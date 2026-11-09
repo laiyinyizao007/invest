@@ -97,11 +97,11 @@ def normalize(raw: pd.DataFrame, period: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def to_bars(df: pd.DataFrame, code: str, exchange: Exchange, interval: Interval) -> list[BarData]:
-    """DataFrame -> vn.py BarData 列表(时间带 DB_TZ 时区)。"""
+def to_bars(df: pd.DataFrame, code: str, exchange: Exchange, interval: Interval, symbol: str | None = None) -> list[BarData]:
+    """DataFrame -> vn.py BarData 列表(时间带 DB_TZ 时区)。symbol 默认是新浪主力连续代码 {code}0。"""
     return [
         BarData(
-            symbol=f"{code}0",
+            symbol=symbol or f"{code}0",
             exchange=exchange,
             datetime=row.datetime.to_pydatetime().replace(tzinfo=DB_TZ),
             interval=interval,

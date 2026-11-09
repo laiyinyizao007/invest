@@ -1,0 +1,314 @@
+"""risk/account_guard.py 与 risk/order_policy.py 单元测试(纯 Python)。"""
+import json
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from risk.account_guard import AccountGuard, AccountLimits, trading_day  # noqa: E402
+from risk.order_policy import (  # noqa: E402
+    RejectKind,
+    RejectMonitor,
+    RetryPolicy,
+    classify_reject,
+    find_stale_orders,
+)
+
+MON_10AM = datetime(2026, 11, 9, 10, 0)       # 2026-11-09 是周一
+TUE_10AM = datetime(2026, 11, 10, 10, 0)
+
+
+# ---------- 交易日 ----------
+
+@pytest.mark.parametrize(
+    "dt, expected",
+    [
+        (datetime(2026, 11, 9, 9, 30), date(2026, 11, 9)),      # 周一日盘
+        (datetime(2026, 11, 9, 14, 59), date(2026, 11, 9)),
+        (datetime(2026, 11, 9, 21, 5), date(2026, 11, 10)),     # 周一夜盘 → 周二交易日
+        (datetime(2026, 11, 10, 0, 30), date(2026, 11, 10)),    # 周二凌晨(周一夜盘的跨午夜部分)
+        (datetime(2026, 11, 13, 21, 5), date(2026, 11, 16)),    # 周五夜盘 → 下周一
+        (datetime(2026, 11, 14, 1, 0), date(2026, 11, 16)),     # 周六凌晨(周五夜盘) → 下周一
+        (datetime(2026, 11, 15, 12, 0), date(2026, 11, 16)),    # 周日 → 周一
+    ],
+)
+def test_trading_day(dt, expected):
+    assert trading_day(dt) == expected
+
+
+# ---------- 阈值校验 ----------
+
+def test_limits_validation():
+    with pytest.raises(ValueError):
+        AccountLimits(daily_loss_limit=0)
+    with pytest.raises(ValueError):
+        AccountLimits(daily_loss_limit=3000, max_drawdown=2000)
+
+
+# ---------- 当日熔断 ----------
+
+def test_daily_breaker_triggers_once_at_threshold():
+    g = AccountGuard(AccountLimits(600, 2000))
+    assert g.update(10_000, MON_10AM) == []                       # 当日开盘权益 10000
+    assert g.update(9_500, MON_10AM) == []                        # 亏 500,未到 600
+    events = g.update(9_400, MON_10AM)                            # 亏 600,恰好触发
+    assert [e.level for e in events] == ["DAILY"]
+    assert not g.can_open(date(2026, 11, 9))
+    assert g.update(9_300, MON_10AM) == []                        # 继续亏不重复报警(边沿触发)
+
+
+def test_daily_lock_expires_next_trading_day():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    g.update(9_400, MON_10AM)
+    assert not g.can_open(date(2026, 11, 9))
+    g.update(9_400, TUE_10AM)                                     # 次日第一次采样作为新的开盘权益
+    assert g.can_open(date(2026, 11, 10))
+
+
+def test_night_session_belongs_to_next_trading_day():
+    """周一夜盘属于周二交易日:不应沿用周一的当日熔断。"""
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    g.update(9_400, MON_10AM)                                     # 周一熔断
+    g.update(9_400, datetime(2026, 11, 9, 21, 5))                 # 周一夜盘 = 周二交易日,新的开盘权益 9400
+    assert g.can_open(date(2026, 11, 10))
+
+
+def test_floating_loss_counts_toward_daily_breaker():
+    """口径用权益,含浮动盈亏:持仓浮亏同样触发,不必等平仓。"""
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    assert g.update(9_390, MON_10AM)[0].level == "DAILY"
+
+
+# ---------- 累计死线 ----------
+
+def test_hard_lock_from_peak_not_from_initial():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    g.update(11_000, MON_10AM)                                    # 创新高 → 底线抬到 9000
+    events = g.update(9_100, MON_10AM)                            # 距最高点回撤 1900 < 2000:只触发当日熔断(较开盘 -900)
+    assert [e.level for e in events] == ["DAILY"] and not g.hard_locked
+    events = g.update(9_000, MON_10AM)                            # 距最高点回撤 2000:触发硬锁定(而不是跌破 8000)
+    assert [e.level for e in events] == ["HARD"]
+    assert g.hard_locked and not g.can_open(date(2026, 11, 9))
+
+
+def test_hard_lock_is_permanent_across_days():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    g.update(7_900, MON_10AM)
+    assert g.hard_locked
+    assert not g.can_open(date(2026, 11, 20))                     # 过了很多天仍然锁定
+
+
+def test_both_levels_can_fire_on_same_update():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    events = g.update(7_000, MON_10AM)
+    assert {e.level for e in events} == {"HARD", "DAILY"}
+
+
+def test_manual_unlock_resets_peak_to_avoid_instant_relock():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    g.update(7_900, MON_10AM)
+    g.unlock_hard()
+    assert not g.hard_locked
+    assert g.update(7_900, TUE_10AM) == []                        # 最高点已重置,不会马上再次触发
+    assert g.peak_equity == 7_900
+
+
+# ---------- 无效采样 ----------
+
+@pytest.mark.parametrize("bad", [0.0, -5.0, float("nan"), None])
+def test_invalid_equity_samples_are_ignored(bad):
+    """CTP 启动/查询瞬间常报 0 权益:不能因此误熔断,也不能污染最高点。"""
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    assert g.update(bad, MON_10AM) == []
+    assert g.can_open(date(2026, 11, 9)) and g.peak_equity == 10_000
+
+
+# ---------- 外部触发的当日锁定 ----------
+
+def test_external_daily_lock_and_idempotence():
+    g = AccountGuard()
+    assert g.lock_daily(MON_10AM, "废单风暴").level == "DAILY"
+    assert g.lock_daily(MON_10AM, "再次") is None
+    assert not g.can_open(date(2026, 11, 9)) and g.can_open(date(2026, 11, 10))
+
+
+def test_external_daily_lock_ignored_when_hard_locked():
+    g = AccountGuard()
+    g.update(10_000, MON_10AM)
+    g.update(7_000, MON_10AM)
+    assert g.lock_daily(MON_10AM, "x") is None
+
+
+# ---------- 持久化 ----------
+
+def test_state_survives_restart(tmp_path):
+    path = tmp_path / "state" / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    g.update(9_400, MON_10AM)
+    g2 = AccountGuard(AccountLimits(600, 2000), path)             # 模拟进程重启
+    assert not g2.can_open(date(2026, 11, 9))
+    assert g2.peak_equity == 10_000 and g2.day_start_equity == 10_000
+
+
+def test_hard_lock_survives_restart_and_requires_manual_unlock(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    g.update(7_900, MON_10AM)
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.hard_locked and "累计死线" in g2.hard_reason
+    g2.unlock_hard()
+    assert not AccountGuard(AccountLimits(600, 2000), path).hard_locked
+
+
+def test_corrupted_state_file_fails_safe(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text("{ not json", encoding="utf-8")
+    g = AccountGuard(AccountLimits(), path)
+    assert g.hard_locked and "损坏" in g.hard_reason          # 宁可停手,不当作"没有锁"
+
+
+def test_missing_keys_in_state_file_fails_safe(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text(json.dumps({"peak_equity": 1}), encoding="utf-8")
+    assert AccountGuard(AccountLimits(), path).hard_locked
+
+
+def test_state_write_is_atomic(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(), path)
+    g.update(10_000, MON_10AM)
+    assert [p.name for p in tmp_path.iterdir()] == ["guard.json"]
+
+
+def test_status_strings():
+    g = AccountGuard(AccountLimits(600, 2000))
+    d = date(2026, 11, 9)
+    g.update(10_000, MON_10AM)
+    assert g.status(d) == "OK"
+    g.update(9_400, MON_10AM)
+    assert g.status(d) == "DAILY_LOCKED"
+    g.update(7_900, MON_10AM)
+    assert g.status(d) == "HARD_LOCKED"
+
+
+# ---------- 盘中重启:当日开盘基准 ----------
+
+def test_new_day_baseline_is_previous_equity_not_first_sample_of_the_day(tmp_path):
+    """进程在已经亏损后的盘中重启:开盘基准取上次采样(前一日收盘附近),而不是新交易日第一次采样。"""
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)                                    # 周一一直运行到收盘,最后权益 10000
+    restarted = AccountGuard(AccountLimits(600, 2000), path)      # 周二盘中才重启,此时权益已亏到 9300
+    events = restarted.update(9_300, TUE_10AM)
+    assert restarted.day_start_equity == 10_000
+    assert [e.level for e in events] == ["DAILY"]                 # 当日亏损 700 ≥ 600,立刻触发而不是被抬高基准而漏掉
+
+
+def test_first_ever_sample_is_used_when_no_history():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    assert g.day_start_equity == 10_000 and g.last_equity == 10_000
+
+
+def test_last_equity_is_persisted_at_least_every_minute(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    g.update(9_990, datetime(2026, 11, 9, 10, 0, 30))             # 30 秒内、没有任何状态变化(未创新高):不落盘
+    assert json.loads(path.read_text(encoding="utf-8"))["last_equity"] == 10_000
+    g.update(9_980, datetime(2026, 11, 9, 10, 1, 1))              # 超过 60 秒:落盘最新权益
+    assert json.loads(path.read_text(encoding="utf-8"))["last_equity"] == 9_980
+
+
+def test_old_state_file_without_last_equity_still_loads(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text(json.dumps({
+        "peak_equity": 10_000, "day": "2026-11-09", "day_start_equity": 10_000,
+        "daily_locked_day": None, "hard_locked": False, "hard_reason": "",
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(), path)
+    assert not g.hard_locked and g.last_equity == 0.0
+
+
+# ---------- 写盘失败不抛异常 ----------
+
+def test_save_failure_is_recorded_not_raised(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")                                       # 目录位置被文件占用,mkdir 必然失败
+    g = AccountGuard(AccountLimits(600, 2000), blocker / "guard.json")
+    events = g.update(10_000, MON_10AM)                           # 不抛异常
+    assert events == [] and g.save_error
+    assert g.update(9_400, MON_10AM)[0].level == "DAILY"          # 内存中的熔断照常工作
+
+
+def test_save_error_clears_after_a_successful_write(tmp_path):
+    g = AccountGuard(AccountLimits(600, 2000), tmp_path / "guard.json")
+    g.save_error = "old"
+    g.update(10_000, MON_10AM)
+    assert g.save_error == ""
+
+
+# ---------- 废单分类 ----------
+
+@pytest.mark.parametrize("text", ["CTP:资金不足", "合约不存在", "平仓量超过持仓量", "不在交易时段", "报单价格不在涨跌停板内"])
+def test_known_hard_rejects(text):
+    assert classify_reject(text) is RejectKind.HARD
+
+
+@pytest.mark.parametrize("text", ["交易服务器连接断开", "请求超时", "网络异常,正在重连"])
+def test_known_soft_rejects(text):
+    assert classify_reject(text) is RejectKind.SOFT
+
+
+@pytest.mark.parametrize("text", [None, "", "某个从未见过的错误", "连接断开且资金不足"])
+def test_unknown_or_mixed_rejects_are_hard(text):
+    """未知文本、同时含软硬关键词:一律按硬拒绝(宁可停手也不重试)。"""
+    assert classify_reject(text) is RejectKind.HARD
+
+
+# ---------- 重试节奏 ----------
+
+def test_retry_policy_delays_and_escalation():
+    p = RetryPolicy()
+    assert [p.delay_for(i) for i in (1, 2, 3)] == [1.0, 3.0, 5.0]
+    assert p.delay_for(4) is None and p.delay_for(0) is None      # 超过 3 次升级为硬故障
+    assert p.max_attempts == 3
+
+
+# ---------- 废单风暴 ----------
+
+def test_reject_storm_within_window():
+    m = RejectMonitor(limit=3, window_seconds=600)
+    assert [m.add(t) for t in (0, 100, 200)] == [False, False, True]
+
+
+def test_old_rejects_fall_out_of_window():
+    m = RejectMonitor(limit=3, window_seconds=600)
+    m.add(0), m.add(100)
+    assert m.add(1000) is False and m.count == 1
+
+
+def test_reject_monitor_validation():
+    with pytest.raises(ValueError):
+        RejectMonitor(limit=0)
+
+
+# ---------- 超时委托 ----------
+
+def test_only_stale_open_orders_are_returned():
+    orders = [("a", 0.0, True), ("b", 100.0, True), ("c", 0.0, False)]
+    assert find_stale_orders(orders, now_ts=130.0, timeout=120.0) == ["a"]     # 平仓单 c 永不因超时被撤
+    assert find_stale_orders(orders, now_ts=130.0, timeout=10.0) == ["a", "b"]

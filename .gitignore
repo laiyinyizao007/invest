@@ -8,3 +8,6 @@ __pycache__/
 .pytest_cache/
 .coverage
 data/
+
+# 容器运行时挂载目录(策略状态、日志、风控状态文件、心跳),不入库
+runtime/

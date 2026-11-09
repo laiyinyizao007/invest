@@ -1,7 +1,8 @@
 # PROJECTWIKI.md
 
-> 项目知识库(单一可信源)。状态:**Phase 0–2 完成**(骨架、数据层、策略/回测/优化/风控模块);
-> **回测结论为负面:未发现可延续的优势**(见 ADR)。当前转向基础设施(Phase 3–5:SimNow 无头运行、Webhook、Docker)。
+> 项目知识库(单一可信源)。状态:**Phase 0–5 的代码均已完成并通过离线端到端测试;尚未在真实 CTP/SimNow 上验证**(见 `docs/runbook-simnow.md`)。
+> Phase 6(期货公司穿透式认证与实盘准入)是人工步骤,见 `docs/live-readiness.md`。
+> **回测结论为负面:在复权数据上同样未发现可延续的优势**(见 ADR);因此当前策略只用于**管道测试**,不应连接真实资金。
 > 跟踪 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)
 
 ## 1. 项目概述
@@ -26,7 +27,11 @@ flowchart LR
   ST[trend_atr_strategy.py] --> BL
   RG[risk_guard.py] --> ST
   PG[promotion_gate.py] -. 晋级检查 .-> OPT
-  ST -. 尚未接入 .-> CTP[CTP 网关 / SimNow - Phase 4]
+  RT[runtime.py] --> ST
+  RT --> GR[guard_rule.py 账户风控]
+  RT --> WH[webhook.py]
+  RT --> CTP[CTP 网关 / SimNow]
+  GR -. 拦截开仓/紧急平仓 .-> CTP
 ```
 | 节点 | 代码路径 | 状态 |
 |---|---|---|
@@ -37,7 +42,9 @@ flowchart LR
 | OPT | `scripts/optimize.py` | 完成 |
 | ST | `strategies/trend_atr_strategy.py`、`random_entry_strategy.py`、`instruments.py` | 完成 |
 | RG / PG | `risk/risk_guard.py`、`risk/promotion_gate.py` | 完成 |
-| CTP | `notify/`(目前仅空包)、无头运行脚本 | 未开始 |
+| RT / GR | `trading/runtime.py`、`trading/guard_rule.py`、`trading/safe_risk.py` | 完成(离线测试) |
+| WH | `notify/webhook.py` | 完成 |
+| CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | 完成,**待 SimNow 实测** |
 
 ## 3. 架构决策记录(ADR)
 - 目录:`docs/adr/`,MADR 格式
@@ -46,12 +53,18 @@ flowchart LR
   - [`20261109-account-risk-budget.md`](docs/adr/20261109-account-risk-budget.md):1 万元 / 300 元预算,超预算则不交易,主测玉米
   - [`20261109-negative-backtest-result.md`](docs/adr/20261109-negative-backtest-result.md):如实记录"未发现优势"与方法学纪律
   - [`20261109-promotion-gate.md`](docs/adr/20261109-promotion-gate.md):策略晋级门槛(8 条)
+  - [`20261109-account-risk-lock.md`](docs/adr/20261109-account-risk-lock.md):账户级双层熔断、平仓永远放行、紧急平仓防重复下单
+  - [`20261109-deployment-and-live-mode.md`](docs/adr/20261109-deployment-and-live-mode.md):实盘模式策略、运行时对账、通知、容器化
 
 ## 4. 设计决策 & 技术债务
 | 项 | 说明 | 优先级 |
 |---|---|---|
 | 分钟线历史很浅 | 新浪每个周期只返回最近约 1023 根(1 分钟≈5 个交易日,15 分钟≈2.5 个月),须每天/每周增量运行脚本积累 | 高 |
-| **旧回测基于未复权数据** | 已用 `build_continuous.py` 量化:换月价差玉米中位 44 点、甲醇 75 点,大于整个 300 元止损;**基于 `C0`/`MA0` 的回测结论作废,须在复权数据(2018-05 起)上重做**,切分已在 ADR 中先行确定 | **最高** |
+| 旧回测基于未复权数据 | 已量化(换月价差玉米中位 44 点、甲醇 75 点)并**在复权数据上重做**:玉米训练段夏普为正仅 11%、选出的参数训练/验证均为负;甲醇无法开仓。旧结论作废,新结论仍是"无法证明优势" | 已处理 |
+| **未在真实 CTP/SimNow 上验证** | 废单文本、持仓回报时序、撤单失败、断线重连、SHFE/INE 平今平昨、夜盘跨日都只在离线假网关上验证;须按 `docs/runbook-simnow.md` 第 5 节实测并回填 | **最高** |
+| 主力合约换月需人工更新 | `LIVE_VT_SYMBOL` 指向具体合约,换月与持仓移仓未实现 | 高 |
+| 本地止损依赖进程存活 | vn.py 停止单是引擎本地触发的;进程退出时若有持仓会发 FATAL,但无法替代交易所端条件单 | 高 |
+| 交易日不处理法定节假日 | 长假前后的当日熔断边界需人工留意 | 中 |
 | 复权数据历史较短 | 新浪分合约日线只到 2018-05;更早需交易所逐日合约数据(大连 2005 起、郑州 2010-08 起,约几千次请求) | 高 |
 | 分钟线历史不足 | 已购买外部数据,待到货后做交叉验证与导入;须先核对时间戳语义、复权情况与授权 | 高 |
 | 回测结论统计效力不足 | 选定参数在验证段仅 1 笔往返;结论只能是"无法证明优势" | 高 |
@@ -78,7 +91,7 @@ flowchart LR
 - **关键函数**:`fetch_with_retry`、`normalize`、`to_bars`、`save_csv`、`run_one`、`main`。
 - **幂等**:数据库 upsert;CSV 按时间戳去重,新数据覆盖旧数据;重复运行安全。
 - **失败隔离**:单个品种/周期失败不影响其余,最终退出码为 1。
-- **测试**:`tests/test_fetch_data.py`,32 个用例。全仓库 124 个测试,覆盖率 98%(目标 85%)。
+- **测试**:`tests/test_fetch_data.py`,32 个用例。全仓库 320 个测试,覆盖率约 97%(目标 85%),在英文/中文 vn.py 语言环境下均通过。
 
 ### `risk/risk_guard.py`(纯 Python,覆盖率 100%)
 - `stop_distance` / `risk_per_trade` / `within_budget`:单笔风险预算,超预算则放弃交易(不缩小止损)。
@@ -100,6 +113,29 @@ flowchart LR
 - 主力 = 前一交易日持仓量最大且只向更远月换月(无前视、不回头);主力停牌不换月,到期强制换月;换月价差取换月前最后共同交易日收盘价之差,无共同日时近似并告警。
 - 取数缓存:已到期合约永久缓存(含确认不存在),未到期合约缓存 24 小时,网络错误不缓存,原子写入;单合约失败不输出残缺序列。
 - 局限:仅 1/5/9 月合约;新浪分合约日线只覆盖 2018-05 之后;差价法可能产生非正价格(会告警)。
+
+### `trading/`(账户风控与运行时)
+- `guard_rule.py`:挂在 vnpy_riskmanager 发单链上的 `AccountGuardRule`。拦截锁定期间的**开仓**,平仓永远放行;每秒读权益推进双层熔断
+  (当日 600 元 / 距最高点 2000 元);撤超时开仓单;废单延迟分类(CTP 先推回报后写错误日志);紧急平仓状态机(按成交量对账、
+  终态后才重试、状态未知不重发、持仓回报滞后时主动查询);`emergency_flatten()` 供运行时看门狗调用。
+- `safe_risk.py`:`SafeRiskEngine` 让平仓单跳过计数类内置规则(每日上限/活动委托/重复报单),并加载上面的规则与项目默认配置。
+- `runtime.py`:`TradingRuntime` 串起网关、风控、CTA 引擎与通知。启动顺序与对账、看门狗(策略被异常停止/行情停更/心跳)、退出码语义见 ADR。
+- `events.py`:自定义事件(账户告警、硬锁定)。
+
+### `risk/account_guard.py` 与 `risk/order_policy.py`(纯 Python,100% 覆盖)
+- `AccountGuard`:权益驱动的双层熔断状态机,原子持久化,损坏即硬锁定,权益 ≤0/NaN 视为无效采样,日初基准取上次采样。
+- `trading_day()`:夜盘归属下一交易日,周末顺延(不处理法定节假日)。
+- `order_policy`:废单关键词分类(未知按硬拒绝)、紧急平仓重试节奏 1/3/5 秒、废单风暴检测、超时开仓委托识别。
+
+### `notify/webhook.py`
+- 非阻塞(有界队列 + 后台线程)、失败重试 1/3/5 秒、60 秒去重(FATAL 不去重)、发送前脱敏(含 URL 路径里的 token)、generic/飞书/Telegram 三种格式。
+
+### `scripts/run_headless.py` 与 `scripts/unlock_account.py`
+- `run_headless.py --symbol c2701.DCE --history CADJ.DCE`:无头运行;`--check` 只校验配置不连接。配置来自环境变量/`.env`,凭据不出现在命令行或日志。
+- `unlock_account.py`:人工解除累计死线硬锁定(需输入 `UNLOCK` 确认)。
+
+### `scripts/build_continuous.py`(补充)
+- `--save` 把复权序列写入 vn.py 数据库(`CADJ.DCE` / `MAADJ.CZCE`),供回测(`optimize.py --symbol CADJ`)和实盘预热使用。
 
 ### `scripts/backtest_lib.py` 与 `scripts/optimize.py`
 - `run_engine` / `run_backtest`:统一成本口径(rate=0,固定手续费折成点数并入滑点);把 vn.py 静默吞掉的策略异常转成 `RuntimeError`。
@@ -170,6 +206,8 @@ sequenceDiagram
 - 所有新脚本第一行业务导入前先 `import bootstrap`。
 - 部署到 Docker/VPS 时设置 `TZ=Asia/Shanghai`;`.env` 通过挂载注入,不入库。
 - 临时文件:pip 异常中断会在 `%TEMP%` 残留 `pip-unpack-*`,可手动清理。
+- **本机网络**:走本地代理(127.0.0.1:7897)下载 PyPI/Docker 镜像这类大文件只有约 20 KB/s,直连约 4.7 MB/s。pip 安装与镜像拉取应绕过代理(`NO_PROXY=*`;WSL 里还要 `unset http_proxy https_proxy` 并忽略 pip 的旧代理配置)。
+- 运行与部署:见 `docs/runbook-simnow.md`、`docs/live-readiness.md`、`docker-compose.yml`;宿主机挂载目录需让 uid 1000 可写。
 - Windows 控制台输出中文时设置 `PYTHONUTF8=1`。
 - **测试不得比较 vn.py 枚举的 `.value` 字符串**(`Direction.LONG.value` 等会随 `LANG` 环境变量在 `'Long'`/`'多'` 间变化),一律用枚举成员比较。
   验证方法:`env -u LANG -u LC_ALL -u LANGUAGE ... pytest tests`。

@@ -253,6 +253,36 @@ def test_corrupted_cache_is_refetched(api, tmp_path):
     assert api["calls"] == ["C2505"]
 
 
+# ---------- 写入 vn.py 数据库 ----------
+
+def test_save_to_database_writes_adjusted_daily_bars_under_adj_symbol(monkeypatch):
+    saved = []
+
+    class FakeDb:
+        def save_bar_data(self, bars):
+            saved.extend(bars)
+
+    monkeypatch.setattr(bc, "get_database", lambda: FakeDb())
+    series, _ = bc.build_continuous(two_contracts(basis=10.0))
+    vt = bc.save_to_database(series, "C")
+    assert vt == "CADJ.DCE"
+    assert len(saved) == len(series)
+    assert {b.symbol for b in saved} == {"CADJ"} and {b.interval.name for b in saved} == {"DAILY"}
+    assert saved[0].close_price == pytest.approx(series["close"].iloc[0])        # 存的是复权价,不是原始价
+    assert saved[0].close_price != series["raw_close"].iloc[0]
+
+
+def test_main_save_flag_calls_database(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(bc.bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["build_continuous.py", "--symbol", "C", "--first-year", "2025", "--last-year", "2025", "--save"])
+    frames = two_contracts()
+    monkeypatch.setattr(bc, "fetch_contract", lambda code: frames.get(code))
+    calls = []
+    monkeypatch.setattr(bc, "save_to_database", lambda series, code: calls.append((len(series), code)) or "CADJ.DCE")
+    assert bc.main() == 0
+    assert calls == [(10, "C")] and "已写入 vn.py 数据库: CADJ.DCE" in capsys.readouterr().out
+
+
 # ---------- main ----------
 
 def test_main_isolates_failures_and_refuses_to_write_partial_series(monkeypatch, tmp_path, capsys):

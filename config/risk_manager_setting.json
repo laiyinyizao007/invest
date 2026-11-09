@@ -1,0 +1,34 @@
+{
+  "委托规模检查": {
+    "order_volume_limit": 2,
+    "order_value_limit": 100000
+  },
+  "每日上限检查": {
+    "total_order_limit": 200,
+    "total_cancel_limit": 100,
+    "total_trade_limit": 100,
+    "contract_order_limit": 200,
+    "contract_cancel_limit": 100,
+    "contract_trade_limit": 100
+  },
+  "活动委托检查": {
+    "active_order_limit": 10
+  },
+  "重复报单检查": {
+    "duplicate_order_limit": 10
+  },
+  "账户风控": {
+    "daily_loss_limit": 600,
+    "max_drawdown": 2000,
+    "flatten_on_daily_lock": true,
+    "stale_order_seconds": 120,
+    "reject_storm_limit": 3,
+    "reject_storm_window": 600,
+    "cancel_lock_limit": 50,
+    "state_file": "data/state/account_guard.json",
+    "reject_classify_delay": 1.5,
+    "flatten_ack_timeout": 10,
+    "position_refresh_timeout": 6,
+    "account_id": ""
+  }
+}

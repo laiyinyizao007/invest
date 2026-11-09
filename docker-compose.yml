@@ -1,0 +1,21 @@
+# 用法:
+#   cp config/.env.example .env   # 填写账号与前置机地址(.env 不入库)
+#   docker compose up -d --build
+#   docker compose logs -f trader
+#
+# 退出码语义(restart: on-failure):0 = 正常停止/硬锁定后确认空仓 → 不会自动重启;
+# 3 = 启动失败(可重试);4 = 对账失败(需人工处理,最多重试几次后停止)。
+services:
+  trader:
+    build: .
+    image: invest-trader:local
+    env_file: .env
+    environment:
+      TZ: Asia/Shanghai
+    command: ["--symbol", "${LIVE_VT_SYMBOL}", "--history", "${HISTORY_VT_SYMBOL:-}"]
+    volumes:
+      - ./runtime/vntrader:/app/.vntrader     # 策略状态、日志、本地数据库
+      - ./runtime/data:/app/data              # 账户风控状态文件、心跳
+    restart: on-failure:3
+    stop_grace_period: 60s
+    init: true

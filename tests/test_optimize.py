@@ -1,5 +1,6 @@
 """scripts/optimize.py 测试:不跑真实回测,用假的 evaluate 验证选参逻辑与"测试段纪律"。"""
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,32 @@ def test_symmetric_peak_selects_centre_not_edge():
     scores = dense(5, lambda i, j, k: -((i - 2) ** 2 + (j - 2) ** 2 + (k - 2) ** 2))
     out = optimize.smoothed(scores)
     assert max(out, key=out.get) == (2, 2, 2)
+
+
+# ---------- 切分 ----------
+
+def test_adjusted_symbols_use_their_own_windows_and_test_window_is_unchanged_after_2024():
+    assert optimize.windows_for("C") is optimize.WINDOWS
+    assert optimize.windows_for("MA") is optimize.WINDOWS
+    adj = optimize.windows_for("CADJ")
+    assert adj is optimize.windows_for("MAADJ") and adj is optimize.WINDOWS_ADJ
+    assert adj["train"][0] == datetime(2018, 5, 1)                       # 复权数据 2018-05 起
+    # 三段首尾相接、互不重叠,按时间顺序排列
+    assert adj["train"][1] < adj["valid"][0] and adj["valid"][1] < adj["test"][0]
+
+
+def test_evaluate_uses_the_windows_of_the_symbol(monkeypatch):
+    seen = {}
+
+    def fake_run(cls, params, key, start, end):
+        seen["range"] = (start, end)
+        return {}, None, []
+
+    monkeypatch.setattr(optimize, "run_backtest", fake_run)
+    optimize.evaluate("CADJ", {}, "valid")
+    assert seen["range"] == optimize.WINDOWS_ADJ["valid"]
+    optimize.evaluate("C", {}, "valid")
+    assert seen["range"] == optimize.WINDOWS["valid"]
 
 
 # ---------- evaluate ----------

@@ -27,4 +27,7 @@ class Instrument:
 INSTRUMENTS: dict[str, Instrument] = {
     "C": Instrument("C0.DCE", size=10, pricetick=1.0),     # 玉米,主测品种
     "MA": Instrument("MA0.CZCE", size=10, pricetick=1.0),  # 甲醇,对照品种
+    # 复权主力连续合约(scripts/build_continuous.py --save 写入),数据自 2018-05 起;回测与实盘预热应使用它们而不是 C0/MA0
+    "CADJ": Instrument("CADJ.DCE", size=10, pricetick=1.0),
+    "MAADJ": Instrument("MAADJ.CZCE", size=10, pricetick=1.0),
 }

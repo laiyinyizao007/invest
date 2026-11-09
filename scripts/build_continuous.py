@@ -13,7 +13,7 @@
   5. 当前主力当天没有成交但之后还会交易(停牌/无量)时,该日不产生 K 线,不换月;只有合约不再有数据(到期)才强制换月。
 
 数据局限:新浪分合约日线只覆盖约 2019 年之后(实测 C1905 可取、C1801~C1809 取不到)。
-用法(项目根目录): python scripts/build_continuous.py --symbol C
+用法(项目根目录): python scripts/build_continuous.py --symbol C [--save]
 """
 import argparse
 import os
@@ -28,8 +28,10 @@ import bootstrap
 import pandas as pd
 
 import akshare as ak
-from fetch_data import fetch_with_retry, normalize
+from fetch_data import SYMBOLS, fetch_with_retry, normalize, to_bars
 from strategies.instruments import INSTRUMENTS
+from vnpy.trader.constant import Interval
+from vnpy.trader.database import get_database
 
 CACHE_DIR = bootstrap.ROOT / "data" / "contracts"
 ROLL_MONTHS = (1, 5, 9)  # 玉米、甲醇的主力合约集中在 1/5/9 月
@@ -181,6 +183,16 @@ def fetch_contract(code: str, today: date | None = None) -> pd.DataFrame | None:
     return df
 
 
+def save_to_database(series: pd.DataFrame, code: str) -> str:
+    """把复权序列写入 vn.py 数据库(日线),代码为 {品种}ADJ,如 CADJ.DCE。重复写入会覆盖同日数据。返回 vt_symbol。"""
+    exchange = SYMBOLS[code]
+    symbol = f"{code}ADJ"
+    bars = to_bars(series[["datetime", "open", "high", "low", "close", "volume", "open_interest"]],
+                   code, exchange, Interval.DAILY, symbol=symbol)
+    get_database().save_bar_data(bars)
+    return f"{symbol}.{exchange.value}"
+
+
 def candidate_codes(product: str, first_year: int, last_year: int) -> list[str]:
     return [f"{product}{yy:02d}{m:02d}" for yy in range(first_year % 100, last_year % 100 + 1) for m in ROLL_MONTHS]
 
@@ -190,6 +202,7 @@ def main() -> int:
     parser.add_argument("--symbol", default="C", choices=["C", "MA"])
     parser.add_argument("--first-year", type=int, default=2018)
     parser.add_argument("--last-year", type=int, default=2027)
+    parser.add_argument("--save", action="store_true", help="把复权序列写入 vn.py 数据库(代码 {品种}ADJ),供回测与实盘预热使用")
     args = parser.parse_args()
 
     frames, failed = {}, []
@@ -215,6 +228,9 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     series.to_csv(out / f"{args.symbol}_continuous_adj.csv", index=False)
     rolls.to_csv(out / f"{args.symbol}_rolls.csv", index=False)
+
+    if args.save:
+        print(f"已写入 vn.py 数据库: {save_to_database(series, args.symbol)}({len(series)} 根日线)")
 
     size = INSTRUMENTS[args.symbol].size
     print(f"\n[{args.symbol}] 复权连续序列 {len(series)} 根 {series.datetime.iloc[0]:%Y-%m-%d}~{series.datetime.iloc[-1]:%Y-%m-%d},换月 {len(rolls)} 次")

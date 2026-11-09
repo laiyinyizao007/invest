@@ -29,6 +29,19 @@ WINDOWS = {
     "valid": (datetime(2019, 1, 1), datetime(2022, 12, 31)),
     "test": (datetime(2023, 1, 1), datetime(2026, 11, 9)),
 }
+# 复权连续合约(CADJ/MAADJ)只有 2018-05 之后的数据,不能使用上面的切分。以下切分在看到任何复权数据上的结果之前就已确定
+# (见 docs/adr/20261109-negative-backtest-result.md),测试段此前从未被查看。
+WINDOWS_ADJ = {
+    "train": (datetime(2018, 5, 1), datetime(2021, 12, 31)),
+    "valid": (datetime(2022, 1, 1), datetime(2023, 12, 31)),
+    "test": (datetime(2024, 1, 1), datetime(2026, 11, 9)),
+}
+
+
+def windows_for(key: str) -> dict:
+    return WINDOWS_ADJ if key.endswith("ADJ") else WINDOWS
+
+
 FAST = [5, 8, 10, 13, 16, 20]
 SLOW = [30, 40, 60, 80, 100, 120]
 MULT = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]  # 含更窄的止损:1 万元/300 元预算下,近年只有窄止损才开得了仓
@@ -37,7 +50,7 @@ MIN_ROUND_TRIPS_NOTE = 10  # 验证/测试段往返笔数少于此值时,夏普�
 
 
 def evaluate(key: str, params: dict, window: str) -> dict:
-    start, end = WINDOWS[window]
+    start, end = windows_for(key)[window]
     stats, _, _ = run_backtest(TrendAtrStrategy, params, key, start, end)
     stats = stats or {}
     return {
@@ -93,13 +106,15 @@ def smoothed(scores: dict[tuple[int, int, int], float]) -> dict[tuple[int, int, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--symbol", default="C", choices=["C", "MA"])
+    parser.add_argument("--symbol", default="CADJ", choices=["C", "MA", "CADJ", "MAADJ"],
+                        help="C/MA = 新浪未复权主力连续(换月跳空会污染结果,仅供对照);CADJ/MAADJ = 复权连续合约")
     parser.add_argument("--test", action="store_true", help="最终确认:查看测试段(只应运行一次)")
     args = parser.parse_args()
     key = args.symbol
 
     combos = grid()
-    print(f"[{key}] 训练段 {WINDOWS['train'][0]:%Y-%m-%d}~{WINDOWS['train'][1]:%Y-%m-%d},共 {len(combos)} 组参数")
+    windows = windows_for(key)
+    print(f"[{key}] 训练段 {windows['train'][0]:%Y-%m-%d}~{windows['train'][1]:%Y-%m-%d},共 {len(combos)} 组参数")
 
     rows, scores = [], {}
     for fi, si, mi, f, s, m in combos:
@@ -136,7 +151,7 @@ def main() -> None:
         tag = "  <-- 最终确认,只看这一次" if window == "test" else ""
         if window != "train" and res["round_trips"] < MIN_ROUND_TRIPS_NOTE:
             tag += f"  [!] 往返仅 {res['round_trips']} 笔,统计无意义,只能说'无法证明优势'"
-        print(f"  {window:5s} {WINDOWS[window][0]:%Y}~{WINDOWS[window][1]:%Y}: 收益 {res['return_pct']:7.1f}%  "
+        print(f"  {window:5s} {windows[window][0]:%Y}~{windows[window][1]:%Y}: 收益 {res['return_pct']:7.1f}%  "
               f"最大回撤 {res['maxdd_pct']:7.1f}%  夏普 {res['sharpe']:5.2f}  往返 {res['round_trips']:3d} 笔  "
               f"期末 {res['end_balance']:8.0f}{tag}")
     if not args.test:
