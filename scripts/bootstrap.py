@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 (ROOT / ".vntrader").mkdir(exist_ok=True)
 
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # 让脚本能 import risk / strategies
+
 os.environ["TZ"] = "CST-8"
 os.environ.setdefault("NO_PROXY", "*")
 

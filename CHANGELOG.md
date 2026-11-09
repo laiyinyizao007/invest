@@ -11,6 +11,10 @@
 - `tests/test_fetch_data.py`:32 个单元测试,覆盖率 97%。
 - `PROJECTWIKI.md`、`docs/adr/`(vn.py 选型、中国时区两条 ADR)。
 - 项目骨架(`0981db3`):`requirements.txt`、`.gitignore`、`config/.env.example`、`strategies/` `risk/` `notify/` `tests/` 空包。
+- Phase 2(策略与回测):`risk/risk_guard.py`(风险预算、只收紧的移动止损、连亏熔断)、`risk/promotion_gate.py`(8 条晋级门槛与夏普置信区间)、
+  `strategies/trend_atr_strategy.py` 与随机入场对照、`scripts/backtest_lib.py`、`scripts/optimize.py`(三段样本外 + 邻域平滑)。
+- `scripts/fetch_data.py` 新增玉米(C)、甲醇(MA)。
+- ADR:账户风险预算、负面回测结果、晋级门槛。测试扩充至 99 个,覆盖率 99%。
 
 ### Changed（变更）
 - 分钟线时间戳由新浪的"K 线结束时间"前推一个周期,统一为 vn.py 的"开始时间"。
@@ -19,6 +23,11 @@
 - 修正 `DB_TZ` 与系统时区不一致导致 vn.py 读回 K 线整体偏移 16 小时的问题(根因:`vnpy_sqlite` 读取时按系统本地时区解释无时区时间)。
 - 数据源 OHLC 自相矛盾的行改为修复而非丢弃(PP 2020-08-06、L 2007-07-31 各 1 行)。
 - CSV 改为先写临时文件再原子替换,避免写入中断损坏已积累的分钟历史。
+- 邻域平滑选参的偏差:边缘格子邻居更少导致得分偏高、无效邻居被忽略使孤立尖峰胜出、负分区域里按 0 计无效邻居偏乐观;
+  现在只有完整 3×3×3 邻域的格子可选,无效邻居按悲观下限计。
+- 测试不再依赖 vn.py 枚举的本地化字符串(原先在中文环境下 4 个测试会失败)。
+- 策略委托价按 `pricetick` 取整(止损取更紧的一侧),避免实盘因价格不是最小变动价位的整数倍被拒单。
+- `backtest_lib` 的异常检测改为精确哨兵,不再因策略日志里出现"异常"二字而误报。
 
 ### Security（安全）
 - 账号、密码、AuthCode 仅放 `.env`(已 `.gitignore`),仓库只提供 `config/.env.example` 模板。

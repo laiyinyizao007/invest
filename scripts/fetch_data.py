@@ -1,7 +1,7 @@
 """用 AKShare(新浪源)下载期货主力连续数据,清洗后写入 vn.py 数据库。
 
 用法(项目根目录下):
-    python scripts/fetch_data.py                      # PP/L/EB,日线+1/5/15 分钟
+    python scripts/fetch_data.py                      # PP/L/EB/C/MA,日线+1/5/15 分钟
     python scripts/fetch_data.py --symbols PP --periods d 15
 
 存储:
@@ -36,6 +36,8 @@ SYMBOLS: dict[str, Exchange] = {
     "PP": Exchange.DCE,  # 聚丙烯
     "L": Exchange.DCE,   # 塑料
     "EB": Exchange.DCE,  # 苯乙烯
+    "C": Exchange.DCE,   # 玉米(1 万元账户的主测品种)
+    "MA": Exchange.CZCE,  # 甲醇(对照品种)
 }
 PERIODS = ("d", "1", "5", "15")
 COLUMNS = ["datetime", "open", "high", "low", "close", "volume", "open_interest"]
