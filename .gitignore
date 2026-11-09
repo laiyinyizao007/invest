@@ -1,0 +1,10 @@
+.env
+*.db
+*.log
+.vntrader/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+data/

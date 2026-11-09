@@ -1,0 +1,12 @@
+vnpy
+vnpy_ctp
+vnpy_ctastrategy
+vnpy_ctabacktester
+vnpy_sqlite
+vnpy_riskmanager
+akshare
+pandas
+python-dotenv
+requests
+pytest
+pytest-cov
