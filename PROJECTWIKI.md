@@ -83,6 +83,7 @@ flowchart LR
   - [`20261109-deployment-and-live-mode.md`](docs/adr/20261109-deployment-and-live-mode.md):实盘模式策略、运行时对账、通知、容器化
   - [`20261110-baseline-15m.md`](docs/adr/20261110-baseline-15m.md):15 分钟基准的事前方案、成绩单与"测试段已被使用"的约束
   - [`20261110-ctp-error-code-and-watchdog-policy.md`](docs/adr/20261110-ctp-error-code-and-watchdog-policy.md):错误码优先的废单三级分类、假死强撤开仓单、断线连接状态机与无积压补发证据
+  - [`20261110-walk-forward-optimizer.md`](docs/adr/20261110-walk-forward-optimizer.md):Walk-Forward 滚动窗口方法学、测试段三层隔离护栏、预算弃单率口径与负面结果记录
 
 ## 4. 设计决策 & 技术债务
 | 项 | 说明 | 优先级 |
@@ -422,6 +423,21 @@ flowchart LR
 - **测试段只有加 `--test` 才会被评估**,且只应运行一次;验证/测试段同时输出"成本×2"压力测试行。
 - **结果为负面**(测试段 -20.2%、夏普 -1.08,成本吞掉全部毛利),详见 ADR;**测试段已被使用一次**。
 
+### `scripts/walk_forward_optimizer.py`(Walk-Forward 滚动优化,测试段物理隔离)
+- 方案见 `docs/adr/20261110-walk-forward-optimizer.md`(**方法学在看到任何结果之前写定**):只在 2020-07~2023-12 区间滚动,
+  3 个窗口(训练 24 月 / 验证 6 月 / 步长 6 月,验证段互斥),测试段起点之后的数据没有任何代码路径可以触达。
+- 网格只扫 fast ∈ {10,14,18,22,26,30} × slow ∈ {40,50,60,70,80,90}(仍要求 `slow ≥ 2×fast`,31 组);
+  `atr_mult=1.5` 与 `risk_budget=300` 固定(参数字典不传 risk_budget 键,无法被覆盖),不使用邻域平滑,按原始夏普多级排序取 Top5。
+- 隔离三层护栏:`TEST_SEGMENT_START` 硬断言(越界 `ValueError`)、API 反例测试、源码扫描测试(2024+ 年份字面量只能出现在常量定义行);不提供 `--test` 开关。
+- 多进程:模块级 `_backtest_one`(入参全基础类型,Windows spawn 可 pickle)+ 单个 `ProcessPoolExecutor`
+  贯穿全部窗口;`--workers 1` 为进程内串行降级路径;每进程独立 `lru_cache`;回测内核仍是 vn.py `BacktestingEngine`(经 `backtest_lib.run_engine_bars`),
+  借此从 `engine.strategy.skipped_by_budget` 读取 300 元预算弃单计数,`backtest_lib.py` 零改动;
+  弃单率分母不含熔断拦截与段末持仓笔数(ADR 有误读边界说明)。
+- 输出:逐窗口 Top5 训练/验证对照 + 跨窗口汇总(第一名验证夏普均值/中位数、正夏普窗口占比、最差验证回撤、预算弃单率),
+  明细写 `data/results/walk_forward_C15.csv`(不纳入版本控制);vn.py 夏普为自然日 ×240 口径,只做同口径排序。
+- 结果(2026-11-10 一次性运行):三个窗口训练段 Top5 夏普全部为负,验证段 15 组参数夏普全部为负、正夏普窗口占比 0%,
+  预算弃单率 0%(atr_mult=1.5 下止损距离都在 300 元内,空仓并非预算造成);与基线 ADR 的负面结论互相印证,详见 ADR 结果章节。
+
 ### `scripts/run_gui.py`(图形界面,人工观察用)
 - 打开 VeighNa Trader 界面,按 `.env` 自动连接 CTP;`--subscribe` 让合约表到位后自动订阅行情;`--no-connect` 手动连接;`--check` 只校验配置。
 - 同样挂载 `SafeRiskManagerApp`:界面里手动下单也受账户风控约束;硬锁定生效时拒绝连接。
@@ -448,6 +464,19 @@ flowchart LR
 | `load_bars_csv` | `(path, symbol, exchange, interval=MINUTE) -> list[BarData]` | 读 `import_minute.py` 输出的 K 线 CSV(时间戳为开始时间) |
 | `run_engine_bars` | `(strategy_class, setting, key, bars, capital=10000, interval=MINUTE, cost_multiplier=1.0) -> BacktestingEngine` | 直接回放内存 K 线;滑点 × `cost_multiplier`;策略异常转 `RuntimeError` |
 | `run_backtest_bars` | `(同上) -> (stats, df, trades)` | 上者 + 绩效统计 |
+
+`python scripts/walk_forward_optimizer.py [--workers N] [--data 路径] [--output 路径]`:Walk-Forward 滚动优化;
+无 `--test` 开关,任何越界窗口在 `_assert_pre_test` 直接 `ValueError`。
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `build_windows` | `() -> list[Window]` | 3 个滚动窗口(训练 24 月/验证 6 月/步长 6 月),构造即过隔离断言 |
+| `grid` | `() -> list[dict]` | fast/slow 二维 31 组,固定 `atr_mult=1.5`,无 `risk_budget` 键 |
+| `rank` | `(rows) -> list[dict]` | fills≥100 门槛;夏普↓→回撤↓→fills↓→fast↑→slow↑ 确定性排序 |
+| `_backtest_one` | `(data_file, params, start_iso, end_iso, cost_multiplier=1.0) -> dict` | 模块级可 pickle worker;含 `skipped_by_budget` 与 `budget_skip_rate` |
+| `map_backtests` | `(data_file, jobs, workers, executor=None) -> list[dict]` | workers=1 串行;否则进程池;executor 仅供测试注入 |
+| `run_window` | `(data_file, window, workers, executor=None) -> dict` | 训练网格→Top5→验证外推;不足 5 组标 `insufficient` |
+| `summarize` | `(results) -> dict` | 第一名验证夏普均值/中位数、正夏普窗口占比、最差回撤、预算弃单率 |
 
 ## 7. 数据模型
 ```mermaid

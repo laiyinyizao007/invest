@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 ### Added（新增）
+- Walk-Forward 滚动优化器 `scripts/walk_forward_optimizer.py`(方法学见 ADR
+  `docs/adr/20261110-walk-forward-optimizer.md`,在看到结果前写定):
+  - 3 个滚动窗口(训练 24 月 / 验证 6 月 / 步长 6 月,验证段互斥),全部止于 2023-12-31;
+    fast ∈ {10..30} × slow ∈ {40..90} 二维网格 31 组,`atr_mult=1.5` 与 `risk_budget=300` 固定
+    (参数字典不传 risk_budget 键,无法覆盖),按原始夏普确定性多级排序取 Top5 自动外推验证段。
+  - 测试段三层隔离护栏:`TEST_SEGMENT_START` 硬断言、API 反例测试、源码扫描测试
+    (2024+ 年份字面量只允许出现在常量定义行),不提供任何 `--test` 开关。
+  - 多进程:模块级可 pickle worker + 单个 `ProcessPoolExecutor` 贯穿全部窗口(避免每窗口重建池
+    导致 lru_cache 失效与重复 spawn),`--workers 1` 串行降级,`--workers` 拒绝 0/负数;
+    每进程独立 K 线缓存 + 回测切片后断言不含测试段 K 线;经 `run_engine_bars` 读取
+    `skipped_by_budget` 报告预算弃单率,`backtest_lib.py` 零改动;明细输出
+    `data/results/walk_forward_C15.csv`(不纳入版本控制)。
+  - 一次性演练结果(108 次回测):训练段最优夏普本身全为负,15 组验证参数夏普全部为负、
+    正夏普窗口占比 0%,预算弃单率全程 0%(空仓并非预算造成),与基线 ADR 负面结论互证;
+    串行/并行两次运行数值完全一致。演练中修复 vn.py 回撤金额带负号导致的两个统计 bug
+    (汇总最差回撤被 0 吞掉、排名平局键方向反),复跑确认排名与数值不变。
+  - codex 双轮审查(第 1 轮工作流 + 第 2 轮 clink codex CLI 833 秒含真实 spawn 动态探针):
+    无 Critical/High;隔离护栏经伪造 2024 窗口实测不可绕过。采纳修复:单池复用、
+    真实 spawn 冒烟测试、summarize 非有限夏普防御(当前 vn.py 的 nan_to_num 使其暂不可达,
+    属防升级缺口)、Window `__post_init__` 校验、tz-aware 入参归一化、奇数 fills 截断测试、
+    空结果不写 CSV;源码扫描层"防误改提示网"定位与弃单率三类误读场景写入 ADR。
+  - 新增 `tests/test_walk_forward_optimizer.py` 29 个测试,新模块覆盖率 99%;
+    全量 643 个测试通过,总覆盖率 88%(门禁 85%)。
 - 极限压力测试前置改造(混沌工程四演练,详见 ADR `docs/adr/20261110-ctp-error-code-and-watchdog-policy.md`):
   - `risk/order_policy.py`:`extract_ctp_error_code()` + `CTP_ERROR_KIND` 码表,废单分类升级为
     「错误码优先 → 关键词回退 → 未知 fail-closed 硬拒绝」三级决策;码表只收录实测/官方背书的 8 个码

@@ -58,6 +58,7 @@ flowchart LR
   DB --> BL
   BL --> OPT[optimize.py 日线基准]
   BL --> O15[optimize_15m.py 15 分钟基准]
+  BL --> WF[walk_forward_optimizer.py<br/>滚动窗口/测试段隔离]
   ST[trend_atr_strategy.py<br/>trend_atr_15m_strategy.py] --> BL
   RG[risk_guard.py<br/>单笔预算 / 移动止损 / 连亏熔断] --> ST
   RT[trading/runtime.py<br/>对账 / 看门狗 / 关闭流程] --> ST
@@ -136,11 +137,14 @@ python scripts/build_continuous.py --symbol C --save
 ```bash
 python scripts/optimize.py --symbol CADJ        # 日线基准
 python scripts/optimize_15m.py                  # 15 分钟基准
+python scripts/walk_forward_optimizer.py        # Walk-Forward 滚动窗口(只在 2023 年底前的区间,测试段物理隔离)
 ```
 
 > **纪律**：不加 `--test`。测试段只在最终确认时看**一次**，看过之后不得再据此调参。
 > 日线基准的测试段：复权数据（`CADJ`/`MAADJ`）为 2024-01 起，未复权数据为 2023-01 起；
 > 15 分钟基准的测试段为 2024-01 ~ 2026-06，**已经用掉了**，新候选需要 2026-06 之后的分钟线或模拟盘记录。
+> `walk_forward_optimizer.py` 不提供任何访问测试段的开关：窗口硬断言 + 源码扫描测试双重保证，
+> 方法学与结果见 `docs/adr/20261110-walk-forward-optimizer.md`。
 
 ### 4. 无头运行（连接 SimNow）
 
