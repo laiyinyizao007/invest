@@ -49,14 +49,14 @@ EXIT_RECONCILE_REFUSED = 4
 class Notifier(Protocol):
     def send(self, level: str, title: str, message: str, extra: dict | None = None) -> bool: ...
 
-    def close(self, flush_timeout: float = ...) -> None: ...
+    def close(self, drain_timeout: float = ...) -> None: ...
 
 
 class NullNotifier:
     def send(self, level: str, title: str, message: str, extra: dict | None = None) -> bool:
         return False
 
-    def close(self, flush_timeout: float = 0.0) -> None:
+    def close(self, drain_timeout: float = 0.0) -> None:
         pass
 
 
@@ -391,7 +391,25 @@ class TradingRuntime:
             try:
                 self.main.close()
             finally:
-                self.notifier.close()
+                self._close_notifier()
+
+    def _close_notifier(self) -> None:
+        """关闭通知器,并给"退出时仍有持仓"这类 FATAL 留出足够的发送时间。
+
+        关闭通知器的默认预算是 10 秒,而一条消息的最坏耗时是
+        (1 + 重试次数) × 单次超时 + 全部退避时间(默认 34 秒)——
+        对端慢一点,"退出时有持仓"这条最关键的告警就会随进程退出一起丢掉,
+        而它恰恰是无人值守最后的兜底手段。所以这里按通知器自己的排空预算来关。
+        """
+        budget = getattr(self.notifier, "drain_timeout", None)
+        if not isinstance(budget, (int, float)) or budget <= 0:
+            budget = 10.0
+        try:
+            self.notifier.close(drain_timeout=float(budget))
+        except TypeError:
+            # 通知器不是本项目的实现(签名里没有 drain_timeout):退回不带参数的关闭,
+            # 绝不能让"签名对不上"把退出流程本身打断 —— 那会让告警根本发不出去。
+            self.notifier.close()
 
     def _on_hard_lock(self, event: Event) -> None:
         data = event.data

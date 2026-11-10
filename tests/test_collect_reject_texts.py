@@ -381,6 +381,25 @@ def test_write_collected_does_not_overwrite_a_doc_without_markers(tmp_path):
     assert (tmp_path / "doc-raw.md").exists()
 
 
+def test_write_collected_keeps_the_begin_marker_so_the_second_run_still_updates(tmp_path):
+    """BEGIN 标记必须原样写回去。
+
+    丢了下一次运行 old.find(BEGIN_MARK) 返回 -1 → 采集结果只落到 -raw.md,
+    主文档里的表格从此不再更新,而且不报错。
+    """
+    out = tmp_path / "doc.md"
+    out.write_text("# 标题\n\n" + c.BEGIN_MARK + ": 自动采集区 -->\n旧表格\n" + c.END_MARK + "\n\n结尾\n",
+                   encoding="utf-8")
+    c.write_collected(out, "新表格\n" + c.END_MARK)
+    text = out.read_text(encoding="utf-8")
+    assert c.BEGIN_MARK in text and "新表格" in text and "旧表格" not in text
+    c.write_collected(out, "又一轮\n" + c.END_MARK)
+    text2 = out.read_text(encoding="utf-8")
+    assert "又一轮" in text2 and "新表格" not in text2
+    assert c.BEGIN_MARK in text2 and c.END_MARK in text2
+    assert not (tmp_path / "doc-raw.md").exists()
+
+
 def test_without_confirm_flag_it_refuses_to_run(monkeypatch, capsys):
     """没有 --confirm-simnow 就直接拒绝执行:这个脚本只允许在模拟盘上跑。"""
     monkeypatch.setenv("CTP_ENVIRONMENT", "实盘")

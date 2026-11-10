@@ -13,9 +13,59 @@
 | Docker 镜像构建 + 容器内 `vnpy_ctp` 导入 + `run_headless.py --check` | ✅ 已验证 |
 | **容器内连接 SimNow 并稳定运行** | ✅ 2026-11-10 完整跑通(连接→授权→登录→结算确认→合约表→策略初始化→订阅→healthy→优雅退出) |
 | 第 5 节 10 项实测(废单文本/回报时序/断线/kill -9/熔断/夜盘/断流/撮合差异) | ⚠ 2 项已做(第 1 项采到 2/6 场景、第 2 项回报时序),其余待做 |
-| 连续 ≥ 5 个交易日无人值守 | ❌ 未开始 |
-| Webhook 告警实际到达手机 | ❌ 未验证 |
+| 第 5 节实测项的**自动化演练脚本**(`scripts/drill.py`) | ✅ 已写好,待在交易时段/夜盘实跑 |
+| 每日证据表 + webhook 连通性自检(`scripts/unattended_report.py`) | ✅ 已写好并跑通离线自检 |
+| 连续 ≥ 5 个交易日无人值守 | ❌ 未开始(证据表目前只有 1 天) |
+| Webhook 告警实际到达手机 | ❌ 未验证(`.env` 的 `WEBHOOK_URL` 为空) |
 | 图形界面 `scripts/run_gui.py`(人工观察,非运行方式) | ✅ 可用,已自动订阅 |
+
+### 5.0 自动化工具(本轮新增)
+
+#### `scripts/drill.py` —— 把第 5 节的实测项做成可重复执行的场景
+第 5 节的每一项原本都要人在旁边一步步做,容易漏步骤、也没留下可核对的记录。现在每项对应一个场景,
+脚本自己连 SimNow、自己做动作、自己记录结论,结果写进 `docs/simnow-drills.md`。
+
+```bash
+# ⚠ 必须在容器里跑:运行时的"是否处于交易时段"判断用 datetime.now()(系统本地时区),
+#   宿主机是 UTC-8、容器是 TZ=Asia/Shanghai,时段判断错位会让看门狗不触发、结论失真。
+docker compose run --rm --entrypoint python trader scripts/drill.py list
+docker compose run --rm --entrypoint python trader scripts/drill.py all --confirm-simnow
+docker compose run --rm --entrypoint python trader scripts/drill.py latency --confirm-simnow --symbol c2701.DCE
+```
+
+| 场景 | 对应第 5 节 | 前提 |
+|---|---|---|
+| `overnight` | 第 8 项 夜盘首根 Tick 与交易日归属 | 需要在夜盘时段(20:30 之后) |
+| `latency` | 第 3 项 成交→持仓回报延迟 | 需要在交易时段内;会真的开 1 手仓,量完立刻平掉 |
+| `tick-stale` | 第 9 项 行情断流 → 看门狗告警 | 需要在交易时段内(看门狗只在时段检查) |
+| `disconnect` | 第 4 项 交易连接断开 → 告警与自动重连 | 需要在交易时段内 |
+| `daily-loss` | 第 6 项 当日熔断 → 撤单 → 平仓 | 无时间前提 |
+| `hard-lock` | 第 7 项 累计死线 → 平仓 → 退出码 0 | 无时间前提 |
+
+- **前提不满足的场景标记为「跳过(⏭)」而不是失败** —— 例如收盘后跑 `tick-stale` 等不到告警是前提问题,不是系统有问题。
+- **状态与实盘完全隔离**:演练用独立的 `.vntrader_drill/` 目录与独立的风控状态文件,熔断/硬锁定不会污染实盘。
+- **只在模拟盘上跑**:交易服务器地址必须在 SimNow 官方白名单内(`scripts/simnow_guard.py`),否则拒绝连接。
+  白名单只收官网公布过的:第一套 `182.254.243.31:30001/30002/30003`,第二套 `:40001`(官网只公布了这一套)。
+- **⚠ 二次确认**:如果地址不在白名单(用了 `--allow-any-address` 逃生舱),而场景又会**真的发委托**
+  (`latency`/`daily-loss`/`hard-lock`),必须再加 `--confirm-any-address-trades`,否则脚本拒绝执行(退出码 2)。
+  用了逃生舱的警告会写进 `docs/simnow-drills.md` 当审计记录。
+- 演练用**空策略**,不会自己下单,避免和演练动作互相干扰。
+- `latency` 场景开的那 1 手仓**平不掉就是失败**:会发 FATAL 告警并以非零码退出 —— "演练通过"却把仓位留在
+  模拟账户里,后面的对账与无人值守证据全部失真。跑完请核对模拟账户确实没有持仓。
+
+#### `scripts/unattended_report.py` —— 无人值守验收的证据
+```bash
+python scripts/unattended_report.py --report          # 生成每日证据表 → docs/unattended-log.md
+python scripts/unattended_report.py --probe-webhook    # webhook 连通性自检
+```
+
+- `--report`:解析 vn.py 每日日志与心跳文件,列出每天的启动次数、成交笔数、异常事件、心跳新鲜度。
+  **只统计日志里真实出现的内容,不推断"没问题"**。
+  默认只统计容器目录 `runtime/vntrader/log` —— 宿主机 `.vntrader/log` 会被单元测试污染,要加 `--include-host` 才统计。
+- `--probe-webhook`:配了 `WEBHOOK_URL` → 用真实通知器发一条"【连通性自检】"消息并报告对端是否接受(**会真的发消息**);
+  没配 → 起本地接收端离线验证"送达 + 业务失败可辨识",并明确指出手机端尚未验证。
+- **注意**:飞书机器人**失败时也返回 HTTP 200**,错误信息在 JSON 体的 `code` 字段里。只看状态码会把"没送达"当成成功,
+  所以通知器现在会解析响应体,业务码非 0 一律算失败并重试。
 
 ## 0. 你需要准备的(我无法代办)
 1. 注册 SimNow 账号(上期技术官网 simnow.com.cn),拿到投资者代码与密码。
@@ -86,6 +136,11 @@ python scripts/run_headless.py --check
 
 ## 6. SimNow 阶段验收
 - 连续无人工干预运行 ≥ 5 个交易日,含夜盘与至少一次周末;
+  **"交易日"的算法**(`scripts/unattended_report.py::longest_clean_streak()`):只有**工作日(周一~周五)**计入连续段,
+  **周末即使有日志文件也不计入**(容器常驻,周末照样有日志,夜盘跨零点还会写进周六的文件 ——
+  把它们算成交易日会让验收结论凭空多出两天)。周末的**严重**事件(紧急平仓、熔断、硬锁定、对账失败)仍然**打断**连续段;
+  周末的警告(空闲期的连接抖动)不打断。周五到周一是连续的**两个**交易日,中间的周末不打断也不占名额。
+  工作日**缺日志**(进程静默死亡)打断连续段,并列进验收清单待人工核对是否节假日。
 - 上表 4–9 项均实测通过并留有记录;
 - 告警(webhook)全部到达手机;
 - 没有出现:重复下单、止损未触发、持仓与策略不一致、进程静默死亡。

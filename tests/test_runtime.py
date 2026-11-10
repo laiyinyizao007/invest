@@ -50,13 +50,15 @@ class RecordingNotifier:
     def __init__(self):
         self.messages: list[tuple[str, str, str]] = []
         self.closed = False
+        self.close_budget: float | None = None      # close() 收到的排空预算
 
     def send(self, level, title, message, extra=None):
         self.messages.append((level, title, message))
         return True
 
-    def close(self, flush_timeout=0.0):
+    def close(self, drain_timeout=0.0):
         self.closed = True
+        self.close_budget = drain_timeout
 
     def titles(self):
         return [t for _, t, _ in self.messages]
@@ -231,6 +233,20 @@ def test_shutdown_with_open_position_raises_a_fatal_alert(make):
     rt.gw.set_position(Direction.LONG, 1)
     rt.shutdown()
     assert any("本地止损将随进程退出而失效" in m for m in rt.notifier.find("退出时仍有持仓"))
+
+
+def test_shutdown_gives_the_notifier_time_to_deliver_the_fatal_alert(make):
+    """退出时仍有持仓的 FATAL 是无人值守最后的兜底,不能随进程退出一起丢掉:
+    关闭通知器的预算必须按通知器自己的排空预算来给,而不是默认的 10 秒。"""
+    class _BudgetedNotifier(RecordingNotifier):
+        def __init__(self):
+            super().__init__()
+            self.drain_timeout = 42.0
+
+    rt = make(notifier=_BudgetedNotifier())
+    rt.start()
+    rt.shutdown()
+    assert rt.notifier.close_budget == 42.0
 
 
 def test_run_returns_refusal_code_and_always_shuts_down(make):

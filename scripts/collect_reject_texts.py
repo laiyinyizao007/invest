@@ -43,14 +43,8 @@ from vnpy.trader.utility import round_to
 
 from trading.runtime import build_ctp_setting
 
-# SimNow 官方公布的前置机地址(2026-11 官网 product.action)。
-# 第一套与实盘交易时间一致(有夜盘),第二套 7x24(仅供 API 测试)。
-# 脚本只允许连这些地址:**期货公司生产 API 的地址一定不在表里**,
-# 这样"--confirm-simnow"就不再是一个可以随手点过去的布尔开关。
-SIMNOW_TD_ADDRESSES = frozenset({
-    "182.254.243.31:30001", "182.254.243.31:30002", "182.254.243.31:30003",
-    "182.254.243.31:40001", "182.254.243.31:40002", "182.254.243.31:40003",
-})
+# SimNow 地址白名单放在 scripts/simnow_guard.py,采集脚本与演练脚本共用同一套约束。
+from simnow_guard import SIMNOW_TD_ADDRESSES, check_simnow_address, normalize_address
 # 交易时段(本地时间,分钟数)。用于判断"能不能用合法价格下单":
 # 交易时段内下单是可能成交的,必须改用越界价格才安全。
 # 日盘 09:00-10:15 / 10:30-11:30 / 13:00-15:00;夜盘 21:00 起,不同品种收在 23:00、01:00 或 02:30。
@@ -299,7 +293,22 @@ def write_collected(out: Path, text: str) -> None:
         alt.write_text(text, encoding="utf-8")
         print(f"{out} 里没有自动采集标记(可能是人工维护的文档),已改写 {alt}", file=sys.stderr)
         return
-    new = old[:begin] + text + old[end + len(END_MARK):]
+    # BEGIN 标记那一行(含"重新采集会替换这一段"这句人话)必须**原样写回去**:
+    # 丢了下一次运行 old.find(BEGIN_MARK) 就找不到标记 → 采集结果只会落到 -raw.md,
+    # 主文档里的表格从此不再更新。
+    line_start = old.rfind("\n", 0, begin) + 1
+    line_end = old.find("\n", begin)
+    if line_end < 0:
+        line_end = len(old)
+    marker_line = old[line_start:line_end]
+    if line_start != begin or END_MARK in marker_line:
+        # BEGIN 标记不在行首,或者两个标记挤在同一行 → 用规范写法,
+        # 别把上一轮的旧内容留在标记行里。
+        marker_line = BEGIN_MARK + " -->"
+    if END_MARK not in text:
+        # 调用方给的正文里没有结束标记 → 补上,否则下一次运行会认为"没有标记"
+        text = text.rstrip("\n") + "\n" + END_MARK
+    new = old[:begin] + marker_line + "\n" + text + old[end + len(END_MARK):]
     out.write_text(new, encoding="utf-8")
 
 
@@ -421,19 +430,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # 地址白名单:SimNow 官方公布的前置机地址。期货公司生产 API 的地址不在表里,
     # 布尔开关("--confirm-simnow")挡不住"配置写错"这种情况,所以这里硬校验。
-    td_address = gateway_setting["交易服务器"]
-    if td_address not in SIMNOW_TD_ADDRESSES and not args.allow_any_address:
-        print(f"交易服务器 {td_address} 不在已知的 SimNow 地址表里。"
-              f"期货公司生产 API 的地址一定不在表内,因此本脚本拒绝连接。"
-              f"确认这是安全的测试环境,可以加 --allow-any-address 强制运行(会再打一次警告)。",
-              file=sys.stderr)
+    td_address = normalize_address(gateway_setting["交易服务器"])
+    allowed, note = check_simnow_address(td_address, args.allow_any_address)
+    if not allowed:
+        print(note, file=sys.stderr)
         return 2
     print(f"目标交易服务器 {td_address},行情服务器 {gateway_setting['行情服务器']}。")
     if td_address not in SIMNOW_TD_ADDRESSES:
-        print(f"⚠⚠ 危险警告:交易服务器 {td_address} 不是已知的 SimNow 地址,"
-              f"本次运行由 --allow-any-address 强制放行。"
-              f"若这个地址属于期货公司生产 API,本脚本会连上**真实资金账户**并发出委托。",
-              file=sys.stderr)
+        print(note, file=sys.stderr)
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)

@@ -22,8 +22,11 @@
 
 ## B. SimNow 准入(见 `docs/runbook-simnow.md`)
 - [ ] 连续 ≥ 5 个交易日无人值守,含夜盘与周末;
+      证据用 `python scripts/unattended_report.py --report` 生成每日证据表(`docs/unattended-log.md`),逐日核对;
 - [ ] 手册第 5 节 10 项实测全部完成并回填;
-- [ ] 告警全部到达。
+      第 3/4/6/7/8/9 项已自动化成 `scripts/drill.py` 的场景,在容器里跑并把结论回填 `docs/simnow-drills.md`;
+- [ ] 告警全部到达:`python scripts/unattended_report.py --probe-webhook` 对真实 webhook 自检通过
+      (⚠ 需要先在 `.env` 里填 `WEBHOOK_URL`;现在是空的,所以这一项无法验证)。
 
 ## C. 期货公司与穿透式监管认证(只有你能做)
 > 以下流程基于一般做法,**具体以你开户的期货公司为准**,2025 年起程序化交易还有报备规定,请向对方确认。
