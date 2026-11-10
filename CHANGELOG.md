@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 ### Added（新增）
+- `README.md`:项目上手入口 —— 说明"这个项目在干嘛、怎么用"。含项目定位与状态提示(策略结论为负面、只用于管道测试、当前不连实盘)、
+  Mermaid 架构速览、目录结构、环境准备与 `.env` 配置、按场景分组的命令(数据下载/主力连续/优化/无头运行/Docker/图形界面/
+  SimNow 演练/废单采集/无人值守日报)、账户级风控阈值表、测试命令、已知限制表、相关文档索引。
+  文档生成偏离说明:按 G11 应由 `simple-gemini` skill(Gemini CLI)生成,但本机 Gemini CLI 报
+  `ProjectIdRequiredError`(缺 `GOOGLE_CLOUD_PROJECT` 环境变量),故由主模型撰写;内容已按仓库脚本的 argparse 实际参数逐条核对。
 - `scripts/simnow_guard.py`:SimNow 前置机地址白名单(`SIMNOW_TD_ADDRESSES`)+ `check_simnow_address()` + `normalize_address()`。
   `--confirm-simnow` 只是布尔开关,挡不住"配置写错连上真券商";CTP 的"柜台环境=实盘"是 SimNow 与期货公司生产 API 共用的,
   **只能靠前置机地址区分**,地址不在表内默认拒绝连接。`collect_reject_texts.py` 与 `drill.py` 共用这一套约束。
