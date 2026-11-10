@@ -6,6 +6,7 @@
 
 ## [Unreleased]
 ### Added（新增）
+- `scripts/import_minute.py`:把购买的分合约 1 分钟线导入为差额复权主力连续合约并合成 15 分钟线(新浪日线补齐缺口、起点成交冷清段裁剪、交易日归属);玉米实测与新浪日线交叉验证通过。
 - `scripts/fetch_data.py`:AKShare(新浪源)下载 PP/L/EB 日线与 1/5/15 分钟线,清洗后写入 vn.py 数据库(日线、1 分钟)或 CSV(5、15 分钟);指数退避重试、失败隔离、重复运行幂等。
 - `scripts/bootstrap.py`:统一启动入口,固定中国时区与项目内 `.vntrader/` 数据目录。
 - `tests/test_fetch_data.py`:32 个单元测试,覆盖率 97%。
