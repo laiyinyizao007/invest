@@ -325,6 +325,16 @@ def test_known_hard_rejects(text):
     assert classify_reject(text) is RejectKind.HARD
 
 
+def test_real_simnow_non_trading_hour_reject_is_hard():
+    """2026-11-10 SimNow 实测文本:非交易时段下发的委托被拒。
+
+    这句里含"连接",会被 SOFT_KEYWORDS 命中;但它是硬拒绝(时段问题,重试没用),
+    必须按硬拒绝处理,否则会无谓地重试平仓单。
+    """
+    text = "交易委托失败，代码：21，信息：CTP:该交易席位未连接到交易所"
+    assert classify_reject(text) is RejectKind.HARD
+
+
 @pytest.mark.parametrize("text", ["交易服务器连接断开", "请求超时", "网络异常,正在重连"])
 def test_known_soft_rejects(text):
     assert classify_reject(text) is RejectKind.SOFT

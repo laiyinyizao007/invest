@@ -36,7 +36,7 @@ from vnpy_ctastrategy import CtaStrategyApp
 
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
-from trading.guard_rule import ACCOUNT_RULE_NAME
+from trading.guard_rule import ACCOUNT_RULE_NAME, GATEWAY_ERROR_MARKERS
 from trading.safe_risk import SafeRiskManagerApp
 
 EXIT_OK = 0
@@ -168,7 +168,10 @@ class TradingRuntime:
             if not self._login_notified:
                 self._login_notified = True
                 self.notify("INFO", "网关已连接", msg)
-        elif log.level >= ERROR:
+        elif log.level >= ERROR or any(k in msg for k in GATEWAY_ERROR_MARKERS):
+            # CTP 的拒单是以 INFO 级别写的(vnpy_ctp 的 write_error 实际调用 write_log),
+            # 只看 level 会漏掉"交易委托失败,代码：21,信息：..."这类关键日志。
+            # 这里用宽措辞:只是给人看的告警,分类错误没有后果,所以"登录失败""订阅失败"也一并提示。
             self.notify("WARN", "网关错误", msg)
 
     def _on_tick(self, event: Event) -> None:

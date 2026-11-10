@@ -18,7 +18,7 @@ from vnpy.trader.object import (
     TickData,
     TradeData,
 )
-from vnpy.trader.logger import ERROR
+from vnpy.trader.logger import ERROR, INFO
 
 
 class SyncEventEngine(EventEngine):
@@ -132,7 +132,10 @@ class FakeGateway(BaseGateway):
 
     # ---- 测试辅助 ----
     def _log_reject(self) -> None:
-        self.on_event(EVENT_LOG, LogData(msg=f"交易委托失败,信息:{self.reject_text}", level=ERROR, gateway_name=self.gateway_name))
+        # 级别用 INFO 而不是 ERROR:真实 vnpy_ctp 的 write_error() 实际调用 write_log(),
+        # 拒单是以 INFO 级别写出来的(2026-11-10 在 SimNow 上实测确认)。
+        # 假网关若用 ERROR,就会掩盖"只认 ERROR 级别会漏掉全部拒单文本"这个真实缺陷。
+        self.on_event(EVENT_LOG, LogData(msg=f"交易委托失败,信息:{self.reject_text}", level=INFO, gateway_name=self.gateway_name))
 
     def _apply_fill(self, order) -> None:
         self.on_trade(TradeData(

@@ -6,6 +6,12 @@
 
 ## [Unreleased]
 ### Added（新增）
+- `scripts/collect_reject_texts.py`:在 SimNow 模拟盘上故意触发几个**必定被拒**的委托,采集 CTP 的真实错误文本,
+  用于校准 `risk/order_policy.py` 的 `HARD_KEYWORDS/SOFT_KEYWORDS`;结果记入 `docs/reject-texts-simnow.md`。
+  安全约束:必须 `--confirm-simnow`,且交易服务器地址必须在 SimNow 官方地址白名单内;
+  交易时段内运行自动改用越界价(不可能成交)并跳过时段场景;
+  发单前先查持仓(已有持仓或交易连接断开就中止,退出码 5);
+  跑完主动查持仓,发现非零持仓即告警并以非零码退出;所有价格按 `price_tick` 对齐。
 - 15 分钟基准策略(`strategies/trend_atr_15m_strategy.py`)、`scripts/optimize_15m.py` 与实验方案 ADR;结果:测试段 -20.2%、夏普 -1.08,成本吞掉全部毛利,**无可延续的优势**(详见 `docs/adr/20261110-baseline-15m.md`)。测试段已被基准使用一次。
 - `scripts/import_minute.py`:把购买的分合约 1 分钟线导入为差额复权主力连续合约并合成 15 分钟线(新浪日线补齐缺口、起点成交冷清段裁剪、交易日归属);玉米实测与新浪日线交叉验证通过。
 - `scripts/fetch_data.py`:AKShare(新浪源)下载 PP/L/EB 日线与 1/5/15 分钟线,清洗后写入 vn.py 数据库(日线、1 分钟)或 CSV(5、15 分钟);指数退避重试、失败隔离、重复运行幂等。
@@ -31,13 +37,56 @@
 - 文档:`docs/runbook-simnow.md`、`docs/live-readiness.md`,ADR 增 3 条(账户风控、部署与实盘模式、负面结果更新)。
 
 ### Changed（变更）
+- `Dockerfile`:把 `locales` 层挪到 `pip install` **之后**。改动前面的层会让 pip 重新下载全部依赖
+  (容器→PyPI 实测 12.6 MB 的 sdist 要 400 秒以上),挪到后面则能命中已有构建缓存,只需重新拉取 `locales` 这一个小包。
+- 测试扩充至 416 个,覆盖率 92%(目标 85%)。
 - 分钟线时间戳由新浪的"K 线结束时间"前推一个周期,统一为 vn.py 的"开始时间"。
 - **文档同步(2026-11-10)**:PROJECTWIKI 补充 15 分钟基准模块、购买数据的派生数据流、GUI 入口、容器内连通 SimNow 未验证等条目;
   `docs/runbook-simnow.md` 与 `docs/live-readiness.md` 刷新 Phase 3–5 的实际状态与剩余实测项;Issue #1 的阶段勾选同步。
 - 明确记录:**15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次**,新候选策略不能再用它做最终确认。
 
 ### Fixed（修复）
+- **CTP 的拒单日志是 INFO 级别,原来永远收不到**(2026-11-10 SimNow 实测):`vnpy_ctp` 的 `write_error()` 实际调用
+  `write_log()`,所以"交易委托失败,代码：21,信息：…"以 INFO 级别写出。`trading/guard_rule.py` 只认 `log.level >= ERROR`,
+  导致废单分类永远拿不到原因(一律按硬拒绝),紧急平仓单的有限重试形同虚设。
+  现按**精确措辞** `REJECT_LOG_MARKERS = ("交易委托失败", "交易撤单失败")` 识别,`trading/runtime.py` 的网关错误告警同步修复
+  (运行时告警另用宽措辞 `GATEWAY_ERROR_MARKERS`,只给人看、分类错误没有后果);
+  `tests/fakes.py` 的假网关也改成 INFO 级别,免得掩盖这个缺陷。措辞收窄的理由:宽泛的"失败"会把
+  "行情服务器登录失败""行情订阅失败"也收进来,真废单日志迟到时就拿这些无关文本去分类,把可重试的软拒绝误判成硬拒绝。
+- **废单关键词冲突**:`该交易席位未连接到交易所`(SimNow 非交易时段的真实拒单文本)含软关键词"连接",
+  被误判成可重试的软拒绝;已显式加入硬关键词表。
+- `scripts/collect_reject_texts.py`:① 竞态——CTP 先推订单回报、后写错误日志,脚本拿到拒单回报就翻日志,
+  必然抓不到(2026-11-10 首次采集白跑一趟);已加 `wait_error` 等错误日志到达。② `close()` 会 join CTP 原生线程,
+  4097 断连风暴下不返回,脚本"跑完不退出";改为限时关闭 + `os._exit` 兜底。
+  ③ 交易时段内跑采集时,"非交易时段开仓""超大手数"两个场景用的是合法价格,**可能成交留下持仓**;
+  现按 `in_trading_session()` 判定,时段内改用越界价并跳过时段场景。④ 价格未按 `price_tick` 对齐,
+  会被 CTP 按"价格非法"拒单,测到的不是想测的场景;已统一 `round_to`。
+- **第二轮 codex 审查追加修复**(2026-11-10):
+  - 采集脚本只靠 `--confirm-simnow` 布尔开关挡不住"配置写错连上真券商"→ 新增 SimNow 官方地址白名单,
+    不在表内直接拒绝连接(`--allow-any-address` 为强制逃生口)。
+  - 场景之间的错误会串味(上一个场景的旧错误离本次发单更近)→ `Collector.error_index()` + `since` 参数。
+  - **"无持仓时平仓"场景可能真的平掉账户上的持仓** → 发单前 `symbol_has_position()` 查持仓,
+    账户上有任何持仓都中止采集(退出码 5);查询必须等满整个窗口(默认 15 秒),
+    否则 CTP 异步到达的持仓回报会被漏掉、误判成空仓。交易连接断开同样中止。
+  - 早退路径不关引擎 → `main()` 用 `try/finally` 统一走限时 `close_engine()`,采集主体拆到 `_collect()`。
+  - 事件线程写、主线程读列表 → `Collector` 加锁,读取走快照。
+  - 多网关时错误张冠李戴 → `_errors` 记来源网关,`_error_text_near(ts, gateway_name)` 按网关过滤,
+    并优先取废单回报**之后**到达的日志。
+- **第三轮 codex 审查追加修复**(2026-11-10):
+  - **交易所级废单的原因拿不到**:`REJECT_LOG_MARKERS` 只认"交易委托失败""交易撤单失败",
+    但 CTP 的交易所拒单走 `onRtnOrder`(`vnpy_ctp/gateway/ctp_gateway.py:673-684` 把状态映射成 REJECTED),
+    原因在 StatusMsg 里、日志措辞是"委托 {委托号} 状态更新，{原因}"(同文件 713-719),
+    **不经过** `onRspOrderInsert`。漏掉它 → 交易所拒单原因永远是"未知"→ 一律按硬拒绝 →
+    平仓单被提前升级为人工处理、丧失重试机会。现已加入 `"状态更新"` 措辞。
+  - 发单前查持仓的等待窗口可能不够 → 查询改为**等满整个窗口且查两轮**(默认 15 秒 + 7.5 秒):
+    CTP 的持仓回报是异步的,而且对空账户**不推送任何持仓事件**,
+    "没收到回报"既可能是真空仓也可能是回报没到。
+  - `Collector` 的 `orders/ticks/contracts` 字典未加锁(与 `errors` 的保护方式不一致)→ 统一加锁,
+    读取改走 `contract_of/tick_of/order_of` 快照方法。
+  - 交易时段窗口未覆盖 CFFEX 的 13:00 下午盘 → 下午盘起点由 13:30 提前到 13:00(保守取并集)。
+  - `--allow-any-address` 的帮助文本与警告改为明确提示"可能连上真实资金账户"。
 - **Docker 容器连不上 SimNow 的根因**:`vnpy_ctp` 的 `toUtf()` 硬编码 `std::locale("zh_CN.GB18030")`,Debian slim 镜像默认无此 locale,CTP 回调线程抛异常导致进程 abort(无 CTP 错误日志)。Dockerfile 已加 `locales` + `localedef -i zh_CN -f GB18030 zh_CN.GB18030`。
+- **Docker 容器内完整连上 SimNow**(2026-11-10 实测):连接→授权→登录→结算确认→合约表→策略初始化→订阅→容器 `healthy`→`docker compose stop` 优雅退出(码 0)。
 - `scripts/backtest_lib.py`:回测异常检测改用精确哨兵(`Traceback` / `触发异常`),避免普通日志含"异常"二字被误报;`run_engine_bars` 补充统计口径说明(按自然日分组,与日线基准的夏普不可直接比较)。
 - `scripts/run_gui.py`:合约事件去重,CTP 重连重发合约表时不会重复订阅;自动订阅的合约缺交易所后缀时给出提示而不是静默不订阅。
 - `scripts/optimize_15m.py`:`--data` 换文件后 K 线缓存按路径取键,不会继续用上一份数据。

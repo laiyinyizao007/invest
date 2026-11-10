@@ -482,6 +482,81 @@ def test_errors_from_non_gateway_sources_are_not_used_to_classify_rejects(env):
     assert "网络超时" in msg and "SOFT" in msg                                  # 用的是网关日志,没有被 Runtime 的日志污染
 
 
+def test_reject_reason_is_found_even_though_ctp_logs_it_at_info_level(env):
+    """真实 vnpy_ctp 把拒单写成 INFO 级别(vnpy_ctp 的 write_error 实际调用 write_log)。
+
+    2026-11-10 在 SimNow 上实测确认:拒单文本是"交易委托失败，代码：21，信息：...",
+    级别 INFO。若只认 ERROR 级别,废单分类永远拿不到原因(一律按硬拒绝),
+    紧急平仓单的有限重试也就永远用不上。
+    """
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_LOG
+    from vnpy.trader.logger import INFO
+    from vnpy.trader.object import LogData
+    env.gw.mode = "accept"
+    env.send(make_req())
+    env.tick(seconds=1)
+    env.gw.mode = "reject"
+    env.gw.reject_text = "网络超时"
+    # 手工补一条 INFO 级别的拒单日志,模拟 vnpy_ctp 的行为
+    env.event_engine.put(Event(EVENT_LOG, LogData(msg="交易委托失败,信息:网络超时", level=INFO, gateway_name="FAKE")))
+    env.event_engine.put(Event(EVENT_LOG, LogData(msg="其它无关的 INFO 日志", level=INFO, gateway_name="FAKE")))
+    env.gw.mode = "reject"
+    env.send(make_req())
+    env.tick(seconds=2)
+    rejects = [a for a in env.alerts if a["title"] == "委托被拒"]
+    assert rejects, "应该收到拒单告警"
+    assert "网络超时" in rejects[-1]["message"] and "SOFT" in rejects[-1]["message"]
+
+
+def test_unrelated_gateway_info_logs_are_not_used_as_reject_reasons(env):
+    """网关的 INFO 级日志里混着"行情订阅失败""行情服务器登录失败"这类无关文本。
+
+    它们不是废单原因:真废单的日志迟到或缺失时,拿这些文本去分类会把可恢复的软拒绝
+    误判成硬拒绝,紧急平仓的有限重试就永远用不上。
+    """
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_LOG
+    from vnpy.trader.logger import INFO
+    from vnpy.trader.object import LogData
+    env.gw.mode = "reject"
+    env.gw.reject_text = "网络超时"                                       # 网关的真实废单原因(软)
+    env.event_engine.put(Event(EVENT_LOG, LogData(msg="行情订阅失败", level=INFO, gateway_name="FAKE")))
+    env.event_engine.put(Event(EVENT_LOG, LogData(msg="行情服务器登录失败", level=INFO, gateway_name="FAKE")))
+    env.send(make_req())
+    env.tick(seconds=2)
+    msg = [a["message"] for a in env.alerts if a["title"] == "委托被拒"][0]
+    assert "行情订阅失败" not in msg and "行情服务器登录失败" not in msg
+
+
+def test_exchange_level_reject_reason_is_found(env):
+    """交易所级拒单走 onRtnOrder,原因在 StatusMsg 里,日志措辞是"委托 X 状态更新，<原因>"。
+
+    这条路径不经过 onRspOrderInsert,"交易委托失败"收不到它;漏掉的话交易所拒单的原因
+    就永远是"未知"→ 一律按硬拒绝 → 平仓单被提前升级为人工处理,丧失重试机会。
+    """
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_LOG
+    from vnpy.trader.logger import INFO
+    from vnpy.trader.object import LogData
+    env.gw.mode = "reject"
+    env.gw.reject_text = "CTP:资金不足"
+    env.event_engine.put(Event(EVENT_LOG, LogData(msg="委托 1_1_5 状态更新,网络繁忙",
+                                                   level=INFO, gateway_name="FAKE")))
+    env.send(make_req())
+    env.tick(seconds=2)
+    msg = [a["message"] for a in env.alerts if a["title"] == "委托被拒"][0]
+    assert "网络繁忙" in msg, "应该拿到交易所级拒单的真实原因"
+
+
+def test_reject_reason_is_taken_from_the_same_gateway_only(env):
+    """多网关时不能拿 A 网关的错误去解释 B 网关的废单。"""
+    env.rule._errors.append((env.clock.mono(), "交易委托失败,信息:另一网关的原因", "OTHER"))
+    env.rule._errors.append((env.clock.mono(), "交易委托失败,信息:本网关的原因", "FAKE"))
+    assert env.rule._error_text_near(env.clock.mono(), "FAKE") == "交易委托失败,信息:本网关的原因"
+    assert env.rule._error_text_near(env.clock.mono(), "OTHER") == "交易委托失败,信息:另一网关的原因"
+
+
 def test_retry_volume_never_exceeds_current_oms_position(env):
     key = ("c2601.DCE", Direction.LONG)
     env.gw.set_position(Direction.LONG, 1)

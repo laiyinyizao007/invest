@@ -11,18 +11,19 @@ RUN apt-get update \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
-# vnpy_ctp 的 toUtf() 硬编码 std::locale("zh_CN.GB18030");slim 镜像默认没有这个 locale,
-# CTP 回调线程构造失败会抛 std::runtime_error -> std::terminate -> 整个进程 abort。
-# 单独一层:上面的工具链层可以命中缓存,不必为这一个 locale 重下 gcc。
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends locales \
-    && localedef -i zh_CN -f GB18030 zh_CN.GB18030 \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
+
+# vnpy_ctp 的 toUtf() 硬编码 std::locale("zh_CN.GB18030");slim 镜像默认没有这个 locale,
+# CTP 回调线程构造失败会抛 std::runtime_error -> std::terminate -> 整个进程 abort(无 CTP 错误日志)。
+# 这一层放在 pip 之后:改动前面的层会让 pip 重下依赖(容器网络慢,pip 那层要几分钟),
+# 放在后面则可以复用已有缓存,只需重新下 locales 这一个小包。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends locales \
+    && localedef -i zh_CN -f GB18030 zh_CN.GB18030 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY risk ./risk
 COPY strategies ./strategies

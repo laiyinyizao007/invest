@@ -40,6 +40,20 @@ ERROR_WINDOW = 3.0                      # 废单与其错误日志的最大时�
 MIN_POSITION_REFRESH_TIMEOUT = 3.0     # 等持仓回报的下限(秒)
 CANCEL_RETRY_SECONDS = 10.0             # 撤单请求发出后多久仍未终结则允许再次撤单
 FLATTEN_REF = "account_guard_flatten"   # 紧急平仓委托的标记,废单处理据此识别,不依赖事件到达顺序
+# CTP 把委托失败写成 INFO 级别的日志,这些措辞用来认出"这是一条拒单原因"。
+# 实测措辞(2026-11-10 SimNow):"交易委托失败,代码：21,信息：…"、"交易撤单失败,代码：…"。
+# **必须用精确措辞**:宽泛的"失败"会把"行情服务器登录失败""行情订阅失败""委托请求发送失败"
+# 也收进来,这些不是废单原因;一旦真废单的日志迟到/缺失,就会拿这些无关文本去分类,
+# 把可重试的软拒绝误判成硬拒绝,紧急平仓的有限重试就永远用不上。
+#
+# "状态更新"覆盖**交易所级别**的废单:CTP 收到交易所的拒单回报时走 `onRtnOrder`,
+# vnpy_ctp 把状态映射成 REJECTED(源码 ctp_gateway.py:673-684),原因写在 StatusMsg 里,
+# 日志措辞是"委托 {委托号} 状态更新，{原因}"(ctp_gateway.py:713-719)。
+# 这条路径**不经过** `onRspOrderInsert`,所以上面两个措辞收不到它;漏掉的话,
+# 交易所拒单的原因就永远是"未知"→ 一律按硬拒绝 → 平仓单被提前升级为人工处理。
+REJECT_LOG_MARKERS = ("交易委托失败", "交易撤单失败", "状态更新")
+# 运行时"网关错误"告警用的宽措辞:这里只是给人看,分类错误没有后果,所以可以宽一点。
+GATEWAY_ERROR_MARKERS = ("失败", "被拒绝", "拒绝", "不支持", "非法")
 
 
 class AccountGuardRule(RuleTemplate):
@@ -97,7 +111,7 @@ class AccountGuardRule(RuleTemplate):
         self._cancel_day = None
         self._open_orders: dict[str, tuple[float, bool]] = {}   # vt_orderid -> (创建时间, 是否开仓单)
         self._cancel_requested: dict[str, float] = {}
-        self._errors: deque[tuple[float, str]] = deque(maxlen=50)
+        self._errors: deque[tuple[float, str, str]] = deque(maxlen=50)   # (时刻, 文本, 来源网关)
         self._pending_rejects: dict[str, tuple[float, OrderData]] = {}
         self._flatten: dict | None = None
         self._hard_emitted: set[bool] = set()    # 已发出的硬锁定事件(flat=False / flat=True 各最多一次)
@@ -149,14 +163,30 @@ class AccountGuardRule(RuleTemplate):
     def _on_log(self, event: Event) -> None:
         log: LogData = event.data
         # 只接受已注册网关(如 CTP)的错误日志;运行时/引擎自身的 ERROR 日志(如"通知发送异常")不能被当成废单原因
-        if log.level >= ERROR and log.gateway_name in self.risk_engine.main_engine.gateways:
-            self._errors.append((self.mono(), log.msg))
+        if log.gateway_name not in self.risk_engine.main_engine.gateways:
+            return
+        # vnpy_ctp 的 write_error() 实际调用 write_log(),也就是**以 INFO 级别**输出
+        # "交易委托失败，代码：21，信息：..."。只认 log.level >= ERROR 会漏掉全部委托失败文本,
+        # 废单分类就永远拿不到原因(2026-11-10 在 SimNow 上实测确认)。所以按文本特征识别。
+        # 只收**明确的废单措辞**:宽泛的"失败"会把"行情订阅失败""登录失败"也收进来,
+        # 它们不是废单原因,拿来分类会把软拒绝误判成硬拒绝。
+        if any(k in log.msg for k in REJECT_LOG_MARKERS):
+            # 记下来源网关:多网关时不能拿 A 网关的错误去解释 B 网关的废单
+            self._errors.append((self.mono(), log.msg, log.gateway_name))
 
-    def _error_text_near(self, ts: float) -> str | None:
-        """取与废单时刻最接近(前后 ERROR_WINDOW 秒内)的网关错误日志。"""
-        best = min(self._errors, key=lambda e: abs(e[0] - ts), default=None)
-        if best is not None and abs(best[0] - ts) <= ERROR_WINDOW:
-            return best[1]
+    def _error_text_near(self, ts: float, gateway_name: str = "") -> str | None:
+        """取与废单时刻最接近(前后 ERROR_WINDOW 秒内)的废单日志。
+
+        优先取**废单回报之后**到达的那条:实测 CTP 的 onRspOrderInsert 是先 `on_order()`
+        (回报)后 `write_error()`(日志),所以真废单的原因一定在回报之后;
+        回报之前的那条多半是别的事件(比如上一次废单)留下的。
+        """
+        candidates = [e for e in self._errors if not gateway_name or e[2] == gateway_name]
+        after = [e for e in candidates if e[0] >= ts]
+        for pool in (after, candidates):
+            best = min(pool, key=lambda e: abs(e[0] - ts), default=None)
+            if best is not None and abs(best[0] - ts) <= ERROR_WINDOW:
+                return best[1]
         return None
 
     def _count_cancel(self) -> None:
@@ -172,7 +202,7 @@ class AccountGuardRule(RuleTemplate):
             if now - t < self.reject_classify_delay:
                 continue
             del self._pending_rejects[oid]
-            self._handle_reject(order, self._error_text_near(t), t)
+            self._handle_reject(order, self._error_text_near(t, order.gateway_name), t)
 
     def _handle_reject(self, order: OrderData, text: str | None, ts: float) -> None:
         kind = classify_reject(text)
