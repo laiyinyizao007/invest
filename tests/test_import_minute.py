@@ -200,6 +200,21 @@ def test_trim_illiquid_start_rejects_unusable_data():
         im.trim_illiquid_start(s, pd.DataFrame({"date": [], "gap": []}))
 
 
+def test_trim_works_when_the_index_does_not_start_at_zero():
+    days = pd.bdate_range("2026-01-05", periods=30)
+    s = pd.DataFrame({"datetime": days, "volume": [10] * 10 + [1000] * 20}, index=range(100, 130))
+    s2, _ = im.trim_illiquid_start(s, pd.DataFrame({"date": pd.to_datetime([]), "gap": []}), fraction=0.5, window=3)
+    assert s2["datetime"].iloc[0] == days[10]
+
+
+def test_days_without_bars_reports_series_days_missing_from_the_intraday_data():
+    mins, series, rolls = adjusted()
+    b = mins["C2109"]
+    mins["C2109"] = b[im.assign_trading_day(b["datetime"], CAL) != DAYS[4]]          # 新主力在第 5 个交易日的分钟数据整天缺失
+    bars = im.build_intraday(mins, series, rolls, CAL, 15)
+    assert im.days_without_bars(bars, series) == [DAYS[4]]
+
+
 def test_validate_flags_each_kind_of_corruption():
     good = pd.DataFrame({"datetime": pd.to_datetime(["2026-01-01 09:00", "2026-01-01 09:15"]),
                          "open": [1.0, 1.0], "high": [2.0, 2.0], "low": [0.5, 0.5], "close": [1.5, 1.5]})

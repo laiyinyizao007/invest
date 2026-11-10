@@ -134,7 +134,8 @@ def trim_illiquid_start(series: pd.DataFrame, rolls: pd.DataFrame, fraction: flo
     run = liquid.rolling(window, min_periods=window).min() == 1
     if not run.any():
         raise ValueError("整个序列都没有连续 %d 个成交充足的交易日,数据不可用" % window)
-    start = series.loc[run.idxmax() - (window - 1), "datetime"]
+    first_ok = int(np.argmax(run.to_numpy()))                         # 位置而非标签:不依赖索引是否从 0 开始
+    start = series["datetime"].iloc[first_ok - (window - 1)]
     return (series[series["datetime"] >= start].reset_index(drop=True),
             rolls[rolls["date"] > start].reset_index(drop=True))
 
@@ -190,6 +191,12 @@ def validate(bars: pd.DataFrame) -> list[str]:
     return problems
 
 
+def days_without_bars(bars: pd.DataFrame, series: pd.DataFrame) -> list:
+    """日线序列里本应有分钟线(不晚于分钟线结束日)却一根都没有的交易日。"""
+    have = set(bars["trading_day"].unique())
+    return [d for d in series["datetime"] if d <= bars["trading_day"].max() and d not in have]
+
+
 def _write_atomic(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".csv.tmp")
@@ -226,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"去掉起点附近成交冷清的 {total - len(series)} 个交易日,序列从 {series['datetime'].min():%Y-%m-%d} 开始")
     bars = build_intraday(minutes, series, rolls, calendar, a.minutes)
     problems = validate(bars) + [f"日线: {x}" for x in validate(series)]
+    missing = days_without_bars(bars, series)
+    if missing:
+        problems.append(f"{len(missing)} 个交易日有日线却没有分钟线(如 {missing[0]:%Y-%m-%d}):该日主力合约的分钟数据缺失")
     tag = a.product.upper()
     _write_atomic(bars, out / f"{tag}_{a.minutes}m_adj.csv")
     _write_atomic(series, out / f"{tag}_1d_adj.csv")
