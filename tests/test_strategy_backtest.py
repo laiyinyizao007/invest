@@ -270,6 +270,6 @@ def test_random_entry_is_deterministic_per_seed(feed):
 def test_instrument_slippage_folds_fee_into_points():
     inst = Instrument("C0.DCE", size=10, pricetick=1.0, fee_per_lot=3.0)
     assert inst.slippage_points == pytest.approx(1.3)
-    assert set(INSTRUMENTS) == {"C", "MA", "CADJ", "MAADJ"}
+    assert set(INSTRUMENTS) == {"C", "MA", "CADJ", "MAADJ", "C15"}
     assert INSTRUMENTS["CADJ"].vt_symbol == "CADJ.DCE" and INSTRUMENTS["MAADJ"].vt_symbol == "MAADJ.CZCE"
     assert INSTRUMENTS["MA"].vt_symbol.endswith(".CZCE")

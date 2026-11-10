@@ -30,4 +30,6 @@ INSTRUMENTS: dict[str, Instrument] = {
     # 复权主力连续合约(scripts/build_continuous.py --save 写入),数据自 2018-05 起;回测与实盘预热应使用它们而不是 C0/MA0
     "CADJ": Instrument("CADJ.DCE", size=10, pricetick=1.0),
     "MAADJ": Instrument("MAADJ.CZCE", size=10, pricetick=1.0),
+    # 购买的分钟线合成的 15 分钟复权主力连续(scripts/import_minute.py 输出,不在数据库里,回测时直接传入 K 线)
+    "C15": Instrument("CADJ15.DCE", size=10, pricetick=1.0),
 }

@@ -235,7 +235,7 @@ class TrendAtrStrategy(CtaTemplate):
         signal = self.entry_signal()
         if signal == 0:
             return
-        if not self.guard.can_open(bar.datetime.date()):
+        if not self.guard.can_open(trading_day(bar.datetime)):
             return
 
         dist = stop_distance(self.atr_value, self.atr_mult)
@@ -323,7 +323,7 @@ class TrendAtrStrategy(CtaTemplate):
             # 平仓:登记盈亏(用于连亏熔断)并清理残留委托
             side = 1 if prev > 0 else -1
             pnl = side * (trade.price - self.entry_price) * self.get_size() * abs(prev)
-            self.guard.on_trade_closed(trade.datetime.date(), pnl)
+            self.guard.on_trade_closed(trading_day(trade.datetime), pnl)
             self.trail.reset()
             self.entry_price = 0.0
             self.entry_dist = 0.0
