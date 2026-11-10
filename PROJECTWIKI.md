@@ -1,8 +1,10 @@
 # PROJECTWIKI.md
 
-> 项目知识库(单一可信源)。状态:**Phase 0–5 的代码均已完成并通过离线端到端测试;尚未在真实 CTP/SimNow 上验证**(见 `docs/runbook-simnow.md`)。
+> 项目知识库(单一可信源)。状态:**Phase 0–5 的代码均已完成并通过离线端到端测试(371 个测试,覆盖率 96%)**;
+> SimNow 上已跑通一次真实 CTP 启动管道(2026-11-10),但**撤单/废单/断线/重启等实测项尚未完成**,Docker 容器内连通 SimNow 也尚未验证(见 `docs/runbook-simnow.md`)。
 > Phase 6(期货公司穿透式认证与实盘准入)是人工步骤,见 `docs/live-readiness.md`。
-> **回测结论为负面:在复权数据上同样未发现可延续的优势**(见 ADR);因此当前策略只用于**管道测试**,不应连接真实资金。
+> **策略结论为负面:日线与 15 分钟两条基准都没有发现可延续的优势**(见 ADR);因此当前策略只用于**管道测试**,不应连接真实资金。
+> **研究数据状态**:15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次,**不能再用于新候选的最终确认**,新候选需要 2026-06 之后的分钟线或模拟盘/小额实盘记录。
 > 跟踪 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)
 
 ## 1. 项目概述
@@ -19,32 +21,43 @@
 ```mermaid
 flowchart LR
   SINA[(新浪行情 via AKShare)] --> FD[fetch_data.py]
+  BUY[(购买的 DCE 分合约 1 分钟线)] --> IM[import_minute.py]
+  IM --> DER[(derived: 复权主力连续<br/>1d / 15m / rolls)]
   BS[bootstrap.py] -. 时区/目录 .-> FD
+  BS -. 时区/目录 .-> IM
   FD --> DB[(.vntrader/database.db)]
   FD --> CSV[(data/csv/*.csv)]
   DB --> BL[backtest_lib.py]
-  BL --> OPT[optimize.py]
-  ST[trend_atr_strategy.py] --> BL
+  DER --> BL
+  BL --> OPT[optimize.py 日线基准]
+  BL --> O15[optimize_15m.py 15 分钟基准]
+  ST[trend_atr_strategy.py 日线] --> BL
+  ST15[trend_atr_15m_strategy.py 15 分钟] --> BL
   RG[risk_guard.py] --> ST
   PG[promotion_gate.py] -. 晋级检查 .-> OPT
+  PG -. 晋级检查 .-> O15
   RT[runtime.py] --> ST
   RT --> GR[guard_rule.py 账户风控]
   RT --> WH[webhook.py]
   RT --> CTP[CTP 网关 / SimNow]
+  GUI[run_gui.py 图形界面] --> GR
+  GUI --> CTP
   GR -. 拦截开仓/紧急平仓 .-> CTP
 ```
 | 节点 | 代码路径 | 状态 |
 |---|---|---|
 | FD | `scripts/fetch_data.py` | 完成 |
 | BS | `scripts/bootstrap.py` | 完成 |
+| IM / DER | `scripts/import_minute.py` → `C:\Dev\data\invest\derived\` | 完成(玉米实测交叉验证通过) |
 | DB / CSV | 运行时生成,均已 `.gitignore` | 完成 |
 | BL | `scripts/backtest_lib.py` | 完成 |
-| OPT | `scripts/optimize.py` | 完成 |
-| ST | `strategies/trend_atr_strategy.py`、`random_entry_strategy.py`、`instruments.py` | 完成 |
+| OPT / O15 | `scripts/optimize.py`、`scripts/optimize_15m.py` | 完成(两者结论均为负面) |
+| ST / ST15 | `strategies/trend_atr_strategy.py`、`trend_atr_15m_strategy.py`、`random_entry_strategy.py`、`instruments.py` | 完成 |
 | RG / PG | `risk/risk_guard.py`、`risk/promotion_gate.py` | 完成 |
 | RT / GR | `trading/runtime.py`、`trading/guard_rule.py`、`trading/safe_risk.py` | 完成(离线测试) |
 | WH | `notify/webhook.py` | 完成 |
-| CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | 完成,**待 SimNow 实测** |
+| CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | 主机端 SimNow 已跑通一次;**容器内连通未验证** |
+| GUI | `scripts/run_gui.py` | 完成(人工观察用,非无人值守) |
 
 ## 3. 架构决策记录(ADR)
 - 目录:`docs/adr/`,MADR 格式
@@ -55,19 +68,23 @@ flowchart LR
   - [`20261109-promotion-gate.md`](docs/adr/20261109-promotion-gate.md):策略晋级门槛(8 条)
   - [`20261109-account-risk-lock.md`](docs/adr/20261109-account-risk-lock.md):账户级双层熔断、平仓永远放行、紧急平仓防重复下单
   - [`20261109-deployment-and-live-mode.md`](docs/adr/20261109-deployment-and-live-mode.md):实盘模式策略、运行时对账、通知、容器化
+  - [`20261110-baseline-15m.md`](docs/adr/20261110-baseline-15m.md):15 分钟基准的事前方案、成绩单与"测试段已被使用"的约束
 
 ## 4. 设计决策 & 技术债务
 | 项 | 说明 | 优先级 |
 |---|---|---|
 | 分钟线历史很浅 | 新浪每个周期只返回最近约 1023 根(1 分钟≈5 个交易日,15 分钟≈2.5 个月),须每天/每周增量运行脚本积累 | 高 |
 | 旧回测基于未复权数据 | 已量化(换月价差玉米中位 44 点、甲醇 75 点)并**在复权数据上重做**:玉米训练段夏普为正仅 11%、选出的参数训练/验证均为负;甲醇无法开仓。旧结论作废,新结论仍是"无法证明优势" | 已处理 |
-| **未在真实 CTP/SimNow 上验证** | 废单文本、持仓回报时序、撤单失败、断线重连、SHFE/INE 平今平昨、夜盘跨日都只在离线假网关上验证;须按 `docs/runbook-simnow.md` 第 5 节实测并回填 | **最高** |
+| **未在真实 CTP/SimNow 上验证** | 启动管道已在真实 SimNow(第一套)跑通一次(2026-11-10);但废单文本、持仓回报时序、撤单失败、断线重连、SHFE/INE 平今平昨、夜盘跨日、kill -9 重启、熔断演练都只在离线假网关上验证;须按 `docs/runbook-simnow.md` 第 5 节实测并回填 | **最高** |
+| 容器内连通 SimNow 未验证 | Docker 镜像构建成功、`vnpy_ctp` 在 Linux 源码编译后可导入、容器内 `--check` 通过;但**容器内连接 SimNow 并稳定运行尚未实测** | 高 |
+| 图形界面不是运行方式 | `run_gui.py` 无对账、无看门狗、无 Webhook,只能人工观察;不得用于无人值守 | 中 |
 | 主力合约换月需人工更新 | `LIVE_VT_SYMBOL` 指向具体合约,换月与持仓移仓未实现 | 高 |
 | 本地止损依赖进程存活 | vn.py 停止单是引擎本地触发的;进程退出时若有持仓会发 FATAL,但无法替代交易所端条件单 | 高 |
 | 交易日不处理法定节假日 | 长假前后的当日熔断边界需人工留意 | 中 |
 | 复权数据历史较短 | 新浪分合约日线只到 2018-05;更早需交易所逐日合约数据(大连 2005 起、郑州 2010-08 起,约几千次请求) | 高 |
-| 分钟线历史不足 | 已购买外部数据,待到货后做交叉验证与导入;须先核对时间戳语义、复权情况与授权 | 高 |
-| 回测结论统计效力不足 | 选定参数在验证段仅 1 笔往返;结论只能是"无法证明优势" | 高 |
+| 分钟线历史不足 | 已购买并导入(DCE 玉米分合约 1 分钟线,约 5.9 年);**只到 2026-06-15**,新候选需要更新数据 | 高 |
+| **15 分钟基准的测试段已被使用一次** | 2024-01 ~ 2026-06 已被 `optimize_15m.py --test` 使用,再用于新候选会产生多重检验偏差;新候选只能用训练/验证段筛选,最终确认需要 2026-06 之后的分钟线或模拟盘记录 | **高** |
+| 回测结论统计效力不足 | 日线选定参数在验证段仅 1 笔往返;15 分钟基准测试段 91 笔往返,均低于 150 的门槛;结论只能是"无法证明优势" | 高 |
 | 预算约束不了跳空 | 默认参数回测有 4 笔单笔亏损超 300 元,最大 700 元(未计成本) | 中 |
 | 日线内高低点先后未知 | 移动止损按当根极值收紧、下一根生效,属日线固有近似 | 中 |
 | 测试段"只看一次"靠人工纪律 | `--test` 未持久化记录使用次数 | 低 |
@@ -91,16 +108,16 @@ flowchart LR
 - **关键函数**:`fetch_with_retry`、`normalize`、`to_bars`、`save_csv`、`run_one`、`main`。
 - **幂等**:数据库 upsert;CSV 按时间戳去重,新数据覆盖旧数据;重复运行安全。
 - **失败隔离**:单个品种/周期失败不影响其余,最终退出码为 1。
-- **测试**:`tests/test_fetch_data.py`,32 个用例。全仓库 320 个测试,覆盖率约 97%(目标 85%),在英文/中文 vn.py 语言环境下均通过。
+- **测试**:`tests/test_fetch_data.py`,32 个用例。全仓库 371 个测试,覆盖率约 96%(目标 85%),在英文/中文 vn.py 语言环境下均通过。
 
 ### `scripts/import_minute.py`(购买的分钟线 → 复权主力连续)
 - **职责**:读取仓库之外的分合约 1 分钟线(`<数据根>/<交易所>/<品种>/月份连续/*/*.csv`),按交易日归属汇总成日线,用新浪日线补齐数据结束日之后的缺口,复用 `build_continuous` 的换月规则与价差,对分钟线做差额复权,合成 N 分钟线(默认 15,时间戳为开始时间)。
-- **入口**:`python scripts/import_minute.py --root C:/Dev/data/invest --exchange DCE_大连商品交易所 --folder C_玉米 --product C`,输出到 `<数据根>/derived/`(`C_15m_adj.csv`、`C_1d_adj.csv`、`C_rolls.csv`,不入库)。
+- **入口**:`python scripts/import_minute.py --root C:/Dev/data/invest --exchange DCE_大连商品交易所 --folder C_玉米 --product C`,输出到 `<数据根>/derived/`(`C_15m_adj.csv`、`C_1d_adj.csv`、`C_rolls.csv`,**不入库**——购买数据与派生产物都不进仓库)。
 - **交易日归属**:日盘归当天;夜盘(≥20 时)归下一个有日盘的交易日;日历之外的夜盘所属日未知,返回 NaT 并丢弃,绝不硬塞进最后一天。
 - **起点裁剪**:购买数据从合约上市日起算,起点附近只有远月合约,挑出的"主力"成交冷清。`trim_illiquid_start` 从第一段"连续 5 个交易日成交量不低于全序列中位数 50%"的日子开始。
 - **缺口**:分钟线只到购买数据的最后一天;其后的交易日只有日线(新浪),不伪造分钟线。
 - **验证**(玉米实测):分钟线合成日线与新浪日线对比,收盘/最高/最低 99% 以上一致,成交量总和比值 1.000;输出的分钟线逐日收盘/最高/最低与日线序列完全一致。
-- **测试**:`tests/test_import_minute.py`,19 个用例(合成数据)。
+- **测试**:`tests/test_import_minute.py`,21 个用例(合成数据)。
 
 ### `risk/risk_guard.py`(纯 Python,覆盖率 100%)
 - `stop_distance` / `risk_per_trade` / `within_budget`:单笔风险预算,超预算则放弃交易(不缩小止损)。
@@ -148,8 +165,27 @@ flowchart LR
 
 ### `scripts/backtest_lib.py` 与 `scripts/optimize.py`
 - `run_engine` / `run_backtest`:统一成本口径(rate=0,固定手续费折成点数并入滑点);把 vn.py 静默吞掉的策略异常转成 `RuntimeError`。
+- `load_bars_csv` / `run_engine_bars` / `run_backtest_bars`:直接回放内存中的 K 线列表(绕过 vn.py 数据库,vn.py 没有 15 分钟 `Interval`);`cost_multiplier` 用来做成本翻倍压力测试;同样检测被吞掉的策略异常。
 - `optimize.py`:三段切分(训练 2005–2018 / 验证 2019–2022 / 测试 2023–),测试段仅 `--test` 才看;
   邻域平滑选参(仅完整 3×3×3 邻域的格子可选,无效邻居按悲观下限计);验证/测试往返笔数 <10 时输出醒目警告。
+
+### `strategies/trend_atr_15m_strategy.py`(15 分钟基准,仅研究用)
+- 继承 `TrendAtrStrategy`,**只把"一根日线"换成"一根 15 分钟线"**,不引入任何新的入场/出场逻辑(控制变量)。
+- `on_tick` 直接抛 `RuntimeError`:不支持实盘/模拟盘,防止误用。
+- 归属的日亏熔断按**期货交易日**计算(夜盘归下一交易日),与 `trading_day()` 一致。
+- 品种参数 `C15`(`CADJ15.DCE`,size=10,pricetick=1.0,滑点 1.3 点/边)只用于回测。
+
+### `scripts/optimize_15m.py`(15 分钟基准的网格优化与三段验证)
+- 方案见 `docs/adr/20261110-baseline-15m.md`(**在看到任何结果之前就已提交**):训练 2020-07~2022-12、验证 2023、测试 2024-01~2026-06。
+- 网格一次定死:快线 {8,12,16,24,32} × 慢线 {48,72,96,144,192,288}(要求 `slow ≥ 2×fast`)× ATR 倍数 {1.5,2,2.5,3,4},共 145 组。
+- 选参:训练段"邻域平均夏普"(复用 `optimize.smoothed`),成交笔数 < 100 的组合不参与排名。
+- **测试段只有加 `--test` 才会被评估**,且只应运行一次;验证/测试段同时输出"成本×2"压力测试行。
+- **结果为负面**(测试段 -20.2%、夏普 -1.08,成本吞掉全部毛利),详见 ADR;**测试段已被使用一次**。
+
+### `scripts/run_gui.py`(图形界面,人工观察用)
+- 打开 VeighNa Trader 界面,按 `.env` 自动连接 CTP;`--subscribe` 让合约表到位后自动订阅行情;`--no-connect` 手动连接;`--check` 只校验配置。
+- 同样挂载 `SafeRiskManagerApp`:界面里手动下单也受账户风控约束;硬锁定生效时拒绝连接。
+- **没有**启动对账、看门狗和 Webhook 告警,**不得用于无人值守**,也不要与无头版同时运行。
 
 ## 6. API 手册(脚本内部接口)
 | 函数 | 签名 | 说明 |
@@ -163,7 +199,15 @@ flowchart LR
 
 命令行参数:`--symbols`(PP/L/EB/C/MA,默认全部)、`--periods`(d/1/5/15,默认全部)。
 
-`python scripts/optimize.py --symbol {C|MA} [--test]`:网格优化;加 `--test` 才查看测试段,且只应运行一次。
+`python scripts/optimize.py --symbol {C|MA} [--test]`:日线网格优化;加 `--test` 才查看测试段,且只应运行一次。
+
+`python scripts/optimize_15m.py [--test]`:15 分钟基准(数据在 `C:\Dev\data\invest\derived\C_15m_adj.csv`);加 `--test` 才查看测试段,只应运行一次。
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `load_bars_csv` | `(path, symbol, exchange, interval=MINUTE) -> list[BarData]` | 读 `import_minute.py` 输出的 K 线 CSV(时间戳为开始时间) |
+| `run_engine_bars` | `(strategy_class, setting, key, bars, capital=10000, interval=MINUTE, cost_multiplier=1.0) -> BacktestingEngine` | 直接回放内存 K 线;滑点 × `cost_multiplier`;策略异常转 `RuntimeError` |
+| `run_backtest_bars` | `(同上) -> (stats, df, trades)` | 上者 + 绩效统计 |
 
 ## 7. 数据模型
 ```mermaid
@@ -175,6 +219,19 @@ flowchart LR
 - **时间语义**:新浪分钟线时间戳是 K 线**结束**时间,入库统一为**开始**时间(vn.py 约定);日线为交易日 00:00。
 - 合约:`PP0` / `L0` / `EB0`(新浪主力连续),交易所 `DCE`。
 - CSV 日期格式固定为 `%Y-%m-%d %H:%M:%S`。
+
+**购买数据与派生产物(仓库之外,`C:\Dev\data\invest\`)**
+```mermaid
+flowchart LR
+  RAW["DCE 分合约 1 分钟线<br/>月份连续/*/*.csv"] --> IM[import_minute.py]
+  SINA2[(新浪日线)] --> IM
+  IM --> D1["derived/C_1d_adj.csv<br/>1526 行"]
+  IM --> D15["derived/C_15m_adj.csv<br/>32540 根"]
+  IM --> DR["derived/C_rolls.csv<br/>28 次换月"]
+```
+- 派生文件**不入库**(购买数据有授权限制,派生产物体积大),换机器需重新导入。
+- 复权方式:差额法(换月价差取换月前最后共同交易日收盘价之差),主力按**前一交易日**持仓量选,只向更远月换月。
+- 分钟线时间戳是**开始**时间;交易日归属:夜盘(≥20 时)归下一交易日,日历之外返回 NaT 并丢弃。
 
 ## 8. 核心流程
 ```mermaid
@@ -206,12 +263,14 @@ sequenceDiagram
 | vnpy_ctastrategy / vnpy_ctabacktester / vnpy_riskmanager / vnpy_sqlite | — | CTA、回测、风控、SQLite |
 | akshare | 1.20.36 | 行情下载 |
 | pandas | 3.1.1 | 数据清洗 |
+| pillow | 已安装 | 界面里点"微信"二维码对话框需要,缺它会让整个界面崩溃 |
 | pytest / pytest-cov | — | 测试 |
 - 许可证:vn.py、akshare 等为宽松开源协议,**尚未逐包核验**;CTP 底层库为上期技术专有二进制,实盘前需确认条款。
 - 潜在冲突:Python 3.13 与部分依赖的兼容性已通过导入验证,尚未跑完整回测。
 
 ## 10. 维护建议
 - **每天/每周运行一次 `fetch_data.py`**,否则分钟线历史会因 1023 根上限而断档且无法回补。
+- **购买数据在 `C:\Dev\data\invest\`,派生文件在 `derived\`;两者都不入库**。换机器或数据更新后重新运行 `scripts/import_minute.py` 重建派生文件。
 - 所有新脚本第一行业务导入前先 `import bootstrap`。
 - 部署到 Docker/VPS 时设置 `TZ=Asia/Shanghai`;`.env` 通过挂载注入,不入库。
 - 临时文件:pip 异常中断会在 `%TEMP%` 残留 `pip-unpack-*`,可手动清理。
