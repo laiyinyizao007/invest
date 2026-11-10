@@ -65,7 +65,7 @@ class RuntimeConfig:
     strategy_setting: dict = field(default_factory=dict)
     gateway_name: str = "CTP"
     gateway_setting: dict = field(default_factory=dict)
-    connect_timeout: float = 120.0                   # 等待合约与账户到位的最长时间(秒);SimNow 的"结算信息确认"耗时波动大(实测 4~60+ 秒)
+    connect_timeout: float = 300.0                   # 等待合约与账户到位的最长时间(秒);网关登录后会下载全市场合约表(含期权),SimNow 上实测 20 秒~3 分钟以上
     position_settle_seconds: float = 5.0             # 账户到位后主动查询持仓并等待其稳定的时间(秒)
     init_timeout: float = 120.0
     heartbeat_seconds: float = 0.0                   # 0 = 不发心跳
@@ -181,7 +181,7 @@ class TradingRuntime:
         if not self._wait_for(self._contract_and_account_ready, self.config.connect_timeout):
             if self._stop_event.is_set():
                 return EXIT_OK
-            self.notify("FATAL", "启动失败", f"{self.config.connect_timeout:.0f}s 内未收到合约 {self.config.vt_symbol} 或账户信息")
+            self.notify("FATAL", "启动失败", f"{self.config.connect_timeout:.0f}s 内未收到合约 {self.config.vt_symbol} 或账户信息(网关登录后要先下载全市场合约表,前置机繁忙时会很慢;账户查询要等合约表完成)")
             return EXIT_STARTUP_FAILED
         if not self._stable_positions():
             if self._stop_event.is_set():
