@@ -392,6 +392,7 @@ class _FakeRuntime:
         self.gateway = _FakeGateway()
         self.rule = None
         self.exit_code = None
+        self.connection_state: dict = {}
 
 
 def _make_drill(**kw):
@@ -630,6 +631,37 @@ def test_disconnect_fails_without_any_alert():
     result = d.scenario_disconnect(drill)
     assert result.ok is False
     assert "没有收到告警" in result.summary
+
+
+def test_disconnect_records_connection_state_and_no_backlog_evidence():
+    """重连后记录连接状态,并给出「无积压补发」的证据项(确定性语义在离线测试里锁定)。"""
+    drill = _make_drill()
+
+    def on_close():
+        drill.notifier.send("ERROR", "网关连接断开", "x")
+        drill.runtime.connection_state["交易"] = False
+        drill.runtime.connection_state["交易"] = True
+        drill.notifier.send("INFO", "网关已连接", "交易服务器登录成功")
+
+    drill.runtime.gateway.td_api.on_close = on_close
+    result = d.scenario_disconnect(drill)
+    assert result.ok is True
+    assert result.details["重连后连接状态"] == "交易:已连接"
+    assert result.details["信号积压补发"].startswith("无补发")
+    assert result.details["窗口内发单失败告警(条)"] == 0
+
+
+def test_disconnect_counts_send_failure_alerts_in_the_window():
+    """断线期间的本地发单失败要计入窗口旁证(框架不排队,这些失败不会在重连后补发)。"""
+    drill = _make_drill()
+
+    def on_close():
+        drill.notifier.send("ERROR", "网关连接断开", "x")
+        drill.notifier.send("WARN", "网关错误", "委托请求发送失败，错误代码：-3")
+
+    drill.runtime.gateway.td_api.on_close = on_close
+    result = d.scenario_disconnect(drill)
+    assert result.details["窗口内发单失败告警(条)"] == 1
 
 
 def test_overnight_reports_the_trading_day_of_the_first_tick():

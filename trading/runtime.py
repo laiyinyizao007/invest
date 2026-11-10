@@ -10,7 +10,8 @@
 
 运行中的看门狗:
 - 策略被引擎异常停止(CtaEngine 捕获策略异常后只写一条日志):其本地止损随之失效,立即告警并紧急平仓;
-- 行情停更:本地止损依赖 Tick 触发,交易时段内长时间没有 Tick 要告警;
+- 行情停更(假死):本地止损依赖 Tick 触发,交易时段内长时间没有 Tick 要告警;首次越限还会强撤全部
+  活动**开仓**委托(平仓单与紧急平仓单不动),新 Tick 到达后复位,可再次边沿触发,可用配置开关回退为只告警;
 - 心跳:定时汇报存活、权益与持仓。
 
 退出:硬锁定且已确认空仓 → 正常退出(退出码 0);硬锁定但平仓失败 → 进程保持存活并持续告警
@@ -42,6 +43,11 @@ from trading.safe_risk import SafeRiskManagerApp
 EXIT_OK = 0
 # 启动里程碑:名称取自 vnpy_ctp 的日志文本,升级 vnpy_ctp 时措辞若变,这里要同步。
 MILESTONES = ("行情服务器登录成功", "交易服务器登录成功", "结算信息确认成功", "合约信息查询成功")
+# 连接状态机的精确措辞(升级 vnpy_ctp 时措辞若变,这里要同步)。
+# 关键:恢复只认「登录成功」。重连过程中还有「连接成功」但尚未认证登录的中间日志,
+# 拿它当恢复凭据会让告警在「连上→未登录→再断」之间抖动。
+DISCONNECT_MARKERS = {"交易服务器连接断开": "交易", "行情服务器连接断开": "行情"}
+CONNECTED_MARKERS = {"交易服务器登录成功": "交易", "行情服务器登录成功": "行情"}
 EXIT_STARTUP_FAILED = 3
 EXIT_RECONCILE_REFUSED = 4
 
@@ -74,6 +80,9 @@ class RuntimeConfig:
     heartbeat_seconds: float = 0.0                   # 0 = 不发心跳
     tick_stale_seconds: float = 60.0                 # 交易时段内超过该时间没有 Tick 就告警
     tick_stale_realert_seconds: float = 300.0
+    # 假死处置开关:首次越过 tick_stale_seconds 时,除告警外是否强撤全部活动**开仓**委托
+    # (平仓单/紧急平仓单不受影响)。置 False 回退为「只告警」的旧行为。
+    stale_cancel_open_orders: bool = True
     drift_tolerance_seconds: float = 15.0            # 策略持仓与账户持仓不一致持续超过该时间 → 视为漂移,告警并紧急平仓
     heartbeat_file: Path | None = None               # 运行中每 10 秒刷新一次,供容器健康检查判断进程是否真的在工作
 
@@ -104,6 +113,10 @@ class TradingRuntime:
         self.risk = self.main.add_app(SafeRiskManagerApp)
         self.cta = self.main.add_app(CtaStrategyApp)
         self.rule = self.risk.rules[ACCOUNT_RULE_NAME]
+        # 把交易时段判定注入规则:规则自身的 120s 超时撤单据此剔除午休/夜盘休市时间;
+        # 同时同步时段基线,与运行时自身的 _in_session 保持同一份初始认知(单一判定函数,不会发散)
+        self.rule.session_active = self._in_trading_session
+        self.rule._was_in_session = self._in_trading_session()
         self.cta.classes = strategy_classes or {"TrendAtrStrategy": TrendAtrStrategy}
         self.cta.load_strategy_data()                # 恢复上次保存的策略状态(持仓/止损);策略配置每次启动都由我们给定
         self.cta.register_event()
@@ -117,8 +130,11 @@ class TradingRuntime:
         self._last_tick: float | None = None
         self._t_connect: float | None = None
         self._milestones: dict[str, float] = {}
-        self._login_notified = False
+        # 通道 → 是否已连接;键缺失表示尚未见过任何连接事件(未知),True/False 为已知状态
+        self._channel_connected: dict[str, bool] = {}
         self._last_stale_alert = -1e9
+        self._stale_cancel_fired = False              # 假死撤单边沿标志:新 Tick 到达后复位
+        self._in_session: bool | None = None          # 上一次定时器看到的时段状态;None = 尚未观测过
         self._last_heartbeat = self._mono()
         self._last_touch = -1e9
         self._drift_since: float | None = None
@@ -160,14 +176,18 @@ class TradingRuntime:
             for m in MILESTONES:
                 if m in msg:
                     self._milestones.setdefault(m, self._mono() - self._t_connect)
-        if "连接断开" in msg:
-            self._login_notified = False
-            self.notify("ERROR", "网关连接断开", msg)
-        elif "登录成功" in msg:
-            # 行情服务器与交易服务器各会报一次"登录成功",只通知一次;各阶段耗时由里程碑记录
-            if not self._login_notified:
-                self._login_notified = True
-                self.notify("INFO", "网关已连接", msg)
+        channel_off = next((ch for phrase, ch in DISCONNECT_MARKERS.items() if phrase in msg), None)
+        channel_on = next((ch for phrase, ch in CONNECTED_MARKERS.items() if phrase in msg), None)
+        if channel_off is not None:
+            # 边沿通知:断连后 CTP 可能反复写同一条断开日志,状态未变就不重复告警
+            if self._channel_connected.get(channel_off) is not False:
+                self._channel_connected[channel_off] = False
+                self.notify("ERROR", "网关连接断开", f"{channel_off}服务器:{msg}")
+        elif channel_on is not None:
+            # 交易/行情两条通道各自迁移、各自通知一次;「连接成功」但未登录的中间态不在标记表里,不驱动状态
+            if self._channel_connected.get(channel_on) is not True:
+                self._channel_connected[channel_on] = True
+                self.notify("INFO", "网关已连接", f"{channel_on}服务器:{msg}")
         elif log.level >= ERROR or any(k in msg for k in GATEWAY_ERROR_MARKERS):
             # CTP 的拒单是以 INFO 级别写的(vnpy_ctp 的 write_error 实际调用 write_log),
             # 只看 level 会漏掉"交易委托失败,代码：21,信息：..."这类关键日志。
@@ -177,6 +197,12 @@ class TradingRuntime:
     def _on_tick(self, event: Event) -> None:
         if event.data.vt_symbol == self.config.vt_symbol:
             self._last_tick = self._mono()
+            self._stale_cancel_fired = False          # 行情恢复:复位假死边沿,允许下一次再触发
+
+    @property
+    def connection_state(self) -> dict[str, bool]:
+        """交易/行情通道当前连接状态的只读副本(如 {"交易": False, "行情": True});未见过事件的通道不出现。"""
+        return dict(self._channel_connected)
 
     # ---------- 启动 ----------
 
@@ -216,6 +242,7 @@ class TradingRuntime:
         self.cta.start_strategy(self.config.strategy_name)
         self._started = True
         self._last_tick = None
+        self._in_session = self._in_trading_session()       # 初始基线:首个定时器不应被当成时段边沿
         self._last_heartbeat = self._mono()
         self.notify("INFO", "已启动", f"{self.config.strategy_name} 运行于 {self.config.vt_symbol},权益 {self._equity():.0f}")
         return None
@@ -492,12 +519,32 @@ class TradingRuntime:
                         "策略被引擎异常停止(通常是策略代码抛出异常),其本地止损已失效。立即撤单并平掉持仓。")
             self.rule.emergency_flatten("策略异常停止,本地止损失效")
 
-        if self._in_trading_session():
+        in_session = self._in_trading_session()
+        if in_session and self._in_session is not True:
+            # 非交易→交易时段边沿(午休/夜盘休市后重入):休市期间没有 Tick 是正常的。
+            # 重置计时并解除边沿,等本时段首 Tick 之后才开始计静默,
+            # 否则定时器若先于首 Tick 触发,会把整个休市时间误算成假死(实测可达 2 万秒),误撤刚挂出的订单。
+            self._last_tick = None
+            self._stale_cancel_fired = False
+        self._in_session = in_session
+        if in_session:
             silent_for = now - self._last_tick if self._last_tick is not None else None
-            if (silent_for is not None and silent_for > self.config.tick_stale_seconds
-                    and now - self._last_stale_alert > self.config.tick_stale_realert_seconds):
-                self._last_stale_alert = now
-                self.notify("WARN", "行情停更", f"交易时段内 {silent_for:.0f}s 没有收到 {self.config.vt_symbol} 的 Tick,本地止损暂时无法触发")
+            if silent_for is not None and silent_for > self.config.tick_stale_seconds:
+                # 边沿触发:每次连续停更只强撤一次,新 Tick 复位后才允许下一次;防止每秒重复撤单
+                if not self._stale_cancel_fired:
+                    self._stale_cancel_fired = True
+                    if self.config.stale_cancel_open_orders:
+                        self.rule.cancel_open_orders_on_stale_tick()
+                        self.notify("ERROR", "行情假死",
+                                    f"交易时段内 {silent_for:.0f}s 没有收到 {self.config.vt_symbol} 的 Tick,"
+                                    "已撤销全部开仓挂单(平仓单不动);本地止损暂时无法触发")
+                    else:
+                        self.notify("ERROR", "行情假死",
+                                    f"交易时段内 {silent_for:.0f}s 没有收到 {self.config.vt_symbol} 的 Tick(配置为只告警,未撤单)")
+                # 周期性 WARN 保留节流:假死持续时按 tick_stale_realert_seconds 再提醒
+                if now - self._last_stale_alert > self.config.tick_stale_realert_seconds:
+                    self._last_stale_alert = now
+                    self.notify("WARN", "行情停更", f"交易时段内 {silent_for:.0f}s 没有收到 {self.config.vt_symbol} 的 Tick,本地止损暂时无法触发")
 
         hb = self.config.heartbeat_seconds
         if hb > 0 and now - self._last_heartbeat >= hb:

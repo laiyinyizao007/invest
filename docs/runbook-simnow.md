@@ -38,7 +38,7 @@ docker compose run --rm --entrypoint python trader scripts/drill.py latency --co
 | `overnight` | 第 8 项 夜盘首根 Tick 与交易日归属 | 需要在夜盘时段(20:30 之后) |
 | `latency` | 第 3 项 成交→持仓回报延迟 | 需要在交易时段内;会真的开 1 手仓,量完立刻平掉 |
 | `tick-stale` | 第 9 项 行情断流 → 看门狗告警 | 需要在交易时段内(看门狗只在时段检查) |
-| `disconnect` | 第 4 项 交易连接断开 → 告警与自动重连 | 需要在交易时段内 |
+| `disconnect` | 第 4 项 交易连接断开 → 告警与自动重连;另记录重连后连接状态、窗口内发单失败计数与「信号无积压补发」证据 | 需要在交易时段内 |
 | `daily-loss` | 第 6 项 当日熔断 → 撤单 → 平仓 | 无时间前提 |
 | `hard-lock` | 第 7 项 累计死线 → 平仓 → 退出码 0 | 无时间前提 |
 

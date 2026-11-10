@@ -52,11 +52,14 @@ class SyncEventEngine(EventEngine):
 
 
 class FakeGateway(BaseGateway):
-    """mode: accept(挂单不成交) / fill(立即全部成交) / reject(废单并输出错误日志) / silent(不产生任何回报)。
+    """mode: accept(挂单不成交) / fill(立即全部成交) / reject(废单并输出错误日志) /
+    silent(不产生任何回报) / disconnected(模拟断连:发单本地快速失败)。
 
-    复现真实 CTP 的两个行为(codex 审查指出过,曾被乐观的假件掩盖):
+    复现真实 CTP 的三个行为(codex 审查指出过,曾被乐观的假件掩盖):
     - 废单时先推送委托回报(REJECTED),之后才写错误日志(error_after_order);
-    - 成交后持仓回报滞后:OMS 里的持仓要等 query_position() 才会刷新(position_lag)。
+    - 成交后持仓回报滞后:OMS 里的持仓要等 query_position() 才会刷新(position_lag);
+    - 断连期间 reqOrderInsert 本地失败:返回空串、不产生任何 OrderData、只写一条 INFO 日志,
+      框架不缓存该订单——重连后不会"一窝蜂"补发(见 tests/test_disconnect_signal.py)。
     """
 
     default_name = "FAKE"
@@ -100,6 +103,13 @@ class FakeGateway(BaseGateway):
         self.push_positions()
 
     def send_order(self, req: OrderRequest) -> str:
+        if self.mode == "disconnected":
+            # 复现 CtpTdApi 断连时的 send_order:reqOrderInsert 本地失败 → 返回空串、无 OrderData、
+            # 只写 INFO 日志(措辞对齐 vnpy_ctp)。订单不进任何队列,重连后无从补发。
+            self.on_event(EVENT_LOG, LogData(
+                msg="委托请求发送失败，错误代码：-3，信息：CTP:未处理请求队列已满(断连模拟)",
+                level=INFO, gateway_name=self.gateway_name))
+            return ""
         self._seq += 1
         order = req.create_order_data(str(self._seq), self.gateway_name)
         self.sent.append(req)

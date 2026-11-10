@@ -10,10 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from risk.account_guard import AccountGuard, AccountLimits, trading_day  # noqa: E402
 from risk.order_policy import (  # noqa: E402
+    CTP_ERROR_KIND,
     RejectKind,
     RejectMonitor,
     RetryPolicy,
     classify_reject,
+    extract_ctp_error_code,
     find_stale_orders,
 )
 
@@ -344,6 +346,51 @@ def test_known_soft_rejects(text):
 def test_unknown_or_mixed_rejects_are_hard(text):
     """未知文本、同时含软硬关键词:一律按硬拒绝(宁可停手也不重试)。"""
     assert classify_reject(text) is RejectKind.HARD
+
+
+# ---------- CTP 数字错误码(三级分类:码表 → 关键词 → fail-closed) ----------
+
+@pytest.mark.parametrize("text, expected", [
+    ("交易委托失败，代码：21，信息：CTP:资金不足", 21),       # 全角冒号
+    ("交易委托失败,代码:81,信息:CTP:报单价格超出涨跌停板", 81),  # 半角冒号
+    ("委托 1 状态更新，代码：33，信息：CTP:合约交易状态不允许", 33),
+    ("没有错误码的纯文本", None),
+    (None, None),
+    ("", None),
+])
+def test_extract_ctp_error_code(text, expected):
+    assert extract_ctp_error_code(text) == expected
+
+
+def test_extract_code_anchors_on_keyword_not_any_number():
+    """断线原因里的数字不能被当成错误码:必须锚定「代码」前缀。"""
+    assert extract_ctp_error_code("交易服务器连接断开，原因0x1001") is None
+    # 「代码」后第一个数字才是错误码,同一行后面的其他数字不影响
+    assert extract_ctp_error_code("交易委托失败，代码：21，信息：错误 4097") == 21
+
+
+@pytest.mark.parametrize("code", sorted(CTP_ERROR_KIND))
+def test_every_listed_ctp_error_code_is_classified_by_table(code):
+    text = f"交易委托失败，代码：{code}，信息：CTP:某原因"
+    assert classify_reject(text) is CTP_ERROR_KIND[code]
+
+
+def test_error_code_overrides_soft_keyword():
+    """实测文本:代码 21 的句子里含软关键词「连接」,码表优先,必须判硬拒绝。"""
+    text = "交易委托失败，代码：21，信息：CTP:该交易席位未连接到交易所"
+    assert extract_ctp_error_code(text) == 21
+    assert classify_reject(text) is RejectKind.HARD
+
+
+def test_unknown_code_falls_back_to_keywords():
+    """码未收录时回退关键词:软关键词文本判软拒绝,给 SimNow 实测补表留出路。"""
+    assert classify_reject("交易委托失败，代码：9999，信息：网络连接超时,正在重连") is RejectKind.SOFT
+    assert classify_reject("交易委托失败，代码：9999，信息：CTP:资金不足") is RejectKind.HARD
+
+
+def test_unknown_code_with_unknown_text_is_hard():
+    """码未收录且关键词也认不出:fail-closed 硬拒绝。"""
+    assert classify_reject("交易委托失败，代码：9999，信息：CTP:某种没见过的错误") is RejectKind.HARD
 
 
 # ---------- 重试节奏 ----------

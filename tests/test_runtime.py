@@ -331,6 +331,241 @@ def test_no_stale_alert_before_the_first_tick(make):
     assert "行情停更" not in rt.notifier.titles()
 
 
+# ---------- 假死看门狗:首次越限强撤开仓单(演练③) ----------
+
+def _open_order_req(price=2200.0):
+    return OrderRequest(symbol="c2601", exchange=Exchange.DCE, direction=Direction.LONG,
+                        type=OrderType.LIMIT, volume=1, price=price, offset=Offset.OPEN)
+
+
+def _close_order_req(price=2190.0):
+    return OrderRequest(symbol="c2601", exchange=Exchange.DCE, direction=Direction.SHORT,
+                        type=OrderType.LIMIT, volume=1, price=price, offset=Offset.CLOSE)
+
+
+def test_stale_tick_forcibly_cancels_open_orders_only_once_and_rearms_on_new_tick(make):
+    rt = make()
+    rt.start()
+    rt.gw.mode = "accept"                                                  # 挂单保持活动
+    rt.gw.push_tick(last=2230.0)
+    open_id = rt.main.send_order(_open_order_req(), "CTP")
+    close_id = rt.main.send_order(_close_order_req(), "CTP")
+    rt.clock.t += 61
+    timer(rt)
+    cancelled = {r.orderid for r in rt.gw.cancel_requests}
+    assert open_id.split(".")[-1] in cancelled                            # 开仓挂单被强撤
+    assert close_id.split(".")[-1] not in cancelled                       # 平仓单不动
+    assert "行情假死" in rt.notifier.titles()
+    n_cancels = len(rt.gw.cancel_requests)
+    timer(rt)                                                             # 连续停更:边沿触发,不重复撤
+    assert len(rt.gw.cancel_requests) == n_cancels
+    rt.gw.push_tick(last=2231.0)                                          # 行情恢复,复位边沿
+    rt.clock.t += 61
+    timer(rt)
+    assert rt.notifier.titles().count("行情假死") == 2                    # 再次停更可二次触发
+
+
+def test_stale_cancel_switch_off_keeps_alert_only_behavior(make):
+    rt = make(config_overrides={"stale_cancel_open_orders": False})
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    rt.main.send_order(_open_order_req(price=2201.0), "CTP")
+    rt.clock.t += 61
+    timer(rt)
+    assert rt.gw.cancel_requests == []                                    # 开关关闭:只告警不撤单
+    assert "行情假死" in rt.notifier.titles() and "行情停更" in rt.notifier.titles()
+
+
+def test_stale_cancel_never_fires_outside_trading_session(make):
+    rt = make()
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    rt.main.send_order(_open_order_req(price=2202.0), "CTP")
+    rt.clock.dt = datetime(2026, 11, 10, 12, 0, 0)                        # 午休
+    rt.clock.t += 61                                                       # 61s:越过假死阈值但低于规则 120s 超时撤单
+    timer(rt)
+    assert "行情假死" not in rt.notifier.titles() and rt.gw.cancel_requests == []
+
+
+def test_stale_watchdog_rearms_at_session_reentry_instead_of_counting_the_break(make):
+    """午休/夜盘休市后时段重入:定时器先于本时段首 Tick 触发时,不得把整个休市时间误算成假死。
+
+    codex 第二轮审查动态复现:单调时钟的 _last_tick 不按时段边界重新武装时,
+    13:30 开盘瞬间会报「7261s 没有 Tick」并误撤年龄 0 秒的新挂单。
+    """
+    rt = make()
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    rt.main.send_order(_open_order_req(price=2203.0), "CTP")
+    rt.clock.dt = datetime(2026, 11, 10, 12, 0, 0)                       # 进入午休
+    rt.clock.t += 7200
+    timer(rt)
+    assert "行情假死" not in rt.notifier.titles() and rt.gw.cancel_requests == []
+    rt.clock.dt = datetime(2026, 11, 10, 13, 30, 1)                      # 开盘重入,定时器先于首 Tick
+    timer(rt)
+    assert "行情假死" not in rt.notifier.titles() and rt.gw.cancel_requests == []
+    rt.gw.push_tick(last=2231.0)                                         # 本时段首 Tick 到达,从此刻才开始计静默
+    rt.clock.t += 61
+    timer(rt)
+    assert "行情假死" in rt.notifier.titles() and rt.gw.cancel_requests  # 真假死仍然报、仍然撤
+
+
+def test_stale_watchdog_rearms_at_night_session_reentry(make):
+    """15:00 日盘收市 → 21:00 夜盘重入:trading_day 已滚动但时段外不动作,夜盘开盘不误报假死。"""
+    rt = make()
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    rt.main.send_order(_open_order_req(price=2205.0), "CTP")
+    rt.clock.dt = datetime(2026, 11, 10, 15, 0, 0)                        # 日盘收市
+    rt.clock.t += 21600
+    timer(rt)
+    assert "行情假死" not in rt.notifier.titles()
+    rt.clock.dt = datetime(2026, 11, 10, 21, 0, 1)                        # 夜盘重入,定时器先于首 Tick
+    timer(rt)
+    assert "行情假死" not in rt.notifier.titles() and rt.gw.cancel_requests == []
+    rt.gw.push_tick(last=2231.0)
+    rt.clock.t += 61
+    timer(rt)
+    assert "行情假死" in rt.notifier.titles() and rt.gw.cancel_requests  # 夜盘内的真假死照常处置
+
+
+def test_start_during_a_break_does_not_fire_on_the_first_timer(make):
+    """休市时段启动:初始基线即为"时段外",13:30 重入时才发生一次边沿,首定时器不误判。"""
+    rt = make()
+    rt.clock.dt = datetime(2026, 11, 10, 12, 0, 0)
+    assert rt.start() is None
+    rt.gw.mode = "accept"
+    timer(rt)                                                             # 休市中:无任何假死告警
+    assert "行情假死" not in rt.notifier.titles()
+    rt.clock.dt = datetime(2026, 11, 10, 13, 30, 1)
+    rt.main.send_order(_open_order_req(price=2206.0), "CTP")
+    timer(rt)                                                             # 重入瞬间:年龄 0 秒的单不能被撤
+    assert "行情假死" not in rt.notifier.titles() and rt.gw.cancel_requests == []
+
+
+def test_session_reentry_clears_only_open_order_cancel_throttle(make):
+    """时段边沿只拨开仓单的撤单节流时间戳,平仓单的 10s 节流必须保留(codex Low1 收窄)。"""
+    rt = make()
+    rt.clock.dt = datetime(2026, 11, 10, 10, 0, 0)
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.cancel_works = False                                           # 撤单无回报:订单保持活动,节流时间戳才会留存
+    rt.gw.push_tick(last=2230.0)
+    open_id = rt.main.send_order(_open_order_req(price=2207.0), "CTP")
+    close_id = rt.main.send_order(_close_order_req(price=2190.0), "CTP")
+    rt.rule._cancel_order(open_id, rt.clock.t)                            # 各发一次撤单请求,建立节流时间戳
+    rt.rule._cancel_order(close_id, rt.clock.t)
+    assert set(rt.rule._cancel_requested) == {open_id, close_id}
+    rt.clock.dt = datetime(2026, 11, 10, 12, 0, 0)                        # 进入午休
+    rt.clock.t += 7200
+    timer(rt)
+    rt.clock.dt = datetime(2026, 11, 10, 13, 30, 0)                       # 重入:开仓单节流被拨、平仓单保留
+    timer(rt)
+    assert open_id not in rt.rule._cancel_requested
+    assert close_id in rt.rule._cancel_requested
+
+
+def test_rule_stale_order_timeout_excludes_the_lunch_break(make):
+    """规则自身的 120s 超时撤单同样按交易时段计时:休市两小时不能让旧挂单在开盘瞬间被撤。"""
+    rt = make()
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    oid = rt.main.send_order(_open_order_req(price=2204.0), "CTP")
+    rt.clock.dt = datetime(2026, 11, 10, 12, 0, 0)                       # 午休
+    rt.clock.t += 7200
+    timer(rt)                                                            # 休市期间不做超时撤单
+    rt.clock.dt = datetime(2026, 11, 10, 13, 30, 0)                      # 重入:挂单年龄被拨回 0
+    timer(rt)
+    rt.clock.t += 61                                                     # 时段内仅 61s < 120s(墙钟年龄已超 2 小时)
+    timer(rt)
+    cancelled = {r.orderid for r in rt.gw.cancel_requests}
+    assert oid.split(".")[-1] not in cancelled
+    rt.clock.t += 60                                                     # 时段内满 121s:超时撤单恢复生效
+    timer(rt)
+    assert oid.split(".")[-1] in {r.orderid for r in rt.gw.cancel_requests}
+
+
+def _gateway_log(rt, msg, level=20):
+    rt.event_engine.put(Event(EVENT_LOG, LogData(msg=msg, level=level, gateway_name=rt.config.gateway_name)))
+
+
+# ---------- 断线连接状态机(演练①) ----------
+
+def test_connection_state_tracks_td_and_md_channels_separately(make):
+    rt = make()
+    rt.start()
+    _gateway_log(rt, "交易服务器连接断开，原因1")
+    assert rt.connection_state == {"交易": False}
+    _gateway_log(rt, "行情服务器连接断开，原因1")
+    assert rt.connection_state == {"交易": False, "行情": False}
+    assert rt.notifier.titles().count("网关连接断开") == 2
+    _gateway_log(rt, "交易服务器登录成功")
+    assert rt.connection_state == {"交易": True, "行情": False}
+    _gateway_log(rt, "行情服务器登录成功")
+    assert rt.connection_state == {"交易": True, "行情": True}
+    assert rt.notifier.titles().count("网关已连接") == 2
+
+
+def test_repeated_disconnect_logs_alert_only_once_per_channel(make):
+    rt = make()
+    rt.start()
+    for _ in range(3):
+        _gateway_log(rt, "交易服务器连接断开，原因1")
+    assert rt.notifier.titles().count("网关连接断开") == 1
+    _gateway_log(rt, "行情服务器连接断开，原因1")
+    assert rt.notifier.titles().count("网关连接断开") == 2
+
+
+def test_intermediate_connect_success_does_not_mark_connected(make):
+    """「连接成功」只是 TCP 连上、尚未认证登录,不能作为恢复凭据,否则告警会抖动。"""
+    rt = make()
+    rt.start()
+    _gateway_log(rt, "交易服务器连接断开，原因1")
+    _gateway_log(rt, "交易服务器连接成功")
+    assert rt.connection_state == {"交易": False}
+    assert "网关已连接" not in rt.notifier.titles()
+    _gateway_log(rt, "交易服务器登录成功")
+    assert rt.connection_state == {"交易": True}
+
+
+def test_reconnected_channel_does_not_realert_without_a_new_disconnect(make):
+    rt = make()
+    rt.start()
+    _gateway_log(rt, "交易服务器登录成功")
+    _gateway_log(rt, "交易服务器登录成功")                    # 重复的登录成功日志
+    assert rt.notifier.titles().count("网关已连接") == 1
+
+
+def test_other_gateway_logs_do_not_change_connection_state(make):
+    rt = make()
+    rt.start()
+    rt.event_engine.put(Event(EVENT_LOG, LogData(msg="交易服务器连接断开", level=20, gateway_name="SomethingElse")))
+    assert rt.connection_state == {}
+
+
+def test_stale_cancel_does_not_touch_emergency_flatten_orders(make):
+    """假死撤单与紧急平仓状态机互斥:FLATTEN_REF 平仓单绝不能被看门狗撤掉。"""
+    rt = make(config_overrides={"tick_stale_seconds": 5.0})               # 缩短阈值,在平仓 ack 超时(10s)内完成验证
+    rt.start()
+    rt.gw.mode = "accept"
+    rt.gw.push_tick(last=2230.0)
+    rt.gw.set_position(Direction.LONG, 1)
+    rt.rule.emergency_flatten("测试用紧急平仓")
+    assert rt.rule.flatten_active
+    flatten_ids = {oid for oid, o in rt.gw.orders.items() if o.reference == "account_guard_flatten"}
+    assert flatten_ids
+    rt.clock.t += 6
+    timer(rt)
+    assert "行情假死" in rt.notifier.titles()                             # 假死确实触发了
+    cancelled = {r.orderid for r in rt.gw.cancel_requests}
+    assert not (flatten_ids & cancelled)                                  # 紧急平仓单未被波及
+
+
 def test_heartbeat(make):
     rt = make(config_overrides={"heartbeat_seconds": 30.0})
     rt.start()

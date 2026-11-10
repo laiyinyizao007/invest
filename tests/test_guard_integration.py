@@ -284,6 +284,68 @@ def test_close_order_reject_does_not_lock_opening(env):
     assert env.send(make_req())
 
 
+def test_hard_reject_emits_fatal_alert_with_error_code_and_locks(env):
+    """硬拒绝要给出「严重错误,已停止策略开仓」的 FATAL 告警并带 CTP 错误码,不淹没在普通拒单告警里。"""
+    env.gw.mode = "reject"
+    env.gw.reject_text = "CTP:资金不足，代码：21，信息：投资者资金不足"
+    env.send(make_req())
+    env.tick(seconds=2)
+    fatal = [a for a in env.alerts if a["level"] == "FATAL" and a["title"] == "严重错误,已停止策略开仓"]
+    assert len(fatal) == 1
+    assert "21" in fatal[0]["message"] and "资金不足" in fatal[0]["message"]
+    env.gw.mode = "accept"
+    assert env.send(make_req()) == ""                          # 当日已禁止开仓
+
+
+def test_hard_reject_without_error_code_still_emits_fatal(env):
+    """没有数字错误码时 fail-closed 仍按硬拒绝,FATAL 告警照发,只是不带错误码段。"""
+    env.gw.mode = "reject"
+    env.gw.reject_text = "某个从未见过的硬错误"
+    env.send(make_req())
+    env.tick(seconds=2)
+    fatal = [a for a in env.alerts if a["title"] == "严重错误,已停止策略开仓"]
+    assert len(fatal) == 1 and "错误码" not in fatal[0]["message"]
+
+
+def test_repeated_hard_rejects_after_lock_emit_a_single_fatal(env):
+    """锁定转换只发生一次:分类延迟窗口内多笔在途单陆续被判 HARD 时,FATAL 与撤单措辞只能出现一次。
+
+    codex 第二轮审查动态复现:旧实现把 FATAL 放在 _lock_daily 之前无条件发射,
+    已锁定后第二笔硬拒绝会再刷一条声称「已撤销全部挂单」的 FATAL,但实际并无撤单动作。
+    """
+    env.gw.mode = "reject"
+    env.gw.reject_text = "CTP:资金不足，代码：21，信息：投资者资金不足"
+    env.send(make_req(price=2200)), env.send(make_req(price=2201))       # 两笔在锁定前都已被柜台拒绝
+    env.tick(seconds=2)                                                   # 同一个定时周期完成两笔分类
+    fatal = [a for a in env.alerts if a["title"] == "严重错误,已停止策略开仓"]
+    assert len(fatal) == 1
+    assert env.alert_titles().count("当日禁止开仓") == 1
+    env.gw.mode = "accept"
+    assert env.send(make_req(price=2202)) == ""                          # 锁定本身仍然有效
+
+
+def test_soft_reject_storm_does_not_emit_severe_fatal(env):
+    """软拒绝攒成风暴只触发「当日禁止开仓」,不能误报「严重错误,已停止策略开仓」。"""
+    env.gw.mode = "reject"
+    env.gw.reject_text = "网络超时,请稍后重试"
+    for price in (2200, 2201, 2202):
+        env.send(make_req(price=price))
+    env.tick(seconds=2)
+    assert "严重错误,已停止策略开仓" not in env.alert_titles()
+    assert "当日禁止开仓" in env.alert_titles()
+
+
+def test_close_order_reject_never_says_strategy_stopped(env):
+    """平仓委托被拒永远不锁离场,也不得出现「已停止」措辞(离场通道不能被误报成策略停手)。"""
+    env.gw.mode = "reject"
+    env.gw.reject_text = "CTP:资金不足，代码：21，信息：投资者资金不足"
+    env.send(make_req(offset=Offset.CLOSE, direction=Direction.SHORT))
+    env.tick(seconds=2)
+    assert all("已停止" not in a["title"] for a in env.alerts)
+    env.gw.mode = "accept"
+    assert env.send(make_req())                               # 开仓能力不受影响
+
+
 def test_stale_open_order_is_cancelled_but_close_order_is_not(env):
     open_id = env.send(make_req())
     close_id = env.send(make_req(offset=Offset.CLOSE, direction=Direction.SHORT))

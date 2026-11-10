@@ -6,6 +6,23 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 极限压力测试前置改造(混沌工程四演练,详见 ADR `docs/adr/20261110-ctp-error-code-and-watchdog-policy.md`):
+  - `risk/order_policy.py`:`extract_ctp_error_code()` + `CTP_ERROR_KIND` 码表,废单分类升级为
+    「错误码优先 → 关键词回退 → 未知 fail-closed 硬拒绝」三级决策;码表只收录实测/官方背书的 8 个码
+    (21/81/63/32/33/14/30/31),软码表留空待 SimNow 实测;模块保持 100% 覆盖率。
+  - `trading/guard_rule.py`:开仓单硬拒绝时发 FATAL「严重错误,已停止策略开仓」(带 CTP 错误码与原因);
+    新增看门狗撤单唯一公开入口 `cancel_open_orders_on_stale_tick()`(复用 offset 过滤,平仓/紧急平仓单不撤)。
+  - `trading/runtime.py`:交易/行情分通道连接状态机(精确措辞驱动、边沿告警、只认「登录成功」为恢复凭据,
+    只读属性 `connection_state`);假死看门狗首次越限强撤全部开仓挂单,新 Tick 复位可再次触发,
+    `stale_cancel_open_orders` 开关可回退旧的只告警行为。
+  - `tests/fakes.py`:`FakeGateway` 新增 `disconnected` 模式(发单本地快速失败返回空串、不产生 OrderData,
+    复现 `CtpTdApi.send_order` 断连行为);新增 `tests/test_disconnect_signal.py` 锁定
+    「断线信号一次性消费、重连无一窝蜂补发、新信号不受影响」三条语义。
+  - `scripts/drill.py`:`disconnect` 场景增加重连后连接状态、窗口内发单失败告警计数、「信号积压补发:无补发」证据项。
+  - 测试由 572 个增至 614 个,全量离线通过,总覆盖率 89%(门禁 85%)。
+  - G11 偏离说明:Gemini CLI 仍报 `ProjectIdRequiredError`(缺 `GOOGLE_CLOUD_PROJECT`),simple-gemini
+    不可用,本 ADR/测试/文档由主模型撰写;plan-down 的方法澄清由 gemini-2.5-flash 与 planner 完成,
+    codex CLI 的设计复核经 clink 后台完成(结论与本方案一致:同一组错误码、同样 fail-closed)。
 - `README.md`:项目上手入口 —— 说明"这个项目在干嘛、怎么用"。含项目定位与状态提示(策略结论为负面、只用于管道测试、当前不连实盘)、
   Mermaid 架构速览、目录结构、环境准备与 `.env` 配置、按场景分组的命令(数据下载/主力连续/优化/无头运行/Docker/图形界面/
   SimNow 演练/废单采集/无人值守日报)、账户级风控阈值表、测试命令、已知限制表、相关文档索引。
@@ -55,6 +72,8 @@
 - 文档:`docs/runbook-simnow.md`、`docs/live-readiness.md`,ADR 增 3 条(账户风控、部署与实盘模式、负面结果更新)。
 
 ### Changed（变更）
+- `trading/runtime.py::_on_log`:原合并式 `_login_notified` 单次通知替换为交易/行情两通道各自的边沿状态迁移,
+  告警标题(「网关连接断开」/「网关已连接」)与消息子串保持不变,依赖它们的 drill 与无人值守日报不受影响。
 - `Dockerfile`:把 `locales` 层挪到 `pip install` **之后**。改动前面的层会让 pip 重新下载全部依赖
   (容器→PyPI 实测 12.6 MB 的 sdist 要 400 秒以上),挪到后面则能命中已有构建缓存,只需重新拉取 `locales` 这一个小包。
 - 测试扩充至 417 个,覆盖率 92%(目标 85%)。
@@ -75,6 +94,25 @@
 - 明确记录:**15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次**,新候选策略不能再用它做最终确认。
 
 ### Fixed（修复）
+- **第八轮 codex 审查(2026-11-10,clink + codex CLI 动态复现)追加修复** —— 1 个 High / 1 个 Medium,
+  均为本轮看门狗/废单改造引入或暴露的问题,修复与新增回归测试在同一原子提交内:
+  - **[High] 跨交易时段重入时看门狗误报「行情假死」并误撤新挂单**:`_last_tick` 是单调时钟时间戳且从不按
+    交易时段边界重新武装,午休/夜盘休市后定时器若先于本时段首 Tick 触发,会把整个休市时间(实测复现 7261s)
+    计为静默,对年龄 0 秒的新开仓单也强撤,而策略 `pending_entry` 一次性消费不重发,等于静默丢失入场。
+    → 运行时记录上一次定时器的时段状态,在「非交易→交易」边沿把 `_last_tick` 置 None、解除假死边沿,
+    等本时段首 Tick 后才开始计 60s 静默;初始基线在 `start()` 记录,首个定时器不被误判为边沿。
+  - **[Medium] 已当日锁定后每笔硬拒绝重复发 FATAL,且「已撤销全部挂单」与实际未撤单不符**:FATAL 原在
+    `_lock_daily()` 之前无条件发射。→ 仅在锁定状态真实转换(`guard.can_open()` 为真)时发 FATAL,
+    已锁定后的后续硬拒绝只保留 ERROR「委托被拒」留痕。
+  - **同类既有问题一并修复**:规则自身的 120s 开仓委托超时也按含休市的单调时间计时,午休两小时后旧挂单会在
+    开盘瞬间被撤。→ 运行时把交易时段判定注入 `AccountGuardRule.session_active`,休市期间不做超时撤单,
+    时段重入时把在跟踪挂单的计时起点拨到开盘时刻(休市时间不计入挂单年龄)。
+  - 新增 3 个回归测试:时段重入不误报(运行时)、规则超时剔除午休(运行时夹具)、锁定后重复硬拒绝只发一次 FATAL(集成)。
+  - 第二轮 clink codex CLI 复核(动态验证夜盘 21:00 重入、休市中启动、启动失败早退三条路径,无 High/Medium),
+    其 4 条 Low 建议全部处置:① 时段边沿的 `_cancel_requested` 清理收窄为只拨开仓单 id,平仓/紧急平仓撤单的
+    10s 节流不被休市边沿清掉;② 规则 `_was_in_session` 基线在运行时注入时同步,与运行时 `_in_session` 同一初始认知;
+    ③ 补仓库级测试 3 个(夜盘重入、休市中启动、节流清理范围);④ 值班手册说明「日锁后硬拒绝只有 ERROR 属预期」。
+    测试由 611 个增至 614 个。
 - **第五轮 codex 审查(2026-11-10)追加修复** —— 2 个 Medium / 4 个 Low:
   - **[Medium] 有日志的周末被当成交易日,"连续 5 个交易日"凭空多出两天**:容器是常驻的,周末照样有日志文件
     (周五夜盘跨过零点还会写进周六的文件 —— `trading_day()` 把 20 点后的夜盘归到下一个工作日)。

@@ -628,11 +628,24 @@ def scenario_disconnect(drill: Drill) -> DrillResult:
     disconnect_alert = drill.notifier.wait_for("连接断开", drill.args.disconnect_timeout, since)
     reconnected = drill.notifier.wait_for("登录成功", drill.args.reconnect_timeout, since)
 
+    def fmt_state() -> str:
+        state = getattr(runtime, "connection_state", None)
+        if not state:
+            return "不可用"
+        return "、".join(f"{ch}:{'已连接' if ok else '断开'}" for ch, ok in sorted(state.items()))
+
+    # 断连期间若策略恰好发单,CTP 本地快速失败并写「委托请求发送失败」(经网关错误告警露出)。
+    # 框架不缓存订单,重连后无从补发;确定性语义由离线测试 tests/test_disconnect_signal.py 锁定,
+    # 这里只记录现场旁证:窗口内出现了几条发单失败告警。
+    send_failures = drill.notifier.find("委托请求发送失败", since)
     details = {
         "断线告警": (f"{disconnect_alert['level']} {disconnect_alert['title']}: {disconnect_alert['message']}"
                     if disconnect_alert else "无"),
         "自动重连": "是" if reconnected else "否",
         "重连等待(秒)": drill.args.reconnect_timeout,
+        "重连后连接状态": fmt_state(),
+        "窗口内发单失败告警(条)": len(send_failures),
+        "信号积压补发": "无补发:断连发单本地失败、框架不排队(离线测试 test_disconnect_signal 锁定语义)",
     }
     if disconnect_alert is None:
         return DrillResult("disconnect", False, "断开交易连接后没有收到告警", details)

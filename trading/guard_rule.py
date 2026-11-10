@@ -30,7 +30,14 @@ from vnpy_riskmanager.base import APP_NAME
 from vnpy_riskmanager.template import RuleTemplate
 
 from risk.account_guard import AccountGuard, AccountLimits, LockEvent, trading_day
-from risk.order_policy import RejectKind, RejectMonitor, RetryPolicy, classify_reject, find_stale_orders
+from risk.order_policy import (
+    RejectKind,
+    RejectMonitor,
+    RetryPolicy,
+    classify_reject,
+    extract_ctp_error_code,
+    find_stale_orders,
+)
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -116,6 +123,10 @@ class AccountGuardRule(RuleTemplate):
         self._flatten: dict | None = None
         self._hard_emitted: set[bool] = set()    # 已发出的硬锁定事件(flat=False / flat=True 各最多一次)
         self._save_error_alerted = False
+        # 交易时段判定:由运行时注入(默认始终在时段内,保持脱离运行时的单测原有行为)。
+        # 超时撤单只在交易时段内计时,午休/夜盘休市时间不计入挂单年龄。
+        self.session_active = lambda: True
+        self._was_in_session = True
 
         self.risk_engine.event_engine.register(EVENT_LOG, self._on_log)
 
@@ -218,6 +229,16 @@ class AccountGuardRule(RuleTemplate):
             return
         storm = self.reject_monitor.add(ts)
         if kind is RejectKind.HARD or storm:
+            # FATAL 只在锁定状态真实转换时发:分类延迟窗口内可能有多笔在途单陆续被判 HARD,
+            # 第一笔已经锁定并撤单后,后续硬拒绝再发 FATAL 既造成告警疲劳,
+            # 其「已撤销全部挂单」措辞也与实际动作(已无单可撤)不符。已锁定时上面的 ERROR「委托被拒」已留痕。
+            if kind is RejectKind.HARD and self.guard.can_open(trading_day(self.clock())):
+                # 硬拒绝 = 重试不会成功的确定性失败(资金不足/涨跌停/权限等):用 FATAL 明确告知
+                # 「策略已被停止开仓」,并带上 CTP 错误码,避免无人值守时淹没在普通「委托被拒」告警里。
+                code = extract_ctp_error_code(text)
+                code_part = f"[CTP 错误码 {code}] " if code is not None else ""
+                self._alert("FATAL", "严重错误,已停止策略开仓",
+                            f"开仓委托被硬拒绝,{code_part}原因:{text or '未知原因'}。已撤销全部开仓挂单,当日禁止新开仓。")
             self._lock_daily(f"开仓委托被{'硬' if kind is RejectKind.HARD else '频繁'}拒绝:{text or '未知原因'}", flatten=False)
 
     # ---------- 每秒定时 ----------
@@ -244,12 +265,23 @@ class AccountGuardRule(RuleTemplate):
         self.lock_status = self.guard.status(trading_day(now_dt))
 
         self._process_pending_rejects(now)
-        stale = find_stale_orders(
-            [(oid, created, is_open) for oid, (created, is_open) in self._open_orders.items()],
-            now, self.stale_order_seconds,
-        )
-        for oid in stale:
-            self._cancel_order(oid, now)
+        in_session = self.session_active()
+        if in_session and not self._was_in_session:
+            # 非交易→交易时段边沿:休市期间没有成交/撤单回报是正常的,挂单年龄要从开盘时刻重新计。
+            # 不做这一步,午休两小时后所有旧挂单会在开盘瞬间被判 120s 超时撤掉(单调时钟含休市时间)。
+            self._open_orders = {oid: (now, is_open) for oid, (_, is_open) in self._open_orders.items()}
+            # 只拨开仓单的撤单节流时间戳:平仓单(含紧急平仓)的 10s 节流不能被休市边沿无差别清掉,
+            # 否则未来若出现短于 10s 的时段间隙,平仓撤单可能绕过节流重复发请求。
+            open_ids = {oid for oid, (_, is_open) in self._open_orders.items() if is_open}
+            self._cancel_requested = {oid: ts for oid, ts in self._cancel_requested.items() if oid not in open_ids}
+        self._was_in_session = in_session
+        if in_session:
+            stale = find_stale_orders(
+                [(oid, created, is_open) for oid, (created, is_open) in self._open_orders.items()],
+                now, self.stale_order_seconds,
+            )
+            for oid in stale:
+                self._cancel_order(oid, now)
         self._advance_flatten(now)
         self.put_event()
 
@@ -295,6 +327,14 @@ class AccountGuardRule(RuleTemplate):
         for order in self.risk_engine.main_engine.get_all_active_orders():
             if order.offset not in CLOSING_OFFSETS:
                 self._cancel_order(order.vt_orderid, now)
+
+    def cancel_open_orders_on_stale_tick(self) -> None:
+        """行情假死看门狗(运行时定时器)撤单的**唯一公开入口**。
+
+        直接复用 _cancel_all_open_orders 的 offset 过滤:平仓单与 FLATTEN_REF 紧急平仓单
+        永远不在撤销集合内,因而不会与紧急平仓状态机竞争——不会撤掉刚重发的平仓委托。
+        """
+        self._cancel_all_open_orders()
 
     def _cancel_order(self, vt_orderid: str, now: float) -> None:
         """撤单;撤单请求发出后超过 CANCEL_RETRY_SECONDS 仍未终结(CTP 撤单失败只有错误日志、没有终态)则允许再撤。"""

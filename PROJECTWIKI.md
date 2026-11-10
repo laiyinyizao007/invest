@@ -82,6 +82,7 @@ flowchart LR
   - [`20261109-account-risk-lock.md`](docs/adr/20261109-account-risk-lock.md):账户级双层熔断、平仓永远放行、紧急平仓防重复下单
   - [`20261109-deployment-and-live-mode.md`](docs/adr/20261109-deployment-and-live-mode.md):实盘模式策略、运行时对账、通知、容器化
   - [`20261110-baseline-15m.md`](docs/adr/20261110-baseline-15m.md):15 分钟基准的事前方案、成绩单与"测试段已被使用"的约束
+  - [`20261110-ctp-error-code-and-watchdog-policy.md`](docs/adr/20261110-ctp-error-code-and-watchdog-policy.md):错误码优先的废单三级分类、假死强撤开仓单、断线连接状态机与无积压补发证据
 
 ## 4. 设计决策 & 技术债务
 | 项 | 说明 | 优先级 |
@@ -172,6 +173,17 @@ flowchart LR
   终态后才重试、状态未知不重发、持仓回报滞后时主动查询);`emergency_flatten()` 供运行时看门狗调用。
 - `safe_risk.py`:`SafeRiskEngine` 让平仓单跳过计数类内置规则(每日上限/活动委托/重复报单),并加载上面的规则与项目默认配置。
 - `runtime.py`:`TradingRuntime` 串起网关、风控、CTA 引擎与通知。启动顺序与对账、看门狗(策略被异常停止/行情停更/心跳)、退出码语义见 ADR。
+  **2026-11-10 极限压力测试前置改造**(ADR `20261110-ctp-error-code-and-watchdog-policy.md`):
+  - 连接状态机:按精确措辞分别跟踪交易/行情两条通道(「服务器连接断开」→ 断开、「服务器登录成功」→ 恢复),
+    边沿告警不重复;「连接成功」的未登录中间态不驱动状态。只读属性 `connection_state` 供演练与巡检读取。
+  - 假死看门狗:交易时段 60s 无 Tick 从「只告警」升级为**首次越限强撤全部活动开仓委托**
+    (经规则唯一入口 `cancel_open_orders_on_stale_tick()`,平仓单与紧急平仓单天然排除),
+    新 Tick 复位边沿;`RuntimeConfig.stale_cancel_open_orders=False` 可回退旧行为,周期 WARN 保留。
+    **时段边沿重新武装**(codex 第八轮修复):午休/夜盘休市后重入交易时段时,`_last_tick` 置 None、
+    边沿解除,等本时段首 Tick 后才开始计静默,避免把休市时间误算成假死、误撤年龄 0 秒的新挂单;
+    初始基线在 `start()` 记录,首个定时器不被当成边沿。
+  - 规则侧同类修复:运行时把 `_in_trading_session` 注入 `AccountGuardRule.session_active`,
+    规则的 120s 开仓委托超时只在交易时段内计时,时段重入时挂单年龄拨回零点,休市时间不再触发超时撤单。
 - **退出时的 FATAL 要留出发送时间**(2026-11-10 codex 三轮修复):`shutdown()` 在关闭通知器前会发
   "退出时仍有持仓"的 FATAL —— 那是无人值守最后的兜底,慢一点的对端就会把它一起丢掉。
   关闭通知器的默认预算是 10 秒,而一条消息的最坏耗时是 (1+重试次数) × 单次超时 + 全部退避(默认 34 秒),
@@ -197,7 +209,15 @@ flowchart LR
 ### `risk/account_guard.py` 与 `risk/order_policy.py`(纯 Python,100% 覆盖)
 - `AccountGuard`:权益驱动的双层熔断状态机,原子持久化,损坏即硬锁定,权益 ≤0/NaN 视为无效采样,日初基准取上次采样。
 - `trading_day()`:夜盘归属下一交易日,周末顺延(不处理法定节假日)。
-- `order_policy`:废单关键词分类(未知按硬拒绝)、紧急平仓重试节奏 1/3/5 秒、废单风暴检测、超时开仓委托识别。
+- `order_policy`:废单**三级分类**(2026-11-10 起):`extract_ctp_error_code()` 先抽数字错误码 →
+  `CTP_ERROR_KIND` 码表命中直接定论(21/81/63/32/33/14/30/31 均 HARD,软码表留空待 SimNow 实测)→
+  未命中回退关键词 → 仍未知 fail-closed 按硬拒绝;正则锚定「代码」前缀且兼容全/半角冒号。
+  另有紧急平仓重试节奏 1/3/5 秒、废单风暴检测、超时开仓委托识别。硬拒绝的 FATAL「严重错误,已停止策略开仓」
+  只在锁定状态真实转换时发一次:分类延迟窗口内多笔在途单陆续被判 HARD 时,已锁定后的后续硬拒绝只留 ERROR「委托被拒」,
+  不重复 FATAL、不声称执行并未发生的撤单(codex 第八轮修复)。**值班须知**:当日熔断/撤单锁定等
+  其他原因已锁定后再来硬拒绝,只有 ERROR「委托被拒」留痕、不再有 FATAL——这不代表锁定失效,
+  开仓仍在规则链上被物理拦截。硬拒绝锁定时规则发
+  FATAL「严重错误,已停止策略开仓」并带错误码;平仓拒单永不锁离场。
 
 ### `scripts/collect_reject_texts.py`(SimNow 真实废单文本采集)
 - **只连已知 SimNow 地址**:白名单 `SIMNOW_TD_ADDRESSES`(官网公布的第一套 30001/30002/30003 / 第二套 40001)。
@@ -276,6 +296,8 @@ flowchart LR
 ### `scripts/drill.py`(SimNow 实测演练:把运行手册第 5 节做成可重复执行)
 - 场景:`latency`(成交→持仓回报延迟)、`tick-stale`(行情断流→看门狗告警)、`disconnect`(交易连接断开→告警与自动重连)、
   `daily-loss`(当日熔断链路)、`hard-lock`(累计死线→平仓→退出码 0)、`overnight`(夜盘首根 Tick 的交易日归属)。
+  `disconnect` 场景另记录重连后 `connection_state`、窗口内「委托请求发送失败」告警计数与「信号积压补发:无补发」证据项;
+  断连期信号一次性消费、重连不补发的确定性语义由离线测试 `tests/test_disconnect_signal.py` 锁定。
 - **状态隔离**:演练用独立的 `.vntrader_drill/` 目录(策略数据、日志、心跳)与独立的 `account_guard.json`,
   演练里的熔断/硬锁定**不会污染实盘状态** `data/state/account_guard.json`。
   vn.py 4.5 没有 `SETTINGS["data_path"]`,真正决定落盘位置的是 `vnpy.trader.utility.TEMP_DIR`,演练改的就是它。
