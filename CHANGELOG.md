@@ -39,7 +39,7 @@
 ### Changed（变更）
 - `Dockerfile`:把 `locales` 层挪到 `pip install` **之后**。改动前面的层会让 pip 重新下载全部依赖
   (容器→PyPI 实测 12.6 MB 的 sdist 要 400 秒以上),挪到后面则能命中已有构建缓存,只需重新拉取 `locales` 这一个小包。
-- 测试扩充至 416 个,覆盖率 92%(目标 85%)。
+- 测试扩充至 417 个,覆盖率 92%(目标 85%)。
 - 分钟线时间戳由新浪的"K 线结束时间"前推一个周期,统一为 vn.py 的"开始时间"。
 - **文档同步(2026-11-10)**:PROJECTWIKI 补充 15 分钟基准模块、购买数据的派生数据流、GUI 入口、容器内连通 SimNow 未验证等条目;
   `docs/runbook-simnow.md` 与 `docs/live-readiness.md` 刷新 Phase 3–5 的实际状态与剩余实测项;Issue #1 的阶段勾选同步。
@@ -85,6 +85,9 @@
     读取改走 `contract_of/tick_of/order_of` 快照方法。
   - 交易时段窗口未覆盖 CFFEX 的 13:00 下午盘 → 下午盘起点由 13:30 提前到 13:00(保守取并集)。
   - `--allow-any-address` 的帮助文本与警告改为明确提示"可能连上真实资金账户"。
+- **SimNow 第二套对新注册账号不可用**(2026-11-10 实测):连 `182.254.243.31:40001` 时行情登录成功、
+  交易登录回 `代码：3,信息：CTP:不合法的登录`;新账号要到第三个交易日才能用第二套。
+  采集脚本现在检测到登录失败会**立刻退出(退出码 6)**并说明原因,不再白等 180 秒超时。
 - **Docker 容器连不上 SimNow 的根因**:`vnpy_ctp` 的 `toUtf()` 硬编码 `std::locale("zh_CN.GB18030")`,Debian slim 镜像默认无此 locale,CTP 回调线程抛异常导致进程 abort(无 CTP 错误日志)。Dockerfile 已加 `locales` + `localedef -i zh_CN -f GB18030 zh_CN.GB18030`。
 - **Docker 容器内完整连上 SimNow**(2026-11-10 实测):连接→授权→登录→结算确认→合约表→策略初始化→订阅→容器 `healthy`→`docker compose stop` 优雅退出(码 0)。
 - `scripts/backtest_lib.py`:回测异常检测改用精确哨兵(`Traceback` / `触发异常`),避免普通日志含"异常"二字被误报;`run_engine_bars` 补充统计口径说明(按自然日分组,与日线基准的夏普不可直接比较)。

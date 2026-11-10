@@ -118,6 +118,8 @@ class Collector:
         self.ticks: dict[str, TickData] = {}
         self.contracts: dict[str, ContractData] = {}
         self.log_lines: list[str] = []
+        # 登录失败的日志文本:等合约表的时候如果登录就失败了,再等下去只是浪费时间
+        self.login_failures: list[str] = []
         # 事件线程写、主线程读:用一把锁把列表的读取变成一致的快照
         self.lock = threading.Lock()
 
@@ -125,8 +127,15 @@ class Collector:
         log: LogData = event.data
         with self.lock:
             self.log_lines.append(log.msg)
+            if "登录失败" in log.msg:
+                self.login_failures.append(log.msg)
             if log.level >= ERROR or any(k in log.msg for k in self.ERROR_MARKERS):
                 self.errors.append((time.monotonic(), log.msg))
+
+    def login_failed(self) -> str:
+        """最近的登录失败文本(没有则空串)。"""
+        with self.lock:
+            return self.login_failures[-1] if self.login_failures else ""
 
     def on_order(self, event: Event) -> None:
         order: OrderData = event.data
@@ -456,6 +465,14 @@ def _collect(args, symbol: str, gateway_setting, event_engine, main_engine, coll
         contract = collector.contract_of(symbol)
         if contract is not None:
             break
+        # 登录失败时合约表永远不会来(第二套环境对新注册账号会回"不合法的登录",
+        # 账号要到第三个交易日才能用),继续等满超时只是浪费时间,立刻报错退出。
+        reason = collector.login_failed()
+        if reason:
+            print(f"交易登录失败,无法采集:{reason}", file=sys.stderr)
+            print("提示:SimNow 第二套(7x24)对新注册账号要等到第三个交易日才能用;"
+                  "第一套与实盘交易时间一致,约 16:00 关闭、21:00 开盘。", file=sys.stderr)
+            return 6
         time.sleep(0.5)
     if contract is None:
         print(f"{args.connect_timeout:.0f} 秒内没有拿到 {symbol} 的合约信息。", file=sys.stderr)

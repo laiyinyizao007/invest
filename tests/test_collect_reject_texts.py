@@ -310,12 +310,37 @@ def test_collect_returns_3_when_the_contract_never_arrives():
     """合约表没到位就发单,所有委托都会被"合约不存在"拒掉,测不到想测的东西 → 直接失败退出。"""
     import argparse
 
-    args = argparse.Namespace(connect_timeout=0.2, out="")
+    args = argparse.Namespace(connect_timeout=0.2, out="", position_check_timeout=0.1)
     collector = c.Collector()                       # 故意不放合约
     engine = _CollectEngine()
     code = c._collect(args, "c2701.DCE", {}, None, engine, collector)
     assert code == 3
     assert engine.sent == [], "没拿到合约信息就不该发任何委托"
+
+
+def test_collect_gives_up_immediately_when_the_login_failed():
+    """登录失败时合约表永远不会来,再等满超时只是浪费时间。
+
+    实测:SimNow 第二套(7x24)对新注册账号回"交易服务器登录失败,代码：3,信息：CTP:不合法的登录",
+    账号要到第三个交易日才能用 —— 白等 180 秒什么也采不到。
+    """
+    import argparse
+
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_LOG
+    from vnpy.trader.logger import ERROR
+    from vnpy.trader.object import LogData
+
+    args = argparse.Namespace(connect_timeout=180.0, out="")
+    collector = c.Collector()
+    collector.on_log(Event(EVENT_LOG, LogData(
+        msg="交易服务器登录失败,代码：3,信息：CTP:不合法的登录", level=ERROR, gateway_name="CTP")))
+    engine = _CollectEngine()
+    started = time.monotonic()
+    code = c._collect(args, "c2701.DCE", {}, None, engine, collector)
+    assert code == 6
+    assert time.monotonic() - started < 5.0, "登录失败应当立刻退出,不能等满超时"
+    assert engine.sent == []
 
 
 def test_collect_aborts_when_the_symbol_already_has_a_position():
@@ -328,7 +353,7 @@ def test_collect_aborts_when_the_symbol_already_has_a_position():
             self.direction = direction
             self.volume = volume
 
-    args = argparse.Namespace(connect_timeout=0.2, out="")
+    args = argparse.Namespace(connect_timeout=0.2, out="", position_check_timeout=0.1)
     collector = c.Collector()
     collector.contracts["c2701.DCE"] = _fake_contract()
     engine = _CollectEngine(positions=[_Pos("c2701.DCE", Direction.LONG, 2)])
