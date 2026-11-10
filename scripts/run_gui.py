@@ -2,6 +2,7 @@
 
 用法(项目根目录):
     python scripts/run_gui.py                 # 打开界面并按 .env 自动连接 CTP
+    python scripts/run_gui.py --subscribe c2701.DCE   # 合约表到位后自动订阅行情(默认取 .env 的 LIVE_VT_SYMBOL)
     python scripts/run_gui.py --no-connect    # 只打开界面,用菜单"系统 → 连接CTP"手动连接
     python scripts/run_gui.py --check         # 只校验配置与依赖,不打开界面
 
@@ -29,14 +30,18 @@ from trading.runtime import build_ctp_setting
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--no-connect", action="store_true", help="不自动连接,用界面菜单手动连接")
+    parser.add_argument("--subscribe", default=os.environ.get("LIVE_VT_SYMBOL", ""),
+                        help="合约表到位后自动订阅的合约,如 c2701.DCE(默认取 LIVE_VT_SYMBOL;留空则不订阅)")
     parser.add_argument("--check", action="store_true", help="只校验配置与依赖,不打开界面")
     return parser.parse_args(argv)
 
 
-def build_gui(env: Mapping[str, str], auto_connect: bool):
+def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
     """组装主引擎与主窗口,返回 (qapp, main_window, main_engine)。不进入事件循环,便于测试。"""
     from vnpy.event import EventEngine
     from vnpy.trader.engine import MainEngine
+    from vnpy.trader.event import EVENT_CONTRACT
+    from vnpy.trader.object import SubscribeRequest
     from vnpy.trader.ui import MainWindow, create_qapp
     from vnpy_ctabacktester import CtaBacktesterApp
     from vnpy_ctastrategy import CtaStrategyApp
@@ -61,6 +66,13 @@ def build_gui(env: Mapping[str, str], auto_connect: bool):
     def on_hard_lock(event):
         main_engine.write_log(f"[风控 FATAL] 硬锁定: {event.data.get('reason', '')}(已平仓: {event.data.get('flat')})")
 
+    def on_contract(event):
+        c = event.data
+        if subscribe and c.vt_symbol == subscribe:           # 合约表到位后自动订阅,否则界面的行情表是空的
+            main_engine.subscribe(SubscribeRequest(symbol=c.symbol, exchange=c.exchange), c.gateway_name)
+            main_engine.write_log(f"已自动订阅行情: {subscribe}")
+
+    event_engine.register(EVENT_CONTRACT, on_contract)
     event_engine.register(EVENT_GUARD_ALERT, on_alert)
     event_engine.register(EVENT_GUARD_HARD_LOCK, on_hard_lock)
 
@@ -92,7 +104,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     if args.check:
         print("配置检查通过: CTP 配置齐全,界面依赖可用")
         return 0
-    qapp, _window, _engine = build_gui(env, auto_connect=not args.no_connect)
+    qapp, _window, _engine = build_gui(env, auto_connect=not args.no_connect, subscribe=args.subscribe)
     return qapp.exec()
 
 

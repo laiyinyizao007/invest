@@ -14,6 +14,16 @@ ENV = {"CTP_USERNAME": "user_x", "CTP_PASSWORD": "pw_secret_123", "CTP_BROKER_ID
        "CTP_TD_ADDRESS": "td:1", "CTP_MD_ADDRESS": "md:1", "CTP_APP_ID": "app", "CTP_AUTH_CODE": "auth_secret_456"}
 
 
+@pytest.fixture(autouse=True)
+def single_qapp(monkeypatch):
+    """同一进程里只能有一个 QApplication:复用已有的。"""
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    import vnpy.trader.ui as ui
+    original = ui.create_qapp
+    monkeypatch.setattr(ui, "create_qapp", lambda name="": QApplication.instance() or original(name))
+
+
 def test_check_mode_validates_config_without_opening_a_window(capsys):
     assert run_gui.main(["--check"], env=ENV) == 0
     out = capsys.readouterr().out
@@ -41,3 +51,29 @@ def test_gui_assembles_with_account_guard_and_does_not_connect(monkeypatch):
         assert "TrendAtrStrategy" in cta.classes                                # 策略类能在界面里被发现
     finally:
         engine.close()                                                          # 不调 window.close():它会弹出模态确认框并阻塞
+
+
+def test_gui_subscribes_to_the_symbol_once_its_contract_arrives(monkeypatch):
+    pytest.importorskip("PySide6")
+    from vnpy.event import Event
+    from vnpy.trader.constant import Exchange, Product
+    from vnpy.trader.engine import MainEngine
+    from vnpy.trader.event import EVENT_CONTRACT
+    from vnpy.trader.object import ContractData
+    subs = []
+    monkeypatch.setattr(MainEngine, "subscribe", lambda self, req, name: subs.append((req.vt_symbol, name)))
+    qapp, window, engine = run_gui.build_gui(ENV, auto_connect=False, subscribe="c2701.DCE")
+    try:
+        def contract(symbol):
+            return ContractData(symbol=symbol, exchange=Exchange.DCE, name=symbol, product=Product.FUTURES,
+                                size=10, pricetick=1, gateway_name="CTP")
+        engine.event_engine.put(Event(EVENT_CONTRACT, contract("c2703")))      # 别的合约不订阅
+        engine.event_engine.put(Event(EVENT_CONTRACT, contract("c2701")))
+        import time
+        for _ in range(50):
+            if subs:
+                break
+            time.sleep(0.05)
+        assert subs == [("c2701.DCE", "CTP")]
+    finally:
+        engine.close()
