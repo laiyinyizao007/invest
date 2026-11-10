@@ -66,6 +66,7 @@ class AccountGuard:
         self.hard_locked: bool = False
         self.hard_reason: str = ""
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
+        self.account_id: str = ""              # 状态所属的账户;换账户时权益基准必须重置(SimNow 2000 万 vs 实盘 1 万)
         self.save_error: str = ""
         self._last_saved_at: datetime | None = None
         self._load()
@@ -83,6 +84,28 @@ class AccountGuard:
         if self.hard_locked:
             return "HARD_LOCKED"
         return "DAILY_LOCKED" if self.is_daily_locked(day) else "OK"
+
+    # ---------- 账户绑定 ----------
+
+    def bind_account(self, account_id: str) -> str | None:
+        """把状态绑定到账户。首次绑定只记录;换了账户则重置权益基准(最高点、日初、当日锁定),返回说明文字。
+
+        硬锁定**不会**因换账户而解除:它代表"需要人判断后才能恢复",只能用 unlock_hard()。
+        """
+        if not account_id or account_id == self.account_id:
+            return None
+        previous, self.account_id = self.account_id, account_id
+        if not previous:               # 首次绑定(含旧版本的状态文件):沿用已有基准,只补记账户
+            self._save()
+            return None
+        self.peak_equity = 0.0
+        self.last_equity = 0.0
+        self.day = None
+        self.day_start_equity = 0.0
+        self.daily_locked_day = None
+        self._last_saved_at = None
+        self._save()
+        return f"账户由 {previous} 变更为 {account_id},权益基准已重置" + ("(硬锁定仍然保留,需人工解锁)" if self.hard_locked else "")
 
     # ---------- 更新 ----------
 
@@ -144,6 +167,7 @@ class AccountGuard:
         if self.state_path is None:
             return
         state = {
+            "account_id": self.account_id,
             "last_equity": self.last_equity,
             "peak_equity": self.peak_equity,
             "day": self.day.isoformat() if self.day else None,
@@ -169,6 +193,7 @@ class AccountGuard:
             return
         try:
             s = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.account_id = str(s.get("account_id", ""))
             self.last_equity = float(s.get("last_equity", 0.0))
             self.peak_equity = float(s["peak_equity"])
             self.day = date.fromisoformat(s["day"]) if s["day"] else None

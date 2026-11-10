@@ -65,7 +65,7 @@ class RuntimeConfig:
     strategy_setting: dict = field(default_factory=dict)
     gateway_name: str = "CTP"
     gateway_setting: dict = field(default_factory=dict)
-    connect_timeout: float = 60.0                    # 等待合约与账户到位的最长时间(秒)
+    connect_timeout: float = 120.0                   # 等待合约与账户到位的最长时间(秒);SimNow 的"结算信息确认"耗时波动大(实测 4~60+ 秒)
     position_settle_seconds: float = 5.0             # 账户到位后主动查询持仓并等待其稳定的时间(秒)
     init_timeout: float = 120.0
     heartbeat_seconds: float = 0.0                   # 0 = 不发心跳

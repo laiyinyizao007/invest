@@ -261,6 +261,63 @@ def test_save_error_clears_after_a_successful_write(tmp_path):
     assert g.save_error == ""
 
 
+# ---------- 账户绑定 ----------
+
+def test_first_binding_keeps_existing_baseline_and_records_account():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.update(10_000, MON_10AM)
+    assert g.bind_account("A") is None and g.account_id == "A" and g.peak_equity == 10_000
+
+
+def test_same_account_does_nothing():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.bind_account("A")
+    g.update(10_000, MON_10AM)
+    assert g.bind_account("A") is None and g.peak_equity == 10_000
+
+
+def test_switching_account_resets_baselines_so_a_big_sim_balance_cannot_hard_lock_a_small_real_account():
+    """SimNow 的 2000 万权益被记成最高点后换成 1 万元账户:不重置会立刻被判回撤 1999 万而硬锁定。"""
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.bind_account("SIM")
+    g.update(20_000_000, MON_10AM)
+    note = g.bind_account("REAL")
+    assert note and "SIM" in note and "REAL" in note
+    assert g.update(10_000, MON_10AM) == [] and not g.hard_locked
+    assert g.peak_equity == 10_000 and g.day_start_equity == 10_000
+
+
+def test_switching_account_clears_the_daily_lock_but_never_the_hard_lock():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.bind_account("A")
+    g.update(10_000, MON_10AM)
+    g.update(9_300, MON_10AM)
+    assert not g.can_open(date(2026, 11, 9))
+    g.bind_account("B")
+    assert g.can_open(date(2026, 11, 9))                                      # 当日熔断属于旧账户
+    g.update(10_000, MON_10AM)
+    g.update(7_000, MON_10AM)
+    assert g.hard_locked
+    note = g.bind_account("C")
+    assert g.hard_locked and "人工解锁" in note                                # 硬锁定只能人工解除
+
+
+def test_account_binding_survives_restart(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.bind_account("SIM")
+    g.update(20_000_000, MON_10AM)
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.account_id == "SIM" and g2.peak_equity == 20_000_000
+    assert g2.bind_account("REAL") is not None and g2.peak_equity == 0.0
+
+
+def test_empty_account_id_is_ignored():
+    g = AccountGuard(AccountLimits(600, 2000))
+    g.bind_account("A")
+    assert g.bind_account("") is None and g.account_id == "A"
+
+
 # ---------- 废单分类 ----------
 
 @pytest.mark.parametrize("text", ["CTP:资金不足", "合约不存在", "平仓量超过持仓量", "不在交易时段", "报单价格不在涨跌停板内"])

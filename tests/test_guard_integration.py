@@ -517,6 +517,20 @@ def test_finishing_a_flatten_cancels_residual_flatten_orders(env):
     assert len(env.gw.cancel_requests) == 1                    # 完成时撤掉残留的平仓单,不留给交易所"超平拒单"兜底
 
 
+def test_rule_resets_baselines_when_the_connected_account_changes(env):
+    from vnpy.trader.object import AccountData
+    env.gw.on_account(AccountData(accountid="SIM", balance=20_000_000.0, frozen=0.0, gateway_name="FAKE"))
+    env.rule.update_setting({"account_id": "SIM", "state_file": str(env.state_file)})
+    env.tick()
+    assert env.rule.guard.peak_equity == 20_000_000
+    env.rule.update_setting({"account_id": "REAL", "state_file": str(env.state_file)})
+    env.gw.on_account(AccountData(accountid="REAL", balance=10_000.0, frozen=0.0, gateway_name="FAKE"))
+    env.tick()
+    assert "账户变更" in env.alert_titles()
+    assert env.rule.guard.peak_equity == 10_000 and not env.rule.guard.hard_locked   # 没有被 2000 万的旧最高点误判为大幅回撤
+    assert env.send(make_req())
+
+
 # ---------- 平仓不被计数类规则拦截 ----------
 
 def test_counting_rules_block_opens_but_never_closes(env):

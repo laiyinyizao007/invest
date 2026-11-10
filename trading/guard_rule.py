@@ -199,9 +199,12 @@ class AccountGuardRule(RuleTemplate):
         for order in main.get_all_active_orders():               # 启动前已存在的活跃委托也要纳入超时管理
             self._open_orders.setdefault(order.vt_orderid, (now, order.offset not in CLOSING_OFFSETS))
 
-        equity = self._account_equity()
-        if equity is not None:
-            for ev in self.guard.update(equity, now_dt):
+        account = self._account()
+        if account is not None:
+            note = self.guard.bind_account(account.accountid)
+            if note:
+                self._alert("WARN", "账户变更", note)
+            for ev in self.guard.update(account.balance, now_dt):
                 self._on_lock_event(ev)
             self.peak_equity, self.day_start_equity = self.guard.peak_equity, self.guard.day_start_equity
         if self.guard.save_error and not self._save_error_alerted:
@@ -219,11 +222,11 @@ class AccountGuardRule(RuleTemplate):
         self._advance_flatten(now)
         self.put_event()
 
-    def _account_equity(self) -> float | None:
+    def _account(self):
         accounts = self.risk_engine.main_engine.get_all_accounts()
         if self.account_id:
             accounts = [a for a in accounts if a.accountid == self.account_id]
-        return accounts[0].balance if accounts else None
+        return accounts[0] if accounts else None
 
     # ---------- 锁定处理 ----------
 
