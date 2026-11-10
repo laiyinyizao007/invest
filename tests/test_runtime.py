@@ -666,3 +666,32 @@ def test_drift_emergency_flatten_is_reported_only_once_even_if_strategy_pos_stay
         rt.clock.t += 20
         timer(rt)
     assert rt.notifier.titles().count("持仓漂移") == 1
+
+
+
+def test_startup_timeout_alert_reports_which_milestones_were_reached(make):
+    """启动慢时,告警里要能看出卡在哪一步(登录/结算确认/合约表下载)。"""
+    from vnpy.trader.object import LogData
+    rt = make()
+    rt.gw.connect_pushes = False
+    orig = rt.gw.connect
+
+    def connect(setting):
+        orig(setting)
+        rt.clock.t += 2.0
+        rt.event_engine.put(Event(EVENT_LOG, LogData(msg="交易服务器登录成功", gateway_name=rt.config.gateway_name)))
+        rt.clock.t += 3.0
+        rt.event_engine.put(Event(EVENT_LOG, LogData(msg="结算信息确认成功", gateway_name=rt.config.gateway_name)))
+
+    rt.gw.connect = connect
+    assert rt.start() == EXIT_STARTUP_FAILED
+    msg = rt.notifier.find("启动失败")[0]
+    assert "交易服务器登录成功=2.0s" in msg and "结算信息确认成功=5.0s" in msg and "合约信息查询成功" not in msg
+
+
+def test_successful_startup_logs_total_elapsed_time(make):
+    rt = make()
+    logs = []
+    rt.event_engine.register(EVENT_LOG, lambda e: logs.append(e.data.msg))
+    assert rt.start() is None
+    assert any("启动耗时" in m for m in logs)

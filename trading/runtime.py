@@ -112,6 +112,8 @@ class TradingRuntime:
         self._started = False
         self._crash_reported = False
         self._last_tick: float | None = None
+        self._t_connect: float | None = None
+        self._milestones: dict[str, float] = {}
         self._last_stale_alert = -1e9
         self._last_heartbeat = self._mono()
         self._last_touch = -1e9
@@ -145,11 +147,17 @@ class TradingRuntime:
         t = event.data
         self.notify("INFO", "成交", f"{t.vt_symbol} {t.direction.value}{t.offset.value} {t.volume}@{t.price}")
 
+    MILESTONES = ("行情服务器登录成功", "交易服务器登录成功", "结算信息确认成功", "合约信息查询成功")
+
     def _on_log(self, event: Event) -> None:
         log = event.data
         if log.gateway_name != self.config.gateway_name:
             return
         msg = log.msg
+        if self._t_connect is not None:
+            for m in self.MILESTONES:
+                if m in msg:
+                    self._milestones.setdefault(m, self._mono() - self._t_connect)
         if "连接断开" in msg:
             self.notify("ERROR", "网关连接断开", msg)
         elif "登录成功" in msg:
@@ -173,6 +181,7 @@ class TradingRuntime:
         if problem:
             self.notify("FATAL", "启动失败", problem)
             return EXIT_STARTUP_FAILED
+        self._t_connect = self._mono()
         try:
             self.main.connect(self.config.gateway_setting, self.config.gateway_name)
         except Exception as exc:
@@ -181,8 +190,9 @@ class TradingRuntime:
         if not self._wait_for(self._contract_and_account_ready, self.config.connect_timeout):
             if self._stop_event.is_set():
                 return EXIT_OK
-            self.notify("FATAL", "启动失败", f"{self.config.connect_timeout:.0f}s 内未收到合约 {self.config.vt_symbol} 或账户信息(网关登录后要先下载全市场合约表,前置机繁忙时会很慢;账户查询要等合约表完成)")
+            self.notify("FATAL", "启动失败", f"{self.config.connect_timeout:.0f}s 内未收到合约 {self.config.vt_symbol} 或账户信息(网关登录后要先下载全市场合约表,前置机繁忙时会很慢;账户查询要等合约表完成)。已完成: {self._milestone_report()}")
             return EXIT_STARTUP_FAILED
+        self.main.write_log(f"启动耗时(自发起连接): {self._milestone_report()}, 合约与账户到位={self._mono() - self._t_connect:.1f}s", source="Runtime")
         if not self._stable_positions():
             if self._stop_event.is_set():
                 return EXIT_OK
@@ -200,6 +210,12 @@ class TradingRuntime:
         self._last_heartbeat = self._mono()
         self.notify("INFO", "已启动", f"{self.config.strategy_name} 运行于 {self.config.vt_symbol},权益 {self._equity():.0f}")
         return None
+
+    def _milestone_report(self) -> str:
+        """启动各阶段距离发起连接的秒数,用于判断慢在哪一步(登录/结算确认/全市场合约表下载)。"""
+        if not self._milestones:
+            return "无任何里程碑"
+        return ", ".join(f"{k}={v:.1f}s" for k, v in sorted(self._milestones.items(), key=lambda kv: kv[1]))
 
     def _check_state_writable(self) -> str | None:
         """状态目录必须可写,否则风控状态(尤其是硬锁定)写不进磁盘,重启后会被"洗掉"。Docker 挂载卷默认属 root,容器内 uid 1000 写不进。"""
