@@ -258,6 +258,12 @@ class Drill:
         # 进场前该合约的持仓总手数;None = 还没记录,不做总手数校验。
         # 净持仓为 0 时可能还有锁仓,收尾判断必须看总手数,所以单独记一份。
         self.gross_baseline: int | None = None
+        # **演练自己开出去的仓位**(方向 + 手数)。
+        # 净持仓账户(CTP 的"净"持仓方向)里,演练开的多仓回报上来是 Direction.NET,
+        # 净额算出来是 0 —— 只看净额会以为"没有仓位要平",于是既不平仓、
+        # 又把留仓手数误报成 0。演练知道自己开了多少,平仓要按这个来。
+        self.owned_volume: int = 0
+        self.owned_direction: Direction | None = None
 
     # ---------- 生命周期 ----------
 
@@ -439,6 +445,10 @@ def scenario_latency(drill: Drill) -> DrillResult:
     drill.positions.clear()
     sent_at = time.monotonic()
     order_id = runtime.main.send_order(req, "CTP")
+    # 记下"演练自己开了 1 手多仓":净持仓账户的持仓回报是 Direction.NET,
+    # 净额看不出来 —— 收尾要按这个手数去平,否则仓位会留在账户上。
+    drill.owned_volume = 1
+    drill.owned_direction = Direction.LONG
 
     trade = drill.wait_for_trade(drill.args.fill_timeout)
     if trade is None:
@@ -451,7 +461,9 @@ def scenario_latency(drill: Drill) -> DrillResult:
         # 撤单后仍然出现仓位,说明撤单与成交撞上了:仓位留在账户上,
         # 必须平掉并按留仓发 FATAL 告警,不能"没成交"就当作没事发生。
         if not drill.wait_flat(drill.args.close_timeout, baseline=baseline):
-            leftover = drill.net_position() - baseline
+            # 留了多少手要看**总手数**:净持仓账户的持仓方向是 NET,
+            # 按净额算出来永远是 0,会把"账户还留着 1 手"报成"多出 0 手"。
+            leftover = drill.gross_position() - (drill.gross_baseline or 0)
             closed = _close_position(drill, pricetick, baseline=baseline)
             drill.notifier.send("FATAL", "演练未能平仓",
                                  f"{drill.symbol} 撤单后仍然成交,账户多出 {leftover} 手;"
@@ -461,6 +473,8 @@ def scenario_latency(drill: Drill) -> DrillResult:
                                f"撤单与成交撞车,账户多出 {leftover} 手"
                                f"({'已平掉' if closed else '没能平掉,仍留仓'}),已发 FATAL 告警",
                                {"撤单后残留手数": leftover, "已平掉": closed})
+        drill.owned_volume = 0
+        drill.owned_direction = None
         return DrillResult("latency", False,
                            f"{drill.args.fill_timeout:.0f}s 内没有成交(价格 {buy_price}),已撤单并确认账户无仓位")
     trade_ts, trade_data = trade
@@ -518,15 +532,31 @@ def _close_position(drill: Drill, pricetick: float, baseline: int = 0) -> bool:
     `baseline` 是演练进场前的账户净持仓(演练之前就存在的仓位)。
     平仓量 = 当前净持仓 − baseline —— 只动演练自己的增量,
     绝不按账户净持仓一刀切去平:那样会把别人(或之前遗留)的仓位一起平掉。
+
+    **净持仓账户(CTP 的"净"持仓方向)例外**:演练开的多仓回报上来是 `Direction.NET`,
+    净额算出来是 0 —— 只看净额会以为"没有仓位要平",于是既不发平仓单、
+    又把留仓手数误报成 0,仓位留在账户上下次运行还得接着还。
+    所以演练记录**自己开了多少、什么方向**(`owned_volume` / `owned_direction`),
+    净额看不出来时按这个来平。
     """
     runtime = drill.runtime
     assert runtime is not None
     net = drill.net_position()
     delta = net - baseline
-    if delta == 0:
-        # 净持仓没有超出 baseline:没有需要按方向平掉的仓位。
-        # 但方向不明的仓位(NET)与多空锁仓都不体现在净额里 —— 再看一次总手数,
-        # 免得把"还留着仓"当成"已经平干净"。
+    owned = drill.owned_volume
+    if delta == 0 and owned > 0:
+        # 净额看不出来(净持仓账户),但演练自己开了仓 → 按自己开的量平。
+        # 平仓方向与持仓方向**相反**:开的是多仓就用 SHORT(卖出)平。
+        volume = owned
+        position_direction = drill.owned_direction or Direction.LONG
+        direction = Direction.SHORT if position_direction == Direction.LONG else Direction.LONG
+    elif delta != 0:
+        # 净持仓为正 = 多头,平仓要用 SHORT(卖出);为负 = 空头,平仓要用 LONG(买入)。
+        volume = abs(delta)
+        direction = Direction.SHORT if delta > 0 else Direction.LONG
+    else:
+        # 没有可平的增量。但方向不明的仓位(NET)与多空锁仓都不体现在净额里 ——
+        # 再看一次总手数,免得把"还留着仓"当成"已经平干净"。
         return drill.at_baseline(baseline)
     tick_entry = drill.last_tick()
     price = 0.0
@@ -535,7 +565,7 @@ def _close_position(drill: Drill, pricetick: float, baseline: int = 0) -> bool:
         # 平多(卖出)挂在**买一**(bid_price)上,主动打买盘成交;
         # 平空(买入)挂在**卖一**(ask_price)上,主动打卖盘成交。
         # 用错一边就会挂在对手价上等不到成交,演练变成"平仓超时"。
-        raw = tick.bid_price if delta > 0 else tick.ask_price
+        raw = tick.bid_price if direction == Direction.SHORT else tick.ask_price
         price = round_to(raw or 0, pricetick)
         if price <= 0:
             price = round_to(tick.last_price, pricetick)
@@ -546,12 +576,18 @@ def _close_position(drill: Drill, pricetick: float, baseline: int = 0) -> bool:
     # 上期所/能源中心区分今仓与昨仓:用普通平仓(Offset.CLOSE)会被交易所拒单。
     # 演练开的是**当日**仓,所以要用 CLOSETODAY。
     offset = Offset.CLOSETODAY if contract.exchange in (Exchange.SHFE, Exchange.INE) else Offset.CLOSE
-    # 净持仓为正 = 多头,平仓要用 SHORT;为负 = 空头,平仓要用 LONG。
-    direction = Direction.SHORT if delta > 0 else Direction.LONG
     req = OrderRequest(symbol=code, exchange=contract.exchange, direction=direction,
-                       offset=offset, price=price, volume=abs(delta), type=OrderType.LIMIT)
-    runtime.main.send_order(req, "CTP")
-    return drill.wait_flat(drill.args.close_timeout, baseline=baseline)
+                       offset=offset, price=price, volume=volume, type=OrderType.LIMIT)
+    close_order_id = runtime.main.send_order(req, "CTP")
+    flat = drill.wait_flat(drill.args.close_timeout, baseline=baseline)
+    if flat:
+        drill.owned_volume = 0
+        drill.owned_direction = None
+    else:
+        # 平仓单没成交:它还挂在交易所上,过一会儿成交就会留下一笔"晚到的"持仓,
+        # 账户状态与演练结论就不一致了。撤掉它。
+        _cancel_order(runtime, close_order_id, code, contract.exchange)
+    return flat
 
 
 def scenario_tick_stale(drill: Drill) -> DrillResult:

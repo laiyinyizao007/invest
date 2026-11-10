@@ -46,7 +46,15 @@ def _redact_key(key, secrets: Iterable[str]):
     if isinstance(key, str):
         return redact(key, secrets)
     if key is None or isinstance(key, (int, float, bool)):
-        return key
+        # 数字/布尔键在 `json.dumps` 里会变成字符串("12345"、"true")——
+        # 直接原样保留就等于把"键恰好等于密钥"的场景漏出去。
+        # 所以按 JSON 形态先脱敏:命中就返回脱敏后的字符串(键类型变了,但不会泄密)。
+        try:
+            canonical = json.dumps(key)
+        except Exception:
+            canonical = str(key)
+        safe = redact(canonical, secrets)
+        return safe if safe != canonical else key
     try:
         return redact(str(key), secrets)
     except Exception:
@@ -135,6 +143,7 @@ class WebhookNotifier:
         self.last_error = ""
         self.history: deque[dict] = deque(maxlen=50)   # 最近发送过的消息,便于排查
         self._inflight = 0          # 后台线程已经取走、但还没发完的消息数
+        self._closed = threading.Event()   # 已请求停止:后台线程排空队列后自行退出
 
     @property
     def enabled(self) -> bool:
@@ -173,6 +182,11 @@ class WebhookNotifier:
         try:
             if not self.enabled or LEVELS.get(level, 0) < self.min_level:
                 return False
+            if self._closed.is_set():
+                # 已经关闭:再收的消息只会躺在队列里没人发(后台线程已退出),
+                # 返回 False 让调用方知道"没发出去",而不是假装收下了。
+                self._bump("dropped", 1)
+                return False
             title, message = redact(title, self.secrets), redact(message, self.secrets)
             if level != "FATAL" and self._is_duplicate((level, title, message)):
                 self._bump("dropped", 1)
@@ -205,12 +219,15 @@ class WebhookNotifier:
         - 关闭前把 FATAL 提到队首:退出时最重要的告警("还有持仓")不该排在几十条 INFO 后面。
         """
         thread = self._thread
+        self._closed.set()
         if thread is None:
             return
         self._prioritize_fatal()
         try:
             self._queue.put_nowait(_STOP)
         except queue.Full:
+            # 队列满,哨兵放不进去 —— 无妨:`_closed` 已经置位,
+            # 后台线程排空队列后会自己退出(见 `_worker`)。
             pass
         budget = min(max(drain_timeout, 0.0), MAX_DRAIN_TIMEOUT)
         deadline = time.monotonic() + budget
@@ -291,7 +308,15 @@ class WebhookNotifier:
 
     def _worker(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                # 队列空了。如果已经请求停止,就在这里退出 ——
+                # 不能只依赖队列里的停止哨兵:队列满的时候哨兵根本放不进去,
+                # 后台线程会永远收不到停止信号,close() 只能干等到预算耗尽。
+                if self._closed.is_set():
+                    return
+                continue
             if item is _STOP:
                 return
             # 这条消息已经不在队列里了,但它还没发完 —— 排空预算必须把它算进去

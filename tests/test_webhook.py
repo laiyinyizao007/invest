@@ -651,3 +651,41 @@ def test_close_does_not_wait_forever_when_the_endpoint_hangs(monkeypatch):
     finally:
         release.set()
         httpd.shutdown()
+
+
+def test_close_stops_the_worker_even_when_the_queue_is_full():
+    """队列满的时候停止哨兵放不进去。
+
+    只靠哨兵停线程的话,worker 永远收不到停止信号 → close() 只能干等到预算耗尽,
+    交易进程被吊在退出阶段。所以另外用独立的"已关闭"标志,排空后自行退出。
+    """
+    release, entered = threading.Event(), threading.Event()
+    httpd, url = _hanging_server(release, entered)
+    try:
+        n = WebhookNotifier(url, timeout=5.0, retry_delays=(), max_queue=2)
+        n.send("INFO", "心跳", "第 1 条")      # 被 worker 取走,卡在发送里
+        assert entered.wait(5)
+        n.send("INFO", "心跳", "第 2 条")      # 队列里 1 条
+        n.send("INFO", "心跳", "第 3 条")      # 队列满(2 条)
+        assert n._queue.qsize() == 2
+        release.set()
+        n.close(drain_timeout=5)
+        assert n._thread is not None and not n._thread.is_alive(), "后台线程没有停下来"
+    finally:
+        release.set()
+        httpd.shutdown()
+
+
+def test_send_after_close_is_refused():
+    """关闭之后再收的消息只会躺在队列里没人发 —— 必须明确拒绝,不能让调用方以为收下了。"""
+    n = WebhookNotifier("http://127.0.0.1:1/hook")
+    n._ensure_started = lambda: None
+    n.close()
+    assert n.send("FATAL", "还有持仓", "关闭之后才发的") is False
+
+
+def test_a_numeric_key_equal_to_the_secret_is_redacted():
+    """数字键在 `json.dumps` 里会变成字符串("12345")——
+    键恰好等于密钥时,原样保留就等于把它发出去了。"""
+    obj = redact_obj({12345: "值"}, ["12345"])
+    assert "12345" not in json.dumps(obj, ensure_ascii=False)

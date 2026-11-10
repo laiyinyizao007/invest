@@ -971,14 +971,14 @@ def test_closing_a_short_position_buys_to_close_it():
 
 
 def test_the_close_order_is_priced_on_the_side_it_trades_on():
-    """平多(卖出)要挂在卖一,平空(买入)要挂在买一:
+    """平多(卖出)挂在**买一**上,平空(买入)挂在**卖一**上:
     用错一边就会挂在对手价上等不到成交,演练变成"平仓超时"。"""
     drill = _make_drill()
     drill.ticks.append((time.monotonic(), _Tick(ask=2400.0, bid=2399.0)))
     drill.position_state = [_Pos(volume=1)]
     d._close_position(drill, 1.0)
     close_orders = [r for r in drill.runtime.main.orders if r.offset != Offset.OPEN]
-    assert close_orders and close_orders[0].price == 2399.0        # 卖出 → 卖一
+    assert close_orders and close_orders[0].price == 2399.0        # 卖出 → 买一(bid)
 
     short_drill = _make_drill()
     short_drill.ticks.append((time.monotonic(), _Tick(ask=2400.0, bid=2399.0)))
@@ -987,7 +987,62 @@ def test_the_close_order_is_priced_on_the_side_it_trades_on():
     short_drill.position_state = [short]
     d._close_position(short_drill, 1.0)
     close_orders2 = [r for r in short_drill.runtime.main.orders if r.offset != Offset.OPEN]
-    assert close_orders2 and close_orders2[0].price == 2400.0     # 买入 → 买一
+    assert close_orders2 and close_orders2[0].price == 2400.0     # 买入 → 卖一(ask)
+
+
+def test_the_position_the_drill_opened_is_closed_even_on_a_netting_account():
+    """净持仓账户:持仓回报是 `Direction.NET`,净额算出来是 0。
+
+    只看净额会以为"没有仓位要平" → 既不发平仓单,又把留仓手数误报成 0,
+    仓位留在账户上下次运行还得接着还。演练知道自己开了 1 手多仓,
+    收尾必须按这个手数、方向(卖出平多)去平。
+    """
+    drill = _make_drill()
+    drill.ticks.append((time.monotonic(), _Tick(ask=2400.0, bid=2399.0)))
+    net_pos = _Pos(volume=1)
+    net_pos.direction = Direction.NET
+    drill.position_state = [net_pos]
+    drill.gross_baseline = 0
+    drill.owned_volume = 1
+    drill.owned_direction = Direction.LONG
+    assert d._close_position(drill, 1.0) is True
+    close_orders = [r for r in drill.runtime.main.orders if r.offset != Offset.OPEN]
+    assert close_orders, "净持仓账户下也必须发出平仓单"
+    assert close_orders[0].volume == 1
+    assert close_orders[0].direction == Direction.SHORT       # 开的是多仓 → 用卖出平
+    assert close_orders[0].price == 2399.0                    # 卖出 → 挂买一
+
+
+def test_the_close_order_is_cancelled_when_it_does_not_fill():
+    """平仓单没成交时它还挂在交易所上,过一会儿成交就会留下一笔"晚到的"持仓 ——
+    账户状态与演练结论就不一致了。撤掉它。"""
+    drill = _make_drill()
+    drill.ticks.append((time.monotonic(), _Tick()))
+    drill.position_state = [_Pos(volume=1)]
+    cancelled = []
+
+    class _StuckMain:
+        """平仓单发出去就是不成交(挂在对手价上等不到)。"""
+
+        def __init__(self):
+            self.orders = []
+
+        def get_contract(self, symbol):
+            return _Contract()
+
+        def get_all_positions(self):
+            return drill.position_state
+
+        def send_order(self, req, gateway_name):
+            self.orders.append(req)
+            return "VT.CLOSE"
+
+        def cancel_order(self, req, gateway_name):
+            cancelled.append(req)
+
+    drill.runtime.main = _StuckMain()
+    assert d._close_position(drill, 1.0) is False
+    assert cancelled, "没成交的平仓单必须撤掉"
 
 
 # ---------------- 告警"发出"与"送达"要分开记 ----------------

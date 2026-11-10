@@ -249,6 +249,34 @@ def test_shutdown_gives_the_notifier_time_to_deliver_the_fatal_alert(make):
     assert rt.notifier.close_budget == 42.0
 
 
+def test_shutdown_survives_a_notifier_that_fails_to_close(make):
+    """通知器关闭时抛异常不能打断 shutdown。
+
+    退出码、对账、后续清理都还在这条路径上 —— 通知器是"顺带关一下",
+    不能因为它出错就把整个退出流程炸掉。
+    """
+    class _BrokenNotifier(RecordingNotifier):
+        def close(self, drain_timeout: float = 10.0) -> None:
+            raise RuntimeError("通知器炸了")
+
+    rt = make(notifier=_BrokenNotifier())
+    rt.start()
+    rt.shutdown()               # 不抛异常
+    assert rt.gw.closed
+
+
+def test_shutdown_survives_a_notifier_whose_close_signature_is_different(make):
+    """签名对不上(TypeError)时退回无参关闭,而不是把退出流程打断。"""
+    class _OldNotifier(RecordingNotifier):
+        def close(self) -> None:                    # 旧签名:没有 drain_timeout
+            super().close()
+
+    rt = make(notifier=_OldNotifier())
+    rt.start()
+    rt.shutdown()
+    assert rt.notifier.closed
+
+
 def test_run_returns_refusal_code_and_always_shuts_down(make):
     rt = make()
     rt.gw.set_position(Direction.LONG, 1)

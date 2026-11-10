@@ -409,7 +409,22 @@ class TradingRuntime:
         except TypeError:
             # 通知器不是本项目的实现(签名里没有 drain_timeout):退回不带参数的关闭,
             # 绝不能让"签名对不上"把退出流程本身打断 —— 那会让告警根本发不出去。
-            self.notifier.close()
+            try:
+                self.notifier.close()
+            except Exception as exc:       # noqa: BLE001
+                # 通知器自己的关闭再出错也不能打断 shutdown:退出码、对账、
+                # 后续清理都还在这条路径上。
+                self._log_notifier_error(exc)
+        except Exception as exc:           # noqa: BLE001
+            # 同上:关闭通知器失败不能把退出流程打断。
+            self._log_notifier_error(exc)
+
+    def _log_notifier_error(self, exc: Exception) -> None:
+        """记录通知器关闭失败。写日志本身也不能再抛 —— 这已经在退出路径上了。"""
+        try:
+            self.main.write_log(f"通知器关闭失败(已忽略): {exc!r}", source="Runtime")
+        except Exception:
+            pass
 
     def _on_hard_lock(self, event: Event) -> None:
         data = event.data
