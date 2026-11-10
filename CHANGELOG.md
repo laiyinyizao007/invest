@@ -37,6 +37,11 @@
 - 明确记录:**15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次**,新候选策略不能再用它做最终确认。
 
 ### Fixed（修复）
+- **Docker 容器连不上 SimNow 的根因**:`vnpy_ctp` 的 `toUtf()` 硬编码 `std::locale("zh_CN.GB18030")`,Debian slim 镜像默认无此 locale,CTP 回调线程抛异常导致进程 abort(无 CTP 错误日志)。Dockerfile 已加 `locales` + `localedef -i zh_CN -f GB18030 zh_CN.GB18030`。
+- `scripts/backtest_lib.py`:回测异常检测改用精确哨兵(`Traceback` / `触发异常`),避免普通日志含"异常"二字被误报;`run_engine_bars` 补充统计口径说明(按自然日分组,与日线基准的夏普不可直接比较)。
+- `scripts/run_gui.py`:合约事件去重,CTP 重连重发合约表时不会重复订阅;自动订阅的合约缺交易所后缀时给出提示而不是静默不订阅。
+- `scripts/optimize_15m.py`:`--data` 换文件后 K 线缓存按路径取键,不会继续用上一份数据。
+- `trading/runtime.py`:网关连接只通知一次(行情/交易各报一次"登录成功"不再重复告警)。
 - 修正 `DB_TZ` 与系统时区不一致导致 vn.py 读回 K 线整体偏移 16 小时的问题(根因:`vnpy_sqlite` 读取时按系统本地时区解释无时区时间)。
 - 数据源 OHLC 自相矛盾的行改为修复而非丢弃(PP 2020-08-06、L 2007-07-31 各 1 行)。
 - CSV 改为先写临时文件再原子替换,避免写入中断损坏已积累的分钟历史。

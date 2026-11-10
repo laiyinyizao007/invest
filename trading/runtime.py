@@ -36,9 +36,12 @@ from vnpy_ctastrategy import CtaStrategyApp
 
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
+from trading.guard_rule import ACCOUNT_RULE_NAME
 from trading.safe_risk import SafeRiskManagerApp
 
 EXIT_OK = 0
+# 启动里程碑:名称取自 vnpy_ctp 的日志文本,升级 vnpy_ctp 时措辞若变,这里要同步。
+MILESTONES = ("行情服务器登录成功", "交易服务器登录成功", "结算信息确认成功", "合约信息查询成功")
 EXIT_STARTUP_FAILED = 3
 EXIT_RECONCILE_REFUSED = 4
 
@@ -100,7 +103,7 @@ class TradingRuntime:
         self.gateway: BaseGateway = self.main.add_gateway(gateway_class, config.gateway_name)
         self.risk = self.main.add_app(SafeRiskManagerApp)
         self.cta = self.main.add_app(CtaStrategyApp)
-        self.rule = self.risk.rules["账户风控"]
+        self.rule = self.risk.rules[ACCOUNT_RULE_NAME]
         self.cta.classes = strategy_classes or {"TrendAtrStrategy": TrendAtrStrategy}
         self.cta.load_strategy_data()                # 恢复上次保存的策略状态(持仓/止损);策略配置每次启动都由我们给定
         self.cta.register_event()
@@ -114,6 +117,7 @@ class TradingRuntime:
         self._last_tick: float | None = None
         self._t_connect: float | None = None
         self._milestones: dict[str, float] = {}
+        self._login_notified = False
         self._last_stale_alert = -1e9
         self._last_heartbeat = self._mono()
         self._last_touch = -1e9
@@ -147,21 +151,23 @@ class TradingRuntime:
         t = event.data
         self.notify("INFO", "成交", f"{t.vt_symbol} {t.direction.value}{t.offset.value} {t.volume}@{t.price}")
 
-    MILESTONES = ("行情服务器登录成功", "交易服务器登录成功", "结算信息确认成功", "合约信息查询成功")
-
     def _on_log(self, event: Event) -> None:
         log = event.data
         if log.gateway_name != self.config.gateway_name:
             return
         msg = log.msg
         if self._t_connect is not None:
-            for m in self.MILESTONES:
+            for m in MILESTONES:
                 if m in msg:
                     self._milestones.setdefault(m, self._mono() - self._t_connect)
         if "连接断开" in msg:
+            self._login_notified = False
             self.notify("ERROR", "网关连接断开", msg)
         elif "登录成功" in msg:
-            self.notify("INFO", "网关已连接", msg)
+            # 行情服务器与交易服务器各会报一次"登录成功",只通知一次;各阶段耗时由里程碑记录
+            if not self._login_notified:
+                self._login_notified = True
+                self.notify("INFO", "网关已连接", msg)
         elif log.level >= ERROR:
             self.notify("WARN", "网关错误", msg)
 
@@ -212,10 +218,14 @@ class TradingRuntime:
         return None
 
     def _milestone_report(self) -> str:
-        """启动各阶段距离发起连接的秒数,用于判断慢在哪一步(登录/结算确认/全市场合约表下载)。"""
-        if not self._milestones:
+        """启动各阶段距离发起连接的秒数,用于判断慢在哪一步(登录/结算确认/全市场合约表下载)。
+
+        里程碑由事件线程写入,这里读取时先复制一份快照,避免遍历时字典被并发改动。
+        """
+        snapshot = dict(self._milestones)
+        if not snapshot:
             return "无任何里程碑"
-        return ", ".join(f"{k}={v:.1f}s" for k, v in sorted(self._milestones.items(), key=lambda kv: kv[1]))
+        return ", ".join(f"{k}={v:.1f}s" for k, v in sorted(snapshot.items(), key=lambda kv: kv[1]))
 
     def _check_state_writable(self) -> str | None:
         """状态目录必须可写,否则风控状态(尤其是硬锁定)写不进磁盘,重启后会被"洗掉"。Docker 挂载卷默认属 root,容器内 uid 1000 写不进。"""

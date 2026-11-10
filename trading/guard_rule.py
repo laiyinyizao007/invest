@@ -35,6 +35,7 @@ from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CLOSING_OFFSETS = {Offset.CLOSE, Offset.CLOSETODAY, Offset.CLOSEYESTERDAY}
+ACCOUNT_RULE_NAME = "账户风控"   # 规则在 RiskEngine.rules 里的键名,多处引用,别再写魔法字符串
 ERROR_WINDOW = 3.0                      # 废单与其错误日志的最大时间差(秒,前后均可)
 MIN_POSITION_REFRESH_TIMEOUT = 3.0     # 等持仓回报的下限(秒)
 CANCEL_RETRY_SECONDS = 10.0             # 撤单请求发出后多久仍未终结则允许再次撤单
@@ -44,7 +45,7 @@ FLATTEN_REF = "account_guard_flatten"   # 紧急平仓委托的标记,废单处�
 class AccountGuardRule(RuleTemplate):
     """账户风控规则"""
 
-    name: str = "账户风控"
+    name: str = ACCOUNT_RULE_NAME
 
     parameters: dict[str, str] = {
         "daily_loss_limit": "当日熔断(元)",

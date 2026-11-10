@@ -67,6 +67,18 @@ def test_strategy_exception_is_not_swallowed():
         run_engine_bars(Boom, SETTING, KEY, synthetic_bars(5))
 
 
+def test_exception_detection_uses_exact_sentinels():
+    """只用精确哨兵:含"异常"二字的普通日志不能误报,真正的 traceback 必须报出来。"""
+    from backtest_lib import _raise_if_strategy_failed
+
+    _raise_if_strategy_failed(["数据异常提示(仅日志)"])          # 不抛
+    _raise_if_strategy_failed(["回放进度：100%"])                # 不抛
+    with pytest.raises(RuntimeError):
+        _raise_if_strategy_failed(["触发异常，回测终止"])
+    with pytest.raises(RuntimeError):
+        _raise_if_strategy_failed(["Traceback (most recent call last): ..."])
+
+
 def test_strategy_refuses_live_ticks():
     strategy = TrendAtr15mStrategy.__new__(TrendAtr15mStrategy)
     with pytest.raises(RuntimeError, match="仅用于研究回测"):
@@ -110,9 +122,26 @@ def test_grid_matches_the_preregistered_plan():
 
 
 def test_valid_score_requires_enough_fills_and_finite_sharpe():
+    assert o.MIN_FILLS == 100
     assert o.valid_score({"sharpe": 1.0, "fills": o.MIN_FILLS - 1}) == float("-inf")
     assert o.valid_score({"sharpe": float("nan"), "fills": 500}) == float("-inf")
     assert o.valid_score({"sharpe": 0.7, "fills": o.MIN_FILLS}) == 0.7
+
+
+def test_bar_cache_is_keyed_by_the_data_file(monkeypatch, tmp_path):
+    """换 --data 必须重新读盘,不能继续用上一份 K 线。"""
+    calls = []
+
+    def fake_load(path, symbol, exchange):
+        calls.append(path)
+        return []
+
+    monkeypatch.setattr(o, "load_bars_csv", fake_load)
+    o.all_bars(tmp_path / "a.csv")
+    o.all_bars(tmp_path / "a.csv")
+    assert calls == [tmp_path / "a.csv"], "同一路径应命中缓存"
+    o.all_bars(tmp_path / "b.csv")
+    assert calls == [tmp_path / "a.csv", tmp_path / "b.csv"], "换了 --data 必须重新读盘"
 
 
 def test_test_window_is_not_evaluated_unless_requested(monkeypatch, capsys, tmp_path):

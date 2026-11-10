@@ -9,7 +9,7 @@
 与无头版(run_headless.py)的区别:
 - 同样挂载账户风控(日亏 600 元 / 累计回撤 2000 元硬锁定、平仓放行等),界面里手动下单也受它约束;
 - **没有**启动对账、行情停更/持仓漂移/策略崩溃看门狗和 Webhook 告警——这些只在无头版里;
-- 硬锁定生效时本脚本拒绝连接;
+- 硬锁定生效时本脚本拒绝**自动**连接(手动从菜单连接不受本脚本拦截);
 - 策略在界面的 CTA 策略页里手动添加、初始化、启动(策略类 TrendAtrStrategy 会被自动发现);
 - 与无头版**不要同时运行**:两个进程会共用同一个账号和 .vntrader 下的策略状态文件。
 
@@ -24,13 +24,14 @@ import bootstrap
 
 from dotenv import load_dotenv
 
+from trading.guard_rule import ACCOUNT_RULE_NAME
 from trading.runtime import build_ctp_setting
 
 
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--no-connect", action="store_true", help="不自动连接,用界面菜单手动连接")
-    parser.add_argument("--subscribe", default=os.environ.get("LIVE_VT_SYMBOL", ""),
+    parser.add_argument("--subscribe", default=(env if env is not None else os.environ).get("LIVE_VT_SYMBOL", ""),
                         help="合约表到位后自动订阅的合约,如 c2701.DCE(默认取 LIVE_VT_SYMBOL;留空则不订阅)")
     parser.add_argument("--check", action="store_true", help="只校验配置与依赖,不打开界面")
     return parser.parse_args(argv)
@@ -59,6 +60,8 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
 
+    subscribed: set[str] = set()
+
     def on_alert(event):
         a = event.data
         main_engine.write_log(f"[风控 {a['level']}] {a['title']}: {a['message']}")
@@ -68,9 +71,13 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
 
     def on_contract(event):
         c = event.data
-        if subscribe and c.vt_symbol == subscribe:           # 合约表到位后自动订阅,否则界面的行情表是空的
+        if subscribe and c.vt_symbol == subscribe and c.vt_symbol not in subscribed:
+            # 合约表到位后自动订阅,否则界面的行情表是空的;CTP 重连会重发合约表,靠 subscribed 去重
+            subscribed.add(c.vt_symbol)
             main_engine.subscribe(SubscribeRequest(symbol=c.symbol, exchange=c.exchange), c.gateway_name)
             main_engine.write_log(f"已自动订阅行情: {subscribe}")
+        elif subscribe and c.vt_symbol == subscribe:
+            main_engine.write_log(f"已订阅过 {subscribe},忽略重复的合约事件")
 
     event_engine.register(EVENT_CONTRACT, on_contract)
     event_engine.register(EVENT_GUARD_ALERT, on_alert)
@@ -79,8 +86,11 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()
 
+    if subscribe and "." not in subscribe:
+        main_engine.write_log(f"自动订阅的合约 {subscribe} 缺少交易所后缀(应形如 c2701.DCE),不会自动订阅")
+
     if auto_connect:
-        rule = risk.rules["账户风控"]
+        rule = risk.rules[ACCOUNT_RULE_NAME]
         if rule.guard.hard_locked:
             main_engine.write_log(f"硬锁定生效中,不连接: {rule.guard.hard_reason}。核对后用 scripts/unlock_account.py 解锁。")
         else:
@@ -93,7 +103,7 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     if env is None:
         load_dotenv(bootstrap.ROOT / ".env", override=False)
         env = os.environ
-    args = parse_args(argv)
+    args = parse_args(argv, env)
     try:
         build_ctp_setting(env)
         import PySide6  # noqa: F401

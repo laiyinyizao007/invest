@@ -77,3 +77,50 @@ def test_gui_subscribes_to_the_symbol_once_its_contract_arrives(monkeypatch):
         assert subs == [("c2701.DCE", "CTP")]
     finally:
         engine.close()
+
+
+def test_repeated_contract_events_do_not_subscribe_twice(monkeypatch):
+    """CTP 重连会重发合约表;重复订阅没有意义,也不能无限发。"""
+    pytest.importorskip("PySide6")
+    from vnpy.event import Event
+    from vnpy.trader.constant import Exchange, Product
+    from vnpy.trader.engine import MainEngine
+    from vnpy.trader.event import EVENT_CONTRACT
+    from vnpy.trader.object import ContractData
+    subs = []
+    monkeypatch.setattr(MainEngine, "subscribe", lambda self, req, name: subs.append((req.vt_symbol, name)))
+    qapp, window, engine = run_gui.build_gui(ENV, auto_connect=False, subscribe="c2701.DCE")
+    try:
+        contract = ContractData(symbol="c2701", exchange=Exchange.DCE, name="c2701", product=Product.FUTURES,
+                                size=10, pricetick=1, gateway_name="CTP")
+        for _ in range(3):
+            engine.event_engine.put(Event(EVENT_CONTRACT, contract))
+        import time
+        for _ in range(50):
+            if subs:
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)                                    # 多等一会儿,确认没有第二次
+        assert subs == [("c2701.DCE", "CTP")]
+    finally:
+        engine.close()
+
+
+def test_symbol_without_exchange_suffix_is_reported(monkeypatch):
+    """少写交易所后缀会导致永远匹配不上合约,必须给出提示而不是静默不订阅。"""
+    pytest.importorskip("PySide6")
+    logs = []
+    from vnpy.trader.engine import MainEngine
+    monkeypatch.setattr(MainEngine, "write_log", lambda self, msg, *a, **kw: logs.append(msg))
+    qapp, window, engine = run_gui.build_gui(ENV, auto_connect=False, subscribe="c2701")
+    try:
+        assert any("缺少交易所后缀" in m for m in logs)
+    finally:
+        engine.close()
+
+
+def test_subscribe_default_comes_from_the_given_env():
+    args = run_gui.parse_args([], env={"LIVE_VT_SYMBOL": "c2701.DCE"})
+    assert args.subscribe == "c2701.DCE"
+    args = run_gui.parse_args([], env={})
+    assert args.subscribe == ""

@@ -12,6 +12,18 @@ from strategies.instruments import INSTRUMENTS
 
 DEFAULT_CAPITAL = 10_000
 
+# vn.py 在策略抛异常时会把 traceback 写进 engine.output("触发异常，回测终止" + traceback)。
+# 只认这两个精确哨兵:策略自己的日志走 BacktestingEngine.logs(不进 output),但用宽泛的
+# "异常"二字判断,一旦 vn.py 改动就会误报(策略日志含"异常")或漏报(文案变化)。
+EXCEPTION_SENTINELS = ("Traceback", "触发异常")
+
+
+def _raise_if_strategy_failed(messages: list[str]) -> None:
+    """vn.py 回测时遇到策略异常只打印日志就返回,结果是半截的,必须当错误处理。"""
+    for msg in messages:
+        if any(s in msg for s in EXCEPTION_SENTINELS):
+            raise RuntimeError(f"回测中策略抛出异常:\n{msg}")
+
 
 def run_engine(
     strategy_class,
@@ -47,15 +59,16 @@ def run_engine(
         raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
-    # vn.py 在策略抛异常时只打印"回测终止"并返回,结果会是半截的,必须当错误处理
-    for msg in messages:
-        if "Traceback" in msg or "触发异常" in msg or "异常" in msg:
-            raise RuntimeError(f"回测中策略抛出异常:\n{msg}")
+    _raise_if_strategy_failed(messages)
     return engine
 
 
 def load_bars_csv(path, symbol: str, exchange: Exchange, interval: Interval = Interval.MINUTE) -> list[BarData]:
-    """读 import_minute.py 输出的 K 线 CSV(时间戳为开始时间,已复权),转成 vn.py BarData 列表。"""
+    """读 import_minute.py 输出的 K 线 CSV(时间戳为开始时间,已复权),转成 vn.py BarData 列表。
+
+    注意:vn.py 没有 15 分钟的 Interval 枚举,这里用 MINUTE **占位**。这些 bar 只用于内存回放,
+    **不要把它们写进 vn.py 数据库**——落库后会被当成 1 分钟线读回,周期全错。
+    """
     df = pd.read_csv(path, parse_dates=["datetime"])
     return [
         BarData(symbol=symbol, exchange=exchange, datetime=row.datetime, interval=interval,
@@ -74,7 +87,12 @@ def run_engine_bars(
     interval: Interval = Interval.MINUTE,
     cost_multiplier: float = 1.0,
 ) -> BacktestingEngine:
-    """直接用给定的 K 线回放(不经过数据库),用于数据库放不下的周期(如 15 分钟)。成本口径同 run_engine。"""
+    """直接用给定的 K 线回放(不经过数据库),用于数据库放不下的周期(如 15 分钟)。成本口径同 run_engine。
+
+    注意:绩效统计沿用 vn.py 的口径——逐日盈亏按**日历日**分组、年化因子固定 240(日线口径)。
+    对日内周期(夜盘与次日日盘同属一个交易日)来说,夏普的数值不能与日线回测直接比大小;
+    收益率、净盈亏、成本、回撤金额不受影响。详见 docs/adr/20261110-baseline-15m.md。
+    """
     if not bars:
         raise RuntimeError(f"{key} 没有可回放的 K 线")
     inst = INSTRUMENTS[key]
@@ -95,9 +113,7 @@ def run_engine_bars(
     engine.add_strategy(strategy_class, setting)
     engine.history_data = list(bars)
     engine.run_backtesting()
-    for msg in messages:
-        if "Traceback" in msg or "触发异常" in msg or "异常" in msg:
-            raise RuntimeError(f"回测中策略抛出异常:\n{msg}")
+    _raise_if_strategy_failed(messages)
     return engine
 
 

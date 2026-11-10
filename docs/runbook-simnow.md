@@ -11,7 +11,7 @@
 | 主机端 SimNow 启动管道(连接→授权→登录→结算确认→合约表→策略初始化→订阅→优雅停止) | ✅ 已跑通一次(第一套,真实 CTP) |
 | 启动各阶段耗时可观测(里程碑日志) | ✅ 已实现 |
 | Docker 镜像构建 + 容器内 `vnpy_ctp` 导入 + `run_headless.py --check` | ✅ 已验证 |
-| **容器内连接 SimNow 并稳定运行** | ❌ 未验证(下一步) |
+| **容器内连接 SimNow** | ⚠ 手工在容器内 `localedef` 后交易/行情登录成功;修复已进 Dockerfile,完整流程待复测 |
 | 第 5 节 10 项实测(废单文本/回报时序/断线/kill -9/熔断/夜盘/断流/撮合差异) | ❌ 全部待做 |
 | 连续 ≥ 5 个交易日无人值守 | ❌ 未开始 |
 | Webhook 告警实际到达手机 | ❌ 未验证 |
@@ -120,7 +120,34 @@ python scripts/run_headless.py --check
 ## 10. Docker 镜像(2026-11-10 实测)
 `docker build` 在 x86_64 上成功:`vnpy_ctp` 在 Linux 下从源码编译并可导入,容器内 `run_headless.py --check` 通过。
 Docker 拉取镜像曾只有约 10 KB/s,后来恢复到正常(`python:3.12-slim` 约 30 秒),原因未查明,可能与代理/网络波动有关;宿主机直连与走代理下载都约 4 MB/s。
-**尚未验证**:容器内连接 SimNow 并稳定运行(镜像构建和配置检查不等于连通)。下一步做法:
+
+### 10.1 必须安装 `zh_CN.GB18030` locale(踩过的坑)
+容器第一次连 SimNow 时进程在 CTP 回调线程里直接 abort,日志只有一行:
+```
+terminate called after throwing an instance of 'std::runtime_error'
+  what():  locale::facet::_S_create_c_locale name not valid
+```
+原因:`vnpy_ctp` 的 `toUtf()` 里硬编码了 `std::locale("zh_CN.GB18030")`。Debian slim 镜像默认只带 `C` / `C.utf8` / `POSIX`,
+构造这个 locale 抛异常 → CTP 回调线程 `std::terminate` → 整个进程挂掉,**没有任何 CTP 错误日志**。
+定位办法:`objdump -s` 看 `vnctpmd.so` 的 .rodata,能看到字面量 `zh_CN.GB18030`。
+修法(Dockerfile 里已加,别删):
+```dockerfile
+apt-get install -y --no-install-recommends locales
+localedef -i zh_CN -f GB18030 zh_CN.GB18030
+```
+只装 `locales` 不生成 `zh_CN.GB18030` 无效;只生成 `zh_CN.UTF-8` 也无效(名字必须完全一致)。
+`LANG=C LC_ALL=C` 不能绕过——失败路径是 `std::locale(name)`,不是环境变量。
+
+### 10.2 当前状态
+| 项 | 状态 |
+|---|---|
+| 镜像构建 + `vnpy_ctp` 导入 + `--check` | ✅ |
+| 容器内连上 SimNow(交易/行情服务器连接并登录成功) | ✅ 2026-11-10 在容器内手工执行 `localedef` 后实测通过 |
+| 容器内 `结算信息确认成功` / `合约信息查询成功` | ❌ 未确认(该步耗时 20 秒~3 分钟,视 SimNow 返回全市场合约表而定) |
+| 由 Dockerfile 自动生成 locale 后跑完整流程 | ❌ 未复测(修复已进 Dockerfile,待下一次 `docker compose up -d --build` 验证) |
+| ≥5 个交易日无人值守 | ❌ 未开始 |
+
+下一步做法:
 ```bash
 docker compose up -d --build
 docker compose logs -f trader     # 观察是否出现"合约信息查询成功"

@@ -24,6 +24,7 @@ from optimize import smoothed
 from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 
 DATA_FILE = Path(r"C:\Dev\data\invest\derived\C_15m_adj.csv")
+# 购买数据与派生产物都在仓库之外,换机器/换目录时用 --data 覆盖(见 main)。
 KEY = "C15"
 WINDOWS = {
     "train": (datetime(2020, 7, 22), datetime(2022, 12, 31, 23, 59)),
@@ -37,14 +38,15 @@ MIN_FILLS = 100            # 训练段成交笔数(开+平)少于此值不参与
 MIN_ROUND_TRIPS_NOTE = 150  # 与晋级门槛一致:往返少于此值夏普没有统计意义
 
 
-@lru_cache(maxsize=1)
-def all_bars():
-    return load_bars_csv(DATA_FILE, "CADJ15", Exchange.DCE)
+@lru_cache(maxsize=4)
+def all_bars(data_file: Path):
+    """按文件路径缓存,换 --data 时缓存键自然变化,不会误用上一份 K 线。"""
+    return load_bars_csv(data_file, "CADJ15", Exchange.DCE)
 
 
 def window_bars(window: str):
     start, end = WINDOWS[window]
-    return [b for b in all_bars() if start <= b.datetime <= end]
+    return [b for b in all_bars(DATA_FILE) if start <= b.datetime <= end]
 
 
 def evaluate(params: dict, window: str, cost_multiplier: float = 1.0) -> dict:
@@ -85,12 +87,17 @@ def report(label: str, window: str, res: dict, note: str = "") -> None:
         flag = f"  [!] 往返仅 {res['round_trips']} 笔(<{MIN_ROUND_TRIPS_NOTE}),夏普无统计意义,只能说'无法证明优势'"
     print(f"  {label:12s} {start:%Y-%m}~{end:%Y-%m}: 收益 {res['return_pct']:7.1f}%  最大回撤 {res['maxdd_pct']:6.1f}% ({res['maxdd_yuan']:7.0f}元)  "
           f"夏普 {res['sharpe']:5.2f}  往返 {res['round_trips']:4d} 笔  净盈亏 {res['net_pnl']:8.0f}元  成本 {res['total_cost']:7.0f}元{note}{flag}")
+    print("           注:夏普按 vn.py 的自然日分组计算(夜盘与次日日盘分属两天),与日线基准的夏普数值不可直接比较;"
+          "收益/净盈亏/成本/回撤的绝对值不受影响。")
 
 
 def main(argv: list[str] | None = None) -> int:
+    global DATA_FILE
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--test", action="store_true", help="最终确认:查看测试段(只应运行一次)")
+    parser.add_argument("--data", default=str(DATA_FILE), help=f"15 分钟复权 K 线 CSV(默认 {DATA_FILE})")
     args = parser.parse_args(argv)
+    DATA_FILE = Path(args.data)
 
     combos = grid()
     print(f"[{KEY}] 数据 {DATA_FILE.name};训练段 {WINDOWS['train'][0]:%Y-%m-%d}~{WINDOWS['train'][1]:%Y-%m-%d},共 {len(combos)} 组参数")

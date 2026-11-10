@@ -1,4 +1,4 @@
-# 交易节点镜像(x86_64 Linux)。vnpy_ctp 在 PyPI 上没有 Linux 预编译包,需要从源码编译,所以安装了编译工具链。
+# 交易节点镜像(x86_64 Linux)。PyPI 上 vnpy_ctp 只有 Windows 预编译包,Linux 下需要编译 pybind11 扩展模块,所以装了编译工具链。
 FROM python:3.13-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -9,6 +9,14 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# vnpy_ctp 的 toUtf() 硬编码 std::locale("zh_CN.GB18030");slim 镜像默认没有这个 locale,
+# CTP 回调线程构造失败会抛 std::runtime_error -> std::terminate -> 整个进程 abort。
+# 单独一层:上面的工具链层可以命中缓存,不必为这一个 locale 重下 gcc。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends locales \
+    && localedef -i zh_CN -f GB18030 zh_CN.GB18030 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
