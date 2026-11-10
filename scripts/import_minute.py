@@ -47,6 +47,10 @@ def load_minutes(folder: Path, product: str) -> dict[str, pd.DataFrame]:
         raise FileNotFoundError(f"没有找到分钟线文件: {folder}/月份连续/*/*.csv")
     parts: dict[str, list[pd.DataFrame]] = {}
     for f in files:
+        header = pd.read_csv(f, encoding="utf-8-sig", nrows=0).columns
+        lacking = [c for c in USECOLS if c not in header]
+        if lacking:
+            raise ValueError(f"{f.name} 缺少必需列: {', '.join(lacking)}(需要 {', '.join(USECOLS)})")
         df = pd.read_csv(f, encoding="utf-8-sig", usecols=USECOLS, parse_dates=["datetime"])
         for symbol, g in df.groupby("symbol"):
             parts.setdefault(contract_code(str(symbol), product), []).append(g.drop(columns="symbol"))
@@ -93,10 +97,12 @@ def daily_from_minutes(df: pd.DataFrame, calendar: np.ndarray) -> pd.DataFrame:
 
 
 def extend_with_sina(frames: dict[str, pd.DataFrame], product: str, fetch=fetch_contract,
-                     months: tuple[int, ...] = (1, 3, 5, 7, 9, 11)) -> dict[str, int]:
+                     months: tuple[int, ...] = tuple(range(1, 13)), failures: list | None = None) -> dict[str, int]:
     """数据结束日之后的交易日用新浪日线补齐(原地修改 frames)。返回 合约 -> 补入的天数。
 
     只补每个合约"已有数据最后一天"之后的日期(从未出现过的合约则只补整体结束日之后),成交量为 0 的日子不补。
+    候选月份默认 1-12 全月(不假设品种只有奇数月合约);不存在的合约新浪返回空,无副作用。
+    取数失败的合约会追加到 failures(调用方据此判定缺口不完整)。
     """
     added: dict[str, int] = {}
     end = max(f["datetime"].max() for f in frames.values())
@@ -110,6 +116,8 @@ def extend_with_sina(frames: dict[str, pd.DataFrame], product: str, fetch=fetch_
             sina = fetch(code)
         except Exception as exc:
             warnings.warn(f"{code}: 新浪取数失败,缺口可能不完整: {exc!r}", stacklevel=2)
+            if failures is not None:
+                failures.append(code)
             continue
         if sina is None or sina.empty:
             continue
@@ -155,6 +163,8 @@ def build_intraday(minutes: dict[str, pd.DataFrame], series: pd.DataFrame, rolls
     off = offsets_by_day(series, rolls)
     chunks = []
     for code, g in series[series["datetime"] <= last_minute_day].groupby("contract"):
+        if code not in minutes:        # 新浪补入的合约没有分钟线(数据恰在夜盘中途结束时可能成为主力),跳过
+            continue
         d = minutes[code]
         d = d.assign(trading_day=assign_trading_day(d["datetime"], calendar))
         days = pd.DatetimeIndex(g["datetime"])
@@ -223,8 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"读入 {len(minutes)} 个合约 {min(minutes, key=contract_expiry)}~{max(minutes, key=contract_expiry)},"
           f"分钟线 {sum(len(d) for d in minutes.values())} 根,交易日 {len(calendar)} 天")
 
+    sina_failed: list[str] = []
     if not a.no_sina:
-        added = extend_with_sina(frames, a.product.upper())
+        added = extend_with_sina(frames, a.product.upper(), failures=sina_failed)
         print("新浪日线补齐: " + (", ".join(f"{c}+{n}" for c, n in added.items()) or "无新增"))
 
     series, rolls = build_continuous(frames)
@@ -233,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"去掉起点附近成交冷清的 {total - len(series)} 个交易日,序列从 {series['datetime'].min():%Y-%m-%d} 开始")
     bars = build_intraday(minutes, series, rolls, calendar, a.minutes)
     problems = validate(bars) + [f"日线: {x}" for x in validate(series)]
+    if sina_failed:
+        problems.append(f"新浪取数失败,缺口可能不完整: {', '.join(sina_failed)}")
     missing = days_without_bars(bars, series)
     if missing:
         problems.append(f"{len(missing)} 个交易日有日线却没有分钟线(如 {missing[0]:%Y-%m-%d}):该日主力合约的分钟数据缺失")

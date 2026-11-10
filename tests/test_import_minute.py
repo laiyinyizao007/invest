@@ -96,6 +96,40 @@ def test_load_minutes_merges_files_dedups_and_drops_nonpositive_prices(tmp_path)
     assert (d[["open", "close"]] > 0).all(axis=None) and len(d) == len(a) - 1
 
 
+def test_load_minutes_reports_missing_columns_clearly(tmp_path):
+    (tmp_path / "月份连续" / "01月").mkdir(parents=True)
+    pd.DataFrame({"datetime": ["2026-03-02 09:00:00"], "symbol": ["DCE.c2105"], "open": [1.0]}).to_csv(
+        tmp_path / "月份连续" / "01月" / "C_01月_1m.csv", index=False)
+    with pytest.raises(ValueError, match="缺少必需列"):
+        im.load_minutes(tmp_path, "C")
+
+
+def test_intraday_skips_contracts_that_only_exist_in_the_sina_extension():
+    mins, series, rolls = adjusted()
+    series = series.copy()
+    series.loc[series.index[-1], "contract"] = "C2609"            # 最后一天的主力来自新浪补齐,没有分钟线
+    bars = im.build_intraday(mins, series, rolls, CAL, 15)       # 不应因 C2609 不在 minutes 里而 KeyError
+    assert "C2609" not in set(bars["contract"])
+
+
+def test_main_fails_when_sina_gap_fill_failed(tmp_path, monkeypatch, capsys):
+    base = tmp_path / "X" / "C_玉米" / "月份连续"
+    (base / "05月").mkdir(parents=True)
+    (base / "09月").mkdir(parents=True)
+    mins = two_contracts()
+    mins["C2105"].assign(symbol="DCE.c2105").to_csv(base / "05月" / "C_05月_1m.csv", index=False, encoding="utf-8-sig")
+    mins["C2109"].assign(symbol="DCE.c2109").to_csv(base / "09月" / "C_09月_1m.csv", index=False, encoding="utf-8-sig")
+    monkeypatch.setattr(im, "trim_illiquid_start", lambda s, r, *a, **k: (s, r))
+
+    def fake_extend(frames, product, failures=None, **k):
+        failures.append("C2109")
+        return {}
+
+    monkeypatch.setattr(im, "extend_with_sina", fake_extend)
+    rc = im.main(["--root", str(tmp_path), "--exchange", "X", "--folder", "C_玉米", "--product", "C"])
+    assert rc == 1 and "新浪取数失败" in capsys.readouterr().out
+
+
 def test_load_minutes_without_files_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
         im.load_minutes(tmp_path, "C")
@@ -119,6 +153,25 @@ def test_extend_with_sina_only_adds_days_after_the_data_end_and_skips_zero_volum
     d = frames["C2609"]
     assert list(d["datetime"].iloc[-2:]) == [pd.Timestamp("2026-03-10"), pd.Timestamp("2026-03-12")]
     assert (d["datetime"] <= end).sum() == len(DAYS) and d["datetime"].is_monotonic_increasing
+
+
+def test_extend_with_sina_covers_even_months_too():
+    frames = {"C2609": im.daily_from_minutes(two_contracts()["C2105"], CAL)}
+    asked = []
+    im.extend_with_sina(frames, "C", fetch=lambda code: asked.append(code))
+    assert "C2612" in asked and "C2610" in asked and "C2603" in asked
+
+
+def test_extend_with_sina_reports_which_contracts_failed():
+    frames = {"C2609": im.daily_from_minutes(two_contracts()["C2105"], CAL)}
+    failures = []
+
+    def boom(code):
+        raise RuntimeError("network")
+
+    with pytest.warns(UserWarning):
+        im.extend_with_sina(frames, "C", fetch=boom, failures=failures)
+    assert "C2609" in failures
 
 
 def test_extend_with_sina_survives_fetch_errors():
