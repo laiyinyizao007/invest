@@ -14,6 +14,12 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 国信测试报告的取证与自动生成(Issue [#9](https://github.com/laiyinyizao007/invest/issues/9)):
+  `scripts/broker_test.py` 在国信测试环境的同一条真实连接上挂载真实风控,逐项演示 18 个测试项(穿透 T1–T7、程序化 P1.1–P6.1),
+  产出脱敏证据 JSON 与渲染成图片的"截图"(`--resume` 增量补测,新的 SKIP 不覆盖旧的 PASS/FAIL);
+  `scripts/broker_report.py` 用 lxml 直接填国信原模板 docx(不新增依赖):以文字定位单元格、先精确再前缀勾选、**不默认勾通过**(模板预勾选一律重置)、
+  不碰国信填写区、列出"报告里还缺什么";模板含国信测试环境 IP 不入库(`--template`/`BROKER_REPORT_TEMPLATE`)。
+  已用真实模板填写验证,Word 可正常打开。`.env.example` 增 `BROKER_TEST_*`;`docs/live-readiness.md` 增 C2b;`docs/broker-filing.md` 增 11 项对照表。
 - 国信程序化测试合规的功能缺口(Issue [#8](https://github.com/laiyinyizao007/invest/issues/8),依据国信《外部接入系统技术测试报告》模板):
   ① 阈值预警——风控规则触达笔数/手数/金额上限时发 WARN「风控阈值触发」告警(走既有 Webhook,按指标 300 秒节流;校验失败类不预警);
   ② 暂停交易——`scripts/pause_trading.py on|off|status` 写/删 `data/state/pause_trading.flag`,标志存在时拒绝新开仓、平仓放行,切换发告警;

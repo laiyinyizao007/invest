@@ -66,6 +66,18 @@ python scripts/penetration_check.py --confirm-broker-test --with-order        # 
 - 步骤结果为 FAIL 时的排查:`授权验证失败` 先核对 AppID/AuthCode 与 BrokerID 是否属于**同一个环境**(测试与生产的授权码不通用);
   `4097 网络读失败` 见 runbook §8(地址/代理),与账号无关。
 
+### C2b. 生成国信《外部接入系统技术测试报告》(可重复)
+国信要求每次(新版本、AppID 变更、模板更新)提交穿透式 + 程序化两份测试报告。在运行机上(`.env` 已填国信测试环境参数与 `BROKER_TEST_*`):
+```bash
+python scripts/broker_test.py --confirm-broker-test --interactive     # 逐项取证(含 2.1 断网演练);非交易时段先跑一遍
+python scripts/broker_test.py --confirm-broker-test --resume data/broker_test/<目录>   # 交易时段补测 SKIP 的项
+python scripts/broker_report.py --template <国信模板.docx> --evidence data/broker_test/<目录>
+```
+- 终端会列出"报告里还缺什么"(未通过/未测试的项、没填的字段、需人工签字盖章)。**不会默认勾通过**。
+- 运行期间**关闭运行机的自动重启**,一次运行只登录一次(国信会检查频繁登录、会话数、退出后是否正常注销)。
+- 国信测试环境参数在模板里(IP/端口/BrokerID),不入库;AppID 按 `client_系统名称_版本号` 命名且与实盘一致。
+- 证据图是渲染图不是界面截图,**先向国信确认是否接受**;设计与局限见 `docs/adr/20261111-broker-test-compliance.md`。
+
 ### C3. 要向期货公司书面确认的问题(我无法替你回答)
 - [ ] 终端是否**固定登记一台**?更换网卡、重装系统、公网 IP 变化后是否需要重新登记?
 - [ ] 家用宽带/动态公网 IP 是否可接受?云主机是否可接受?
@@ -74,6 +86,9 @@ python scripts/penetration_check.py --confirm-broker-test --with-order        # 
 - [ ] 是否要求提交程序化交易报备材料?模板是什么?(草稿见 `docs/broker-filing.md`)
 - [ ] 报撤单频率、撤单率、日内最大委托笔数是否有硬性上限?
 - [ ] 测试环境的前置地址、BrokerID、AppID、AuthCode、可用合约与测试时段。
+- [ ] 证据图(文本渲染的"截图")是否被接受?不接受的话哪些项必须真实界面截图?
+- [ ] Webhook(Telegram/飞书)是否被接受为阈值预警方式?
+- [ ] 「退出后是否正常注销」怎么判定(我们在退出前发 ReqUserLogout 并固定等待 1.5 秒,无回报可验证)?
 
 ## D. 首次实盘(满足 A、B、C 之后,且经你明确授权)
 - [ ] 固定 1 手;账户级风控参数按 1 万元设置(当日 600 / 累计 2000);

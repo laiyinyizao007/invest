@@ -257,7 +257,7 @@ flowchart TB
 | 非策略委托白名单扩展 | `trading/guard_rule.py::STRATEGY_REF_PREFIX` 由单个前缀扩为集合(`AlgoTrading_`/`SpreadTrading_`) | 无头路径启用算法单/价差应用 | 同上 ADR |
 | 测试段使用次数持久化 | `walk_forward_optimizer.py`/`optimize*.py` 的 `--test` 写入使用记录,重复使用即拒绝 | 第二个候选需要用到测试段之前 | §4「测试段只看一次靠人工纪律」 |
 | 批量撤单入口(国信 5.2,选测) | 操作员入口(类似 `pause_trading.py`,请求文件由运行时消费)撤销全部未成交开仓单 | 国信要求该选测项,或需要应急一键撤单时 | `docs/adr/20261111-broker-test-compliance.md` |
-| 连接断开的全自动演练(国信 2.1) | `scripts/` 取证运行器中程序化断开交易连接并断言告警与恢复 | 取证运行器落地后;现为半自动(提示操作者断网) | 同上 |
+| 连接断开的全自动演练(国信 2.1) | `scripts/broker_test.py` 中程序化断开交易连接并断言告警与恢复 | 取证运行器已落地(Issue #9),现为半自动(`--interactive` 提示操作者断网/恢复);全自动需可靠的断连注入手段 | 同上 |
 
 ### 2.7 已处理技术债归档(原 §4 表中的行,原文不改)
 
