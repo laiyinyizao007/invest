@@ -20,6 +20,10 @@
   `scripts/broker_report.py` 用 lxml 直接填国信原模板 docx(不新增依赖):以文字定位单元格、先精确再前缀勾选、**不默认勾通过**(模板预勾选一律重置)、
   不碰国信填写区、列出"报告里还缺什么";模板含国信测试环境 IP 不入库(`--template`/`BROKER_REPORT_TEMPLATE`)。
   已用真实模板填写验证,Word 可正常打开。`.env.example` 增 `BROKER_TEST_*`;`docs/live-readiness.md` 增 C2b;`docs/broker-filing.md` 增 11 项对照表。
+  经 codereview + codex 两轮外部审查后固化的运行约束:发单类测试项前**统一过空仓闸门**(有持仓或查不准持仓则一笔不发、全部记 FAIL)、
+  演示委托用**唯一价格**(不同步骤不落进重复报单的同一个价格键)、测试前置地址**由操作者人工确认**(脚本无法用握手判别)、
+  暂停/阈值步骤**异常也清场**(finally 解除暂停标志并撤遗留委托)、撤单要等终态确认才算数、日志只取本次运行之后的行；
+  报告侧:选测项 FAIL 同样不勾「测试结论:通过」,证据图文件缺失进 warnings 与缺失清单(不静默交缺图报告)。
 - 国信程序化测试合规的功能缺口(Issue [#8](https://github.com/laiyinyizao007/invest/issues/8),依据国信《外部接入系统技术测试报告》模板):
   ① 阈值预警——风控规则触达笔数/手数/金额上限时发 WARN「风控阈值触发」告警(走既有 Webhook,按指标 300 秒节流;校验失败类不预警);
   ② 暂停交易——`scripts/pause_trading.py on|off|status` 写/删 `data/state/pause_trading.flag`,标志存在时拒绝新开仓、平仓放行,切换发告警;
