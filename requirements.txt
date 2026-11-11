@@ -4,6 +4,8 @@ vnpy_ctastrategy
 vnpy_ctabacktester
 vnpy_sqlite
 vnpy_riskmanager
+vnpy_algotrading
+vnpy_spreadtrading
 akshare
 pandas
 python-dotenv

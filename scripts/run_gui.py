@@ -11,6 +11,8 @@
 - **没有**启动对账、行情停更/持仓漂移/策略崩溃看门狗和 Webhook 告警——这些只在无头版里;
 - 硬锁定生效时本脚本拒绝**自动**连接(手动从菜单连接不受本脚本拦截);
 - 策略在界面的 CTA 策略页里手动添加、初始化、启动(策略类 TrendAtrStrategy 会被自动发现);
+- 另挂载 vn.py 官方的算法单(AlgoTrading,TWAP/冰山等拆单算法)与价差/组合套利(SpreadTrading)两个应用页:
+  平台能力面的演示与手动试验用,无人值守路径不使用它们;
 - 与无头版**不要同时运行**:两个进程会共用同一个账号和 .vntrader 下的策略状态文件。
 
 这是人工观察与试验用的入口,不是无人值守的运行方式。
@@ -44,9 +46,11 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
     from vnpy.trader.event import EVENT_CONTRACT
     from vnpy.trader.object import SubscribeRequest
     from vnpy.trader.ui import MainWindow, create_qapp
+    from vnpy_algotrading import AlgoTradingApp
     from vnpy_ctabacktester import CtaBacktesterApp
     from vnpy_ctastrategy import CtaStrategyApp
     from vnpy_ctp import CtpGateway
+    from vnpy_spreadtrading import SpreadTradingApp
 
     from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
     from trading.safe_risk import SafeRiskManagerApp
@@ -59,6 +63,8 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
     risk = main_engine.add_app(SafeRiskManagerApp)
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
+    main_engine.add_app(AlgoTradingApp)      # 算法单/拆单(TWAP、冰山等),平台能力面,不进无人值守路径
+    main_engine.add_app(SpreadTradingApp)    # 价差/组合套利,同上
 
     subscribed: set[str] = set()
 
@@ -107,7 +113,9 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) ->
     try:
         build_ctp_setting(env)
         import PySide6  # noqa: F401
+        import vnpy_algotrading  # noqa: F401
         import vnpy_ctp  # noqa: F401
+        import vnpy_spreadtrading  # noqa: F401
     except (ValueError, ImportError) as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2

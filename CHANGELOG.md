@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 报备能力面补齐(Issue #4):安装 vn.py 官方模块 `vnpy_algotrading`(算法单/拆单:TWAP、冰山等)与
+  `vnpy_spreadtrading`(价差/组合套利),注册到 GUI 入口 `run_gui.py`——平台能力面的演示与手动试验用,
+  无人值守路径(`run_headless`/`runtime`)零改动;多账户能力(vn.py `add_gateway` 原生支持多 CTP 网关)
+  在 PROJECTWIKI §5 补如实说明(项目默认单账户,`AccountGuardRule` 当前按单账户监控);
+  新增日内演示策略 `strategies/intraday_demo_strategy.py`(继承 15 分钟基准,尾盘 14:30 K 线收盘
+  发出强平限价单、力争 15:00 前离场,反向跳空未成交时保护性止损接管而非裸奔过夜;夜盘/尾盘不开新仓,
+  仅研究/回测)。全量 647 个测试通过,总覆盖率 90%(门禁 85%)。
 - 目标架构设计(PROJECTWIKI.md §2.2–2.5,依据两份研究资料):两层架构——
   **内层 = vn.py 流程引擎(确定性内核,现有 trading/risk/strategies/研究脚本/notify/Docker)**,
   **外层 = Bisheng 流程编排(AI 策略研究员,规划位)**;边界铁律 = 外层只经研究沙盒 API
