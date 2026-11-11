@@ -41,6 +41,39 @@
 3. 把 `.env` 的 `CTP_ENVIRONMENT` 设为 `测试`(看穿式测试环境用测试版 API),在测试环境跑满对方要求的天数;
 4. 通过后获得生产环境的 AppID/AuthCode,`CTP_ENVIRONMENT` 改回 `实盘`。
 
+### C2. 运行机与终端信息(2026-11-10 起)
+实盘与穿透测试在**另一台 Windows 机器**上**直接用 Python 运行**,不用 Docker、不在开发机上跑。
+理由:穿透式监管上报的是真实运行环境的 IP/MAC/硬盘序列号;容器里读到的是容器的信息,与宿主机对不上会被驳回。
+树莓派(ARM64)不可行:CTP 官方库只有 x86_64,见 `docs/adr/20261109-deployment-and-live-mode.md` §5。
+
+在**那台运行机上**(项目根目录)依次执行:
+```bash
+python scripts/collect_terminal_info.py --public-ip --out terminal-info.txt   # 终端信息采集(照着填采集表)
+python scripts/run_headless.py --check                                        # 配置与依赖自检,不连接
+python scripts/penetration_check.py --confirm-broker-test                     # 连测试环境走一遍,生成脱敏报告
+python scripts/penetration_check.py --confirm-broker-test --with-order        # 交易时段:再加跌停价买单+撤单
+```
+- 采集脚本输出里标了 `[出网]` 的网卡才是实际访问期货公司前置的那块;**运行机上不要开 TUN/VPN 类代理**
+  (开发机上默认路由走虚拟网卡 `198.18.0.x`,采到的 MAC/IP 会是虚拟网卡的,见 runbook §8)。
+- 演练报告写在 `data/penetration/`(不入库):步骤结果 + 脱敏网关日志,可作为"测试留痕"交给期货公司;
+  账号只保留头尾 2 位,密码/授权码/AppID 全部替换为 `***`。交给对方前仍请自己通读一遍。
+- `CTP_ENVIRONMENT=测试` 才会走看穿式测试环境;`实盘` + 非 SimNow 地址 = 生产 API,演练脚本**直接拒绝**。
+  没拿到测试环境参数之前,可以用 SimNow 地址预演脚本本身(`实盘` + SimNow 前置),但那**不算**期货公司的穿透测试。
+- 自动重启:没有 `docker-compose` 的 `restart: on-failure:3`,用 Windows 任务计划程序(开机/失败时重启)或 NSSM 把
+  `run_headless.py` 注册为服务,并遵守退出码语义——**退出码 0(含硬锁定后空仓)不得自动重启**,2/3/4 最多重试几次;
+  日志目录 `.vntrader/log` 与风控状态 `data/state/` 需保留(无人值守证据表读它们)。
+- 步骤结果为 FAIL 时的排查:`授权验证失败` 先核对 AppID/AuthCode 与 BrokerID 是否属于**同一个环境**(测试与生产的授权码不通用);
+  `4097 网络读失败` 见 runbook §8(地址/代理),与账号无关。
+
+### C3. 要向期货公司书面确认的问题(我无法替你回答)
+- [ ] 终端是否**固定登记一台**?更换网卡、重装系统、公网 IP 变化后是否需要重新登记?
+- [ ] 家用宽带/动态公网 IP 是否可接受?云主机是否可接受?
+- [ ] 测试环境与生产环境登记的终端信息是否是同一套?
+- [ ] 软件名称/版本怎么填(vn.py 是开源框架、本项目是基于它的自研脚本)?是否要求软件提供方出具认证文件?
+- [ ] 是否要求提交程序化交易报备材料?模板是什么?(草稿见 `docs/broker-filing.md`)
+- [ ] 报撤单频率、撤单率、日内最大委托笔数是否有硬性上限?
+- [ ] 测试环境的前置地址、BrokerID、AppID、AuthCode、可用合约与测试时段。
+
 ## D. 首次实盘(满足 A、B、C 之后,且经你明确授权)
 - [ ] 固定 1 手;账户级风控参数按 1 万元设置(当日 600 / 累计 2000);
 - [ ] 先在**非交易时段**连通并核对账户权益、持仓、可用资金;

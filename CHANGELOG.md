@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 穿透式监管接入工具(Issue [#5](https://github.com/laiyinyizao007/invest/issues/5)):新增 `scripts/collect_terminal_info.py`
+  (Windows 终端信息采集,标出出网网卡与虚拟网卡)、`scripts/penetration_check.py`(看穿式测试环境演练:
+  逐里程碑判定登录全流程、订阅/账户/持仓、可选跌停价买单+撤单,生成脱敏报告;生产 API 无条件拒绝);
+  新增 `docs/broker-filing.md`(报备说明草稿,事实取自仓库)、`docs/live-readiness.md` C2/C3(Windows 直接运行的部署方式与要向期货公司确认的问题);
+  `.env.example` 补测试环境说明。详见 PROJECTWIKI §5。
 - 报备能力面补齐(Issue #4):安装 vn.py 官方模块 `vnpy_algotrading`(算法单/拆单:TWAP、冰山等)与
   `vnpy_spreadtrading`(价差/组合套利),注册到 GUI 入口 `run_gui.py`——平台能力面的演示与手动试验用,
   无人值守路径(`run_headless`/`runtime`)零改动;多账户能力(vn.py `add_gateway` 原生支持多 CTP 网关)

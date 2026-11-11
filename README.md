@@ -206,6 +206,10 @@ python scripts/drill.py all --confirm-simnow         # 跑全部场景
 
 ```bash
 python scripts/collect_reject_texts.py --confirm-simnow --out docs/reject-texts-simnow.md
+
+# 期货公司穿透式监管测试(在运行实盘的那台 Windows 上直接运行,不用 Docker;详见 docs/live-readiness.md C2)
+python scripts/collect_terminal_info.py --public-ip --out terminal-info.txt   # 终端信息采集
+python scripts/penetration_check.py --confirm-broker-test [--with-order]      # 测试环境演练,报告写到 data/penetration/
 ```
 
 > 两个脚本都只连 **SimNow 白名单地址**；`--confirm-simnow` 只是布尔开关，挡不住「配置写错连上真券商」，

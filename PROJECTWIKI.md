@@ -725,6 +725,15 @@ flowchart TB
 - 结果(2026-11-10 一次性运行):三个窗口训练段 Top5 夏普全部为负,验证段 15 组参数夏普全部为负、正夏普窗口占比 0%,
   预算弃单率 0%(atr_mult=1.5 下止损距离都在 300 元内,空仓并非预算造成);与基线 ADR 的负面结论互相印证,详见 ADR 结果章节。
 
+### `scripts/collect_terminal_info.py` 与 `scripts/penetration_check.py`(穿透式监管接入,Issue #5)
+- 运行机是**另一台 Windows**,直接用 Python 运行(不用 Docker:容器内采到的 IP/MAC 与宿主机不符;树莓派 ARM64 无 CTP 库)。
+- `collect_terminal_info.py`:仅 Windows,PowerShell `Get-CimInstance` 采 OS/CPU/主板/BIOS/硬盘序列号/网卡 MAC 与 IP;
+  用 UDP connect(不发包)判断出网网卡并标出虚拟网卡(VPN/TUN/虚拟机);`--public-ip` 才访问第三方查公网 IP。`--target <前置地址>` 可按该目标的路由判断出网网卡。
+- `penetration_check.py`:`--confirm-broker-test` 必加;目标闸门只放行 `CTP_ENVIRONMENT=测试` 或 SimNow 地址预演,
+  `实盘`+非 SimNow = 生产 API **无条件拒绝**。按里程碑日志(连接→授权→登录→结算→合约→行情)逐步判定,再订阅 Tick、查账户/持仓;
+  `--with-order` 在交易时段报跌停价买 1 手并立即撤销,意外成交以退出码 5 告警。报告写 `data/penetration/`(不入库),账号头尾保留、密钥全部 `***`。
+- 报备材料草稿见 `docs/broker-filing.md`;向期货公司确认的问题与部署方式见 `docs/live-readiness.md` C2/C3。
+
 ### `scripts/run_gui.py`(图形界面,人工观察用)
 - 打开 VeighNa Trader 界面,按 `.env` 自动连接 CTP;`--subscribe` 让合约表到位后自动订阅行情;`--no-connect` 手动连接;`--check` 只校验配置。
 - 同样挂载 `SafeRiskManagerApp`:界面里手动下单也受账户风控约束;硬锁定生效时拒绝连接。
@@ -854,4 +863,5 @@ sequenceDiagram
 ## 12. 变更日志
 - 参见 [`CHANGELOG.md`](CHANGELOG.md)。提交与本文件同步更新,提交信息引用 Issue #1。
 - 2026-11-10:§2 新增 2.2–2.5(目标分层架构含内层 vn.py 流程引擎/外层 Bisheng AI 策略研究员两层边界、研究方法论映射 25 条、四阶段演进路线与技术债去向、规划位登记表);§2.1 现状图保留不变,节点状态表 2 行状态文字同步;§4 技术债表不改动,去向见 §2.4;新增 ADR `20261110-bisheng-ai-researcher.md`。
+- 2026-11-10:穿透式监管接入工具(Issue #5):§5 新增 `collect_terminal_info.py`/`penetration_check.py`;新增 `docs/broker-filing.md`;`docs/live-readiness.md` 补 C2/C3。
 - 2026-11-10:报备能力面补齐(Issue #4):§5 新增日内演示策略模块文档、`run_gui` 条目补算法单/价差应用页与多账户能力说明;新增依赖 `vnpy_algotrading`/`vnpy_spreadtrading`;全量测试 643→647,覆盖率 88%→90%。
