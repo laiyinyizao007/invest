@@ -1,0 +1,269 @@
+# 目标架构、演进路线与规划位
+
+> 本文件由 `PROJECTWIKI.md` 拆出(2026-11-11,Issue #7),内容原样迁移自原 §2.2、§2.4、§2.5,**章节编号沿用原编号**,
+> 以保证既有 ADR 里的「PROJECTWIKI §2.x」引用仍可对应。新增登记项与已处理技术债归档在末尾(§2.6、§2.7)。
+> **图例**:本文件描述的是**目标**,不是现状——图中虚线/标「规划」的节点**尚未实现**(外层 Bisheng 为零代码)。
+> 现状数据流见 `PROJECTWIKI.md` §2.1;方法论依据见 `docs/methodology-mapping.md`。
+
+### 2.2 目标分层架构:内层 vn.py 流程引擎 + 外层 Bisheng AI 策略研究员
+
+> 决策:`docs/adr/20261110-bisheng-ai-researcher.md`(2026-11-10 采纳);方法论依据:`docs/期货交易复盘与人性反思-要点梳理.md` §6。
+> **当前状态:只有本节设计与 ADR,没有任何外层代码**;外层组件全部为规划位(阶段三/四,见 §2.4 与 §2.5)。
+
+**第一设计公理**:内层必须能在 Bisheng 完全宕机的情况下独立完成交易与风控——AI 研究员是可选增益,不是交易路径依赖。
+
+**边界铁律**:外层绝不接触实盘交易、真实发单、CTP 凭据、`.env` 交易段;唯一交互通道是下表的**研究沙盒 API 端点白名单**;`risk/promotion_gate.py` 是候选策略进入视野的唯一闸门。
+
+**研究沙盒 API 端点白名单**(规划位→阶段三,先 CLI 后 HTTP):
+
+| 端点 | 语义 | 对应内层函数 |
+|---|---|---|
+| `/research/backtest` | 提交沙盒回测(策略文件须位于 pending 目录) | `scripts/backtest_lib.py::run_engine_bars` |
+| `/research/optimize` | 触发 walk-forward 滚动寻优(日期断言照常生效) | `scripts/walk_forward_optimizer.py` 公开函数 |
+| `/research/gate` | 查询候选的晋级 8 条结果 | `risk/promotion_gate.py::check_gate` |
+| `/research/results` | 查询结果摘要与 Trace 式诊断书 | 结果文件读取 + 确定性诊断逻辑 |
+| `/research/data` | 列出可用数据段及其「测试段已消费」状态 | 数据清单 |
+
+**明确不存在的端点**:任何下单、查账户、改风控参数、连 CTP 的能力——网关进程从部署层就拿不到 CTP 段环境变量(fail-closed 于部署层,不靠代码自律)。
+
+**形态演进**:先 CLI(`scripts/research_api.py` 子命令,规划位)→ 被真实使用后固化为薄 HTTP 网关(FastAPI 单文件)。业务逻辑全部留在纯逻辑层,网关只做适配,不写任何研究逻辑。
+
+**安全约束落位**(研究资料 §6.2/§6.3 → 工程):
+
+| 研究资料条目 | 两层落位 |
+|---|---|
+| 模板限制(§6.2-1):LLM 只写信号函数,风控写死 | 内层只读资产:策略骨架模板由人维护、有独立单测;LLM 产出只能继承该骨架 |
+| 沙盒状态机(§6.3-①)Pending→Approved→Executing | 目录即状态:`pending_strategies/`(LLM 唯一可写)→ walk-forward + gate 全过 + **人工批准** → `approved/`(runtime 只认);装载永远人工,fail-closed |
+| 硬记忆预算(§6.3-②)`deque(maxlen=3)` | 外层工作流约束:只携带最近 3 次失败的结构化 Trace,内层零代码 |
+| Trace 弱点挖掘(§6.3-③) | 内层确定性「诊断书」:回撤/次数/连亏/夏普四维,可单测;LLM 拿具象 Trace 定向改进 |
+| 平台 CVE-2026-82278(Code 节点 RCE) | Bisheng 版本 ≥2.6.0、仅内网监听、禁用 Code 节点、与交易 compose 物理分离(见 ADR 安全约束) |
+
+目标分层架构图(实线 = 已实现;虚线 = 规划位):
+
+```mermaid
+flowchart TB
+  classDef planned fill:#fafafa,stroke:#999,stroke-dasharray:4 3,color:#777
+
+  %% ═══════════ 内层 ① 数据层 ═══════════
+  subgraph D[内层 ① 数据层]
+    BS[scripts/bootstrap.py] -.-> FD
+    BS -.-> IM
+    FD[scripts/fetch_data.py 新浪日线+分钟增量]
+    IM[scripts/import_minute.py 购买 DCE 1 分钟]
+    FD --> DB[(.vntrader/database.db)]
+    FD --> CSV[(data/csv)]
+    IM --> DER[(derived 复权连续 1d/15m/rolls)]
+    SCHED[增量调度器 规划位→阶段二]:::planned
+    SCHED -. 定时触发 .-> FD
+    RECC[CTP 行情自录 规划位→阶段二起]:::planned
+    RECC -. 新样本外数据 .-> DER
+  end
+
+  %% ═══════════ 内层 ② 研究层 ═══════════
+  subgraph R[内层 ② 研究层（纯逻辑,离线可复现）]
+    DB --> BL
+    CSV --> BL
+    DER --> BL
+    BL[scripts/backtest_lib.py 统一成本/异常哨兵]
+    BL --> OPT[scripts/optimize.py 日线基准]
+    BL --> O15[scripts/optimize_15m.py 15m 三段基准]
+    BL --> WFO[scripts/walk_forward_optimizer.py 滚动窗口+三层隔离]
+    ST0[strategies/random_entry_strategy.py 随机对照] --> BL
+    PG[risk/promotion_gate.py 晋级 8 条·唯一闸门] -. 门槛检查 .-> OPT
+    PG -.- O15
+    PG -.- WFO
+    PP[参数平原/PBO/DSR 规划位→阶段三]:::planned
+    PP -. 强化第 8 条 .-> PG
+    TPE[Optuna TPE 规划位→阶段三]:::planned
+    TPE -. 候选生成 .-> WFO
+    MRO[月度滚动重估引擎 optimizer/ 预留 规划位→阶段三]:::planned
+    MRO -. 周期调用 .-> WFO
+    RSA[研究沙盒 API CLI→HTTP 固化 规划位→阶段三]:::planned
+    RSA -. 白名单端点 .-> BL
+    RSA -.- WFO
+    RSA -.- PG
+  end
+
+  %% ═══════════ 内层 ③ 策略层 ═══════════
+  subgraph S[内层 ③ 策略层]
+    ST[strategies/trend_atr_strategy.py 日线]
+    ST15[strategies/trend_atr_15m_strategy.py 15m]
+    INS[strategies/instruments.py 成本口径]
+    SBX[策略骨架模板+pending/approved 沙盒 规划位→阶段四]:::planned
+    SBX -. gate 通过+人工批准后 .-> ST15
+    RTR[MetaRouter 状态路由 规划位→阶段四]:::planned
+    RTR -. 启停路由 .-> ST15
+  end
+  ST --> BL
+  ST15 --> BL
+  INS --> BL
+
+  %% ═══════════ 内层 ④ 风控层 ═══════════
+  subgraph G[内层 ④ 风控层（平仓永远放行）]
+    RG[risk/risk_guard.py 预算/移动止损/连亏熔断] --> ST
+    AG[risk/account_guard.py 600/2000 双层熔断]
+    OP[risk/order_policy.py CTP 错误码三级分类]
+    SR[trading/safe_risk.py 平仓跳过计数]
+  end
+
+  %% ═══════════ 内层 ⑤ 执行层 ═══════════
+  subgraph E[内层 ⑤ 执行层]
+    RH[scripts/run_headless.py 无头入口 退出码 0/2/3/4]
+    RT[trading/runtime.py 五步启动/三重对账/看门狗]
+    GR[trading/guard_rule.py 挂 riskmanager 检查链]
+    CTP[CTP 网关 / SimNow / 实盘]
+    CAL[交易日历/节假日 规划位→阶段二]:::planned
+    RM[主力换月自动化 规划位→阶段二]:::planned
+  end
+  RH --> RT
+  RT --> ST
+  RT --> GR
+  GR --> AG
+  GR --> OP
+  GR --> SR
+  RT --> WH
+  RT --> CTP
+  GR -. 拦截开仓/紧急平仓 .-> CTP
+  CAL -. 熔断边界 .-> GR
+  RM -. 合约切换 .-> RT
+
+  %% ═══════════ 内层 ⑥ 消息层 ═══════════
+  subgraph N[内层 ⑥ 消息层（Webhook 即伪前端）]
+    WH[notify/webhook.py 队列/重试/去重/脱敏]
+    CTRL[反向控制 /stop_all 规划位→阶段三]:::planned
+    CTRL -. 撤单+锁引擎 .-> RT
+  end
+
+  %% ═══════════ 内层 ⑦ 部署与验收层 ═══════════
+  subgraph P[内层 ⑦ 部署与验收层]
+    DK[Dockerfile + compose GB18030 locale/心跳 HEALTHCHECK]
+    DR[scripts/drill.py 混沌演练六场景]
+    SG[scripts/simnow_guard.py 地址白名单]
+    UR[scripts/unattended_report.py 每日证据]
+    LOG[(vn.py 每日日志+心跳)]
+  end
+  DK --> RH
+  DR -. 独立状态目录 .-> CTP
+  SG --> DR
+  DR --> DRDOC[(docs/simnow-drills.md)]
+  LOG --> UR
+  WH --> UR
+  UR --> URDOC[(docs/unattended-log.md)]
+
+  %% ═══════════ 外层:AI 策略研究员(与内层物理隔离) ═══════════
+  subgraph AI[外层 ⑧ AI 策略研究员（Bisheng）规划位→阶段四]
+    BSN[Bisheng 工作流/Agent 假设→调工具→读诊断→迭代<br/>HITL 人工审批节点]:::planned
+    KB[(Bisheng 知识库 ADR/要点梳理/成绩单<br/>即上下文投喂)]:::planned
+    MEM[反馈记忆 deque maxlen=3<br/>只带最近 3 次失败 Trace]:::planned
+  end
+  KB -. 上下文 .-> BSN
+  BSN -. 唯一通道·研究沙盒 API 白名单端点 .-> RSA
+  BSN -. 产出策略代码·仅落 pending 目录 .-> SBX
+  MEM -. 结构化反馈 .-> BSN
+```
+
+**图例与注解**:
+- 实线 = 已实现,节点路径与 §2.1 现状图一致;`-.->` = 规划位,进入实现前须先补 ADR(沿用「脚本与 ADR 同一原子提交」先例);
+- GUI(`scripts/run_gui.py`)故意不画——§4 已定性「图形界面不是运行方式」,目标架构是无头架构;
+- **外层子图没有任何指向执行层/风控层/CTP 的连线——图形本身就是边界契约**;
+- 规划位组件只在 §2.5 登记表文字预留,不建空目录、不写占位文件。
+
+### 2.4 差距与演进路线
+
+> **声明:每个阶段的验收都只是通道/能力验收,不是策略准入。**`docs/live-readiness.md` 的结论先行仍然成立:晋级门槛 8 条一项未过,不应该上实盘;实盘切换需用户另行明确授权。
+> 与 live-readiness 的对应:阶段一 = B 段全项;阶段二 = A 段工程性前置 + C 段并行(人工);阶段三 = A 段晋级门槛的规模化支撑;阶段四超出 live-readiness 范围(能力扩张,非准入条件)。
+
+**阶段一:SimNow 实测验收闭环(当前,最高优先级)**
+- 内容:drill.py 六场景在交易时段/夜盘实跑并回填 `docs/simnow-drills.md`;runbook §5 十项全部实测回填;`--probe-webhook` 真机自检通过;连续 ≥5 交易日无人值守(含夜盘与周末)逐日核对证据表;借废单轰炸场景补采 4 类废单文本入 `docs/reject-texts-simnow.md` 与 `risk/order_policy.py` 硬码表。
+- 验收:live-readiness B 段三项全勾;废单关键词表 ≥6 条实测;心跳连续 5 交易日无中断。
+- 退出:B 段全勾 → 阶段二;若熔断/看门狗实跑暴露 bug,修复后 **5 天计数从零重新开始**(不折算)。
+
+**阶段二:多品种与调度自动化(阶段一退出后启动;C 段人工认证并行)**
+- 内容:增量调度器上 VPS cron(fetch_data 每日增量,消除 1023 根断档风险);主力换月自动化(fail-closed 校验,见 §2.5);交易日历/节假日模块;回测成本换期货公司真实费率(依赖 C 段拿到费率表);多品种复权连续数据扩充(阶段三触发条件①的积累)。
+- 验收:调度器连续 4 周无断档;换月校验在至少一次真实换月窗口 fail-closed 拦截验证;成本口径更新并重跑基准(**结论可能是负面上修,如实记录,不回头改门槛**)。
+- 退出:技术债表中「调度/换月/节假日/成本」四条标记已处理。
+
+**阶段三:月度滚动寻优引擎化 + 研究沙盒 API 固化(触发条件驱动,不排日期)**
+- 进入条件(2026-11-10 共识,三条件同时满足):①≥2 个品种的复权连续数据可用;②实盘运行且产生月度换参需求;③分钟/日线数据厚度支持新窗口。若长期不满足,本阶段保持规划位不动——**这本身是正确状态,不是停滞**。
+- 内容:`walk_forward_optimizer.py` 提升为 `optimizer/` 包 + 月度调度 + 新 ADR;参数平原卷积接入晋级门槛第 8 条;试验次数扩大后引入 PBO/DSR;反向控制 /stop_all(前置 = 阶段一 webhook 验证通过 + 无人值守常态化);研究沙盒 API 两步固化——CLI 先行(月度调度器可直接调 CLI),被真实使用后固化为薄 HTTP 网关。**API 固化是 Bisheng 接入(阶段四)的硬前置**。
+- 铁律(进新 ADR):**风控底线永不优化**——只有入场参数可寻优,3% 止损/300 元预算/双层断头台必须像钢铁一样固化在代码里。
+- 验收:月度重估输出经人工确认后才允许换参,换参前后策略行为变化有 webhook 播报与日志证据;网关端点白名单通过负向测试;网关进程环境变量中无 CTP 段(部署层验证);pending 策略调用 gate 的路径有集成测试。
+- 退出:至少一个完整月度周期由 API 驱动完成;API 契约文档化(§6 API 手册新增小节)。
+
+**阶段四:Bisheng AI 研究员接入 + 状态路由与 Alpha Factory(远期,不给时间承诺)**
+- 进入条件:阶段三 API 固化 + 阶段一退出 + 多品种数据就位。理由:①外层价值密度取决于内层质量——未经 SimNow 校准的沙盒会放大过拟合与撮合失真;②边界 API 是安全前提——没有固化白名单端点,边界铁律无法在部署层强制;③Bisheng 资源需求(≥8 核/32GB)需要独立部署决策(ADR 未决项)。
+- 三步接入(每步独立可停,前一步稳定才进下一步):
+  - **4a 人工驱动 CLI**(可无 Bisheng):人用研究沙盒 CLI 跑完整研究循环;模板与 pending/approved 约定落地并有单测。退出:至少完整走通 2 个候选。
+  - **4b Bisheng 工具调用 + HITL**:Agent 调研究 API(触发回测/读诊断书/查 gate);每个候选进入 approved 前经 HITL 人工确认;反馈记忆 maxlen=3 生效。退出:≥1 个候选由外层驱动走完 pending→gate→人工批准全流程;外层宕机不影响内层交易(断耦演练)。
+  - **4c 闭环自动化**:Agent 连续迭代,自动收菜到 approved/,**装载仍需人工**;Alpha Factory 双轨并跑;所有 LLM 产出留痕(工作流日志可回放)。
+- 状态路由(MetaRouter)与 Alpha Factory 双轨在本阶段后半段展开,进入条件:≥2 个通过晋级门槛且风格相反的策略并存。
+
+**§4 技术债条目去向**(§4 原表不动,此处只标去向):
+
+| §4 技术债条目 | 去向 |
+|---|---|
+| 未在真实 CTP/SimNow 上验证(最高) | 阶段一 |
+| 演练脚本已就绪但未实跑(最高) | 阶段一 |
+| 飞书真实 webhook 未验证 | 阶段一 |
+| 无人值守只跑 1 天 | 阶段一 |
+| 废单关键词表只覆盖 2 条实测文本 | 阶段一(借 drill 废单轰炸采回) |
+| 主力合约换月需人工更新 | 阶段二(规划位 RM) |
+| 交易日不处理法定节假日 | 阶段二(规划位 CAL) |
+| 回测成本是假设值 | 阶段二(依赖 C 段拿真实费率) |
+| 缺少自动化调度 | 阶段二(规划位 SCHED) |
+| 分钟线历史不足 / 复权数据历史较短 | **不进路线图**——数据资产边界,§4 保留;新样本外唯一出路 = 补购或 CTP 自录(规划位 RECC) |
+| 15 分钟基准的测试段已被使用一次 | **不进路线图**——永久性研究纪律,ADR 已锁;仅作为阶段三触发条件③「数据变厚」的理由之一 |
+| 本地止损依赖进程存活 / 停止单引擎本地触发 | **接受的风险**(见 §2.5 末) |
+| 其余(夏普口径、统计效力、跳空、DailyLossGuard、CSV-only、turnover、OHLC 等) | 保留 §4 原位,目标架构不吸收 |
+
+**明确不做**(防止被反复重新提出;研究资料原文与既有 ADR 已给出理由):
+- CPCV——研究资料原文「底层改动太大暂不碰」;
+- **每日自动优化**——研究资料 §3.5 明确反对(「散户爆仓的捷径」),与 promotion-gate ADR「不得事后放宽」精神一致;
+- 自建前端(Web 面板/Vue/React/Streamlit)——§5.3 四条理由;
+- 手机 app 自动化下单——§1 非目标。
+
+### 2.5 规划位组件登记表
+
+> 约定:**不建空目录、不写占位文件**;触发条件满足时按「新 ADR + 代码同一原子提交」落地(先例:`scripts/walk_forward_optimizer.py` 与其 ADR)。空目录会诱导「填空式开发」,恰恰破坏触发条件的护栏作用。
+
+| 规划位 | 预留位置(触发时) | 触发条件 | 来源 |
+|---|---|---|---|
+| 月度滚动重估引擎 | `scripts/walk_forward_optimizer.py` 提升为 `optimizer/` 包 + 调度入口 + 新 ADR | 三条件同时满足:①≥2 品种复权连续数据;②实盘月度换参需求;③数据厚度支持新窗口 | 2026-11-10 共识 |
+| Optuna TPE 寻优 | 并入 `walk_forward_optimizer.py` 或其旁新脚本(不改 `optimize.py` 已定案口径) | 参数维度 >2 或组合空间 > 数百,网格不再可行 | 要点梳理 §3.5 |
+| 参数平原卷积 / PBO / DSR | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
+| 研究沙盒 API(CLI→HTTP) | `scripts/research_api.py` 子命令 → 薄 HTTP 网关(FastAPI 单文件)+ 契约入 §6 API 手册 | 阶段三(月度调度器程序化触发 CLI;Bisheng 接入前固化 HTTP) | ADR bisheng-ai-researcher |
+| 策略骨架模板 + pending/approved 沙盒 | `strategies/` 内模板文件 + `pending_strategies/`/`approved/` 目录约定 + 新 ADR | 阶段四 4a 启动前 | 要点梳理 §6.3-① |
+| Bisheng 外层 | 独立 compose 文件(与交易 compose 完全分离,不共享网络与 `.env`) | 阶段四 4b(前置 = 阶段三 API 固化);版本 ≥2.6.0、仅内网、禁用 Code 节点 | ADR bisheng-ai-researcher |
+| 反馈记忆 maxlen=3 | Bisheng 工作流设计约束(内层零代码) | 阶段四 4b | 要点梳理 §6.3-② |
+| 反向控制 /stop_all | `notify/webhook.py` 增加接收侧 + `trading/runtime.py` 暴露停机钩子 + **新 ADR**(指令来源校验/白名单/误触防护) | 阶段三;前置 = webhook 真机验证通过 + 无人值守常态化 | 要点梳理 §5.3 |
+| MetaRouter 状态路由 | `strategies/` 内新策略类(路由器本身就是一个 CtaTemplate 策略,不建 router/ 目录) | ≥2 个通过晋级门槛且风格相反的策略并存 | 要点梳理 §6.5 |
+| Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
+| 增量调度器 | VPS cron / systemd timer,不写 Python 常驻进程(KISS) | 阶段一无人值守 ≥5 天达标后,分钟线断档风险成为现实约束 | §4「缺自动化调度」 |
+| 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
+| 主力换月自动化 | 扩展 `scripts/import_minute.py` rolls 派生逻辑 → runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
+| CTP 行情自录 | vnpy DataRecorder 挂到 runtime 或独立无头进程 | 新候选需要新样本外数据、且购买数据未更新时;**与补购分钟线二选一或并行,由届时数据缺口形状决定** | 要点梳理 §3.1 |
+
+**接受的风险**(有意不设规划位,避免虚假承诺):本地止损依赖进程存活——vn.py 停止单是引擎本地触发的,进程退出即失效;缓解 = 固定 1 手轻仓 + 行情假死看门狗 + 进程退出发 FATAL。研究资料未提供交易所端条件单的可行方案,标记为接受的风险而非规划位。
+
+
+### 2.6 新增登记项(2026-11-11,依据复盘研究资料深挖与纪律机制补缺)
+
+| 规划位 | 预留位置(触发时) | 触发条件 | 来源 |
+|---|---|---|---|
+| 保证金占比实时风控 | `trading/guard_rule.py` 新规则:资金使用率超过阈值(研究资料建议 <30%)时告警/拒绝开仓,读 CTP 账户的保证金与可用资金 | 多品种/多策略并发(阶段三)或本金变化;固定 1 手单品种时该约束恒成立,暂无必要 | 要点梳理 §2 |
+| 跳空/夜盘滑点验收 | `docs/runbook-simnow.md` 第 5 节新增实测项 + `scripts/drill.py` 场景:夜盘跳空下止损单实际成交价与预算的偏离 | 阶段一实测完成后;真实滑点最终以小额实盘为准(SimNow 撮合偏理想) | 原文「跳空极端局」;§4「预算约束不了跳空」 |
+| `parameter_on_plateau` 的计算来源 | 优化器输出 → `risk/promotion_gate.py::CandidateMetrics.parameter_on_plateau` 的调用方 | 与「参数平原卷积」同触发;在此之前该项由人工判断 | `docs/adr/20261111-discipline-enforcement.md` 已知局限 |
+| 周期性 `ReqQryOrder` 对账 | `trading/runtime.py` 定时查询委托,与本会话委托号对账,补上外部终端下单的检测 | runbook 第 5 节第 11 项实测发现收不到外部会话的委托回报 | 同上 ADR(codex 审查 H1) |
+| 非策略委托白名单扩展 | `trading/guard_rule.py::STRATEGY_REF_PREFIX` 由单个前缀扩为集合(`AlgoTrading_`/`SpreadTrading_`) | 无头路径启用算法单/价差应用 | 同上 ADR |
+| 测试段使用次数持久化 | `walk_forward_optimizer.py`/`optimize*.py` 的 `--test` 写入使用记录,重复使用即拒绝 | 第二个候选需要用到测试段之前 | §4「测试段只看一次靠人工纪律」 |
+
+### 2.7 已处理技术债归档(原 §4 表中的行,原文不改)
+
+> 这些行已被解决或与保留行重复,从 `PROJECTWIKI.md` §4 移出以免状态页混入历史;保留原文以便追溯。
+
+| 项 | 说明 | 优先级 |
+|---|---|---|
+| 旧回测基于未复权数据 | 已量化(换月价差玉米中位 44 点、甲醇 75 点)并**在复权数据上重做**:玉米训练段夏普为正仅 11%、选出的参数训练/验证均为负;甲醇无法开仓。旧结论作废,新结论仍是"无法证明优势" | 已处理 |
+| 容器内连通 SimNow 未验证 | **已于 2026-11-10 实测通过**(连接→授权→登录→结算确认→合约表→策略初始化→订阅→healthy→优雅退出 0);关键前提是镜像里必须有 `zh_CN.GB18030` locale,见下一行 | 已处理 |
+| 容器必须自带 `zh_CN.GB18030` locale | `vnpy_ctp` 的 `toUtf()` 硬编码 `std::locale("zh_CN.GB18030")`;slim 镜像默认没有该 locale,CTP 回调线程会抛异常并 abort 整个进程(无 CTP 错误日志)。Dockerfile 已加 `locales` + `localedef -i zh_CN -f GB18030 zh_CN.GB18030`;详见 `docs/runbook-simnow.md` §10.1 | 已处理 |
+| 停止单是引擎本地触发 | vn.py CTA 停止单不是交易所委托,断线时不执行;实盘须跑在稳定服务器并加行情停更检测 | 高 |

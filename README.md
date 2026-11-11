@@ -324,7 +324,11 @@ pytest tests -q --cov=risk --cov=strategies --cov=trading --cov=notify --cov=scr
 
 | 文档 | 内容 |
 |---|---|
-| [PROJECTWIKI.md](PROJECTWIKI.md) | 项目知识库（单一可信源）：架构、模块文档、技术债、追溯关系 |
+| [PROJECTWIKI.md](PROJECTWIKI.md) | 项目知识库（单一可信源）：现状架构、ADR 索引、未解决技术债、模块索引 |
+| [docs/roadmap.md](docs/roadmap.md) | 目标分层架构、四阶段演进路线、规划位登记表 |
+| [docs/methodology-mapping.md](docs/methodology-mapping.md) | 研究方法论 → 系统映射，及研究资料的矛盾与证据强度 |
+| [docs/modules.md](docs/modules.md) | 各模块的详细文档（职责、约束、修复经过） |
+| [docs/broker-filing.md](docs/broker-filing.md) | 程序化交易报备说明草稿 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录 |
 | [docs/runbook-simnow.md](docs/runbook-simnow.md) | SimNow 实测运行手册（含容器内跑通记录） |
 | [docs/live-readiness.md](docs/live-readiness.md) | 实盘准入检查清单（人工步骤） |

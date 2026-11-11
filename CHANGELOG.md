@@ -5,6 +5,14 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+### Changed（变更）
+- PROJECTWIKI 拆分与瘦身(Issue [#7](https://github.com/laiyinyizao007/invest/issues/7)):876 行 → 299 行。
+  原 §2.2/§2.4/§2.5 迁至 `docs/roadmap.md`(编号沿用,另增 §2.6 新增规划位与 §2.7 已处理技术债归档);原 §2.3 迁至
+  `docs/methodology-mapping.md`(25 行扩充到 34 行,新增「研究文档的矛盾与证据强度」一节给出本项目采纳口径);
+  原 §5 整体迁至 `docs/modules.md`(原文未删改),§5 改为模块索引;§4 只留未解决条目并新增 3 条技术债;
+  修正过期事实(运行环境改为远程 Windows 直接运行、不再写死测试数、阶段命名统一)。迁移经逐行校验:除有意改写的 19 行外无丢失。
+  Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
+
 ### Added（新增）
 - 纪律机制补缺(Issue [#6](https://github.com/laiyinyizao007/invest/issues/6),依据《期货交易复盘与人性反思》):
   ① 解锁问责——`AccountGuard` 记录硬锁定时间与解锁历史,`unlock_account.py` 增加冷却期(硬锁定当个交易日内拒绝,退出码 3)
