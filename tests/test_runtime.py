@@ -1000,3 +1000,18 @@ def test_shutdown_survives_a_failing_logout(make, monkeypatch):
     rt.start()
     rt.shutdown()
     assert rt.gw.closed and rt.notifier.closed                              # 登出失败不能打断退出
+
+
+def test_refuses_to_start_when_position_direction_is_unknown(make):
+    """净持仓账户回报 Direction.NET:方向不明,不能按"非多即空"算净额,必须拒绝启动。"""
+    rt = make()
+    rt.gw.set_position(Direction.NET, 1)
+    assert rt.start() == EXIT_RECONCILE_REFUSED
+    assert any("方向不明" in m for m in rt.notifier.find("对账失败,拒绝启动"))
+
+
+def test_position_drift_reports_unknown_direction_instead_of_miscounting(make):
+    rt = make()
+    assert rt.start() is None                                   # None = 启动成功,进入运行
+    rt.gw.set_position(Direction.NET, 2)
+    assert "方向不明" in (rt._position_drift() or "")

@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from vnpy.event import Event, EventEngine
-from vnpy.trader.constant import Direction
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.event import EVENT_LOG, EVENT_TICK, EVENT_TIMER, EVENT_TRADE
 from vnpy.trader.gateway import BaseGateway
@@ -35,6 +34,7 @@ from vnpy.trader.logger import ERROR
 from vnpy.trader.utility import get_file_path
 from vnpy_ctastrategy import CtaStrategyApp
 
+from risk.positions import describe, signed_net, undirected
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
 from trading.graceful_exit import logout_ctp
@@ -360,8 +360,11 @@ class TradingRuntime:
 
         positions = [p for p in self.main.get_all_positions() if p.volume > 0]
         foreign = [p for p in positions if p.vt_symbol != cfg.vt_symbol]
-        net = sum(p.volume if p.direction == Direction.LONG else -p.volume for p in positions if p.vt_symbol == cfg.vt_symbol)
+        net = signed_net(positions, cfg.vt_symbol)
         problems = []
+        blind = undirected(positions)
+        if blind:
+            problems.append("持仓方向不明(净持仓账户?),无法核对多空与止损方向,为防算反拒绝启动: " + describe(blind))
         if foreign:
             problems.append("账户存在不属于本策略合约的持仓: " + ", ".join(f"{p.vt_symbol} {p.direction.value}{p.volume}" for p in foreign))
         if self.strategy.pos != net:
@@ -489,7 +492,10 @@ class TradingRuntime:
         # 局限:按净持仓比较,同一合约同时持有多空时净额为 0,与 strategy.pos=0 一致而不判漂移(单策略单腿场景影响极小)
         positions = [p for p in self.main.get_all_positions() if p.volume > 0]
         foreign = [p for p in positions if p.vt_symbol != self.config.vt_symbol]
-        net = sum(p.volume if p.direction == Direction.LONG else -p.volume for p in positions if p.vt_symbol == self.config.vt_symbol)
+        net = signed_net(positions, self.config.vt_symbol)
+        blind = undirected(positions)
+        if blind:
+            return "持仓方向不明(净持仓账户?),无法核对多空: " + describe(blind)
         if foreign:
             return "账户存在不属于本策略合约的持仓: " + ", ".join(f"{p.vt_symbol} {p.direction.value}{p.volume}" for p in foreign)
         if self.strategy is not None and self.strategy.pos != net:

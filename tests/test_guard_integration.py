@@ -689,3 +689,49 @@ def test_status_variable_reflects_lock(env):
     assert env.rule.lock_status == "DAILY_LOCKED"
     assert env.rule.peak_equity == 10_000 and env.rule.day_start_equity == 10_000
     _ = date  # noqa
+
+
+def test_flatten_escalates_instead_of_guessing_when_position_direction_is_unknown(env):
+    """方向不明(净持仓)时不能按"非多即空"猜平仓方向:一笔平仓单都不发,直接升级人工并保持存活。"""
+    env.gw.mode = "fill"
+    env.gw.set_position(Direction.NET, 1)
+    env.set_equity(7_900)
+    env.tick()
+    env.tick(seconds=1)
+    env.tick(seconds=1)
+    assert env.gw.sent == []
+    assert "紧急平仓失败" in env.alert_titles()
+    assert env.hard_locks and all(not h["flat"] for h in env.hard_locks)     # flat=False:进程保持存活继续告警,绝不当作已空仓
+
+
+def test_send_close_orders_refuses_undirected_position_on_its_own(env):
+    """纵深防御:即使调用方没拦截,发单函数自己也不能把方向不明的持仓推导成"非多即空"。"""
+    env.gw.set_position(Direction.NET, 1)
+    positions = env.rule._oms_positions()
+    sent = env.rule._send_close_orders({key: 1 for key in positions}, positions)
+    assert sent == {} and env.gw.sent == []
+    assert "平仓方向不明" in env.alert_titles()
+
+
+def test_mixed_directed_and_undirected_positions_send_no_close_orders(env):
+    """宁可整体升级人工也不对一部分仓位自动平:账户形态不明时,已知方向的仓位也不动(取舍记录在 ADR)。"""
+    env.gw.mode = "fill"
+    env.gw.set_position(Direction.LONG, 1)
+    env.gw.set_position(Direction.NET, 1, symbol="c2605")
+    env.set_equity(7_900)
+    env.tick()
+    env.tick(seconds=1)
+    assert env.gw.sent == [] and "紧急平仓失败" in env.alert_titles()
+
+
+def test_undirected_position_appearing_mid_flatten_cancels_the_resting_close_order(env):
+    """平仓进行到一半出现方向不明持仓:状态机升级后不再观察,已挂出的平仓单必须先撤掉。"""
+    env.gw.mode = "accept"                                     # 平仓单挂着不成交
+    env.gw.set_position(Direction.SHORT, 1)
+    env.set_equity(7_900)
+    env.tick()
+    assert env.gw.sent and env.gw.sent[-1].offset == Offset.CLOSE
+    env.gw.set_position(Direction.NET, 1)
+    env.tick(seconds=1)
+    assert env.gw.cancel_requests                               # 挂着的平仓单被撤
+    assert "紧急平仓失败" in env.alert_titles()

@@ -14,6 +14,12 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 净持仓方向不明 fail-closed(Issue [#10](https://github.com/laiyinyizao007/invest/issues/10)):新增 `risk/positions.py`(`signed_net`/`undirected`/`describe`);
+  `trading/runtime.py` 的启动对账与运行中漂移检测遇到 `Direction.NET` 等方向不明的持仓时拒绝启动/告警,不再按"非多即空"算净额;
+  `trading/guard_rule.py` 紧急平仓遇方向不明持仓时**不发任何平仓单**、直接升级人工(FATAL,硬锁定时 flat=False 保持进程存活)。
+  此前 NET 会被当空头算反、平反。账户是否真会回报 NET 尚未实测(SimNow/国信测试环境待验证,结论补记进 ADR)。
+- 架构总图 `docs/architecture.md`:分层依赖图与允许的 import 方向、磁盘状态归属表、隔离机制摘要、ADR 已知局限台账;
+  roadmap §2.6 登记脚本层去重/统一交易时段表/脚本分目录三个规划位;修正 `modules.md` 写死的测试数。
 - 国信测试报告的取证与自动生成(Issue [#9](https://github.com/laiyinyizao007/invest/issues/9)):
   `scripts/broker_test.py` 在国信测试环境的同一条真实连接上挂载真实风控,逐项演示 18 个测试项(穿透 T1–T7、程序化 P1.1–P6.1),
   产出脱敏证据 JSON 与渲染成图片的"截图"(`--resume` 增量补测,新的 SKIP 不覆盖旧的 PASS/FAIL);

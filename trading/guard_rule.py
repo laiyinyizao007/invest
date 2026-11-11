@@ -35,6 +35,7 @@ from vnpy_riskmanager.base import APP_NAME
 from vnpy_riskmanager.template import RuleTemplate
 
 from risk.account_guard import AccountGuard, AccountLimits, LockEvent, trading_day
+from risk.positions import describe, undirected
 from risk.order_policy import (
     RejectKind,
     RejectMonitor,
@@ -508,6 +509,14 @@ class AccountGuardRule(RuleTemplate):
         if st["targets"] is None:                                 # 首次:以当时的持仓作为需要平掉的目标量
             st["targets"] = {key: p.volume for key, p in positions.items()}
 
+        blind = undirected(positions.values())
+        if blind:                                                 # 方向不明(净持仓账户)时按多/空猜方向会把仓位越平越大:不发任何平仓单,直接升级人工
+            for order in main.get_all_active_orders():            # 升级后状态机不再观察:此前已挂出的平仓单必须先撤,不能留在交易所无人监督
+                if order.reference == FLATTEN_REF:
+                    self._cancel_order(order.vt_orderid, now)
+            self._escalate_flatten("持仓方向不明(净持仓账户?),无法判定平仓方向,不自动平仓: " + describe(blind))
+            return
+
         if any(o.reference == FLATTEN_REF for _, o in self._pending_rejects.values()):
             return                                                # 有平仓废单还没分类完,先不动作
 
@@ -585,7 +594,13 @@ class AccountGuardRule(RuleTemplate):
             if contract is None or not (last and math.isfinite(last) and last > 0):
                 self._alert("ERROR", "平仓缺少行情", f"{pos.vt_symbol} 无合约或有效最新价,本轮无法平仓")
                 continue
-            selling = pos.direction == Direction.LONG
+            if pos.direction == Direction.LONG:
+                selling = True
+            elif pos.direction == Direction.SHORT:
+                selling = False
+            else:                                                 # 纵深防御:调用方已拦截方向不明,这里仍绝不推导"非多即空"
+                self._alert("ERROR", "平仓方向不明", f"{pos.vt_symbol} 持仓方向 {getattr(pos.direction, 'value', pos.direction)},不发平仓单")
+                continue
             limit = tick.limit_down if selling else tick.limit_up
             price = limit if (limit and math.isfinite(limit) and limit > 0) else last * (0.95 if selling else 1.05)
             req = OrderRequest(

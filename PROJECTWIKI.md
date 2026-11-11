@@ -25,6 +25,8 @@
 
 ## 2. 架构设计
 
+> 分层依赖图、磁盘状态归属表、隔离机制与**已知局限台账**见 [`docs/architecture.md`](docs/architecture.md)。
+
 ### 2.1 现状数据流(全部已实现)
 ```mermaid
 flowchart LR
@@ -87,7 +89,7 @@ flowchart LR
 - 详见 [`docs/methodology-mapping.md`](docs/methodology-mapping.md):研究资料条目 → 状态 → 实现文件的映射表(34 行),以及研究文档自身的矛盾与证据强度——本项目的采纳口径。
 
 ## 3. 架构决策记录(ADR)
-- 目录:`docs/adr/`,MADR 格式
+- 目录:`docs/adr/`,MADR 格式;各 ADR 的「已知局限」汇总与状态见 [`docs/architecture.md`](docs/architecture.md) §4
   - [`20261109-use-vnpy.md`](docs/adr/20261109-use-vnpy.md):采用 vn.py,不自研
   - [`20261109-china-timezone.md`](docs/adr/20261109-china-timezone.md):进程统一为中国时区
   - [`20261109-account-risk-budget.md`](docs/adr/20261109-account-risk-budget.md):1 万元 / 300 元预算,超预算则不交易,主测玉米
