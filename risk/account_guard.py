@@ -14,6 +14,8 @@
 - 当日开盘权益 = 前一次采样的权益(持久化),而不是新交易日的第一次采样:进程在盘中重启时,
   第一次采样可能已经包含当日亏损,若以它为基准,当日熔断会被抬高而永远不触发。
 - 交易日按夜盘归属下一交易日处理,不处理法定节假日(周五夜盘归下周一)。
+- 纪律问责(docs/adr/20261111-discipline-enforcement.md):硬锁定记录触发时间,人工解锁有冷却期并写入解锁历史
+  (解锁后峰值重置 = 重新获得完整预算,必须留痕);运行中检测到的非策略委托按交易日计数。
 """
 import json
 import math
@@ -31,6 +33,10 @@ def trading_day(dt: datetime) -> date:
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
+
+
+UNLOCK_HISTORY_LIMIT = 20      # 状态文件里最多保留的解锁记录条数
+MANUAL_DAYS_LIMIT = 60         # 非策略委托按日计数,最多保留的天数
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,9 @@ class AccountGuard:
         self.daily_locked_day: date | None = None
         self.hard_locked: bool = False
         self.hard_reason: str = ""
+        self.hard_locked_at: str = ""          # 硬锁定触发时间(ISO);空 = 未知(旧状态文件/文件损坏),冷却期无法计算
+        self.unlock_history: list[dict] = []   # 人工解锁记录:{at, locked_at, reason, forced}
+        self.manual_orders: dict[str, int] = {}  # 交易日(ISO) -> 当日检测到的非策略委托笔数
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
         self.account_id: str = ""              # 状态所属的账户;换账户时权益基准必须重置(SimNow 2000 万 vs 实盘 1 万)
         self.save_error: str = ""
@@ -126,6 +135,7 @@ class AccountGuard:
 
         if not self.hard_locked and self.peak_equity - equity >= self.limits.max_drawdown:
             self.hard_locked = True
+            self.hard_locked_at = now.isoformat(timespec="seconds")
             self.hard_reason = (f"权益 {equity:.0f} 距最高点 {self.peak_equity:.0f} 回撤 "
                                 f"{self.peak_equity - equity:.0f} 元 >= 累计死线 {self.limits.max_drawdown:.0f} 元")
             events.append(LockEvent("HARD", self.hard_reason, equity, day))
@@ -154,12 +164,53 @@ class AccountGuard:
         self._save()
         return LockEvent("DAILY", reason, 0.0, day)
 
-    def unlock_hard(self) -> None:
-        """人工解除硬锁定,并把最高点重置为下一次采样的权益(否则会立刻再次触发)。"""
+    def unlock_cooldown(self, now: datetime) -> str:
+        """解锁冷却:硬锁定发生的交易日内不允许解锁(需要隔夜冷静)。返回空串 = 可以解锁,否则是拒绝理由。
+
+        触发时间未知(旧状态文件、状态文件损坏)时无法证明已过冷却期,**按冷却期内处理**:必须 --force 交互确认,
+        否则"把状态文件弄坏"就成了绕过冷却的办法。
+        """
+        unknown = "硬锁定触发时间未知(旧状态文件或状态文件损坏),无法证明已过冷却期,解锁需在核对后用 --force 强制"
+        if not self.hard_locked_at:
+            return unknown
+        try:
+            locked_day = trading_day(datetime.fromisoformat(self.hard_locked_at))
+        except ValueError:
+            return unknown
+        if trading_day(now) > locked_day:
+            return ""
+        return f"硬锁定发生在交易日 {locked_day},解锁需等到下一个交易日(隔夜冷静),或在核对后用 --force 强制"
+
+    def unlock_hard(self, now: datetime | None = None, forced: bool = False) -> None:
+        """人工解除硬锁定,并把最高点重置为下一次采样的权益(否则会立刻再次触发)。
+
+        重置峰值等于重新获得完整的累计死线预算,所以每次解锁都写入 unlock_history(含是否越过冷却)。
+        """
+        now = now or datetime.now()
+        before = (self.hard_locked, self.hard_reason, self.hard_locked_at, self.peak_equity, list(self.unlock_history))
+        self.unlock_history = (self.unlock_history + [{
+            "at": now.isoformat(timespec="seconds"), "locked_at": self.hard_locked_at,
+            "reason": self.hard_reason, "forced": forced,
+        }])[-UNLOCK_HISTORY_LIMIT:]
         self.hard_locked = False
         self.hard_reason = ""
+        self.hard_locked_at = ""
         self.peak_equity = 0.0
         self._save()
+        if self.save_error:
+            # 没写进磁盘就不算解锁:内存状态回滚,与磁盘保持一致(调用方据 save_error 报错)
+            self.hard_locked, self.hard_reason, self.hard_locked_at, self.peak_equity, self.unlock_history = before
+
+    # ---------- 非策略委托计数 ----------
+
+    def record_manual_order(self, now: datetime) -> int:
+        """记一笔非策略委托(不是 CTA 策略、也不是紧急平仓发出的),返回当日累计笔数。只计数,不触发锁定。"""
+        key = trading_day(now).isoformat()
+        self.manual_orders[key] = self.manual_orders.get(key, 0) + 1
+        for old in sorted(self.manual_orders)[:-MANUAL_DAYS_LIMIT]:
+            del self.manual_orders[old]
+        self._save()
+        return self.manual_orders[key]
 
     # ---------- 持久化 ----------
 
@@ -175,6 +226,9 @@ class AccountGuard:
             "daily_locked_day": self.daily_locked_day.isoformat() if self.daily_locked_day else None,
             "hard_locked": self.hard_locked,
             "hard_reason": self.hard_reason,
+            "hard_locked_at": self.hard_locked_at,
+            "unlock_history": self.unlock_history,
+            "manual_orders": self.manual_orders,
         }
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +255,10 @@ class AccountGuard:
             self.daily_locked_day = date.fromisoformat(s["daily_locked_day"]) if s["daily_locked_day"] else None
             self.hard_locked = bool(s["hard_locked"])
             self.hard_reason = str(s["hard_reason"])
+            # 以下为后加字段:旧状态文件没有,缺失时取默认值(向后兼容)
+            self.hard_locked_at = str(s.get("hard_locked_at", ""))
+            self.unlock_history = [dict(h) for h in s.get("unlock_history", [])][-UNLOCK_HISTORY_LIMIT:]
+            self.manual_orders = {str(k): int(v) for k, v in s.get("manual_orders", {}).items()}
         except (ValueError, KeyError, TypeError, OSError) as exc:
             # 状态文件损坏:宁可保守地进入硬锁定,也不能当作"没有锁"继续交易
             self.hard_locked = True

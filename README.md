@@ -154,6 +154,8 @@ python scripts/run_headless.py --symbol c2701.DCE
 python scripts/run_headless.py --symbol c2701.DCE --history CADJ.DCE \
        --setting '{"fast_window":10,"slow_window":40}' --heartbeat 60
 python scripts/run_headless.py --check          # 只校验配置与依赖，不连接、不交易
+# 连接生产 API(实盘且非 SimNow)前必须有晋级门槛批准文件:未全部通过时下面的命令不会写文件
+python scripts/record_promotion.py --metrics candidate.json --strategy <名称> --approver <批准人>
 ```
 
 容器方式（推荐用于长期运行）：
@@ -234,6 +236,7 @@ python scripts/import_minute.py --root C:/Dev/data/invest \
 
 # 解除账户硬锁定（风控锁定后需要人工确认才放行）
 python scripts/unlock_account.py --yes
+# 注意:硬锁定当个交易日内会被冷却期拒绝(退出码 3);核对后确需越过用 --force(须交互输入 FORCE,不能与 --yes 同用)
 ```
 
 ---

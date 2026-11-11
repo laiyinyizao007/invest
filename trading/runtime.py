@@ -370,6 +370,7 @@ class TradingRuntime:
         if problems:
             self.notify("FATAL", "对账失败,拒绝启动", ";".join(problems) + "。请人工核对账户与 .vntrader/cta_strategy_data.json")
             return EXIT_RECONCILE_REFUSED
+        self.rule.arm_manual_detection()      # 对账通过:此后出现的非策略委托才计为人工干预
         return None
 
     def _equity(self) -> float:
@@ -565,5 +566,9 @@ def build_ctp_setting(env: dict[str, str]) -> dict[str, Any]:
         raise ValueError("缺少环境变量: " + ", ".join(missing))
     setting: dict[str, Any] = {key: env[var] for key, var in required.items()}
     # "实盘" = 生产版 API(SimNow 与实盘使用);"测试" = 期货公司看穿式监管测试环境
-    setting["柜台环境"] = env.get("CTP_ENVIRONMENT", "实盘")
+    environment = (env.get("CTP_ENVIRONMENT", "实盘") or "实盘").strip()
+    if environment not in ("实盘", "测试"):
+        # 写法不规范(尾随空格、live、PROD…)时不能悄悄当成别的环境:实盘准入检查按精确值判断
+        raise ValueError("CTP_ENVIRONMENT 只能是「实盘」或「测试」")
+    setting["柜台环境"] = environment
     return setting

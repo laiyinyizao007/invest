@@ -6,6 +6,14 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 纪律机制补缺(Issue [#6](https://github.com/laiyinyizao007/invest/issues/6),依据《期货交易复盘与人性反思》):
+  ① 解锁问责——`AccountGuard` 记录硬锁定时间与解锁历史,`unlock_account.py` 增加冷却期(硬锁定当个交易日内拒绝,退出码 3)
+  与 `--force`(须交互输入 FORCE、不能与 `--yes` 同用);② 非策略委托检测——运行中发现 reference 不属于 CTA 策略/紧急平仓的新委托,
+  告警并按交易日计数(只告警不锁定;启动对账通过后才开始计数),每日证据表记为严重事件、让"人工干预 = 0"可验收;
+  ③ 实盘准入——`run_headless` 连接生产 API(`实盘` 且非 SimNow)前要求 `data/state/promotion_approval.json`,
+  由新增的 `scripts/record_promotion.py` 在晋级门槛全部通过时才写出(SimNow 与看穿式测试环境豁免)。
+  codex 审查后加固:运行时仍在运行(心跳 60 秒内)时拒绝解锁、触发时间未知须 `--force`、写盘失败回滚、`CTP_ENVIRONMENT` 严格校验(只允许「实盘」「测试」)、已计数委托号防回放重复。
+  新增 ADR `20261111-discipline-enforcement.md`、`20261111-risk-floor-immutability.md`(风控底线不可优化、明确不做清单、本地止损已接受风险)。
 - 穿透式监管接入工具(Issue [#5](https://github.com/laiyinyizao007/invest/issues/5)):新增 `scripts/collect_terminal_info.py`
   (Windows 终端信息采集,标出出网网卡与虚拟网卡)、`scripts/penetration_check.py`(看穿式测试环境演练:
   逐里程碑判定登录全流程、订阅/账户/持仓、可选跌停价买单+撤单,生成脱敏报告;生产 API 无条件拒绝);

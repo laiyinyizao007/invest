@@ -133,6 +133,7 @@ python scripts/run_headless.py --check
 | 8 | 夜盘跨日:21:00 开盘第一根 Tick 到来时的信号发单、交易日归属 | 验证日线合成与 `trading_day` | — |
 | 9 | 行情断流:交易时段内停掉行情,是否收到"行情停更"告警 | 本地止损依赖 Tick | — |
 | 10 | SimNow 的撮合与真实交易所的差异(排队、滑点、成交回报) | **SimNow 不能代表真实滑点**,回测成本假设需用实盘小额再校准 | `strategies/instruments.py` |
+| 11 | **非策略委托检测的 reference 假设**:在 SimNow 上用手机 App/另一终端手动下一单,**两种结果都要记录**:① 收到 reference 为空的回报并触发「检测到非策略委托」告警 → 假设成立;② 本进程完全收不到该委托的事件 → 检测只覆盖同会话干预,需按 ADR 登记周期性 `ReqQryOrder` 对账;升级 vnpy_ctp 后同样复验 | 检测依赖 vnpy_ctp 只在 send_order 事件里带 reference 的行为(源码推断,未实测) | `docs/adr/20261111-discipline-enforcement.md` 已知局限 |
 
 ## 6. SimNow 阶段验收
 - 连续无人工干预运行 ≥ 5 个交易日,含夜盘与至少一次周末;

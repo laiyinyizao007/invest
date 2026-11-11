@@ -383,3 +383,15 @@ def test_the_help_text_prints_without_a_unicode_error(capsys):
     code = u.main([])
     assert code == 2
     assert "无人值守" in capsys.readouterr().out
+
+
+def test_manual_intervention_makes_the_day_dirty_and_severe(tmp_path):
+    """验收要求"人工干预次数 = 0":出现非策略委托告警的那天不能算干净,连续段要断。"""
+    path = write_log(tmp_path, "vt_20261110.log", [
+        "2026-11-10 09:01:03.000 [INFO] 已启动: trend_atr 运行于 c2701.DCE",
+        "2026-11-10 10:00:00.000 [ERROR] 检测到非策略委托: c2701.DCE 多开 1@2400",
+    ])
+    stats = u.parse_day_log(path)
+    assert stats.events == Counter({("严重", "非策略委托"): 1})
+    assert not stats.clean and stats.has_severe
+    assert any("人工干预次数 = 0" in line for line in u.acceptance_checklist([stats]))

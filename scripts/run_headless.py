@@ -7,7 +7,12 @@
 配置来自环境变量(优先)或项目根目录的 .env(见 config/.env.example)。密码、授权码只从环境读取,
 不出现在命令行参数里,也不会写进日志或通知(通知会把它们替换成 ***)。
 
-退出码:0 正常停止/硬锁定后确认空仓/硬锁定生效中(不要自动重启);3 启动失败(可重试);4 对账失败(需人工处理)。
+退出码:0 正常停止/硬锁定后确认空仓/硬锁定生效中(不要自动重启);2 配置错误/缺少实盘准入批准;
+3 启动失败(可重试);4 对账失败(需人工处理)。
+
+实盘准入:目标是生产 API(CTP_ENVIRONMENT=实盘 且交易前置不是 SimNow)时,必须存在
+data/state/promotion_approval.json(由 scripts/record_promotion.py 在晋级门槛全部通过后写出),否则退出码 2。
+SimNow 与期货公司看穿式测试环境(CTP_ENVIRONMENT=测试)不受限。
 
 重要:这是**管道测试**用的运行方式。当前策略在回测里没有发现可延续的优势(见 ADR),
 在没有通过晋级门槛之前,不要连接真实资金账户。
@@ -18,12 +23,15 @@ import os
 import signal
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import bootstrap
 
 from dotenv import load_dotenv
 
 from notify.webhook import WebhookNotifier
+from risk.live_admission import APPROVAL_RELATIVE, check_live_admission
+from simnow_guard import is_simnow_address
 from trading.runtime import EXIT_OK, RuntimeConfig, TradingRuntime, build_ctp_setting
 
 
@@ -73,6 +81,7 @@ def main(
     env: Mapping[str, str] | None = None,
     gateway_loader: Callable[[], type] | None = None,
     runtime_factory: Callable[..., TradingRuntime] = TradingRuntime,
+    approval_path: Path | None = None,
 ) -> int:
     if env is None:
         load_dotenv(bootstrap.ROOT / ".env", override=False)     # 已存在的环境变量(如 Docker 注入)优先
@@ -94,6 +103,13 @@ def main(
             gateway_class = gateway_loader()
     except (ValueError, json.JSONDecodeError, ImportError) as exc:
         print(f"配置错误: {exc}", file=sys.stderr)              # 异常信息里只有变量名,不含值
+        return 2
+
+    admitted, admission_note = check_live_admission(
+        gateway_setting["柜台环境"], is_simnow_address(gateway_setting["交易服务器"]),
+        approval_path if approval_path is not None else bootstrap.ROOT / APPROVAL_RELATIVE)
+    if not admitted:
+        print(f"拒绝启动: {admission_note}", file=sys.stderr)
         return 2
 
     config = RuntimeConfig(

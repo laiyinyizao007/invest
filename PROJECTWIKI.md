@@ -361,6 +361,9 @@ flowchart TB
   - [`20261110-walk-forward-optimizer.md`](docs/adr/20261110-walk-forward-optimizer.md):Walk-Forward 滚动窗口方法学、测试段三层隔离护栏、预算弃单率口径与负面结果记录
   - [`20261110-bisheng-ai-researcher.md`](docs/adr/20261110-bisheng-ai-researcher.md):两层架构——外层 Bisheng AI 策略研究员经研究沙盒 API 与内层 vn.py 确定性内核隔离;LLM 产出只落 pending 目录、装载永远人工、外层可整体替换
 
+  - [`20261111-discipline-enforcement.md`](docs/adr/20261111-discipline-enforcement.md):纪律机制补缺——解锁冷却与历史、非策略委托检测(只告警计数)、实盘准入检查(生产 API 必须有晋级门槛批准)
+  - [`20261111-risk-floor-immutability.md`](docs/adr/20261111-risk-floor-immutability.md):风控底线不可优化(预算是约束不是变量)、明确不做清单、本地止损依赖进程存活的已接受风险
+
 ## 4. 设计决策 & 技术债务
 | 项 | 说明 | 优先级 |
 |---|---|---|
@@ -725,6 +728,11 @@ flowchart TB
 - 结果(2026-11-10 一次性运行):三个窗口训练段 Top5 夏普全部为负,验证段 15 组参数夏普全部为负、正夏普窗口占比 0%,
   预算弃单率 0%(atr_mult=1.5 下止损距离都在 300 元内,空仓并非预算造成);与基线 ADR 的负面结论互相印证,详见 ADR 结果章节。
 
+### 纪律机制补缺(Issue #6,详见 `docs/adr/20261111-discipline-enforcement.md`)
+- **解锁问责**:`AccountGuard` 记录 `hard_locked_at` 与 `unlock_history`;`scripts/unlock_account.py` 在硬锁定当个交易日内拒绝解锁(退出码 3),`--force` 须交互输入 `FORCE` 且不能与 `--yes` 同用;解锁后峰值重置的语义不变。
+- **非策略委托检测**:`AccountGuardRule._track_manual_order`——reference 不是 `CtaStrategy_*`/`FLATTEN_REF` 的新委托,经 3 秒确认窗口后告警并按交易日计数(`guard.manual_orders`);只告警不锁定;启动对账通过后才 arm;每日证据表记为严重事件。
+- **实盘准入**:`risk/live_admission.py` + `scripts/record_promotion.py`——`run_headless` 连接生产 API(`实盘` 且非 SimNow)前要求 `data/state/promotion_approval.json`,该文件仅在 `check_gate` 全部通过时写出;SimNow 与 `测试` 环境豁免。
+
 ### `scripts/collect_terminal_info.py` 与 `scripts/penetration_check.py`(穿透式监管接入,Issue #5)
 - 运行机是**另一台 Windows**,直接用 Python 运行(不用 Docker:容器内采到的 IP/MAC 与宿主机不符;树莓派 ARM64 无 CTP 库)。
 - `collect_terminal_info.py`:仅 Windows,PowerShell `Get-CimInstance` 采 OS/CPU/主板/BIOS/硬盘序列号/网卡 MAC 与 IP;
@@ -863,5 +871,6 @@ sequenceDiagram
 ## 12. 变更日志
 - 参见 [`CHANGELOG.md`](CHANGELOG.md)。提交与本文件同步更新,提交信息引用 Issue #1。
 - 2026-11-10:§2 新增 2.2–2.5(目标分层架构含内层 vn.py 流程引擎/外层 Bisheng AI 策略研究员两层边界、研究方法论映射 25 条、四阶段演进路线与技术债去向、规划位登记表);§2.1 现状图保留不变,节点状态表 2 行状态文字同步;§4 技术债表不改动,去向见 §2.4;新增 ADR `20261110-bisheng-ai-researcher.md`。
+- 2026-11-11:纪律机制补缺(Issue #6):解锁冷却与历史、非策略委托检测、实盘准入检查;新增 ADR `20261111-discipline-enforcement.md`、`20261111-risk-floor-immutability.md`。
 - 2026-11-10:穿透式监管接入工具(Issue #5):§5 新增 `collect_terminal_info.py`/`penetration_check.py`;新增 `docs/broker-filing.md`;`docs/live-readiness.md` 补 C2/C3。
 - 2026-11-10:报备能力面补齐(Issue #4):§5 新增日内演示策略模块文档、`run_gui` 条目补算法单/价差应用页与多账户能力说明;新增依赖 `vnpy_algotrading`/`vnpy_spreadtrading`;全量测试 643→647,覆盖率 88%→90%。

@@ -18,7 +18,7 @@ from risk.account_guard import AccountGuard, AccountLimits  # noqa: E402
 
 ENV = {"CTP_USERNAME": "user_x", "CTP_PASSWORD": "pw_secret_123", "CTP_BROKER_ID": "9999",
        "CTP_TD_ADDRESS": "td:1", "CTP_MD_ADDRESS": "md:1", "CTP_APP_ID": "app", "CTP_AUTH_CODE": "auth_secret_456",
-       "LIVE_VT_SYMBOL": "c2701.DCE"}
+       "LIVE_VT_SYMBOL": "c2701.DCE", "CTP_ENVIRONMENT": "测试"}
 
 
 class StubRuntime:

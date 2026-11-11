@@ -26,6 +26,7 @@ from vnpy.trader.event import EVENT_LOG
 from vnpy.trader.logger import ERROR
 from vnpy.trader.object import LogData, OrderData, OrderRequest
 from vnpy.trader.utility import round_to
+from vnpy_ctastrategy.base import APP_NAME as CTA_APP_NAME
 from vnpy_riskmanager.base import APP_NAME
 from vnpy_riskmanager.template import RuleTemplate
 
@@ -47,6 +48,9 @@ ERROR_WINDOW = 3.0                      # 废单与其错误日志的最大时�
 MIN_POSITION_REFRESH_TIMEOUT = 3.0     # 等持仓回报的下限(秒)
 CANCEL_RETRY_SECONDS = 10.0             # 撤单请求发出后多久仍未终结则允许再次撤单
 FLATTEN_REF = "account_guard_flatten"   # 紧急平仓委托的标记,废单处理据此识别,不依赖事件到达顺序
+STRATEGY_REF_PREFIX = f"{CTA_APP_NAME}_"   # CTA 引擎下单的 reference 前缀(vnpy_ctastrategy/engine.py)
+MANUAL_CONFIRM_DELAY = 3.0              # 首个事件没有策略标记时,等这么久再认定为非策略委托(见 on_order 的说明)
+SEEN_ORDERS_LIMIT = 5000                # 已见委托号的上限,超过则丢弃最旧的一半(只影响去重,不影响风控)
 # CTP 把委托失败写成 INFO 级别的日志,这些措辞用来认出"这是一条拒单原因"。
 # 实测措辞(2026-11-10 SimNow):"交易委托失败,代码：21,信息：…"、"交易撤单失败,代码：…"。
 # **必须用精确措辞**:宽泛的"失败"会把"行情服务器登录失败""行情订阅失败""委托请求发送失败"
@@ -121,6 +125,13 @@ class AccountGuardRule(RuleTemplate):
         self._errors: deque[tuple[float, str, str]] = deque(maxlen=50)   # (时刻, 文本, 来源网关)
         self._pending_rejects: dict[str, tuple[float, OrderData]] = {}
         self._flatten: dict | None = None
+        # 非策略委托检测(docs/adr/20261111-discipline-enforcement.md):启动对账完成后由运行时 arm 才开始计数,
+        # 否则 CTP 登录后回放的当日历史委托(reference 为空)会被误认成人工下单。
+        self._manual_armed = False
+        self._seen_orders: dict[str, None] = {}      # 保持插入顺序,超限时丢最旧的
+        self._own_orders: set[str] = set()
+        self._manual_counted: set[str] = set()      # 已计数的非策略委托号:不随 _seen_orders 淘汰,防回放重复计数
+        self._manual_pending: dict[str, tuple[float, OrderData]] = {}
         self._hard_emitted: set[bool] = set()    # 已发出的硬锁定事件(flat=False / flat=True 各最多一次)
         self._save_error_alerted = False
         # 交易时段判定:由运行时注入(默认始终在时段内,保持脱离运行时的单测原有行为)。
@@ -157,8 +168,51 @@ class AccountGuardRule(RuleTemplate):
 
     # ---------- 事件 ----------
 
+    def arm_manual_detection(self) -> None:
+        """启动对账完成后调用:此后首次出现、且不是本系统发出的委托才算"非策略委托"。"""
+        self._manual_armed = True
+
+    def _track_manual_order(self, order: OrderData, now: float) -> None:
+        """识别非策略委托(只告警+计数,不锁定、不拦截)。
+
+        本系统发出的委托:CTA 策略单 reference 以 `CtaStrategy_` 开头,紧急平仓是 FLATTEN_REF。
+        vnpy_ctp 只在 send_order 返回时的那次事件里带 reference,之后 CTP 回报(onRtnOrder)的 reference 为空;
+        别的终端(手机 App、柜台)下的单只会以"reference 为空"的回报出现。所以:
+        - 首次出现且 reference 为空的委托先挂起 MANUAL_CONFIRM_DELAY 秒,期间若见到带策略标记的事件则放行
+          (CTP 回报线程可能抢在 send_order 的事件之前到达);
+        - 已见过的委托号不再判定,避免断线重连后的回放造成重复计数。
+        """
+        oid = order.vt_orderid
+        is_own = order.reference == FLATTEN_REF or order.reference.startswith(STRATEGY_REF_PREFIX)
+        first = oid not in self._seen_orders
+        if first:
+            if len(self._seen_orders) >= SEEN_ORDERS_LIMIT:
+                for old in list(self._seen_orders)[:SEEN_ORDERS_LIMIT // 2]:
+                    del self._seen_orders[old]
+            self._seen_orders[oid] = None
+        if is_own:
+            self._own_orders.add(oid)
+            self._manual_pending.pop(oid, None)
+        elif oid not in self._manual_counted and first and self._manual_armed and oid not in self._own_orders:
+            self._manual_pending[oid] = (now, order)
+
+    def _process_manual_pending(self, now: float) -> None:
+        for oid, (t, order) in list(self._manual_pending.items()):
+            if now - t < MANUAL_CONFIRM_DELAY:
+                continue
+            del self._manual_pending[oid]
+            if oid in self._own_orders:
+                continue
+            self._manual_counted.add(oid)
+            today = self.guard.record_manual_order(self.clock())
+            self._alert("ERROR", "检测到非策略委托",
+                        f"{order.vt_symbol} {order.direction.value if order.direction else ''}{order.offset.value} "
+                        f"{order.volume}@{order.price}(委托号 {oid},reference={order.reference!r})。"
+                        f"今日第 {today} 笔。这不是本系统发出的单:人工干预会使无人值守验收作废,请核对账户与持仓。")
+
     def on_order(self, order: OrderData) -> None:
         now = self.mono()
+        self._track_manual_order(order, now)
         is_open = order.offset not in CLOSING_OFFSETS
         if order.is_active():
             self._open_orders.setdefault(order.vt_orderid, (now, is_open))
@@ -265,6 +319,7 @@ class AccountGuardRule(RuleTemplate):
         self.lock_status = self.guard.status(trading_day(now_dt))
 
         self._process_pending_rejects(now)
+        self._process_manual_pending(now)
         in_session = self.session_active()
         if in_session and not self._was_in_session:
             # 非交易→交易时段边沿:休市期间没有成交/撤单回报是正常的,挂单年龄要从开盘时刻重新计。
