@@ -39,7 +39,8 @@
 
 ### `risk/promotion_gate.py`(纯 Python,覆盖率 100%)
 - `sharpe_standard_error` / `sharpe_ci`:夏普的统计误差(Lo 2002 近似)。
-- `check_gate(CandidateMetrics, GateThresholds)`:8 条晋级门槛,返回未通过项。接入真实回测流程尚未实现。
+- `check_gate(CandidateMetrics, GateThresholds)`:8 条晋级门槛,返回未通过项(8 条门槛在代码里是 11 个失败原因——夏普过高/过低、回撤百分比/金额各算一条门槛的两个方向)。
+  **未接入优化脚本**:目前只有 `scripts/record_promotion.py` 与 `risk/live_admission.py` 消费它,优化器不会自动过闸。
 
 ### `strategies/trend_atr_strategy.py`
 - 日线双均线(金叉做多/死叉做空,仅空仓入场)+ ATR 移动止损,1 手;可选固定止盈(保守:收盘后触及目标则下一根开盘附近离场)。

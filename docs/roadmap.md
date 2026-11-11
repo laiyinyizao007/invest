@@ -47,7 +47,7 @@ flowchart TB
   %% ═══════════ 内层 ① 数据层 ═══════════
   subgraph D[内层 ① 数据层]
     BS[scripts/bootstrap.py] -.-> FD
-    BS -.-> IM
+    BS --> IM
     FD[scripts/fetch_data.py 新浪日线+分钟增量]
     IM[scripts/import_minute.py 购买 DCE 1 分钟]
     FD --> DB[(.vntrader/database.db)]
@@ -145,7 +145,7 @@ flowchart TB
   DK --> RH
   DR -. 独立状态目录 .-> CTP
   SG --> DR
-  DR --> DRDOC[(docs/simnow-drills.md)]
+  DR -.-> DRDOC[(docs/simnow-drills.md 尚未生成<br/>演练首次实跑时写出)]
   LOG --> UR
   WH --> UR
   UR --> URDOC[(docs/unattended-log.md)]
@@ -164,6 +164,8 @@ flowchart TB
 
 **图例与注解**:
 - 实线 = 已实现,节点路径与 §2.1 现状图一致;`-.->` = 规划位,进入实现前须先补 ADR(沿用「脚本与 ADR 同一原子提交」先例);
+- **实线只表示"代码存在",不表示"已验证"**:如 `DRDOC`(演练结果文档)尚未生成,`CTP` 只在启动管道上实测过;逐节点的实现/验证程度见 `docs/architecture.md` §0;
+- `PG`(晋级门槛)**未接入优化脚本**:目前只有 `scripts/record_promotion.py` 与 `risk/live_admission.py` 消费它,优化器不会自动过闸;门槛的 `parameter_on_plateau` 由调用方提供(人工判断),计算来源见 §2.6;
 - GUI(`scripts/run_gui.py`)故意不画——§4 已定性「图形界面不是运行方式」,目标架构是无头架构;
 - **外层子图没有任何指向执行层/风控层/CTP 的连线——图形本身就是边界契约**;
 - 规划位组件只在 §2.5 登记表文字预留,不建空目录、不写占位文件。
@@ -207,7 +209,7 @@ flowchart TB
 | 飞书真实 webhook 未验证 | 阶段一 |
 | 无人值守只跑 1 天 | 阶段一 |
 | 废单关键词表只覆盖 2 条实测文本 | 阶段一(借 drill 废单轰炸采回) |
-| 主力合约换月需人工更新 | 阶段二(规划位 RM) |
+| 主力合约换月需人工更新 | 阶段二(规划位 RM;换月派生数据实际在 `scripts/build_continuous.py`) |
 | 交易日不处理法定节假日 | 阶段二(规划位 CAL) |
 | 回测成本是假设值 | 阶段二(依赖 C 段拿真实费率) |
 | 缺少自动化调度 | 阶段二(规划位 SCHED) |
@@ -240,7 +242,7 @@ flowchart TB
 | Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
 | 增量调度器 | VPS cron / systemd timer,不写 Python 常驻进程(KISS) | 阶段一无人值守 ≥5 天达标后,分钟线断档风险成为现实约束 | §4「缺自动化调度」 |
 | 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
-| 主力换月自动化 | 扩展 `scripts/import_minute.py` rolls 派生逻辑 → runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
+| 主力换月自动化 | 扩展 `scripts/build_continuous.py` 的 rolls 派生逻辑(换月数据实际在这里生成,不在 `import_minute.py`)→ runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
 | CTP 行情自录 | vnpy DataRecorder 挂到 runtime 或独立无头进程 | 新候选需要新样本外数据、且购买数据未更新时;**与补购分钟线二选一或并行,由届时数据缺口形状决定** | 要点梳理 §3.1 |
 
 **接受的风险**(有意不设规划位,避免虚假承诺):本地止损依赖进程存活——vn.py 停止单是引擎本地触发的,进程退出即失效;缓解 = 固定 1 手轻仓 + 行情假死看门狗 + 进程退出发 FATAL。研究资料未提供交易所端条件单的可行方案,标记为接受的风险而非规划位。

@@ -27,14 +27,14 @@
 
 > 分层依赖图、磁盘状态归属表、隔离机制与**已知局限台账**见 [`docs/architecture.md`](docs/architecture.md)。
 
-### 2.1 现状数据流(全部已实现)
+### 2.1 现状数据流(代码已实现;**各节点的真实验证程度见下表**,不要把"代码完成"读成"已验证")
 ```mermaid
 flowchart LR
   SINA[(新浪行情 via AKShare)] --> FD[fetch_data.py]
   BUY[(购买的 DCE 分合约 1 分钟线)] --> IM[import_minute.py]
   IM --> DER[(derived: 复权主力连续<br/>1d / 15m / rolls)]
-  BS[bootstrap.py] -. 时区/目录 .-> FD
-  BS -. 时区/目录 .-> IM
+  BS[bootstrap.py] --> FD
+  BS --> IM
   FD --> DB[(.vntrader/database.db)]
   FD --> CSV[(data/csv/*.csv)]
   DB --> BL[backtest_lib.py]
@@ -71,12 +71,12 @@ flowchart LR
 | OPT / O15 | `scripts/optimize.py`、`scripts/optimize_15m.py` | 完成(两者结论均为负面) |
 | ST / ST15 | `strategies/trend_atr_strategy.py`、`trend_atr_15m_strategy.py`、`random_entry_strategy.py`、`instruments.py` | 完成 |
 | RG / PG | `risk/risk_guard.py`、`risk/promotion_gate.py` | 完成 |
-| RT / GR | `trading/runtime.py`、`trading/guard_rule.py`、`trading/safe_risk.py` | 完成(离线测试) |
+| RT / GR | `trading/runtime.py`、`trading/guard_rule.py`、`trading/safe_risk.py` | 完成(仅假网关离线测试;**未在真实 CTP 上验证**) |
 | WH | `notify/webhook.py` | 完成 |
-| CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | 主机端与**容器内**均已跑通完整 SimNow 启动管道 |
+| CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | **部分**:主机端与容器内均跑通完整启动管道(2026-11-10);废单文本、撤单失败、断线重连、夜盘跨日**未在真实 CTP 验证** |
 | GUI | `scripts/run_gui.py` | 完成(人工观察用,非无人值守) |
-| SG / DR | `scripts/simnow_guard.py`、`scripts/drill.py` | 完成(**未实跑**,阶段一,见 §2.4) |
-| UR | `scripts/unattended_report.py` | 完成(离线自检通过,真实 webhook 待配,probe 未通过) |
+| SG / DR | `scripts/simnow_guard.py`、`scripts/drill.py` | 代码完成,**演练从未实跑**(`docs/simnow-drills.md` 尚不存在,首次实跑时由脚本生成);阶段一,见 §2.4 |
+| UR | `scripts/unattended_report.py` | 完成(离线自检通过,真实 webhook 待配,probe 未通过;连续 5 天证据未攒齐) |
 
 
 ### 2.2 目标架构与演进路线(已迁出)

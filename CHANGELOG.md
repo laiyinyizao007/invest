@@ -14,6 +14,12 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 文档状态对齐(Issue [#11](https://github.com/laiyinyizao007/invest/issues/11)):新增 `docs/architecture.md` §0「目标 vs 现状」逐节点实现矩阵
+  (IMPL/PART/PLAN + 证据文件路径 + 实现比例 + 依赖顺序),作为"实现了多少"的单一出处;
+  roadmap 目标图的 `DRDOC` 改回规划位(演练从未实跑、该文档尚不存在)、`PG`(晋级门槛)三条边改回规划位(门槛**未接入优化脚本**),
+  `BS` 依赖边改回实线;§2.5 换月派生指向改回 `scripts/build_continuous.py`(实际在它那里,不在 `import_minute.py`);
+  wiki §2.1 状态列改为区分"代码完成"与"已验证"(`RT/GR` 仅假网关测试、`CTP` 只有启动管道实测、`SG/DR` 从未实跑、`UR` 证据未攒齐),
+  图例注明实线只表示代码存在。
 - 净持仓方向不明 fail-closed(Issue [#10](https://github.com/laiyinyizao007/invest/issues/10)):新增 `risk/positions.py`(`signed_net`/`undirected`/`describe`);
   `trading/runtime.py` 的启动对账与运行中漂移检测遇到 `Direction.NET` 等方向不明的持仓时拒绝启动/告警,不再按"非多即空"算净额;
   `trading/guard_rule.py` 紧急平仓遇方向不明持仓时**不发任何平仓单**、直接升级人工(FATAL,硬锁定时 flat=False 保持进程存活)。

@@ -3,6 +3,83 @@
 > 本页是 `PROJECTWIKI.md` §2 的补充:wiki §2.1 画"数据怎么流",这里画**代码怎么分层、磁盘状态归谁、哪些东西不能碰、哪些局限还没解决**。
 > 事实来源:2026-11-11 的架构审视(import 图逐文件核对)。目标架构与规划位见 `docs/roadmap.md`。
 
+## 0. 目标 vs 现状:逐节点实现矩阵
+
+> 2026-11-11 逐节点核对代码得出。**IMPL** = 代码存在;**PART** = 代码在但未验证/不完整;**PLAN** = 只有设计,无代码。
+> 本表是"实现了多少"的单一出处,每轮改动后更新;证据列给的都是可点开的文件路径。
+> 目标架构与阶段划分见 `docs/roadmap.md` §2.2–§2.6。
+
+### 数据层
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| bootstrap | IMPL | `scripts/bootstrap.py`(导入副作用:工作目录、`TZ`、`.vntrader`);`isolate_state()`/`load_env()` 尚未抽成 |
+| fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
+| import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
+| SCHED 增量调度 | PLAN | 无 cron / 计划任务 |
+| RECC CTP tick 录制 | PLAN | 无 `DataRecorder` |
+
+### 策略与研究
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| backtest_lib / optimize / optimize_15m / walk_forward_optimizer | IMPL | `scripts/backtest_lib.py`、`scripts/optimize.py`、`scripts/optimize_15m.py`、`scripts/walk_forward_optimizer.py`;优化器**无 `--test` 开关**,测试段使用靠人工纪律 |
+| 随机入场对照 | IMPL | `strategies/random_entry_strategy.py` |
+| 晋级门槛 | IMPL(未接线) | `risk/promotion_gate.py::check_gate`;只被 `scripts/record_promotion.py`、`risk/live_admission.py` 消费,**未接入优化脚本**;`parameter_on_plateau` 由调用方传入,无计算来源 |
+| PP 参数平原/PBO/DSR | PLAN | 只有布尔字段 |
+| TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
+| RSA 研究沙盒 API / SBX 骨架目录 / RTR MetaRouter | PLAN | 零代码 |
+
+### 风控与守卫
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| risk_guard(预算/移动止损/连亏熔断) | IMPL | `risk/risk_guard.py` |
+| account_guard(双层熔断) | IMPL | `risk/account_guard.py`;`trading_day()` 按 `hour >= 20` 且**只跳周末**,不认法定节假日 |
+| order_policy(废单分级) | PART | `risk/order_policy.py` 三级分类;码表只有 8 个实测/官方背书码,其余靠关键词回退 |
+| live_admission / positions | IMPL | `risk/live_admission.py`、`risk/positions.py`(净持仓方向 fail-closed) |
+| 保证金占比风控 | PLAN | 无 |
+| 周期性 `ReqQryOrder` 对账 | PLAN | 无 |
+
+### 运行与运维
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| runtime(启动五步/对账/看门狗) | IMPL(仅假网关) | `trading/runtime.py`;废单/撤单/断线/夜盘跨日未在真实 CTP 验证 |
+| guard_rule | IMPL | `trading/guard_rule.py`;失败态的紧急平仓不自动恢复(见 §4 局限台账) |
+| CTP / SimNow | PART | 启动管道跑通一次;其余路径未验证 |
+| Docker + GB18030 locale + HEALTHCHECK | IMPL | `Dockerfile`、`docker-compose.yml` |
+| drill.py 六场景 | PART | 代码完成,**从未实跑**(`docs/simnow-drills.md` 尚不存在,首次实跑时生成) |
+| simnow_guard | IMPL | `scripts/simnow_guard.py` |
+| unattended_report | PART | `scripts/unattended_report.py`;连续 5 天证据未攒齐 |
+| CAL 交易日历 | PLAN | 无节假日逻辑 |
+| RM 主力换月自动化 | PLAN | rolls 数据离线生成,运行时无人校验 `LIVE_VT_SYMBOL` |
+| 统一时段表 `risk/sessions.py` | PLAN | 时段定义散在 4 处,语义各异(见 §1 已知违例) |
+
+### 通知
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| webhook(队列/重试/去重/脱敏) | IMPL | `notify/webhook.py`;真实飞书 webhook 从未验证(`.env` 里 URL 为空) |
+| CTRL `/stop_all` 反向控制 | PLAN | 无接收端 |
+
+### 合规工具
+| 节点 | 状态 | 证据 / 缺口 |
+|---|---|---|
+| broker_test / broker_evidence / broker_report / penetration_check / collect_terminal_info | IMPL | `scripts/` 下五个脚本 |
+| 2.1 断网演练 | PART | 半自动(`--interactive` 提示操作者断网) |
+| 5.2 批量撤单 | PLAN | 无 |
+| 证据里记录前置地址/BrokerID/AppID | PLAN | `broker_test.py` 目前只用 `LIVE_VT_SYMBOL` |
+
+### 外层与基础设施
+| 节点 | 状态 |
+|---|---|
+| Bisheng 外层(BSN / KB / MEM / 独立 compose) | PLAN(零代码) |
+| 日历 / 调度 | PLAN |
+
+### 实现比例(粗估,PART 记半)
+数据 ~60% · 策略研究 ~70% · 风控守卫 ~85% · 运行运维 ~70% 节点但**对真实交易所验证仅 ~40%** · 通知 50% · 合规工具 ~80% · 外层 0%。
+
+### 依赖顺序(先做这些,再往上加功能)
+`统一时段表 + 日历` → `假期感知的熔断边界` → `换月校验` → `调度` → `数据积累` → `月度重估`;
+`门槛的 parameter_on_plateau 计算来源` → `参数平原/过拟合检验` → 门槛全自动;
+`共享包 ctp_tools / isolate_state / load_env` → `scripts/` 分目录 → `研究沙盒 API` → `Bisheng 外层`。
+
 ## 1. 分层与允许的 import 方向
 
 ```mermaid

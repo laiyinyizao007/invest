@@ -7,7 +7,7 @@
 
 ## A. 策略准入(代码与数据,我可以做)
 - [ ] 数据已复权(`CADJ/MAADJ`),并有足够长的样本外(见晋级门槛 ADR 的最少年数表);
-- [ ] 通过晋级门槛全部 8 条(`risk/promotion_gate.py::check_gate` 输出为空);并用 `python scripts/record_promotion.py` 写出 `data/state/promotion_approval.json`——
+- [ ] 通过晋级门槛全部 8 条(`risk/promotion_gate.py::check_gate` 输出为空;8 条门槛对应 11 个失败原因,夏普上下界与回撤双口径各算一条门槛的两个方向);并用 `python scripts/record_promotion.py` 写出 `data/state/promotion_approval.json`——
       没有这个文件,`run_headless.py` 拒绝连接生产 API(`实盘` 且非 SimNow;见 `docs/adr/20261111-discipline-enforcement.md`);
 - [ ] 随机入场对照分位 ≥ 95%,成本翻倍后夏普 ≥ 1.0;
 - [ ] 测试段只看过**一次**,看后没有再调参;
