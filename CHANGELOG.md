@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 目标架构设计(PROJECTWIKI.md §2.2–2.5,依据两份研究资料):两层架构——
+  **内层 = vn.py 流程引擎(确定性内核,现有 trading/risk/strategies/研究脚本/notify/Docker)**,
+  **外层 = Bisheng 流程编排(AI 策略研究员,规划位)**;边界铁律 = 外层只经研究沙盒 API
+  白名单端点(5 个 `/research/*` 端点)交互,`promotion_gate` 是候选策略唯一闸门,LLM 产出
+  只落 `pending_strategies/`、经 walk-forward + gate 全过 + 人工批准才进 `approved/`、
+  装载永远人工。附:研究方法论→系统映射表 25 条、四阶段演进路线(SimNow 验收闭环 →
+  多品种与调度 → 月度滚动引擎化+研究 API 固化 → Bisheng 接入与 Alpha Factory)、
+  技术债去向表、「明确不做」清单(CPCV/每日自动优化/自建前端)、规划位登记表
+  (不建空目录,触发条件满足时「新 ADR + 代码同一原子提交」)。
+- 新 ADR `docs/adr/20261110-bisheng-ai-researcher.md`:外层 AI 策略研究员采用 Bisheng 编排;
+  含备选方案对比(Dify/LangGraph/Coze)、可替换性条款(全部业务逻辑在内层,外层只是编排壳)、
+  安全约束(版本 ≥2.6.0 因 CVE-2026-82278 Code 节点 RCE、仅内网、禁用 Code 节点、与交易
+  compose 物理分离);未决:部署机器(阶段四 4b 前决定)。
 - 研究资料《期货交易的复盘与人性反思》(`docs/期货交易的复盘与人性反思.md`):
   由用户提供 PDF(Gemini 对话导出,51 页)全文忠实转写而来,未改写删减,仅做排版规范化;
   原始 PDF 不入仓库。内容为一次人机协作量化复盘对话——交易纪律反思、1 万元本金约束下的
