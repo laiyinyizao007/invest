@@ -37,6 +37,7 @@ from vnpy_ctastrategy import CtaStrategyApp
 
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
+from trading.graceful_exit import logout_ctp
 from trading.guard_rule import ACCOUNT_RULE_NAME, GATEWAY_ERROR_MARKERS
 from trading.safe_risk import SafeRiskManagerApp
 
@@ -417,9 +418,18 @@ class TradingRuntime:
             self.main.write_log(f"停止策略时出错: {exc!r}", source="Runtime")
         finally:
             try:
+                self._logout_gateway()           # 先登出再关引擎:vnpy_ctp 的 close() 只断开连接、不发登出请求
                 self.main.close()
             finally:
                 self._close_notifier()
+
+    def _logout_gateway(self) -> None:
+        """退出前向前置发登出请求(国信「退出后是否正常注销」);任何失败只记日志,不打断退出。"""
+        try:
+            results = logout_ctp(self.main, self.config.gateway_name, sleep=self._sleep)
+            self.main.write_log("退出登出: " + ";".join(results), source="Runtime")
+        except Exception as exc:       # noqa: BLE001
+            self.main.write_log(f"退出登出出错: {exc!r}", source="Runtime")
 
     def _close_notifier(self) -> None:
         """关闭通知器,并给"退出时仍有持仓"这类 FATAL 留出足够的发送时间。

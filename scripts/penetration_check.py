@@ -373,10 +373,13 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"连接 {symbol} ...")
     main_engine.connect(setting, "CTP")
+    closed = False
     try:
         run, code = run_checks(args, symbol, main_engine, collector, tuple(secrets))
     finally:
-        close_engine(main_engine)
+        closed = close_engine(main_engine)
+    run.add("关闭连接", "PASS" if closed else "WARN",
+            "引擎在限时内正常关闭" if closed else "关闭超时,进程将被强制结束(国信「退出后是否正常注销」可能受影响,请观察)")
 
     import platform
     import socket

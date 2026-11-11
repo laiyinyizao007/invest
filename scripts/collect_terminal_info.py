@@ -31,6 +31,7 @@ PS_QUERIES = {
     "cpu": "Get-CimInstance Win32_Processor | Select-Object Name,ProcessorId",
     "baseboard": "Get-CimInstance Win32_BaseBoard | Select-Object Manufacturer,Product,SerialNumber",
     "bios": "Get-CimInstance Win32_BIOS | Select-Object SerialNumber",
+    "computer": "Get-CimInstance Win32_ComputerSystem | Select-Object Manufacturer,Model,TotalPhysicalMemory",
     "disks": "Get-CimInstance Win32_DiskDrive | Select-Object Model,SerialNumber,Size",
     "adapters": ("Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=true' "
                  "| Select-Object Description,MACAddress,IPAddress,DefaultIPGateway"),
@@ -122,6 +123,13 @@ def normalize_adapters(raw: list[dict], primary_ip: str) -> list[dict]:
     return adapters
 
 
+def machine_info(item: dict) -> dict:
+    """整机信息:厂商、型号、内存(GB)。程序化测试报告的「测试机型号/内存」栏用。"""
+    total = int(item.get("TotalPhysicalMemory") or 0)
+    return {"manufacturer": (item.get("Manufacturer") or "").strip(), "model": (item.get("Model") or "").strip(),
+            "memory_gb": round(total / 1024 ** 3)}
+
+
 def package_version(name: str) -> str:
     try:
         from importlib.metadata import version
@@ -156,6 +164,7 @@ def collect(with_public_ip: bool = False, target: str = "") -> dict:
         "baseboard": [{"manufacturer": b.get("Manufacturer", ""), "product": b.get("Product", ""),
                        "serial": (b.get("SerialNumber") or "").strip()} for b in raw["baseboard"]],
         "bios_serial": ((raw["bios"] or [{}])[0].get("SerialNumber") or "").strip(),
+        "machine": machine_info((raw["computer"] or [{}])[0]),
         "disks": [{"model": d.get("Model", ""), "serial": (d.get("SerialNumber") or "").strip(),
                    "size_gb": round(int(d.get("Size") or 0) / 1024 ** 3)} for d in raw["disks"]],
         "adapters": normalize_adapters(raw["adapters"], primary),
@@ -197,6 +206,9 @@ def render_text(info: dict) -> str:
     lines = [f"终端信息采集结果({info['collected_at']})", "=" * 48,
              f"主机名:{info['hostname']}",
              f"操作系统:{info['os']['name']} {info['os']['version']}(build {info['os']['build']},{info['os']['arch']})"]
+    machine = info.get("machine") or {}
+    if machine:
+        lines.append(f"整机:{machine.get('manufacturer', '')} {machine.get('model', '')}(内存 {machine.get('memory_gb', 0)} GB)")
     for cpu in info["cpu"]:
         lines.append(f"CPU:{cpu['name']}(ID {cpu['processor_id']})")
     for board in info["baseboard"]:

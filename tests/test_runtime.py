@@ -974,3 +974,29 @@ def test_successful_startup_logs_total_elapsed_time(make):
     rt.event_engine.register(EVENT_LOG, lambda e: logs.append(e.data.msg))
     assert rt.start() is None
     assert any("启动耗时" in m for m in logs)
+
+
+def test_shutdown_logs_out_before_closing_the_gateway(make, monkeypatch):
+    """vnpy_ctp 的 close() 只断开连接;退出前必须先发登出请求(国信「退出后是否正常注销」)。"""
+    import trading.runtime as runtime_module
+    order = []
+    monkeypatch.setattr(runtime_module, "logout_ctp", lambda main, name, sleep=None: order.append("logout") or ["交易: 已发送登出请求"])
+    rt = make()
+    rt.start()
+    original_close = rt.main.close
+    rt.main.close = lambda: (order.append("close"), original_close())[1]
+    rt.shutdown()
+    assert order == ["logout", "close"]
+
+
+def test_shutdown_survives_a_failing_logout(make, monkeypatch):
+    import trading.runtime as runtime_module
+
+    def boom(*a, **k):
+        raise RuntimeError("logout broke")
+
+    monkeypatch.setattr(runtime_module, "logout_ctp", boom)
+    rt = make()
+    rt.start()
+    rt.shutdown()
+    assert rt.gw.closed and rt.notifier.closed                              # 登出失败不能打断退出

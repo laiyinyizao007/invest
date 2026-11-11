@@ -7,6 +7,9 @@
    而是延迟 reject_classify_delay 秒,在前后 3 秒窗口里取最近的错误日志再分类;未知按硬拒绝。
    硬拒绝或废单风暴 → 当日禁止开仓。开仓单永不自动重试。
 4. 单日撤单次数达到 cancel_lock_limit → 当日禁止开仓(内置规则的撤单上限是兜底,这里更早触发)。
+5. 阈值预警:vn.py 内置规则触达上限时只写日志并拒单,这里把这类日志转成 WARN 告警(按指标节流),
+   满足「达到阈值后预警」(国信程序化测试 3.1)。
+6. 手动暂停:`pause_trading.flag` 存在时拒绝新开仓,平仓放行(国信程序化测试 5.1)。
 
 紧急平仓走 risk_engine._send_order(绕过风控规则的原始发单通道):平仓只会降低风险,不能被限流拦住。
 紧急平仓状态机的关键约束(防止重复下单):
@@ -15,6 +18,7 @@
 - 状态未知(无回报)绝不重发,超时升级人工;成交量已覆盖持仓但持仓回报迟迟不清零,同样不重发,主动查询持仓并升级人工。
 """
 import math
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -47,6 +51,10 @@ ACCOUNT_RULE_NAME = "账户风控"   # 规则在 RiskEngine.rules 里的键名,�
 ERROR_WINDOW = 3.0                      # 废单与其错误日志的最大时间差(秒,前后均可)
 MIN_POSITION_REFRESH_TIMEOUT = 3.0     # 等持仓回报的下限(秒)
 CANCEL_RETRY_SECONDS = 10.0             # 撤单请求发出后多久仍未终结则允许再次撤单
+PAUSE_FLAG_NAME = "pause_trading.flag"  # 与状态文件同目录;存在 = 手动暂停开仓(scripts/pause_trading.py 写/删)
+THRESHOLD_LOG_PREFIX = "委托被拦截，"      # vnpy_riskmanager 的 RiskEngine.write_log 统一前缀
+THRESHOLD_LOG_MARKERS = ("达到上限", "超过上限")   # 笔数/手数/金额类阈值(含合约级笔数/撤单/成交上限);合约代码不存在、价位不合规不属于阈值
+THRESHOLD_ALERT_INTERVAL = 300.0        # 同一指标的阈值预警最短间隔(秒),避免每笔被拒都推一条
 FLATTEN_REF = "account_guard_flatten"   # 紧急平仓委托的标记,废单处理据此识别,不依赖事件到达顺序
 STRATEGY_REF_PREFIX = f"{CTA_APP_NAME}_"   # CTA 引擎下单的 reference 前缀(vnpy_ctastrategy/engine.py)
 MANUAL_CONFIRM_DELAY = 3.0              # 首个事件没有策略标记时,等这么久再认定为非策略委托(见 on_order 的说明)
@@ -128,6 +136,8 @@ class AccountGuardRule(RuleTemplate):
         # 非策略委托检测(docs/adr/20261111-discipline-enforcement.md):启动对账完成后由运行时 arm 才开始计数,
         # 否则 CTP 登录后回放的当日历史委托(reference 为空)会被误认成人工下单。
         self._manual_armed = False
+        self._threshold_alerted: dict[str, float] = {}   # 指标 -> 上次预警的单调时刻
+        self._pause_active = False
         self._seen_orders: dict[str, None] = {}      # 保持插入顺序,超限时丢最旧的
         self._own_orders: set[str] = set()
         self._manual_counted: set[str] = set()      # 已计数的非策略委托号:不随 _seen_orders 淘汰,防回放重复计数
@@ -154,6 +164,10 @@ class AccountGuardRule(RuleTemplate):
         self.peak_equity, self.day_start_equity = self.guard.peak_equity, self.guard.day_start_equity
         if path is not None:
             self.risk_engine.main_engine.write_log(f"账户风控状态文件: {path}", source="AccountGuard")
+        else:
+            # 没有状态文件 = 熔断状态不落盘,手动暂停标志也无处可放:不能让操作员以为暂停生效了
+            self.risk_engine.main_engine.write_log(
+                "未配置账户风控状态文件(state_file):熔断状态不落盘,手动暂停(pause_trading.flag)不可用", source="AccountGuard")
 
     # ---------- 发单检查 ----------
 
@@ -164,7 +178,31 @@ class AccountGuardRule(RuleTemplate):
         if not self.guard.can_open(today):
             self.write_log(f"账户处于{self.guard.status(today)},禁止新开仓:{req}")
             return False
+        if self._pause_flag_exists():
+            self.write_log(f"交易已手动暂停({PAUSE_FLAG_NAME}),禁止新开仓:{req}")
+            return False
         return True
+
+    # ---------- 手动暂停 ----------
+
+    def _pause_flag_path(self) -> Path | None:
+        state_path = self.guard.state_path
+        return state_path.parent / PAUSE_FLAG_NAME if state_path is not None else None
+
+    def _pause_flag_exists(self) -> bool:
+        path = self._pause_flag_path()
+        return path is not None and path.exists()
+
+    def _sync_pause_state(self) -> None:
+        """暂停状态变化时发一次告警(边沿触发)。"""
+        active = self._pause_flag_exists()
+        if active == self._pause_active:
+            return
+        self._pause_active = active
+        if active:
+            self._alert("WARN", "交易已暂停", f"检测到 {PAUSE_FLAG_NAME}:新开仓一律拒绝,平仓与持仓管理照常。解除请运行 scripts/pause_trading.py off")
+        else:
+            self._alert("WARN", "交易已恢复", "暂停标志已解除,允许新开仓")
 
     # ---------- 事件 ----------
 
@@ -203,6 +241,8 @@ class AccountGuardRule(RuleTemplate):
             del self._manual_pending[oid]
             if oid in self._own_orders:
                 continue
+            if len(self._manual_counted) >= SEEN_ORDERS_LIMIT:
+                self._manual_counted.clear()      # 上限兜底:人工委托要累计到上千笔才会触及,清空只可能让回放重复计一次
             self._manual_counted.add(oid)
             today = self.guard.record_manual_order(self.clock())
             self._alert("ERROR", "检测到非策略委托",
@@ -225,8 +265,28 @@ class AccountGuardRule(RuleTemplate):
         elif order.status == Status.REJECTED:
             self._pending_rejects[order.vt_orderid] = (now, order)   # 稍后(等错误日志到达)再分类
 
+    def _on_threshold_log(self, msg: str) -> None:
+        """风控规则触达阈值的日志 → WARN 告警(同一指标 THRESHOLD_ALERT_INTERVAL 秒内只发一次)。"""
+        body = msg[len(THRESHOLD_LOG_PREFIX):]
+        metric = body.split("：", 1)[0]
+        metric = "".join(ch for ch in metric if not (ch.isdigit() or ch == "."))   # "汇总委托笔数201达到上限200" / 整数浮点手数 → 同一指标
+        if metric.startswith("合约"):
+            # 合约级阈值按合约分别节流:A 合约刚预警过,B 合约的突破不能被吞掉
+            found = re.search(r"symbol='([^']+)'", body)
+            metric += "@" + (found.group(1) if found else "")
+        now = self.mono()
+        last = self._threshold_alerted.get(metric)
+        if last is not None and now - last < THRESHOLD_ALERT_INTERVAL:
+            return
+        self._threshold_alerted[metric] = now
+        self._alert("WARN", "风控阈值触发", body)
+
     def _on_log(self, event: Event) -> None:
         log: LogData = event.data
+        if (log.gateway_name == APP_NAME and log.msg.startswith(THRESHOLD_LOG_PREFIX)
+                and any(m in log.msg for m in THRESHOLD_LOG_MARKERS)):
+            self._on_threshold_log(log.msg)
+            return
         # 只接受已注册网关(如 CTP)的错误日志;运行时/引擎自身的 ERROR 日志(如"通知发送异常")不能被当成废单原因
         if log.gateway_name not in self.risk_engine.main_engine.gateways:
             return
@@ -320,6 +380,7 @@ class AccountGuardRule(RuleTemplate):
 
         self._process_pending_rejects(now)
         self._process_manual_pending(now)
+        self._sync_pause_state()
         in_session = self.session_active()
         if in_session and not self._was_in_session:
             # 非交易→交易时段边沿:休市期间没有成交/撤单回报是正常的,挂单年龄要从开盘时刻重新计。

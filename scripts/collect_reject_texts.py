@@ -41,6 +41,7 @@ from vnpy.trader.logger import ERROR
 from vnpy.trader.object import ContractData, LogData, OrderData, OrderRequest, TickData
 from vnpy.trader.utility import round_to
 
+from trading.graceful_exit import logout_ctp
 from trading.runtime import build_ctp_setting
 
 # SimNow 地址白名单放在 scripts/simnow_guard.py,采集脚本与演练脚本共用同一套约束。
@@ -312,16 +313,21 @@ def write_collected(out: Path, text: str) -> None:
     out.write_text(new, encoding="utf-8")
 
 
-def close_engine(main_engine, timeout: float = 10.0) -> None:
+def close_engine(main_engine, timeout: float = 10.0) -> bool:
     """关闭引擎,但不无限等。
 
     CTP 网关的 close() 会 join 原生 API 线程;在 4097 断连风暴下这个 join 可能长时间不返回,
     表现为脚本"跑完了但不退出"(2026-11-10 实测)。这里放到后台线程里限时等,
     剩下的由 __main__ 里的 os._exit 兜底。
     """
-    t = threading.Thread(target=main_engine.close, daemon=True)
+    def shutdown() -> None:
+        logout_ctp(main_engine)            # 先登出再关闭:vnpy_ctp 的 close() 只断开连接、不发登出请求
+        main_engine.close()
+
+    t = threading.Thread(target=shutdown, daemon=True)
     t.start()
     t.join(timeout)
+    return not t.is_alive()      # False = 限时内没关完,调用方应当如实记录而不是假装正常退出
 
 
 def positions_of_symbol(positions: list[str], symbol: str) -> list[str]:

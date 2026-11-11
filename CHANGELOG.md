@@ -14,6 +14,12 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 国信程序化测试合规的功能缺口(Issue [#8](https://github.com/laiyinyizao007/invest/issues/8),依据国信《外部接入系统技术测试报告》模板):
+  ① 阈值预警——风控规则触达笔数/手数/金额上限时发 WARN「风控阈值触发」告警(走既有 Webhook,按指标 300 秒节流;校验失败类不预警);
+  ② 暂停交易——`scripts/pause_trading.py on|off|status` 写/删 `data/state/pause_trading.flag`,标志存在时拒绝新开仓、平仓放行,切换发告警;
+  ③ `collect_terminal_info.py` 增整机厂商/型号/内存;`penetration_check.py` 报告记录「关闭连接」步骤(`close_engine` 返回是否限时内关闭)。
+  ④ 优雅登出——运行时 `shutdown()` 与脚本共用的 `close_engine` 在关闭引擎前先向已登录的交易/行情通道各发 `ReqUserLogout`(vnpy_ctp 的 `close()` 只断开连接、不登出),失败不打断退出。
+  新增 ADR `20261111-broker-test-compliance.md`。
 - 纪律机制补缺(Issue [#6](https://github.com/laiyinyizao007/invest/issues/6),依据《期货交易复盘与人性反思》):
   ① 解锁问责——`AccountGuard` 记录硬锁定时间与解锁历史,`unlock_account.py` 增加冷却期(硬锁定当个交易日内拒绝,退出码 3)
   与 `--force`(须交互输入 FORCE、不能与 `--yes` 同用);② 非策略委托检测——运行中发现 reference 不属于 CTA 策略/紧急平仓的新委托,
