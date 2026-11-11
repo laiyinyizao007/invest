@@ -10,7 +10,7 @@
 1. 参数只在训练段选,取训练夏普 Top5 自动代入同一窗口的验证段;验证段不参与任何选参;
 2. risk_budget=300 是策略类默认值(TrendAtrStrategy),参数字典里不传该键,预算永远生效;
    每次回测报告 skipped_by_budget(预算弃单笔数)与弃单率;
-3. atr_mult 固定类默认 1.5,不进网格(网格只扫 fast/slow 两个维度,见 plan.md D2);
+3. atr_mult 固定类默认 1.5,不进网格(网格只扫 fast/slow 两个维度,见 docs/plans/20261110-walk-forward-optimizer-plan.md D2);
 4. 夏普按 vn.py 自然日分组 ×240 年化口径,15 分钟数据上只能做同口径排序,不可解释为年化收益。
 
 用法(项目根目录):
