@@ -306,3 +306,60 @@ def test_shipped_openapi_file_matches_the_route_whitelist_exactly():
 
     assert declared == gw.ROUTES
     assert spec["servers"][0]["url"] == "http://research-gateway:8765"
+
+
+# ---------- 毕昇工具节点把所有参数当字符串传:网关要容忍「JSON 字符串形式的对象/整数」 ----------
+
+def test_backtest_accepts_params_given_as_json_string(tmp_path):
+    seen = {}
+
+    def backtest_job(**kw):
+        seen.update(kw)
+        return {"ok": 1}
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=backtest_job))
+    body = {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train", "params": "{\"fast_window\": 10}"}
+
+    assert call(app, "POST", "/research/backtest", body)[0] == 200
+    assert seen["params"] == {"fast_window": 10}
+
+
+def test_string_params_that_are_not_json_objects_are_rejected(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=lambda **kw: pytest.fail("不应进入作业")))
+    base = {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train"}
+
+    for bad in ("not json", "[1]", "5", "\"x\""):
+        assert call(app, "POST", "/research/backtest", {**base, "params": bad})[0] == 400, bad
+
+
+def test_blank_string_params_mean_empty_params(tmp_path):
+    seen = {}
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=lambda **kw: seen.update(kw) or {"ok": 1}))
+
+    call(app, "POST", "/research/backtest", {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train", "params": ""})
+
+    assert seen["params"] == {}
+
+
+def test_gate_accepts_string_random_runs_and_string_plateau(tmp_path):
+    seen = {}
+
+    def gate_job(**kw):
+        seen.update(kw)
+        return {"passed": False}
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(gate_job=gate_job, plateau_from_data=lambda d: (True, "ok")))
+    body = {"strategy": "a.py", "class": "S", "params": "{}", "random_runs": "40", "plateau": "{\"cell\": [1,1,1], \"scores\": []}"}
+
+    assert call(app, "POST", "/research/gate", body)[0] == 200
+    assert seen["random_runs"] == 40 and seen["plateau"] == (True, "ok")
+    assert call(app, "POST", "/research/gate", {**body, "random_runs": "abc"})[0] == 400
+
+
+def test_blank_optional_fields_from_the_tool_node_are_treated_as_absent(tmp_path):
+    seen = {}
+    app = make_app(tmp_path, jobs=SimpleNamespace(gate_job=lambda **kw: seen.update(kw) or {"passed": False},
+                                                  plateau_from_data=lambda d: pytest.fail("空字符串不应当作高原数据")))
+
+    assert call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "S", "params": "", "random_runs": "", "plateau": ""})[0] == 200
+    assert seen["random_runs"] is None and seen["plateau"][0] is False

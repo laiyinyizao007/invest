@@ -74,6 +74,31 @@ def load_token(path: Path) -> str:
     return token
 
 
+def _lenient_object(value, name: str) -> dict | None:
+    """毕昇工具节点把所有参数都当字符串传:接受「JSON 字符串形式的对象」;空串视为未提供;其余非对象一律拒绝。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError as exc:
+            raise rs.SandboxError(f"{name} 不是合法 JSON") from exc
+    if not isinstance(value, dict):
+        raise rs.SandboxError(f"{name} 必须是 JSON 对象")
+    return value
+
+
+def _lenient_int(value, name: str) -> int | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise rs.SandboxError(f"{name} 必须是整数")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise rs.SandboxError(f"{name} 必须是整数") from exc
+
+
 def _default_jobs() -> SimpleNamespace:
     import research_api as api
     return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job,
@@ -190,31 +215,27 @@ class GatewayApp:
 
     def _backtest(self, data, _params):
         strategy, cls, key, segment = (data.get(k) for k in ("strategy", "class", "key", "segment"))
-        params = data.get("params", {})
         if not all(isinstance(x, str) for x in (strategy, cls, key, segment)) or not CLASS_NAME.match(cls):
             return 400, {"error": "strategy/class/key/segment 必须是字符串,class 必须是合法标识符"}
         if key not in rs.KEYS or segment not in rs.SEGMENTS:
             return 400, {"error": f"key 只能是 {list(rs.KEYS)},segment 只能是 {list(rs.SEGMENTS)}"}
-        if not isinstance(params, dict):
-            return 400, {"error": "params 必须是 JSON 对象"}
+        params = _lenient_object(data.get("params"), "params") or {}
         # confirm 固定为 False:批准只能由本机 CLI 触发,请求体里的同名字段被忽略
         return self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
                              params=params, confirm=False)
 
     def _gate(self, data, _params):
-        strategy, cls, params = data.get("strategy"), data.get("class"), data.get("params", {})
+        strategy, cls = data.get("strategy"), data.get("class")
         if not isinstance(strategy, str) or not isinstance(cls, str) or not CLASS_NAME.match(cls):
             return 400, {"error": "strategy/class 必须是字符串,class 必须是合法标识符"}
-        if not isinstance(params, dict):
-            return 400, {"error": "params 必须是 JSON 对象"}
-        plateau_data = data.get("plateau")                          # 只接受内联网格得分,绝不读取调用方给的路径
+        params = _lenient_object(data.get("params"), "params") or {}
+        random_runs = _lenient_int(data.get("random_runs"), "random_runs")
+        plateau_data = _lenient_object(data.get("plateau"), "plateau")   # 只接受内联网格得分,绝不读取调用方给的路径
         plateau = (False, "未提供 plateau:参数高原未评估,按未通过处理")
         if plateau_data is not None:
-            if not isinstance(plateau_data, dict):
-                return 400, {"error": "plateau 必须是对象"}
             plateau = self.jobs.plateau_from_data(plateau_data)
         return self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
-                             random_runs=data.get("random_runs"), confirm=False)
+                             random_runs=random_runs, confirm=False)
 
     def _results(self, _data, params):
         run_id = params["run_id"]
