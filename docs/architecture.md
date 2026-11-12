@@ -26,7 +26,7 @@
 | fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
 | import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
 | SCHED 增量调度 | PART | `scripts/record_market_incremental.py` 提供有界、可重入的 `fetch_data.py` 短任务；由 `@goodandready/dsh-cron@0.3.43` 调度，长期前台任务被生命周期闸门明确排除 |
-| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；合约信息只能从交易前置查询，故采用受限交易前置连接（仅认证+查合约，发单/查账户硬性禁止，见 ADR 修订）；**从未连接过 SimNow/国信，真实录制未验证** |
+| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；合约信息只能从交易前置查询，故采用受限交易前置连接（仅认证+查合约，发单/查账户硬性禁止，见 ADR 修订）；SimNow 第二套 7x24 已验证连接/合约/订阅/tick/优雅停止，但行情时间不可信、正式库 0 行；**第一套前置交易时段录制与国信测试环境均未验证** |
 
 ### 策略与研究
 | 节点 | 状态 | 证据 / 缺口 |
@@ -132,7 +132,7 @@ flowchart TB
 | `data/state/promotion_approval.json` | `scripts/record_promotion.py`(仅晋级门槛全过) | `scripts/run_headless.py` 连接生产 API 前 | 任何自动流程不得代写 |
 | `data/state/heartbeat` | 运行时(无头) | 容器健康检查 | — |
 | `.vntrader/` | vn.py 引擎、`bootstrap.py` 建目录 | 回测、CTA | 录制入口 |
-| `.vntrader_record/` | 官方 DataRecorder 录制入口（规划实现） | 录制状态与独立 database.db | 回测、交易运行时、演练、取证 |
+| `.vntrader_record/` | 官方 DataRecorder 录制入口（已实现，真实录制待验收） | 录制状态与独立 database.db | 回测、交易运行时、演练、取证 |
 | `.vntrader_drill/` | `scripts/drill.py` | 演练自身 | 实盘、录制入口 |
 | `.vntrader_brokertest/` | `scripts/broker_test.py` | 取证自身 | 实盘 |
 | `data/broker_test/<时间戳>/` | `scripts/broker_test.py`、`broker_report.py` | 报告生成 | 不入库(含测试账号);国信模板同样不入库 |

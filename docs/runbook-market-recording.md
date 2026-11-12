@@ -101,3 +101,16 @@ python scripts/record_market_incremental.py --symbols C MA --periods 1 15 --time
 - 项目知识库：`PROJECTWIKI.md`
 - 变更日志：`CHANGELOG.md`
 - 跟踪 Issue：[#13](https://github.com/laiyinyizao007/invest/issues/13)
+
+## 6. 交易时段验收清单（第一套前置，待执行）
+
+> 前置条件：中国时间交易时段内（日盘 09:00–15:00，夜盘 21:00 起）。非交易时段第一套前置会反复 `OnSessionDisconnected`（原因 4097），属预期，不算失败。本机 `date` 的时区可能不是中国时区，以 `[DateTime]::UtcNow.AddHours(8)` 为准。
+
+1. **预检**：`python scripts/record_market_data.py --check` 通过；确认 `.vntrader_record/database.db` 当前行数（记基线）。
+2. **连接**：用第一套前置（30001/30011）启动 wrapper，5–10 秒内 `status.json` 应出现 `connected` → `recording`，`last_tick` 非空。
+3. **数据**：持续 ≥3 分钟后停止；`dbtickdata` 行数 > 0，`dbbardata` 至少含 2 个合约各若干根完整 1 分钟 K 线（时间连续、无整分钟缺口）。
+4. **时间偏差**：`status.json` 的 `data_warning` 应为空；若出现偏差告警，**不要放宽 `filter_window` 凑数**，记录偏差并如实写入验收记录。
+5. **优雅停止**：`stop` 返回 0；日志里无 flush 超时告警；停止后行数不再变化。
+6. **DSH 重启实测**：让 DSH 触发 `ensure`/`watchdog` 后重启 DSH，确认不重复拉起、不误杀，并如实记录 DSH 关闭期间的录制缺口。
+7. **回填**：把结果写入上方「验收记录」（不写账号、密码与前置地址）；全部通过才关闭 Issue #13。
+
