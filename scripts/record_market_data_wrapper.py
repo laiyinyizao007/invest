@@ -129,22 +129,45 @@ def stop_signal(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
 
 
+_HELD_LOCKS: dict[str, int] = {}
+
+
+def _os_lock(fd: int) -> bool:
+    """对已打开的文件加非阻塞排它锁;锁随 fd 关闭/进程退出由 OS 释放,不依赖 PID 探测。"""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
 def acquire_lock(path: Path) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
+    key = str(path.resolve())
+    if key in _HELD_LOCKS:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(json.dumps({"pid": os.getpid(), "at": now()}))
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    if not _os_lock(fd):
+        os.close(fd)
+        return False
+    _HELD_LOCKS[key] = fd
+    # 内容仅供诊断(从偏移 1 写,避开 Windows 被锁的第 0 字节)
+    os.lseek(fd, 1, os.SEEK_SET)
+    os.ftruncate(fd, 1)
+    os.write(fd, json.dumps({"pid": os.getpid(), "at": now()}).encode("utf-8"))
     return True
 
 
 def release_lock(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
+    fd = _HELD_LOCKS.pop(str(path.resolve()), None)
+    if fd is not None:
+        os.close(fd)  # 关闭即释放;不 unlink,避免误删他人刚取得的锁文件
 
 
 def current(state_dir: Path) -> dict[str, Any] | None:

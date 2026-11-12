@@ -477,3 +477,57 @@ def test_assess_skew_warns_when_only_some_symbols_are_dropped():
     message = recorder.assess_skew({"c2701.DCE": 1.0, "MA701.CZCE": 500.0}, 60)
 
     assert "部分" in message and "MA701.CZCE" in message and "c2701.DCE" not in message.split("部分")[0]
+
+
+@pytest.mark.parametrize("path", [".vntrader", ".vntrader/", ".", "data", "./.vntrader/../.vntrader"])
+def test_database_dir_must_not_be_trading_or_backtest_store(monkeypatch, path):
+    monkeypatch.setattr(recorder, "check_simnow_address", lambda address: (True, "ok"))
+
+    with pytest.raises(ValueError, match="CTP_RECORD_DATABASE_DIR"):
+        recorder.validate_config({**BASE_ENV, "CTP_RECORD_DATABASE_DIR": path})
+
+
+def test_database_dir_default_and_custom_isolated_dir_are_accepted(monkeypatch):
+    monkeypatch.setattr(recorder, "check_simnow_address", lambda address: (True, "ok"))
+
+    assert recorder.validate_config(BASE_ENV)["database_dir"] == Path(".vntrader_record")
+    assert recorder.validate_config({**BASE_ENV, "CTP_RECORD_DATABASE_DIR": ".vntrader_record2"})
+
+
+def test_wrapper_lock_leftover_file_without_holder_is_acquirable(tmp_path):
+    lock = tmp_path / "wrapper.lock"
+    lock.write_text(json.dumps({"pid": 999999, "at": "x"}), encoding="utf-8")  # 持有者早已退出遗留
+
+    assert wrapper.acquire_lock(lock) is True
+    wrapper.release_lock(lock)
+
+
+def test_wrapper_lock_is_released_by_os_when_holder_process_dies(tmp_path):
+    import subprocess
+    import sys
+    lock = tmp_path / "wrapper.lock"
+    code = (
+        "import sys, time; sys.path.insert(0, r'%s'); import record_market_data_wrapper as w; "
+        "from pathlib import Path; assert w.acquire_lock(Path(sys.argv[1])); print('held', flush=True); time.sleep(60)"
+    ) % str(Path(wrapper.__file__).parent)
+    holder = subprocess.Popen([sys.executable, "-c", code, str(lock)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert wrapper.acquire_lock(lock) is False  # 真实并发持有者:拒绝
+    finally:
+        if sys.platform == "win32":  # venv 的 python.exe 是启动器,须杀整棵进程树
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(holder.pid)], capture_output=True)
+        else:
+            holder.kill()
+        holder.wait()
+    assert wrapper.acquire_lock(lock) is True  # 持有者被杀后由 OS 释放,无需 PID 探测
+    wrapper.release_lock(lock)
+
+
+@pytest.mark.parametrize("path", ["archive/.vntrader", "archive/data", "a/b", "../x", "C:/recording/.vntrader"])
+def test_database_dir_must_be_single_level_under_project_root(monkeypatch, path):
+    # isolate_state 只收目录名并拼到项目根下;多层/绝对路径会让 TEMP_DIR 落到别处(甚至主库)
+    monkeypatch.setattr(recorder, "check_simnow_address", lambda address: (True, "ok"))
+
+    with pytest.raises(ValueError, match="CTP_RECORD_DATABASE_DIR"):
+        recorder.validate_config({**BASE_ENV, "CTP_RECORD_DATABASE_DIR": path})

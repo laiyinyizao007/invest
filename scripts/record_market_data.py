@@ -77,6 +77,27 @@ def _bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
     raise ValueError(f"{name} 必须是 true/false")
 
 
+# 交易/回测主库所在位置;录制库绝不能落在这些目录之内或与其重合
+PROTECTED_DB_DIRS = (".vntrader", "data")
+
+
+def _check_database_dir(raw: str) -> Path:
+    """录制库目录必须是项目根下的单层独立目录。
+
+    bootstrap.isolate_state 只接收目录名并拼到项目根下;若放行多层/绝对路径,
+    `archive/.vntrader` 这类值会通过校验却把 TEMP_DIR 重映射回主库。
+    返回规范化后的单层目录名,校验与使用同源。
+    """
+    root = bootstrap.ROOT.resolve()
+    resolved = (root / raw).resolve()
+    if resolved.parent != root or resolved.name.lower() in {n.lower() for n in PROTECTED_DB_DIRS}:
+        raise ValueError(
+            f"CTP_RECORD_DATABASE_DIR={raw!r} 必须是项目根下的单层独立目录"
+            "(不得为 .vntrader/data、项目根、多层或绝对路径;默认 .vntrader_record)"
+        )
+    return Path(resolved.name)
+
+
 def validate_config(env: Mapping[str, str]) -> dict:
     profile = (env.get("CTP_RECORD_PROFILE") or PROFILE_SIMNOW).strip()
     if profile not in PROFILES:
@@ -113,7 +134,7 @@ def validate_config(env: Mapping[str, str]) -> dict:
         "record_tick": _bool_env(env, "CTP_RECORD_TICK", True),
         "record_1m": _bool_env(env, "CTP_RECORD_1M", True),
         "state_dir": Path(env.get("CTP_RECORD_STATE_DIR", ".ops/recording")),
-        "database_dir": Path(env.get("CTP_RECORD_DATABASE_DIR", ".vntrader_record")),
+        "database_dir": _check_database_dir(env.get("CTP_RECORD_DATABASE_DIR", ".vntrader_record")),
     }
 
 
