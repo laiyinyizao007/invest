@@ -25,9 +25,11 @@ EXCEPTION_SENTINELS = ("Traceback", "触发异常")
 
 def _raise_if_strategy_failed(messages: list[str]) -> None:
     """vn.py 回测时遇到策略异常只打印日志就返回,结果是半截的,必须当错误处理。"""
-    for msg in messages:
+    for index, msg in enumerate(messages):
         if any(s in msg for s in EXCEPTION_SENTINELS):
-            raise RuntimeError(f"回测中策略抛出异常:\n{msg}")
+            # vn.py 先打印「触发异常」再单独打印 traceback:把哨兵之后的几条一并带上,否则只剩一句没有信息的话
+            detail = "\n".join(messages[index:index + 3])[-2000:]
+            raise RuntimeError("回测中策略抛出异常:\n" + detail)
 
 
 def run_engine(

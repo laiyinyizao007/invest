@@ -392,3 +392,13 @@ def test_plain_source_is_stored_unchanged(tmp_path):
     call(app, "POST", "/research/candidates", {"name": "plain.py", "source": GOOD})
 
     assert (tmp_path / "pending_strategies" / "plain.py").read_text(encoding="utf-8") == GOOD
+
+
+def test_feedback_includes_strategy_errors_with_type_and_message(tmp_path):
+    app = make_app(tmp_path)
+    seed_result(app, "20261112-210000-000000", kind="backtest", status="strategy_error", **{"class": "Candidate", "key": "CADJ"},
+                error={"type": "ValueError", "message": "too many values to unpack (expected 3)"})
+
+    traces = call(app, "GET", "/research/feedback")[1]["traces"]
+
+    assert len(traces) == 1 and traces[0]["failures"] == ["策略运行报错: ValueError: too many values to unpack (expected 3)"]

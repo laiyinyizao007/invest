@@ -322,3 +322,41 @@ def test_parent_passes_the_approved_hash_to_children(tree, monkeypatch):
     run(*BT, "--confirm-reviewed")
 
     assert seen["cmd"][seen["cmd"].index("--sha256") + 1] == api.rs.file_sha256(tree / "pending_strategies" / "s.py")
+
+
+# ---------- 策略自身报错是研究中的正常结果,不是网关故障 ----------
+
+def test_describe_error_keeps_type_and_message_but_drops_paths_and_truncates():
+    text = ("回测中策略抛出异常:" + chr(10) + "Traceback (most recent call last):" + chr(10) + "  File \"/app/pending_strategies/x.py\", line 9" + chr(10)
+            + "ValueError: too many values to unpack (expected 3) in C:/Users/me/secret/x.py")
+
+    out = api.describe_error(RuntimeError(text))
+
+    assert out["type"] == "ValueError" and "too many values to unpack" in out["message"]
+    assert "C:" not in out["message"] and "/app/" not in out["message"] and len(out["message"]) <= 200
+
+
+def test_describe_error_falls_back_to_exception_type_for_plain_errors():
+    assert api.describe_error(KeyError("boom"))["type"] == "KeyError"
+    long = api.describe_error(RuntimeError("x" * 1000))
+    assert len(long["message"]) <= 200
+
+
+def test_backtest_job_records_strategy_errors_as_results_instead_of_raising(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "ValueError", "message": "too many values"}})
+
+    result = api.backtest_job(strategy="s.py", cls="S", key="CADJ", segment="train", params={}, confirm=True)
+
+    assert result["status"] == "strategy_error" and result["error"]["type"] == "ValueError"
+    assert "stats" not in result and result["run_id"]
+    assert (tree / "data" / "research" / f"{result['run_id']}.json").exists()
+
+
+def test_gate_job_records_strategy_errors_too(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "KeyError", "message": "x"}})
+
+    result = api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+
+    assert result["status"] == "strategy_error" and result["kind"] == "gate" and result["passed"] is False

@@ -272,7 +272,10 @@ class GatewayApp:
             failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
             diagnosis = result.get("diagnosis") or {}
             weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
-            failed = bool(failures) if result.get("kind") == "gate" else weakest is not None
+            error = result.get("error")
+            if result.get("status") == "strategy_error" and isinstance(error, dict):
+                failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
+            failed = bool(failures) if (result.get("kind") == "gate" or failures) else weakest is not None
             if not failed:
                 continue
             cls = result.get("class")

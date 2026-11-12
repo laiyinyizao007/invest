@@ -18,6 +18,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -56,6 +57,26 @@ def kill_tree(proc: subprocess.Popen) -> None:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
     else:
         proc.kill()
+
+
+_PATH_LIKE = re.compile(r"(?:[A-Za-z]:[\\/]|/(?:app|usr|home|tmp|root)/)[^\s\"')]*")
+_EXC_LINE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))\b:?\s*(.*)$")
+
+
+def describe_error(exc: BaseException) -> dict:
+    """把策略运行时异常压成 {type, message}:取 traceback 末尾的异常行,抹掉本机路径,截断到 200 字符。
+
+    注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,所以限长并只保留可打印字符。"""
+    text = str(exc)
+    name, msg = type(exc).__name__, text
+    for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
+        m = _EXC_LINE.match(line)
+        if m:
+            name, msg = m.group(1), m.group(2)
+            break
+    msg = _PATH_LIKE.sub("<path>", msg)
+    msg = "".join(ch for ch in msg if ch.isprintable())[:200]
+    return {"type": name.split(".")[-1], "message": msg}
 
 
 class JobError(Exception):
@@ -170,6 +191,13 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
            "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", rs.file_sha256(path)]
     body = spawn_child(cmd, timeout)
+    if "error" in body:                    # 策略自身报错是研究中的正常结果:记录下来供反馈,而不是当作网关故障
+        result = {"kind": "backtest", "status": "strategy_error", "strategy_file": path.name,
+                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": key,
+                  "segment": segment, "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"),
+                  "error": body["error"]}
+        result["run_id"] = rs.save_result(result, paths["results_dir"])
+        return result
 
     from risk.diagnosis import diagnose
     result = {
@@ -226,6 +254,12 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
            "--params", json.dumps(params), "--random-runs", str(random_runs),
            "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path)]
     body = spawn_child(cmd, timeout)
+    if "error" in body:
+        result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
+                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": "C15",
+                  "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"), "error": body["error"]}
+        result["run_id"] = rs.save_result(result, paths["results_dir"])
+        return result
     result = {
         "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "class": cls, "key": "C15", "params": params, "plateau_note": plateau_note,
@@ -303,9 +337,13 @@ def run_gate_child(args) -> int:
         return EXIT_FAILED
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
-    result = run_gate(candidate_cls=cls, params=json.loads(args.params), windows=windows, bars=bars,
-                      runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
-                      data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL)
+    try:
+        result = run_gate(candidate_cls=cls, params=json.loads(args.params), windows=windows, bars=bars,
+                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
+                          data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL)
+    except Exception as exc:
+        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
+        return EXIT_OK
     print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 
@@ -329,7 +367,11 @@ def run_child(args) -> int:
     if not (isinstance(strategy_class, type) and issubclass(strategy_class, CtaTemplate)):
         print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
         return EXIT_FAILED
-    stats, _, trades = run_backtest(strategy_class, json.loads(args.params), args.key, start, end)
+    try:
+        stats, _, trades = run_backtest(strategy_class, json.loads(args.params), args.key, start, end)
+    except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
+        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
+        return EXIT_OK
     stats = stats or {}
     row = {
         "return_pct": stats.get("total_return", 0.0), "maxdd_pct": stats.get("max_ddpercent", 0.0),

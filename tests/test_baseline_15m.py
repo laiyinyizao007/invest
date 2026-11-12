@@ -248,3 +248,11 @@ def test_select_window_ends_exactly_where_the_first_walk_forward_validation_begi
     assert o.WINDOWS["select"][0] == first.train_start
     assert o.WINDOWS["select"][1] == first.train_end           # 选参数据止于 W1 训练段末,W1~W3 验证窗口保持样本外
     assert o.WINDOWS["select"][1] < first.valid_start
+
+
+def test_strategy_failure_message_carries_the_traceback_that_vnpy_prints_next():
+    from backtest_lib import _raise_if_strategy_failed
+    messages = ["回放进度", "触发异常，回测终止", "Traceback (most recent call last):" + chr(10) + "  File x" + chr(10) + "ValueError: too many values to unpack (expected 3)"]
+
+    with pytest.raises(RuntimeError, match="too many values to unpack"):
+        _raise_if_strategy_failed(messages)
