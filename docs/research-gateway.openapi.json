@@ -37,7 +37,7 @@
     "/research/data": {
       "get": {
         "operationId": "list_data_segments",
-        "summary": "列出可用数据段(训练/验证)及测试段是否已被消费。测试段不可经此访问。",
+        "summary": "列出可用数据段(训练/验证)、测试段是否已被消费,以及迭代额度 iteration{used,limit,window_hours,next_release_in_seconds}。测试段不可经此访问。",
         "responses": {
           "200": {
             "description": "数据段清单"
@@ -82,6 +82,12 @@
           },
           "409": {
             "description": "同名候选已存在,请换名"
+          },
+          "429": {
+            "description": "滚动窗口内提交数已达上限(默认 24 小时最多 5 个);响应里说明已用额度与最早一条何时释放"
+          },
+          "500": {
+            "description": "提交账本损坏或无法写入,拒绝提交(fail-closed)"
           }
         }
       }
@@ -128,6 +134,13 @@
                   "params": {
                     "type": "object",
                     "description": "策略参数"
+                  },
+                  "view": {
+                    "type": "string",
+                    "enum": [
+                      "report"
+                    ],
+                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
                   }
                 }
               }
@@ -181,6 +194,13 @@
                   "plateau": {
                     "type": "object",
                     "description": "参数网格得分 {cell:[i,j,k], scores:[[i,j,k,score],...]};缺省则参数高原按未通过"
+                  },
+                  "view": {
+                    "type": "string",
+                    "enum": [
+                      "report"
+                    ],
+                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
                   }
                 }
               }
@@ -264,6 +284,13 @@
                   "random_runs": {
                     "type": "integer",
                     "description": "随机对照次数;缺省取服务端配置"
+                  },
+                  "view": {
+                    "type": "string",
+                    "enum": [
+                      "report"
+                    ],
+                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
                   }
                 }
               }

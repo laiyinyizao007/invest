@@ -27,6 +27,7 @@ from pathlib import Path
 import bootstrap
 import research_config as rc
 import research_sandbox as rs
+from risk.report import render_report
 
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
@@ -173,6 +174,43 @@ def approve_job(strategy: str) -> dict:
     return {"approved": path.name, "sha256": sha}
 
 
+def review_job(strategy: str, input_fn=None, write=print) -> dict:
+    """先看代码再批准:打印文件摘要、静态筛查结果和**带行号的完整源码**,再问一次 [y/N]。
+    只有明确输入 y 才记录批准(绑定代码哈希);空输入、其它输入、stdin 已关闭一律视为不批准。
+    静态筛查不过的直接拒绝,不提问。批准只能在本机由人触发,外层没有任何端点能调用它。"""
+    cfg, paths = settings()
+    path = resolve_strategy(strategy, cfg)
+    source = path.read_text(encoding="utf-8")
+    sha = rs.file_sha256(path)
+    findings = screen(path, cfg)
+    write(f"文件: {path.name}   大小: {len(source.encode('utf-8'))} 字节   sha256: {sha}")
+    write("静态筛查: " + ("通过" if not findings else "未通过"))
+    for finding in findings:
+        write(f"  - {finding}")
+    write("-" * 60)
+    for number, line in enumerate(source.splitlines(), 1):
+        write(f"{number:4d} | {line}")
+    write("-" * 60)
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过,不予批准")
+    try:
+        if rs.is_approved(path, paths["approvals_file"]):
+            write("该内容(同一哈希)已批准过。")
+            return {"approved": True, "already": True, "sha256": sha, "name": path.name}
+        try:
+            answer = (input_fn or input)("读完以上代码,确认批准运行? [y/N] ")     # 调用时再取 input,便于替换
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() != "y":
+            write("未批准。")
+            return {"approved": False, "sha256": sha, "name": path.name}
+        rs.record_approval(path, paths["approvals_file"])
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc))
+    write("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")
+    return {"approved": True, "already": False, "sha256": sha, "name": path.name}
+
+
 def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dict, timeout: float | None = None,
                  confirm: bool = False) -> dict:
     cfg, paths = settings()
@@ -196,7 +234,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
                   "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": key,
                   "segment": segment, "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"),
                   "error": body["error"]}
-        result["run_id"] = rs.save_result(result, paths["results_dir"])
+        save_with_report(result, paths)
         return result
 
     from risk.diagnosis import diagnose
@@ -206,7 +244,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
         "window": [f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"], "ran_at": datetime.now().isoformat(timespec="seconds"),
         "stats": body["stats"], "diagnosis": diagnose(body["stats"], body["pnls"]),
     }
-    result["run_id"] = rs.save_result(result, paths["results_dir"])
+    save_with_report(result, paths)
     return result
 
 
@@ -258,7 +296,7 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
         result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
                   "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": "C15",
                   "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"), "error": body["error"]}
-        result["run_id"] = rs.save_result(result, paths["results_dir"])
+        save_with_report(result, paths)
         return result
     result = {
         "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
@@ -266,12 +304,18 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
         "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
     }
-    result["run_id"] = rs.save_result(result, paths["results_dir"])
+    save_with_report(result, paths)
     return result
 
 
 EVALUATE_NOTICE = ("evaluate 的样本外由服务端保证：参数只在选参窗口（2020-07-22 ~ 2022-06-30）上按候选声明的 param_grid 选出，"
                    "门槛评估只用其后的滚动验证窗口（2022-07 ~ 2023-12），两段不重叠；测试段不可达。")
+
+
+def save_with_report(result: dict, paths: dict) -> None:
+    """落盘前补上确定性中文报告(纯函数生成,出错也只是一行说明),并写入 run_id。"""
+    result["report"] = render_report(result)
+    result["run_id"] = rs.save_result(result, paths["results_dir"])
 
 
 def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
@@ -299,7 +343,7 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
     else:
         result = {**base, **body}
-    result["run_id"] = rs.save_result(result, paths["results_dir"])
+    save_with_report(result, paths)
     return result
 
 
@@ -313,6 +357,15 @@ def run_cli_job(func) -> int:
         message = getattr(exc, "message", str(exc))
         print(("拒绝: " if code == EXIT_REFUSED else "") + message, file=sys.stderr)
         return code
+
+
+def cmd_review(args) -> int:
+    try:
+        review_job(args.strategy)
+    except (JobError, rs.SandboxError) as exc:
+        print("拒绝: " + getattr(exc, "message", str(exc)), file=sys.stderr)
+        return getattr(exc, "code", EXIT_REFUSED)
+    return EXIT_OK
 
 
 def cmd_data(_args) -> int:
@@ -501,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds + grid.timeout_seconds")
     ev.add_argument("--confirm-reviewed", action="store_true")
     ev.set_defaults(func=cmd_evaluate)
+    rv = sub.add_parser("review", help="先看代码再批准:显示带行号的源码与静态筛查结果,输入 y 才批准")
+    rv.add_argument("--strategy", required=True)
+    rv.set_defaults(func=cmd_review)
     ap = sub.add_parser("approve", help="人工批准:读过代码后执行,批准绑定到代码内容的 sha256")
     ap.add_argument("--strategy", required=True)
     ap.set_defaults(func=cmd_approve)
