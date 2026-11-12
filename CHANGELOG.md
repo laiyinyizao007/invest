@@ -16,6 +16,8 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 研究网关**提交额度账本**（`scripts/research_gateway.py`，配置 `iteration.window_hours`，默认 24，范围 1–720）：滚动窗口内最多提交 `iteration.max_iterations` 个候选，由服务端强制，LLM 无法绕过；额度检查、写文件、记账在同一把锁内完成，记账失败则撤回候选文件；账本损坏 fail-closed（拒绝提交）；`/research/data` 回报已用额度与最早释放时间。请求可带 `view:"report"` 只取精炼回报（run_id/passed/status/report），非法取值在运行作业前即拒绝。
+- 确定性中文报告 `risk/report.py::render_report`：把 backtest/gate/evaluate 结果压成几行文字，纯函数、输入残缺也不抛异常、不做策略建议；每个作业结果附带 `report` 并落盘。此前 `research_api.py` 已导入该模块而文件未入库，现补齐。
 - 通知器**落盘待补发队列**（`notify/webhook.py`，环境变量 `WEBHOOK_OUTBOX`，默认 `data/state/webhook_outbox.jsonl`，`off` 关闭）：发送最终失败（如本机断网）的告警不再丢弃，写入 JSONL（临时文件 + fsync + 原子替换），网络恢复后由后台线程补发——FATAL/ERROR/WARN 按发生先后逐条补发并加「【补发】」前缀、保留原始时间；INFO 积压 ≥3 条合并成一条摘要（最多列 20 行）；条数上限（FATAL 优先保留）与存活期（默认 24 小时）；已知断网时新告警只试一次而不是空等约 34 秒；退出时内存队列里没发完的也落盘；进程重启后继续补发。起因：夜盘切断网络 240 秒的演练里，断网期间产生的「行情假死」「网关连接断开」告警恢复后也没有补发。已用真实 Telegram 验证。演练的送达统计改为如实报告实际发送/暂存/放弃/已补发/待补发条数；`drill.py` 场景跑完先落一份结果再进入退出阶段。
 - 记录夜盘完整 `all` 的两个新发现：`latency` 在行情清淡时 30 秒没成交（对活跃度敏感）；`disconnect` 重连后退出登出（`logout_ctp`）出现一次原生段错误（139），待复现。
 - `disconnect` 演练通过：改为外部真实切断容器网络（`drill.py --external-cut FILE` + 宿主机 `docker network disconnect/connect`），旧版 `td_api.close()` 会释放整个原生 API 导致段错误，已移除；没给 `--external-cut` 时场景自动跳过。实测：切断 240 秒——行情停更看门狗 61 秒告警，CTP 心跳超时约 121 秒报断线（8193），恢复后约 2 秒自动重连；切断 30 秒无断线。至此六个演练场景全部通过。

@@ -49,6 +49,10 @@ class GatewayError(RuntimeError):
     pass
 
 
+class LedgerError(RuntimeError):
+    """提交账本无法读取:fail-closed,拒绝提交而不是悄悄放行。"""
+
+
 def assert_clean_environment(env) -> None:
     leaked = sorted(k for k in env if k.upper().startswith("CTP_"))
     if leaked:
@@ -110,6 +114,20 @@ def _lenient_int(value, name: str) -> int | None:
         raise rs.SandboxError(f"{name} 必须是整数") from exc
 
 
+def _view(data: dict) -> str | None:
+    """可选的 view 字段:缺省/空串 = 完整结果;"report" = 只回精炼报告;其它一律拒绝(在运行任何作业之前)。"""
+    value = data.get("view")
+    if value is None or value == "":
+        return None
+    if value != "report":
+        raise rs.SandboxError('view 只能是 "report"(或不填表示完整结果)')
+    return "report"
+
+
+def _compact(result: dict) -> dict:
+    return {k: result[k] for k in ("run_id", "passed", "status", "report") if k in result}
+
+
 def _default_jobs() -> SimpleNamespace:
     import research_api as api
     return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job, evaluate_job=api.evaluate_job,
@@ -119,10 +137,13 @@ def _default_jobs() -> SimpleNamespace:
 class GatewayApp:
     """纯逻辑的请求处理(不涉及 socket),便于单测。"""
 
-    def __init__(self, cfg: dict, paths: dict, token: str, jobs=None, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, cfg: dict, paths: dict, token: str, jobs=None, clock: Callable[[], float] = time.monotonic,
+                 wall: Callable[[], float] = time.time):
         self.cfg, self.paths, self.token = cfg, paths, token
         self.jobs = jobs if jobs is not None else _default_jobs()
         self.clock = clock
+        self.wall = wall                      # 挂钟时间(秒):迭代上限的滚动窗口用它;clock 是单调钟,只用于限流
+        self._ledger_lock = threading.Lock()
         self._hits: deque[float] = deque()
         self._busy = threading.Lock()
         self._lock = threading.Lock()
@@ -183,9 +204,56 @@ class GatewayApp:
             return "results", {"run_id": path[len(prefix):]}
         return None, {}
 
+    # ---- 提交账本:滚动窗口内最多提交 N 个候选(服务端强制,LLM 无法绕过) ----
+    def _ledger_path(self) -> Path:
+        return self.paths["results_dir"] / "submissions.jsonl"
+
+    def _ledger_entries(self) -> list[dict]:
+        path = self._ledger_path()
+        if not path.exists():
+            return []
+        entries: list[dict] = []
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                data = json.loads(line)
+                if not isinstance(data, dict) or isinstance(data.get("at"), bool) or not isinstance(data.get("at"), (int, float)):
+                    raise ValueError("记录缺少时间戳")
+                entries.append(data)
+        except (OSError, ValueError) as exc:
+            raise LedgerError(f"提交账本损坏或无法读取,拒绝提交(fail-closed): {exc}") from exc
+        return entries
+
+    def _iteration_status(self, entries: list[dict], now: float) -> dict:
+        cfg = self.cfg["iteration"]
+        window = cfg["window_hours"] * 3600.0
+        recent = [e for e in entries if now - e["at"] < window]
+        release = None if not recent else int(round(min(e["at"] for e in recent) + window - now))
+        return {"used": len(recent), "limit": cfg["max_iterations"], "window_hours": cfg["window_hours"],
+                "next_release_in_seconds": release}
+
+    def _write_ledger(self, entries: list[dict]) -> None:
+        path = self._ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+
+    def _iteration_snapshot(self) -> dict:
+        try:
+            with self._ledger_lock:
+                return self._iteration_status(self._ledger_entries(), self.wall())
+        except LedgerError as exc:
+            return {"error": str(exc)}
+
     # ---- 端点 ----
     def _data(self, _data, _params):
-        return 200, {"data": self.jobs.data_report()}
+        return 200, {"data": self.jobs.data_report(), "iteration": self._iteration_snapshot()}
 
     def _candidates(self, data, _params):
         name, source = data.get("name"), data.get("source")
@@ -206,12 +274,36 @@ class GatewayApp:
             return 400, {"error": "静态筛查未通过: " + "; ".join(findings)}
         target = self.paths["pending_dir"] / name
         self.paths["pending_dir"].mkdir(parents=True, exist_ok=True)
-        try:
-            with open(target, "xb") as stream:                      # x:绝不覆盖已有文件
-                stream.write(raw)
-        except FileExistsError:
-            return 409, {"error": "同名候选已存在,请换名"}
-        return 200, {"name": name, "sha256": rs.file_sha256(target)}
+        with self._ledger_lock:                                     # 额度检查、写文件、记账必须是一个整体,否则并发能多交
+            try:
+                entries = self._ledger_entries()
+            except LedgerError as exc:
+                return 500, {"error": str(exc)}
+            now = self.wall()
+            status = self._iteration_status(entries, now)
+            if status["used"] >= status["limit"]:
+                hours = (status["next_release_in_seconds"] or 0) / 3600.0
+                return 429, {"error": f"滚动 {status['window_hours']} 小时内最多提交 {status['limit']} 个候选,"
+                                      f"已用 {status['used']}/{status['limit']};最早一条约 {hours:.1f} 小时后释放", "iteration": status}
+            try:
+                with open(target, "xb") as stream:                  # x:绝不覆盖已有文件
+                    stream.write(raw)
+            except FileExistsError:
+                return 409, {"error": "同名候选已存在,请换名"}
+            sha = rs.file_sha256(target)
+            window = self.cfg["iteration"]["window_hours"] * 3600.0
+            kept = [e for e in entries if now - e["at"] < window]
+            try:
+                self._write_ledger(kept + [{"at": now, "name": name, "sha256": sha}])
+            except OSError as exc:
+                target.unlink(missing_ok=True)                      # 记不上账就不留文件:否则额度形同虚设
+                return 500, {"error": f"提交账本写入失败,已撤回本次提交: {exc}"}
+        return 200, {"name": name, "sha256": sha}
+
+    @staticmethod
+    def _shape(outcome: tuple, view: str | None) -> tuple:
+        status, payload = outcome
+        return (status, _compact(payload)) if status == 200 and view == "report" and isinstance(payload, dict) else outcome
 
     def _run_job(self, func, **kwargs):
         import research_api as api
@@ -235,9 +327,10 @@ class GatewayApp:
         if key not in rs.KEYS or segment not in rs.SEGMENTS:
             return 400, {"error": f"key 只能是 {list(rs.KEYS)},segment 只能是 {list(rs.SEGMENTS)}"}
         params = _lenient_object(data.get("params"), "params") or {}
+        view = _view(data)
         # confirm 固定为 False:批准只能由本机 CLI 触发,请求体里的同名字段被忽略
-        return self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
-                             params=params, confirm=False)
+        return self._shape(self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
+                                         params=params, confirm=False), view)
 
     def _gate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -249,8 +342,9 @@ class GatewayApp:
         plateau = (False, "未提供 plateau:参数高原未评估,按未通过处理")
         if plateau_data is not None:
             plateau = self.jobs.plateau_from_data(plateau_data)
-        return self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
-                             random_runs=random_runs, confirm=False)
+        view = _view(data)
+        return self._shape(self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
+                                         random_runs=random_runs, confirm=False), view)
 
     def _evaluate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -258,7 +352,8 @@ class GatewayApp:
             return 400, {"error": "strategy/class 必须是字符串,class 必须是合法标识符"}
         random_runs = _lenient_int(data.get("random_runs"), "random_runs")
         # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
-        return self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False)
+        view = _view(data)
+        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False), view)
 
     def _results(self, _data, params):
         run_id = params["run_id"]

@@ -138,3 +138,10 @@ def test_grid_section_has_sane_shipped_values():
 def test_invalid_grid_values_are_rejected(tmp_path, data):
     with pytest.raises(rc.ConfigError):
         rc.load(write(tmp_path, data))
+
+
+def test_iteration_window_hours_default_and_bounds(tmp_path):
+    assert rc.load()["iteration"] == {"max_iterations": 5, "window_hours": 24}
+    for bad in (0, 721):
+        with pytest.raises(rc.ConfigError):
+            rc.load(write(tmp_path, {"iteration": {"window_hours": bad}}))

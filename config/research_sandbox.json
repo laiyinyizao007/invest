@@ -1,6 +1,7 @@
 {
   "iteration": {
-    "max_iterations": 5
+    "max_iterations": 5,
+    "window_hours": 24
   },
   "feedback": {
     "limit": 3

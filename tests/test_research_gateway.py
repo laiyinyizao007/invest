@@ -11,14 +11,14 @@ import research_gateway as gw
 TOKEN = "t" * 40
 
 
-def make_app(tmp_path, jobs=None, clock=None, **cfg_over):
+def make_app(tmp_path, jobs=None, clock=None, wall=None, **cfg_over):
     cfg = rc.load()
     for section, values in cfg_over.items():
         cfg[section].update(values)
     (tmp_path / "pending_strategies").mkdir(exist_ok=True)
     paths = {"pending_dir": tmp_path / "pending_strategies", "results_dir": tmp_path / "data" / "research",
              "approvals_file": tmp_path / "data" / "research" / "approvals.json", "token_file": tmp_path / "tok"}
-    return gw.GatewayApp(cfg, paths, TOKEN, jobs=jobs or SimpleNamespace(), clock=clock or (lambda: 0.0))
+    return gw.GatewayApp(cfg, paths, TOKEN, jobs=jobs or SimpleNamespace(), clock=clock or (lambda: 0.0), wall=wall or (lambda: 1_000_000.0))
 
 
 def call(app, method, path, body=None, token=TOKEN, raw=None):
@@ -442,3 +442,121 @@ def test_feedback_includes_failed_evaluations_but_not_passed_ones(tmp_path):
     traces = call(app, "GET", "/research/feedback")[1]["traces"]
 
     assert [t["run_id"] for t in traces] == ["20261112-210001-000000"] and traces[0]["kind"] == "evaluate"
+
+
+
+# ---------- 迭代上限:滚动窗口内最多提交 N 个候选(服务端强制,LLM 无法绕过) ----------
+
+def submit(app, name, source=None):
+    return call(app, "POST", "/research/candidates", {"name": name, "source": source or GOOD})
+
+
+def test_candidates_beyond_the_rolling_limit_are_refused_with_a_clear_reason(tmp_path):
+    app = make_app(tmp_path, iteration={"max_iterations": 2, "window_hours": 24})
+
+    assert submit(app, "a1.py")[0] == 200 and submit(app, "a2.py")[0] == 200
+    status, body = submit(app, "a3.py")
+
+    assert status == 429 and "最多提交 2" in body["error"] and "24" in body["error"] and "释放" in body["error"]
+    assert not (tmp_path / "pending_strategies" / "a3.py").exists()
+
+
+def test_rejected_submissions_do_not_consume_the_quota(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(data_report=lambda: []), iteration={"max_iterations": 2, "window_hours": 24})
+    submit(app, "ok.py")
+
+    assert submit(app, "ok.py")[0] == 409                         # 同名
+    assert submit(app, "BAD NAME.py")[0] == 400                   # 命名
+    assert submit(app, "evil.py", "import os\n")[0] == 400       # 静态筛查
+    status, body = call(app, "GET", "/research/data")
+
+    assert body["iteration"]["used"] == 1 and submit(app, "second.py")[0] == 200
+
+
+def test_quota_is_released_when_old_submissions_leave_the_window(tmp_path):
+    now = [1_000_000.0]
+    app = make_app(tmp_path, wall=lambda: now[0], iteration={"max_iterations": 1, "window_hours": 24})
+    assert submit(app, "first.py")[0] == 200
+    assert submit(app, "second.py")[0] == 429
+
+    now[0] += 24 * 3600 - 1
+    assert submit(app, "second.py")[0] == 429                     # 差一秒
+    now[0] += 2
+    assert submit(app, "second.py")[0] == 200
+
+
+def test_data_endpoint_reports_remaining_iteration_quota(tmp_path):
+    now = [1_000_000.0]
+    app = make_app(tmp_path, jobs=SimpleNamespace(data_report=lambda: []), wall=lambda: now[0],
+                   iteration={"max_iterations": 5, "window_hours": 24})
+    submit(app, "one.py")
+    now[0] += 3600
+
+    _, body = call(app, "GET", "/research/data")
+
+    it = body["iteration"]
+    assert (it["used"], it["limit"], it["window_hours"]) == (1, 5, 24)
+    assert it["next_release_in_seconds"] == 23 * 3600
+
+
+def test_corrupt_ledger_fails_closed_and_stores_nothing(tmp_path):
+    app = make_app(tmp_path)
+    app.paths["results_dir"].mkdir(parents=True, exist_ok=True)
+    (app.paths["results_dir"] / "submissions.jsonl").write_text("{broken\n", encoding="utf-8")
+
+    status, body = submit(app, "a.py")
+
+    assert status == 500 and "账本" in body["error"]
+    assert not (tmp_path / "pending_strategies" / "a.py").exists()
+
+
+def test_ledger_keeps_only_entries_inside_the_window(tmp_path):
+    now = [1_000_000.0]
+    app = make_app(tmp_path, wall=lambda: now[0], iteration={"max_iterations": 5, "window_hours": 1})
+    submit(app, "old.py")
+    now[0] += 7200
+    submit(app, "new.py")
+
+    rows = [json.loads(l) for l in (app.paths["results_dir"] / "submissions.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    assert [r["name"] for r in rows] == ["new.py"] and len(rows[0]["sha256"]) == 64
+
+
+# ---------- view=report:只回精炼报告(体积小,工作流结果节点直接展示) ----------
+
+FULL = {"run_id": "r1", "passed": False, "report": "结论: 未通过", "metrics": {"x": 1}, "windows": [1, 2, 3], "failures": ["a"]}
+
+
+def test_view_report_returns_only_the_compact_fields(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL), backtest_job=lambda **kw: dict(FULL),
+                                                  gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x")))
+
+    for path, body in (("/research/evaluate", {"strategy": "a.py", "class": "C"}),
+                       ("/research/gate", {"strategy": "a.py", "class": "C"}),
+                       ("/research/backtest", {"strategy": "a.py", "class": "C", "key": "CADJ", "segment": "train"})):
+        status, out = call(app, "POST", path, {**body, "view": "report"})
+        assert status == 200 and out == {"run_id": "r1", "passed": False, "report": "结论: 未通过"}, path
+        full = call(app, "POST", path, body)[1]
+        assert "metrics" in full and "failures" in full                  # 默认仍是完整结果
+
+
+def test_unknown_view_is_rejected_before_running_anything(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: pytest.fail("不应运行")))
+
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "raw"})[0] == 400
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": 5})[0] == 400
+
+
+def test_blank_view_means_full_result(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+
+    assert "metrics" in call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": ""})[1]
+
+
+def test_view_report_keeps_strategy_error_status(tmp_path):
+    result = {"run_id": "r2", "passed": False, "status": "strategy_error", "report": "策略运行报错: X", "error": {"type": "X"}}
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(result)))
+
+    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "report"})[1]
+
+    assert out["status"] == "strategy_error" and out["report"].startswith("策略运行报错")

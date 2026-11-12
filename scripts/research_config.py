@@ -22,7 +22,7 @@ import bootstrap
 CONFIG_PATH = bootstrap.ROOT / "config" / "research_sandbox.json"
 
 DEFAULTS: dict[str, dict[str, Any]] = {
-    "iteration": {"max_iterations": 5},
+    "iteration": {"max_iterations": 5, "window_hours": 24},
     "feedback": {"limit": 3},
     "gate": {"random_runs": 200, "timeout_seconds": 3600},
     "backtest": {"timeout_seconds": 600},
@@ -38,6 +38,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
 # (最小, 最大);bool 不算整数
 INT_BOUNDS = {
     ("iteration", "max_iterations"): (1, 50),
+    ("iteration", "window_hours"): (1, 720),
     ("feedback", "limit"): (1, 10),
     ("gate", "random_runs"): (20, 2000),
     ("gate", "timeout_seconds"): (1, 86_400),

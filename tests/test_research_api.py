@@ -429,3 +429,100 @@ def test_evaluate_child_refuses_a_file_changed_after_approval(tmp_path):
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(f), "--cls", "S", "--random-runs", "20", "--sha256", sha])
 
     assert api.run_evaluate_child(args) == api.EXIT_REFUSED
+
+
+# ---------- 结果里带确定性中文报告 ----------
+
+def test_every_job_result_carries_a_report_and_saves_it(tree, monkeypatch):
+    make_strategy(tree)
+    stats = {"return_pct": 1.0, "maxdd_pct": -2.0, "maxdd_yuan": -200.0, "sharpe": 2.0, "round_trips": 200,
+             "end_balance": 10100.0, "net_pnl": 100.0, "total_cost": 10.0}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"stats": stats, "pnls": [1, -1, 1]})
+
+    bt = api.backtest_job(strategy="s.py", cls="S", key="CADJ", segment="train", params={}, confirm=True)
+
+    assert "沙盒回测" in bt["report"]
+    saved = json.loads((tree / "data" / "research" / f"{bt['run_id']}.json").read_text(encoding="utf-8"))
+    assert saved["report"] == bt["report"]
+
+
+def test_gate_and_evaluate_results_carry_reports_including_strategy_errors(tree, monkeypatch):
+    make_strategy(tree)
+    body = {"passed": False, "failures": ["样本外夏普 -1 < 1.5"], "metrics": {"oos_sharpe": -1.0}, "selection": {"n_cells": 27, "valid_cells": 5, "on_plateau": False},
+            "params": {"a": 1}, "diagnosis": {"summary": "s"}}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: body)
+
+    ev = api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+    gt = api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+    assert "选参 + 晋级门槛评估" in ev["report"] and "晋级门槛评估" in gt["report"] and "未通过" in ev["report"]
+
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "ValueError", "message": "boom"}})
+    err = api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+    assert "策略运行报错" in err["report"] and "boom" in err["report"]
+
+
+# ---------- review:先看代码再批准 ----------
+
+def test_review_shows_numbered_source_and_approves_only_on_y(tree, capsys):
+    path = make_strategy(tree, "class S:\n    x = 1\n")
+    shown = []
+
+    out = api.review_job("s.py", input_fn=lambda prompt: "y", write=shown.append)
+
+    text = "\n".join(shown)
+    assert "sha256" in text and api.rs.file_sha256(path) in text and "静态筛查: 通过" in text
+    assert "   1 | class S:" in text and "   2 |     x = 1" in text
+    assert out["approved"] is True and api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+@pytest.mark.parametrize("answer", ["", "n", "N", "yes please", " "])
+def test_review_does_not_approve_on_anything_but_y(tree, answer):
+    path = make_strategy(tree)
+
+    out = api.review_job("s.py", input_fn=lambda prompt: answer, write=lambda *_: None)
+
+    assert out["approved"] is False
+    assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+def test_review_treats_closed_stdin_as_no(tree):
+    path = make_strategy(tree)
+
+    def eof(prompt):
+        raise EOFError
+
+    assert api.review_job("s.py", input_fn=eof, write=lambda *_: None)["approved"] is False
+    assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+def test_review_refuses_code_that_fails_static_screening_without_asking(tree):
+    make_strategy(tree, "import os\n")
+
+    with pytest.raises(api.JobError) as err:
+        api.review_job("s.py", input_fn=lambda prompt: pytest.fail("筛查不过不该提问"), write=lambda *_: None)
+
+    assert "静态筛查未通过" in err.value.message
+
+
+def test_review_on_already_approved_content_does_not_ask_again(tree):
+    path = make_strategy(tree)
+    api.rs.record_approval(path, tree / "data" / "research-control" / "approvals.json")
+
+    out = api.review_job("s.py", input_fn=lambda prompt: pytest.fail("已批准不该再问"), write=lambda *_: None)
+
+    assert out["approved"] is True and out["already"] is True
+
+
+def test_review_cli_wires_through_builtin_input(tree, monkeypatch, capsys):
+    path = make_strategy(tree)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    assert run("review", "--strategy", "s.py") == api.EXIT_OK
+    assert api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+    assert "已批准" in capsys.readouterr().out
+
+
+def test_review_refuses_paths_outside_pending(tree, capsys):
+    (tree / "evil.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert run("review", "--strategy", "../evil.py") == api.EXIT_REFUSED
