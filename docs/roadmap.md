@@ -259,7 +259,7 @@ flowchart TB
 |---|---|---|---|
 | 保证金占比实时风控 | `trading/guard_rule.py` 新规则:资金使用率超过阈值(研究资料建议 <30%)时告警/拒绝开仓,读 CTP 账户的保证金与可用资金 | 多品种/多策略并发(阶段三)或本金变化;固定 1 手单品种时该约束恒成立,暂无必要 | 要点梳理 §2 |
 | 跳空/夜盘滑点验收 | `docs/runbook-simnow.md` 第 5 节新增实测项 + `scripts/drill.py` 场景:夜盘跳空下止损单实际成交价与预算的偏离 | 阶段一实测完成后;真实滑点最终以小额实盘为准(SimNow 撮合偏理想) | 原文「跳空极端局」;§4「预算约束不了跳空」 |
-| `parameter_on_plateau` 的计算来源 | 优化器输出 → `risk/promotion_gate.py::CandidateMetrics.parameter_on_plateau` 的调用方 | 与「参数平原卷积」同触发;在此之前该项由人工判断 | `docs/adr/20261111-discipline-enforcement.md` 已知局限 |
+| `parameter_on_plateau` 的计算来源 — **计算已落地(2026-11-12)** | `risk/plateau.py::parameter_on_plateau`(邻域均值 > 0 且至少一半格子得分为正);**尚未接入优化脚本/门槛调用方**,见 ADR `20261112-research-sandbox-groundwork` | — | `docs/adr/20261111-discipline-enforcement.md` 已知局限 |
 | 周期性 `ReqQryOrder` 对账 | `trading/runtime.py` 定时查询委托,与本会话委托号对账,补上外部终端下单的检测 | runbook 第 5 节第 11 项实测发现收不到外部会话的委托回报 | 同上 ADR(codex 审查 H1) |
 | 非策略委托白名单扩展 | `trading/guard_rule.py::STRATEGY_REF_PREFIX` 由单个前缀扩为集合(`AlgoTrading_`/`SpreadTrading_`) | 无头路径启用算法单/价差应用 | 同上 ADR |
 | 测试段使用次数持久化 — **已落地(2026-11-12)** | `scripts/segment_ledger.py` + 入库登记 `config/test_segment_usage.json`;`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复即拒绝;15 分钟基准测试段已补登记。`walk_forward_optimizer.py` 无 `--test`,不适用 | — | §4「测试段只看一次靠人工纪律」 |
