@@ -1,7 +1,9 @@
 """使用官方 vnpy_datarecorder 录制 C/MA Tick 与 1 分钟 Bar。
 
-此入口只连接行情、订阅具体合约并写入独立数据库；不加载交易策略、不发单、不查询账户。
-默认只允许 SimNow，国信测试必须显式使用 ``guoxin-test`` profile。
+此入口连接行情前置，并**受限地**连接交易前置——仅用于认证与查询合约清单
+（vn.py 的合约信息只来自交易前置，行情前置收到的 tick 在没有合约时会被丢弃）。
+网关层与底层请求层都硬性禁止发单、撤单、查询资金与持仓；不加载交易策略。
+默认只允许 SimNow，国信测试必须显式使用 ``guoxin-test`` profile 并提供地址允许列表。
 """
 from __future__ import annotations
 
@@ -25,16 +27,28 @@ PROFILE_SIMNOW = "simnow"
 PROFILE_GUOXIN = "guoxin-test"
 PROFILES = frozenset({PROFILE_SIMNOW, PROFILE_GUOXIN})
 SYMBOL_RE = re.compile(r"^(c\d{3,4}\.DCE|MA\d{3,4}\.CZCE)$", re.IGNORECASE)
-REQUIRED_MARKET_CTP = (
+REQUIRED_CTP = (
     "CTP_USERNAME", "CTP_PASSWORD", "CTP_BROKER_ID", "CTP_MD_ADDRESS",
+    "CTP_TD_ADDRESS", "CTP_APP_ID", "CTP_AUTH_CODE",
 )
 
 
-def _require_td_for_simnow(env: Mapping[str, str], profile: str) -> None:
-    if profile == PROFILE_SIMNOW and not env.get("CTP_TD_ADDRESS"):
-        raise ValueError("SimNow profile 必须提供 CTP_TD_ADDRESS 以执行地址白名单校验")
-
-
+def _check_allowed_addresses(env: Mapping[str, str]) -> None:
+    """国信测试环境没有公开的官方地址表:必须由操作者按期货公司书面参数显式列出 host:port。"""
+    allowed = {
+        normalize_address(item)
+        for item in env.get("CTP_RECORD_ALLOWED_ADDRESSES", "").split(",")
+        if item.strip()
+    }
+    if not allowed:
+        raise ValueError(
+            "guoxin-test 必须在 CTP_RECORD_ALLOWED_ADDRESSES 中列出允许连接的 host:port"
+            "（取自期货公司书面给出的测试环境参数，逗号分隔）"
+        )
+    for name in ("CTP_MD_ADDRESS", "CTP_TD_ADDRESS"):
+        address = normalize_address(env[name])
+        if address not in allowed:
+            raise ValueError(f"{name}={address} 不在允许列表 CTP_RECORD_ALLOWED_ADDRESSES 内，拒绝连接")
 
 
 def parse_symbols(value: str) -> tuple[str, ...]:
@@ -67,7 +81,7 @@ def validate_config(env: Mapping[str, str]) -> dict:
     profile = (env.get("CTP_RECORD_PROFILE") or PROFILE_SIMNOW).strip()
     if profile not in PROFILES:
         raise ValueError(f"CTP_RECORD_PROFILE 只允许 {', '.join(sorted(PROFILES))}")
-    missing = [name for name in REQUIRED_MARKET_CTP if not env.get(name)]
+    missing = [name for name in REQUIRED_CTP if not env.get(name)]
     if missing:
         raise ValueError("缺少环境变量: " + ", ".join(missing))
     symbols = parse_symbols(env.get("CTP_RECORD_SYMBOLS", ""))
@@ -76,7 +90,8 @@ def validate_config(env: Mapping[str, str]) -> dict:
         raise ValueError("CTP_ENVIRONMENT 只能是「实盘」或「测试」")
     if profile == PROFILE_GUOXIN and environment != "测试":
         raise ValueError("guoxin-test 必须使用 CTP_ENVIRONMENT=测试")
-    _require_td_for_simnow(env, profile)
+    if profile == PROFILE_GUOXIN:
+        _check_allowed_addresses(env)
     if profile == PROFILE_SIMNOW:
         allowed, note = check_simnow_address(env["CTP_TD_ADDRESS"])
         if not allowed:
@@ -152,6 +167,73 @@ class RecorderStatus:
             self.data["last_error"] = f"status 写入失败: {type(exc).__name__}: {exc}"
 
 
+def build_contract_only_gateway():
+    """构造“只认证 + 查合约”的 CTP 网关类。延迟导入,方便无 vn.py 环境下做配置检查。
+
+    限制分两层(纵深防御):
+    1. 网关/交易接口的业务方法(send_order/cancel_order/query_account/query_position)拒绝执行;
+    2. 底层 C++ 请求方法(reqOrderInsert/reqOrderAction/reqQryTradingAccount/reqQryInvestorPosition)
+       直接抛 PermissionError,即使有人绕过业务方法也发不出去。
+    放行的只有 vn.py 登录流程自带的:认证、登录、确认结算单、查询合约。
+    """
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_TIMER as EVENT_TIMER_NAME
+    from vnpy_ctp import CtpGateway
+    from vnpy_ctp.gateway.ctp_gateway import CtpTdApi
+
+    def _refuse(*_args, **_kwargs):
+        raise PermissionError("录制入口禁止该交易请求")
+
+    class ContractOnlyTdApi(CtpTdApi):
+        def send_order(self, req) -> str:
+            self.gateway.write_log("录制入口禁止发单,已拒绝")
+            return ""
+
+        def cancel_order(self, req) -> None:
+            self.gateway.write_log("录制入口禁止撤单,已拒绝")
+
+        def query_account(self) -> None:
+            return
+
+        def query_position(self) -> None:
+            return
+
+        reqOrderInsert = _refuse
+        reqOrderAction = _refuse
+        reqQryTradingAccount = _refuse
+        reqQryInvestorPosition = _refuse
+
+    class ContractOnlyCtpGateway(CtpGateway):
+        def __init__(self, event_engine, gateway_name: str) -> None:
+            super().__init__(event_engine, gateway_name)
+            self.td_api = ContractOnlyTdApi(self)
+
+        def send_order(self, req) -> str:
+            return self.td_api.send_order(req)
+
+        def cancel_order(self, req) -> None:
+            self.td_api.cancel_order(req)
+
+        def query_account(self) -> None:
+            return
+
+        def query_position(self) -> None:
+            return
+
+        def init_query(self) -> None:
+            # 不注册资金/持仓轮询;只保留日期刷新(夜盘跨午夜后行情日期要靠它更新)
+            self.event_engine.register(EVENT_TIMER_NAME, self.process_timer_event)
+
+        def process_timer_event(self, event: Event) -> None:
+            self.count += 1
+            if self.count < 2:
+                return
+            self.count = 0
+            self.md_api.update_date()
+
+    return ContractOnlyCtpGateway
+
+
 def create_engines():
     """创建事件引擎与主引擎。MainEngine.__init__ 已启动事件引擎,不得再次 start()。"""
     from vnpy.event import EventEngine
@@ -214,39 +296,18 @@ def run(config: dict, env: Mapping[str, str]) -> int:
 
     from vnpy.event import Event
     from vnpy.trader.event import EVENT_CONTRACT, EVENT_TICK
-    from vnpy_ctp import CtpGateway
     from vnpy_datarecorder import DataRecorderApp
-
-    class MarketDataOnlyCtpGateway(CtpGateway):
-        """只初始化 CTP 行情前置，不建立交易前置或查询账户/持仓。"""
-
-        def connect(self, setting: dict) -> None:
-            address = setting["行情服务器"]
-            if not address.startswith(("tcp://", "ssl://", "socks")):
-                address = "tcp://" + address
-            self.md_api.connect(
-                address,
-                setting["用户名"],
-                setting["密码"],
-                setting["经纪商代码"],
-                setting.get("柜台环境", "实盘") == "实盘",
-            )
-
-        def close(self) -> None:
-            self.md_api.close()
-
-        def init_query(self) -> None:
-            # 交易账户/持仓查询属于录制入口禁止触碰的交易状态。
-            return
 
     setting = {
         "用户名": env["CTP_USERNAME"], "密码": env["CTP_PASSWORD"],
         "经纪商代码": env["CTP_BROKER_ID"], "行情服务器": env["CTP_MD_ADDRESS"],
+        "交易服务器": env["CTP_TD_ADDRESS"],
+        "产品名称": env["CTP_APP_ID"], "授权编码": env["CTP_AUTH_CODE"],
         "柜台环境": env.get("CTP_ENVIRONMENT", "实盘"),
     }
     status = RecorderStatus(config["state_dir"] / "status.json", config)
     event_engine, main_engine = create_engines()
-    main_engine.add_gateway(MarketDataOnlyCtpGateway)
+    main_engine.add_gateway(build_contract_only_gateway())
     main_engine.add_app(DataRecorderApp)
     recorder = main_engine.get_engine("DataRecorder")
     sync_recordings(recorder, config["symbols"], config["record_tick"], config["record_1m"])

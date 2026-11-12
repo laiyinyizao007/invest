@@ -21,6 +21,8 @@ BASE_ENV = {
     "CTP_MD_ADDRESS": "tcp://127.0.0.1:30001",
     "CTP_TD_ADDRESS": "tcp://127.0.0.1:30000",
     "CTP_ENVIRONMENT": "测试",
+    "CTP_APP_ID": "app",
+    "CTP_AUTH_CODE": "auth",
 }
 
 
@@ -364,3 +366,95 @@ def test_watchdog_gives_new_process_time_to_publish_heartbeat(tmp_path, monkeypa
 
     assert wrapper.watchdog(state) == 0
     assert calls == []
+
+
+# ---- 方案 A:受限连接交易前置,只做认证 + 合约查询 ----
+
+def test_trading_front_credentials_are_required(monkeypatch):
+    monkeypatch.setattr(recorder, "check_simnow_address", lambda address: (True, "ok"))
+    for name in ("CTP_TD_ADDRESS", "CTP_APP_ID", "CTP_AUTH_CODE"):
+        env = {k: v for k, v in BASE_ENV.items() if k != name}
+        with pytest.raises(ValueError, match=name):
+            recorder.validate_config(env)
+
+
+GUOXIN_ENV = {
+    **BASE_ENV,
+    "CTP_RECORD_PROFILE": "guoxin-test",
+    "CTP_ENVIRONMENT": "测试",
+    "CTP_MD_ADDRESS": "tcp://203.0.113.10:41293",
+    "CTP_TD_ADDRESS": "tcp://203.0.113.10:41285",
+}
+
+
+def test_guoxin_profile_requires_explicit_address_allowlist():
+    with pytest.raises(ValueError, match="CTP_RECORD_ALLOWED_ADDRESSES"):
+        recorder.validate_config(GUOXIN_ENV)
+
+
+def test_guoxin_profile_rejects_address_outside_allowlist():
+    env = {**GUOXIN_ENV, "CTP_RECORD_ALLOWED_ADDRESSES": "203.0.113.10:41285"}  # 缺行情端口
+
+    with pytest.raises(ValueError, match="不在允许列表"):
+        recorder.validate_config(env)
+
+
+def test_guoxin_profile_accepts_addresses_in_allowlist():
+    env = {**GUOXIN_ENV, "CTP_RECORD_ALLOWED_ADDRESSES": " tcp://203.0.113.10:41285 , 203.0.113.10:41293"}
+
+    assert recorder.validate_config(env)["profile"] == "guoxin-test"
+
+
+@pytest.fixture
+def locked_gateway():
+    from vnpy.event import EventEngine
+
+    gateway_cls = recorder.build_contract_only_gateway()
+    return gateway_cls(EventEngine(), "CTP")
+
+
+def _order_request():
+    from vnpy.trader.constant import Direction, Exchange, OrderType
+    from vnpy.trader.object import OrderRequest
+
+    return OrderRequest(
+        symbol="c2701", exchange=Exchange.DCE, direction=Direction.LONG,
+        type=OrderType.LIMIT, volume=1, price=1.0,
+    )
+
+
+def test_contract_only_gateway_refuses_orders_without_touching_the_front(locked_gateway, monkeypatch):
+    touched = []
+    for name in ("reqOrderInsert", "reqOrderAction", "reqQryTradingAccount", "reqQryInvestorPosition"):
+        monkeypatch.setattr(type(locked_gateway.td_api).__mro__[1], name, lambda *a, **k: touched.append(name), raising=False)
+
+    assert locked_gateway.send_order(_order_request()) == ""
+    assert locked_gateway.td_api.send_order(_order_request()) == ""
+    locked_gateway.cancel_order(object())
+    locked_gateway.query_account()
+    locked_gateway.query_position()
+
+    assert touched == []
+
+
+@pytest.mark.parametrize("name", ["reqOrderInsert", "reqOrderAction", "reqQryTradingAccount", "reqQryInvestorPosition"])
+def test_contract_only_trading_api_blocks_raw_requests(locked_gateway, name):
+    """纵深防御:即使有人绕过网关方法直接调底层请求,也必须被拒绝。"""
+    with pytest.raises(PermissionError, match="录制入口"):
+        getattr(locked_gateway.td_api, name)({}, 1)
+
+
+def test_contract_only_gateway_timer_only_refreshes_md_date(locked_gateway):
+    from vnpy.trader.event import EVENT_TIMER
+
+    calls = []
+    locked_gateway.query_account = lambda: calls.append("account")
+    locked_gateway.query_position = lambda: calls.append("position")
+    locked_gateway.md_api.update_date = lambda: calls.append("date")
+
+    locked_gateway.init_query()
+    assert not hasattr(locked_gateway, "query_functions")
+    for _ in range(6):
+        locked_gateway.process_timer_event(None)
+
+    assert calls and set(calls) == {"date"}  # 夜盘跨午夜需要刷新日期,但绝不查账户/持仓

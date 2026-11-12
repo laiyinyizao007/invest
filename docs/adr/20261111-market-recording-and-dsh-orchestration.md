@@ -74,7 +74,11 @@ DSH Desktop 关闭期间不承诺继续录制。只有在后续本机实测证�
 
 ## Implementation Guidance
 
-- `record_market_data.py` 只连接行情、订阅具体合约并调用官方 DataRecorder；不得导入交易策略、下单模块、账户查询或风控状态。
+- `record_market_data.py` 连接行情前置，并**受限地**连接交易前置（修订，2026-11-12 经用户确认）：vn.py 的合约信息 `ContractData` 只来自交易前置的 `onRspQryInstrument`，行情前置收到 tick 时若没有合约会直接丢弃，所以“只连行情前置”无法录制。采用的方案是登录交易前置，**仅**用于认证、登录、确认结算单和查询合约清单。
+  - 硬性限制分两层：① 网关与交易接口的 `send_order`/`cancel_order`/`query_account`/`query_position` 拒绝执行；② 底层 `reqOrderInsert`/`reqOrderAction`/`reqQryTradingAccount`/`reqQryInvestorPosition` 直接抛 `PermissionError`。资金/持仓轮询定时器不注册，只保留行情日期刷新（夜盘跨午夜依赖它）。
+  - 被否决的备选：从本地版本化合约元数据构造 `ContractData`（不碰交易前置，但需手工维护乘数/最小变动价位，换月要改配置）。选择 A 的代价是录制进程持有交易前置的会话和凭证，它不再是“绝对碰不到交易”的进程；已知残余风险见 runbook「验收记录」。
+  - 仍不得导入交易策略、下单模块或风控状态。
+  - 已知残余：vn.py 登录流程会发 `reqSettlementInfoConfirm`（确认结算单，非下单类）；交易前置会推送账户已有的委托/成交回报，录制入口不使用也不落库这些数据。
 - 独立 bootstrap 必须在导入 vn.py database/DataRecorder 之前固定中国时区、`.vntrader_record/` 临时目录和日志路径。
 - wrapper 必须使用不可猜测的进程身份校验（PID + 命令行/profile/状态签名），并在停止前确认目标仍是本任务创建的进程；不能仅凭 PID 操作。
 - `ensure`、`watchdog` 和增量任务必须是有界、可重入的短任务；不得配置所谓无限 timeout。

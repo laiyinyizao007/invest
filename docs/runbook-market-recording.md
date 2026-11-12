@@ -4,15 +4,15 @@
 
 ## 1. 安全边界
 
-- `record_market_data.py` 只连接行情前置，订阅明确的 C/MA 具体合约，并调用官方 `vnpy_datarecorder`。
+- `record_market_data.py` 连接行情前置，并受限地连接交易前置（仅认证 + 查询合约清单，原因见 ADR），订阅明确的 C/MA 具体合约，调用官方 `vnpy_datarecorder`。
 - 录制数据写入独立的 `.vntrader_record/database.db`，不使用交易和回测主库。
-- 录制入口不加载策略、不发单、不查询账户、持仓或风控状态。
+- 录制入口不加载策略；发单、撤单、查询资金与持仓在网关层和底层请求层都被硬性拒绝（有单元测试覆盖）；不读取风控状态。
 - SimNow 必须通过地址白名单校验；国信测试必须显式使用 `guoxin-test` profile 和 `CTP_ENVIRONMENT=测试`。
 - 不把真实凭证写入仓库；运行时从 `.env` 或受控环境变量注入。
 
 ## 2. 离线配置检查
 
-先在项目根目录准备 `.env`，至少填写 `CTP_USERNAME`、`CTP_PASSWORD`、`CTP_BROKER_ID`、`CTP_MD_ADDRESS`、`CTP_TD_ADDRESS` 和具体合约列表。然后运行：
+先在项目根目录准备 `.env`，至少填写 `CTP_USERNAME`、`CTP_PASSWORD`、`CTP_BROKER_ID`、`CTP_MD_ADDRESS`、`CTP_TD_ADDRESS`、`CTP_APP_ID`、`CTP_AUTH_CODE` 和具体合约列表。国信测试 profile 还必须填写 `CTP_RECORD_ALLOWED_ADDRESSES`（逗号分隔的 host:port，取自期货公司书面测试环境参数，只放本机 `.env`，不入库），行情与交易地址都必须在其中。然后运行：
 
 ```text
 python scripts/record_market_data.py --check
@@ -71,7 +71,7 @@ python scripts/record_market_incremental.py --symbols C MA --periods 1 15 --time
 - **注意**：venv 下 `python.exe` 是启动器，wrapper 记录的是外层启动器 PID，真实解释器是其子进程；身份校验依赖命令行含录制脚本路径，两层都满足。
 - **codex 深度审查（2026-11-12，G8 第 2 轮；第 1 轮 `codereview` 的外部专家因 Gemini 免费额度用尽未能验证，仅有本地逐行核查）**，对照已安装 vnpy 源码核实后的结论：
   - **阻断（已修复）**：`MainEngine` 已启动事件引擎，原代码再次 `start()` 必抛 `RuntimeError`，录制进程在连接前就会退出。
-  - **阻断（未修复，待决）**：CTP 的合约（`ContractData`）只来自交易前置的 `onRspQryInstrument`；行情前置收到 tick 时若无合约会直接丢弃（`ctp_gateway.py` 的 `onRtnDepthMarketData`）。本入口只连行情前置，所以不会订阅、也录不到数据。可选方案：(a) 受限地连交易前置，仅做认证与合约查询，并在 gateway 层禁用发单/撤单/查账户/查持仓；(b) 从可信的版本化本地合约元数据构造 `ContractData`。(a) 突破“不连交易前置”的原定边界，(b) 要维护乘数、最小变动价位等元数据。**这是安全边界决策，需用户确认后再改。**
+  - **阻断（已按用户选择的方案 A 修复，2026-11-12；仍待 SimNow 实测）**：CTP 的合约（`ContractData`）只来自交易前置的 `onRspQryInstrument`；行情前置收到 tick 时若无合约会直接丢弃（`ctp_gateway.py` 的 `onRtnDepthMarketData`）。本入口只连行情前置，所以不会订阅、也录不到数据。可选方案：(a) 受限地连交易前置，仅做认证与合约查询，并在 gateway 层禁用发单/撤单/查账户/查持仓；(b) 从可信的版本化本地合约元数据构造 `ContractData`。(a) 突破“不连交易前置”的原定边界，(b) 要维护乘数、最小变动价位等元数据。用户选择 (a)：已实现受限交易前置连接（见 ADR 修订），离线单元测试与真实 `MainEngine` 冒烟（不连任何前置）通过；**真实前置上的认证、结算单确认、合约查询与 tick 入库从未验证**，需明确授权后在 SimNow 上验收。
   - **已修复**：DCE 合约被转大写后传给 DataRecorder 导致“找不到合约”；启动时不同步持久化录制列表，旧合约会继续被录；关闭时不 flush，丢尾部约 10 秒 tick/bar；每个 tick 同步写状态文件且写失败会终止事件线程；SimNow 白名单只校验交易前置而录制连的是行情前置（现要求 MD 主机与已通过白名单的 TD 主机一致）；wrapper 子进程继承调用方管道；`start` 不确认子进程存活；`watchdog` 与 `ensure` 相同、不查心跳；增量任务陈旧锁永久残留、超时不杀进程树、向子进程传递 CTP 凭证；PowerShell 身份查询无超时。
   - **未修复，待决或后续**：国信测试 profile 对地址没有任何校验（需要期货公司提供测试环境地址后建白名单）；DataRecorder 写线程异常后只置 `active=False`，状态文件不反映（需监听 recorder 日志事件）；PID 身份校验未核验 profile/state 目录/实例 token，POSIX 无命令行校验；`wrapper.lock` 无陈旧锁恢复；`last_bar` 字段从不更新；`database_dir` 允许任意路径且隔离只取目录名，未拒绝交易/回测主库。
   - 注：codex 对“venv 双层进程下 `subprocess.run(timeout)` 必然无限阻塞”未能复现；仅当后代进程持有输出管道时才会，本机用显式孙进程复现过（3 秒超时实际 30.2 秒返回）。`fetch_data.py` 自身不派生子进程，已改为树级终止作为加固。

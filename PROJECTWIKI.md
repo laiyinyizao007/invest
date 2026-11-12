@@ -148,7 +148,7 @@ flowchart LR
 **数据**
 - `scripts/bootstrap.py`:所有脚本的统一启动入口(固定工作目录与中国时区,须先于 `vnpy.trader.database` 导入)。
 - `scripts/fetch_data.py`:新浪行情下载→清洗→存 vn.py 数据库/CSV(分钟线只返回最近约 1023 根,须定期增量运行)。
-- `scripts/record_market_data.py`、`scripts/record_market_data_wrapper.py`:官方 DataRecorder 行情录制与独立子进程生命周期管理；设计目标是只连行情、不发单、不查账户。**当前无法录到数据**：合约来源（交易前置查询）与“不连交易前置”的边界冲突，待决，详见 runbook「验收记录」。
+- `scripts/record_market_data.py`、`scripts/record_market_data_wrapper.py`:官方 DataRecorder 行情录制与独立子进程生命周期管理；连行情前置，并受限地连交易前置（仅认证+查合约，发单/撤单/查资金/查持仓在代码层硬性禁止）。**从未连接过真实前置，录制未验证**，详见 runbook「验收记录」与 ADR 修订。
 - `scripts/record_market_incremental.py`:DSH 调用的有界、可重入增量任务；通过锁、超时和结果状态文件保护定时补数。
 - `docs/runbook-market-recording.md`:行情录制、增量任务、离线检查与生命周期验收手册。
 - `scripts/import_minute.py`:购买的 DCE 分合约 1 分钟线 → 复权主力连续(日线/15 分钟/换月表,派生文件不入库)。

@@ -26,7 +26,7 @@
 | fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
 | import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
 | SCHED 增量调度 | PART | `scripts/record_market_incremental.py` 提供有界、可重入的 `fetch_data.py` 短任务；由 `@goodandready/dsh-cron@0.3.43` 调度，长期前台任务被生命周期闸门明确排除 |
-| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；**尚不能录到数据**：CTP 合约信息只来自交易前置查询，“只连行情前置”拿不到合约、tick 会被 vnpy_ctp 丢弃，合约来源方案待决（见 runbook「验收记录」）；从未连接过 SimNow/国信 |
+| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；合约信息只能从交易前置查询，故采用受限交易前置连接（仅认证+查合约，发单/查账户硬性禁止，见 ADR 修订）；**从未连接过 SimNow/国信，真实录制未验证** |
 
 ### 策略与研究
 | 节点 | 状态 | 证据 / 缺口 |
