@@ -16,6 +16,13 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 毕昇研究工作流收尾（不依赖 LLM 的部分；LLM 联调待模型有额度）：
+  - **服务端强制迭代上限**：滚动 `iteration.window_hours`（默认 24）小时内最多提交 `iteration.max_iterations`（默认 5）个候选，网关用提交账本 `submissions.jsonl` 计数，超限返回 429 并说明已用额度与何时释放；被 400/409 拒绝的提交不计数；账本损坏 fail-closed；`GET /research/data` 返回剩余额度。此前 `max_iterations` 是没有任何代码使用的空配置。毕昇里实测：第 6 个提交被拒，原因原样出现在节点失败信息里。
+  - **确定性中文报告**（`risk/report.py`）：各作业结果落盘带 `report`；网关 `view: "report"`（精炼 JSON）与 `view: "text"`（纯文本，供结果节点直接展示；出错仍返回 JSON）。
+  - **先看代码再批准**：`research_api.py review --strategy X` 显示带行号源码与静态筛查结果，只有输入 y 才批准；筛查不过不提问。
+  - **无 LLM 联调工作流** `tools/bisheng/build_v3_manual.py` + `run_v3_manual.py`（人输入文件名与源码 → 提交 → 本机 review 批准 → 选参+门槛评估 → 文本报告），以及 `check_retrieval.py`（知识库检索自检）；共用 helper `bsflow.py`。
+  - **v3 工作流修正**：写策略提示词此前**没有引用**「读最近失败反馈」节点的输出（v2 起的一次静默失败的替换），现已引用，并接入知识库检索节点（`invest-研究资料`）；提示词要求每个参数 5~7 个取值（3×3×3 只有 1 个内部格子，几乎选不出参数）、禁止 `{{#` 字样；`--model-id` 一键换模型。
+- **实测发现——毕昇变量替换只会改写源码里字面的 `{{#节点.变量#}}` 标记**（改成 `{节点.变量}`）；普通花括号（字典、f-string 双花括号）、引号、反斜杠、制表符、中文、多行逐字节不变。批准绑定的是网关实际存下的内容，安全性不受影响，但 LLM 若在代码/注释里写了该标记会被悄悄改写——到网关时已被改，网关拦不了，只能靠提示词禁止。
 - 研究网关**提交额度账本**（`scripts/research_gateway.py`，配置 `iteration.window_hours`，默认 24，范围 1–720）：滚动窗口内最多提交 `iteration.max_iterations` 个候选，由服务端强制，LLM 无法绕过；额度检查、写文件、记账在同一把锁内完成，记账失败则撤回候选文件；账本损坏 fail-closed（拒绝提交）；`/research/data` 回报已用额度与最早释放时间。请求可带 `view:"report"` 只取精炼回报（run_id/passed/status/report），非法取值在运行作业前即拒绝。
 - 确定性中文报告 `risk/report.py::render_report`：把 backtest/gate/evaluate 结果压成几行文字，纯函数、输入残缺也不抛异常、不做策略建议；每个作业结果附带 `report` 并落盘。此前 `research_api.py` 已导入该模块而文件未入库，现补齐。
 - 通知器**落盘待补发队列**（`notify/webhook.py`，环境变量 `WEBHOOK_OUTBOX`，默认 `data/state/webhook_outbox.jsonl`，`off` 关闭）：发送最终失败（如本机断网）的告警不再丢弃，写入 JSONL（临时文件 + fsync + 原子替换），网络恢复后由后台线程补发——FATAL/ERROR/WARN 按发生先后逐条补发并加「【补发】」前缀、保留原始时间；INFO 积压 ≥3 条合并成一条摘要（最多列 20 行）；条数上限（FATAL 优先保留）与存活期（默认 24 小时）；已知断网时新告警只试一次而不是空等约 34 秒；退出时内存队列里没发完的也落盘；进程重启后继续补发。起因：夜盘切断网络 240 秒的演练里，断网期间产生的「行情假死」「网关连接断开」告警恢复后也没有补发。已用真实 Telegram 验证。演练的送达统计改为如实报告实际发送/暂存/放弃/已补发/待补发条数；`drill.py` 场景跑完先落一份结果再进入退出阶段。

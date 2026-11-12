@@ -16,3 +16,14 @@ python build_v1.py
 python run_v1.py <flow_id> "研究想法"
 ```
 威胁模型与批准机制见 `docs/adr/20261112-research-sandbox-config-and-approval.md`。
+
+## v3 与无 LLM 联调（2026-11-12 新增）
+
+| 文件 | 作用 |
+|---|---|
+| `bsflow.py` | 节点构造共用 helper（`build_v1/v2/v3.py` 模块末尾直接调 `main()`，不可导入，新脚本统一用它） |
+| `build_v3.py` | 生成/更新 v3 工作流（想法→读失败反馈→检索研究资料→LLM 起名→LLM 写候选→提交→本机批准→选参+门槛评估）；`--update <flow_id>`，`--model-id <id>` 换模型 |
+| `build_v3_manual.py` / `run_v3_manual.py` | 不用 LLM 的联调版：人输入文件名与源码，`--rounds N` 连跑 N 轮（用来触发迭代上限）；运行脚本会核对到达网关的源码哈希，并用真实的 `research_api.py review`（stdin 输入 y）批准——**仅联调用**，日常应由人读完代码后手工批准 |
+| `check_retrieval.py` | 知识库检索自检（不用对话 LLM） |
+
+联调会占用迭代额度并留下候选与结果：测完请清理 `data/research/submissions.jsonl`、`data/research/*.json`、`data/research-control/approvals.json`（**保留 `gateway.token`**）与 `pending_strategies/` 下的测试候选——否则下一轮 LLM 会读到测试垃圾作为「最近失败反馈」。

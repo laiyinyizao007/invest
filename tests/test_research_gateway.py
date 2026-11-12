@@ -560,3 +560,45 @@ def test_view_report_keeps_strategy_error_status(tmp_path):
     out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "report"})[1]
 
     assert out["status"] == "strategy_error" and out["report"].startswith("策略运行报错")
+
+
+# ---------- view=text:纯文本报告(给毕昇结果节点直接展示,不显示成带 \n 转义的 JSON) ----------
+
+def test_view_text_returns_plain_text_with_the_run_id(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+
+    status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
+
+    assert status == 200 and isinstance(payload, gw.PlainText)
+    assert payload.startswith("结论: 未通过") and "run_id: r1" in payload
+
+
+def test_errors_stay_json_even_when_text_view_is_requested(tmp_path):
+    def boom(**kw):
+        raise api.JobError(api.EXIT_REFUSED, api.NEEDS_APPROVAL)
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=boom))
+
+    status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
+
+    assert status == 403 and isinstance(payload, dict) and "approve" in payload["error"]
+
+
+def test_server_sends_text_view_as_text_plain():
+    import threading
+    import urllib.request
+    app = make_app_for_server()
+    app.jobs = SimpleNamespace(evaluate_job=lambda **kw: dict(FULL))
+    server = gw.build_server(app, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/research/evaluate", method="POST",
+                                     data=json.dumps({"strategy": "a.py", "class": "C", "view": "text"}).encode("utf-8"),
+                                     headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+        resp = urllib.request.urlopen(req, timeout=5)
+        body = resp.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert resp.headers["Content-Type"].startswith("text/plain") and body.startswith("结论: 未通过")

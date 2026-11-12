@@ -114,14 +114,18 @@ def _lenient_int(value, name: str) -> int | None:
         raise rs.SandboxError(f"{name} 必须是整数") from exc
 
 
+class PlainText(str):
+    """标记「按 text/plain 原样输出」的响应体:毕昇工具节点的输出是整段响应文本,JSON 里的换行会显示成 \\n,人没法读。"""
+
+
 def _view(data: dict) -> str | None:
-    """可选的 view 字段:缺省/空串 = 完整结果;"report" = 只回精炼报告;其它一律拒绝(在运行任何作业之前)。"""
+    """可选的 view 字段:缺省/空串 = 完整结果;"report" = 只回精炼报告(JSON);"text" = 纯文本报告;其它一律拒绝(在运行任何作业之前)。"""
     value = data.get("view")
     if value is None or value == "":
         return None
-    if value != "report":
-        raise rs.SandboxError('view 只能是 "report"(或不填表示完整结果)')
-    return "report"
+    if value not in ("report", "text"):
+        raise rs.SandboxError('view 只能是 "report" 或 "text"(或不填表示完整结果)')
+    return value
 
 
 def _compact(result: dict) -> dict:
@@ -303,7 +307,13 @@ class GatewayApp:
     @staticmethod
     def _shape(outcome: tuple, view: str | None) -> tuple:
         status, payload = outcome
-        return (status, _compact(payload)) if status == 200 and view == "report" and isinstance(payload, dict) else outcome
+        if status != 200 or not isinstance(payload, dict):
+            return outcome                                   # 错误一律保持 JSON,调用方才能读到原因
+        if view == "report":
+            return status, _compact(payload)
+        if view == "text":
+            return status, PlainText(f"{payload.get('report', '')}\n\n(run_id: {payload.get('run_id', '?')})")
+        return outcome
 
     def _run_job(self, func, **kwargs):
         import research_api as api
@@ -407,9 +417,10 @@ def build_server(app: GatewayApp, host: str, port: int) -> ThreadingHTTPServer:
             limit = app.cfg["gateway"]["max_body_bytes"]
             body = self.rfile.read(length) if 0 < length <= limit else (b"x" * (limit + 1) if length > limit else b"")
             status, payload = app.handle(method, self.path, dict(self.headers.items()), body)
-            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            is_text = isinstance(payload, PlainText)
+            raw = (str(payload) if is_text else json.dumps(payload, ensure_ascii=False)).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", ("text/plain" if is_text else "application/json") + "; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)

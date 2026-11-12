@@ -104,3 +104,11 @@ def test_selection_window_with_non_string_items_does_not_break_the_whole_report(
 def test_random_entry_threshold_in_report_follows_the_gate_default():
     from risk.promotion_gate import GateThresholds
     assert f"门槛 {GateThresholds.min_random_percentile:.0f}%" in render_report(evaluate_result())
+
+
+def test_selection_note_is_not_repeated_when_it_is_already_a_failure_line():
+    note = "没有任何参数组合同时满足最少往返笔数与完整邻域,无法选参"
+    text = render_report({"kind": "evaluate", "passed": False, "params": None, "failures": ["无法选参: " + note],
+                          "selection": {"n_cells": 27, "valid_cells": 9, "on_plateau": False, "note": note}})
+
+    assert text.count(note) == 1 and "9/27" in text

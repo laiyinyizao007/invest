@@ -138,9 +138,10 @@
                   "view": {
                     "type": "string",
                     "enum": [
-                      "report"
+                      "report",
+                      "text"
                     ],
-                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
+                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回完整结果。出错时一律返回 JSON"
                   }
                 }
               }
@@ -198,9 +199,10 @@
                   "view": {
                     "type": "string",
                     "enum": [
-                      "report"
+                      "report",
+                      "text"
                     ],
-                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
+                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回完整结果。出错时一律返回 JSON"
                   }
                 }
               }
@@ -288,9 +290,10 @@
                   "view": {
                     "type": "string",
                     "enum": [
-                      "report"
+                      "report",
+                      "text"
                     ],
-                    "description": "填 report 则只返回 {run_id, passed, status, report}(精炼中文报告,体积小,适合直接展示);不填返回完整结果"
+                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回完整结果。出错时一律返回 JSON"
                   }
                 }
               }

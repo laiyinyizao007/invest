@@ -46,15 +46,17 @@ def _diagnosis_line(diagnosis: Any) -> str | None:
     return None
 
 
-def _selection_lines(selection: Any, params: Any) -> list[str]:
+def _selection_lines(selection: Any, params: Any, failures: Any = None) -> list[str]:
     if not isinstance(selection, dict):
         return []
     valid, total = selection.get("valid_cells"), selection.get("n_cells")
     lines = [f"选参: 在 {'~'.join(str(x) for x in (selection.get('window') or ['?', '?']))} 扫描 {valid}/{total} 个有效格子"
              + (f",选出 {_params(params)}" if params else ""),
              "参数高原: " + ("在高原上" if selection.get("on_plateau") else "不在高原上")]
-    if selection.get("note"):
-        lines.append(f"  {_clip(selection['note'])}")
+    note = selection.get("note")
+    # 选参说明常与「未通过的门槛」里的某一条一字不差（无法选参），重复展示只会增加噪音
+    if note and not any(str(f).endswith(str(note)) for f in (failures if isinstance(failures, list) else [])):
+        lines.append(f"  {_clip(note)}")
     return lines
 
 
@@ -88,7 +90,7 @@ def _render(r: dict) -> str:
         verdict = f"结论: 未通过({len(failures)} 项未过)" if failures else "结论: 未通过"
     lines = [f"{title}(类 {r.get('class', '?')})", verdict]
     if kind == "evaluate":
-        lines += _selection_lines(r.get("selection"), r.get("params"))
+        lines += _selection_lines(r.get("selection"), r.get("params"), failures)
     if metrics:
         lines.append(f"样本外: 夏普 {_num(metrics.get('oos_sharpe'))},往返 {metrics.get('round_trips', '?')} 笔,"
                      f"最大回撤 {_num(metrics.get('max_drawdown_pct'), '.1f')}%({_num(metrics.get('max_drawdown_yuan'), '.0f')} 元)")
