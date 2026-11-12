@@ -301,3 +301,17 @@ def build_from_dir(tmp_path, evs, out_dir):
     template = build_template(tmp_path / "template2.docx")
     outcome = br.build_report(template, out_dir, tmp_path / "out2.docx", ctx(), evs)
     return outcome, br.Docx(outcome.path)
+
+
+def test_fill_covers_prints_submitter_name_beside_signature_line(tmp_path):
+    doc = br.Docx(build_template(tmp_path / "template.docx"))
+    p = etree.SubElement(doc.body, br.P)
+    for text in ("提测方（签字/盖章(", "加盖骑缝章", ")）：      "):
+        r = etree.SubElement(p, br.R)
+        etree.SubElement(r, br.T).text = text
+    br.fill_covers(doc, ctx(submitter_name="测试员甲"))
+    assert "加盖骑缝章)）：（提测方姓名：测试员甲" in br.text_of(p)
+    p2 = etree.SubElement(doc.body, br.P)
+    etree.SubElement(etree.SubElement(p2, br.R), br.T).text = "提测方（签字/盖章(加盖骑缝章)）：  "
+    br.fill_covers(doc, ctx(submitter_name=""))
+    assert br.text_of(p2) == "提测方（签字/盖章(加盖骑缝章)）：  "

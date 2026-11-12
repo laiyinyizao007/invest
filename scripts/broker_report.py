@@ -505,6 +505,9 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
 def fill_covers(doc: Docx, ctx: ReportContext) -> None:
     replace_in_paragraphs(doc.body, "XXXX系统", f"{ctx.system_name}系统")
     replace_in_paragraphs(doc.body, "XXXX年XX月XX日", f"{ctx.report_date:%Y年%m月%d日}")
+    # 签字栏只打印提测方姓名方便对位,不代替手写签字/盖章
+    if ctx.submitter_name:
+        replace_in_paragraphs(doc.body, "加盖骑缝章)）：", f"加盖骑缝章)）：（提测方姓名：{ctx.submitter_name}，请在此处手写签名）")
 
 
 def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: ReportContext,
