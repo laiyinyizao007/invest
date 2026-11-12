@@ -20,6 +20,11 @@ import sys
 import warnings
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401  (保证工作目录与时区设置)
 
 import numpy as np

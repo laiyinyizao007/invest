@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import optimize  # noqa: E402  (内部会先 import bootstrap)
 

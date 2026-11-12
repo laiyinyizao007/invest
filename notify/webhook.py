@@ -29,9 +29,12 @@ MAX_DRAIN_TIMEOUT = 300.0
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
-    for secret in secrets:
-        if secret and len(secret) >= 4:      # 太短的字符串替换会误伤正常文本
-            text = text.replace(secret, "***")
+    """替换已知敏感值；长度不足 3 的值不替换，避免误伤普通文本。
+
+    长值优先替换，避免短密钥是长密钥前缀时留下后缀。
+    """
+    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
+        text = text.replace(secret, "***")
     return text
 
 

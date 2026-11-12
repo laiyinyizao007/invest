@@ -22,9 +22,12 @@ import os
 import sys
 from collections.abc import Mapping
 
-import bootstrap
+import sys
+from pathlib import Path
 
-from dotenv import load_dotenv
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import bootstrap
 
 from trading.guard_rule import ACCOUNT_RULE_NAME
 from trading.runtime import build_ctp_setting
@@ -107,7 +110,7 @@ def build_gui(env: Mapping[str, str], auto_connect: bool, subscribe: str = ""):
 
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None) -> int:
     if env is None:
-        load_dotenv(bootstrap.ROOT / ".env", override=False)
+        bootstrap.load_env()
         env = os.environ
     args = parse_args(argv, env)
     try:

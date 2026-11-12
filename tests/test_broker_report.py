@@ -9,8 +9,6 @@ import pytest
 from lxml import etree
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(0, str(ROOT / "tests"))
 
 import broker_evidence as be  # noqa: E402
 import broker_report as br  # noqa: E402

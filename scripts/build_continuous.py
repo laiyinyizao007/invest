@@ -23,6 +23,11 @@ import time
 import warnings
 from datetime import date
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap
 
 import pandas as pd

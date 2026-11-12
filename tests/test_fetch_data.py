@@ -5,7 +5,6 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import fetch_data  # noqa: E402  (内部会先 import bootstrap)
 from vnpy.trader.constant import Exchange, Interval  # noqa: E402

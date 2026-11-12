@@ -38,25 +38,19 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Callable
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap
+
+# 演练的状态目录与实盘完全分开，且必须早于 vn.py logger 导入。
+DRILL_ROOT = bootstrap.ROOT / ".vntrader_drill"
+ISOLATED = bootstrap.isolate_state(DRILL_ROOT.name)
 
 # scripts/ 目录里的模块(simnow_guard、run_headless)按同目录导入
 sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
-
-# 演练的状态目录与实盘完全分开:风控状态、策略数据、日志、数据库都写在这里。
-DRILL_ROOT = bootstrap.ROOT / ".vntrader_drill"
-DRILL_ROOT.mkdir(parents=True, exist_ok=True)
-
-# vn.py 4.5 **没有** SETTINGS["data_path"] 这个键 —— 设了也不起作用。
-# 真正决定落盘位置的是 vnpy.trader.utility 的 TEMP_DIR(在模块导入时按"当前目录下的 .vntrader"
-# 算一次,之后再改这个全局量才有效)。而日志目录(vnpy.trader.logger)与数据库路径
-# (vnpy_sqlite.sqlite_database)在**各自模块被导入时**就把路径算死了,所以必须:
-#   ① 在导入 vnpy_ctastrategy(它会连带导入 vnpy.trader.logger)之前改 TEMP_DIR;
-#   ② 在导入 trading.runtime(它会连带导入 vnpy_sqlite)之前改。
-# 否则演练的日志会写进实盘的 .vntrader/log —— 那正是"无人值守每日证据表"读的地方,
-# 演练的"已启动"会被当成实盘的启动次数,证据表直接失真。
-import vnpy.trader.utility as _vnpy_utility  # noqa: E402
-_vnpy_utility.TEMP_DIR = DRILL_ROOT
 
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType  # noqa: E402
 from vnpy.trader.event import EVENT_POSITION, EVENT_TICK, EVENT_TRADE  # noqa: E402
@@ -97,7 +91,7 @@ def risky_scenarios(names: list[str], td_address: str) -> list[str]:
     地址在这里**自己**归一化 —— 调用方忘了归一化时,白名单判断会失效
     (同一个地址的两种写法会得到不同的结论),那道闸门必须自己站得住。
     """
-    from simnow_guard import SIMNOW_TD_ADDRESSES, normalize_address
+    from ctp_tools.simnow import SIMNOW_TD_ADDRESSES, normalize_address
 
     if normalize_address(td_address) in SIMNOW_TD_ADDRESSES:
         return []
@@ -907,8 +901,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name:12s} {desc}")
         return 0
 
-    from dotenv import load_dotenv
-    load_dotenv(bootstrap.ROOT / ".env", override=False)
+    bootstrap.load_env()
     env = dict(os.environ)
 
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
@@ -925,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
-    from simnow_guard import SIMNOW_TD_ADDRESSES, check_simnow_address, normalize_address
+    from ctp_tools.simnow import SIMNOW_TD_ADDRESSES, check_simnow_address, normalize_address
 
     td_address = normalize_address(gateway_setting["交易服务器"])
     allowed, note = check_simnow_address(td_address, args.allow_any_address)

@@ -17,6 +17,11 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap
 
 import pandas as pd

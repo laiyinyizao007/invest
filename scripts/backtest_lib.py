@@ -1,6 +1,11 @@
 """回测封装:统一成本口径,并把 vn.py 静默吞掉的策略异常变成真正的报错。"""
 from datetime import datetime
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401  必须先于 vnpy 导入
 
 import pandas as pd

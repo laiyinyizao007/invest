@@ -22,6 +22,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401
 
 from lxml import etree
@@ -562,8 +567,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.evidence / "evidence.json").exists():
         print(f"证据目录里没有 evidence.json:{args.evidence}。请先运行 scripts/broker_test.py。", file=sys.stderr)
         return 2
-    from dotenv import load_dotenv
-    load_dotenv(bootstrap.ROOT / ".env", override=False)
+    bootstrap.load_env()
     info = None
     if not args.no_terminal_info and sys.platform == "win32":
         import collect_terminal_info

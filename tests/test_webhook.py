@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notify.webhook import WebhookNotifier, redact, redact_obj  # noqa: E402
 import notify.webhook as webhook_module  # noqa: E402
@@ -153,6 +152,10 @@ def test_secrets_are_redacted_everywhere(server):
 def test_short_secrets_are_not_replaced():
     assert redact("a 12 b", ["12"]) == "a 12 b"                    # 太短,替换会误伤正常文本
     assert redact("pw=abcd", ["abcd"]) == "pw=***"
+
+
+def test_three_character_secret_is_redacted_through_webhook_path():
+    assert redact("auth=abc", ["abc"]) == "auth=***"
 
 
 def test_extra_with_non_json_types_does_not_break_sending(server):

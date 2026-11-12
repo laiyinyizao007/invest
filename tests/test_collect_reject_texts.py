@@ -1,4 +1,5 @@
 """废单文本采集脚本的纯逻辑测试(不联网、不连 CTP)。"""
+import os
 import sys
 import threading
 import time
@@ -8,7 +9,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
 import collect_reject_texts as c  # noqa: E402  (内部会先 import bootstrap)
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType  # noqa: E402
@@ -409,8 +409,7 @@ def test_without_confirm_flag_it_refuses_to_run(monkeypatch, capsys):
 
 def test_missing_symbol_is_reported(monkeypatch, capsys):
     # 不加载真实的 .env(里面有 LIVE_VT_SYMBOL),也不去连 CTP
-    import dotenv
-    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **kw: None)
+    monkeypatch.setattr(c.bootstrap, "load_env", lambda: os.environ)
     monkeypatch.delenv("LIVE_VT_SYMBOL", raising=False)
     assert c.main(["--confirm-simnow"]) == 2
     assert "未指定合约" in capsys.readouterr().err

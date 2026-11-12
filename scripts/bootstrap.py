@@ -13,6 +13,11 @@
 import os
 import sys
 from pathlib import Path
+from collections.abc import Mapping
+
+
+_STATE_NAME = ""
+ISOLATED = False
 
 if "vnpy.trader.database" in sys.modules:
     raise RuntimeError("bootstrap 必须先于 vnpy.trader.database 导入,否则时区设置不会生效")
@@ -26,7 +31,37 @@ if str(ROOT) not in sys.path:
 
 os.environ["TZ"] = "CST-8"
 os.environ.setdefault("NO_PROXY", "*")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 from vnpy.trader.setting import SETTINGS  # noqa: E402
 
 SETTINGS["database.timezone"] = "Asia/Shanghai"
+
+
+def isolate_state(name: str) -> bool:
+    """将 vn.py 临时目录切换到项目根目录下的隔离目录。
+
+    必须在导入会加载 `vnpy.trader.logger` 的模块之前调用；返回值也会暴露
+    当前进程是否仍处于安全导入顺序，调用方可据此拒绝连接真实柜台。
+    """
+    global _STATE_NAME, ISOLATED
+    if not name or Path(name).name != name:
+        raise ValueError("隔离目录名必须是单层非空目录名")
+    state_root = ROOT / name
+    state_root.mkdir(parents=True, exist_ok=True)
+    from vnpy.trader import utility
+    utility.TEMP_DIR = state_root
+    _STATE_NAME = name
+    ISOLATED = "vnpy.trader.logger" not in sys.modules
+    return ISOLATED
+
+
+def load_env(env: Mapping[str, str] | None = None) -> Mapping[str, str]:
+    """加载项目 `.env`，保留调用进程已注入的环境变量优先级。"""
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env", override=False)
+    return os.environ if env is None else env

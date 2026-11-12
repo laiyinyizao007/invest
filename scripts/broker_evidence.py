@@ -12,6 +12,8 @@ import textwrap
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from notify.webhook import redact
+
 PASS, FAIL, SKIP, MANUAL = "PASS", "FAIL", "SKIP", "MANUAL"
 STATUS_LABEL = {PASS: "通过", FAIL: "未通过", SKIP: "未测试", MANUAL: "待人工"}
 STATUS_COLOR = {PASS: (34, 139, 34), FAIL: (200, 30, 30), SKIP: (120, 120, 120), MANUAL: (210, 120, 0)}
@@ -122,9 +124,8 @@ def render_shot(ev: Evidence, shot: Shot, path: Path, secrets: tuple[str, ...] =
 
 
 def _redact(text: str, secrets: tuple[str, ...]) -> str:
-    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
-        text = text.replace(secret, "***")
-    return text
+    """兼容旧内部调用；实际脱敏统一由 notify.webhook.redact 执行。"""
+    return redact(text, secrets)
 
 
 def render_all(evidences: list[Evidence], out_dir: Path, secrets: tuple[str, ...] = ()) -> bool:

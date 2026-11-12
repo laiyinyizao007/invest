@@ -16,7 +16,6 @@ import pytest
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.object import BarData
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import walk_forward_optimizer as wf  # noqa: E402  (内部会先 import bootstrap)
 

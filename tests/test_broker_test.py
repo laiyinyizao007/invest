@@ -1,4 +1,5 @@
 """国信取证运行器的步骤测试:假网关 + 同步事件引擎 + **真实**风控规则(不联网、不连 CTP)。"""
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -7,8 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(0, str(ROOT / "tests"))
 
 import broker_evidence as be  # noqa: E402
 import broker_test as bt  # noqa: E402
@@ -309,8 +308,7 @@ def test_main_refuses_without_confirmation_and_for_production(monkeypatch, capsy
     env = {"CTP_USERNAME": "u", "CTP_PASSWORD": "pw_secret_1", "CTP_BROKER_ID": "8030", "CTP_TD_ADDRESS": "10.0.0.1:1",
            "CTP_MD_ADDRESS": "10.0.0.1:2", "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2", "LIVE_VT_SYMBOL": "c2701.DCE",
            "CTP_ENVIRONMENT": "测试"}
-    import dotenv
-    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)       # 不能让仓库里真实的 .env 补全被 delenv 的变量
+    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert bt.main([]) == bt.EXIT_CONFIG and "--confirm-broker-test" in capsys.readouterr().err
@@ -347,8 +345,7 @@ def test_final_safety_is_quiet_when_clean_and_never_raises(env):
 
 
 def test_main_refuses_to_connect_when_state_isolation_did_not_take_effect(monkeypatch, capsys):
-    import dotenv
-    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
     for k, v in {"CTP_USERNAME": "u", "CTP_PASSWORD": "pw_secret_1", "CTP_BROKER_ID": "8030", "CTP_TD_ADDRESS": "10.0.0.1:1",
                  "CTP_MD_ADDRESS": "10.0.0.1:2", "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2",
                  "LIVE_VT_SYMBOL": "c2701.DCE", "CTP_ENVIRONMENT": "测试"}.items():

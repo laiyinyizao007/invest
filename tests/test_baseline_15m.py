@@ -9,7 +9,6 @@ import pytest
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.object import BarData
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import optimize_15m as o  # noqa: E402  (内部会先 import bootstrap)
 from backtest_lib import load_bars_csv, run_backtest_bars, run_engine_bars  # noqa: E402

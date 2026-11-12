@@ -3,7 +3,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
 import drill as d  # noqa: E402
 from simnow_guard import SIMNOW_TD_ADDRESSES, check_simnow_address, is_simnow_address  # noqa: E402

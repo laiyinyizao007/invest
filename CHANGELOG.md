@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 ### Changed（变更）
+- Batch B 脚本层整理(Issue [#12](https://github.com/laiyinyizao007/invest/issues/12)):统一 `notify.webhook.redact` 脱敏实现，新增 `bootstrap.isolate_state()`/`load_env()`，并将 CTP 采集与穿透测试的可复用逻辑真正下沉至 `ctp_tools/`，两个 CLI 现在直接使用共享实现；用 `pyproject.toml` 统一测试导入路径。交易日历仍保留在后续 Batch D。
+
 - PROJECTWIKI 拆分与瘦身(Issue [#7](https://github.com/laiyinyizao007/invest/issues/7)):876 行 → 299 行。
   原 §2.2/§2.4/§2.5 迁至 `docs/roadmap.md`(编号沿用,另增 §2.6 新增规划位与 §2.7 已处理技术债归档);原 §2.3 迁至
   `docs/methodology-mapping.md`(25 行扩充到 34 行,新增「研究文档的矛盾与证据强度」一节给出本项目采纳口径);

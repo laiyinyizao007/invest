@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from risk.account_guard import AccountGuard, AccountLimits, trading_day  # noqa: E402
 from risk.order_policy import (  # noqa: E402

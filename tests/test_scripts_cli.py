@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(0, str(ROOT / "tests"))
 
 import run_headless  # noqa: E402  (内部会先 import bootstrap)
 import unlock_account  # noqa: E402

@@ -27,6 +27,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap
 
 sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
@@ -38,8 +43,9 @@ from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_TICK
 from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest  # noqa: E402
 from vnpy.trader.utility import round_to  # noqa: E402
 
-from collect_reject_texts import Collector, check_positions, close_engine, in_trading_session  # noqa: E402
-from simnow_guard import is_simnow_address, normalize_address  # noqa: E402
+from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session  # noqa: E402
+from notify.webhook import redact  # noqa: E402
+from ctp_tools.simnow import is_simnow_address, normalize_address  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
 
 REPORT_DIR = bootstrap.ROOT / "data" / "penetration"
@@ -69,257 +75,15 @@ MILESTONE_LABELS = {
 FAILURE_MARKERS = ("授权验证失败", "交易服务器登录失败", "行情服务器登录失败")
 
 
-@dataclass
-class Step:
-    name: str
-    status: str          # PASS / FAIL / WARN / SKIP
-    detail: str = ""
-    seconds: float = 0.0
+from ctp_tools.penetration import (
+    Run, check_target, do_order_cancel, failure_lines, limit_down_price, mask_account,
+    milestone_status, package_version, render_report, run_checks as _run_checks,
+    trade_connected, wait_milestones,
+)
 
 
-@dataclass
-class Run:
-    steps: list[Step] = field(default_factory=list)
-    secrets: tuple[str, ...] = ()   # 控制台输出也要脱敏(CTP 错误文本可能带账号)
-
-    def add(self, name: str, status: str, detail: str = "", seconds: float = 0.0) -> Step:
-        step = Step(name, status, detail, seconds)
-        self.steps.append(step)
-        shown = redact(detail, list(self.secrets))
-        print(f"  [{status}] {name}" + (f":{shown}" if shown else ""))
-        return step
-
-    def failed(self) -> bool:
-        return any(s.status == "FAIL" for s in self.steps)
-
-
-def check_target(environment: str, td_address: str, confirmed: bool) -> tuple[bool, str]:
-    """目标环境闸门。返回 (是否放行, 说明)。生产 API 没有任何强制放行的出口。"""
-    if not confirmed:
-        return False, "未加 --confirm-broker-test。本脚本会连接并发出测试委托,请确认目标是期货公司的测试环境。"
-    address = normalize_address(td_address)
-    if environment == "测试":
-        return True, f"目标:期货公司看穿式测试环境(柜台环境=测试),交易前置 {address}。"
-    if is_simnow_address(address):
-        return True, f"目标:SimNow 预演(交易前置 {address})。注意:SimNow 不等于期货公司的穿透测试。"
-    return False, (f"柜台环境={environment!r} 且交易前置 {address} 不是 SimNow 地址:这是**生产 API**,"
-                   "穿透测试只能连看穿式测试环境。请把 .env 的 CTP_ENVIRONMENT 改为「测试」并填测试前置地址。")
-
-
-def redact(text: str, secrets: list[str]) -> str:
-    """把已知敏感值替换为 ***(长度不足 3 的值不替换,避免把普通字符误伤成一片星号)。"""
-    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
-        text = text.replace(secret, "***")
-    return text
-
-
-def mask_account(account: str) -> str:
-    """账号只保留头 2 位与尾 2 位;长度 < 8 的短账号全部掩码(保留比例过高等于没脱敏)。"""
-    if len(account) < 8:
-        return "*" * len(account)
-    return account[:2] + "*" * (len(account) - 4) + account[-2:]
-
-
-def milestone_status(log_lines: list[str]) -> dict[str, bool]:
-    """从网关日志里判断各里程碑是否出现。"""
-    return {key: any(text in line for line in log_lines) for key, text in MILESTONES}
-
-
-def failure_lines(log_lines: list[str]) -> list[str]:
-    return [line for line in log_lines if any(m in line for m in FAILURE_MARKERS)]
-
-
-def limit_down_price(limit_down: float, pricetick: float, last_price: float = 0.0) -> float:
-    """跌停价对齐最小变动价位;拿不到跌停价、或它不低于最新价(无涨跌停/异常值)时返回 0,由调用方跳过报单。"""
-    if limit_down <= 0 or (last_price > 0 and limit_down >= last_price):
-        return 0.0
-    return round_to(limit_down, pricetick) if pricetick > 0 else limit_down
-
-
-def render_report(run: Run, meta: dict[str, str], log_lines: list[str], secrets: list[str]) -> str:
-    lines = [
-        "# 看穿式监管测试演练报告", "",
-        f"- 时间:{meta['time']}",
-        f"- 目标:{meta['target']}",
-        f"- 账号:{meta['account']}",
-        f"- 合约:{meta['symbol']}",
-        f"- 软件:vn.py {meta['vnpy']} / vnpy_ctp {meta['vnpy_ctp']} / Python {meta['python']}",
-        f"- 终端:{meta['host']}", "",
-        "## 步骤结果", "",
-        "| 步骤 | 结果 | 说明 | 耗时(s) |", "|---|---|---|---|",
-    ]
-    for s in run.steps:
-        lines.append(f"| {s.name} | {s.status} | {redact(s.detail, secrets) or '-'} | {s.seconds:.1f} |")
-    lines += ["", "## 网关日志(已脱敏)", "", "```"]
-    lines += [redact(line, secrets) for line in log_lines]
-    lines += ["```", ""]
-    return "\n".join(lines)
-
-
-def package_version(name: str) -> str:
-    try:
-        from importlib.metadata import version
-        return version(name)
-    except Exception:
-        return "未装"
-
-
-def wait_milestones(collector: Collector, timeout: float) -> tuple[dict[str, bool], list[str]]:
-    """等到全部里程碑出现、出现失败日志或超时。返回 (里程碑状态, 失败日志)。"""
-    deadline = time.monotonic() + timeout
-    while True:
-        with collector.lock:
-            lines = list(collector.log_lines)
-        status = milestone_status(lines)
-        failures = failure_lines(lines)
-        if all(status.values()) or failures or time.monotonic() >= deadline:
-            return status, failures
-        time.sleep(0.5)
-
-
-def do_order_cancel(run: Run, main_engine, collector: Collector, contract, tick) -> int:
-    """跌停价买单 + 立即撤单。返回 EXIT_* 码(EXIT_POSITION 表示意外成交)。"""
-    price = limit_down_price(float(getattr(tick, "limit_down", 0) or 0), contract.pricetick,
-                             float(getattr(tick, "last_price", 0) or 0))
-    if price <= 0:
-        run.add("报单/撤单", "SKIP", "Tick 里没有可信的跌停价(缺失或不低于最新价),无法构造不易成交的委托")
-        return EXIT_OK
-    req = OrderRequest(symbol=contract.symbol, exchange=contract.exchange, direction=Direction.LONG,
-                       type=OrderType.LIMIT, volume=1, price=price, offset=Offset.OPEN, reference="penetration")
-    t0 = time.monotonic()
-    vt_orderid = main_engine.send_order(req, "CTP")
-    if not vt_orderid:
-        run.add("报单", "FAIL", "send_order 没有返回委托号(请求发送失败)", time.monotonic() - t0)
-        return EXIT_STEP_FAILED
-    order = None
-    while time.monotonic() - t0 < 10:
-        order = collector.order_of(vt_orderid)
-        if order and order.status != Status.SUBMITTING:
-            break
-        time.sleep(0.1)
-    if order is not None and order.status == Status.REJECTED:
-        run.add("报单", "FAIL", f"委托被拒绝(价格 {price})", time.monotonic() - t0)
-        return EXIT_STEP_FAILED
-    if order is None or order.status == Status.SUBMITTING:
-        # 回报只是慢,委托随后仍可能进入交易所:照样发撤单,不能因为"没看到回报"就放着不管
-        run.add("报单", "FAIL", f"10 秒内没有收到委托回报({vt_orderid}),已尝试撤单兜底", time.monotonic() - t0)
-        cancel_req = (order.create_cancel_request() if order is not None else
-                      CancelRequest(orderid=vt_orderid.split(".", 1)[-1], symbol=contract.symbol,
-                                    exchange=contract.exchange))
-        main_engine.cancel_order(cancel_req, "CTP")
-        collector.wait_order_final(vt_orderid, timeout=10.0)
-        return EXIT_STEP_FAILED
-    run.add("报单", "PASS", f"跌停价买 1 手 @ {price},状态 {order.status.value}", time.monotonic() - t0)
-
-    if order.is_active():
-        t1 = time.monotonic()
-        main_engine.cancel_order(order.create_cancel_request(), "CTP")
-        final = collector.wait_order_final(vt_orderid, timeout=10.0)
-        # 先判成交再判撤单:"部分成交后撤单成功"状态是 CANCELLED,但已经留下了持仓
-        if final is not None and final.traded > 0:
-            run.add("撤单", "FAIL", f"委托已成交 {final.traded} 手(状态 {final.status.value}),留下了持仓",
-                    time.monotonic() - t1)
-            return EXIT_POSITION
-        if final is not None and final.status == Status.CANCELLED:
-            run.add("撤单", "PASS", "委托已撤销", time.monotonic() - t1)
-        else:
-            run.add("撤单", "FAIL", f"10 秒内没有确认撤销(状态 {final.status.value if final else '无回报'})"
-                    f"——委托可能仍挂在柜台,请立即人工撤单", time.monotonic() - t1)
-    elif order.traded > 0:
-        run.add("撤单", "FAIL", f"委托已成交 {order.traded} 手,留下了持仓")
-        return EXIT_POSITION
-    return EXIT_OK
-
-
-def trade_connected(main_engine) -> bool:
-    """交易通道是否仍在线。vnpy_ctp 断线只清 login_status、不清 connect_status,
-    所以不能沿用 check_positions 返回的 connected(它读 connect_status,断线后仍为 True)。"""
-    td_api = getattr(main_engine.get_gateway("CTP"), "td_api", None)
-    return bool(getattr(td_api, "login_status", False))
-
-
-def run_checks(args, symbol: str, main_engine, collector: Collector,
-               secrets: tuple[str, ...] = ()) -> tuple[Run, int]:
-    run = Run(secrets=tuple(secrets))
-    t0 = time.monotonic()
-    status, failures = wait_milestones(collector, args.connect_timeout)
-    elapsed = time.monotonic() - t0
-    with collector.lock:
-        disconnects = [line for line in collector.log_lines if "连接断开" in line]
-    timeout_note = f"{args.connect_timeout:.0f} 秒内未出现"
-    if disconnects:
-        timeout_note += f"(最近一次断开:{disconnects[-1]};4097 排查见 docs/runbook-simnow.md §8)"
-    for key, _text in MILESTONES:
-        run.add(MILESTONE_LABELS[key], "PASS" if status[key] else "FAIL",
-                "" if status[key] else (failures[-1] if failures else timeout_note), elapsed)
-    if failures or not (status["td_login"] and status["contracts"]):
-        return run, EXIT_LOGIN
-
-    if not trade_connected(main_engine):
-        run.add("交易通道在线", "FAIL", "里程碑已出现但交易通道当前已断开(见网关日志里的「连接断开」),后续查询不可信")
-        return run, EXIT_LOGIN
-
-    contract = collector.contract_of(symbol)
-    if contract is None:
-        run.add("合约存在", "FAIL", f"合约表里没有 {symbol}")
-        return run, EXIT_STEP_FAILED
-    run.add("合约存在", "PASS", f"{symbol},最小变动 {contract.pricetick},单笔上限 {contract.max_volume}")
-
-    main_engine.subscribe(SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange), "CTP")
-    t1 = time.monotonic()
-    tick = None
-    while time.monotonic() - t1 < args.tick_timeout:
-        tick = collector.tick_of(symbol)
-        if tick is not None:
-            break
-        time.sleep(0.5)
-    in_session = in_trading_session(datetime.now())
-    if tick is not None:
-        run.add("订阅行情", "PASS", f"收到 Tick,最新价 {tick.last_price}", time.monotonic() - t1)
-    elif in_session:
-        run.add("订阅行情", "FAIL", f"交易时段内 {args.tick_timeout:.0f} 秒没有收到 Tick", time.monotonic() - t1)
-    else:
-        run.add("订阅行情", "WARN", "非交易时段,没有 Tick(请在交易时段补测)", time.monotonic() - t1)
-
-    t2 = time.monotonic()
-    gateway = main_engine.get_gateway("CTP")
-    try:
-        gateway.query_account()
-    except Exception:
-        pass
-    while time.monotonic() - t2 < 10 and not main_engine.get_all_accounts():
-        time.sleep(0.5)
-    accounts = main_engine.get_all_accounts()
-    run.add("查询账户", "PASS" if accounts else "FAIL",
-            "已收到账户资金回报" if accounts else "10 秒内没有收到账户资金回报", time.monotonic() - t2)
-
-    t3 = time.monotonic()
-    positions, _ = check_positions(main_engine, symbol, wait=args.position_wait, early_exit=False)
-    connected = trade_connected(main_engine)
-    if not connected:
-        run.add("查询持仓", "FAIL", "交易连接已断开,查询结果不可信", time.monotonic() - t3)
-    else:
-        run.add("查询持仓", "PASS", f"当前持仓 {len(positions)} 项", time.monotonic() - t3)
-
-    code = EXIT_OK
-    if args.with_order:
-        if not in_session:
-            run.add("报单/撤单", "SKIP", "非交易时段,报单会被拒绝,请在交易时段补测")
-        elif tick is None:
-            run.add("报单/撤单", "SKIP", "没有 Tick,无法取跌停价")
-        else:
-            code = do_order_cancel(run, main_engine, collector, contract, tick)
-            after, _ = check_positions(main_engine, symbol, wait=args.position_wait, early_exit=False)
-            ok = trade_connected(main_engine)
-            if after:
-                run.add("收尾持仓检查", "FAIL", f"发现持仓 {len(after)} 项,请立即人工核对并平仓")
-                code = EXIT_POSITION
-            elif not ok:
-                run.add("收尾持仓检查", "WARN", "连接已断开,无法确认是否留下持仓,请人工核对")
-    else:
-        run.add("报单/撤单", "SKIP", "未加 --with-order")
-    return run, code
-
+def run_checks(args, symbol, main_engine, collector, secrets=()):
+    return _run_checks(args, symbol, main_engine, collector, secrets, in_trading_session)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -335,8 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
 
-    from dotenv import load_dotenv
-    load_dotenv(bootstrap.ROOT / ".env", override=False)
+    bootstrap.load_env()
     env = os.environ
 
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")

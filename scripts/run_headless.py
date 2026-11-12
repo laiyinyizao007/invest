@@ -25,13 +25,16 @@ import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-import bootstrap
+import sys
+from pathlib import Path
 
-from dotenv import load_dotenv
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import bootstrap
 
 from notify.webhook import WebhookNotifier
 from risk.live_admission import APPROVAL_RELATIVE, check_live_admission
-from simnow_guard import is_simnow_address
+from ctp_tools.simnow import is_simnow_address
 from trading.runtime import EXIT_OK, RuntimeConfig, TradingRuntime, build_ctp_setting
 
 
@@ -84,7 +87,7 @@ def main(
     approval_path: Path | None = None,
 ) -> int:
     if env is None:
-        load_dotenv(bootstrap.ROOT / ".env", override=False)     # 已存在的环境变量(如 Docker 注入)优先
+        bootstrap.load_env()     # 已存在的环境变量(如 Docker 注入)优先
         env = os.environ
     args = parse_args(argv, env)
 

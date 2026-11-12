@@ -28,20 +28,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap
 
-sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
-
-# 隔离状态目录(做法同 drill.py):日志、风控状态都落在这里。vnpy 的日志目录在 vnpy.trader.logger 导入时就算死了,
-# 所以必须在导入任何 vnpy 模块之前改 TEMP_DIR,否则取证的日志会写进实盘的 .vntrader/log(无人值守证据表读的地方)。
+# 隔离必须发生在任何会导入 vn.py logger 的模块之前。
 BT_ROOT = bootstrap.ROOT / ".vntrader_brokertest"
-BT_ROOT.mkdir(parents=True, exist_ok=True)
-import vnpy.trader.utility as _vnpy_utility  # noqa: E402
+ISOLATED = bootstrap.isolate_state(BT_ROOT.name)
 
-_vnpy_utility.TEMP_DIR = BT_ROOT
-# 隔离是否真的生效:若此刻 vnpy.trader.logger 已被导入,日志目录已经算死在原来的位置——取证日志会写进实盘目录。
-# 作为脚本运行时这里一定是 True(bootstrap 只导入 setting);被别的模块(如测试)导入时可能是 False,此时 main() 拒绝真连接。
-ISOLATED = "vnpy.trader.logger" not in sys.modules
+sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
 
 from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status  # noqa: E402
@@ -54,9 +52,10 @@ import pause_trading  # noqa: E402
 from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_evidence,
 )
-from collect_reject_texts import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
-from penetration_check import (  # noqa: E402
-    MILESTONE_LABELS, MILESTONES, Run, check_target, do_order_cancel, mask_account, redact, wait_milestones,
+from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
+from ctp_tools.penetration import (  # noqa: E402
+    MILESTONE_LABELS, MILESTONES, Run, check_target, do_order_cancel, limit_down_price, mask_account, redact,
+    wait_milestones,
 )
 from trading.events import EVENT_GUARD_ALERT  # noqa: E402
 from trading.guard_rule import ACCOUNT_RULE_NAME  # noqa: E402
@@ -172,7 +171,6 @@ def limit_price(ctx: Ctx, which: str = "down") -> float:
     tick = ctx.tick
     if tick is None or ctx.contract is None:
         return 0.0
-    from penetration_check import limit_down_price
     return limit_down_price(float(getattr(tick, "limit_down", 0) or 0), ctx.contract.pricetick, float(getattr(tick, "last_price", 0) or 0))
 
 
@@ -754,8 +752,7 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
 
-    from dotenv import load_dotenv
-    load_dotenv(bootstrap.ROOT / ".env", override=False)
+    bootstrap.load_env()
     env = os.environ
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
     if not symbol:

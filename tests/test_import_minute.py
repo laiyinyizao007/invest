@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import import_minute as im  # noqa: E402  (内部会先 import bootstrap)
 from build_continuous import build_continuous  # noqa: E402

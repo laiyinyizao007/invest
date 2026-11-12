@@ -29,6 +29,11 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401  必须先于 vnpy 导入
 
 import pandas as pd

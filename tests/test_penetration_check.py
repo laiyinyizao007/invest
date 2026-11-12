@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
 
 import penetration_check as pc  # noqa: E402  (内部会先 import bootstrap)
 from collect_reject_texts import Collector  # noqa: E402

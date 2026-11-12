@@ -24,6 +24,11 @@ import os
 import sys
 import time
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401  必须先于 vnpy.trader.database 导入
 
 import akshare as ak

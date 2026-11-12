@@ -9,8 +9,6 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "scripts"))
-sys.path.insert(0, str(ROOT / "tests"))
 
 import unlock_account  # noqa: E402
 from risk.account_guard import UNLOCK_HISTORY_LIMIT, AccountGuard, AccountLimits  # noqa: E402

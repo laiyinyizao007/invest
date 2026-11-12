@@ -7,7 +7,6 @@ import numpy as np
 from vnpy.trader.constant import Exchange, Interval, Offset
 from vnpy.trader.object import BarData
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from backtest_lib import run_backtest_bars, run_engine_bars  # noqa: E402
 from strategies.intraday_demo_strategy import IntradayDemoStrategy  # noqa: E402

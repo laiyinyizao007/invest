@@ -18,6 +18,11 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import bootstrap  # noqa: F401
 
 from risk.account_guard import AccountGuard, AccountLimits

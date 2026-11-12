@@ -1,5 +1,15 @@
 # 架构总图:分层、状态归属、隔离机制与已知局限台账
 
+## Batch B 脚本层整理（Issue #12）
+
+- `scripts/bootstrap.py` 是脚本入口的环境与 vn.py 状态边界；需要隔离状态的入口在导入 vn.py 日志模块前调用 `isolate_state()`。
+- `ctp_tools/collector.py` 与 `ctp_tools/penetration.py` 只承载可复用的 CTP 采集、持仓检查、穿透式测试逻辑，不包含 CLI 入口；连接环境闸门仍由 `scripts/collect_reject_texts.py` 与 `scripts/penetration_check.py` 负责。
+- `notify.webhook.redact()` 是统一脱敏实现，最短替换长度为 3 个字符，长值优先替换。
+- 测试通过 `pyproject.toml` 的 `pythonpath` 统一加载项目根目录、`scripts` 和 `tests`，不再在测试文件中手工注入路径。
+
+> 交易日历与统一交易时段表不属于本批，保留在后续 Batch D；本批不改变 `trading/runtime.py` 与 `risk/account_guard.py` 的交易日边界逻辑。
+
+
 > 本页是 `PROJECTWIKI.md` §2 的补充:wiki §2.1 画"数据怎么流",这里画**代码怎么分层、磁盘状态归谁、哪些东西不能碰、哪些局限还没解决**。
 > 事实来源:2026-11-11 的架构审视(import 图逐文件核对)。目标架构与规划位见 `docs/roadmap.md`。
 
@@ -12,7 +22,7 @@
 ### 数据层
 | 节点 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| bootstrap | IMPL | `scripts/bootstrap.py`(导入副作用:工作目录、`TZ`、`.vntrader`);`isolate_state()`/`load_env()` 尚未抽成 |
+| bootstrap | IMPL | `scripts/bootstrap.py`(工作目录、`TZ`、`.vntrader`);提供 `isolate_state()` 与 `load_env()`，入口按需在 vn.py 日志导入前调用 |
 | fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
 | import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
 | SCHED 增量调度 | PLAN | 无 cron / 计划任务 |
