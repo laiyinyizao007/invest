@@ -406,3 +406,27 @@ def test_book_redacts_summary_and_shot_lines_at_add_time():
     book.add("P1.1", be.PASS, "密码 pw_secret_1 泄露了", [be.Shot("", ["auth pw_secret_1 ok"])], "t")
     ev = book.items["P1.1"]
     assert ev.summary == "密码 *** 泄露了" and ev.shots[0].lines == ["auth *** ok"]
+
+
+# ---------- 连接环境留痕 ----------
+
+SETTING = {"用户名": "user_secret_9", "密码": "pw_secret_1", "经纪商代码": "8030", "交易服务器": "10.0.0.1:41205",
+           "行情服务器": "10.0.0.1:41213", "产品名称": "client_product_1.0", "授权编码": "auth_secret_2", "柜台环境": "测试"}
+
+
+def test_connection_info_records_fronts_and_broker_but_no_secrets():
+    info = bt.connection_info(SETTING, now=datetime(2026, 11, 12, 21, 0))
+    assert info["trade_front"] == "10.0.0.1:41205" and info["market_front"] == "10.0.0.1:41213"
+    assert info["broker_id"] == "8030" and info["environment"] == "测试" and info["at"] == "2026-11-12T21:00:00"
+    dumped = str(info)
+    for secret in ("user_secret_9", "pw_secret_1", "auth_secret_2", "client_product_1.0"):
+        assert secret not in dumped
+    assert info["app_id"] and info["app_id"] != SETTING["产品名称"]       # 只留掩码,足以区分不同产品名
+
+
+def test_save_connection_info_appends_one_entry_per_run(tmp_path):
+    be.save_connection_info(tmp_path, {"at": "a"})
+    be.save_connection_info(tmp_path, {"at": "b"})                       # --resume 的多次运行都要留痕
+
+    import json
+    assert [r["at"] for r in json.loads((tmp_path / "connection.json").read_text(encoding="utf-8"))] == ["a", "b"]

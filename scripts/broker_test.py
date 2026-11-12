@@ -50,7 +50,7 @@ from vnpy.trader.utility import round_to  # noqa: E402
 
 import pause_trading  # noqa: E402
 from broker_evidence import (  # noqa: E402
-    FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_evidence,
+    FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
 from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
 from ctp_tools.penetration import (  # noqa: E402
@@ -738,6 +738,18 @@ def print_summary(evs: list[Evidence]) -> None:
         print(f"\n{len(missing)} 项不是「通过」:SKIP 的在交易时段用 --resume 补测;MANUAL 的需人工演练;FAIL 的先排查。")
 
 
+def connection_info(setting: dict, now: datetime | None = None) -> dict:
+    """本次连接的环境事实。不含用户名/密码/授权编码;AppID 只留掩码。"""
+    return {
+        "at": (now or datetime.now()).isoformat(timespec="seconds"),
+        "environment": setting["柜台环境"],
+        "trade_front": setting["交易服务器"],
+        "market_front": setting["行情服务器"],
+        "broker_id": setting["经纪商代码"],
+        "app_id": mask_account(setting["产品名称"]),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--symbol", default="", help="测试合约,如 c2701.DCE(默认取 .env 的 LIVE_VT_SYMBOL)")
@@ -805,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
     event_engine.register(EVENT_GUARD_ALERT, lambda e: ctx.alerts.append(e.data))
     event_engine.register(EVENT_TRADE, lambda e: ctx.trades.append(e.data))
 
+    started_at = datetime.now()
     print(f"连接 {symbol}(账号 {mask_account(env.get('CTP_USERNAME', ''))})...")
     main_engine.connect(setting, "CTP")
     book = Book(clean=ctx.clean)
@@ -823,6 +836,7 @@ def main(argv: list[str] | None = None) -> int:
     evidences = merge_evidence(load_evidence(out_dir) if args.resume else {}, book.list())
     cjk = render_all(evidences, out_dir, secrets)
     save_evidence(out_dir, evidences)
+    save_connection_info(out_dir, connection_info(setting, started_at))
     if not cjk:
         print("⚠ 没找到支持中文的字体(msyh.ttc/simhei.ttf),证据图里的中文会显示为方框;可设环境变量 BROKER_REPORT_FONT 指定字体。", file=sys.stderr)
     for note in notes:

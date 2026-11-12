@@ -262,14 +262,14 @@ flowchart TB
 | `parameter_on_plateau` 的计算来源 | 优化器输出 → `risk/promotion_gate.py::CandidateMetrics.parameter_on_plateau` 的调用方 | 与「参数平原卷积」同触发;在此之前该项由人工判断 | `docs/adr/20261111-discipline-enforcement.md` 已知局限 |
 | 周期性 `ReqQryOrder` 对账 | `trading/runtime.py` 定时查询委托,与本会话委托号对账,补上外部终端下单的检测 | runbook 第 5 节第 11 项实测发现收不到外部会话的委托回报 | 同上 ADR(codex 审查 H1) |
 | 非策略委托白名单扩展 | `trading/guard_rule.py::STRATEGY_REF_PREFIX` 由单个前缀扩为集合(`AlgoTrading_`/`SpreadTrading_`) | 无头路径启用算法单/价差应用 | 同上 ADR |
-| 测试段使用次数持久化 | `walk_forward_optimizer.py`/`optimize*.py` 的 `--test` 写入使用记录,重复使用即拒绝 | 第二个候选需要用到测试段之前 | §4「测试段只看一次靠人工纪律」 |
+| 测试段使用次数持久化 — **已落地(2026-11-12)** | `scripts/segment_ledger.py` + 入库登记 `config/test_segment_usage.json`;`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复即拒绝;15 分钟基准测试段已补登记。`walk_forward_optimizer.py` 无 `--test`,不适用 | — | §4「测试段只看一次靠人工纪律」 |
 | 批量撤单入口(国信 5.2,选测) | 操作员入口(类似 `pause_trading.py`,请求文件由运行时消费)撤销全部未成交开仓单 | 国信要求该选测项,或需要应急一键撤单时 | `docs/adr/20261111-broker-test-compliance.md` |
 | 连接断开的全自动演练(国信 2.1) | `scripts/broker_test.py` 中程序化断开交易连接并断言告警与恢复 | 取证运行器已落地(Issue #9),现为半自动(`--interactive` 提示操作者断网/恢复);全自动需可靠的断连注入手段 | 同上 |
 | 紧急平仓失败态的恢复与限频提醒;持仓模式做成显式启动不变量 | `trading/guard_rule.py` 失败态继续观察持仓,确认空仓后发 `flat=True`、限频重复 FATAL;`RuntimeConfig` 增持仓模式并在启动时核对 | SimNow 实测出账户形态结论之后;涉及紧急平仓状态机(实盘安全路径) | codex 审查 2026-11-11,见 `docs/adr/20261109-account-risk-lock.md` |
 | 脚本层去重:PART — 共享实现已下沉并由两个 CLI 使用；函数拆分与脚本间通知依赖仍待后续整理 | 新包 `ctp_tools/`(位于 `scripts/` 之外),`bootstrap.py` 增 `isolate_state(name)`(含 `ISOLATED` 自检,`drill.py` 同样获得)与 `load_env()` | 下一批重构(Issue 另开);剩余违例见 `docs/architecture.md` §1 | 架构审视 2026-11-11 |
 | 统一交易时段表(`risk/sessions.py`) | 取代 4 处各自定义的时段;与交易日历 CAL 合并 | SimNow 实测完成后;涉及 `runtime.py`/`account_guard.py` 实盘路径 | 同上 |
 | `scripts/` 分子目录(data/research/ops/broker) | 重组目录并同步 README、runbook、Dockerfile、测试导入 | 共享包与去重完成之后最后做 | 同上 |
-| 取证证据里记录前置地址与 BrokerID | `scripts/broker_test.py` 把本次连接的交易/行情前置地址、BrokerID、AppID 写进 `evidence.json` | 国信要求「报告与实际连接的测试环境一致」,或需要事后自证连的是哪个环境 | 同上 ADR §5(脚本无法用握手判别环境,只能留痕) |
+| 取证证据里记录前置地址与 BrokerID — **已落地(2026-11-12)** | `scripts/broker_test.py` 每次运行向证据目录的 `connection.json` 追加环境、交易/行情前置、BrokerID、AppID(掩码),不含账号密码授权码;单独成文件以免破坏 `evidence.json` 的列表格式 | — | 同上 ADR §5(脚本无法用握手判别环境,只能留痕) |
 
 ### 2.7 已处理技术债归档(原 §4 表中的行,原文不改)
 

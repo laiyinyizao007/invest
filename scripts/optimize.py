@@ -26,6 +26,7 @@ import bootstrap
 
 import pandas as pd
 
+import segment_ledger
 from backtest_lib import run_backtest
 from strategies.trend_atr_strategy import TrendAtrStrategy
 
@@ -41,6 +42,11 @@ WINDOWS_ADJ = {
     "valid": (datetime(2022, 1, 1), datetime(2023, 12, 31)),
     "test": (datetime(2024, 1, 1), datetime(2026, 11, 9)),
 }
+
+
+def segment_key(key: str) -> str:
+    start, end = windows_for(key)["test"]
+    return f"optimize:{key}:{start:%Y-%m-%d}~{end:%Y-%m-%d}"
 
 
 def windows_for(key: str) -> dict:
@@ -116,6 +122,11 @@ def main() -> None:
     parser.add_argument("--test", action="store_true", help="最终确认:查看测试段(只应运行一次)")
     args = parser.parse_args()
     key = args.symbol
+    if args.test:
+        try:
+            segment_ledger.check(segment_key(key))
+        except segment_ledger.SegmentAlreadyUsed as exc:
+            raise SystemExit(f"拒绝运行 --test: {exc}")
 
     combos = grid()
     windows = windows_for(key)
@@ -151,6 +162,8 @@ def main() -> None:
     params = {"fast_window": int(best.fast_window), "slow_window": int(best.slow_window), "atr_mult": float(best.atr_mult)}
     print(f"\n选定参数(训练段邻域平均最优): {params}")
 
+    if args.test:  # 先登记后运行:结果一旦被看到,该测试段即算已使用
+        segment_ledger.record(segment_key(key), note=f"optimize.py --symbol {key} --test 参数 {params}")
     for window in ("train", "valid") + (("test",) if args.test else ()):
         res = evaluate(key, params, window)
         tag = "  <-- 最终确认,只看这一次" if window == "test" else ""

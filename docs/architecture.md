@@ -31,7 +31,7 @@
 ### 策略与研究
 | 节点 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| backtest_lib / optimize / optimize_15m / walk_forward_optimizer | IMPL | `scripts/backtest_lib.py`、`scripts/optimize.py`、`scripts/optimize_15m.py`、`scripts/walk_forward_optimizer.py`;优化器**无 `--test` 开关**,测试段使用靠人工纪律 |
+| backtest_lib / optimize / optimize_15m / walk_forward_optimizer | IMPL | `scripts/backtest_lib.py`、`scripts/optimize.py`、`scripts/optimize_15m.py`、`scripts/walk_forward_optimizer.py`;`walk_forward_optimizer.py` **无 `--test` 开关**;`optimize.py`/`optimize_15m.py` 的 `--test` 经 `segment_ledger.py` 登记,重复使用即拒绝 |
 | 随机入场对照 | IMPL | `strategies/random_entry_strategy.py` |
 | 晋级门槛 | IMPL(未接线) | `risk/promotion_gate.py::check_gate`;只被 `scripts/record_promotion.py`、`risk/live_admission.py` 消费,**未接入优化脚本**;`parameter_on_plateau` 由调用方传入,无计算来源 |
 | PP 参数平原/PBO/DSR | PLAN | 只有布尔字段 |

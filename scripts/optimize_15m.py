@@ -24,6 +24,7 @@ import bootstrap
 import pandas as pd
 from vnpy.trader.constant import Exchange
 
+import segment_ledger
 from backtest_lib import load_bars_csv, run_backtest_bars
 from optimize import smoothed
 from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
@@ -96,6 +97,11 @@ def report(label: str, window: str, res: dict, note: str = "") -> None:
           "收益/净盈亏/成本/回撤的绝对值不受影响。")
 
 
+def segment_key() -> str:
+    start, end = WINDOWS["test"]
+    return f"optimize_15m:{KEY}:{start:%Y-%m-%d}~{end:%Y-%m-%d}"
+
+
 def main(argv: list[str] | None = None) -> int:
     global DATA_FILE
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -103,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data", default=str(DATA_FILE), help=f"15 分钟复权 K 线 CSV(默认 {DATA_FILE})")
     args = parser.parse_args(argv)
     DATA_FILE = Path(args.data)
+    if args.test:
+        try:
+            segment_ledger.check(segment_key())
+        except segment_ledger.SegmentAlreadyUsed as exc:
+            print(f"拒绝运行 --test: {exc}", file=sys.stderr)
+            return 2
 
     combos = grid()
     print(f"[{KEY}] 数据 {DATA_FILE.name};训练段 {WINDOWS['train'][0]:%Y-%m-%d}~{WINDOWS['train'][1]:%Y-%m-%d},共 {len(combos)} 组参数")
@@ -138,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     params = {"fast_window": int(best.fast_window), "slow_window": int(best.slow_window), "atr_mult": float(best.atr_mult)}
     print(f"\n选定参数(训练段邻域平均最优): {params}")
 
+    if args.test:  # 先登记后运行
+        segment_ledger.record(segment_key(), note=f"optimize_15m.py --test 参数 {params}")
     windows = ["train", "valid"] + (["test"] if args.test else [])
     for w in windows:
         tag = "  <-- 最终确认,只看这一次" if w == "test" else ""

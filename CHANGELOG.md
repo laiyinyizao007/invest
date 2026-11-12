@@ -16,6 +16,8 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 测试段使用登记 `scripts/segment_ledger.py` + `config/test_segment_usage.json`:`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复使用即拒绝(无强制开关,重置须手工改登记文件并补 ADR);15 分钟基准测试段补登记为已使用。`tests/conftest.py` 让所有测试使用临时登记文件。
+- 国信取证运行器每次运行向 `connection.json` 追加实际连接的环境、前置地址、BrokerID 与 AppID 掩码(不含账号密码授权码)。
 - 行情录制二次加固(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):`wrapper.lock` 改为 OS 文件锁(Windows `msvcrt.locking` / POSIX `flock`),持有进程退出即自动释放,不再依赖 PID 探测与 unlink;`CTP_RECORD_DATABASE_DIR` 必须是项目根下的单层独立目录(拒绝 `.vntrader`/`data`/项目根/多层/绝对路径——codex 审查发现 `archive/.vntrader` 经 `isolate_state(name)` 只取目录名会把 TEMP_DIR 重映射回主库)。新增测试含真实子进程并发持锁,全量 853 通过。G8:codex 轮已审并修复 1 Critical + 2 High;`codereview` 轮待做。
 - 个人信息防线 `tests/test_no_personal_data.py`:本机 `.env` 中的姓名/电话/邮箱/账号取值不得出现在任何受版本控制的文件里(失败信息只给位置,不回显取值);测试数据里的姓名一律改为虚构占位。真实个人信息只放本机 `.env`。
 - 行情录制 codex 审查后的加固(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):修复 `EventEngine` 重复启动、DCE 小写合约被大写后找不到、关闭时不 flush 丢尾部数据、每 tick 同步写状态文件、旧录制列表不同步;SimNow 要求行情前置主机与已通过白名单的交易前置主机一致;wrapper 子进程不再继承调用方管道、启动后确认存活、`watchdog` 检查心跳;增量任务超时杀整棵进程树、陈旧锁自动恢复、不向下载子进程传递 `CTP_*` 凭证。合约来源问题按用户确认的方案 A 解决:受限连接交易前置,只做认证+查合约,发单/撤单/查资金/查持仓在网关层与底层请求层双重硬性禁止(ADR 已修订边界);国信 profile 新增 `CTP_RECORD_ALLOWED_ADDRESSES` 显式地址允许列表。SimNow 第二套 7x24 前置上已验证认证/登录/合约查询/订阅/tick 到达/优雅停止,以及临时库中 DataRecorder 入库(115 tick + 2 根 1 分钟 K 线);但该环境行情时间不可信(比本机快 417s、郑商所日期停在两天前),DataRecorder 的 60s 保护会丢光 tick,故正式库为 0 行。新增 `data_warning`/`degraded` 状态,时间偏差 ≥60s 时显式告警。**交易时段内的真实录制仍待验收。**

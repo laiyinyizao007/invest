@@ -1,0 +1,10 @@
+{
+  "optimize:C:2023-01-01~2026-11-09": {
+    "at": "2026-11-12T01:27:26",
+    "note": "optimize.py --symbol C --test 参数 {'fast_window': 10, 'slow_window': 60, 'atr_mult': 1.25}"
+  },
+  "optimize_15m:C15:2024-01-01~2026-06-15": {
+    "at": "2026-11-10",
+    "note": "补登记:docs/adr/20261110-baseline-15m.md 记载该测试段已被 optimize_15m.py --test 使用一次"
+  }
+}

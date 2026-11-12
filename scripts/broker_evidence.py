@@ -146,6 +146,25 @@ def save_evidence(out_dir: Path, evidences: list[Evidence]) -> Path:
     return path
 
 
+def save_connection_info(out_dir: Path, info: dict) -> Path:
+    """追加记录本次运行实际连接的环境(前置地址/BrokerID 等),供事后自证"报告与实际连接的测试环境一致"。
+
+    单独成文件而非塞进 evidence.json:后者是证据条目列表,被 load_evidence/render 等多处按列表消费。
+    --resume 的每次运行各追加一条。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "connection.json"
+    runs: list = []
+    if path.exists():
+        try:
+            runs = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            runs = []
+    runs.append(info)
+    path.write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def load_evidence(out_dir: Path) -> dict[str, Evidence]:
     path = out_dir / "evidence.json"
     if not path.exists():
