@@ -119,3 +119,73 @@ def test_data_reports_segments_and_never_offers_test_segment(capsys):
     out = json.loads(capsys.readouterr().out)
     assert {x["key"] for x in out} == {"CADJ", "MAADJ"}
     assert all(x["test_segment_accessible_via_sandbox"] is False and set(x["segments"]) == {"train", "valid"} for x in out)
+
+
+# ---------- gate ----------
+
+GT = ("gate", "--strategy", "s.py", "--class", "S", "--params", "{}")
+
+
+def test_gate_requires_review_confirmation(tree, capsys):
+    (tree / "pending_strategies" / "s.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert run(*GT) == api.EXIT_REFUSED and "confirm-reviewed" in capsys.readouterr().err
+
+
+def test_gate_refuses_unsafe_code_without_spawning(tree, monkeypatch, capsys):
+    (tree / "pending_strategies" / "s.py").write_text("import subprocess\n", encoding="utf-8")
+    fake_subprocess(monkeypatch, lambda *a, **k: pytest.fail("筛查未过不得启动子进程"))
+
+    assert run(*GT, "--confirm-reviewed") == api.EXIT_REFUSED and "禁止导入" in capsys.readouterr().err
+
+
+def test_gate_rejects_nonpositive_random_runs(tree):
+    (tree / "pending_strategies" / "s.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert run(*GT, "--random-runs", "0", "--confirm-reviewed") == api.EXIT_REFUSED
+
+
+def test_gate_plateau_file_is_validated_and_missing_means_not_on_plateau(tree, tmp_path):
+    assert api.load_plateau(None) == (False, "未提供 --plateau-file:参数高原未评估,按未通过处理")
+    bad = tmp_path / "p.json"
+    bad.write_text("{not json", encoding="utf-8")
+    with pytest.raises(api.rs.SandboxError):
+        api.load_plateau(str(bad))
+
+
+def test_gate_plateau_file_uses_plateau_logic(tmp_path):
+    import itertools
+    scores = [[a, b, c, 1.0] for a, b, c in itertools.product(range(5), repeat=3)]
+    good = tmp_path / "p.json"
+    good.write_text(json.dumps({"cell": [2, 2, 2], "scores": scores}), encoding="utf-8")
+    spike = tmp_path / "q.json"
+    spike.write_text(json.dumps({"cell": [2, 2, 2], "scores": [[*s[:3], 9.0 if s[:3] == [2, 2, 2] else -1.0] for s in scores]}), encoding="utf-8")
+
+    assert api.load_plateau(str(good))[0] is True
+    assert api.load_plateau(str(spike))[0] is False
+
+
+def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypatch, capsys):
+    (tree / "pending_strategies" / "s.py").write_text("class S: pass\n", encoding="utf-8")
+    body = {"passed": False, "failures": ["x"], "metrics": {"random_runs": 3}, "windows": [], "diagnosis": {}}
+
+    class FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return api.CHILD_MARK + json.dumps(body) + "\n", ""
+
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
+
+    assert run(*GT, "--random-runs", "3", "--confirm-reviewed") == api.EXIT_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "gate" and out["passed"] is False and len(out["strategy_sha256"]) == 64
+    assert out["plateau_note"].startswith("未提供")
+    assert (tree / "results" / f"{out['run_id']}.json").exists()
+
+
+def test_gate_child_parser_converts_random_runs_to_int():
+    args = api.build_parser().parse_args(["_gate_child", "--file", "f", "--cls", "S", "--params", "{}",
+                                          "--random-runs", "7", "--on-plateau", "0"])
+
+    assert args.random_runs == 7

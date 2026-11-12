@@ -14,6 +14,13 @@
 3. **随机对照种子数 N 参数化**,默认 200,种子序列固定为 `0..N-1` 保证可复现。
 4. **评估逻辑做成纯函数**(`risk/candidate_eval.py`):窗口结果聚合、分位数、`CandidateMetrics` 组装;与回测引擎、CLI 解耦,可单测。
 
+## 实现(2026-11-12)
+
+- `scripts/research_gate.py`(编排,执行器可注入)+ `scripts/research_api.py gate`;随机对照 `strategies/random_entry_15m_strategy.py`,入场概率 = 候选在该窗口的往返数 / K 线数(限幅 1e-4~0.5)。
+- 参数高原需要调用方提供网格得分(`--plateau-file`);缺省 fail-closed。目前**没有任何脚本自动产出该文件**(优化器还没接线),需要手工或后续脚本生成。
+- 随机对照的出场逻辑取自 TrendAtr 家族(ATR 移动止损),候选使用其它出场机制时,这条衡量的是「相同出场下入场信号的贡献」。
+- 范围仅限 15 分钟玉米(C15);日线 CADJ/MAADJ 没有滚动验证窗口,暂不支持 `gate`。
+
 ## 不变
 
 门槛数值、`check_gate` 语义、「不得事后放宽」、测试段只看一次、外层不触碰实盘与凭据。

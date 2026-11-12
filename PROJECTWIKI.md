@@ -157,7 +157,7 @@ flowchart LR
 **策略与研究**
 - `strategies/trend_atr_strategy.py`:日线趋势 + ATR 止损策略,含实盘模式(Tick→日线合成、信号次日发单、状态持久化)。
 - `strategies/trend_atr_15m_strategy.py`、`intraday_demo_strategy.py`、`random_entry_strategy.py`、`instruments.py`:15 分钟基准、日内演示(仅研究/回测)、随机入场对照、品种参数。
-- `scripts/research_api.py`、`scripts/research_sandbox.py`:研究沙盒 CLI(`data`/`backtest`/`results`)与底座;`risk/diagnosis.py`、`risk/plateau.py`:诊断书与参数高原。威胁模型与限制见文件头及 ADR `20261112-research-sandbox-groundwork`。
+- `scripts/research_api.py`、`scripts/research_sandbox.py`:研究沙盒 CLI(`data`/`backtest`/`gate`/`results`)与底座,`scripts/research_gate.py` 门槛评估编排;`risk/diagnosis.py`、`risk/plateau.py`:诊断书与参数高原。威胁模型与限制见文件头及 ADR `20261112-research-sandbox-groundwork`。
 - `scripts/segment_ledger.py`、`config/test_segment_usage.json`:测试段使用登记，`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记，重复使用即拒绝（无强制开关）。
 - `scripts/backtest_lib.py`:回测公共库(统一成本、内存 K 线回放、异常哨兵)。
 - `scripts/optimize.py`、`optimize_15m.py`、`walk_forward_optimizer.py`:日线/15 分钟网格与三段验证;Walk-Forward 滚动优化(测试段物理隔离)。

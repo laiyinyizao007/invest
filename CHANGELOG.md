@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 沙盒 `gate` 子命令与 `scripts/research_gate.py`:15 分钟玉米滚动验证段(W1~W3,不触碰测试段)上跑候选 / 成本翻倍 / 随机入场对照(新增 `RandomEntry15mStrategy`,入场概率按候选活跃度对齐,`--random-runs` 参数化默认 200),汇总后调用晋级门槛;缺 `--plateau-file` 时参数高原按未通过处理。实测 200 次对照约 23 秒。示例:基准类 fast=14/slow=60 的结果与既有 ADR 一致(样本外夏普 -3.96,门槛 7 项未过)。
 - 候选评估纯逻辑 `risk/candidate_eval.py`(ADR `20261112-candidate-evaluation`):滚动验证段拼接成样本外序列、随机入场分位数(种子数参数化,默认 200)、组装 `CandidateMetrics` 并调用 `check_gate`;门槛数值不放宽,无随机对照样本时分位数记 0。尚未接入沙盒 `gate` 子命令。
 - 研究沙盒 CLI `scripts/research_api.py`(`data`/`backtest`/`results`)与底座 `scripts/research_sandbox.py`:仅 `pending_strategies/` 内策略、仅训练/验证段、子进程 + 环境白名单 + 静态筛查 + 需 `--confirm-reviewed`;结果附诊断书与代码 sha256。纵深防御而非沙盒,威胁模型写在 `research_sandbox.py` 文件头与 ADR。
 - 研究沙盒纯逻辑底座(ADR `20261112-research-sandbox-groundwork`):`risk/diagnosis.py` 确定性诊断书(回撤/次数/连亏/夏普四维,阈值与晋级门槛同源);`risk/plateau.py` 的 `parameter_on_plateau` 计算(比门槛原文更严:邻域内至少一半格子得分为正)。毕昇先于 API 固化部署,仅作知识库问答,不接工具。
