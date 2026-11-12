@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 毕昇工作流 v3（`tools/bisheng/build_v3.py`、`run_v3.py`）：LLM 写继承 `TrendAtr15mStrategy` 的 15 分钟候选，评估节点由日线回测换成 `run_gate`（15 分钟玉米滚动验证段上的晋级门槛评估），解决 v2 里日线候选基类与 15 分钟门槛评估不一致的问题。联调时 MiniMax 返回 429（Token Plan 用量上限），LLM 节点未能实跑；不依赖 LLM 的部分用手写 15 分钟唐奇安候选从毕昇容器一侧实测通过（提交→本机批准→门槛评估，28 秒）：样本外夏普 -5.47、往返 240 笔、对随机入场仅 6 分位，该想法不成立。注意：LLM 候选没有参数网格，`plateau` 恒为空，所以「参数高原」一项永远判未通过——在为候选做参数网格寻优之前，LLM 候选无法通过全部门槛，这是如实的限制而非缺陷。
 - `drill.py` 诊断埋点 `--trace FILE` / `--trace-skip-close`（新增 `scripts/drill_trace.py`，默认关闭）：逐行 fsync 的 trace、退出钩子、致命信号转储与周期线程栈转储、释放后 API 调用探针、启动与断线阶段周期快照、距上次登出间隔。用它在夜盘一次运行定位了 `disconnect` 场景静默退出：退出码 139，根因是 `td_api.close()` 释放了整个原生 API，事件引擎定时器线程随后调用 `query_position` 触发段错误；场景本身无法验证「断线与自动重连」，需改为真实切网（`docker network disconnect`），改造前该场景视为未验证。
 - 修复 `drill.py` 的 `latency` 场景在真实 SimNow 上必然失败的缺陷：代码读 `tick.ask_price` / `tick.bid_price`，而 vn.py 的 `TickData` 只有 `ask_price_1` / `bid_price_1`。此前单测用手写假 Tick 同样写成 `ask_price`，与代码互相印证，所以 1000+ 个测试全绿却从未发现。测试改用真实 `TickData` 并加一条断言防止假字段回流。夜盘实测 `latency` 通过：成交→持仓回报 0.177 秒，1 手仓已平；`overnight`、`tick-stale` 通过。
 - 行情录制「卡住」检测：启动后超时未订阅 → `stalled`，`watchdog` 据此受控重启（忽略上次运行遗留状态）；订阅后长时间无任何 Tick → `data_warning`（只告警）。起因：SimNow 第一套前置夜盘实测，距上次停止仅约 16 秒再启动时，进程连接登录成功却 3 分钟不订阅，状态一直是 `connected`、心跳正常，旧版 watchdog 看不出。
