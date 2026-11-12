@@ -31,5 +31,10 @@
   "screening": {
     "extra_forbidden_modules": [],
     "extra_forbidden_calls": []
+  },
+  "grid": {
+    "min_round_trips": 10,
+    "max_cells": 343,
+    "timeout_seconds": 1800
   }
 }

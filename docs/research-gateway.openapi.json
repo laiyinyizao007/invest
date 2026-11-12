@@ -5,14 +5,32 @@
     "version": "1.0.0",
     "description": "毕昇调用确定性内核的唯一通道。只有下列端点;不存在下单、查账户、改风控、访问测试段、批准代码的能力。批准只能由人在本机执行 research_api.py approve。"
   },
-  "servers": [{"url": "http://research-gateway:8765"}],
-  "security": [{"bearerAuth": []}],
+  "servers": [
+    {
+      "url": "http://research-gateway:8765"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
   "components": {
     "securitySchemes": {
-      "bearerAuth": {"type": "http", "scheme": "bearer"}
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
     },
     "schemas": {
-      "Error": {"type": "object", "properties": {"error": {"type": "string"}}}
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
     }
   },
   "paths": {
@@ -20,7 +38,11 @@
       "get": {
         "operationId": "list_data_segments",
         "summary": "列出可用数据段(训练/验证)及测试段是否已被消费。测试段不可经此访问。",
-        "responses": {"200": {"description": "数据段清单"}}
+        "responses": {
+          "200": {
+            "description": "数据段清单"
+          }
+        }
       }
     },
     "/research/candidates": {
@@ -29,19 +51,38 @@
         "summary": "提交候选策略源码,落入 pending 目录。提交不等于批准;需要人读代码后在本机批准才能运行。",
         "requestBody": {
           "required": true,
-          "content": {"application/json": {"schema": {
-            "type": "object",
-            "required": ["name", "source"],
-            "properties": {
-              "name": {"type": "string", "description": "文件名,小写字母数字下划线,以 .py 结尾,最长 40 字符"},
-              "source": {"type": "string", "description": "策略源码;禁止导入 os/subprocess/socket 等,禁止 exec/eval/open 等"}
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "source"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "文件名,小写字母数字下划线,以 .py 结尾,最长 40 字符"
+                  },
+                  "source": {
+                    "type": "string",
+                    "description": "策略源码;禁止导入 os/subprocess/socket 等,禁止 exec/eval/open 等"
+                  }
+                }
+              }
             }
-          }}}
+          }
         },
         "responses": {
-          "200": {"description": "已提交,返回 name 与 sha256"},
-          "400": {"description": "命名/大小/静态筛查未通过"},
-          "409": {"description": "同名候选已存在,请换名"}
+          "200": {
+            "description": "已提交,返回 name 与 sha256"
+          },
+          "400": {
+            "description": "命名/大小/静态筛查未通过"
+          },
+          "409": {
+            "description": "同名候选已存在,请换名"
+          }
         }
       }
     },
@@ -51,23 +92,61 @@
         "summary": "在训练或验证段做沙盒回测(日线 CADJ/MAADJ)。仅运行已被人批准的代码;返回绩效与诊断书。",
         "requestBody": {
           "required": true,
-          "content": {"application/json": {"schema": {
-            "type": "object",
-            "required": ["strategy", "class", "key", "segment"],
-            "properties": {
-              "strategy": {"type": "string", "description": "已提交的文件名"},
-              "class": {"type": "string", "description": "策略类名"},
-              "key": {"type": "string", "enum": ["CADJ", "MAADJ"]},
-              "segment": {"type": "string", "enum": ["train", "valid"]},
-              "params": {"type": "object", "description": "策略参数"}
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "strategy",
+                  "class",
+                  "key",
+                  "segment"
+                ],
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "description": "已提交的文件名"
+                  },
+                  "class": {
+                    "type": "string",
+                    "description": "策略类名"
+                  },
+                  "key": {
+                    "type": "string",
+                    "enum": [
+                      "CADJ",
+                      "MAADJ"
+                    ]
+                  },
+                  "segment": {
+                    "type": "string",
+                    "enum": [
+                      "train",
+                      "valid"
+                    ]
+                  },
+                  "params": {
+                    "type": "object",
+                    "description": "策略参数"
+                  }
+                }
+              }
             }
-          }}}
+          }
         },
         "responses": {
-          "200": {"description": "绩效 + 四维诊断书(回撤/次数/连亏/夏普)"},
-          "403": {"description": "代码尚未被人批准"},
-          "409": {"description": "已有作业在运行"},
-          "504": {"description": "超时"}
+          "200": {
+            "description": "绩效 + 四维诊断书(回撤/次数/连亏/夏普)"
+          },
+          "403": {
+            "description": "代码尚未被人批准"
+          },
+          "409": {
+            "description": "已有作业在运行"
+          },
+          "504": {
+            "description": "超时"
+          }
         }
       }
     },
@@ -77,23 +156,50 @@
         "summary": "晋级门槛评估:15 分钟玉米滚动验证段上跑候选、成本翻倍、随机入场对照,按门槛逐条给出结果。只评估,不批准、不上线。",
         "requestBody": {
           "required": true,
-          "content": {"application/json": {"schema": {
-            "type": "object",
-            "required": ["strategy", "class"],
-            "properties": {
-              "strategy": {"type": "string"},
-              "class": {"type": "string"},
-              "params": {"type": "object"},
-              "random_runs": {"type": "integer", "description": "随机对照次数;缺省取服务端配置"},
-              "plateau": {"type": "object", "description": "参数网格得分 {cell:[i,j,k], scores:[[i,j,k,score],...]};缺省则参数高原按未通过"}
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "strategy",
+                  "class"
+                ],
+                "properties": {
+                  "strategy": {
+                    "type": "string"
+                  },
+                  "class": {
+                    "type": "string"
+                  },
+                  "params": {
+                    "type": "object"
+                  },
+                  "random_runs": {
+                    "type": "integer",
+                    "description": "随机对照次数;缺省取服务端配置"
+                  },
+                  "plateau": {
+                    "type": "object",
+                    "description": "参数网格得分 {cell:[i,j,k], scores:[[i,j,k,score],...]};缺省则参数高原按未通过"
+                  }
+                }
+              }
             }
-          }}}
+          }
         },
         "responses": {
-          "200": {"description": "passed、failures、metrics、windows、diagnosis、protocol_notice"},
-          "403": {"description": "代码尚未被人批准"},
-          "409": {"description": "已有作业在运行"},
-          "504": {"description": "超时"}
+          "200": {
+            "description": "passed、failures、metrics、windows、diagnosis、protocol_notice"
+          },
+          "403": {
+            "description": "代码尚未被人批准"
+          },
+          "409": {
+            "description": "已有作业在运行"
+          },
+          "504": {
+            "description": "超时"
+          }
         }
       }
     },
@@ -101,15 +207,83 @@
       "get": {
         "operationId": "get_recent_failures",
         "summary": "最近若干次失败的结构化 Trace(条数由服务端配置限定,默认 3)。只含固定字段。",
-        "responses": {"200": {"description": "traces 列表"}}
+        "responses": {
+          "200": {
+            "description": "traces 列表"
+          }
+        }
       }
     },
     "/research/results/{run_id}": {
       "get": {
         "operationId": "get_result",
         "summary": "读取一次回测或门槛评估的完整结果。",
-        "parameters": [{"name": "run_id", "in": "path", "required": true, "schema": {"type": "string"}}],
-        "responses": {"200": {"description": "结果"}, "404": {"description": "不存在"}}
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "结果"
+          },
+          "404": {
+            "description": "不存在"
+          }
+        }
+      }
+    },
+    "/research/evaluate": {
+      "post": {
+        "operationId": "run_evaluate",
+        "summary": "选参 + 晋级门槛评估(推荐):候选类须声明 param_grid(恰好三个策略参数,各至少 3 个递增数值,且参数名须出现在类的 parameters 列表里)。服务端先在选参窗口(止于 2022-06-30)扫网格、邻域平滑选参并判定参数高原,再用选出的参数在其后的滚动验证窗口上做完整门槛评估,两段数据不重叠。风控参数(risk_budget 等)不得进入网格。仅运行已被人批准的代码。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "strategy",
+                  "class"
+                ],
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "description": "已提交的文件名"
+                  },
+                  "class": {
+                    "type": "string",
+                    "description": "策略类名;须继承 TrendAtr15mStrategy 并声明 param_grid"
+                  },
+                  "random_runs": {
+                    "type": "integer",
+                    "description": "随机对照次数;缺省取服务端配置"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "passed、failures、params(选出的参数)、selection(选参摘要:有效格子数、是否在高原)、metrics、windows、diagnosis;候选自身出错时 status=strategy_error 及 error"
+          },
+          "403": {
+            "description": "代码尚未被人批准"
+          },
+          "409": {
+            "description": "已有作业在运行"
+          },
+          "504": {
+            "description": "超时"
+          }
+        }
       }
     }
   }

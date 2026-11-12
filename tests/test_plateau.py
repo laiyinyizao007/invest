@@ -61,3 +61,22 @@ def test_feeds_the_promotion_gate_field():
                          random_entry_percentile=99, stress_sharpe=1.5, data_adjusted=True, parameter_on_plateau=plateau)
 
     assert any("参数高原" in f for f in check_gate(m))
+
+
+def test_smoothed_matches_optimize_smoothed_on_the_same_scores():
+    import optimize
+    from risk.plateau import smoothed
+    scores = {c: ((c[0] * 7 + c[1] * 3 + c[2]) % 5) - 1.0 for c in itertools.product(range(5), repeat=3)}
+    scores[(2, 2, 2)] = NEG_INF
+    scores[(1, 3, 2)] = NEG_INF
+
+    assert smoothed(scores) == optimize.smoothed(scores)
+
+
+def test_smoothed_skips_incomplete_neighbourhoods_and_invalid_cells():
+    from risk.plateau import smoothed
+    scores = {c: 1.0 for c in itertools.product(range(3), repeat=3)}
+
+    assert set(smoothed(scores)) == {(1, 1, 1)}                         # 只有中心格的 27 邻域完整
+    scores[(1, 1, 1)] = NEG_INF
+    assert smoothed(scores) == {}

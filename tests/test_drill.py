@@ -607,65 +607,14 @@ def test_tick_stale_fails_when_the_watchdog_stays_silent():
     assert "行情停更" in result.summary
 
 
-def test_disconnect_records_whether_the_client_reconnects():
-    drill = _make_drill()
-    drill.runtime.gateway.td_api.on_close = lambda: drill.notifier.send(
-        "ERROR", "网关连接断开", "交易服务器连接断开")
-    result = d.scenario_disconnect(drill)
-    assert result.ok is True
-    assert drill.runtime.gateway.td_api.closed is True
-    assert result.details["自动重连"] == "否"
 
 
-def test_disconnect_notices_a_successful_reconnect():
-    drill = _make_drill()
-
-    def on_close():
-        drill.notifier.send("ERROR", "网关连接断开", "x")
-        drill.notifier.send("INFO", "网关已连接", "交易服务器登录成功")
-
-    drill.runtime.gateway.td_api.on_close = on_close
-    result = d.scenario_disconnect(drill)
-    assert result.ok is True
-    assert result.details["自动重连"] == "是"
 
 
-def test_disconnect_fails_without_any_alert():
-    drill = _make_drill()
-    result = d.scenario_disconnect(drill)
-    assert result.ok is False
-    assert "没有收到告警" in result.summary
 
 
-def test_disconnect_records_connection_state_and_no_backlog_evidence():
-    """重连后记录连接状态,并给出「无积压补发」的证据项(确定性语义在离线测试里锁定)。"""
-    drill = _make_drill()
-
-    def on_close():
-        drill.notifier.send("ERROR", "网关连接断开", "x")
-        drill.runtime.connection_state["交易"] = False
-        drill.runtime.connection_state["交易"] = True
-        drill.notifier.send("INFO", "网关已连接", "交易服务器登录成功")
-
-    drill.runtime.gateway.td_api.on_close = on_close
-    result = d.scenario_disconnect(drill)
-    assert result.ok is True
-    assert result.details["重连后连接状态"] == "交易:已连接"
-    assert result.details["信号积压补发"].startswith("无补发")
-    assert result.details["窗口内发单失败告警(条)"] == 0
 
 
-def test_disconnect_counts_send_failure_alerts_in_the_window():
-    """断线期间的本地发单失败要计入窗口旁证(框架不排队,这些失败不会在重连后补发)。"""
-    drill = _make_drill()
-
-    def on_close():
-        drill.notifier.send("ERROR", "网关连接断开", "x")
-        drill.notifier.send("WARN", "网关错误", "委托请求发送失败，错误代码：-3")
-
-    drill.runtime.gateway.td_api.on_close = on_close
-    result = d.scenario_disconnect(drill)
-    assert result.details["窗口内发单失败告警(条)"] == 1
 
 
 def test_overnight_reports_the_trading_day_of_the_first_tick():
@@ -1140,61 +1089,123 @@ def _traced_drill(tmp_path, **kw):
     return drill
 
 
-def test_disconnect_with_trace_records_every_checkpoint_in_order(tmp_path):
-    drill = _traced_drill(tmp_path)
-    drill.runtime.gateway.td_api.on_close = lambda: drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
+# ---------- disconnect:外部切断网络(旧做法 td_api.close() 会释放整个原生 API,事件引擎定时器随后调用它导致 SIGSEGV) ----------
+
+def _external_cut(tmp_path, **kw):
+    drill = _make_drill(**kw)
+    drill.args.external_cut = str(tmp_path / "cut_request.json")
+    return drill
+
+
+def _act_when_requested(drill, steps, delay=0.05):
+    """模拟宿主机:看到「请求切网」文件后,按序发出若干告警(代替真实的断网与重连)。"""
+    import threading
+    path = Path(drill.args.external_cut)
+
+    def run():
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for level, title, message in steps:
+            time.sleep(delay)
+            drill.notifier.send(level, title, message)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+TRADE_DOWN = ("ERROR", "网关连接断开", "交易服务器:交易服务器连接断开,原因8193")
+MD_DOWN = ("ERROR", "网关连接断开", "行情服务器:行情服务器连接断开,原因8193")
+TRADE_UP = ("INFO", "网关已连接", "交易服务器:交易服务器登录成功")
+MD_UP = ("INFO", "网关已连接", "行情服务器:行情服务器登录成功")
+
+
+def test_disconnect_is_skipped_without_an_external_cut_so_all_never_crashes():
+    drill = _make_drill()
 
     result = d.scenario_disconnect(drill)
 
-    text = (tmp_path / "t.log").read_text(encoding="utf-8")
-    order = ["disconnect_before_close", "close_begin", "api_close_called", "close_returned", "api_marked_released",
-             "wait_disconnect_alert_done", "wait_reconnect_done"]
-    positions = [text.index(name) for name in order]
-    assert positions == sorted(positions) and result.ok is True
-    assert drill.runtime.gateway.td_api.closed is True            # 探针只记录,原函数照常执行
+    assert result.skipped is True and "外部切网" in result.summary
+    assert drill.runtime.gateway.td_api.closed is False            # 绝不再调用 td_api.close()
 
 
-def test_disconnect_trace_flags_calls_into_the_released_api(tmp_path):
-    drill = _traced_drill(tmp_path)
-    api = drill.runtime.gateway.td_api
-    api.query_account = lambda: "acct"                            # 假 API 上补一个会被探针包装的方法
+def test_disconnect_writes_a_cut_request_and_reports_a_successful_reconnect(tmp_path):
+    import json
+    drill = _external_cut(tmp_path)
+    _act_when_requested(drill, [TRADE_DOWN, MD_DOWN, TRADE_UP, MD_UP])
 
-    def on_close():
-        drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
-        api.query_account()                                       # 释放之后窗口内有人又调用了 API
+    result = d.scenario_disconnect(drill)
 
-    api.on_close = on_close
-    d.scenario_disconnect(drill)
-    drill.runtime.gateway.td_api.query_account()                  # 窗口结束后再调一次
-
-    text = (tmp_path / "t.log").read_text(encoding="utf-8")
-    assert "call_after_release" in text and "method=query_account" in text
-
-
-def test_trace_skip_close_is_a_control_run_that_never_releases_the_api(tmp_path):
-    drill = _traced_drill(tmp_path)
-    drill.args.trace_skip_close = True
-
-    d.scenario_disconnect(drill)
-
-    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    request = json.loads(Path(drill.args.external_cut).read_text(encoding="utf-8"))
+    assert "ready_at" in request and request["scenario"] == "disconnect"
+    assert result.ok is True and result.details["自动重连"] == "是"
+    assert result.details["断线检测耗时(秒)"] >= 0 and result.details["断线到重连(秒)"] >= 0
     assert drill.runtime.gateway.td_api.closed is False
-    assert "close_begin skipped=True" in text and "api_marked_released" not in text
 
 
-def test_disconnect_without_trace_leaves_the_api_unwrapped():
-    drill = _make_drill()
-    drill.runtime.gateway.td_api.on_close = lambda: drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
+def test_disconnect_reports_no_reconnect_when_the_trade_channel_never_comes_back(tmp_path):
+    drill = _external_cut(tmp_path)
+    _act_when_requested(drill, [TRADE_DOWN, MD_UP])                # 只有行情登录成功,交易通道没回来
+
+    result = d.scenario_disconnect(drill)
+
+    assert result.ok is True and result.details["自动重连"] == "否"
+    assert "没有自动重连" in result.summary
+
+
+def test_disconnect_fails_without_a_trade_channel_alert(tmp_path):
+    drill = _external_cut(tmp_path)
+    _act_when_requested(drill, [MD_DOWN])                          # 仅行情断开不算交易连接断开
+
+    result = d.scenario_disconnect(drill)
+
+    assert result.ok is False and "没有收到告警" in result.summary
+
+
+def test_disconnect_ignores_alerts_that_predate_the_cut(tmp_path):
+    drill = _external_cut(tmp_path)
+    drill.notifier.send(*TRADE_DOWN)                               # 场景开始之前的旧告警
+    drill.notifier.send(*TRADE_UP)
+
+    result = d.scenario_disconnect(drill)
+
+    assert result.ok is False
+
+
+def test_disconnect_records_connection_state_and_counts_send_failures(tmp_path):
+    drill = _external_cut(tmp_path)
+    drill.runtime.connection_state["交易"] = True
+    _act_when_requested(drill, [TRADE_DOWN, ("WARN", "网关错误", "委托请求发送失败,错误代码:-3"), TRADE_UP])
+
+    result = d.scenario_disconnect(drill)
+
+    assert result.details["重连后连接状态"] == "交易:已连接"
+    assert result.details["窗口内发单失败告警(条)"] == 1
+    assert result.details["信号积压补发"].startswith("无补发")
+
+
+def test_disconnect_with_trace_records_checkpoints_in_order(tmp_path):
+    import drill_trace
+    drill = _external_cut(tmp_path)
+    drill.trace = drill_trace.TraceLog(tmp_path / "t.log")
+    _act_when_requested(drill, [TRADE_DOWN, TRADE_UP])
 
     d.scenario_disconnect(drill)
 
-    assert "close" not in vars(drill.runtime.gateway.td_api)       # 没有任何包装
-    assert drill.trace.enabled is False
+    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    order = ["cut_requested", "disconnect_detected", "reconnect_detected"]
+    positions = [text.index(name) for name in order]
+    assert positions == sorted(positions)
 
 
-def test_trace_flag_parses_and_defaults_to_off():
-    import argparse
+def test_cut_flags_parse_and_the_release_based_simulation_is_gone():
     import re
-    src = (Path(d.__file__)).read_text(encoding="utf-8")
+    src = Path(d.__file__).read_text(encoding="utf-8")
     assert re.search(r'add_argument\("--trace",\s*default=""', src)
-    assert "--trace-skip-close" in src
+    assert re.search(r'add_argument\("--external-cut",\s*default=""', src)
+    import ast
+    func = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "scenario_disconnect")
+    calls = [ast.unparse(n.func) for n in ast.walk(func) if isinstance(n, ast.Call)]
+    assert not any(c.endswith(".close") for c in calls), calls          # 代码里不得再调用 close()(文档字符串里提及不算)
+    assert "--trace-skip-close" not in src

@@ -34,3 +34,23 @@ def parameter_on_plateau(scores: Mapping[Cell, float], cell: Cell, min_positive_
     values = [floor if scores[pos] == NEG_INF else scores[pos] for pos in positions]
     positive = sum(1 for v in values if v > 0)
     return sum(values) / len(values) > 0 and positive / len(values) >= min_positive_fraction
+
+
+def smoothed(scores: Mapping[Cell, float]) -> dict[Cell, float]:
+    """每个格子的得分 = 自己及周围 3×3×3 邻域共 27 个格子得分的平均(与 scripts/optimize.py::smoothed 同一算法的纯 Python 版)。
+
+    - 网格内但无效(-inf)的邻居按「悲观下限」计入:下限 = min(0, 全网格有效得分的最小值);
+    - 邻域不完整的格子(网格边界或空洞)不参与选参,自身无效的格子也不参与。
+    """
+    out: dict[Cell, float] = {}
+    valid = [v for v in scores.values() if v != NEG_INF]
+    floor = min(0.0, min(valid)) if valid else 0.0
+    for cell, own in scores.items():
+        if own == NEG_INF:
+            continue
+        positions = list(neighborhood(cell))
+        if any(pos not in scores for pos in positions):
+            continue
+        values = [floor if scores[pos] == NEG_INF else scores[pos] for pos in positions]
+        out[cell] = sum(values) / len(values)
+    return out

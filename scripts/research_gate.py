@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable, Sequence
 
+from research_grid import GridError, select_params
 from risk import candidate_eval as ce
 from risk.diagnosis import diagnose
 
@@ -76,6 +77,32 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
          "round_trips": pooled["round_trips"]},
         [p for res in base for p in res.get("trade_pnls", [])] or None,
     )
+    return result
+
+
+def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,
+                   max_cells: int, min_round_trips: int, select_window: tuple[datetime, datetime],
+                   validation_windows: Sequence[Window], data_adjusted: bool = True) -> dict:
+    """选参 + 门槛评估:候选在类上声明 `param_grid`,先在**选参窗口**(止于第一个验证窗口之前)扫网格选参并判定参数高原,
+    再用选出的参数在**滚动验证窗口**上做完整门槛评估。选参数据与评估数据不重叠,样本外因此成立。
+
+    选不出参数时 fail-closed:不跑成本翻倍与随机对照,直接给出未通过及原因。"""
+    grid = getattr(candidate_cls, "param_grid", None)
+    if grid is None:
+        raise GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
+    selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
+                              max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
+    summary = {k: v for k, v in selection.items() if k != "plateau"}      # 完整得分表留在服务端,不回传给外层
+    summary["plateau_cell"] = selection["plateau"]["cell"]
+    if selection["best_params"] is None:
+        return {"passed": False, "failures": ["无法选参: " + selection["note"]], "params": None,
+                "selection": summary, "kind_detail": "selection-only"}
+    result = run_gate(candidate_cls=candidate_cls, params=selection["best_params"], windows=validation_windows, bars=bars,
+                      runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
+                      on_plateau=selection["on_plateau"], capital=capital)
+    result["params"] = selection["best_params"]
+    result["selection"] = summary
+    result["kind_detail"] = "selection+gate"
     return result
 
 

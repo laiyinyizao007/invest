@@ -120,3 +120,21 @@ def test_shipped_paths_keep_approvals_and_token_in_the_control_directory():
     assert cfg["paths"]["approvals_file"].startswith("data/research-control/")
     assert cfg["gateway"]["token_file"].startswith("data/research-control/")
     assert not cfg["paths"]["results_dir"].startswith("data/research-control")      # 结果目录(容器可写)与控制目录(容器只读)分开
+
+
+def test_grid_section_has_sane_shipped_values():
+    cfg = rc.load()
+
+    assert cfg["grid"] == {"min_round_trips": 10, "max_cells": 343, "timeout_seconds": 1800}
+
+
+@pytest.mark.parametrize("data", [
+    {"grid": {"max_cells": 26}},               # 少于一个 3x3x3 邻域,永远选不出参数
+    {"grid": {"max_cells": 100000}},           # 失控
+    {"grid": {"min_round_trips": 0}},
+    {"grid": {"min_round_trips": 100000}},
+    {"grid": {"timeout_seconds": 0}},
+])
+def test_invalid_grid_values_are_rejected(tmp_path, data):
+    with pytest.raises(rc.ConfigError):
+        rc.load(write(tmp_path, data))

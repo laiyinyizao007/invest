@@ -51,7 +51,7 @@ def test_malformed_authorization_header_is_rejected(tmp_path):
 def test_exact_route_whitelist_and_nothing_trading_related_exists():
     assert gw.ROUTES == {
         ("GET", "/research/data"), ("POST", "/research/candidates"), ("POST", "/research/backtest"),
-        ("POST", "/research/gate"), ("GET", "/research/feedback"),
+        ("POST", "/research/gate"), ("POST", "/research/evaluate"), ("GET", "/research/feedback"),
     } | {("GET", "/research/results/{run_id}")}
     import re
     tokens = {tok for _, p in gw.ROUTES for tok in re.split(r"[/_{}]+", p.lower()) if tok}
@@ -402,3 +402,43 @@ def test_feedback_includes_strategy_errors_with_type_and_message(tmp_path):
     traces = call(app, "GET", "/research/feedback")[1]["traces"]
 
     assert len(traces) == 1 and traces[0]["failures"] == ["策略运行报错: ValueError: too many values to unpack (expected 3)"]
+
+
+# ---------- evaluate:选参 + 门槛评估 ----------
+
+def test_evaluate_forwards_validated_fields_and_never_passes_confirm(tmp_path):
+    seen = {}
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: seen.update(kw) or {"passed": False}))
+
+    status, _ = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "Candidate", "random_runs": "50", "confirm": True})
+
+    assert status == 200 and seen == {"strategy": "a.py", "cls": "Candidate", "random_runs": 50, "confirm": False}
+
+
+def test_evaluate_rejects_bad_fields_without_entering_the_job(tmp_path):
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: pytest.fail("校验未过不应进入作业")))
+
+    assert call(app, "POST", "/research/evaluate", {"class": "C"})[0] == 400
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "bad name; rm"})[0] == 400
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "random_runs": "abc"})[0] == 400
+
+
+def test_evaluate_maps_unapproved_to_403(tmp_path):
+    def evaluate_job(**kw):
+        raise api.JobError(api.EXIT_REFUSED, api.NEEDS_APPROVAL)
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=evaluate_job))
+
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 403
+
+
+def test_feedback_includes_failed_evaluations_but_not_passed_ones(tmp_path):
+    app = make_app(tmp_path)
+    seed_result(app, "20261112-210001-000000", kind="evaluate", passed=False, failures=["样本外夏普 -1 < 1.5"],
+                **{"class": "C", "key": "C15"}, diagnosis={"weakest": "sharpe", "summary": "s"})
+    seed_result(app, "20261112-210002-000000", kind="evaluate", passed=True, failures=[], **{"class": "C", "key": "C15"},
+                diagnosis={"weakest": "sharpe", "summary": "s"})
+
+    traces = call(app, "GET", "/research/feedback")[1]["traces"]
+
+    assert [t["run_id"] for t in traces] == ["20261112-210001-000000"] and traces[0]["kind"] == "evaluate"

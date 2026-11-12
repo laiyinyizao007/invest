@@ -360,3 +360,72 @@ def test_gate_job_records_strategy_errors_too(tree, monkeypatch):
     result = api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
 
     assert result["status"] == "strategy_error" and result["kind"] == "gate" and result["passed"] is False
+
+
+# ---------- evaluate:候选声明 param_grid,服务端选参 + 门槛评估 ----------
+
+def test_evaluate_job_requires_prior_approval_and_never_spawns(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("未批准不得启动子进程"))
+
+    with pytest.raises(api.JobError) as err:
+        api.evaluate_job(strategy="s.py", cls="S")
+
+    assert err.value.message == api.NEEDS_APPROVAL
+
+
+def test_evaluate_job_spawns_the_evaluate_child_with_hash_and_configured_timeouts(tree, monkeypatch):
+    path = make_strategy(tree)
+    seen = {}
+
+    def fake_spawn(cmd, timeout):
+        seen.update(cmd=cmd, timeout=timeout)
+        return {"passed": False, "failures": ["x"], "params": {"a": 1}, "selection": {"n_cells": 27}, "metrics": {}}
+
+    monkeypatch.setattr(api, "spawn_child", fake_spawn)
+
+    result = api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    cfg = api.rc.load()
+    assert "_evaluate_child" in seen["cmd"] and seen["cmd"][seen["cmd"].index("--sha256") + 1] == api.rs.file_sha256(path)
+    assert seen["timeout"] == cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
+    assert result["kind"] == "evaluate" and result["passed"] is False and result["run_id"]
+    assert "选参窗口" in result["protocol_notice"]
+    assert (tree / "data" / "research" / f"{result['run_id']}.json").exists()
+
+
+def test_evaluate_job_records_strategy_errors_as_results(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "GridError", "message": "param_grid 必须恰好 3 个参数"}})
+
+    result = api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert result["status"] == "strategy_error" and result["kind"] == "evaluate" and result["passed"] is False
+    assert result["error"]["type"] == "GridError"
+
+
+def test_evaluate_job_validates_random_runs_bounds(tree):
+    make_strategy(tree)
+
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", random_runs=5, confirm=True)
+
+
+def test_evaluate_cli_and_child_parsers():
+    parser = api.build_parser()
+
+    args = parser.parse_args(["evaluate", "--strategy", "s.py", "--class", "S", "--random-runs", "50"])
+    child = parser.parse_args(["_evaluate_child", "--file", "f", "--cls", "S", "--random-runs", "50", "--sha256", "abc"])
+
+    assert args.random_runs == 50 and child.random_runs == 50 and child.sha256 == "abc"
+
+
+def test_evaluate_child_refuses_a_file_changed_after_approval(tmp_path):
+    f = tmp_path / "s.py"
+    f.write_text("class S: pass\n", encoding="utf-8")
+    sha = api.rs.file_sha256(f)
+    f.write_text("class S:\n    x = 1\n", encoding="utf-8")
+
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(f), "--cls", "S", "--random-runs", "20", "--sha256", sha])
+
+    assert api.run_evaluate_child(args) == api.EXIT_REFUSED

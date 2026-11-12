@@ -117,3 +117,67 @@ def test_random_entry_15m_strategy_exposes_seed_and_entry_prob_parameters():
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
     assert {"entry_prob", "seed"} <= set(RandomEntry15mStrategy.parameters)
     assert issubclass(RandomEntry15mStrategy, TrendAtr15mStrategy)
+
+
+# ---------- 选参 + 门槛评估(候选声明 param_grid) ----------
+
+SELECT = (datetime(2020, 7, 22), datetime(2022, 6, 30, 23, 59))
+EVAL_BARS = [bar(datetime(2021, 3, 1, 9, 0)), bar(datetime(2021, 9, 1, 9, 0)), bar(datetime(2022, 3, 1, 9, 0)),
+             bar(datetime(2022, 8, 1, 9, 0)), bar(datetime(2023, 2, 1, 9, 0)), bar(datetime(2023, 3, 1, 9, 0))]
+
+
+class GridCand:
+    parameters = ["a", "b", "c"]
+    param_grid = {"a": [1, 2, 3], "b": [1, 2, 3], "c": [1, 2, 3]}
+
+
+def evaluate(**kw):
+    args = dict(candidate_cls=GridCand, bars=EVAL_BARS, runner=make_runner(), random_cls=Rand, random_runs=3, capital=10_000,
+                max_cells=100, min_round_trips=10, select_window=SELECT, validation_windows=[W1, W2])
+    args.update(kw)
+    return rg.run_evaluation(**args)
+
+
+def test_evaluation_selects_on_the_early_window_then_gates_on_validation_windows_only():
+    calls = []
+    result = evaluate(runner=make_runner(calls=calls))
+
+    select_calls = [c for c in calls if c[0] == "GridCand" and c[3] == 1.0 and set(c[1]) == {"a", "b", "c"} and c[2] == 3]
+    assert len(select_calls) >= 27                                         # 3x3x3 网格都在选参窗口(3 根 K 线)上跑过
+    gate_candidate_calls = [c for c in calls if c[0] == "GridCand" and c[2] == 2 and c[1] == result["params"]]    # W2 有 2 根 K 线
+    assert gate_candidate_calls, "门槛评估必须用选出的参数"
+    assert result["selection"]["window"] == ["2020-07-22", "2022-06-30"]
+    assert result["kind_detail"] == "selection+gate"
+
+
+def test_evaluation_without_valid_params_fails_closed_and_skips_the_gate():
+    calls = []
+    result = evaluate(runner=make_runner(calls=calls, trips=3))            # 往返不足 -> 无有效格子
+
+    assert result["passed"] is False and result["params"] is None
+    assert any("无法选参" in f for f in result["failures"])
+    assert all(c[3] == 1.0 for c in calls) and not any(c[0] == "Rand" for c in calls)      # 没有跑成本翻倍与随机对照
+
+
+def test_evaluation_passes_the_plateau_verdict_into_the_gate():
+    result = evaluate()
+
+    assert result["selection"]["on_plateau"] is True
+    assert not any("参数高原" in f for f in result["failures"])            # 平坦得分 -> 在高原上,不应再因此失败
+
+
+def test_evaluation_requires_a_declared_grid():
+    class NoGrid:
+        parameters = ["a"]
+
+    with pytest.raises(rg.GridError, match="param_grid"):
+        evaluate(candidate_cls=NoGrid)
+
+
+def test_evaluation_result_trims_the_score_table_but_keeps_the_verdict():
+    import json
+    result = evaluate()
+
+    assert "scores" not in result["selection"].get("plateau", {})
+    assert result["selection"]["n_cells"] == 27
+    json.dumps(result, ensure_ascii=False)

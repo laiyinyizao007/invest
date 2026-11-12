@@ -35,6 +35,7 @@ ROUTES = {
     ("POST", "/research/candidates"),
     ("POST", "/research/backtest"),
     ("POST", "/research/gate"),
+    ("POST", "/research/evaluate"),
     ("GET", "/research/feedback"),
     ("GET", "/research/results/{run_id}"),
 }
@@ -111,7 +112,7 @@ def _lenient_int(value, name: str) -> int | None:
 
 def _default_jobs() -> SimpleNamespace:
     import research_api as api
-    return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job,
+    return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job, evaluate_job=api.evaluate_job,
                            plateau_from_data=api.plateau_from_data)
 
 
@@ -251,6 +252,14 @@ class GatewayApp:
         return self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
                              random_runs=random_runs, confirm=False)
 
+    def _evaluate(self, data, _params):
+        strategy, cls = data.get("strategy"), data.get("class")
+        if not isinstance(strategy, str) or not isinstance(cls, str) or not CLASS_NAME.match(cls):
+            return 400, {"error": "strategy/class 必须是字符串,class 必须是合法标识符"}
+        random_runs = _lenient_int(data.get("random_runs"), "random_runs")
+        # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
+        return self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False)
+
     def _results(self, _data, params):
         run_id = params["run_id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
@@ -275,7 +284,7 @@ class GatewayApp:
             error = result.get("error")
             if result.get("status") == "strategy_error" and isinstance(error, dict):
                 failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
-            failed = bool(failures) if (result.get("kind") == "gate" or failures) else weakest is not None
+            failed = bool(failures) if (result.get("kind") in ("gate", "evaluate") or failures) else weakest is not None
             if not failed:
                 continue
             cls = result.get("class")

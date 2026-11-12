@@ -649,58 +649,76 @@ def scenario_tick_stale(drill: Drill) -> DrillResult:
     return DrillResult("tick-stale", True, "行情断流后收到了看门狗告警", details)
 
 
-# 埋点探针要包装的方法:只包装存在的;不存在的静默跳过
-TD_PROBE_METHODS = ("close", "query_account", "query_position", "query_order", "query_trade", "send_order", "cancel_order",
-                    "reqUserLogout", "reqQryInstrument", "reqQryTradingAccount", "reqQryInvestorPosition")
-GATEWAY_PROBE_METHODS = ("close", "query_account", "query_position", "send_order", "cancel_order", "subscribe")
+def _trade_alert(drill: "Drill", phrase: str, since: int, timeout: float, after: int | None = None) -> dict | None:
+    """等一条**交易通道**的告警(消息里含「交易」且含 phrase)。行情通道的断开/登录不算。"""
+    deadline = time.monotonic() + timeout
+    start = since if after is None else after
+    while time.monotonic() < deadline:
+        for alert in drill.notifier.find(phrase, start):
+            if "交易" in alert["message"] or "交易" in alert["title"]:
+                return alert
+        time.sleep(0.2)
+    return None
 
 
 def scenario_disconnect(drill: Drill) -> DrillResult:
     """交易连接断开 → 是否告警、是否自动重连(运行手册第 5 节第 4 项)。
 
-    做法:关掉交易连接,观察有没有"连接断开"告警,以及之后有没有重新"登录成功"。
-    这条结论决定实盘要不要自己做重连(CTP 客户端不重连的话,得靠外层守护进程重启)。
+    **断线由外部真实切断网络来制造**:演练在容器里跑,宿主机对该容器执行 `docker network disconnect`,
+    等一会儿再 `docker network connect`(见仓库外的启动器与 docs/runbook-simnow.md)。演练本身只负责
+    写一个「请求切网」文件、然后观察告警。
+
+    为什么不再自己调用 `td_api.close()`:它在 vnpy_ctp 里是原生 `exit()`,会**释放整个 API 对象**,
+    约 1.5 秒后事件引擎定时器线程调用 `query_position` 打到已释放的对象上,进程段错误(退出码 139);
+    而且释放之后根本不会再有断开回调与自动重连,这个场景永远回答不了它想问的问题。
+    没有 `--external-cut` 时该场景直接跳过,所以 `all` 不会再因它崩溃。
     """
+    request_file = getattr(drill.args, "external_cut", "") or ""
+    if not request_file:
+        return DrillResult("disconnect", True, "跳过:需要外部切网(用 --external-cut FILE 并由宿主机执行 docker network disconnect)",
+                           {"前提": "不满足"}, skipped=True)
     runtime = drill.runtime
     assert runtime is not None
-    since = drill.notifier.mark()             # 只认本次断线之后的告警
     trace = drill.trace
-    td_api = runtime.gateway.td_api
-    td_probe = gateway_probe = snapshot = None
-    if trace.enabled:
-        # 埋点:关闭前后的状态、已释放 API 的再次调用、所有线程的周期栈转储(见 drill_trace.py 的假设表)
-        td_probe = drill_trace.ReleasedApiProbe(trace, td_api, "td", TD_PROBE_METHODS)
-        gateway_probe = drill_trace.ReleasedApiProbe(trace, runtime.gateway, "gateway", GATEWAY_PROBE_METHODS)
+    since = drill.notifier.mark()             # 只认本次切网之后的告警
+    began = time.monotonic()
 
+    request = Path(request_file)
+    request.parent.mkdir(parents=True, exist_ok=True)
+    tmp = request.with_name(request.name + ".tmp")
+    tmp.write_text(json.dumps({"scenario": "disconnect", "ready_at": datetime.now().isoformat(timespec="seconds"),
+                               "pid": os.getpid()}), encoding="utf-8")
+    os.replace(tmp, request)                  # 原子出现:宿主机看到文件时内容已完整
+    trace.write("cut_requested", file=request.name)
+
+    snapshot = None
+    if trace.enabled:
         def sample() -> dict:
+            td_api = getattr(runtime.gateway, "td_api", None)
             md_api = getattr(runtime.gateway, "md_api", None)
             return {"td_connect": getattr(td_api, "connect_status", None), "td_login": getattr(td_api, "login_status", None),
                     "md_connect": getattr(md_api, "connect_status", None), "md_login": getattr(md_api, "login_status", None),
                     "conn_state": dict(runtime.connection_state), "alerts_since": len(drill.notifier.find("", since)),
-                    "threads": len(drill_trace.thread_names())}
+                    "ticks_total": len(drill.ticks),
+                    "last_tick_age_s": round(time.monotonic() - drill.ticks[-1][0], 1) if drill.ticks else None}
 
         snapshot = drill_trace.PeriodicSnapshot(trace, "disconnect", sample, interval=10.0)
-        trace.write("disconnect_before_close", **sample())
         snapshot.start()
-        drill_trace.dump_threads_later(trace, 20.0, repeat=True)
-    skip_close = bool(getattr(drill.args, "trace_skip_close", False))
-    began = time.monotonic()
-    trace.write("close_begin", skipped=skip_close)
-    if not skip_close:
-        td_api.close()
-    trace.write("close_returned", seconds=round(time.monotonic() - began, 3), skipped=skip_close)
-    if td_probe is not None and not skip_close:
-        td_probe.mark_released()
-        gateway_probe.mark_released()
     try:
-        disconnect_alert = drill.notifier.wait_for("连接断开", drill.args.disconnect_timeout, since)
-        trace.write("wait_disconnect_alert_done", got=disconnect_alert is not None)
-        reconnected = drill.notifier.wait_for("登录成功", drill.args.reconnect_timeout, since)
-        trace.write("wait_reconnect_done", got=reconnected is not None)
+        disconnect_alert = _trade_alert(drill, "连接断开", since, drill.args.disconnect_timeout)
+        detected_after = time.monotonic() - began
+        trace.write("disconnect_detected", got=disconnect_alert is not None, seconds=round(detected_after, 1))
+        reconnected = None
+        reconnect_after = None
+        if disconnect_alert is not None:
+            # 只认断线告警之后的「交易服务器登录成功」;起点取断线告警所在位置
+            idx = drill.notifier.find("", since).index(disconnect_alert) + since
+            reconnected = _trade_alert(drill, "登录成功", since, drill.args.reconnect_timeout, after=idx + 1)
+            reconnect_after = time.monotonic() - began - detected_after
+        trace.write("reconnect_detected", got=reconnected is not None, seconds=None if reconnect_after is None else round(reconnect_after, 1))
     finally:
         if snapshot is not None:
             snapshot.stop()
-            drill_trace.cancel_thread_dumps()
 
     def fmt_state() -> str:
         state = getattr(runtime, "connection_state", None)
@@ -715,14 +733,16 @@ def scenario_disconnect(drill: Drill) -> DrillResult:
     details = {
         "断线告警": (f"{disconnect_alert['level']} {disconnect_alert['title']}: {disconnect_alert['message']}"
                     if disconnect_alert else "无"),
+        "断线检测耗时(秒)": round(detected_after, 1),
         "自动重连": "是" if reconnected else "否",
-        "重连等待(秒)": drill.args.reconnect_timeout,
+        "断线到重连(秒)": None if reconnect_after is None else round(reconnect_after, 1),
+        "重连等待上限(秒)": drill.args.reconnect_timeout,
         "重连后连接状态": fmt_state(),
         "窗口内发单失败告警(条)": len(send_failures),
         "信号积压补发": "无补发:断连发单本地失败、框架不排队(离线测试 test_disconnect_signal 锁定语义)",
     }
     if disconnect_alert is None:
-        return DrillResult("disconnect", False, "断开交易连接后没有收到告警", details)
+        return DrillResult("disconnect", False, "切断网络后没有收到告警", details)
     if reconnected is None:
         return DrillResult("disconnect", True, "有断线告警,但观察窗口内没有自动重连", details)
     return DrillResult("disconnect", True, "有断线告警,并且自动重连成功", details)
@@ -970,8 +990,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--overnight-timeout", type=float, default=3600.0, help="等待夜盘首根 Tick 的最长时间(秒)")
     parser.add_argument("--trace", default="", metavar="FILE",
                         help="诊断埋点写到此文件(逐行 fsync;退出钩子/致命信号转储/已释放 API 探针/周期快照)。默认关闭")
-    parser.add_argument("--trace-skip-close", action="store_true",
-                        help="控制运行:disconnect 场景不真的调用 td_api.close(),用来判断静默退出是否与它有关(需配合 --trace)")
+    parser.add_argument("--external-cut", default="", metavar="FILE",
+                        help="disconnect 场景:就绪后写此「请求切网」文件,由宿主机真实切断/恢复容器网络;不给则该场景跳过")
     parser.add_argument("--confirm-simnow", action="store_true", help="确认目标是 SimNow 模拟盘")
     parser.add_argument("--allow-any-address", action="store_true",
                         help="⚠ 危险:交易服务器地址不在已知 SimNow 地址表里时强制放行,可能连上真实资金账户")

@@ -270,6 +270,39 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     return result
 
 
+EVALUATE_NOTICE = ("evaluate 的样本外由服务端保证：参数只在选参窗口（2020-07-22 ~ 2022-06-30）上按候选声明的 param_grid 选出，"
+                   "门槛评估只用其后的滚动验证窗口（2022-07 ~ 2023-12），两段不重叠；测试段不可达。")
+
+
+def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
+                 confirm: bool = False) -> dict:
+    """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
+    再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。"""
+    cfg, paths = settings()
+    timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
+    random_runs = random_runs if random_runs is not None else cfg["gate"]["random_runs"]
+    path = resolve_strategy(strategy, cfg)
+    low, high = rc.INT_BOUNDS[("gate", "random_runs")]
+    if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
+        raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    require_clean(path, cfg)
+    check_approval(path, paths, confirm)
+    source = path.read_text(encoding="utf-8")
+
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
+           "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path)]
+    body = spawn_child(cmd, timeout)
+    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
+            "ran_at": datetime.now().isoformat(timespec="seconds")}
+    if "error" in body:
+        result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
+    else:
+        result = {**base, **body}
+    result["run_id"] = rs.save_result(result, paths["results_dir"])
+    return result
+
+
 def run_cli_job(func) -> int:
     """CLI 适配:作业成功则打印 JSON,JobError 则把消息打到 stderr 并返回对应退出码。"""
     try:
@@ -299,6 +332,11 @@ def cmd_backtest(args) -> int:
         return backtest_job(strategy=args.strategy, cls=args.cls, key=args.key, segment=args.segment, params=params,
                             timeout=args.timeout, confirm=args.confirm_reviewed)
     return run_cli_job(job)
+
+
+def cmd_evaluate(args) -> int:
+    return run_cli_job(lambda: evaluate_job(strategy=args.strategy, cls=args.cls, random_runs=args.random_runs,
+                                            timeout=args.timeout, confirm=args.confirm_reviewed))
 
 
 def cmd_gate(args) -> int:
@@ -342,6 +380,44 @@ def run_gate_child(args) -> int:
                           runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL)
     except Exception as exc:
+        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
+        return EXIT_OK
+    print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
+    return EXIT_OK
+
+
+def run_evaluate_child(args) -> int:
+    """子进程：加载候选，读取其 param_grid，在选参窗口选参，再在滚动验证窗口做门槛评估。测试段不可达。"""
+    import walk_forward_optimizer as wf
+    from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
+    from research_gate import engine_runner, run_evaluation
+    from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
+    from vnpy.trader.constant import Exchange
+    path = Path(args.file)
+    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
+        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
+        return EXIT_REFUSED
+    cfg = rc.load()
+    if screen(path, cfg):
+        print("静态筛查未通过", file=sys.stderr)
+        return EXIT_REFUSED
+    spec = importlib.util.spec_from_file_location("pending_strategy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from vnpy_ctastrategy import CtaTemplate
+    candidate = getattr(module, args.cls, None)
+    if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
+        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
+        return EXIT_FAILED
+    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    windows = wf.build_windows()
+    try:
+        result = run_evaluation(
+            candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
+            random_runs=args.random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
+            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows])
+    except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
     print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
@@ -418,6 +494,13 @@ def build_parser() -> argparse.ArgumentParser:
     gt.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds")
     gt.add_argument("--confirm-reviewed", action="store_true")
     gt.set_defaults(func=cmd_gate)
+    ev = sub.add_parser("evaluate", help="选参 + 晋级门槛评估(候选在类上声明 param_grid;15 分钟玉米;不触碰测试段)")
+    ev.add_argument("--strategy", required=True)
+    ev.add_argument("--class", dest="cls", required=True)
+    ev.add_argument("--random-runs", type=int, default=None, help="随机入场对照次数;缺省取配置 gate.random_runs")
+    ev.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds + grid.timeout_seconds")
+    ev.add_argument("--confirm-reviewed", action="store_true")
+    ev.set_defaults(func=cmd_evaluate)
     ap = sub.add_parser("approve", help="人工批准:读过代码后执行,批准绑定到代码内容的 sha256")
     ap.add_argument("--strategy", required=True)
     ap.set_defaults(func=cmd_approve)
@@ -433,6 +516,11 @@ def build_parser() -> argparse.ArgumentParser:
         gchild.add_argument(f"--{name}", required=True)
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.set_defaults(func=run_gate_child)
+    echild = sub.add_parser("_evaluate_child")  # 内部使用
+    for name in ("file", "cls", "sha256"):
+        echild.add_argument(f"--{name}", required=True)
+    echild.add_argument("--random-runs", type=int, required=True)
+    echild.set_defaults(func=run_evaluate_child)
     return parser
 
 

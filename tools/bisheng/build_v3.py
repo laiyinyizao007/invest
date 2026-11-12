@@ -18,9 +18,15 @@ from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 
 
 class Candidate(TrendAtr15mStrategy):
-    # 可选:覆盖可优化参数(fast_window / slow_window / atr_mult),其余风控与出场逻辑继承自基类,不得修改
+    # 其余风控与出场逻辑继承自基类,不得修改。可优化参数只有:fast_window / slow_window / atr_mult,以及你自己新增的信号参数
     fast_window = 16
     slow_window = 96
+    breakout_n = 48                      # 示例:你自己新增的信号参数(类属性)
+    # 新增的参数名必须登记到 parameters,否则引擎不会把它传给策略
+    parameters = TrendAtr15mStrategy.parameters + ["breakout_n"]
+    # 必须声明 param_grid:恰好三个参数,每个至少 3 个、至多 10 个**严格递增**的数值;不得包含 risk_budget、max_daily_losses、atr_window
+    # 服务端会在 2022-06-30 之前的数据上扫描这个网格选参,再在其后的验证窗口评估,所以不要自己挑「最好看」的参数
+    param_grid = {"breakout_n": [24, 48, 72, 96], "slow_window": [48, 96, 144], "atr_mult": [1.5, 2.0, 3.0]}
 
     def entry_signal(self) -> int:
         # 返回 1 做多 / -1 做空 / 0 无信号;只能使用 self.am(ArrayManager)提供的指标:
@@ -108,18 +114,18 @@ def build(tool):
     wait["data"]["tab"]["value"] = "dialog_input"
     nodes.append(wait)
 
-    bt = flow_node("tool_gate", tool_tpl(child["run_gate"]), 2240, 0, "晋级门槛评估")
+    bt = flow_node("tool_eval", tool_tpl(child["run_evaluate"]), 2240, 0, "选参+晋级门槛评估")
     set_param(bt, "strategy", ref("llm_name", "output") + ".py")
     set_param(bt, "class", "Candidate")
-    # params / random_runs / plateau 留空:用类属性参数、服务端默认随机对照次数;缺 plateau 时参数高原按未通过处理
+    # random_runs 留空:取服务端配置;参数由候选声明的 param_grid 在服务端选出,不经工作流传递
     nodes.append(bt)
 
     res = flow_node("output_result", "output", 2560, 0, "门槛评估结果")
-    set_param(res, "message", {"msg": "晋级门槛评估(15 分钟玉米滚动验证段,不触碰测试段):\n" + ref("tool_gate", "output"), "files": []})
+    set_param(res, "message", {"msg": "选参 + 晋级门槛评估(选参窗口止于 2022-06-30,验证窗口之后;不触碰测试段):\n" + ref("tool_eval", "output"), "files": []})
     nodes.append(res)
     nodes.append(flow_node("end_v1", "end", 2880, 0, "结束"))
 
-    order = ["start_v1", "input_idea", "tool_feedback", "llm_name", "llm_code", "tool_submit", "output_tip", "input_wait", "tool_gate", "output_result", "end_v1"]
+    order = ["start_v1", "input_idea", "tool_feedback", "llm_name", "llm_code", "tool_submit", "output_tip", "input_wait", "tool_eval", "output_result", "end_v1"]
     edges = [edge(a, b) for a, b in zip(order, order[1:])]
     # 回环:输出结果后回到「想法」输入,由人给出下一轮想法;人不再输入即结束(end 节点保留给显式终止)
     edges = [e for e in edges if not (e["source"] == "output_result" and e["target"] == "end_v1")]
@@ -139,7 +145,7 @@ def main():
         r = bs._req("PUT", f"/workflow/versions/{ids['version_id']}", {"name": "v1", "data": data, "flow_id": flow_id}, token=t)
         print("update:", r.get("status_code"), r.get("status_message"))
         return
-    r = bs._req("POST", "/workflow/create", {"name": "invest 研究工作流 v3(15分钟+门槛)", "description": "人工驱动的多轮研究循环:想法->读失败反馈->LLM 写 15 分钟候选->提交->本机批准->晋级门槛评估->下一轮", "data": data}, token=t)
+    r = bs._req("POST", "/workflow/create", {"name": "invest 研究工作流 v3(15分钟+门槛)", "description": "人工驱动的多轮研究循环:想法->读失败反馈->LLM 写 15 分钟候选(声明 param_grid)->提交->本机批准->选参+晋级门槛评估->下一轮", "data": data}, token=t)
     print("create:", r.get("status_code"), r.get("status_message"))
     if r.get("status_code") in (200, 201):
         flow = r["data"]

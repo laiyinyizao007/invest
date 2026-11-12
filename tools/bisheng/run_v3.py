@@ -64,7 +64,7 @@ async def main(flow_id, ideas):
                         if item.get("key", "").endswith(".output") and body.get("node_id") == "llm_name":
                             cand_name = str(item.get("value")).strip()
                             print(f"[起名] {cand_name!r}")
-                        if item.get("key", "").endswith(".output") and body.get("node_id") in ("tool_submit", "tool_gate"):
+                        if item.get("key", "").endswith(".output") and body.get("node_id") in ("tool_submit", "tool_eval"):
                             print(f"[{body.get('name')}] {str(item.get('value'))[:300]}")
                 continue
             if cat in ("output_msg", "stream_msg", "stream_over", "error", "end_cover"):
