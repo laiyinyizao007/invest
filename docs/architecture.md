@@ -33,10 +33,14 @@
 |---|---|---|
 | backtest_lib / optimize / optimize_15m / walk_forward_optimizer | IMPL | `scripts/backtest_lib.py`、`scripts/optimize.py`、`scripts/optimize_15m.py`、`scripts/walk_forward_optimizer.py`;`walk_forward_optimizer.py` **无 `--test` 开关**;`optimize.py`/`optimize_15m.py` 的 `--test` 经 `segment_ledger.py` 登记,重复使用即拒绝 |
 | 随机入场对照 | IMPL | `strategies/random_entry_strategy.py` |
-| 晋级门槛 | IMPL(未接线) | `risk/promotion_gate.py::check_gate`;只被 `scripts/record_promotion.py`、`risk/live_admission.py` 消费,**未接入优化脚本**;`parameter_on_plateau` 由调用方传入,无计算来源 |
-| PP 参数平原/PBO/DSR | PLAN | 只有布尔字段 |
+| 晋级门槛 | IMPL(已接入沙盒) | `risk/promotion_gate.py::check_gate`;由研究沙盒 `gate`/`evaluate`(`scripts/research_gate.py`)调用;`parameter_on_plateau` 由 `risk/plateau.py` 在选参时计算;旧优化脚本(`optimize.py`)仍未自动过闸 |
+| PP 参数平原 / PBO/DSR | PART | 参数平原 IMPL(`risk/plateau.py` + `scripts/research_grid.py`);PBO/DSR PLAN |
 | TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
-| RSA 研究沙盒 API / SBX 骨架目录 / RTR MetaRouter | PLAN | 零代码 |
+| RSA 研究沙盒 API(CLI + HTTP 网关 + 容器) | IMPL | `scripts/research_api.py`、`research_gateway.py`、`docker-compose.research.yml`、`docker/research/`;端到端经毕昇容器 → 沙盒容器实测;**威胁模型:纵深防御而非完整隔离**(见 ADR) |
+| SBX 骨架目录 | PART | `pending_strategies/` 已落地(外层唯一可写位置);`approved/` 与骨架模板未做 |
+| 外层 Bisheng AI 研究员 | PART | 本机部署(仅 127.0.0.1);工具与工作流 v3、无 LLM 联调工作流已建;**LLM 节点联调待额度**;`tools/bisheng/` |
+| 诊断书 / 候选评估 / 中文报告 | IMPL | `risk/diagnosis.py`、`risk/candidate_eval.py`、`risk/report.py`(纯函数) |
+| RTR MetaRouter | PLAN | 零代码 |
 
 ### 风控与守卫
 | 节点 | 状态 | 证据 / 缺口 |
@@ -51,11 +55,12 @@
 ### 运行与运维
 | 节点 | 状态 | 证据 / 缺口 |
 |---|---|---|
-| runtime(启动五步/对账/看门狗) | IMPL(仅假网关) | `trading/runtime.py`;废单/撤单/断线/夜盘跨日未在真实 CTP 验证 |
+| runtime(启动五步/对账/看门狗) | IMPL(夜盘演练验证) | `trading/runtime.py`;2026-11-12 夜盘 SimNow 实测通过:成交回报延迟、行情停更看门狗、真实切网的断线/重连、当日熔断、硬锁定与重启拒绝;**未验证**:废单文本补采、kill -9 重启、撮合差异;退出登出在重连后有一次原生崩溃待复现 |
 | guard_rule | IMPL | `trading/guard_rule.py`;失败态的紧急平仓不自动恢复(见 §4 局限台账) |
-| CTP / SimNow | PART | 启动管道跑通一次;其余路径未验证 |
+| CTP / SimNow | IMPL(第一套前置) | 启动管道、演练六场景、行情录制均在第一套前置通过;国信测试环境未连 |
 | Docker + GB18030 locale + HEALTHCHECK | IMPL | `Dockerfile`、`docker-compose.yml` |
-| drill.py 六场景 | PART | 代码完成,**从未实跑**(`docs/simnow-drills.md` 尚不存在,首次实跑时生成) |
+| drill.py 六场景 | IMPL | 2026-11-12 夜盘全部通过,`docs/simnow-drills.md`;`disconnect` 要求 `--external-cut`(宿主机真实切网),没给则跳过;`--trace` 诊断埋点(`scripts/drill_trace.py`)。`latency` 对行情活跃度敏感 |
+| notify 落盘待补发队列 | IMPL | `notify/webhook.py`(`WEBHOOK_OUTBOX`);单测 + 真实 HTTP 断网恢复测试 + 真实 Telegram 补发验证;真实切网复测待做 |
 | simnow_guard | IMPL | `scripts/simnow_guard.py` |
 | unattended_report | PART | `scripts/unattended_report.py`;连续 5 天证据未攒齐 |
 | CAL 交易日历 | PLAN | 无节假日逻辑 |

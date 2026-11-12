@@ -358,3 +358,18 @@
   多账户属于平台能力面,未在项目配置中启用,启用前需另行评估账户风控的多账户覆盖。
 - **没有**启动对账、看门狗和 Webhook 告警,**不得用于无人值守**,也不要与无头版同时运行。
 
+
+### 研究沙盒(2026-11-12,ADR `20261112-research-sandbox-*`)
+- `scripts/research_api.py`:CLI 入口(`data`/`approve`/`review`/`backtest`/`gate`/`evaluate`/`results`);`review` 先展示带行号源码与静态筛查再问 y/N;批准绑定代码 sha256。
+- `scripts/research_sandbox.py`:路径限制、静态筛查(纵深防御,非完整隔离)、子进程环境白名单、批准账本 `data/research-control/approvals.json`(容器内只读)。
+- `scripts/research_gate.py` / `research_grid.py`:服务端按候选声明的 `param_grid` 在选参窗口(止于 2022-06-30)寻优,再对验证窗口做晋级门槛评估(3×3×3 邻域参数平原、随机入场对照、成本翻倍)。
+- `scripts/research_config.py` + `config/research_sandbox.json`:全部可调参数,严格校验;`iteration.max_iterations`/`window_hours`(滚动窗口内提交上限,服务端强制,超限 429)。
+- `scripts/research_gateway.py`:标准库 HTTP 网关,白名单路由与 `docs/research-gateway.openapi.json` 一致;`view=report|text` 返回精简中文报告;反馈只返回最近 N 条失败 Trace。容器见 `docker-compose.research.yml`、`docker/research/`。
+- `risk/diagnosis.py`、`risk/plateau.py`、`risk/candidate_eval.py`、`risk/report.py`:纯函数;`strategies/random_entry_15m_strategy.py`:随机入场对照。
+
+### `scripts/drill_trace.py` 与 `tools/bisheng/`
+- `drill_trace.py`:`drill.py --trace` 的 faulthandler 诊断埋点(定位 `td_api.close()` 段错误)。
+- `tools/bisheng/`:毕昇工作流构建/运行脚本(`bs.py` API 封装、`bsflow.py` 节点 helper、`build_v3.py` LLM 版、`build_v3_manual.py` 无 LLM 联调版、`run_*.py`);用法见该目录 README。`templates.json` 需用 `extract_templates.js` 重新生成,不入库。
+
+### `notify/webhook.py` 落盘待补发队列
+发送最终失败的告警写入 `WEBHOOK_OUTBOX`(JSONL),网络恢复后补发(【补发】前缀、保留原时间、积压 INFO≥3 条合并摘要),重启后继续;容量与最大年龄有上限。
