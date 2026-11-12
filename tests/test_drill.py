@@ -317,13 +317,18 @@ def _args(**kw):
     return argparse.Namespace(**base)
 
 
-class _Tick:
-    def __init__(self, symbol="c2701.DCE", ask=2400.0, bid=2399.0, last=2400.0):
-        self.vt_symbol = symbol
-        self.ask_price = ask
-        self.bid_price = bid
-        self.last_price = last
-        self.datetime = datetime(2026, 11, 10, 21, 0, 1)
+def _Tick(symbol="c2701.DCE", ask=2400.0, bid=2399.0, last=2400.0):
+    """用真实的 vn.py TickData 构造:假对象曾使用不存在的 ask_price 字段,让 drill.py 的同款错误通过了全部单测。"""
+    from vnpy.trader.object import TickData
+    code, exchange = symbol.split(".")
+    return TickData(gateway_name="CTP", symbol=code, exchange=Exchange(exchange), datetime=datetime(2026, 11, 10, 21, 0, 1),
+                    last_price=last, ask_price_1=ask, bid_price_1=bid)
+
+
+def test_real_tick_data_has_level_one_prices_but_no_bare_ask_price():
+    tick = _Tick()
+    assert tick.ask_price_1 == 2400.0 and tick.bid_price_1 == 2399.0
+    assert not hasattr(tick, "ask_price") and not hasattr(tick, "bid_price")     # 防止有人再把假字段加回来
 
 
 class _Trade:

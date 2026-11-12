@@ -416,7 +416,7 @@ def scenario_latency(drill: Drill) -> DrillResult:
     if contract is None:
         return DrillResult("latency", False, f"没有拿到 {drill.symbol} 的合约信息,无法构造委托")
     pricetick = contract.pricetick or 1.0
-    buy_price = round_to(tick.ask_price or tick.last_price, pricetick)
+    buy_price = round_to(tick.ask_price_1 or tick.last_price, pricetick)
     if buy_price <= 0:
         return DrillResult("latency", False, "行情里没有可用的买价/最新价,无法构造委托")
 
@@ -556,10 +556,10 @@ def _close_position(drill: Drill, pricetick: float, baseline: int = 0) -> bool:
     price = 0.0
     if tick_entry is not None:
         tick = tick_entry[1]
-        # 平多(卖出)挂在**买一**(bid_price)上,主动打买盘成交;
-        # 平空(买入)挂在**卖一**(ask_price)上,主动打卖盘成交。
+        # 平多(卖出)挂在**买一**(bid_price_1)上,主动打买盘成交;
+        # 平空(买入)挂在**卖一**(ask_price_1)上,主动打卖盘成交。
         # 用错一边就会挂在对手价上等不到成交,演练变成"平仓超时"。
-        raw = tick.bid_price if direction == Direction.SHORT else tick.ask_price
+        raw = tick.bid_price_1 if direction == Direction.SHORT else tick.ask_price_1
         price = round_to(raw or 0, pricetick)
         if price <= 0:
             price = round_to(tick.last_price, pricetick)
