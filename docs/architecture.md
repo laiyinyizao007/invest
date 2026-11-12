@@ -26,7 +26,7 @@
 | fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
 | import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
 | SCHED 增量调度 | PART | `scripts/record_market_incremental.py` 提供有界、可重入的 `fetch_data.py` 短任务；由 `@goodandready/dsh-cron@0.3.43` 调度，长期前台任务被生命周期闸门明确排除 |
-| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；合约信息只能从交易前置查询，故采用受限交易前置连接（仅认证+查合约，发单/查账户硬性禁止，见 ADR 修订）；SimNow 第二套 7x24 已验证连接/合约/订阅/tick/优雅停止，但行情时间不可信、正式库 0 行；**第一套前置交易时段录制与国信测试环境均未验证** |
+| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 接入官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制（dummy worker 实测通过）；合约信息只能从交易前置查询，故采用受限交易前置连接（仅认证+查合约，发单/查账户硬性禁止，见 ADR 修订）；SimNow 第二套 7x24 已验证连接/合约/订阅/tick/优雅停止，但行情时间不可信、正式库 0 行；SimNow 第一套前置交易时段录制已验收（2026-11-12 夜盘，数据自洽、自动重连正常）；**DSH 重启实测与国信测试环境未验证，且有「连接成功但不订阅、状态仍为 connected」的缺陷待修** |
 
 ### 策略与研究
 | 节点 | 状态 | 证据 / 缺口 |
