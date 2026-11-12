@@ -59,14 +59,19 @@ def event(state_dir: Path, kind: str, **values: Any) -> None:
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _pid_alive_windows(pid: int) -> bool:
+ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
+
+
+def _pid_state_windows(pid: int) -> str:
     # os.kill(pid, 0) 在 Windows 上不是存活探测(会抛 WinError 87,且对已退出进程可能"成功"),
     # 必须用 OpenProcess + GetExitCodeProcess 判断。
+    # 只有 ERROR_INVALID_PARAMETER(进程不存在)才是确定的"已死";访问被拒/查询失败是"未知"。
     import ctypes
     from ctypes import wintypes
 
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
@@ -74,28 +79,35 @@ def _pid_alive_windows(pid: int) -> bool:
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
-        return False
+        return DEAD if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else UNKNOWN
     try:
         code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
+            return UNKNOWN
+        return ALIVE if code.value == STILL_ACTIVE else DEAD
     finally:
         kernel32.CloseHandle(handle)
 
 
-def pid_alive(pid: int) -> bool:
+def pid_state(pid: int) -> str:
     if pid <= 0:
-        return False
+        return DEAD
     if os.name == "nt":
-        return _pid_alive_windows(pid)
+        return _pid_state_windows(pid)
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
+    except ProcessLookupError:
+        return DEAD
+    except PermissionError:
+        return ALIVE  # 进程存在,只是不属于我们
     except OSError:
-        return False
-    return True
+        return UNKNOWN
+    return ALIVE
+
+
+def pid_alive(pid: int) -> bool:
+    """只有确定存活才返回 True;"未知"不当作存活放行(身份无法证明时 fail-closed)。"""
+    return pid_state(pid) == ALIVE
 
 
 def process_identity(pid: int, expected_profile: str | None = None) -> bool:
@@ -186,6 +198,11 @@ def start(state_dir: Path, profile: str | None = None) -> int:
     if current(state_dir):
         event(state_dir, "already_running", pid=read_json(files["state"])["pid"])
         return 0
+    recorded = read_json(files["state"]) or {}
+    if recorded and pid_state(int(recorded.get("pid", 0) or 0)) == UNKNOWN:
+        # 无法判断记录的进程是否还活着:宁可不录也不拉起第二个录制进程写同一个库
+        event(state_dir, "pid_state_unknown", pid=recorded.get("pid"))
+        return 2
     if not acquire_lock(files["lock"]):
         event(state_dir, "start_locked")
         return 2

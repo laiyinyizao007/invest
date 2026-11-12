@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 行情录制 wrapper 的 PID 探测改为三态（alive/dead/unknown）：Windows 访问被拒或查询失败不再被当成「已死」；记录的 PID 状态未知时 `start` 拒绝拉起第二个录制进程。新增 4 组测试，全量 867 通过。
 - 测试段使用登记 `scripts/segment_ledger.py` + `config/test_segment_usage.json`:`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复使用即拒绝(无强制开关,重置须手工改登记文件并补 ADR);15 分钟基准测试段补登记为已使用。`tests/conftest.py` 让所有测试使用临时登记文件。
 - 国信取证运行器每次运行向 `connection.json` 追加实际连接的环境、前置地址、BrokerID 与 AppID 掩码(不含账号密码授权码)。
 - 行情录制二次加固(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):`wrapper.lock` 改为 OS 文件锁(Windows `msvcrt.locking` / POSIX `flock`),持有进程退出即自动释放,不再依赖 PID 探测与 unlink;`CTP_RECORD_DATABASE_DIR` 必须是项目根下的单层独立目录(拒绝 `.vntrader`/`data`/项目根/多层/绝对路径——codex 审查发现 `archive/.vntrader` 经 `isolate_state(name)` 只取目录名会把 TEMP_DIR 重映射回主库)。新增测试含真实子进程并发持锁,全量 853 通过。G8:codex 轮已审并修复 1 Critical + 2 High;`codereview` 轮待做。

@@ -531,3 +531,52 @@ def test_database_dir_must_be_single_level_under_project_root(monkeypatch, path)
 
     with pytest.raises(ValueError, match="CTP_RECORD_DATABASE_DIR"):
         recorder.validate_config({**BASE_ENV, "CTP_RECORD_DATABASE_DIR": path})
+
+
+def test_pid_state_is_three_valued_on_real_processes():
+    import subprocess
+    import sys
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert wrapper.pid_state(child.pid) == wrapper.ALIVE
+    finally:
+        child.kill()
+        child.wait()
+    assert wrapper.pid_state(child.pid) == wrapper.DEAD
+    assert wrapper.pid_state(0) == wrapper.DEAD
+
+
+def test_pid_alive_is_false_when_state_unknown():
+    # 未知不能当成"存活"来放行,也不能当成"已死"来回收
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(wrapper, "pid_state", lambda pid: wrapper.UNKNOWN)
+    try:
+        assert wrapper.pid_alive(123) is False
+    finally:
+        mp.undo()
+
+
+def test_start_refuses_to_spawn_duplicate_when_recorded_pid_state_is_unknown(tmp_path, monkeypatch):
+    wrapper.write_json(wrapper.paths(tmp_path)["state"], {"pid": 4321, "profile": "simnow"})
+    monkeypatch.setattr(wrapper, "pid_state", lambda pid: wrapper.UNKNOWN)
+    monkeypatch.setattr(wrapper.subprocess, "Popen", lambda *a, **k: pytest.fail("状态未知时不得拉起第二个录制进程"))
+
+    assert wrapper.start(tmp_path) == 2
+    assert "pid_state_unknown" in (tmp_path / "events.ndjson").read_text(encoding="utf-8")
+
+
+def test_start_still_replaces_state_of_a_dead_pid(tmp_path, monkeypatch):
+    wrapper.write_json(wrapper.paths(tmp_path)["state"], {"pid": 4321, "profile": "simnow"})
+    monkeypatch.setattr(wrapper, "pid_state", lambda pid: wrapper.DEAD)
+    spawned = []
+
+    class Child:
+        pid = 777
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(wrapper.subprocess, "Popen", lambda *a, **k: spawned.append(1) or Child())
+    monkeypatch.setattr(wrapper, "STARTUP_GRACE", 0.0)
+
+    assert wrapper.start(tmp_path) == 0 and spawned
