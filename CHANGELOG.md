@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 研究沙盒 HTTP 网关 `scripts/research_gateway.py`(标准库实现,无新增依赖):路由白名单(data/candidates/backtest/gate/feedback/results)、Bearer 令牌(独立文件,`init-token` 生成且不覆盖)、先鉴权再路由、全局限流、请求体上限、重作业串行(忙则 409)、提交通道只写 pending 且绝不覆盖并先过静态筛查、请求体里的 `confirm` 被忽略(批准只能由本机 `approve` 触发)、反馈最多返回配置的 N 条且只含固定字段(不回传源码/路径/调用方自由文本)、启动自检拒绝带 CTP_* 环境变量的进程。`research_api` 抽出 CLI 与网关共用的作业函数(JobError)。实测:真实 socket 上 401/404/403 行为正确,提交→本机批准→回测→反馈全链路通;**未解决:毕昇容器访问不到宿主 127.0.0.1 上的网关**(`host.docker.internal` 解析到过期地址 172.20.10.5,连接超时),见 ADR 待决项。
 - 研究沙盒参数配置化 `config/research_sandbox.json` + `scripts/research_config.py`:迭代轮数、反馈条数、随机对照次数、各类超时、候选大小/命名规则、网关监听/限流/令牌路径、各目录、筛查追加清单;严格校验(未知键/越界/路径越界即拒绝运行),安全边界不可被配置调没。人工批准绑定代码哈希:新增 `research_api.py approve`,`backtest`/`gate` 只运行已批准的代码(代码一改即失效),`--confirm-reviewed` 变为「现在批准」的快捷方式。ADR `20261112-research-sandbox-config-and-approval`。
 - `optimize_15m.py --select-only`:样本外安全选参——训练段止于 2022-06-30(与 Walk-Forward W1 训练段末一致,有测试锁定),不评估验证/测试段,与 `--test` 互斥;输出的参数与 `--plateau-out` 文件交给 `gate`,滚动验证窗口才是真正的样本外。实测该流程选出 16/192/3.0,在 W1~W3 上样本外夏普 0.31(此前用重叠窗口选参的 24/192/3.0 为 1.39,其中含样本内成分),对随机对照 93.5 分位,往返 58 笔,门槛 6 项未过。
 - `optimize_15m.py --plateau-out FILE`:把训练段参数网格得分写成沙盒 `gate --plateau-file` 可读的 JSON(只含训练段)。`gate` 结果新增 `protocol_notice`:候选参数若参考过滚动验证窗口(2022-07 ~ 2023-12)就不再是样本外——`optimize_15m.py` 的训练/验证段与这些窗口重叠,用它的输出做 gate 只能算参考(实测其选出的 24/192/3.0 在这些窗口上夏普 1.39、对随机对照 100 分位,但往返仅 48 笔、不在高原,门槛 5 项未过)。

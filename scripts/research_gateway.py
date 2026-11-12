@@ -1,0 +1,322 @@
+"""研究沙盒 HTTP 网关(阶段四 4b):毕昇与确定性内核之间唯一的网络通道。
+
+只做适配,不写任何研究逻辑——全部转调 research_api 的作业函数。用标准库实现(无新增依赖),
+因为这是仅本机可达、低并发的薄网关;依赖越少,供应链与攻击面越小。
+
+端点即白名单(ROUTES);其余一律 404/405。**不存在**:下单、查账户、改风控、连 CTP、访问测试段、
+批准(approve)、写 approved/。批准只能由本机 CLI 触发(research_api.py approve),请求体里的 confirm 字段会被忽略。
+启动前自检:进程环境里不得有任何 CTP_* 变量(部署层 fail-closed,见 ADR bisheng-ai-researcher 安全约束 5)。
+令牌:独立文件(路径来自配置,默认 data/research/gateway.token),`init-token` 生成,永不覆盖。
+决议见 docs/adr/20261112-research-sandbox-config-and-approval.md 与 docs/plans/20261112-bisheng-integration-spec.md。
+"""
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import os
+import re
+import secrets
+import sys
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable
+
+import bootstrap
+import research_config as rc
+import research_sandbox as rs
+
+ROUTES = {
+    ("GET", "/research/data"),
+    ("POST", "/research/candidates"),
+    ("POST", "/research/backtest"),
+    ("POST", "/research/gate"),
+    ("GET", "/research/feedback"),
+    ("GET", "/research/results/{run_id}"),
+}
+CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
+MIN_TOKEN_LENGTH = 32
+MAX_TRACE_FAILURES = 8
+MAX_TRACE_TEXT = 300
+
+
+class GatewayError(RuntimeError):
+    pass
+
+
+def assert_clean_environment(env) -> None:
+    leaked = sorted(k for k in env if k.upper().startswith("CTP_"))
+    if leaked:
+        raise GatewayError("网关进程环境里不得有 CTP 段变量(部署层隔离),发现: " + ", ".join(leaked))
+
+
+def init_token(path: Path) -> str:
+    path = Path(path)
+    if path.exists():
+        raise GatewayError(f"令牌文件已存在,拒绝覆盖: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    path.write_text(token + chr(10), encoding="utf-8")
+    return token
+
+
+def load_token(path: Path) -> str:
+    try:
+        token = Path(path).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise GatewayError(f"令牌文件无法读取: {exc}") from exc
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise GatewayError(f"令牌过短(<{MIN_TOKEN_LENGTH}),请用 init-token 重新生成")
+    return token
+
+
+def _default_jobs() -> SimpleNamespace:
+    import research_api as api
+    return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job,
+                           plateau_from_data=api.plateau_from_data)
+
+
+class GatewayApp:
+    """纯逻辑的请求处理(不涉及 socket),便于单测。"""
+
+    def __init__(self, cfg: dict, paths: dict, token: str, jobs=None, clock: Callable[[], float] = time.monotonic):
+        self.cfg, self.paths, self.token = cfg, paths, token
+        self.jobs = jobs if jobs is not None else _default_jobs()
+        self.clock = clock
+        self._hits: deque[float] = deque()
+        self._busy = threading.Lock()
+        self._lock = threading.Lock()
+
+    # ---- 通用关口 ----
+    def _rate_limited(self) -> bool:
+        now = self.clock()
+        limit = self.cfg["gateway"]["rate_limit_per_minute"]
+        with self._lock:
+            while self._hits and now - self._hits[0] >= 60.0:
+                self._hits.popleft()
+            if len(self._hits) >= limit:
+                return True
+            self._hits.append(now)
+            return False
+
+    def _authorised(self, headers: dict) -> bool:
+        value = headers.get("authorization", "")
+        scheme, _, supplied = value.partition(" ")
+        return scheme == "Bearer" and hmac.compare_digest(supplied.encode("utf-8"), self.token.encode("utf-8"))
+
+    def handle(self, method: str, path: str, headers: dict, body: bytes) -> tuple[int, dict]:
+        headers = {k.lower(): v for k, v in headers.items()}
+        if self._rate_limited():
+            return 429, {"error": "请求过于频繁"}
+        if not self._authorised(headers):
+            return 401, {"error": "未授权"}          # 先鉴权再路由:不向未授权者泄露路由是否存在
+        if len(body) > self.cfg["gateway"]["max_body_bytes"]:
+            return 413, {"error": "请求体过大"}
+
+        route, params = self._match(method, path)
+        if route is None:
+            known_paths = {p.split("{")[0].rstrip("/") for _, p in ROUTES}
+            return (405, {"error": "方法不允许"}) if path.rstrip("/") in known_paths else (404, {"error": "不存在"})
+        data: dict = {}
+        if method == "POST":
+            try:
+                data = json.loads(body.decode("utf-8") or "null")
+            except (ValueError, UnicodeDecodeError):
+                return 400, {"error": "请求体不是合法 JSON"}
+            if not isinstance(data, dict):
+                return 400, {"error": "请求体必须是 JSON 对象"}
+        try:
+            return getattr(self, "_" + route)(data, params)
+        except rs.SandboxError as exc:
+            return 400, {"error": str(exc)}
+        except Exception as exc:                                    # 兜底:不回传异常细节(可能含本机路径)
+            print(f"网关内部错误: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 500, {"error": "内部错误"}
+
+    @staticmethod
+    def _match(method: str, path: str):
+        path = path.split("?", 1)[0]
+        if (method, path) in ROUTES:
+            return path.rsplit("/", 1)[-1], {}
+        prefix = "/research/results/"
+        if method == "GET" and path.startswith(prefix) and "/" not in path[len(prefix):] and path[len(prefix):]:
+            return "results", {"run_id": path[len(prefix):]}
+        return None, {}
+
+    # ---- 端点 ----
+    def _data(self, _data, _params):
+        return 200, {"data": self.jobs.data_report()}
+
+    def _candidates(self, data, _params):
+        name, source = data.get("name"), data.get("source")
+        if not isinstance(name, str) or not isinstance(source, str):
+            return 400, {"error": "name 与 source 必须是字符串"}
+        if not re.fullmatch(self.cfg["candidates"]["name_pattern"], name):
+            return 400, {"error": "文件名不符合命名规则"}
+        raw = source.encode("utf-8")
+        if len(raw) > self.cfg["candidates"]["max_source_bytes"]:
+            return 400, {"error": f"源码超过大小上限 {self.cfg['candidates']['max_source_bytes']} 字节"}
+        screening = self.cfg["screening"]
+        findings = rs.screen_source(source, screening["extra_forbidden_modules"], screening["extra_forbidden_calls"])
+        if findings:
+            return 400, {"error": "静态筛查未通过: " + "; ".join(findings)}
+        target = self.paths["pending_dir"] / name
+        self.paths["pending_dir"].mkdir(parents=True, exist_ok=True)
+        try:
+            with open(target, "xb") as stream:                      # x:绝不覆盖已有文件
+                stream.write(raw)
+        except FileExistsError:
+            return 409, {"error": "同名候选已存在,请换名"}
+        return 200, {"name": name, "sha256": rs.file_sha256(target)}
+
+    def _run_job(self, func, **kwargs):
+        import research_api as api
+        if not self._busy.acquire(blocking=False):
+            return 409, {"error": "已有作业在运行,请稍后重试"}
+        try:
+            return 200, func(**kwargs)
+        except api.JobError as exc:
+            if exc.code == api.EXIT_TIMEOUT:
+                return 504, {"error": exc.message}
+            if exc.code == api.EXIT_FAILED:
+                return 500, {"error": exc.message}
+            return (403 if exc.message == api.NEEDS_APPROVAL else 400), {"error": exc.message}
+        finally:
+            self._busy.release()
+
+    def _backtest(self, data, _params):
+        strategy, cls, key, segment = (data.get(k) for k in ("strategy", "class", "key", "segment"))
+        params = data.get("params", {})
+        if not all(isinstance(x, str) for x in (strategy, cls, key, segment)) or not CLASS_NAME.match(cls):
+            return 400, {"error": "strategy/class/key/segment 必须是字符串,class 必须是合法标识符"}
+        if key not in rs.KEYS or segment not in rs.SEGMENTS:
+            return 400, {"error": f"key 只能是 {list(rs.KEYS)},segment 只能是 {list(rs.SEGMENTS)}"}
+        if not isinstance(params, dict):
+            return 400, {"error": "params 必须是 JSON 对象"}
+        # confirm 固定为 False:批准只能由本机 CLI 触发,请求体里的同名字段被忽略
+        return self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
+                             params=params, confirm=False)
+
+    def _gate(self, data, _params):
+        strategy, cls, params = data.get("strategy"), data.get("class"), data.get("params", {})
+        if not isinstance(strategy, str) or not isinstance(cls, str) or not CLASS_NAME.match(cls):
+            return 400, {"error": "strategy/class 必须是字符串,class 必须是合法标识符"}
+        if not isinstance(params, dict):
+            return 400, {"error": "params 必须是 JSON 对象"}
+        plateau_data = data.get("plateau")                          # 只接受内联网格得分,绝不读取调用方给的路径
+        plateau = (False, "未提供 plateau:参数高原未评估,按未通过处理")
+        if plateau_data is not None:
+            if not isinstance(plateau_data, dict):
+                return 400, {"error": "plateau 必须是对象"}
+            plateau = self.jobs.plateau_from_data(plateau_data)
+        return self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
+                             random_runs=data.get("random_runs"), confirm=False)
+
+    def _results(self, _data, params):
+        run_id = params["run_id"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            return 400, {"error": "非法的 run_id"}
+        try:
+            return 200, rs.load_result(run_id, self.paths["results_dir"])
+        except rs.SandboxError:
+            return 404, {"error": "没有这条结果"}
+
+    def _feedback(self, _data, _params):
+        """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。"""
+        limit = self.cfg["feedback"]["limit"]
+        traces = []
+        for run_id in reversed(rs.list_results(self.paths["results_dir"])):
+            try:
+                result = rs.load_result(run_id, self.paths["results_dir"])
+            except rs.SandboxError:
+                continue
+            failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
+            diagnosis = result.get("diagnosis") or {}
+            weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
+            failed = bool(failures) if result.get("kind") == "gate" else weakest is not None
+            if not failed:
+                continue
+            cls = result.get("class")
+            traces.append({
+                "run_id": run_id, "kind": result.get("kind"), "key": result.get("key"),
+                "class": cls if isinstance(cls, str) and CLASS_NAME.match(cls) else None,
+                "weakest": weakest if isinstance(weakest, str) else None, "failures": failures,
+                "summary": str(diagnosis.get("summary", ""))[:MAX_TRACE_TEXT] if isinstance(diagnosis, dict) else "",
+            })
+            if len(traces) >= limit:
+                break
+        return 200, {"limit": limit, "traces": traces}
+
+
+def build_server(app: GatewayApp, host: str, port: int) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "research-gateway"
+        sys_version = ""
+
+        def _serve(self, method: str) -> None:
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            limit = app.cfg["gateway"]["max_body_bytes"]
+            body = self.rfile.read(length) if 0 < length <= limit else (b"x" * (limit + 1) if length > limit else b"")
+            status, payload = app.handle(method, self.path, dict(self.headers.items()), body)
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self._serve("GET")
+
+        def do_POST(self):
+            self._serve("POST")
+
+        def do_PUT(self):
+            self._serve("PUT")
+
+        def do_DELETE(self):
+            self._serve("DELETE")
+
+        def log_message(self, fmt, *args):                          # 访问日志不含请求体与令牌
+            print(f"{self.address_string()} {fmt % args}", file=sys.stderr)
+
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split(chr(10))[0])
+    parser.add_argument("command", choices=("serve", "init-token"))
+    args = parser.parse_args(argv)
+    try:
+        cfg = rc.load()
+        paths = rc.resolve_paths(cfg, bootstrap.ROOT)
+        if args.command == "init-token":
+            init_token(paths["token_file"])
+            print(f"令牌已生成: {paths['token_file']}(内容不在此打印;把它配置到毕昇工具的鉴权头里)")
+            return 0
+        assert_clean_environment(os.environ)
+        token = load_token(paths["token_file"])
+    except (rc.ConfigError, GatewayError) as exc:
+        print(f"拒绝: {exc}", file=sys.stderr)
+        return 2
+    app = GatewayApp(cfg, paths, token)
+    server = build_server(app, cfg["gateway"]["host"], cfg["gateway"]["port"])
+    print(f"研究沙盒网关监听 {cfg['gateway']['host']}:{cfg['gateway']['port']}", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

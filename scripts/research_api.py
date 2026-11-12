@@ -49,9 +49,75 @@ def refuse(message: str) -> int:
     return EXIT_REFUSED
 
 
-# ---------- data ----------
+# ---------- 作业(CLI 与网关共用) ----------
 
-def cmd_data(_args) -> int:
+def kill_tree(proc: subprocess.Popen) -> None:
+    if sys.platform == "win32":      # venv 的 python.exe 是启动器,须杀整棵进程树
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
+
+
+class JobError(Exception):
+    """作业被拒绝或失败。code 沿用 CLI 退出码;message 可安全回传给调用方(不含本机路径与密钥)。"""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def spawn_child(cmd: list[str], timeout: float) -> dict:
+    """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                            errors="replace", cwd=bootstrap.ROOT, env=rs.sandbox_env(os.environ))
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        proc.communicate()
+        raise JobError(EXIT_TIMEOUT, f"超过 {timeout}s,已终止")
+    line = next((ln for ln in reversed(stdout.splitlines()) if ln.startswith(CHILD_MARK)), None)
+    if proc.returncode != 0 or line is None:
+        # 详细输出只留在本机 stderr;回传给调用方的 message 不含子进程原始输出(可能含本机路径)
+        print("失败:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
+        raise JobError(EXIT_FAILED, "回测失败(详情见本机日志)")
+    return json.loads(line[len(CHILD_MARK):])
+
+
+NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
+
+
+def check_approval(path: Path, paths: dict, confirm: bool) -> None:
+    """人工批准检查,未通过抛 JobError。confirm=True(仅本机 CLI 可传)等价于「我现在读过并批准」,会记录哈希。"""
+    try:
+        if confirm:
+            rs.record_approval(path, paths["approvals_file"])
+        elif not rs.is_approved(path, paths["approvals_file"]):
+            raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc))
+
+
+def screen(path: Path, cfg: dict) -> list[str]:
+    return rs.screen_source(path.read_text(encoding="utf-8"), cfg["screening"]["extra_forbidden_modules"],
+                            cfg["screening"]["extra_forbidden_calls"])
+
+
+def require_clean(path: Path, cfg: dict) -> None:
+    findings = screen(path, cfg)
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+
+
+def resolve_strategy(strategy: str, cfg: dict) -> Path:
+    try:
+        return rs.resolve_pending(strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc))
+
+
+def data_report() -> list:
     import optimize
     import segment_ledger
     out = []
@@ -70,167 +136,147 @@ def cmd_data(_args) -> int:
             "test_segment_accessible_via_sandbox": False,
             "test_segment_consumed": consumed,
         })
-    emit(out)
-    return EXIT_OK
+    return out
 
 
-# ---------- backtest ----------
-
-def kill_tree(proc: subprocess.Popen) -> None:
-    if sys.platform == "win32":      # venv 的 python.exe 是启动器,须杀整棵进程树
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-    else:
-        proc.kill()
-
-
-def spawn_child(cmd: list[str], timeout: float) -> tuple[int, dict | None]:
-    """在受限环境(环境变量白名单)的子进程里运行,返回 (退出码, 子进程回传的 JSON)。失败时 JSON 为 None。"""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", cwd=bootstrap.ROOT, env=rs.sandbox_env(os.environ))
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc)
-        proc.communicate()
-        print(f"超过 {timeout}s,已终止", file=sys.stderr)
-        return EXIT_TIMEOUT, None
-    line = next((ln for ln in reversed(stdout.splitlines()) if ln.startswith(CHILD_MARK)), None)
-    if proc.returncode != 0 or line is None:
-        print("失败:\n" + (stderr or stdout)[-1500:], file=sys.stderr)
-        return EXIT_FAILED, None
-    return EXIT_OK, json.loads(line[len(CHILD_MARK):])
-
-
-NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
-
-
-def gate_approval(args, path: Path, paths: dict) -> str | None:
-    """人工批准检查。返回拒绝原因;None 表示放行。--confirm-reviewed 等价于「我现在读过并批准」,会记录哈希。"""
-    try:
-        if args.confirm_reviewed:
-            rs.record_approval(path, paths["approvals_file"])
-            return None
-        return None if rs.is_approved(path, paths["approvals_file"]) else NEEDS_APPROVAL
-    except rs.SandboxError as exc:
-        return str(exc)
-
-
-def screen(path: Path, cfg: dict) -> list[str]:
-    return rs.screen_source(path.read_text(encoding="utf-8"), cfg["screening"]["extra_forbidden_modules"],
-                            cfg["screening"]["extra_forbidden_calls"])
-
-
-def cmd_approve(args) -> int:
-    """本机人工批准:读过代码后执行。静态筛查不过的代码不予批准。外层没有任何端点能触发它。"""
+def approve_job(strategy: str) -> dict:
     cfg, paths = settings()
-    try:
-        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
-    except rs.SandboxError as exc:
-        return refuse(str(exc))
+    path = resolve_strategy(strategy, cfg)
     findings = screen(path, cfg)
     if findings:
-        print("拒绝批准: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
-        return EXIT_REFUSED
+        raise JobError(EXIT_REFUSED, "拒绝批准: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     try:
         sha = rs.record_approval(path, paths["approvals_file"])
     except rs.SandboxError as exc:
-        return refuse(str(exc))
-    emit({"approved": path.name, "sha256": sha})
-    return EXIT_OK
+        raise JobError(EXIT_REFUSED, str(exc))
+    return {"approved": path.name, "sha256": sha}
 
 
-def cmd_backtest(args) -> int:
+def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dict, timeout: float | None = None,
+                 confirm: bool = False) -> dict:
     cfg, paths = settings()
-    timeout = args.timeout if args.timeout is not None else cfg["backtest"]["timeout_seconds"]
+    timeout = timeout if timeout is not None else cfg["backtest"]["timeout_seconds"]
+    path = resolve_strategy(strategy, cfg)
     try:
-        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
-        start, end = rs.segment_window(args.key, args.segment)
-        params = json.loads(args.params)
-        if not isinstance(params, dict):
-            raise rs.SandboxError("--params 必须是 JSON 对象")
-    except (rs.SandboxError, json.JSONDecodeError) as exc:
-        return refuse(str(exc))
+        start, end = rs.segment_window(key, segment)
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc))
+    if not isinstance(params, dict):
+        raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
+    require_clean(path, cfg)
+    check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
-    findings = screen(path, cfg)
-    if findings:
-        print("拒绝: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
-        return EXIT_REFUSED
-    reason = gate_approval(args, path, paths)
-    if reason:
-        return refuse(reason)
 
-    cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", args.cls,
-           "--key", args.key, "--segment", args.segment, "--params", json.dumps(params)]
-    code, body = spawn_child(cmd, timeout)
-    if body is None:
-        return code
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
+           "--key", key, "--segment", segment, "--params", json.dumps(params)]
+    body = spawn_child(cmd, timeout)
 
     from risk.diagnosis import diagnose
     result = {
-        "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
-        "class": args.cls, "key": args.key, "segment": args.segment, "params": params,
+        "kind": "backtest", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "class": cls, "key": key, "segment": segment, "params": params,
         "window": [f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"], "ran_at": datetime.now().isoformat(timespec="seconds"),
         "stats": body["stats"], "diagnosis": diagnose(body["stats"], body["pnls"]),
     }
     result["run_id"] = rs.save_result(result, paths["results_dir"])
-    emit(result)
-    return EXIT_OK
+    return result
+
+
+def plateau_from_data(data: dict) -> tuple[bool, str]:
+    """由参数网格得分(cell + scores)判定是否在高原上。"""
+    try:
+        cell = tuple(int(x) for x in data["cell"])
+        scores = {(int(a), int(b), int(c)): float(v) for a, b, c, v in data["scores"]}
+    except (ValueError, KeyError, TypeError) as exc:
+        raise rs.SandboxError(f"参数高原数据无法解析: {exc}") from exc
+    from risk.plateau import parameter_on_plateau
+    ok = parameter_on_plateau(scores, cell)
+    return ok, "参数高原判定来自提供的网格得分" + ("" if ok else "(不在高原上)")
 
 
 def load_plateau(path: str | None) -> tuple[bool, str]:
-    """读取参数网格得分并判定是否在高原上;未提供时 fail-closed(按未通过处理)并说明原因。"""
+    """读取参数网格得分文件并判定;未提供时 fail-closed(按未通过处理)并说明原因。"""
     if not path:
         return False, "未提供 --plateau-file:参数高原未评估,按未通过处理"
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        cell = tuple(int(x) for x in data["cell"])
-        scores = {(int(a), int(b), int(c)): float(v) for a, b, c, v in data["scores"]}
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError) as exc:
         raise rs.SandboxError(f"--plateau-file 无法解析: {exc}") from exc
-    from risk.plateau import parameter_on_plateau
-    ok = parameter_on_plateau(scores, cell)
-    return ok, "参数高原判定来自 --plateau-file" + ("" if ok else "(不在高原上)")
+    ok, note = plateau_from_data(data)
+    return ok, note.replace("提供的网格得分", "--plateau-file")
 
 
-def cmd_gate(args) -> int:
+def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str], random_runs: int | None = None,
+             timeout: float | None = None, confirm: bool = False) -> dict:
     cfg, paths = settings()
-    timeout = args.timeout if args.timeout is not None else cfg["gate"]["timeout_seconds"]
-    random_runs = args.random_runs if args.random_runs is not None else cfg["gate"]["random_runs"]
-    try:
-        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
-        params = json.loads(args.params)
-        if not isinstance(params, dict):
-            raise rs.SandboxError("--params 必须是 JSON 对象")
-        low, high = rc.INT_BOUNDS[("gate", "random_runs")]
-        if not low <= random_runs <= high:
-            raise rs.SandboxError(f"--random-runs 必须在 [{low}, {high}] 内(配置边界)")
-        on_plateau, plateau_note = load_plateau(args.plateau_file)
-    except (rs.SandboxError, json.JSONDecodeError) as exc:
-        return refuse(str(exc))
+    timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"]
+    random_runs = random_runs if random_runs is not None else cfg["gate"]["random_runs"]
+    path = resolve_strategy(strategy, cfg)
+    if not isinstance(params, dict):
+        raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
+    low, high = rc.INT_BOUNDS[("gate", "random_runs")]
+    if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
+        raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    on_plateau, plateau_note = plateau
+    require_clean(path, cfg)
+    check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
-    findings = screen(path, cfg)
-    if findings:
-        print("拒绝: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
-        return EXIT_REFUSED
-    reason = gate_approval(args, path, paths)
-    if reason:
-        return refuse(reason)
 
-    cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", args.cls,
+    cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
            "--on-plateau", "1" if on_plateau else "0"]
-    code, body = spawn_child(cmd, timeout)
-    if body is None:
-        return code
+    body = spawn_child(cmd, timeout)
     result = {
         "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
-        "class": args.cls, "key": "C15", "params": params, "plateau_note": plateau_note,
+        "class": cls, "key": "C15", "params": params, "plateau_note": plateau_note,
         "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
     }
     result["run_id"] = rs.save_result(result, paths["results_dir"])
-    emit(result)
-    return EXIT_OK
+    return result
+
+
+def run_cli_job(func) -> int:
+    """CLI 适配:作业成功则打印 JSON,JobError 则把消息打到 stderr 并返回对应退出码。"""
+    try:
+        emit(func())
+        return EXIT_OK
+    except (JobError, rs.SandboxError) as exc:
+        code = getattr(exc, "code", EXIT_REFUSED)
+        message = getattr(exc, "message", str(exc))
+        print(("拒绝: " if code == EXIT_REFUSED else "") + message, file=sys.stderr)
+        return code
+
+
+def cmd_data(_args) -> int:
+    return run_cli_job(data_report)
+
+
+def cmd_approve(args) -> int:
+    return run_cli_job(lambda: approve_job(args.strategy))
+
+
+def cmd_backtest(args) -> int:
+    def job():
+        try:
+            params = json.loads(args.params)
+        except json.JSONDecodeError as exc:
+            raise JobError(EXIT_REFUSED, f"--params 不是合法 JSON: {exc}")
+        return backtest_job(strategy=args.strategy, cls=args.cls, key=args.key, segment=args.segment, params=params,
+                            timeout=args.timeout, confirm=args.confirm_reviewed)
+    return run_cli_job(job)
+
+
+def cmd_gate(args) -> int:
+    def job():
+        try:
+            params = json.loads(args.params)
+            plateau = load_plateau(args.plateau_file)
+        except json.JSONDecodeError as exc:
+            raise JobError(EXIT_REFUSED, f"--params 不是合法 JSON: {exc}")
+        return gate_job(strategy=args.strategy, cls=args.cls, params=params, plateau=plateau,
+                        random_runs=args.random_runs, timeout=args.timeout, confirm=args.confirm_reviewed)
+    return run_cli_job(job)
 
 
 def run_gate_child(args) -> int:
