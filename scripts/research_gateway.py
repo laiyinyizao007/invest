@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import hashlib
 import json
 import os
 import re
@@ -289,19 +290,26 @@ class GatewayApp:
                 hours = (status["next_release_in_seconds"] or 0) / 3600.0
                 return 429, {"error": f"滚动 {status['window_hours']} 小时内最多提交 {status['limit']} 个候选,"
                                       f"已用 {status['used']}/{status['limit']};最早一条约 {hours:.1f} 小时后释放", "iteration": status}
+            if target.exists():
+                return 409, {"error": "同名候选已存在,请换名"}              # 重名不占额度
+            sha = hashlib.sha256(raw).hexdigest()
+            window = self.cfg["iteration"]["window_hours"] * 3600.0
+            kept = [e for e in entries if now - e["at"] < window]
+            try:                                                    # 先记账再落文件:崩溃只会多扣一个额度,不会多放一个
+                self._write_ledger(kept + [{"at": now, "name": name, "sha256": sha}])
+            except OSError as exc:
+                return 500, {"error": f"提交账本写入失败,未保存候选: {exc}"}
             try:
                 with open(target, "xb") as stream:                  # x:绝不覆盖已有文件
                     stream.write(raw)
-            except FileExistsError:
-                return 409, {"error": "同名候选已存在,请换名"}
-            sha = rs.file_sha256(target)
-            window = self.cfg["iteration"]["window_hours"] * 3600.0
-            kept = [e for e in entries if now - e["at"] < window]
-            try:
-                self._write_ledger(kept + [{"at": now, "name": name, "sha256": sha}])
-            except OSError as exc:
-                target.unlink(missing_ok=True)                      # 记不上账就不留文件:否则额度形同虚设
-                return 500, {"error": f"提交账本写入失败,已撤回本次提交: {exc}"}
+            except (FileExistsError, OSError) as exc:
+                try:
+                    self._write_ledger(kept)                        # 文件没落成就把刚记的账退回
+                except OSError:
+                    pass
+                if isinstance(exc, FileExistsError):
+                    return 409, {"error": "同名候选已存在,请换名"}
+                return 500, {"error": f"候选文件写入失败: {exc}"}
         return 200, {"name": name, "sha256": sha}
 
     @staticmethod

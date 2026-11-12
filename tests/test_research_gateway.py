@@ -602,3 +602,41 @@ def test_server_sends_text_view_as_text_plain():
         server.server_close()
 
     assert resp.headers["Content-Type"].startswith("text/plain") and body.startswith("结论: 未通过")
+
+
+def test_ledger_write_failure_leaves_no_candidate_file(tmp_path):
+    app = make_app(tmp_path)
+
+    def boom(_entries):
+        raise OSError("disk full")
+
+    app._write_ledger = boom
+    status, body = submit(app, "a.py")
+
+    assert status == 500 and "账本" in body["error"]
+    assert not (tmp_path / "pending_strategies" / "a.py").exists()
+
+
+def test_candidate_file_write_failure_gives_the_quota_back(tmp_path, monkeypatch):
+    app = make_app(tmp_path, iteration={"max_iterations": 1, "window_hours": 24})
+    import builtins
+    real_open = builtins.open
+
+    def failing_open(path, mode="r", *a, **k):
+        if "xb" in mode:
+            raise PermissionError("denied")
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    status, _ = submit(app, "a.py")
+    monkeypatch.undo()
+
+    assert status == 500
+    assert submit(app, "b.py")[0] == 200            # 额度已退回,下一次仍可提交
+
+
+def test_duplicate_name_does_not_consume_quota(tmp_path):
+    app = make_app(tmp_path, iteration={"max_iterations": 2, "window_hours": 24})
+    assert submit(app, "a.py")[0] == 200
+    assert submit(app, "a.py")[0] == 409
+    assert submit(app, "b.py")[0] == 200
