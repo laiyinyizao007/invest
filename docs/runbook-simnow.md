@@ -53,6 +53,27 @@ docker compose run --rm --entrypoint python trader scripts/drill.py latency --co
 - `latency` 场景开的那 1 手仓**平不掉就是失败**:会发 FATAL 告警并以非零码退出 —— "演练通过"却把仓位留在
   模拟账户里,后面的对账与无人值守证据全部失真。跑完请核对模拟账户确实没有持仓。
 
+#### 演练实测记录（SimNow 第一套前置，2026-11-12 夜盘）
+
+| 场景 | 结果 |
+|---|---|
+| `overnight` | ✅ 21:00 之后的首根 Tick 归属下一交易日 |
+| `latency` | ✅ 成交→持仓回报 0.177 秒，1 手仓已平。**首次运行失败**：`drill.py` 读了不存在的 `TickData.ask_price`（应为 `ask_price_1`），单测的假 Tick 犯了同样的错，所以全绿却从未发现；已修并改用真实 `TickData` |
+| `tick-stale` | ✅ 行情断流 60 秒后看门狗告警 |
+| `disconnect` | ❌ **场景设计本身有缺陷，非系统缺陷**，见下 |
+| `daily-loss`、`hard-lock` | 未跑（排在 `disconnect` 之后） |
+
+**`disconnect` 的根因（用 `--trace` 埋点一次运行定位，退出码 139 / SIGSEGV）**：场景用 `td_api.close()` 模拟断线，而 vnpy_ctp 的 `close()` 是原生 `exit()`——**释放整个 API 对象**，不是「断开连接」。`close()` 本身 17 毫秒内正常返回；约 1.5 秒后 vn.py 事件引擎的定时器线程调用 `gateway.process_timer_event → query_position → reqQryInvestorPosition`，打到已释放的原生对象上，进程段错误。此前整套 `all` 运行里「进程在 disconnect 标题后悄悄消失」就是它（当时管道吞掉了退出码）。
+
+含义：
+1. 这个场景**永远无法回答**它想问的问题（断线是否告警、CTP 客户端是否自动重连）——API 已被释放，不会再有回调，更不会重连。
+2. 生产路径不受影响：`runtime.shutdown()` 是先停事件引擎再关网关，没有「释放后继续跑定时器」的情形。
+3. 要真正验证断线与重连，需要**真的切断网络**而不是释放 API。可行做法：演练在容器里跑，由宿主机对该容器执行 `docker network disconnect` → 等待 → `docker network connect`，原生 API 会看到真实的 TCP 断开并自行重连。该改造尚未做，`disconnect` 场景在改造前应视为「未验证」，不得计入阶段一验收。
+
+另一次失败（`disconnect` 单独重跑，登录后 300 秒收不到合约表，退出码 3）是**重复登录限流**：上一次登出后立即重新登录会卡住，间隔 ≥5 分钟正常；与行情录制里发现的同一现象。
+
+**排查工具**：`drill.py --trace FILE`（默认关闭）逐行 fsync 记录退出钩子、致命信号转储、释放后 API 调用探针、周期快照与登录间隔；`--trace-skip-close` 为控制运行。
+
 #### `scripts/unattended_report.py` —— 无人值守验收的证据
 ```bash
 python scripts/unattended_report.py --report          # 生成每日证据表 → docs/unattended-log.md

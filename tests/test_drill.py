@@ -1129,3 +1129,72 @@ def test_an_unconfigured_notification_channel_is_not_reported_as_a_failed_delive
     summary = rec.delivery_summary()
     assert summary["通知渠道已配置"] is False
     assert summary["发出"] == 1 and summary["底层接受"] == 0
+
+
+# ---------- 诊断埋点(--trace):默认关闭;开启后 disconnect 的各检查点都落盘 ----------
+
+def _traced_drill(tmp_path, **kw):
+    import drill_trace
+    drill = _make_drill(**kw)
+    drill.trace = drill_trace.TraceLog(tmp_path / "t.log")
+    return drill
+
+
+def test_disconnect_with_trace_records_every_checkpoint_in_order(tmp_path):
+    drill = _traced_drill(tmp_path)
+    drill.runtime.gateway.td_api.on_close = lambda: drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
+
+    result = d.scenario_disconnect(drill)
+
+    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    order = ["disconnect_before_close", "close_begin", "api_close_called", "close_returned", "api_marked_released",
+             "wait_disconnect_alert_done", "wait_reconnect_done"]
+    positions = [text.index(name) for name in order]
+    assert positions == sorted(positions) and result.ok is True
+    assert drill.runtime.gateway.td_api.closed is True            # 探针只记录,原函数照常执行
+
+
+def test_disconnect_trace_flags_calls_into_the_released_api(tmp_path):
+    drill = _traced_drill(tmp_path)
+    api = drill.runtime.gateway.td_api
+    api.query_account = lambda: "acct"                            # 假 API 上补一个会被探针包装的方法
+
+    def on_close():
+        drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
+        api.query_account()                                       # 释放之后窗口内有人又调用了 API
+
+    api.on_close = on_close
+    d.scenario_disconnect(drill)
+    drill.runtime.gateway.td_api.query_account()                  # 窗口结束后再调一次
+
+    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    assert "call_after_release" in text and "method=query_account" in text
+
+
+def test_trace_skip_close_is_a_control_run_that_never_releases_the_api(tmp_path):
+    drill = _traced_drill(tmp_path)
+    drill.args.trace_skip_close = True
+
+    d.scenario_disconnect(drill)
+
+    text = (tmp_path / "t.log").read_text(encoding="utf-8")
+    assert drill.runtime.gateway.td_api.closed is False
+    assert "close_begin skipped=True" in text and "api_marked_released" not in text
+
+
+def test_disconnect_without_trace_leaves_the_api_unwrapped():
+    drill = _make_drill()
+    drill.runtime.gateway.td_api.on_close = lambda: drill.notifier.send("ERROR", "网关连接断开", "交易服务器连接断开")
+
+    d.scenario_disconnect(drill)
+
+    assert "close" not in vars(drill.runtime.gateway.td_api)       # 没有任何包装
+    assert drill.trace.enabled is False
+
+
+def test_trace_flag_parses_and_defaults_to_off():
+    import argparse
+    import re
+    src = (Path(d.__file__)).read_text(encoding="utf-8")
+    assert re.search(r'add_argument\("--trace",\s*default=""', src)
+    assert "--trace-skip-close" in src

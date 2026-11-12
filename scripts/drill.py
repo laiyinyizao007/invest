@@ -44,6 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap
+import drill_trace
 
 # 演练的状态目录与实盘完全分开，且必须早于 vn.py logger 导入。
 DRILL_ROOT = bootstrap.ROOT / ".vntrader_drill"
@@ -239,7 +240,8 @@ class RecordingNotifier:
 class Drill:
     """一次演练的上下文:运行时 + 观察器。"""
 
-    def __init__(self, args, env: dict[str, str], symbol: str, notifier) -> None:
+    def __init__(self, args, env: dict[str, str], symbol: str, notifier, trace=None) -> None:
+        self.trace = trace if trace is not None else drill_trace.NULL_TRACE
         self.args = args
         self.env = env
         self.symbol = symbol
@@ -284,17 +286,55 @@ class Drill:
         engine.register(EVENT_TICK, self._on_tick)
         engine.register(EVENT_TRADE, self._on_trade)
         engine.register(EVENT_POSITION, self._on_position)
-        code = self.runtime.start()
+        trace = self.trace
+        gap = None
+        snapshot = None
+        if trace.enabled:
+            gap = drill_trace.LoginGap(Path(trace.path).with_name("login_gap.json"))
+            trace.write("login_gap", seconds_since_last_logout=gap.seconds_since_last_logout())
+            snapshot = drill_trace.PeriodicSnapshot(trace, "startup", self._startup_sample, interval=10.0)
+            snapshot.start()
+            self._startup_began = time.monotonic()
+        try:
+            code = self.runtime.start()
+        finally:
+            if snapshot is not None:
+                snapshot.stop()
+        trace.write("start_result", ok=code is None, exit_code=code, milestones=self._milestone_names())
         return code is None
+
+    def _milestone_names(self) -> str:
+        milestones = getattr(self.runtime, "_milestones", {}) or {}
+        return ",".join(f"{k}={v:.1f}s" for k, v in sorted(milestones.items(), key=lambda kv: kv[1]))
+
+    def _startup_sample(self) -> dict:
+        """启动阶段每 10 秒一次:合约表条数是否在增长,用来区分「登录后收不到合约表」与别的问题。"""
+        runtime = self.runtime
+        main = getattr(runtime, "main", None)
+        contracts = len(main.get_all_contracts()) if main is not None else -1
+        return {"elapsed_s": round(time.monotonic() - getattr(self, "_startup_began", time.monotonic()), 1),
+                "contracts": contracts, "conn_state": dict(getattr(runtime, "connection_state", {}) or {}),
+                "milestones": self._milestone_names()}
 
     def stop(self) -> None:
         if self.runtime is not None:
+            trace = self.trace
+            trace.write("drill_stop_enter")
             self.runtime.request_stop(EXIT_OK, "演练结束")
+
+            def shutdown_with_trace() -> None:
+                trace.write("shutdown_begin")
+                self.runtime.shutdown()
+                trace.write("shutdown_end")
+
             # 关闭可能不返回:CTP 网关的 close() 会 join 原生线程,断连时可能长时间挂着。
             # 放到后台线程里限时等,剩下的交给 __main__ 的 os._exit 兜底。
-            thread = threading.Thread(target=self.runtime.shutdown, daemon=True)
+            thread = threading.Thread(target=shutdown_with_trace, daemon=True)
             thread.start()
             thread.join(10.0)
+            trace.write("drill_stop_exit", shutdown_still_running=thread.is_alive())
+            if trace.enabled:
+                drill_trace.LoginGap(Path(trace.path).with_name("login_gap.json")).mark_logout()
 
     # ---------- 观察 ----------
 
@@ -609,6 +649,12 @@ def scenario_tick_stale(drill: Drill) -> DrillResult:
     return DrillResult("tick-stale", True, "行情断流后收到了看门狗告警", details)
 
 
+# 埋点探针要包装的方法:只包装存在的;不存在的静默跳过
+TD_PROBE_METHODS = ("close", "query_account", "query_position", "query_order", "query_trade", "send_order", "cancel_order",
+                    "reqUserLogout", "reqQryInstrument", "reqQryTradingAccount", "reqQryInvestorPosition")
+GATEWAY_PROBE_METHODS = ("close", "query_account", "query_position", "send_order", "cancel_order", "subscribe")
+
+
 def scenario_disconnect(drill: Drill) -> DrillResult:
     """交易连接断开 → 是否告警、是否自动重连(运行手册第 5 节第 4 项)。
 
@@ -618,9 +664,43 @@ def scenario_disconnect(drill: Drill) -> DrillResult:
     runtime = drill.runtime
     assert runtime is not None
     since = drill.notifier.mark()             # 只认本次断线之后的告警
-    runtime.gateway.td_api.close()
-    disconnect_alert = drill.notifier.wait_for("连接断开", drill.args.disconnect_timeout, since)
-    reconnected = drill.notifier.wait_for("登录成功", drill.args.reconnect_timeout, since)
+    trace = drill.trace
+    td_api = runtime.gateway.td_api
+    td_probe = gateway_probe = snapshot = None
+    if trace.enabled:
+        # 埋点:关闭前后的状态、已释放 API 的再次调用、所有线程的周期栈转储(见 drill_trace.py 的假设表)
+        td_probe = drill_trace.ReleasedApiProbe(trace, td_api, "td", TD_PROBE_METHODS)
+        gateway_probe = drill_trace.ReleasedApiProbe(trace, runtime.gateway, "gateway", GATEWAY_PROBE_METHODS)
+
+        def sample() -> dict:
+            md_api = getattr(runtime.gateway, "md_api", None)
+            return {"td_connect": getattr(td_api, "connect_status", None), "td_login": getattr(td_api, "login_status", None),
+                    "md_connect": getattr(md_api, "connect_status", None), "md_login": getattr(md_api, "login_status", None),
+                    "conn_state": dict(runtime.connection_state), "alerts_since": len(drill.notifier.find("", since)),
+                    "threads": len(drill_trace.thread_names())}
+
+        snapshot = drill_trace.PeriodicSnapshot(trace, "disconnect", sample, interval=10.0)
+        trace.write("disconnect_before_close", **sample())
+        snapshot.start()
+        drill_trace.dump_threads_later(trace, 20.0, repeat=True)
+    skip_close = bool(getattr(drill.args, "trace_skip_close", False))
+    began = time.monotonic()
+    trace.write("close_begin", skipped=skip_close)
+    if not skip_close:
+        td_api.close()
+    trace.write("close_returned", seconds=round(time.monotonic() - began, 3), skipped=skip_close)
+    if td_probe is not None and not skip_close:
+        td_probe.mark_released()
+        gateway_probe.mark_released()
+    try:
+        disconnect_alert = drill.notifier.wait_for("连接断开", drill.args.disconnect_timeout, since)
+        trace.write("wait_disconnect_alert_done", got=disconnect_alert is not None)
+        reconnected = drill.notifier.wait_for("登录成功", drill.args.reconnect_timeout, since)
+        trace.write("wait_reconnect_done", got=reconnected is not None)
+    finally:
+        if snapshot is not None:
+            snapshot.stop()
+            drill_trace.cancel_thread_dumps()
 
     def fmt_state() -> str:
         state = getattr(runtime, "connection_state", None)
@@ -888,6 +968,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--disconnect-timeout", type=float, default=60.0, help="等待断线告警的最长时间(秒)")
     parser.add_argument("--lock-timeout", type=float, default=30.0, help="等待熔断/硬锁定告警的最长时间(秒)")
     parser.add_argument("--overnight-timeout", type=float, default=3600.0, help="等待夜盘首根 Tick 的最长时间(秒)")
+    parser.add_argument("--trace", default="", metavar="FILE",
+                        help="诊断埋点写到此文件(逐行 fsync;退出钩子/致命信号转储/已释放 API 探针/周期快照)。默认关闭")
+    parser.add_argument("--trace-skip-close", action="store_true",
+                        help="控制运行:disconnect 场景不真的调用 td_api.close(),用来判断静默退出是否与它有关(需配合 --trace)")
     parser.add_argument("--confirm-simnow", action="store_true", help="确认目标是 SimNow 模拟盘")
     parser.add_argument("--allow-any-address", action="store_true",
                         help="⚠ 危险:交易服务器地址不在已知 SimNow 地址表里时强制放行,可能连上真实资金账户")
@@ -948,7 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
     from run_headless import build_notifier
 
     notifier = RecordingNotifier(build_notifier(env))
-    drill = Drill(args, env, symbol, notifier)
+    global _TRACE_SESSION
+    _TRACE_SESSION = drill_trace.setup(args.trace)
+    drill = Drill(args, env, symbol, notifier, trace=_TRACE_SESSION.trace if _TRACE_SESSION else None)
     results: list[DrillResult] = []
     # 审计记录:用了逃生舱(目标地址不在 SimNow 白名单)必须留在结果文件里,不能只打在终端上
     warnings: list[str] = []
@@ -1012,6 +1098,9 @@ SCENE_FUNCS: dict[str, Callable[[Drill], DrillResult]] = {
 }
 
 
+_TRACE_SESSION = None
+
+
 if __name__ == "__main__":
     code = 1
     try:
@@ -1025,4 +1114,8 @@ if __name__ == "__main__":
     finally:
         sys.stdout.flush()
         sys.stderr.flush()
+        if _TRACE_SESSION is not None:
+            # 先记「Python 走到了最后一步」,再关会话;若 trace 里没有这行,说明进程是在这之前被原生崩溃/外部终止带走的
+            _TRACE_SESSION.trace.write("main_exit", code=code, meaning=drill_trace.describe_exit_code(code))
+            _TRACE_SESSION.close()
         os._exit(code)
