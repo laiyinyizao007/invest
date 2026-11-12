@@ -180,10 +180,15 @@ flowchart TB
 - 验收:live-readiness B 段三项全勾;废单关键词表 ≥6 条实测;心跳连续 5 交易日无中断。
 - 退出:B 段全勾 → 阶段二;若熔断/看门狗实跑暴露 bug,修复后 **5 天计数从零重新开始**(不折算)。
 
-**阶段二:多品种与调度自动化(阶段一退出后启动;C 段人工认证并行)**
-- 内容:增量调度器上 VPS cron(fetch_data 每日增量,消除 1023 根断档风险);主力换月自动化(fail-closed 校验,见 §2.5);交易日历/节假日模块;回测成本换期货公司真实费率(依赖 C 段拿到费率表);多品种复权连续数据扩充(阶段三触发条件①的积累)。
-- 验收:调度器连续 4 周无断档;换月校验在至少一次真实换月窗口 fail-closed 拦截验证;成本口径更新并重跑基准(**结论可能是负面上修,如实记录,不回头改门槛**)。
-- 退出:技术债表中「调度/换月/节假日/成本」四条标记已处理。
+**阶段一并行数据基础设施副线（2026-11-11 起，与阶段一主线并行）**
+- 内容:官方 vn.py DataRecorder 录制 C/MA 具体合约的 Tick 与 1 分钟 Bar，写入独立 `.vntrader_record/database.db`;增量入口复用 `scripts/fetch_data.py`，由 `scripts/record_market_incremental.py` 提供有界、可重入短任务，再由 DSH cron 触发 `ensure`/`watchdog`。该副线不改变阶段一 SimNow 交易验收主线，也不构成策略准入证据。
+- 生命周期边界:`@goodandready/dsh-cron@0.3.43` 的外部运行器有界超时，不能直接承载长期 DataRecorder；采用 wrapper 独立 child。DSH Desktop 关闭期间不承诺继续录制。详见 `docs/adr/20261111-market-recording-and-dsh-orchestration.md`。
+- 验收:先完成 dummy worker 的 Windows 进程树、停止、PID 重用、DSH 重启/关闭实测；再做 SimNow/国信测试 profile 的离线自检和明确授权后的行情验收。未完成实测前不得宣称常驻录制已验收。
+
+**阶段二:多品种与交易工程自动化(阶段一退出后启动;C 段人工认证并行)**
+- 内容:主力换月自动化(fail-closed 校验,见 §2.5);交易日历/节假日模块;回测成本换期货公司真实费率(依赖 C 段拿到费率表);多品种复权连续数据消费与扩充(阶段三触发条件①的积累)。
+- 验收:换月校验在至少一次真实换月窗口 fail-closed 拦截验证;成本口径更新并重跑基准(**结论可能是负面上修,如实记录,不回头改门槛**)。阶段一副线的连续调度证据作为输入，但不替代本阶段工程验收。
+- 退出:技术债表中「换月/节假日/成本」三条标记已处理。
 
 **阶段三:月度滚动寻优引擎化 + 研究沙盒 API 固化(触发条件驱动,不排日期)**
 - 进入条件(2026-11-10 共识,三条件同时满足):①≥2 个品种的复权连续数据可用;②实盘运行且产生月度换参需求;③分钟/日线数据厚度支持新窗口。若长期不满足,本阶段保持规划位不动——**这本身是正确状态,不是停滞**。
@@ -240,10 +245,10 @@ flowchart TB
 | 反向控制 /stop_all | `notify/webhook.py` 增加接收侧 + `trading/runtime.py` 暴露停机钩子 + **新 ADR**(指令来源校验/白名单/误触防护) | 阶段三;前置 = webhook 真机验证通过 + 无人值守常态化 | 要点梳理 §5.3 |
 | MetaRouter 状态路由 | `strategies/` 内新策略类(路由器本身就是一个 CtaTemplate 策略,不建 router/ 目录) | ≥2 个通过晋级门槛且风格相反的策略并存 | 要点梳理 §6.5 |
 | Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
-| 增量调度器 | VPS cron / systemd timer,不写 Python 常驻进程(KISS) | 阶段一无人值守 ≥5 天达标后,分钟线断档风险成为现实约束 | §4「缺自动化调度」 |
+| 增量调度器 | DSH `@goodandready/dsh-cron` 短任务 `ensure`/`watchdog`，不写 Python 常驻调度器；生命周期边界见 `docs/adr/20261111-market-recording-and-dsh-orchestration.md` | 阶段一并行副线立即建设；先完成 dummy worker Windows 生命周期实测 | §4「缺自动化调度」/Issue #13 |
 | 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
 | 主力换月自动化 | 扩展 `scripts/build_continuous.py` 的 rolls 派生逻辑(换月数据实际在这里生成,不在 `import_minute.py`)→ runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
-| CTP 行情自录 | vnpy DataRecorder 挂到 runtime 或独立无头进程 | 新候选需要新样本外数据、且购买数据未更新时;**与补购分钟线二选一或并行,由届时数据缺口形状决定** | 要点梳理 §3.1 |
+| CTP 行情自录 | 官方 `vnpy_datarecorder` 独立无头进程，数据写 `.vntrader_record/database.db`；由 wrapper + DSH 短任务 `ensure`/`watchdog` 管理，不挂交易 runtime | 阶段一并行副线；先完成生命周期实测，再做 SimNow/国信测试 profile 验收 | 要点梳理 §3.1 / Issue #13 |
 
 **接受的风险**(有意不设规划位,避免虚假承诺):本地止损依赖进程存活——vn.py 停止单是引擎本地触发的,进程退出即失效;缓解 = 固定 1 手轻仓 + 行情假死看门狗 + 进程退出发 FATAL。研究资料未提供交易所端条件单的可行方案,标记为接受的风险而非规划位。
 

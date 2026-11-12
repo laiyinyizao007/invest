@@ -16,6 +16,8 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 补齐行情录制与增量调度的有界任务 `scripts/record_market_incremental.py`、离线生命周期测试 `tests/test_recording_tools.py` 和运行手册 `docs/runbook-market-recording.md`；Windows dummy worker 实测已通过并修复 `pid_alive` 在 Windows 上的误判（旧实现使 `ensure`/`watchdog` 重复拉起、`stop` 永远拒绝）；DSH 重启行为与授权行情端到端实测仍待完成（Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)）。
+- 行情录制与 DSH 调度生命周期闸门(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):核对 `@goodandready/dsh-cron@0.3.43` 的有限超时、Windows 进程树终止和非 detached spawn 语义，锁定官方 `vnpy_datarecorder` + 独立 `.vntrader_record/database.db` + 短任务 `ensure`/`watchdog` + wrapper 方案；生命周期 ADR 见 [`docs/adr/20261111-market-recording-and-dsh-orchestration.md`](docs/adr/20261111-market-recording-and-dsh-orchestration.md)，本机 dummy worker 实测仍待完成。
 - 文档状态对齐(Issue [#11](https://github.com/laiyinyizao007/invest/issues/11)):新增 `docs/architecture.md` §0「目标 vs 现状」逐节点实现矩阵
   (IMPL/PART/PLAN + 证据文件路径 + 实现比例 + 依赖顺序),作为"实现了多少"的单一出处;
   roadmap 目标图的 `DRDOC` 改回规划位(演练从未实跑、该文档尚不存在)、`PG`(晋级门槛)三条边改回规划位(门槛**未接入优化脚本**),

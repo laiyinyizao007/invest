@@ -3,6 +3,7 @@ vnpy_ctp
 vnpy_ctastrategy
 vnpy_ctabacktester
 vnpy_sqlite
+vnpy_datarecorder==1.1.1
 vnpy_riskmanager
 vnpy_algotrading
 vnpy_spreadtrading

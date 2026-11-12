@@ -25,8 +25,8 @@
 | bootstrap | IMPL | `scripts/bootstrap.py`(工作目录、`TZ`、`.vntrader`);提供 `isolate_state()` 与 `load_env()`，入口按需在 vn.py 日志导入前调用 |
 | fetch_data | IMPL | `scripts/fetch_data.py`(按时间戳去重,可重复跑);**无调度** |
 | import_minute / derived | IMPL | `scripts/import_minute.py`、`scripts/build_continuous.py`(换月派生在这里) |
-| SCHED 增量调度 | PLAN | 无 cron / 计划任务 |
-| RECC CTP tick 录制 | PLAN | 无 `DataRecorder` |
+| SCHED 增量调度 | PART | `scripts/record_market_incremental.py` 提供有界、可重入的 `fetch_data.py` 短任务；由 `@goodandready/dsh-cron@0.3.43` 调度，长期前台任务被生命周期闸门明确排除 |
+| RECC CTP tick 录制 | PART | `scripts/record_market_data.py` + `scripts/record_market_data_wrapper.py` 已实现官方 `vnpy_datarecorder`、独立 `.vntrader_record/database.db` 和本地生命周期控制；Windows dummy worker 与 SimNow/国信实测仍待完成 |
 
 ### 策略与研究
 | 节点 | 状态 | 证据 / 缺口 |
@@ -131,8 +131,9 @@ flowchart TB
 | `data/state/pause_trading.flag` | `scripts/pause_trading.py` | 守卫规则每次 `check_allowed` | — |
 | `data/state/promotion_approval.json` | `scripts/record_promotion.py`(仅晋级门槛全过) | `scripts/run_headless.py` 连接生产 API 前 | 任何自动流程不得代写 |
 | `data/state/heartbeat` | 运行时(无头) | 容器健康检查 | — |
-| `.vntrader/` | vn.py 引擎、`bootstrap.py` 建目录 | 回测、CTA | — |
-| `.vntrader_drill/` | `scripts/drill.py` | 演练自身 | 实盘 |
+| `.vntrader/` | vn.py 引擎、`bootstrap.py` 建目录 | 回测、CTA | 录制入口 |
+| `.vntrader_record/` | 官方 DataRecorder 录制入口（规划实现） | 录制状态与独立 database.db | 回测、交易运行时、演练、取证 |
+| `.vntrader_drill/` | `scripts/drill.py` | 演练自身 | 实盘、录制入口 |
 | `.vntrader_brokertest/` | `scripts/broker_test.py` | 取证自身 | 实盘 |
 | `data/broker_test/<时间戳>/` | `scripts/broker_test.py`、`broker_report.py` | 报告生成 | 不入库(含测试账号);国信模板同样不入库 |
 | `docs/simnow-drills.md`、`docs/reject-texts-simnow.md`、`docs/unattended-log.md` | `drill.py`/`collect_reject_texts.py`/`unattended_report.py` 按标记区重写 | 人读 | 手工改标记区内的内容;`simnow-drills.md` **尚不存在**——演练还没实跑,首次运行时由脚本生成 |
