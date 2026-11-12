@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from risk.promotion_gate import GateThresholds
+
 MAX_FAILURES = 10
 MAX_LINE = 240
 
@@ -48,7 +50,7 @@ def _selection_lines(selection: Any, params: Any) -> list[str]:
     if not isinstance(selection, dict):
         return []
     valid, total = selection.get("valid_cells"), selection.get("n_cells")
-    lines = [f"选参: 在 {'~'.join(selection.get('window') or ['?', '?'])} 扫描 {valid}/{total} 个有效格子"
+    lines = [f"选参: 在 {'~'.join(str(x) for x in (selection.get('window') or ['?', '?']))} 扫描 {valid}/{total} 个有效格子"
              + (f",选出 {_params(params)}" if params else ""),
              "参数高原: " + ("在高原上" if selection.get("on_plateau") else "不在高原上")]
     if selection.get("note"):
@@ -90,7 +92,7 @@ def _render(r: dict) -> str:
     if metrics:
         lines.append(f"样本外: 夏普 {_num(metrics.get('oos_sharpe'))},往返 {metrics.get('round_trips', '?')} 笔,"
                      f"最大回撤 {_num(metrics.get('max_drawdown_pct'), '.1f')}%({_num(metrics.get('max_drawdown_yuan'), '.0f')} 元)")
-        lines.append(f"对照: 超过随机入场的 {_num(metrics.get('random_entry_percentile'), '.1f')}%(门槛 95%),"
+        lines.append(f"对照: 超过随机入场的 {_num(metrics.get('random_entry_percentile'), '.1f')}%(门槛 {GateThresholds.min_random_percentile:.0f}%),"
                      f"成本翻倍后夏普 {_num(metrics.get('stress_sharpe'))}")
     if failures:
         lines.append("未通过的门槛:")

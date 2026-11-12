@@ -526,3 +526,15 @@ def test_review_refuses_paths_outside_pending(tree, capsys):
     (tree / "evil.py").write_text("x = 1\n", encoding="utf-8")
 
     assert run("review", "--strategy", "../evil.py") == api.EXIT_REFUSED
+
+
+def test_review_refuses_when_file_changes_while_user_is_reading(tree):
+    path = make_strategy(tree, "class S:\n    x = 1\n")
+
+    def swap_then_say_yes(prompt):
+        path.write_text("class S:\n    x = 2\n", encoding="utf-8")      # 阅读期间被换成没看过的内容
+        return "y"
+
+    with pytest.raises(api.JobError):
+        api.review_job("s.py", input_fn=swap_then_say_yes, write=lambda _: None)
+    assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")

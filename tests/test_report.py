@@ -92,3 +92,15 @@ def test_report_is_deterministic_and_json_safe():
     a, b = render_report(evaluate_result()), render_report(evaluate_result())
 
     assert a == b and json.loads(json.dumps({"report": a}, ensure_ascii=False))["report"] == a
+
+
+def test_selection_window_with_non_string_items_does_not_break_the_whole_report():
+    import datetime
+    text = render_report(evaluate_result(selection={"n_cells": 4, "valid_cells": 2, "on_plateau": True,
+                                                    "window": [datetime.date(2020, 7, 22), 20220630]}))
+    assert "报告生成失败" not in text and "2020-07-22~20220630" in text and "未通过的门槛" in text
+
+
+def test_random_entry_threshold_in_report_follows_the_gate_default():
+    from risk.promotion_gate import GateThresholds
+    assert f"门槛 {GateThresholds.min_random_percentile:.0f}%" in render_report(evaluate_result())

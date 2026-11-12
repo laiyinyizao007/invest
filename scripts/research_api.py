@@ -204,6 +204,8 @@ def review_job(strategy: str, input_fn=None, write=print) -> dict:
         if answer.strip().lower() != "y":
             write("未批准。")
             return {"approved": False, "sha256": sha, "name": path.name}
+        if rs.file_sha256(path) != sha:                       # 批准必须绑定到用户刚读过的内容
+            raise JobError(EXIT_REFUSED, "文件在阅读期间被改动,未批准;请重新运行 review")
         rs.record_approval(path, paths["approvals_file"])
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
