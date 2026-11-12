@@ -20,6 +20,8 @@ import bootstrap
 
 SCRIPT = Path(__file__).with_name("record_market_data.py")
 DEFAULT_STATE = bootstrap.ROOT / ".ops" / "recording"
+STARTUP_GRACE = 3.0              # 拉起后观察多久,期间退出视为启动失败
+HEARTBEAT_STALE_SECONDS = 120.0  # 录制进程每 5 秒写心跳;超过此值视为卡死
 
 
 def now() -> str:
@@ -109,6 +111,7 @@ def process_identity(pid: int, expected_profile: str | None = None) -> bool:
                 ],
                 text=True,
                 stderr=subprocess.DEVNULL,
+                timeout=10,  # WMI/CIM 假死时 ensure/watchdog 仍须是有界短任务
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -170,18 +173,66 @@ def start(state_dir: Path, profile: str | None = None) -> int:
             env["CTP_RECORD_PROFILE"] = profile
         command = [sys.executable, str(SCRIPT)]
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
-        child = subprocess.Popen(
-            command,
-            cwd=bootstrap.ROOT,
-            env=env,
-            creationflags=creationflags,
-        )
+        # 不能继承调用方的 stdout/stderr:DSH 以捕获输出方式调用短任务时,
+        # 常驻录制进程握着管道会让调用一直等不到 EOF。输出落到专用日志文件。
+        with (state_dir / "recorder.log").open("ab") as log:
+            child = subprocess.Popen(
+                command,
+                cwd=bootstrap.ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+            )
         data = {"pid": child.pid, "started_at": now(), "profile": profile or env.get("CTP_RECORD_PROFILE", "simnow"), "command": command}
         write_json(files["state"], data)
         event(state_dir, "started", pid=child.pid, profile=data["profile"])
+        # 启动后短暂观察:配置错误等会让录制进程立即退出,不能报告"启动成功"
+        deadline = time.monotonic() + STARTUP_GRACE
+        while time.monotonic() < deadline:
+            returncode = child.poll()
+            if returncode is not None:
+                event(state_dir, "start_failed", pid=child.pid, returncode=returncode)
+                try:
+                    files["state"].unlink()
+                except FileNotFoundError:
+                    pass
+                return returncode or 3
+            time.sleep(0.1)
         return 0
     finally:
         release_lock(files["lock"])
+
+
+def heartbeat_age(state_dir: Path) -> float | None:
+    """status.json 心跳距今秒数;文件缺失或无法解析返回 None。"""
+    stamp = (read_json(paths(state_dir)["status"]) or {}).get("heartbeat_at")
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def watchdog(state_dir: Path, profile: str | None = None) -> int:
+    """进程不在 → 启动;进程在但心跳陈旧(卡死) → 受控重启;健康 → 不动。"""
+    data = current(state_dir)
+    if not data:
+        return start(state_dir, profile)
+    try:
+        started = datetime.fromisoformat(data["started_at"])
+        uptime = (datetime.now(timezone.utc) - started).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        uptime = float("inf")
+    # 新进程还没来得及写心跳时,status.json 可能是上次运行遗留的旧文件,不据此判断
+    if uptime < HEARTBEAT_STALE_SECONDS:
+        return 0
+    age = heartbeat_age(state_dir)
+    if age is not None and age <= HEARTBEAT_STALE_SECONDS:
+        return 0
+    event(state_dir, "heartbeat_stale", pid=data.get("pid"), age_seconds=age)
+    stop(state_dir)
+    return start(state_dir, profile)
 
 
 def stop(state_dir: Path, timeout: float = 15.0) -> int:
@@ -236,8 +287,10 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     state_dir = (bootstrap.ROOT / args.state_dir).resolve() if not args.state_dir.is_absolute() else args.state_dir
-    if args.command in {"start", "ensure", "watchdog"}:
+    if args.command in {"start", "ensure"}:
         return start(state_dir, args.profile)
+    if args.command == "watchdog":
+        return watchdog(state_dir, args.profile)
     if args.command == "stop":
         return stop(state_dir)
     if args.command == "restart":

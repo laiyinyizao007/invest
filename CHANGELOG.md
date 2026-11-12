@@ -16,8 +16,9 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 行情录制 codex 审查后的加固(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):修复 `EventEngine` 重复启动、DCE 小写合约被大写后找不到、关闭时不 flush 丢尾部数据、每 tick 同步写状态文件、旧录制列表不同步;SimNow 要求行情前置主机与已通过白名单的交易前置主机一致;wrapper 子进程不再继承调用方管道、启动后确认存活、`watchdog` 检查心跳;增量任务超时杀整棵进程树、陈旧锁自动恢复、不向下载子进程传递 `CTP_*` 凭证。**仍未解决:合约来源(见 runbook「验收记录」),录制入口暂时录不到数据。**
 - `scripts/broker_report.py` 在国信报告签字栏旁打印提测方姓名（仅提示，不代替手写签字/盖章；姓名为空时不改动模板）。
-- 补齐行情录制与增量调度的有界任务 `scripts/record_market_incremental.py`、离线生命周期测试 `tests/test_recording_tools.py` 和运行手册 `docs/runbook-market-recording.md`；Windows dummy worker 实测已通过并修复 `pid_alive` 在 Windows 上的误判（旧实现使 `ensure`/`watchdog` 重复拉起、`stop` 永远拒绝）；DSH 重启行为与授权行情端到端实测仍待完成（Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)）。
+- 补齐行情录制与增量调度的有界任务 `scripts/record_market_incremental.py`、离线生命周期测试 `tests/test_recording_tools.py` 和运行手册 `docs/runbook-market-recording.md`；**当前尚不能录到数据**（合约来源问题待决，见 runbook「验收记录」）；Windows dummy worker 实测已通过并修复 `pid_alive` 在 Windows 上的误判（旧实现使 `ensure`/`watchdog` 重复拉起、`stop` 永远拒绝）；DSH 重启行为与授权行情端到端实测仍待完成（Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)）。
 - 行情录制与 DSH 调度生命周期闸门(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):核对 `@goodandready/dsh-cron@0.3.43` 的有限超时、Windows 进程树终止和非 detached spawn 语义，锁定官方 `vnpy_datarecorder` + 独立 `.vntrader_record/database.db` + 短任务 `ensure`/`watchdog` + wrapper 方案；生命周期 ADR 见 [`docs/adr/20261111-market-recording-and-dsh-orchestration.md`](docs/adr/20261111-market-recording-and-dsh-orchestration.md)，本机 dummy worker 实测仍待完成。
 - 文档状态对齐(Issue [#11](https://github.com/laiyinyizao007/invest/issues/11)):新增 `docs/architecture.md` §0「目标 vs 现状」逐节点实现矩阵
   (IMPL/PART/PLAN + 证据文件路径 + 实现比例 + 依赖顺序),作为"实现了多少"的单一出处;
