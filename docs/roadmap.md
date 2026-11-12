@@ -238,7 +238,7 @@ flowchart TB
 | 月度滚动重估引擎 | `scripts/walk_forward_optimizer.py` 提升为 `optimizer/` 包 + 调度入口 + 新 ADR | 三条件同时满足:①≥2 品种复权连续数据;②实盘月度换参需求;③数据厚度支持新窗口 | 2026-11-10 共识 |
 | Optuna TPE 寻优 | 并入 `walk_forward_optimizer.py` 或其旁新脚本(不改 `optimize.py` 已定案口径) | 参数维度 >2 或组合空间 > 数百,网格不再可行 | 要点梳理 §3.5 |
 | 参数平原卷积 / PBO / DSR | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
-| 研究沙盒 API(CLI→HTTP) | `scripts/research_api.py` 子命令 → 薄 HTTP 网关(FastAPI 单文件)+ 契约入 §6 API 手册 | 阶段三(月度调度器程序化触发 CLI;Bisheng 接入前固化 HTTP) | ADR bisheng-ai-researcher |
+| 研究沙盒 API(CLI→HTTP) — **CLI 已部分落地(2026-11-12:data/backtest/results;gate、optimize 未做,HTTP 未做)** | `scripts/research_api.py` 子命令 → 薄 HTTP 网关(FastAPI 单文件)+ 契约入 §6 API 手册 | 阶段三(月度调度器程序化触发 CLI;Bisheng 接入前固化 HTTP) | ADR bisheng-ai-researcher |
 | 策略骨架模板 + pending/approved 沙盒 | `strategies/` 内模板文件 + `pending_strategies/`/`approved/` 目录约定 + 新 ADR | 阶段四 4a 启动前 | 要点梳理 §6.3-① |
 | Bisheng 外层 | 独立 compose 文件(与交易 compose 完全分离,不共享网络与 `.env`) | 阶段四 4b(前置 = 阶段三 API 固化);版本 ≥2.6.0、仅内网、禁用 Code 节点 | ADR bisheng-ai-researcher |
 | 反馈记忆 maxlen=3 | Bisheng 工作流设计约束(内层零代码) | 阶段四 4b | 要点梳理 §6.3-② |

@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 研究沙盒 CLI `scripts/research_api.py`(`data`/`backtest`/`results`)与底座 `scripts/research_sandbox.py`:仅 `pending_strategies/` 内策略、仅训练/验证段、子进程 + 环境白名单 + 静态筛查 + 需 `--confirm-reviewed`;结果附诊断书与代码 sha256。纵深防御而非沙盒,威胁模型写在 `research_sandbox.py` 文件头与 ADR。
 - 研究沙盒纯逻辑底座(ADR `20261112-research-sandbox-groundwork`):`risk/diagnosis.py` 确定性诊断书(回撤/次数/连亏/夏普四维,阈值与晋级门槛同源);`risk/plateau.py` 的 `parameter_on_plateau` 计算(比门槛原文更严:邻域内至少一半格子得分为正)。毕昇先于 API 固化部署,仅作知识库问答,不接工具。
 - 行情录制 wrapper 的 PID 探测改为三态（alive/dead/unknown）：Windows 访问被拒或查询失败不再被当成「已死」；记录的 PID 状态未知时 `start` 拒绝拉起第二个录制进程。新增 4 组测试，全量 867 通过。
 - 测试段使用登记 `scripts/segment_ledger.py` + `config/test_segment_usage.json`:`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复使用即拒绝(无强制开关,重置须手工改登记文件并补 ADR);15 分钟基准测试段补登记为已使用。`tests/conftest.py` 让所有测试使用临时登记文件。

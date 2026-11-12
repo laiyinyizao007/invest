@@ -30,7 +30,14 @@
 
 - 把晋级门槛接进优化脚本:门槛需要样本外夏普、随机入场分位数、成本翻倍夏普等输入,而现有优化器只产出训练/验证段结果。
   接线要先定义「候选评估」的数据流(哪一段算样本外、随机对照如何跑),单独设计。
-- `scripts/research_api.py` CLI 与 pending/approved 目录约定:阶段三 / 4a 原定内容,待上一条之后。
+- `approved/` 目录与批准流程、`gate` 子命令、15 分钟品种的沙盒回测:待门槛接线设计之后。
+
+## 补充:`scripts/research_api.py`(2026-11-12 已落地 `data` / `backtest` / `results`)
+
+- `backtest` 只接受 `pending_strategies/`(已加入 .gitignore)内的 .py,只能跑训练/验证段(测试段在解析器与代码层双重不可达),必须带 `--confirm-reviewed`。
+- 策略在**子进程**中运行:环境变量走白名单(`CTP_*`、`WEBHOOK_*`、`LIVE_*` 等一律不传),静态筛查(禁导入 os/subprocess/socket 等、禁 exec/eval/open/getattr 等)在父子进程各做一次,超时杀整棵进程树。
+- **这是纵深防御,不是沙盒**:策略仍以当前用户权限运行,能被刻意绕过。因此 4a 的前提是代码运行前由人读过;结果里记录代码 sha256。LLM 产出在无人读过时运行,需要容器级隔离,是 4b 的前置。
+- 结果存 `data/research/<run_id>.json`(含诊断书);`results` 读取。
 
 ## 验证
 

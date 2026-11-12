@@ -16,6 +16,9 @@ __pycache__/
 .coverage
 data/
 
+# 研究沙盒:候选策略(含 LLM 产出)只在本机 pending 目录,绝不入库;批准后由人移入 strategies/
+pending_strategies/
+
 # 容器运行时挂载目录(策略状态、日志、风控状态文件、心跳),不入库
 runtime/
 
