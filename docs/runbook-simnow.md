@@ -12,7 +12,7 @@
 | 启动各阶段耗时可观测(里程碑日志) | ✅ 已实现 |
 | Docker 镜像构建 + 容器内 `vnpy_ctp` 导入 + `run_headless.py --check` | ✅ 已验证 |
 | **容器内连接 SimNow 并稳定运行** | ✅ 2026-11-10 完整跑通(连接→授权→登录→结算确认→合约表→策略初始化→订阅→healthy→优雅退出) |
-| 第 5 节 10 项实测(废单文本/回报时序/断线/kill -9/熔断/夜盘/断流/撮合差异) | ⚠ 2 项已做(第 1 项采到 2/6 场景、第 2 项回报时序),其余待做 |
+| 第 5 节 10 项实测(废单文本/回报时序/断线/kill -9/熔断/夜盘/断流/撮合差异) | ⚠ 2026-11-12 夜盘演练补做了第 3、6、7、8、9 项（均通过）；第 4 项（断线）场景需重做；其余待做 |
 | 第 5 节实测项的**自动化演练脚本**(`scripts/drill.py`) | ✅ 已写好,待在交易时段/夜盘实跑 |
 | 每日证据表 + webhook 连通性自检(`scripts/unattended_report.py`) | ✅ 已写好并跑通离线自检 |
 | 连续 ≥ 5 个交易日无人值守 | ❌ 未开始(证据表目前只有 1 天) |
@@ -61,7 +61,10 @@ docker compose run --rm --entrypoint python trader scripts/drill.py latency --co
 | `latency` | ✅ 成交→持仓回报 0.177 秒，1 手仓已平。**首次运行失败**：`drill.py` 读了不存在的 `TickData.ask_price`（应为 `ask_price_1`），单测的假 Tick 犯了同样的错，所以全绿却从未发现；已修并改用真实 `TickData` |
 | `tick-stale` | ✅ 行情断流 60 秒后看门狗告警 |
 | `disconnect` | ❌ **场景设计本身有缺陷，非系统缺陷**，见下 |
-| `daily-loss`、`hard-lock` | 未跑（排在 `disconnect` 之后） |
+| `daily-loss` | ✅ 注入权益下降 700 元（阈值 600）→ `DAILY_LOCKED`、禁止新开仓告警；场景开平 1 手无残留 |
+| `hard-lock` | ✅ 注入回撤 2100 元（死线 2000）→ FATAL、紧急平仓、账户空仓、退出码 0、**重启后拒绝交易** |
+
+完整合并表见 `docs/simnow-drills.md`。
 
 **`disconnect` 的根因（用 `--trace` 埋点一次运行定位，退出码 139 / SIGSEGV）**：场景用 `td_api.close()` 模拟断线，而 vnpy_ctp 的 `close()` 是原生 `exit()`——**释放整个 API 对象**，不是「断开连接」。`close()` 本身 17 毫秒内正常返回；约 1.5 秒后 vn.py 事件引擎的定时器线程调用 `gateway.process_timer_event → query_position → reqQryInvestorPosition`，打到已释放的原生对象上，进程段错误。此前整套 `all` 运行里「进程在 disconnect 标题后悄悄消失」就是它（当时管道吞掉了退出码）。
 
