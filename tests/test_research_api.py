@@ -19,7 +19,6 @@ def fake_subprocess(monkeypatch, popen):
 def tree(tmp_path, monkeypatch):
     (tmp_path / "pending_strategies").mkdir()
     monkeypatch.setattr(api.bootstrap, "ROOT", tmp_path)
-    monkeypatch.setattr(api, "RESULTS_DIR", tmp_path / "results")
     return tmp_path
 
 
@@ -34,7 +33,8 @@ def test_backtest_requires_review_confirmation(tree, capsys):
     (tree / "pending_strategies" / "s.py").write_text("x = 1\n", encoding="utf-8")
 
     assert run(*BT) == api.EXIT_REFUSED
-    assert "confirm-reviewed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "confirm-reviewed" in err and "approve" in err
 
 
 def test_backtest_refuses_test_segment_at_parser_level():
@@ -104,7 +104,7 @@ def test_backtest_success_writes_result_with_diagnosis_and_hash(tree, monkeypatc
     out = json.loads(capsys.readouterr().out)
     assert len(out["strategy_sha256"]) == 64 and out["segment"] == "valid"
     assert out["diagnosis"]["dimensions"]["sharpe"]["level"] == "ok"
-    assert (tree / "results" / f"{out['run_id']}.json").exists()
+    assert (tree / "data" / "research" / f"{out['run_id']}.json").exists()
     assert run("results", out["run_id"]) == api.EXIT_OK
     assert json.loads(capsys.readouterr().out)["run_id"] == out["run_id"]
 
@@ -177,12 +177,12 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
-    assert run(*GT, "--random-runs", "3", "--confirm-reviewed") == api.EXIT_OK
+    assert run(*GT, "--random-runs", "20", "--confirm-reviewed") == api.EXIT_OK
     out = json.loads(capsys.readouterr().out)
     assert out["kind"] == "gate" and out["passed"] is False and len(out["strategy_sha256"]) == 64
     assert out["plateau_note"].startswith("未提供")
     assert "没看过滚动验证窗口" in out["protocol_notice"]
-    assert (tree / "results" / f"{out['run_id']}.json").exists()
+    assert (tree / "data" / "research" / f"{out['run_id']}.json").exists()
 
 
 def test_gate_child_parser_converts_random_runs_to_int():
@@ -190,3 +190,103 @@ def test_gate_child_parser_converts_random_runs_to_int():
                                           "--random-runs", "7", "--on-plateau", "0"])
 
     assert args.random_runs == 7
+
+
+# ---------- approve 与配置驱动 ----------
+
+def make_strategy(tree, body="class S: pass\n"):
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_approve_records_hash_and_unlocks_backtest_without_confirm_flag(tree, monkeypatch, capsys):
+    path = make_strategy(tree)
+    assert run("approve", "--strategy", "s.py") == api.EXIT_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["sha256"] == api.rs.file_sha256(path)
+
+    class FakeProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "", "boom"
+
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
+    assert run(*BT) == api.EXIT_FAILED                    # 通过了批准关口,走到子进程(假进程失败)
+
+
+def test_edit_after_approval_requires_reapproval(tree, monkeypatch, capsys):
+    path = make_strategy(tree)
+    run("approve", "--strategy", "s.py")
+    capsys.readouterr()
+    path.write_text("class S:\n    x = 1\n", encoding="utf-8")
+    fake_subprocess(monkeypatch, lambda *a, **k: pytest.fail("未重新批准不得启动子进程"))
+
+    assert run(*BT) == api.EXIT_REFUSED and "approve" in capsys.readouterr().err
+
+
+def test_approve_refuses_code_that_fails_screening(tree, capsys):
+    make_strategy(tree, "import os\n")
+
+    assert run("approve", "--strategy", "s.py") == api.EXIT_REFUSED
+    assert not (tree / "data" / "research" / "approvals.json").exists()
+
+
+def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
+    path = make_strategy(tree)
+
+    class FakeProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "", "x"
+
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
+    run(*BT, "--confirm-reviewed")
+
+    assert api.rs.is_approved(path, tree / "data" / "research" / "approvals.json")
+
+
+def test_defaults_come_from_config_and_cli_flags_override(tree, monkeypatch):
+    make_strategy(tree)
+    cfg = api.rc.load()
+    cfg["gate"]["random_runs"] = 37
+    cfg["backtest"]["timeout_seconds"] = 11
+    monkeypatch.setattr(api.rc, "load", lambda path=None: cfg)
+    seen = {}
+
+    class FakeProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            seen["timeout"] = timeout
+            return "", "x"
+
+    def popen(cmd, **kw):
+        seen["cmd"] = cmd
+        return FakeProc()
+
+    fake_subprocess(monkeypatch, popen)
+    run(*GT, "--confirm-reviewed")
+    assert seen["cmd"][seen["cmd"].index("--random-runs") + 1] == "37"
+
+    run(*BT, "--confirm-reviewed")
+    assert seen["timeout"] == 11
+    run(*BT, "--timeout", "5", "--confirm-reviewed")
+    assert seen["timeout"] == 5
+
+
+def test_random_runs_outside_configured_bounds_is_refused(tree):
+    make_strategy(tree)
+
+    assert run(*GT, "--random-runs", "5", "--confirm-reviewed") == api.EXIT_REFUSED
+
+
+def test_invalid_config_refuses_every_command(tree, monkeypatch, capsys):
+    def boom(path=None):
+        raise api.rc.ConfigError("坏了")
+
+    monkeypatch.setattr(api.rc, "load", boom)
+
+    assert run("results") == api.EXIT_REFUSED and "配置非法" in capsys.readouterr().err

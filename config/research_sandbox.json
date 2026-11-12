@@ -1,0 +1,35 @@
+{
+  "iteration": {
+    "max_iterations": 5
+  },
+  "feedback": {
+    "limit": 3
+  },
+  "gate": {
+    "random_runs": 200,
+    "timeout_seconds": 3600
+  },
+  "backtest": {
+    "timeout_seconds": 600
+  },
+  "candidates": {
+    "max_source_bytes": 65536,
+    "name_pattern": "^[a-z0-9_]{1,40}\\.py$"
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token_file": "data/research/gateway.token",
+    "rate_limit_per_minute": 30,
+    "max_body_bytes": 131072
+  },
+  "paths": {
+    "pending_dir": "pending_strategies",
+    "results_dir": "data/research",
+    "approvals_file": "data/research/approvals.json"
+  },
+  "screening": {
+    "extra_forbidden_modules": [],
+    "extra_forbidden_calls": []
+  }
+}

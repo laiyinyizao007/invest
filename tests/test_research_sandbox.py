@@ -134,3 +134,71 @@ def test_save_and_load_result_roundtrip_and_list(tmp_path):
 def test_load_result_rejects_unsafe_ids(tmp_path, rid):
     with pytest.raises(rs.SandboxError):
         rs.load_result(rid, tmp_path)
+
+
+# ---------- 批准:绑定到代码哈希 ----------
+
+def test_approval_is_bound_to_content_hash(tmp_path):
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+
+    assert rs.is_approved(f, approvals) is False
+    sha = rs.record_approval(f, approvals, now=datetime(2026, 11, 12, 21, 0))
+    assert sha == rs.file_sha256(f) and rs.is_approved(f, approvals) is True
+
+    f.write_text("a = 2\n", encoding="utf-8")                  # 代码一改,批准自动失效
+    assert rs.is_approved(f, approvals) is False
+
+
+def test_approval_survives_rename_but_not_edit(tmp_path):
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    rs.record_approval(f, approvals)
+    g = tmp_path / "renamed.py"
+    g.write_text("a = 1\n", encoding="utf-8")
+
+    assert rs.is_approved(g, approvals) is True                # 批准的是内容,不是文件名
+
+
+def test_corrupt_approvals_file_fails_closed(tmp_path):
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text("{broken", encoding="utf-8")
+
+    with pytest.raises(rs.SandboxError):
+        rs.is_approved(f, approvals)
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(f, approvals)
+
+
+def test_recording_twice_keeps_one_entry(tmp_path):
+    import json
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    rs.record_approval(f, approvals)
+    rs.record_approval(f, approvals)
+
+    assert len(json.loads(approvals.read_text(encoding="utf-8"))) == 1
+
+
+# ---------- 配置驱动的筛查与目录 ----------
+
+def test_screen_extra_lists_extend_the_builtin_ones():
+    assert rs.screen_source("import numpy\n") == []
+    assert any("numpy" in x for x in rs.screen_source("import numpy\n", extra_modules=("numpy",)))
+    assert any("print" in x for x in rs.screen_source("print(1)\n", extra_calls=("print",)))
+    assert any("os" in x for x in rs.screen_source("import os\n", extra_modules=("numpy",)))   # 内置清单不会被覆盖
+
+
+def test_resolve_pending_honours_configured_directory(tmp_path):
+    d = tmp_path / "inbox"
+    d.mkdir()
+    (d / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert rs.resolve_pending("a.py", tmp_path, pending_dir="inbox") == (d / "a.py").resolve()
+    with pytest.raises(rs.SandboxError):
+        rs.resolve_pending("pending_strategies/a.py", tmp_path, pending_dir="inbox")

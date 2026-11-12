@@ -2,6 +2,7 @@
 
 子命令即端点白名单的 CLI 形态(docs/roadmap.md §2.2):
     data       列出可用数据段及其「测试段已消费」状态
+    approve    人工批准候选策略(绑定代码哈希);backtest/gate 只运行已批准的代码
     gate       晋级门槛评估(15 分钟玉米,滚动验证段 + 成本翻倍 + 随机入场对照)
     backtest   对 pending_strategies/ 内的策略在训练/验证段做沙盒回测
     results    读取结果摘要与诊断书(不带 RUN_ID 则列出全部)
@@ -23,14 +24,20 @@ from datetime import datetime
 from pathlib import Path
 
 import bootstrap
+import research_config as rc
 import research_sandbox as rs
 
-RESULTS_DIR = bootstrap.ROOT / "data" / "research"
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
 # gate 无法验证候选参数是怎么选出来的,只能提醒:参数若参考过验证窗口(2022-07 ~ 2023-12)的表现,该窗口就不再是样本外
 PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必须在没看过滚动验证窗口(2022-07-01 ~ 2023-12-31)的情况下选定;"
                    "optimize_15m.py 默认的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠;请用 optimize_15m.py --select-only(训练段止于 2022-06-30)选参。")
+
+
+def settings() -> tuple[dict, dict]:
+    """(配置, 解析后的路径)。每次调用现读,配置非法时抛 ConfigError(由 main 统一转为拒绝)。"""
+    cfg = rc.load()
+    return cfg, rc.resolve_paths(cfg, bootstrap.ROOT)
 
 
 def emit(obj) -> None:
@@ -94,11 +101,49 @@ def spawn_child(cmd: list[str], timeout: float) -> tuple[int, dict | None]:
     return EXIT_OK, json.loads(line[len(CHILD_MARK):])
 
 
-def cmd_backtest(args) -> int:
-    if not args.confirm_reviewed:
-        return refuse("需要 --confirm-reviewed:策略代码运行前必须由人读过(见 research_sandbox.py 威胁模型)")
+NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
+
+
+def gate_approval(args, path: Path, paths: dict) -> str | None:
+    """人工批准检查。返回拒绝原因;None 表示放行。--confirm-reviewed 等价于「我现在读过并批准」,会记录哈希。"""
     try:
-        path = rs.resolve_pending(args.strategy, bootstrap.ROOT)
+        if args.confirm_reviewed:
+            rs.record_approval(path, paths["approvals_file"])
+            return None
+        return None if rs.is_approved(path, paths["approvals_file"]) else NEEDS_APPROVAL
+    except rs.SandboxError as exc:
+        return str(exc)
+
+
+def screen(path: Path, cfg: dict) -> list[str]:
+    return rs.screen_source(path.read_text(encoding="utf-8"), cfg["screening"]["extra_forbidden_modules"],
+                            cfg["screening"]["extra_forbidden_calls"])
+
+
+def cmd_approve(args) -> int:
+    """本机人工批准:读过代码后执行。静态筛查不过的代码不予批准。外层没有任何端点能触发它。"""
+    cfg, paths = settings()
+    try:
+        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
+    except rs.SandboxError as exc:
+        return refuse(str(exc))
+    findings = screen(path, cfg)
+    if findings:
+        print("拒绝批准: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        sha = rs.record_approval(path, paths["approvals_file"])
+    except rs.SandboxError as exc:
+        return refuse(str(exc))
+    emit({"approved": path.name, "sha256": sha})
+    return EXIT_OK
+
+
+def cmd_backtest(args) -> int:
+    cfg, paths = settings()
+    timeout = args.timeout if args.timeout is not None else cfg["backtest"]["timeout_seconds"]
+    try:
+        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
         start, end = rs.segment_window(args.key, args.segment)
         params = json.loads(args.params)
         if not isinstance(params, dict):
@@ -106,14 +151,17 @@ def cmd_backtest(args) -> int:
     except (rs.SandboxError, json.JSONDecodeError) as exc:
         return refuse(str(exc))
     source = path.read_text(encoding="utf-8")
-    findings = rs.screen_source(source)
+    findings = screen(path, cfg)
     if findings:
-        print("拒绝: 静态筛查未通过:\n  " + "\n  ".join(findings), file=sys.stderr)
+        print("拒绝: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
         return EXIT_REFUSED
+    reason = gate_approval(args, path, paths)
+    if reason:
+        return refuse(reason)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", args.cls,
            "--key", args.key, "--segment", args.segment, "--params", json.dumps(params)]
-    code, body = spawn_child(cmd, args.timeout)
+    code, body = spawn_child(cmd, timeout)
     if body is None:
         return code
 
@@ -124,7 +172,7 @@ def cmd_backtest(args) -> int:
         "window": [f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"], "ran_at": datetime.now().isoformat(timespec="seconds"),
         "stats": body["stats"], "diagnosis": diagnose(body["stats"], body["pnls"]),
     }
-    result["run_id"] = rs.save_result(result, RESULTS_DIR)
+    result["run_id"] = rs.save_result(result, paths["results_dir"])
     emit(result)
     return EXIT_OK
 
@@ -145,28 +193,33 @@ def load_plateau(path: str | None) -> tuple[bool, str]:
 
 
 def cmd_gate(args) -> int:
-    if not args.confirm_reviewed:
-        return refuse("需要 --confirm-reviewed:策略代码运行前必须由人读过(见 research_sandbox.py 威胁模型)")
+    cfg, paths = settings()
+    timeout = args.timeout if args.timeout is not None else cfg["gate"]["timeout_seconds"]
+    random_runs = args.random_runs if args.random_runs is not None else cfg["gate"]["random_runs"]
     try:
-        path = rs.resolve_pending(args.strategy, bootstrap.ROOT)
+        path = rs.resolve_pending(args.strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
         params = json.loads(args.params)
         if not isinstance(params, dict):
             raise rs.SandboxError("--params 必须是 JSON 对象")
-        if args.random_runs <= 0:
-            raise rs.SandboxError("--random-runs 必须为正")
+        low, high = rc.INT_BOUNDS[("gate", "random_runs")]
+        if not low <= random_runs <= high:
+            raise rs.SandboxError(f"--random-runs 必须在 [{low}, {high}] 内(配置边界)")
         on_plateau, plateau_note = load_plateau(args.plateau_file)
     except (rs.SandboxError, json.JSONDecodeError) as exc:
         return refuse(str(exc))
     source = path.read_text(encoding="utf-8")
-    findings = rs.screen_source(source)
+    findings = screen(path, cfg)
     if findings:
-        print("拒绝: 静态筛查未通过:\n  " + "\n  ".join(findings), file=sys.stderr)
+        print("拒绝: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
         return EXIT_REFUSED
+    reason = gate_approval(args, path, paths)
+    if reason:
+        return refuse(reason)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", args.cls,
-           "--params", json.dumps(params), "--random-runs", str(args.random_runs),
+           "--params", json.dumps(params), "--random-runs", str(random_runs),
            "--on-plateau", "1" if on_plateau else "0"]
-    code, body = spawn_child(cmd, args.timeout)
+    code, body = spawn_child(cmd, timeout)
     if body is None:
         return code
     result = {
@@ -175,7 +228,7 @@ def cmd_gate(args) -> int:
         "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
     }
-    result["run_id"] = rs.save_result(result, RESULTS_DIR)
+    result["run_id"] = rs.save_result(result, paths["results_dir"])
     emit(result)
     return EXIT_OK
 
@@ -188,7 +241,7 @@ def run_gate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
-    if rs.screen_source(path.read_text(encoding="utf-8")):
+    if screen(path, rc.load()):
         print("静态筛查未通过", file=sys.stderr)
         return EXIT_REFUSED
     spec = importlib.util.spec_from_file_location("pending_strategy", path)
@@ -213,7 +266,7 @@ def run_child(args) -> int:
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     start, end = rs.segment_window(args.key, args.segment)
-    if rs.screen_source(Path(args.file).read_text(encoding="utf-8")):         # 子进程再筛一次,防止文件在两步之间被替换
+    if screen(Path(args.file), rc.load()):         # 子进程再筛一次,防止文件在两步之间被替换
         print("静态筛查未通过", file=sys.stderr)
         return EXIT_REFUSED
     spec = importlib.util.spec_from_file_location("pending_strategy", args.file)
@@ -241,8 +294,9 @@ def run_child(args) -> int:
 # ---------- results ----------
 
 def cmd_results(args) -> int:
+    _, paths = settings()
     try:
-        emit(rs.load_result(args.run_id, RESULTS_DIR) if args.run_id else rs.list_results(RESULTS_DIR))
+        emit(rs.load_result(args.run_id, paths["results_dir"]) if args.run_id else rs.list_results(paths["results_dir"]))
     except rs.SandboxError as exc:
         return refuse(str(exc))
     return EXIT_OK
@@ -258,18 +312,21 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--key", required=True, choices=rs.KEYS)
     bt.add_argument("--segment", required=True, choices=rs.SEGMENTS)
     bt.add_argument("--params", default="{}", help="策略参数 JSON 对象")
-    bt.add_argument("--timeout", type=float, default=600.0)
-    bt.add_argument("--confirm-reviewed", action="store_true", help="确认策略代码已由人读过")
+    bt.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 backtest.timeout_seconds")
+    bt.add_argument("--confirm-reviewed", action="store_true", help="我现在读过代码并批准(等价于先执行 approve)")
     bt.set_defaults(func=cmd_backtest)
     gt = sub.add_parser("gate", help="晋级门槛评估(15 分钟玉米,滚动验证段;不触碰测试段)")
     gt.add_argument("--strategy", required=True)
     gt.add_argument("--class", dest="cls", required=True)
     gt.add_argument("--params", default="{}")
-    gt.add_argument("--random-runs", type=int, default=200, help="随机入场对照次数(默认 200,种子 0..N-1)")
+    gt.add_argument("--random-runs", type=int, default=None, help="随机入场对照次数;缺省取配置 gate.random_runs(种子 0..N-1)")
     gt.add_argument("--plateau-file", default=None, help="参数网格得分 JSON;缺省则参数高原按未通过处理")
-    gt.add_argument("--timeout", type=float, default=3600.0)
+    gt.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds")
     gt.add_argument("--confirm-reviewed", action="store_true")
     gt.set_defaults(func=cmd_gate)
+    ap = sub.add_parser("approve", help="人工批准:读过代码后执行,批准绑定到代码内容的 sha256")
+    ap.add_argument("--strategy", required=True)
+    ap.set_defaults(func=cmd_approve)
     rr = sub.add_parser("results", help="读取结果与诊断书")
     rr.add_argument("run_id", nargs="?", default="")
     rr.set_defaults(func=cmd_results)
@@ -287,7 +344,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except rc.ConfigError as exc:
+        return refuse(f"配置非法,拒绝运行: {exc}")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 研究沙盒参数配置化 `config/research_sandbox.json` + `scripts/research_config.py`:迭代轮数、反馈条数、随机对照次数、各类超时、候选大小/命名规则、网关监听/限流/令牌路径、各目录、筛查追加清单;严格校验(未知键/越界/路径越界即拒绝运行),安全边界不可被配置调没。人工批准绑定代码哈希:新增 `research_api.py approve`,`backtest`/`gate` 只运行已批准的代码(代码一改即失效),`--confirm-reviewed` 变为「现在批准」的快捷方式。ADR `20261112-research-sandbox-config-and-approval`。
 - `optimize_15m.py --select-only`:样本外安全选参——训练段止于 2022-06-30(与 Walk-Forward W1 训练段末一致,有测试锁定),不评估验证/测试段,与 `--test` 互斥;输出的参数与 `--plateau-out` 文件交给 `gate`,滚动验证窗口才是真正的样本外。实测该流程选出 16/192/3.0,在 W1~W3 上样本外夏普 0.31(此前用重叠窗口选参的 24/192/3.0 为 1.39,其中含样本内成分),对随机对照 93.5 分位,往返 58 笔,门槛 6 项未过。
 - `optimize_15m.py --plateau-out FILE`:把训练段参数网格得分写成沙盒 `gate --plateau-file` 可读的 JSON(只含训练段)。`gate` 结果新增 `protocol_notice`:候选参数若参考过滚动验证窗口(2022-07 ~ 2023-12)就不再是样本外——`optimize_15m.py` 的训练/验证段与这些窗口重叠,用它的输出做 gate 只能算参考(实测其选出的 24/192/3.0 在这些窗口上夏普 1.39、对随机对照 100 分位,但往返仅 48 笔、不在高原,门槛 5 项未过)。
 - 沙盒 `gate` 子命令与 `scripts/research_gate.py`:15 分钟玉米滚动验证段(W1~W3,不触碰测试段)上跑候选 / 成本翻倍 / 随机入场对照(新增 `RandomEntry15mStrategy`,入场概率按候选活跃度对齐,`--random-runs` 参数化默认 200),汇总后调用晋级门槛;缺 `--plateau-file` 时参数高原按未通过处理。实测 200 次对照约 23 秒。示例:基准类 fast=14/slow=60 的结果与既有 ADR 一致(样本外夏普 -3.96,门槛 7 项未过)。

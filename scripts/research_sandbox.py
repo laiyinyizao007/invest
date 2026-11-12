@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -36,16 +37,16 @@ class SandboxError(ValueError):
     pass
 
 
-def resolve_pending(arg: str, root: Path) -> Path:
-    """只认 `<root>/pending_strategies/` 下的 .py 文件;裸文件名按该目录解析。"""
-    pending = (root / PENDING_DIR).resolve()
+def resolve_pending(arg: str, root: Path, pending_dir: str = PENDING_DIR) -> Path:
+    """只认 `<root>/<pending_dir>/` 下的 .py 文件(pending_dir 来自配置,默认 pending_strategies);裸文件名按该目录解析。"""
+    pending = (root / pending_dir).resolve()
     candidate = Path(arg)
-    if not candidate.is_absolute() and candidate.parts[:1] != (PENDING_DIR,):
-        candidate = Path(PENDING_DIR) / candidate
+    if not candidate.is_absolute() and candidate.parts[:1] != (pending_dir,):
+        candidate = Path(pending_dir) / candidate
     path = candidate if candidate.is_absolute() else root / candidate
     resolved = path.resolve()                      # 解开 .. 与符号链接后再判断
     if pending not in resolved.parents:
-        raise SandboxError(f"策略文件必须位于 {PENDING_DIR}/ 内: {arg!r}")
+        raise SandboxError(f"策略文件必须位于 {pending_dir}/ 内: {arg!r}")
     if resolved.suffix != ".py":
         raise SandboxError("策略文件必须是 .py")
     if not resolved.is_file():
@@ -53,8 +54,12 @@ def resolve_pending(arg: str, root: Path) -> Path:
     return resolved
 
 
-def screen_source(source: str) -> list[str]:
-    """静态筛查:返回发现的可疑构造(中文说明);空列表表示未发现。**不是安全保证。**"""
+def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: Sequence[str] = ()) -> list[str]:
+    """静态筛查:返回发现的可疑构造(中文说明);空列表表示未发现。**不是安全保证。**
+
+    extra_* 来自配置,只能在内置禁用清单之上追加,不能删减。"""
+    forbidden_modules = FORBIDDEN_MODULES | set(extra_modules)
+    forbidden_calls = FORBIDDEN_CALLS | set(extra_calls)
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -68,9 +73,9 @@ def screen_source(source: str) -> list[str]:
         else:
             names = []
         for name in names:
-            if name.split(".")[0] in FORBIDDEN_MODULES:
+            if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
             findings.append(f"第 {node.lineno} 行: 禁止调用 {node.func.id}()")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
@@ -118,6 +123,42 @@ def round_trip_pnls(trades: Sequence, size: float) -> list[float]:
                 open_lots.pop(0)
         pnls.append(pnl)
     return pnls
+
+
+# ---------- 人工批准:绑定到代码内容的哈希 ----------
+# 批准动作只能由本机 CLI(research_api.py approve)触发;外层(毕昇)没有任何端点能写入批准记录。
+# 批准的是内容而不是文件名:代码一改哈希就变,批准自动失效。
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _load_approvals(approvals_file: Path) -> dict:
+    if not Path(approvals_file).exists():
+        return {}
+    try:
+        data = json.loads(Path(approvals_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SandboxError(f"批准记录无法读取,拒绝继续(fail-closed): {exc}") from exc
+    if not isinstance(data, dict):
+        raise SandboxError("批准记录格式错误(应为对象)")
+    return data
+
+
+def is_approved(path: Path, approvals_file: Path) -> bool:
+    return file_sha256(path) in _load_approvals(approvals_file)
+
+
+def record_approval(path: Path, approvals_file: Path, now: datetime | None = None) -> str:
+    approvals_file = Path(approvals_file)
+    data = _load_approvals(approvals_file)
+    sha = file_sha256(path)
+    data.setdefault(sha, {"name": Path(path).name, "at": (now or datetime.now()).isoformat(timespec="seconds")})
+    approvals_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = approvals_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, approvals_file)
+    return sha
 
 
 _ID = re.compile(r"^[A-Za-z0-9_-]+$")
