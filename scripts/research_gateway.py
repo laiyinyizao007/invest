@@ -74,6 +74,16 @@ def load_token(path: Path) -> str:
     return token
 
 
+def strip_code_fence(source: str) -> str:
+    """LLM 常把代码包在 ```python ... ``` 里:只剥最外层围栏,内容原样保留;没有围栏则不改动。"""
+    text = source.strip()
+    if text.startswith("```") and text.endswith("```") and text.count("```") == 2:
+        first_newline = text.find(chr(10))
+        if first_newline != -1:
+            return text[first_newline + 1:-3].strip(chr(10)) + chr(10)
+    return source
+
+
 def _lenient_object(value, name: str) -> dict | None:
     """毕昇工具节点把所有参数都当字符串传:接受「JSON 字符串形式的对象」;空串视为未提供;其余非对象一律拒绝。"""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -180,6 +190,10 @@ class GatewayApp:
         name, source = data.get("name"), data.get("source")
         if not isinstance(name, str) or not isinstance(source, str):
             return 400, {"error": "name 与 source 必须是字符串"}
+        name = name.strip()
+        if name and not name.endswith(".py"):
+            name += ".py"                                           # 工作流里常把「名字」与「.py」分开给
+        source = strip_code_fence(source)
         if not re.fullmatch(self.cfg["candidates"]["name_pattern"], name):
             return 400, {"error": "文件名不符合命名规则"}
         raw = source.encode("utf-8")

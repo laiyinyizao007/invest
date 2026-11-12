@@ -363,3 +363,32 @@ def test_blank_optional_fields_from_the_tool_node_are_treated_as_absent(tmp_path
 
     assert call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "S", "params": "", "random_runs": "", "plateau": ""})[0] == 200
     assert seen["random_runs"] is None and seen["plateau"][0] is False
+
+
+# ---------- LLM 常把代码包在 markdown 围栏里:网关剥掉围栏与首尾空白,但不改内容 ----------
+
+def test_submit_strips_markdown_fences_and_name_whitespace(tmp_path):
+    app = make_app(tmp_path)
+    fenced = "```python" + chr(10) + GOOD + "```" + chr(10)
+
+    status, body = call(app, "POST", "/research/candidates", {"name": "  fenced_1.py" + chr(10), "source": fenced})
+
+    assert status == 200 and body["name"] == "fenced_1.py"
+    assert (tmp_path / "pending_strategies" / "fenced_1.py").read_text(encoding="utf-8") == GOOD
+
+
+def test_name_without_extension_gets_py_appended_only_when_pattern_allows(tmp_path):
+    app = make_app(tmp_path)
+
+    status, body = call(app, "POST", "/research/candidates", {"name": "momentum_a", "source": GOOD})
+
+    assert status == 200 and body["name"] == "momentum_a.py"
+    assert call(app, "POST", "/research/candidates", {"name": "bad name", "source": GOOD})[0] == 400
+
+
+def test_plain_source_is_stored_unchanged(tmp_path):
+    app = make_app(tmp_path)
+
+    call(app, "POST", "/research/candidates", {"name": "plain.py", "source": GOOD})
+
+    assert (tmp_path / "pending_strategies" / "plain.py").read_text(encoding="utf-8") == GOOD
