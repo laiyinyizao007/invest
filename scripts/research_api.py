@@ -168,7 +168,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     source = path.read_text(encoding="utf-8")
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
-           "--key", key, "--segment", segment, "--params", json.dumps(params)]
+           "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", rs.file_sha256(path)]
     body = spawn_child(cmd, timeout)
 
     from risk.diagnosis import diagnose
@@ -224,7 +224,7 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
-           "--on-plateau", "1" if on_plateau else "0"]
+           "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path)]
     body = spawn_child(cmd, timeout)
     result = {
         "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
@@ -287,6 +287,9 @@ def run_gate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
+    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
+        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
+        return EXIT_REFUSED
     if screen(path, rc.load()):
         print("静态筛查未通过", file=sys.stderr)
         return EXIT_REFUSED
@@ -312,6 +315,9 @@ def run_child(args) -> int:
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     start, end = rs.segment_window(args.key, args.segment)
+    if rs.file_sha256(Path(args.file)) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
+        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
+        return EXIT_REFUSED
     if screen(Path(args.file), rc.load()):         # 子进程再筛一次,防止文件在两步之间被替换
         print("静态筛查未通过", file=sys.stderr)
         return EXIT_REFUSED
@@ -377,11 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("run_id", nargs="?", default="")
     rr.set_defaults(func=cmd_results)
     child = sub.add_parser("_child")           # 内部使用
-    for name in ("file", "cls", "key", "segment", "params"):
+    for name in ("file", "cls", "key", "segment", "params", "sha256"):
         child.add_argument(f"--{name}", required=True)
     child.set_defaults(func=run_child)
     gchild = sub.add_parser("_gate_child")     # 内部使用
-    for name in ("file", "cls", "params", "on-plateau"):
+    for name in ("file", "cls", "params", "on-plateau", "sha256"):
         gchild.add_argument(f"--{name}", required=True)
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.set_defaults(func=run_gate_child)

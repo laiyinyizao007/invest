@@ -296,3 +296,13 @@ def make_app_for_server():
     import tempfile
     from pathlib import Path
     return make_app(Path(tempfile.mkdtemp()))
+
+
+def test_shipped_openapi_file_matches_the_route_whitelist_exactly():
+    from pathlib import Path
+    spec = json.loads((Path(__file__).resolve().parents[1] / "docs" / "research-gateway.openapi.json").read_text(encoding="utf-8"))
+
+    declared = {(method.upper(), path) for path, methods in spec["paths"].items() for method in methods}
+
+    assert declared == gw.ROUTES
+    assert spec["servers"][0]["url"] == "http://research-gateway:8765"

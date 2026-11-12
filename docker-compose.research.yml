@@ -1,0 +1,44 @@
+# 研究沙盒网关(与交易 compose 完全分离)。
+#   启动: docker compose -f docker-compose.research.yml up -d --build
+# 隔离措施:
+#   - 网络 research_net 是 internal(无外网出口);只有毕昇后端额外接入它,毕昇通过 http://research-gateway:8765 调用。
+#   - 只读根文件系统、丢弃全部 capability、禁止提权、限制 CPU/内存/进程数、非 root。
+#   - 不挂载 .env、不传任何 CTP_* 变量;数据一律只读挂载(日线库、15 分钟 CSV)。
+#   - 控制目录(批准记录、令牌)只读:批准只能由宿主机上的人通过 research_api.py approve 写入。
+#   - 候选策略目录与结果目录可写:前者是外层唯一可写位置,后者保存回测/门槛结果。
+services:
+  research-gateway:
+    build:
+      context: .
+      dockerfile: docker/research/Dockerfile
+    image: invest-research:latest
+    container_name: invest-research-gateway
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    cpus: 4
+    mem_limit: 4g
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /app/.vntrader:size=128m,uid=1000,gid=1000
+    environment:
+      INVEST_C15_DATA: /data/derived/C_15m_adj.csv
+    volumes:
+      - ./.vntrader/database.db:/seed/database.db:ro
+      - ${INVEST_DERIVED_DIR:-C:/Dev/data/invest/derived}:/data/derived:ro
+      - ./pending_strategies:/app/pending_strategies
+      - ./data/research:/app/data/research
+      - ./data/research-control:/app/data/research-control:ro
+    networks: [research_net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,socket,sys; s=socket.create_connection((socket.gethostbyname(socket.gethostname()), 8765), 3); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  research_net:
+    name: research_net
+    internal: true

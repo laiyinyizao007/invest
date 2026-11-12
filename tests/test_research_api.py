@@ -187,7 +187,7 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
 
 def test_gate_child_parser_converts_random_runs_to_int():
     args = api.build_parser().parse_args(["_gate_child", "--file", "f", "--cls", "S", "--params", "{}",
-                                          "--random-runs", "7", "--on-plateau", "0"])
+                                          "--random-runs", "7", "--on-plateau", "0", "--sha256", "abc"])
 
     assert args.random_runs == 7
 
@@ -230,7 +230,7 @@ def test_approve_refuses_code_that_fails_screening(tree, capsys):
     make_strategy(tree, "import os\n")
 
     assert run("approve", "--strategy", "s.py") == api.EXIT_REFUSED
-    assert not (tree / "data" / "research" / "approvals.json").exists()
+    assert not (tree / "data" / "research-control" / "approvals.json").exists()
 
 
 def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
@@ -245,7 +245,7 @@ def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
     run(*BT, "--confirm-reviewed")
 
-    assert api.rs.is_approved(path, tree / "data" / "research" / "approvals.json")
+    assert api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
 
 
 def test_defaults_come_from_config_and_cli_flags_override(tree, monkeypatch):
@@ -290,3 +290,35 @@ def test_invalid_config_refuses_every_command(tree, monkeypatch, capsys):
     monkeypatch.setattr(api.rc, "load", boom)
 
     assert run("results") == api.EXIT_REFUSED and "配置非法" in capsys.readouterr().err
+
+
+def test_child_refuses_when_file_changed_after_approval(tmp_path):
+    f = tmp_path / "s.py"
+    f.write_text("class S: pass\n", encoding="utf-8")
+    sha = api.rs.file_sha256(f)
+    f.write_text("class S:\n    x = 1\n", encoding="utf-8")                 # 批准之后被改动(TOCTOU)
+
+    args = api.build_parser().parse_args(["_child", "--file", str(f), "--cls", "S", "--key", "CADJ", "--segment", "train",
+                                          "--params", "{}", "--sha256", sha])
+
+    assert api.run_child(args) == api.EXIT_REFUSED
+
+
+def test_parent_passes_the_approved_hash_to_children(tree, monkeypatch):
+    make_strategy(tree)
+    seen = {}
+
+    class FakeProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "", "x"
+
+    def popen(cmd, **kw):
+        seen["cmd"] = cmd
+        return FakeProc()
+
+    fake_subprocess(monkeypatch, popen)
+    run(*BT, "--confirm-reviewed")
+
+    assert seen["cmd"][seen["cmd"].index("--sha256") + 1] == api.rs.file_sha256(tree / "pending_strategies" / "s.py")

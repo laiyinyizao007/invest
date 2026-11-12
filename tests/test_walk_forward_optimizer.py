@@ -462,3 +462,16 @@ def test_main_skips_csv_when_every_window_is_empty(monkeypatch, tmp_path, capsys
     assert wf.main(["--workers", "1", "--data", str(tmp_path / "x.csv"), "--output", str(out_csv)]) == 0
     assert "未写出 CSV" in capsys.readouterr().out
     assert not out_csv.exists()                                   # 不写只有换行符的空文件
+
+
+def test_data_file_can_be_overridden_by_environment(monkeypatch):
+    import importlib
+
+    import walk_forward_optimizer as wf
+    monkeypatch.setenv("INVEST_C15_DATA", "/data/derived/C_15m_adj.csv")
+    try:
+        reloaded = importlib.reload(wf)
+        assert str(reloaded.DATA_FILE).replace("\\", "/") == "/data/derived/C_15m_adj.csv"
+    finally:
+        monkeypatch.delenv("INVEST_C15_DATA")
+        importlib.reload(wf)

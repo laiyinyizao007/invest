@@ -1,0 +1,13 @@
+# 研究沙盒只做无头回测:不需要 vnpy 的 GUI 依赖(PySide6/pyqtgraph/qdarkstyle,体积数百 MB)。
+# vnpy 三件套用 --no-deps 安装(见 Dockerfile),这里列出回测链路实际需要的运行时依赖。
+numpy
+pandas
+loguru
+plotly
+deap
+ta-lib
+tzlocal
+tqdm
+pyzmq
+requests
+peewee

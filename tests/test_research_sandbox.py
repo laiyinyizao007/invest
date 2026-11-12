@@ -202,3 +202,10 @@ def test_resolve_pending_honours_configured_directory(tmp_path):
     assert rs.resolve_pending("a.py", tmp_path, pending_dir="inbox") == (d / "a.py").resolve()
     with pytest.raises(rs.SandboxError):
         rs.resolve_pending("pending_strategies/a.py", tmp_path, pending_dir="inbox")
+
+
+def test_sandbox_env_passes_data_and_config_paths_but_still_nothing_secret():
+    env = rs.sandbox_env({"INVEST_C15_DATA": "/data/derived/x.csv", "RESEARCH_SANDBOX_CONFIG": "/tmp/c.json",
+                          "CTP_PASSWORD": "x", "WEBHOOK_URL": "u", "DEEPSEEK_API_KEY": "k"})
+
+    assert env == {"INVEST_C15_DATA": "/data/derived/x.csv", "RESEARCH_SANDBOX_CONFIG": "/tmp/c.json"}

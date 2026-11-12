@@ -47,7 +47,7 @@ from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 # 任何窗口的结束日期必须严格早于它。
 TEST_SEGMENT_START = datetime(2024, 1, 1)
 
-DATA_FILE = Path(r"C:\Dev\data\invest\derived\C_15m_adj.csv")
+DATA_FILE = Path(os.environ.get("INVEST_C15_DATA") or r"C:\Dev\data\invest\derived\C_15m_adj.csv")
 KEY = "C15"
 SYMBOL = "CADJ15"
 

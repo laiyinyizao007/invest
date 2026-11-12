@@ -96,3 +96,27 @@ def test_resolved_paths_stay_inside_project_root(tmp_path):
 
     assert all(tmp_path in p.parents for p in paths.values())
     assert set(paths) == {"pending_dir", "results_dir", "approvals_file", "token_file"}
+
+
+def test_config_path_can_be_overridden_by_environment(tmp_path, monkeypatch):
+    path = write(tmp_path, {"gate": {"random_runs": 321}})
+    monkeypatch.setenv("RESEARCH_SANDBOX_CONFIG", str(path))
+
+    assert rc.load()["gate"]["random_runs"] == 321
+
+
+def test_explicit_path_beats_environment(tmp_path, monkeypatch):
+    env_path = write(tmp_path, {"gate": {"random_runs": 321}})
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"gate": {"random_runs": 111}}), encoding="utf-8")
+    monkeypatch.setenv("RESEARCH_SANDBOX_CONFIG", str(env_path))
+
+    assert rc.load(other)["gate"]["random_runs"] == 111
+
+
+def test_shipped_paths_keep_approvals_and_token_in_the_control_directory():
+    cfg = rc.load()
+
+    assert cfg["paths"]["approvals_file"].startswith("data/research-control/")
+    assert cfg["gateway"]["token_file"].startswith("data/research-control/")
+    assert not cfg["paths"]["results_dir"].startswith("data/research-control")      # 结果目录(容器可写)与控制目录(容器只读)分开

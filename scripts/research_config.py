@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "gate": {"random_runs": 200, "timeout_seconds": 3600},
     "backtest": {"timeout_seconds": 600},
     "candidates": {"max_source_bytes": 65536, "name_pattern": r"^[a-z0-9_]{1,40}\.py$"},
-    "gateway": {"host": "127.0.0.1", "port": 8765, "token_file": "data/research/gateway.token",
+    "gateway": {"host": "127.0.0.1", "port": 8765, "token_file": "data/research-control/gateway.token",
                 "rate_limit_per_minute": 30, "max_body_bytes": 131072},
     "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
-              "approvals_file": "data/research/approvals.json"},
+              "approvals_file": "data/research-control/approvals.json"},
     "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": []},
 }
 
@@ -115,7 +116,8 @@ def _validate(cfg: dict) -> None:
 
 
 def load(path: Path | str | None = None) -> dict:
-    path = Path(path) if path is not None else CONFIG_PATH
+    # 显式参数 > 环境变量 RESEARCH_SANDBOX_CONFIG(容器里用它指向启动时生成的配置)> 随仓库的默认文件
+    path = Path(path) if path is not None else Path(os.environ.get("RESEARCH_SANDBOX_CONFIG") or CONFIG_PATH)
     if not path.exists():
         cfg = copy.deepcopy(DEFAULTS)
     else:

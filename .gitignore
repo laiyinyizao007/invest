@@ -28,3 +28,6 @@ runtime/
 terminal-info.txt
 docs/API--*/
 docs/*外部接入系统技术测试报告*.docx
+
+# 研究沙盒镜像的离线轮子(体积大,由 fetch_wheels.sh 生成)
+docker/research/wheelhouse/
