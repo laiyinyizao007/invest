@@ -181,6 +181,7 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
     out = json.loads(capsys.readouterr().out)
     assert out["kind"] == "gate" and out["passed"] is False and len(out["strategy_sha256"]) == 64
     assert out["plateau_note"].startswith("未提供")
+    assert "没看过滚动验证窗口" in out["protocol_notice"]
     assert (tree / "results" / f"{out['run_id']}.json").exists()
 
 

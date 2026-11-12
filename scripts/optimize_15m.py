@@ -97,6 +97,13 @@ def report(label: str, window: str, res: dict, note: str = "") -> None:
           "收益/净盈亏/成本/回撤的绝对值不受影响。")
 
 
+def plateau_json(scores: dict, cell: tuple) -> str:
+    """把训练段参数网格得分写成沙盒 `gate --plateau-file` 能读的 JSON。无效格子写成 "-inf" 字符串(JSON 没有无穷大)。"""
+    import json
+    rows = [[*key, "-inf" if value == float("-inf") else value] for key, value in sorted(scores.items())]
+    return json.dumps({"cell": list(cell), "scores": rows}, ensure_ascii=False)
+
+
 def segment_key() -> str:
     start, end = WINDOWS["test"]
     return f"optimize_15m:{KEY}:{start:%Y-%m-%d}~{end:%Y-%m-%d}"
@@ -106,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     global DATA_FILE
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--test", action="store_true", help="最终确认:查看测试段(只应运行一次)")
+    parser.add_argument("--plateau-out", default=None, help="把训练段参数网格得分写到此 JSON,供研究沙盒 gate --plateau-file 使用")
     parser.add_argument("--data", default=str(DATA_FILE), help=f"15 分钟复权 K 线 CSV(默认 {DATA_FILE})")
     args = parser.parse_args(argv)
     DATA_FILE = Path(args.data)
@@ -149,6 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     best = df.iloc[0]
     params = {"fast_window": int(best.fast_window), "slow_window": int(best.slow_window), "atr_mult": float(best.atr_mult)}
     print(f"\n选定参数(训练段邻域平均最优): {params}")
+    if args.plateau_out:     # 只含训练段得分,不触碰验证/测试段
+        cell = (FAST.index(params["fast_window"]), SLOW.index(params["slow_window"]), MULT.index(params["atr_mult"]))
+        Path(args.plateau_out).write_text(plateau_json(scores, cell), encoding="utf-8")
+        print(f"参数网格得分已写入 {args.plateau_out}")
 
     if args.test:  # 先登记后运行
         segment_ledger.record(segment_key(), note=f"optimize_15m.py --test 参数 {params}")

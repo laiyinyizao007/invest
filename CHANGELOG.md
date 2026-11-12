@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- `optimize_15m.py --plateau-out FILE`:把训练段参数网格得分写成沙盒 `gate --plateau-file` 可读的 JSON(只含训练段)。`gate` 结果新增 `protocol_notice`:候选参数若参考过滚动验证窗口(2022-07 ~ 2023-12)就不再是样本外——`optimize_15m.py` 的训练/验证段与这些窗口重叠,用它的输出做 gate 只能算参考(实测其选出的 24/192/3.0 在这些窗口上夏普 1.39、对随机对照 100 分位,但往返仅 48 笔、不在高原,门槛 5 项未过)。
 - 沙盒 `gate` 子命令与 `scripts/research_gate.py`:15 分钟玉米滚动验证段(W1~W3,不触碰测试段)上跑候选 / 成本翻倍 / 随机入场对照(新增 `RandomEntry15mStrategy`,入场概率按候选活跃度对齐,`--random-runs` 参数化默认 200),汇总后调用晋级门槛;缺 `--plateau-file` 时参数高原按未通过处理。实测 200 次对照约 23 秒。示例:基准类 fast=14/slow=60 的结果与既有 ADR 一致(样本外夏普 -3.96,门槛 7 项未过)。
 - 候选评估纯逻辑 `risk/candidate_eval.py`(ADR `20261112-candidate-evaluation`):滚动验证段拼接成样本外序列、随机入场分位数(种子数参数化,默认 200)、组装 `CandidateMetrics` 并调用 `check_gate`;门槛数值不放宽,无随机对照样本时分位数记 0。尚未接入沙盒 `gate` 子命令。
 - 研究沙盒 CLI `scripts/research_api.py`(`data`/`backtest`/`results`)与底座 `scripts/research_sandbox.py`:仅 `pending_strategies/` 内策略、仅训练/验证段、子进程 + 环境白名单 + 静态筛查 + 需 `--confirm-reviewed`;结果附诊断书与代码 sha256。纵深防御而非沙盒,威胁模型写在 `research_sandbox.py` 文件头与 ADR。

@@ -161,3 +161,50 @@ def test_test_window_is_not_evaluated_unless_requested(monkeypatch, capsys, tmp_
     calls.clear()
     assert o.main(["--test"]) == 0
     assert calls.count("test") == 2                                             # 常规成本 + 成本翻倍,各一次
+
+
+def test_plateau_file_is_written_from_training_scores_only(monkeypatch, tmp_path):
+    import json
+    monkeypatch.setattr(o.bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(o, "grid", lambda: [(i, j, k, o.FAST[i], o.SLOW[j], o.MULT[k]) for i in range(5) for j in range(6) for k in range(5)
+                                           if o.SLOW[j] >= 2 * o.FAST[i]])
+    windows = []
+
+    def fake_eval(params, window, cost_multiplier=1.0):
+        windows.append(window)
+        return {"return_pct": 1.0, "maxdd_pct": -1.0, "maxdd_yuan": -100.0, "sharpe": 1.0, "round_trips": 200,
+                "fills": 400, "end_balance": 10100.0, "net_pnl": 100.0, "total_cost": 50.0}
+
+    monkeypatch.setattr(o, "evaluate", fake_eval)
+    out = tmp_path / "plateau.json"
+
+    assert o.main(["--plateau-out", str(out)]) == 0
+
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert len(data["cell"]) == 3 and data["scores"]
+    assert all(len(row) == 4 for row in data["scores"])
+    assert "test" not in windows
+
+
+def test_plateau_file_roundtrips_through_the_gate_loader(monkeypatch, tmp_path):
+    import research_api as api
+    monkeypatch.setattr(o.bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(o, "grid", lambda: [(i, j, k, o.FAST[i], o.SLOW[j], o.MULT[k]) for i in range(5) for j in range(6) for k in range(5)
+                                           if o.SLOW[j] >= 2 * o.FAST[i]])
+    monkeypatch.setattr(o, "evaluate", lambda params, window, cost_multiplier=1.0: {
+        "return_pct": 1.0, "maxdd_pct": -1.0, "maxdd_yuan": -100.0, "sharpe": 1.0, "round_trips": 200,
+        "fills": 400, "end_balance": 10100.0, "net_pnl": 100.0, "total_cost": 50.0})
+    out = tmp_path / "plateau.json"
+    o.main(["--plateau-out", str(out)])
+
+    ok, note = api.load_plateau(str(out))
+
+    assert ok is True and "plateau-file" in note                        # 全平面均为正得分的网格,选中格必在高原上
+
+
+def test_invalid_cells_are_serialised_so_the_loader_counts_them_at_the_floor():
+    import json
+    text = o.plateau_json({(0, 0, 0): 1.0, (0, 0, 1): float("-inf")}, (0, 0, 0))
+
+    rows = json.loads(text)["scores"]
+    assert [0, 0, 1, "-inf"] in rows and [0, 0, 0, 1.0] in rows

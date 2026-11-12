@@ -28,6 +28,9 @@ import research_sandbox as rs
 RESULTS_DIR = bootstrap.ROOT / "data" / "research"
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
+# gate 无法验证候选参数是怎么选出来的,只能提醒:参数若参考过验证窗口(2022-07 ~ 2023-12)的表现,该窗口就不再是样本外
+PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必须在没看过滚动验证窗口(2022-07-01 ~ 2023-12-31)的情况下选定;"
+                   "optimize_15m.py 的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠,用它的输出做 gate 的结果只能算参考。")
 
 
 def emit(obj) -> None:
@@ -169,6 +172,7 @@ def cmd_gate(args) -> int:
     result = {
         "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "class": args.cls, "key": "C15", "params": params, "plateau_note": plateau_note,
+        "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
     }
     result["run_id"] = rs.save_result(result, RESULTS_DIR)
