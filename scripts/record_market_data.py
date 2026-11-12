@@ -167,6 +167,22 @@ class RecorderStatus:
             self.data["last_error"] = f"status 写入失败: {type(exc).__name__}: {exc}"
 
 
+def assess_skew(skews: Mapping[str, float], window: float) -> str | None:
+    """tick 时间与本机时钟相差 >= window 秒时,DataRecorder 会静默丢弃该 tick。
+
+    返回需要提示的警告;没有已观测的合约或全部正常时返回 None。
+    """
+    bad = {symbol: value for symbol, value in skews.items() if abs(value) >= window}
+    if not bad:
+        return None
+    detail = ", ".join(f"{symbol} 相差 {value:+.0f}s" for symbol, value in sorted(bad.items()))
+    scope = "全部" if len(bad) == len(skews) else "部分"
+    return (
+        f"{scope}合约的行情时间与本机时钟相差 >= {window:.0f}s,DataRecorder 会丢弃这些 tick({detail})。"
+        "请先核对本机时钟;若本机准确,则是前置的行情时间不可信(如 SimNow 7x24 仿真环境),不能据此验收。"
+    )
+
+
 def build_contract_only_gateway():
     """构造“只认证 + 查合约”的 CTP 网关类。延迟导入,方便无 vn.py 环境下做配置检查。
 
@@ -335,10 +351,14 @@ def run(config: dict, env: Mapping[str, str]) -> int:
         subscribed.add(contract.vt_symbol)
         status.update(status="recording", connected_symbols=sorted(subscribed))
 
+    skews: dict[str, float] = {}
+
     def on_tick(event: Event) -> None:
         # 事件线程内只更新内存;落盘由下面的主循环每 5 秒完成
         tick = event.data
         if tick.vt_symbol.upper() in config["symbols"]:
+            if tick.datetime:
+                skews[tick.vt_symbol] = (tick.datetime - datetime.now(tick.datetime.tzinfo)).total_seconds()
             status.note(last_tick=tick.datetime.isoformat() if tick.datetime else None)
 
     def request_stop(_signum=None, _frame=None):
@@ -359,7 +379,11 @@ def run(config: dict, env: Mapping[str, str]) -> int:
 
     try:
         while not stop.wait(5):
-            status.update(status="recording" if subscribed else "connected")
+            warning = assess_skew(dict(skews), recorder.filter_window)
+            status.update(
+                status=("degraded" if warning else "recording") if subscribed else "connected",
+                data_warning=warning,
+            )
     finally:
         status.update(status="stopping")
         flushed = flush_recorder(recorder)

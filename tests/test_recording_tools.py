@@ -458,3 +458,22 @@ def test_contract_only_gateway_timer_only_refreshes_md_date(locked_gateway):
         locked_gateway.process_timer_event(None)
 
     assert calls and set(calls) == {"date"}  # 夜盘跨午夜需要刷新日期,但绝不查账户/持仓
+
+
+# ---- 时间偏差可见性(SimNow 实测发现:偏差 >= 60 秒时 DataRecorder 会静默丢光所有 tick) ----
+
+def test_assess_skew_is_silent_when_clocks_agree():
+    assert recorder.assess_skew({}, 60) is None
+    assert recorder.assess_skew({"c2701.DCE": 1.5, "MA701.CZCE": -2.0}, 60) is None
+
+
+def test_assess_skew_warns_when_every_symbol_will_be_dropped():
+    message = recorder.assess_skew({"c2701.DCE": 417.0, "MA701.CZCE": -172383.0}, 60)
+
+    assert "全部" in message and "c2701.DCE" in message and "MA701.CZCE" in message
+
+
+def test_assess_skew_warns_when_only_some_symbols_are_dropped():
+    message = recorder.assess_skew({"c2701.DCE": 1.0, "MA701.CZCE": 500.0}, 60)
+
+    assert "部分" in message and "MA701.CZCE" in message and "c2701.DCE" not in message.split("部分")[0]
