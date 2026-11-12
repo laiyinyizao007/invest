@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 行情录制「卡住」检测：启动后超时未订阅 → `stalled`，`watchdog` 据此受控重启（忽略上次运行遗留状态）；订阅后长时间无任何 Tick → `data_warning`（只告警）。起因：SimNow 第一套前置夜盘实测，距上次停止仅约 16 秒再启动时，进程连接登录成功却 3 分钟不订阅，状态一直是 `connected`、心跳正常，旧版 watchdog 看不出。
 - 策略自身报错作为研究结果回传,而不是网关故障:子进程捕获策略运行异常 → `{type, message}`(取 traceback 末行,抹掉本机路径,限 200 字符)→ 记为 `status: strategy_error` 的结果(HTTP 200)→ `feedback` 的失败 Trace 中给出「策略运行报错: 类型: 信息」;`backtest_lib` 的异常信息现带上 vn.py 随后打印的 traceback(此前只剩一句「触发异常」)。毕昇工作流 v2(多轮循环)实测:布林带想法第 1 轮因 `am.boll` 返回值个数用错而报错,反馈回流后第 2 轮 LLM 自行改写并跑通(夏普 -1.02,该想法不成立)。注意:反馈里的报错文本可能来自已批准代码的异常信息,属进入 LLM 上下文的外部文本,故限长且只保留可打印字符。
 - 毕昇工作流 v2 构建与联调脚本 `tools/bisheng/build_v2.py`、`run_v2.py`:想法→读失败反馈→LLM 起名→LLM 写 `entry_signal`(带反馈)→提交→本机批准→回测→输出→回到想法输入(每轮都需人批准,轮数天然由人把控)。
 - 研究沙盒容器化 `docker-compose.research.yml` + `docker/research/`:网关与回测在独立容器内运行,内部网络 `research_net`(无外网)、只读根文件系统、丢弃 capability、非 root、资源限额、控制目录只读、数据只读、不含 `.env`/CTP;毕昇后端经该网络调用。镜像约 248 MB(去掉 vnpy 的 GUI 依赖),依赖由宿主机预下载轮子后离线安装(`fetch_wheels.sh`)。子进程运行前重算代码哈希(堵批准后替换文件);批准记录与令牌移入控制目录 `data/research-control/`;`RESEARCH_SANDBOX_CONFIG`、`INVEST_C15_DATA` 环境变量。随附毕昇可导入的接口描述 `docs/research-gateway.openapi.json`(有测试保证与路由白名单一致)。

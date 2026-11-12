@@ -254,6 +254,19 @@ def heartbeat_age(state_dir: Path) -> float | None:
         return None
 
 
+def reports_stalled(state_dir: Path, data: dict) -> bool:
+    """status.json 报 stalled 且它属于本次运行(started_at 不早于 wrapper 记录的启动时间),避免被上一次运行遗留的状态误导。"""
+    status = read_json(paths(state_dir)["status"]) or {}
+    if status.get("status") != "stalled":
+        return False
+    try:
+        run_started = datetime.fromisoformat(status["started_at"])
+        launched = datetime.fromisoformat(data["started_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (run_started - launched).total_seconds() >= -30.0
+
+
 def watchdog(state_dir: Path, profile: str | None = None) -> int:
     """进程不在 → 启动;进程在但心跳陈旧(卡死) → 受控重启;健康 → 不动。"""
     data = current(state_dir)
@@ -264,6 +277,11 @@ def watchdog(state_dir: Path, profile: str | None = None) -> int:
         uptime = (datetime.now(timezone.utc) - started).total_seconds()
     except (KeyError, TypeError, ValueError):
         uptime = float("inf")
+    # 卡在 connected 的进程心跳是正常的,必须看它自报的 stalled 状态(须先于下面的「新进程宽限」判断)
+    if reports_stalled(state_dir, data):
+        event(state_dir, "stalled", pid=data.get("pid"))
+        stop(state_dir)
+        return start(state_dir, profile)
     # 新进程还没来得及写心跳时,status.json 可能是上次运行遗留的旧文件,不据此判断
     if uptime < HEARTBEAT_STALE_SECONDS:
         return 0

@@ -188,6 +188,26 @@ class RecorderStatus:
             self.data["last_error"] = f"status 写入失败: {type(exc).__name__}: {exc}"
 
 
+STARTUP_STALL_SECONDS = 90.0   # 连接后超过此时间仍未订阅到任何合约 -> stalled(实测 SimNow 快速重复登录后会卡在 connected)
+
+
+def assess_stall(subscribed: bool, elapsed: float, limit: float = STARTUP_STALL_SECONDS) -> str | None:
+    """只看启动阶段:已订阅则盘后没有 Tick 是正常的,不判卡住;未订阅超过 limit 秒则返回说明。"""
+    if subscribed or elapsed < limit:
+        return None
+    return f"连接后 {elapsed:.0f}s 仍未订阅到任何合约(可能被前置限制重复登录,或合约查询未返回),需要重启"
+
+
+SILENCE_WARN_SECONDS = 120.0
+
+
+def assess_silence(subscribed_for: float | None, ticks_seen: bool, limit: float = SILENCE_WARN_SECONDS) -> str | None:
+    """已订阅却一直没有任何 Tick。只给 data_warning,不触发重启:非交易时段、行情前置未连通都会这样,系统里还没有交易日历可区分。"""
+    if subscribed_for is None or ticks_seen or subscribed_for < limit:
+        return None
+    return f"订阅后 {subscribed_for:.0f}s 仍未收到任何 Tick(非交易时段属正常;交易时段内说明行情前置未连通或未推送)"
+
+
 def assess_skew(skews: Mapping[str, float], window: float) -> str | None:
     """tick 时间与本机时钟相差 >= window 秒时,DataRecorder 会静默丢弃该 tick。
 
@@ -398,9 +418,21 @@ def run(config: dict, env: Mapping[str, str]) -> int:
     status.update(status="connecting")
     main_engine.connect(setting, "CTP")
 
+    started = time.monotonic()
+    first_subscribed_at = None
+    stall_limit = float(env.get("CTP_RECORD_STALL_SECONDS") or STARTUP_STALL_SECONDS)
     try:
         while not stop.wait(5):
             warning = assess_skew(dict(skews), recorder.filter_window)
+            stalled = assess_stall(bool(subscribed), time.monotonic() - started, stall_limit)
+            if subscribed and first_subscribed_at is None:
+                first_subscribed_at = time.monotonic()
+            silence = assess_silence(None if first_subscribed_at is None else time.monotonic() - first_subscribed_at,
+                                     bool(skews))
+            warning = warning or silence
+            if stalled:
+                status.update(status="stalled", last_error=stalled, data_warning=warning)
+                continue
             status.update(
                 status=("degraded" if warning else "recording") if subscribed else "connected",
                 data_warning=warning,

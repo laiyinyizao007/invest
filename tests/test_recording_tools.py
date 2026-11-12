@@ -580,3 +580,53 @@ def test_start_still_replaces_state_of_a_dead_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(wrapper, "STARTUP_GRACE", 0.0)
 
     assert wrapper.start(tmp_path) == 0 and spawned
+
+
+# ---- 卡住检测:连接成功但迟迟订阅不到合约(实测 SimNow 快速重复登录后出现) ----
+
+def test_assess_stall_only_fires_when_unsubscribed_past_the_limit():
+    assert recorder.assess_stall(subscribed=False, elapsed=10, limit=90) is None
+    assert "未订阅" in recorder.assess_stall(subscribed=False, elapsed=90, limit=90)
+    assert recorder.assess_stall(subscribed=True, elapsed=3600, limit=90) is None      # 已订阅:盘后无 Tick 是正常的
+
+
+def _write_status(state, status, started_age_seconds, heartbeat_age_seconds=5):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    (state / "status.json").write_text(json.dumps({
+        "status": status, "started_at": (now - timedelta(seconds=started_age_seconds)).isoformat(timespec="seconds"),
+        "heartbeat_at": (now - timedelta(seconds=heartbeat_age_seconds)).isoformat(timespec="seconds"),
+    }), encoding="utf-8")
+
+
+def test_watchdog_restarts_a_recorder_that_reports_stalled_even_with_a_fresh_heartbeat(tmp_path, monkeypatch):
+    state, calls = _stage_running_wrapper(tmp_path, monkeypatch, heartbeat_age_seconds=5, started_age_seconds=100)
+    _write_status(state, "stalled", started_age_seconds=100)
+
+    assert wrapper.watchdog(state) == 0
+    assert calls == ["stop", "start"]
+    assert "stalled" in (state / "events.ndjson").read_text(encoding="utf-8")
+
+
+def test_watchdog_ignores_a_stalled_status_left_by_a_previous_run(tmp_path, monkeypatch):
+    # 新进程刚启动 20 秒,status.json 还是上一次运行遗留的 stalled:不能据此重启
+    state, calls = _stage_running_wrapper(tmp_path, monkeypatch, heartbeat_age_seconds=5, started_age_seconds=20)
+    _write_status(state, "stalled", started_age_seconds=3600)
+
+    assert wrapper.watchdog(state) == 0
+    assert calls == []
+
+
+def test_watchdog_leaves_recording_status_alone(tmp_path, monkeypatch):
+    state, calls = _stage_running_wrapper(tmp_path, monkeypatch, heartbeat_age_seconds=5, started_age_seconds=100)
+    _write_status(state, "recording", started_age_seconds=100)
+
+    assert wrapper.watchdog(state) == 0
+    assert calls == []
+
+
+def test_assess_silence_warns_when_subscribed_but_no_tick_ever_arrived():
+    assert recorder.assess_silence(subscribed_for=30, ticks_seen=False, limit=120) is None
+    assert "未收到任何 Tick" in recorder.assess_silence(subscribed_for=120, ticks_seen=False, limit=120)
+    assert recorder.assess_silence(subscribed_for=3600, ticks_seen=True, limit=120) is None
+    assert recorder.assess_silence(subscribed_for=None, ticks_seen=False, limit=120) is None     # 还没订阅:交给 stalled 判断
