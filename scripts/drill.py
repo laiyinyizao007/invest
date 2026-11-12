@@ -480,7 +480,10 @@ def scenario_latency(drill: Drill) -> DrillResult:
     if contract is None:
         return DrillResult("latency", False, f"没有拿到 {drill.symbol} 的合约信息,无法构造委托")
     pricetick = contract.pricetick or 1.0
-    buy_price = round_to(tick.ask_price_1 or tick.last_price, pricetick)
+    # 挂「卖一 + N 跳」:限价买单按对手价成交(有价格改善),上限只是封顶滑点;清淡行情里卖一在 30 秒内被撤走/上移时,
+    # 贴着卖一挂会一直不成交(夜盘后段实测),所以留出几跳余量。
+    aggress = max(0, int(getattr(drill.args, "aggress_ticks", 0)))
+    buy_price = round_to((tick.ask_price_1 or tick.last_price) + aggress * pricetick, pricetick)
     if buy_price <= 0:
         return DrillResult("latency", False, "行情里没有可用的买价/最新价,无法构造委托")
 
@@ -1004,6 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="结果写入的 Markdown 文件(默认:仓库 docs/simnow-drills.md;容器内退到 data/)")
     parser.add_argument("--connect-timeout", type=float, default=300.0, help="等待合约与账户到位的最长时间(秒)")
     parser.add_argument("--tick-timeout", type=float, default=120.0, help="等待第一根 Tick 的最长时间(秒)")
+    parser.add_argument("--aggress-ticks", type=int, default=3,
+                        help="latency 开仓的限价在卖一之上加几跳(默认 3;0 = 贴卖一,清淡行情可能不成交)")
     parser.add_argument("--fill-timeout", type=float, default=30.0, help="等待成交/持仓回报的最长时间(秒)")
     parser.add_argument("--close-timeout", type=float, default=60.0, help="等待平仓的最长时间(秒)")
     parser.add_argument("--tick-stale-seconds", type=float, default=60.0, help="看门狗的行情停更阈值(秒)")

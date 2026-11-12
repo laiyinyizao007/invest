@@ -1253,3 +1253,17 @@ def test_delivery_warnings_call_out_deferred_and_still_pending_alerts():
 def test_delivery_warnings_are_silent_when_everything_was_sent():
     assert d.delivery_warnings({"通知渠道已配置": True, "发出": 5, "底层接受": 5, "未送达": 0, "未送达明细": [],
                                 "实际发送成功": 5, "暂存待补发": 0, "最终放弃": 0, "已补发": 0, "仍在待补发队列": 0}) == []
+
+
+def test_latency_prices_the_open_order_above_the_ask_by_the_configured_ticks():
+    drill = _make_drill(aggress_ticks=3)
+    drill.ticks.append((time.monotonic(), _Tick(ask=2400.0)))
+    d.scenario_latency(drill)
+    assert drill.runtime.main.orders[0].price == 2403.0          # 卖一 2400 + 3 跳(跳价 1)
+
+
+def test_latency_with_zero_aggression_sits_on_the_ask():
+    drill = _make_drill(aggress_ticks=0)
+    drill.ticks.append((time.monotonic(), _Tick(ask=2400.0)))
+    d.scenario_latency(drill)
+    assert drill.runtime.main.orders[0].price == 2400.0
