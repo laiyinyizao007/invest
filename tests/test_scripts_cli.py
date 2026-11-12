@@ -149,3 +149,18 @@ def test_unlock_main_parses_arguments(tmp_path):
     path = locked_state(tmp_path)
     assert unlock_account.main(["--state", str(path), "--yes"]) == 0
     assert not json.loads(path.read_text(encoding="utf-8"))["hard_locked"]
+
+
+def test_notifier_outbox_is_on_by_default_under_data_state():
+    n = run_headless.build_notifier({**ENV, "WEBHOOK_URL": "http://x/y"})
+
+    assert n._outbox_path is not None and n._outbox_path.name == "webhook_outbox.jsonl"
+    assert n._outbox_path.parent.name == "state" and n._outbox_path.parent.parent.name == "data"
+
+
+def test_notifier_outbox_can_be_redirected_or_switched_off():
+    custom = run_headless.build_notifier({**ENV, "WEBHOOK_URL": "http://x/y", "WEBHOOK_OUTBOX": "/tmp/my_outbox.jsonl"})
+    off = run_headless.build_notifier({**ENV, "WEBHOOK_URL": "http://x/y", "WEBHOOK_OUTBOX": "off"})
+
+    assert str(custom._outbox_path).replace("\\", "/").endswith("/tmp/my_outbox.jsonl")
+    assert off._outbox_path is None

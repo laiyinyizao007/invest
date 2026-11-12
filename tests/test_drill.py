@@ -1209,3 +1209,47 @@ def test_cut_flags_parse_and_the_release_based_simulation_is_gone():
     calls = [ast.unparse(n.func) for n in ast.walk(func) if isinstance(n, ast.Call)]
     assert not any(c.endswith(".close") for c in calls), calls          # 代码里不得再调用 close()(文档字符串里提及不算)
     assert "--trace-skip-close" not in src
+
+
+def test_delivery_summary_reports_what_was_actually_sent_not_just_accepted():
+    """「被通知器接受」只说明进了队列;网络中断时消息会被暂存或放弃,必须单独统计。"""
+
+    class _Inner:
+        enabled = True
+        sent, deferred, failed, redelivered, pending_outbox = 3, 2, 1, 4, 2
+
+        def send(self, level, title, message, extra=None):
+            return True
+
+        def close(self, drain_timeout=10.0):
+            pass
+
+    rec = d.RecordingNotifier(_Inner())
+    rec.send("ERROR", "网关连接断开", "x")
+
+    summary = rec.delivery_summary()
+
+    assert summary["实际发送成功"] == 3 and summary["暂存待补发"] == 2 and summary["最终放弃"] == 1
+    assert summary["已补发"] == 4 and summary["仍在待补发队列"] == 2
+
+
+def test_delivery_summary_tolerates_notifiers_without_counters():
+    rec = d.RecordingNotifier(_NullNotifier())
+    rec.send("INFO", "x", "y")
+
+    summary = rec.delivery_summary()
+
+    assert summary["实际发送成功"] is None and summary["暂存待补发"] is None
+
+
+def test_delivery_warnings_call_out_deferred_and_still_pending_alerts():
+    text = d.delivery_warnings({"通知渠道已配置": True, "发出": 9, "底层接受": 9, "未送达": 0, "未送达明细": [],
+                                "实际发送成功": 6, "暂存待补发": 3, "最终放弃": 0, "已补发": 1, "仍在待补发队列": 2})
+
+    joined = " ".join(text)
+    assert "3 条" in joined and "暂存" in joined and "2 条" in joined
+
+
+def test_delivery_warnings_are_silent_when_everything_was_sent():
+    assert d.delivery_warnings({"通知渠道已配置": True, "发出": 5, "底层接受": 5, "未送达": 0, "未送达明细": [],
+                                "实际发送成功": 5, "暂存待补发": 0, "最终放弃": 0, "已补发": 0, "仍在待补发队列": 0}) == []

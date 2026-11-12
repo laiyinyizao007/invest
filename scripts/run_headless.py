@@ -38,6 +38,15 @@ from ctp_tools.simnow import is_simnow_address
 from trading.runtime import EXIT_OK, RuntimeConfig, TradingRuntime, build_ctp_setting
 
 
+def webhook_outbox_path(env: Mapping[str, str]) -> Path | None:
+    """待补发队列文件。默认 data/state/webhook_outbox.jsonl(容器里是挂载出来的卷,重启不丢);
+    WEBHOOK_OUTBOX=off 关闭;写别的路径则改用该路径。"""
+    value = (env.get("WEBHOOK_OUTBOX", "") or "").strip()
+    if value.lower() in ("off", "none", "false", "0"):
+        return None
+    return Path(value) if value else bootstrap.ROOT / "data" / "state" / "webhook_outbox.jsonl"
+
+
 def build_notifier(env: Mapping[str, str]) -> WebhookNotifier:
     url = env.get("WEBHOOK_URL", "")
     secrets = [env.get("CTP_PASSWORD", ""), env.get("CTP_AUTH_CODE", ""), env.get("WEBHOOK_TELEGRAM_CHAT_ID", "")]
@@ -47,6 +56,7 @@ def build_notifier(env: Mapping[str, str]) -> WebhookNotifier:
         chat_id=env.get("WEBHOOK_TELEGRAM_CHAT_ID", ""),
         min_level=env.get("WEBHOOK_MIN_LEVEL", "INFO"),
         secrets=[s for s in secrets if s],
+        outbox_path=webhook_outbox_path(env),
     )
 
 

@@ -59,6 +59,7 @@ docker compose run --rm --entrypoint python trader scripts/drill.py latency --co
 |---|---|
 | `overnight` | ✅ 21:00 之后的首根 Tick 归属下一交易日 |
 | `latency` | ✅ 成交→持仓回报 0.177 秒，1 手仓已平。**首次运行失败**：`drill.py` 读了不存在的 `TickData.ask_price`（应为 `ask_price_1`），单测的假 Tick 犯了同样的错，所以全绿却从未发现；已修并改用真实 `TickData` |
+| `latency`（最后一次完整 `all`） | ❌ 30 秒没成交（夜盘后段行情清淡，按卖一价挂单）；已撤单、账户无仓位。该场景对行情活跃度敏感，不能视为稳定通过 |
 | `tick-stale` | ✅ 行情断流 60 秒后看门狗告警 |
 | `disconnect` | ✅ 切网 240 秒：行情停更 61 秒告警；CTP 约 121 秒报断线（8193）；恢复后约 2 秒自动重连。首个版本因释放 API 段错误，改为外部真实切网后通过，详见下 |
 | `daily-loss` | ✅ 注入权益下降 700 元（阈值 600）→ `DAILY_LOCKED`、禁止新开仓告警；场景开平 1 手无残留 |

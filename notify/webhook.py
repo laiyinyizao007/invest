@@ -5,8 +5,12 @@
 - 相同(级别, 标题, 内容)在 dedup_window 秒内只发一次(FATAL 不去重),避免故障时刷屏;
 - 发送前把 secrets 里的敏感字符串(密码、授权码、token)替换成 ***,防止通过消息泄露;
 - 三种格式:generic(JSON)、feishu(飞书机器人)、telegram(Bot API)。
+- 可选的**落盘待补发队列**(outbox_path):发送最终失败的消息不丢,写入 JSONL 文件,网络恢复后由后台线程补发(带「【补发】」前缀,
+  保留原始发生时间);进程重启后继续补发;积压的 INFO 合并成一条摘要,避免恢复后刷屏。
+  起因:夜盘真实切断网络 240 秒的演练里,断网期间产生的「行情假死」「网关连接断开」告警恢复后也没有补发(旧版只重试约十几秒就放弃)。
 """
 import json
+import os
 import queue
 import socket
 import threading
@@ -14,6 +18,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
@@ -26,6 +31,10 @@ _STOP = object()
 # 上限的意义是"宁可丢一部分非 FATAL 告警,也不能让退出流程拖住"。
 # FATAL 在 close() 时会被提到队首,优先送达。
 MAX_DRAIN_TIMEOUT = 300.0
+
+# 待补发队列:积压的 INFO 达到这个条数就合并成一条摘要(摘要里最多列这么多行)
+DIGEST_MIN_ITEMS = 3
+DIGEST_MAX_LINES = 20
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -120,6 +129,11 @@ class WebhookNotifier:
         host: str | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        outbox_path: str | os.PathLike | None = None,
+        outbox_max: int = 200,
+        outbox_max_age: float = 86_400.0,
+        redeliver_interval: float = 30.0,
+        now: Callable[[], datetime] = datetime.now,
     ) -> None:
         if kind not in ("generic", "feishu", "telegram"):
             raise ValueError(f"不支持的 webhook 类型: {kind}")
@@ -147,10 +161,31 @@ class WebhookNotifier:
         self.history: deque[dict] = deque(maxlen=50)   # 最近发送过的消息,便于排查
         self._inflight = 0          # 后台线程已经取走、但还没发完的消息数
         self._closed = threading.Event()   # 已请求停止:后台线程排空队列后自行退出
+        # ---- 落盘待补发队列 ----
+        self._outbox_path = Path(outbox_path) if outbox_path else None
+        self._outbox_max, self._outbox_max_age = max(1, int(outbox_max)), float(outbox_max_age)
+        self._redeliver_interval = float(redeliver_interval)
+        self._now = now
+        self._outbox_lock = threading.Lock()          # 保护 _outbox 列表与文件
+        self._redeliver_lock = threading.Lock()       # 同一时刻只允许一个补发过程(后台线程与手动调用不重复发)
+        self.deferred = 0         # 发送最终失败而暂存进待补发队列的条数
+        self.redelivered = 0      # 从待补发队列补发成功的条数
+        self.expired = 0          # 超过 outbox_max_age 被放弃的条数
+        self._down_until = float("-inf")      # 已知断网到这个时刻为止:新消息只试一次,不走完整重试
+        self._last_redeliver = float("-inf")
+        self._outbox: list[dict] = self._load_outbox()
+        if self._outbox and self.enabled:
+            self._ensure_started()            # 上次进程遗留的告警:启动就开始补发,不必等第一条新告警
 
     @property
     def enabled(self) -> bool:
         return bool(self.url)
+
+    @property
+    def pending_outbox(self) -> int:
+        """待补发队列里还有多少条。"""
+        with self._outbox_lock:
+            return len(self._outbox)
 
     @property
     def flush_timeout(self) -> float:
@@ -239,6 +274,7 @@ class WebhookNotifier:
             if remaining <= 0:
                 break
             thread.join(min(remaining, 0.2))
+        self._persist_pending_queue()         # 预算用完仍没发出去的,落盘留给下次进程补发,而不是随进程消失
 
     def _prioritize_fatal(self) -> None:
         """把队列里的 FATAL 消息提到最前面(停止哨兵保持在最后)。"""
@@ -319,6 +355,7 @@ class WebhookNotifier:
                 # 后台线程会永远收不到停止信号,close() 只能干等到预算耗尽。
                 if self._closed.is_set():
                     return
+                self._maybe_redeliver()
                 continue
             if item is _STOP:
                 return
@@ -388,24 +425,178 @@ class WebhookNotifier:
             return "飞书响应体里没有业务码,无法确认已送达"
         return None
 
+    def _try_post(self, payload: dict) -> bool:
+        """发一次。成功返回 True;失败返回 False 并把(脱敏后的)原因记进 last_error。"""
+        try:
+            resp = requests.post(self.url, json=payload, timeout=self.timeout)
+            if 200 <= resp.status_code < 300:
+                problem = self._body_error(resp)
+                if problem is None:
+                    return True
+                # 响应体里带回了错误信息,可能含 token 之类的敏感内容,落库前脱敏
+                self.last_error = redact(problem, self.secrets + self._url_secrets)
+            else:
+                self.last_error = f"HTTP {resp.status_code}"
+        except Exception as exc:
+            self.last_error = redact(repr(exc), self.secrets + self._url_secrets)   # 异常文本里可能带 token/URL 的路径
+        return False
+
     def _deliver(self, item: dict) -> None:
         payload = self._payload(item)
-        attempts = 1 + len(self.retry_delays)
+        # 已知断网(刚有一次投递或补发完整失败)时只试一次:否则队列里每条消息都要空等约 34 秒,
+        # 断网越久积压越多,最终把队列塞满、反而丢消息。
+        known_down = self._outbox_path is not None and self._clock() < self._down_until
+        attempts = 1 if known_down else 1 + len(self.retry_delays)
         for attempt in range(attempts):
-            try:
-                resp = requests.post(self.url, json=payload, timeout=self.timeout)
-                if 200 <= resp.status_code < 300:
-                    problem = self._body_error(resp)
-                    if problem is None:
-                        self._bump("sent", 1)
-                        self.history.append(item)
-                        return
-                    # 响应体里带回了错误信息,可能含 token 之类的敏感内容,落库前脱敏
-                    self.last_error = redact(problem, self.secrets + self._url_secrets)
-                else:
-                    self.last_error = f"HTTP {resp.status_code}"
-            except Exception as exc:
-                self.last_error = redact(repr(exc), self.secrets + self._url_secrets)   # 异常文本里可能带 token/URL 的路径
+            if self._try_post(payload):
+                self._bump("sent", 1)
+                self.history.append(item)
+                self._down_until = float("-inf")
+                return
             if attempt < attempts - 1:
                 self._sleep(self.retry_delays[attempt])
-        self._bump("failed", 1)
+        if self._outbox_path is not None:
+            self._down_until = self._clock() + self._redeliver_interval
+        self._defer(item)
+
+    # ---------- 落盘待补发队列 ----------
+
+    def _load_outbox(self) -> list[dict]:
+        if self._outbox_path is None or not self._outbox_path.exists():
+            return []
+        entries: list[dict] = []
+        try:
+            for line in self._outbox_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(data, dict) and {"level", "title", "message", "time"} <= data.keys():
+                    entries.append(data)
+        except OSError as exc:
+            self.last_error = repr(exc)
+        return entries[-self._outbox_max:]
+
+    def _save_outbox_locked(self) -> None:
+        """整体改写(临时文件 + fsync + 原子替换):进程在任何时刻被杀,文件要么是旧版要么是新版,不会是半截。"""
+        if self._outbox_path is None:
+            return
+        try:
+            self._outbox_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._outbox_path.with_name(self._outbox_path.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as stream:
+                for entry in self._outbox:
+                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, self._outbox_path)
+        except OSError as exc:
+            self.last_error = repr(exc)      # 落盘失败只记录,绝不抛:通知模块不能影响交易
+
+    def _defer(self, item: dict) -> None:
+        """投递最终失败:有待补发队列就暂存,否则按旧行为计为 failed(放弃)。"""
+        if self._outbox_path is None:
+            self._bump("failed", 1)
+            return
+        with self._outbox_lock:
+            self._outbox.append(item)
+            while len(self._outbox) > self._outbox_max:
+                # 挤掉最旧的非 FATAL;全是 FATAL 时才挤掉最旧的 FATAL
+                victim = next((i for i, e in enumerate(self._outbox) if e.get("level") != "FATAL"), 0)
+                del self._outbox[victim]
+                self._bump("dropped", 1)
+            self._save_outbox_locked()
+        self._bump("deferred", 1)
+
+    def _persist_pending_queue(self) -> None:
+        """把内存队列里还没发出去的消息落盘(close() 预算耗尽、进程即将退出时调用)。"""
+        if self._outbox_path is None:
+            return
+        leftovers = []
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if queued is not _STOP:
+                leftovers.append(queued)
+        for queued in leftovers:
+            self._defer(queued)
+
+    def _expire_locked(self) -> None:
+        now = self._now()
+        kept = []
+        for entry in self._outbox:
+            try:
+                age = (now - datetime.fromisoformat(entry["time"])).total_seconds()
+            except (ValueError, TypeError):
+                age = 0.0                    # 时间戳无法解析:宁可补发也不静默丢弃
+            if age > self._outbox_max_age:
+                self._bump("expired", 1)
+            else:
+                kept.append(entry)
+        if len(kept) != len(self._outbox):
+            self._outbox = kept
+            self._save_outbox_locked()
+
+    def _remove_from_outbox(self, entries: list[dict]) -> None:
+        gone = {id(e) for e in entries}
+        with self._outbox_lock:
+            self._outbox = [e for e in self._outbox if id(e) not in gone]
+            self._save_outbox_locked()
+
+    def _digest(self, infos: list[dict]) -> dict:
+        shown = infos[:DIGEST_MAX_LINES]
+        lines = [f"{e['time']} {e['title']}" for e in shown]
+        if len(infos) > len(shown):
+            lines.append(f"其余 {len(infos) - len(shown)} 条 INFO 告警已省略")
+        return {"level": "INFO", "title": f"【补发摘要】{len(infos)} 条 INFO 告警", "message": "\n".join(lines),
+                "extra": {}, "time": self._now().isoformat(timespec="seconds")}
+
+    def process_outbox_once(self) -> int:
+        """尝试补发一轮,返回本轮成功发出的**告警条数**(摘要里的每条也各算一条)。
+
+        顺序:FATAL/ERROR/WARN 按发生先后逐条补发;INFO 少于 DIGEST_MIN_ITEMS 条逐条发,否则合并成一条摘要。
+        遇到第一次失败立刻停止(网络显然还没恢复),不对每条都空等超时。"""
+        if not self._redeliver_lock.acquire(blocking=False):
+            return 0
+        try:
+            with self._outbox_lock:
+                self._expire_locked()
+                entries = list(self._outbox)
+            if not entries:
+                return 0
+            urgent = [e for e in entries if e.get("level") != "INFO"]
+            infos = [e for e in entries if e.get("level") == "INFO"]
+            sent = 0
+            plan: list[tuple[dict, list[dict]]] = [(dict(e, title="【补发】" + e["title"]), [e]) for e in urgent]
+            if len(infos) >= DIGEST_MIN_ITEMS:
+                plan.append((self._digest(infos), infos))
+            else:
+                plan += [(dict(e, title="【补发】" + e["title"]), [e]) for e in infos]
+            for message, sources in plan:
+                if not self._try_post(self._payload(message)):
+                    self._down_until = self._clock() + self._redeliver_interval
+                    return sent
+                self._remove_from_outbox(sources)
+                self._bump("sent", 1)
+                self._bump("redelivered", len(sources))
+                self.history.append(message)
+                self._down_until = float("-inf")
+                sent += len(sources)
+            return sent
+        finally:
+            self._redeliver_lock.release()
+
+    def _maybe_redeliver(self) -> None:
+        """后台线程空闲时调用:待补发队列非空且距上次尝试已过 redeliver_interval 就补发一轮。"""
+        if self._outbox_path is None or self._clock() - self._last_redeliver < self._redeliver_interval:
+            return
+        with self._outbox_lock:
+            if not self._outbox:
+                return
+        self._last_redeliver = self._clock()
+        try:
+            self.process_outbox_once()
+        except Exception as exc:     # noqa: BLE001  补发出错不能打断后台线程
+            self.last_error = repr(exc)

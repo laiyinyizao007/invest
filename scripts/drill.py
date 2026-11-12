@@ -85,6 +85,25 @@ ORDER = ["overnight", "latency", "tick-stale", "disconnect", "daily-loss", "hard
 REAL_ORDER_SCENARIOS = frozenset({"latency", "daily-loss", "hard-lock"})
 
 
+def delivery_warnings(delivery: dict) -> list[str]:
+    """把送达统计翻成写进结果文件的提示。只在有异常时才有内容。"""
+    warnings: list[str] = []
+    if not delivery["通知渠道已配置"]:
+        warnings.append("通知渠道未配置(WEBHOOK_URL 为空):本次只验证了"
+                        "「运行时确实发出了告警」,没有验证「告警送达手机」。")
+        return warnings
+    if delivery["未送达"]:
+        warnings.append(f"有 {delivery['未送达']} 条告警没有被通知器接受(去重/过滤/队列满):"
+                        f"{'、'.join(delivery['未送达明细'][:5])}。")
+    deferred, pending = delivery.get("暂存待补发"), delivery.get("仍在待补发队列")
+    if deferred:
+        warnings.append(f"有 {deferred} 条告警发送失败后暂存进待补发队列(网络中断?),其中已补发 {delivery.get('已补发') or 0} 条;"
+                        f"**{pending or 0} 条本次退出时仍未补发**,会在下次启动后继续补发。")
+    if delivery.get("最终放弃"):
+        warnings.append(f"有 {delivery['最终放弃']} 条告警最终放弃(未启用待补发队列)。")
+    return warnings
+
+
 def risky_scenarios(names: list[str], td_address: str) -> list[str]:
     """在非 SimNow 地址上、且会真的发委托的场景。
 
@@ -205,9 +224,14 @@ class RecordingNotifier:
             delivered = sum(1 for a in self.alerts if a.get("delivered"))
             missed = [a for a in self.alerts if not a.get("delivered")]
         configured = bool(getattr(self.inner, "enabled", True))
+        # 「被接受」只说明进了发送队列;网络中断时消息可能被暂存待补发或最终放弃,这里单独报告
+        # (底层没有这些计数器时给 None,不猜)。
         return {"通知渠道已配置": configured,
                 "发出": total, "底层接受": delivered, "未送达": len(missed),
-                "未送达明细": [f"{a['level']} {a['title']}" for a in missed]}
+                "未送达明细": [f"{a['level']} {a['title']}" for a in missed],
+                "实际发送成功": getattr(self.inner, "sent", None), "暂存待补发": getattr(self.inner, "deferred", None),
+                "最终放弃": getattr(self.inner, "failed", None), "已补发": getattr(self.inner, "redelivered", None),
+                "仍在待补发队列": getattr(self.inner, "pending_outbox", None)}
 
     def close(self, drain_timeout: float = 10.0) -> None:
         self.inner.close(drain_timeout)
@@ -1062,6 +1086,7 @@ def main(argv: list[str] | None = None) -> int:
         warnings.append(f"目标交易服务器 {td_address} **不在**已知的 SimNow 地址表内,"
                         f"本次由 --allow-any-address 强制放行。"
                         f"若该地址属于期货公司生产 API,本次演练的委托会发到**真实资金账户**。")
+    out = Path(args.out) if args.out else default_out_path()
     try:
         if not drill.start():
             print("启动失败:没有进入运行状态(见上方告警)", file=sys.stderr)
@@ -1084,6 +1109,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    {k}: {v}")
             if name == "hard-lock":
                 break       # 硬锁定会让运行时退出,后面的场景不再有意义
+        # 先落一份结果,再进入退出阶段:退出时发 ReqUserLogout 曾在重连之后触发原生段错误(139),
+        # 进程一崩,后面的 write_results 就不会执行,整次演练的证据全丢。送达统计要等通知器排空后才完整,稍后会覆盖这份。
+        write_results(out, results, datetime.now().isoformat(timespec="seconds"), warnings=list(warnings))
+        print(f"\n结果已先行写入 {out}(退出阶段结束后会用完整的送达统计覆盖)")
     finally:
         drill.stop()
         # 等待要够长,后台线程才可能把队列里的告警发完(尤其 hard-lock 的 FATAL)。
@@ -1093,15 +1122,9 @@ def main(argv: list[str] | None = None) -> int:
     # 告警"发出"与"送达"是两件事:底层拒绝(去重/过滤/队列满)时手机端并没有响。
     # 渠道压根没配时这不算"丢告警",但也不能算"验证过送达"。
     delivery = notifier.delivery_summary()
-    if not delivery["通知渠道已配置"]:
-        warnings.append("通知渠道未配置(WEBHOOK_URL 为空):本次只验证了"
-                        "「运行时确实发出了告警」,没有验证「告警送达手机」。")
-    elif delivery["未送达"]:
-        warnings.append(f"有 {delivery['未送达']} 条告警没有被通知器接受(去重/过滤/队列满):"
-                        f"{'、'.join(delivery['未送达明细'][:5])}。")
+    warnings.extend(delivery_warnings(delivery))
 
     stamp = datetime.now().isoformat(timespec="seconds")
-    out = Path(args.out) if args.out else default_out_path()
     write_results(out, results, stamp, warnings=warnings)
     print(f"\n结果已写入 {out}")
     print(render_results(results))
