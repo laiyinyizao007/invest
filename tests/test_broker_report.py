@@ -27,7 +27,7 @@ def evidences(**overrides):
 
 def ctx(**kw):
     defaults = dict(system_name="invest", version="1.0", app_id="client_invest_1.0", account="12345678",
-                    submitter_name="Laiyin", contact_name="Lai", contact_phone="13800000000", contact_email="a@b.c",
+                    submitter_name="测试员乙", contact_name="联系人乙", contact_phone="13800000000", contact_email="a@b.c",
                     machine="Dell XPS", os_name="Windows 11", cpu="Ultra 9", memory="32 GB", disk="NVMe 954GB",
                     test_time="2026-11-11", report_date=datetime(2026, 11, 11))
     defaults.update(kw)
@@ -115,7 +115,7 @@ def test_report_fills_fields_and_checks_results(tmp_path):
     top = table_with(doc, "AppID/RelayAppID")                              # 穿透表之一
     assert br.text_of(br.find_row(top, "AppID/RelayAppID")[1][1]) == "client_invest_1.0"
     summary = [t for t in doc.body.findall(br.TBL) if br.find_row(t, "提测方")][0]
-    assert br.text_of(br.find_row(summary, "联系人")[1][2]) == "Lai"
+    assert br.text_of(br.find_row(summary, "联系人")[1][2]) == "联系人乙"
     phone_row = br.find_row(summary, "电话")[1]
     assert br.text_of(phone_row[2]) == "13800000000" and br.text_of(phone_row[4]) == "a@b.c"
     assert br.text_of(br.find_row(summary, "程序化交易系统")[1][1]).startswith("测试机型号:Dell XPS")

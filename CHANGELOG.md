@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 个人信息防线 `tests/test_no_personal_data.py`:本机 `.env` 中的姓名/电话/邮箱/账号取值不得出现在任何受版本控制的文件里(失败信息只给位置,不回显取值);测试数据里的姓名一律改为虚构占位。真实个人信息只放本机 `.env`。
 - 行情录制 codex 审查后的加固(Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)):修复 `EventEngine` 重复启动、DCE 小写合约被大写后找不到、关闭时不 flush 丢尾部数据、每 tick 同步写状态文件、旧录制列表不同步;SimNow 要求行情前置主机与已通过白名单的交易前置主机一致;wrapper 子进程不再继承调用方管道、启动后确认存活、`watchdog` 检查心跳;增量任务超时杀整棵进程树、陈旧锁自动恢复、不向下载子进程传递 `CTP_*` 凭证。合约来源问题按用户确认的方案 A 解决:受限连接交易前置,只做认证+查合约,发单/撤单/查资金/查持仓在网关层与底层请求层双重硬性禁止(ADR 已修订边界);国信 profile 新增 `CTP_RECORD_ALLOWED_ADDRESSES` 显式地址允许列表。SimNow 第二套 7x24 前置上已验证认证/登录/合约查询/订阅/tick 到达/优雅停止,以及临时库中 DataRecorder 入库(115 tick + 2 根 1 分钟 K 线);但该环境行情时间不可信(比本机快 417s、郑商所日期停在两天前),DataRecorder 的 60s 保护会丢光 tick,故正式库为 0 行。新增 `data_warning`/`degraded` 状态,时间偏差 ≥60s 时显式告警。**交易时段内的真实录制仍待验收。**
 - `scripts/broker_report.py` 在国信报告签字栏旁打印提测方姓名（仅提示，不代替手写签字/盖章；姓名为空时不改动模板）。
 - 补齐行情录制与增量调度的有界任务 `scripts/record_market_incremental.py`、离线生命周期测试 `tests/test_recording_tools.py` 和运行手册 `docs/runbook-market-recording.md`；**真实前置上的录制尚未验证**（合约来源已改为受限交易前置连接，见 ADR 修订）；Windows dummy worker 实测已通过并修复 `pid_alive` 在 Windows 上的误判（旧实现使 `ensure`/`watchdog` 重复拉起、`stop` 永远拒绝）；DSH 重启行为与授权行情端到端实测仍待完成（Issue [#13](https://github.com/laiyinyizao007/invest/issues/13)）。
