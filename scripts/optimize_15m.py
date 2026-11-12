@@ -35,6 +35,8 @@ KEY = "C15"
 WINDOWS = {
     "train": (datetime(2020, 7, 22), datetime(2022, 12, 31, 23, 59)),
     "valid": (datetime(2023, 1, 1), datetime(2023, 12, 31, 23, 59)),
+    # 样本外安全选参:训练段止于 Walk-Forward 第一个验证窗口之前(2022-07-01 起的验证窗口因此保持真正的样本外)
+    "select": (datetime(2020, 7, 22), datetime(2022, 6, 30, 23, 59)),
     "test": (datetime(2024, 1, 1), datetime(2026, 6, 15, 23, 59)),
 }
 FAST = [8, 12, 16, 24, 32]
@@ -113,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     global DATA_FILE
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--test", action="store_true", help="最终确认:查看测试段(只应运行一次)")
+    parser.add_argument("--select-only", action="store_true",
+                        help="样本外安全选参:只用 2022-06-30 之前的数据选参并输出,不评估验证/测试段(供研究沙盒 gate 使用)")
     parser.add_argument("--plateau-out", default=None, help="把训练段参数网格得分写到此 JSON,供研究沙盒 gate --plateau-file 使用")
     parser.add_argument("--data", default=str(DATA_FILE), help=f"15 分钟复权 K 线 CSV(默认 {DATA_FILE})")
     args = parser.parse_args(argv)
@@ -124,12 +128,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"拒绝运行 --test: {exc}", file=sys.stderr)
             return 2
 
+    if args.select_only and args.test:
+        print("拒绝: --select-only 与 --test 不能同时使用", file=sys.stderr)
+        return 2
+    train_w = "select" if args.select_only else "train"
     combos = grid()
-    print(f"[{KEY}] 数据 {DATA_FILE.name};训练段 {WINDOWS['train'][0]:%Y-%m-%d}~{WINDOWS['train'][1]:%Y-%m-%d},共 {len(combos)} 组参数")
+    print(f"[{KEY}] 数据 {DATA_FILE.name};训练段 {WINDOWS[train_w][0]:%Y-%m-%d}~{WINDOWS[train_w][1]:%Y-%m-%d},共 {len(combos)} 组参数")
     rows, scores = [], {}
     for i, (fi, si, mi, f, s, m) in enumerate(combos, 1):
         params = {"fast_window": f, "slow_window": s, "atr_mult": m}
-        res = evaluate(params, "train")
+        res = evaluate(params, train_w)
         scores[(fi, si, mi)] = valid_score(res)
         rows.append({**params, **res, "score": scores[(fi, si, mi)], "grid": (fi, si, mi)})
         if i % 25 == 0:
@@ -162,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.plateau_out).write_text(plateau_json(scores, cell), encoding="utf-8")
         print(f"参数网格得分已写入 {args.plateau_out}")
 
+    if args.select_only:     # 到此为止:验证/测试段一律不看,保持 gate 的滚动验证窗口为真正的样本外
+        print("(--select-only:未评估验证/测试段。把上面的参数和 --plateau-out 文件交给 research_api.py gate。)")
+        return 0
     if args.test:  # 先登记后运行
         segment_ledger.record(segment_key(), note=f"optimize_15m.py --test 参数 {params}")
     windows = ["train", "valid"] + (["test"] if args.test else [])

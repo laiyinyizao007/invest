@@ -30,7 +30,7 @@ CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
 # gate 无法验证候选参数是怎么选出来的,只能提醒:参数若参考过验证窗口(2022-07 ~ 2023-12)的表现,该窗口就不再是样本外
 PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必须在没看过滚动验证窗口(2022-07-01 ~ 2023-12-31)的情况下选定;"
-                   "optimize_15m.py 的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠,用它的输出做 gate 的结果只能算参考。")
+                   "optimize_15m.py 默认的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠;请用 optimize_15m.py --select-only(训练段止于 2022-06-30)选参。")
 
 
 def emit(obj) -> None:

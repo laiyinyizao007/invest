@@ -208,3 +208,43 @@ def test_invalid_cells_are_serialised_so_the_loader_counts_them_at_the_floor():
 
     rows = json.loads(text)["scores"]
     assert [0, 0, 1, "-inf"] in rows and [0, 0, 0, 1.0] in rows
+
+
+def _stub_grid_and_eval(monkeypatch, tmp_path, windows_seen):
+    monkeypatch.setattr(o.bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(o, "grid", lambda: [(i, j, k, o.FAST[i], o.SLOW[j], o.MULT[k]) for i in range(5) for j in range(6) for k in range(5)
+                                           if o.SLOW[j] >= 2 * o.FAST[i]])
+
+    def fake_eval(params, window, cost_multiplier=1.0):
+        windows_seen.append(window)
+        return {"return_pct": 1.0, "maxdd_pct": -1.0, "maxdd_yuan": -100.0, "sharpe": 1.0, "round_trips": 200,
+                "fills": 400, "end_balance": 10100.0, "net_pnl": 100.0, "total_cost": 50.0}
+
+    monkeypatch.setattr(o, "evaluate", fake_eval)
+
+
+def test_select_only_touches_only_the_early_selection_window(monkeypatch, tmp_path, capsys):
+    seen = []
+    _stub_grid_and_eval(monkeypatch, tmp_path, seen)
+    out = tmp_path / "p.json"
+
+    assert o.main(["--select-only", "--plateau-out", str(out)]) == 0
+
+    assert set(seen) == {"select"}                       # 既不看 train(到 2022-12)也不看 valid/test
+    assert out.exists() and "select-only" in capsys.readouterr().out
+
+
+def test_select_only_cannot_be_combined_with_test(monkeypatch, tmp_path, capsys):
+    seen = []
+    _stub_grid_and_eval(monkeypatch, tmp_path, seen)
+
+    assert o.main(["--select-only", "--test"]) == 2 and seen == []
+
+
+def test_select_window_ends_exactly_where_the_first_walk_forward_validation_begins():
+    import walk_forward_optimizer as wf
+    first = wf.build_windows()[0]
+
+    assert o.WINDOWS["select"][0] == first.train_start
+    assert o.WINDOWS["select"][1] == first.train_end           # 选参数据止于 W1 训练段末,W1~W3 验证窗口保持样本外
+    assert o.WINDOWS["select"][1] < first.valid_start
