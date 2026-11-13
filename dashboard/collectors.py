@@ -920,23 +920,30 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
 MAX_DOC_BYTES = 500_000
 
 
-def _read_limited(path: Path, limit: int) -> str | None:
+def _read_limited(path: Path, limit: int) -> tuple[str, bool] | None:
+    """读文件并返回 (内容, 是否被截断)。
+
+    **截断要能看出来**:运行手册被砍掉一半还显示成完整的一篇,人会照着缺步骤的操作——
+    这是"看起来正常其实不是"。超出上限就明确标记,前端据此显示"已截断"。
+    """
     try:
         with path.open("rb") as fh:
             raw = fh.read(limit + 1)
     except OSError:
         return None
-    return raw[:limit].decode("utf-8", errors="replace")
+    truncated = len(raw) > limit
+    return raw[:limit].decode("utf-8", errors="replace"), truncated
 
 
 def get_doc(settings: Settings, key: str) -> dict | None:
     """按键取文档。键必须精确等于白名单里的键,不接受任何路径。"""
     if not isinstance(key, str) or key not in settings.paths["docs"]:
         return None
-    text = _read_limited(settings.paths["docs"][key], MAX_DOC_BYTES)
-    if text is None:
+    read = _read_limited(settings.paths["docs"][key], MAX_DOC_BYTES)
+    if read is None:
         return None
-    return {"key": key, "title": settings.raw["docs_titles"][key], "markdown": text}
+    text, truncated = read
+    return {"key": key, "title": settings.raw["docs_titles"][key], "markdown": text, "truncated": truncated}
 
 
 # ---------------------------------------------------------------- 总览

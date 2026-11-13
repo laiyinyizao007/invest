@@ -211,6 +211,7 @@ export interface DocData {
   key: "unattended-log" | "simnow-drills";
   title: string;
   markdown: string;
+  truncated: boolean;
 }
 
 export interface LiveData {

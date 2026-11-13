@@ -470,3 +470,27 @@ def test_invalid_runs_older_than_the_displayed_window_are_still_counted(tmp_path
     res(tmp_path, runs=good + bad)
     r, runs = _runs_of(tmp_path)
     assert len(runs) == 10 and r.level == "warn" and "1 个运行结果" in r.section["message"]
+
+
+def test_an_oversized_document_is_marked_as_truncated_not_silently_cut(tmp_path):
+    """运行手册被砍掉一半还显示成完整的一篇,人会照着缺步骤的操作——必须能看出来。"""
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("x" * (col.MAX_DOC_BYTES + 100), encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is True
+    assert len(d["markdown"]) == col.MAX_DOC_BYTES
+
+
+def test_a_document_within_the_limit_is_not_marked_truncated(tmp_path):
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("# 标题\n正文\n", encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is False and d["markdown"].startswith("# 标题")

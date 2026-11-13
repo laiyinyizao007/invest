@@ -2382,12 +2382,17 @@
           "markdown": {
             "type": "string",
             "description": "Markdown 原文。前端须用禁用 HTML 的渲染器或纯文本显示,不得直接插入 DOM"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "文档超过大小上限被截断。前端必须显示『已截断』提示——半篇运行手册看起来是完整的一篇"
           }
         },
         "required": [
           "key",
           "title",
-          "markdown"
+          "markdown",
+          "truncated"
         ],
         "additionalProperties": true
       },
