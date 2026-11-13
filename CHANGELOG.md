@@ -6,6 +6,7 @@
 
 ## [Unreleased]
 ### Changed（变更）
+- 路线图与 ADR 评审『另类数据与遗漏模块』愿景清单(仅文档):可行项登记为 `docs/roadmap.md` §2.8(宏观因子只采集存档、特征库、实盘 tick 异常值过滤[先核查]、外部心跳看门狗[仅告警]、策略注册表与本机回滚、盈亏归因、结算单账目核对、组合资金分配、自成交与持仓限额卫士、市场状态识别、Web 热力图与族谱视图);红线冲突项写入『明确不做』并**局部修订**既有的『不做自建前端』:独立进程的只读状态页获准,交易终端式前端与嵌入交易进程的前端仍不做。新增不做:网页一键全平/批准/回滚/改风控阈值、公网穿透、外层实时写入实盘配置、云端接管交易。核对结论:日常结算单确认由 `vnpy_ctp` 自动完成;滑点与成本压力已在回测与晋级门槛中。
 - Batch B 脚本层整理(Issue [#12](https://github.com/laiyinyizao007/invest/issues/12)):统一 `notify.webhook.redact` 脱敏实现，新增 `bootstrap.isolate_state()`/`load_env()`，并将 CTP 采集与穿透测试的可复用逻辑真正下沉至 `ctp_tools/`，两个 CLI 现在直接使用共享实现；用 `pyproject.toml` 统一测试导入路径。交易日历仍保留在后续 Batch D。
 
 - PROJECTWIKI 拆分与瘦身(Issue [#7](https://github.com/laiyinyizao007/invest/issues/7)):876 行 → 299 行。
