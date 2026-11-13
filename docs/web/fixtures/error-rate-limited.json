@@ -1,0 +1,4 @@
+{
+  "error": "请求过于频繁",
+  "code": "rate_limited"
+}

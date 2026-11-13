@@ -1,0 +1,37 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 60.0,
+  "message": null,
+  "data": {
+    "heartbeat": {
+      "process": "running",
+      "last_beat_at": "2026-11-13T08:29:56+08:00",
+      "age_seconds": 4.0
+    },
+    "guard": {
+      "account_masked": "12****34",
+      "day": "2026-11-13",
+      "day_start_equity": 10000.0,
+      "last_equity": 8000.0,
+      "peak_equity": 10120.0,
+      "daily_pnl": -2000.0,
+      "drawdown_from_peak": 2120.0,
+      "daily_locked_day": null,
+      "hard_locked": true,
+      "hard_reason": "累计回撤超过 2000 元",
+      "limits": {
+        "daily_loss_yuan": 600.0,
+        "hard_drawdown_yuan": 2000.0
+      }
+    },
+    "pause": {
+      "paused": false,
+      "since": null
+    },
+    "live_admission": {
+      "approved": false
+    }
+  }
+}

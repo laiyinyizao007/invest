@@ -1,0 +1,47 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 2.0,
+  "stale_after_seconds": 15.0,
+  "message": null,
+  "data": {
+    "account": {
+      "balance": 9870.5,
+      "available": 8900.0,
+      "margin": 970.5,
+      "frozen": 0.0,
+      "currency": "CNY"
+    },
+    "positions": [
+      {
+        "vt_symbol": "c2701.DCE",
+        "direction": "net",
+        "volume": 1,
+        "avg_price": 2186.0,
+        "pnl": -30.0
+      }
+    ],
+    "open_orders": [],
+    "trades_today": [
+      {
+        "vt_tradeid": "CTP.100001",
+        "vt_symbol": "c2701.DCE",
+        "direction": "long",
+        "offset": "open",
+        "price": 2186.0,
+        "volume": 1,
+        "time": "09:01:12"
+      }
+    ],
+    "ticks": [
+      {
+        "vt_symbol": "c2701.DCE",
+        "last_price": 2183.0,
+        "bid_price_1": 2183.0,
+        "ask_price_1": 2184.0,
+        "volume": 18342,
+        "time": "09:03:41"
+      }
+    ]
+  }
+}

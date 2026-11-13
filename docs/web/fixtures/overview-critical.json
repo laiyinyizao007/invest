@@ -1,0 +1,38 @@
+{
+  "server_time": "2026-11-13T08:30:00+08:00",
+  "level": "critical",
+  "reasons": [
+    {
+      "section": "trading",
+      "level": "critical",
+      "text": "累计死线已触发,账户硬锁定:累计回撤超过 2000 元"
+    }
+  ],
+  "sections": {
+    "trading": {
+      "state": "ok",
+      "level": "critical",
+      "headline": "硬锁定"
+    },
+    "alerts": {
+      "state": "ok",
+      "level": "warn",
+      "headline": "待补发 3 条"
+    },
+    "days": {
+      "state": "ok",
+      "level": "critical",
+      "headline": "今日有严重事件"
+    },
+    "recording": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "录制中"
+    },
+    "research": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "额度 2/5"
+    }
+  }
+}

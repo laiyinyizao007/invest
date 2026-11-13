@@ -1,0 +1,2933 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "invest 状态页 API",
+    "version": "1.0.0",
+    "description": "状态页(Web 监控面板)的前后端契约,覆盖阶段①到⑤。每个操作带 `x-phase`(哪个阶段上线)与 `x-role`(最低角色)。后端用 `GET /api/meta` 的 `capabilities` 告诉前端当前启用了哪些阶段;**前端不得调用本文件之外的任何接口**。阶段①所有接口都是只读 GET。详细约定见 docs/web/02-api-contract.md。"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8770",
+      "description": "阶段①只监听本机回环地址"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/api/meta": {
+      "get": {
+        "operationId": "getMeta",
+        "summary": "版本、阶段、环境横幅、能力开关、轮询建议",
+        "description": "前端启动时先取一次。capabilities 决定显示哪些页面/按钮;环境横幅必须常驻显示。",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Meta"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/overview": {
+      "get": {
+        "operationId": "getOverview",
+        "summary": "总体级别与各区块摘要",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Overview"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/trading": {
+      "get": {
+        "operationId": "getTrading",
+        "summary": "交易进程心跳、账户风控状态、暂停标志、实盘准入",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/TradingData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/alerts": {
+      "get": {
+        "operationId": "getAlerts",
+        "summary": "待补发告警队列与近期异常事件",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/AlertsData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/days": {
+      "get": {
+        "operationId": "getDays",
+        "summary": "无人值守每日统计与验收清单",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/DaysData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60,
+              "default": 14
+            }
+          }
+        ]
+      }
+    },
+    "/api/recording": {
+      "get": {
+        "operationId": "getRecording",
+        "summary": "行情录制进程状态",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/RecordingData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/research": {
+      "get": {
+        "operationId": "getResearch",
+        "summary": "研究沙盒额度、待审候选、最近运行",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/ResearchData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/research/runs/{run_id}": {
+      "get": {
+        "operationId": "getRun",
+        "summary": "单次研究运行详情(含确定性中文报告)",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{8}-[0-9]{6}-[0-9]{6}$"
+            }
+          }
+        ]
+      }
+    },
+    "/api/docs/{key}": {
+      "get": {
+        "operationId": "getDoc",
+        "summary": "证据文档(键白名单,不接受路径)",
+        "description": "",
+        "x-phase": 1,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DocData"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "unattended-log",
+                "simnow-drills"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "/api/live": {
+      "get": {
+        "operationId": "getLive",
+        "summary": "实时资金、持仓、挂单、当日成交、最新行情",
+        "description": "数据来自运行时周期性写出的快照文件;stale_after 默认 15 秒。",
+        "x-phase": 2,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/LiveData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/equity": {
+      "get": {
+        "operationId": "getEquity",
+        "summary": "权益曲线",
+        "description": "",
+        "x-phase": 2,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/EquityData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "parameters": [
+          {
+            "name": "interval",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1m",
+                "5m",
+                "1h",
+                "1d"
+              ],
+              "default": "5m"
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        ]
+      }
+    },
+    "/api/control/pause": {
+      "post": {
+        "operationId": "pauseOpening",
+        "summary": "暂停新开仓",
+        "x-phase": 3,
+        "x-role": "operator",
+        "description": "需要写令牌 + X-CSRF-Token 头 + 请求体 confirm 字段;每次调用写审计。只影响开仓,平仓永远放行。",
+        "security": [
+          {
+            "writeToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PauseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/control/resume": {
+      "post": {
+        "operationId": "resumeOpening",
+        "summary": "解除暂停(默认只允许本机 CLI,是否开放由阶段③ ADR 决定)",
+        "x-phase": 3,
+        "x-role": "operator",
+        "description": "需要写令牌 + X-CSRF-Token 头 + 请求体 confirm 字段;每次调用写审计。只影响开仓,平仓永远放行。",
+        "security": [
+          {
+            "writeToken": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/audit": {
+      "get": {
+        "operationId": "getAudit",
+        "summary": "控制操作审计记录",
+        "description": "",
+        "x-phase": 3,
+        "x-role": "operator",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/AuditData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/research/candidates/{name}": {
+      "get": {
+        "operationId": "getCandidate",
+        "summary": "候选策略只读审阅视图(带行号源码、静态筛查、哈希)",
+        "description": "网页不提供『批准』按钮:批准只能在本机由人执行,review_command 仅供复制。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9_]{1,40}\\.py$"
+            }
+          }
+        ]
+      }
+    },
+    "/api/research/runs": {
+      "get": {
+        "operationId": "listRuns",
+        "summary": "研究运行列表(分页)",
+        "description": "",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "backtest",
+                "gate",
+                "evaluate"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "/api/data/segments": {
+      "get": {
+        "operationId": "getDataSegments",
+        "summary": "数据段清单与测试段消费状态",
+        "description": "",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/DataSegments"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/drills": {
+      "get": {
+        "operationId": "getDrills",
+        "summary": "SimNow 演练结果(结构化)",
+        "description": "",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/DrillsData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/recording/quality": {
+      "get": {
+        "operationId": "getRecordingQuality",
+        "summary": "录制 K 线完整性",
+        "description": "",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/RecordingQuality"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "operationId": "getConfig",
+        "summary": "脱敏后的生效配置(风控预算、合约、阈值)",
+        "description": "",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/ConfigView"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/nodes": {
+      "get": {
+        "operationId": "getNodes",
+        "summary": "多节点汇总(交易机/录制机/研究机)",
+        "description": "",
+        "x-phase": 5,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "",
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/SectionBase"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "data": {
+                          "oneOf": [
+                            {
+                              "$ref": "#/components/schemas/NodesData"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "data"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/whoami": {
+      "get": {
+        "operationId": "whoami",
+        "summary": "当前用户与角色",
+        "description": "",
+        "x-phase": 5,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhoAmI"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "只读令牌(data/state/status.token)。放 Authorization 头,绝不放 URL。"
+      },
+      "writeToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "阶段③起:独立的写令牌,与只读令牌不同。"
+      }
+    },
+    "parameters": {
+      "CsrfToken": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "阶段③写操作必带。值由 GET /api/meta 之外的专用握手下发(见契约文档 §写操作)。"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "缺少或错误的令牌。响应不透露正确令牌的任何信息。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "角色不足或写操作未开放。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "键/ID 不在白名单或不存在。路径穿越一律走这里。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "参数不合法(含 confirm 字段不匹配)。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "超过每分钟请求上限;按 Retry-After 退避。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Level": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "warn",
+          "critical",
+          "unknown"
+        ],
+        "description": "总体级别。unknown = 没有足够信息判断(数据缺失/过期),必须与 ok 区别显示。"
+      },
+      "SectionState": {
+        "type": "string",
+        "enum": [
+          "ok",
+          "stale",
+          "missing",
+          "corrupt",
+          "unknown"
+        ],
+        "description": "区块数据状态。前端遇到未列出的取值必须按 unknown 渲染,不得当作 ok。"
+      },
+      "Severity": {
+        "type": "string",
+        "enum": [
+          "severe",
+          "warning"
+        ],
+        "description": "severe=严重, warning=警告(与无人值守日志口径一致)"
+      },
+      "SectionBase": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/SectionState"
+          },
+          "as_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "数据自身的时间(文件修改时间或内容时间),不是服务器当前时间"
+          },
+          "age_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "距 as_of 的秒数,服务器计算"
+          },
+          "stale_after_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "超过此年龄 state 变为 stale"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "给人看的说明,例如『文件不存在』『JSON 损坏』"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "additionalProperties": true
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "forbidden",
+              "not_found",
+              "bad_request",
+              "rate_limited",
+              "csrf",
+              "conflict",
+              "unavailable",
+              "internal"
+            ]
+          }
+        },
+        "required": [
+          "error",
+          "code"
+        ],
+        "additionalProperties": true
+      },
+      "Environment": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "enum": [
+              "simnow",
+              "guoxin-test",
+              "live",
+              "unknown"
+            ]
+          },
+          "display": {
+            "type": "string",
+            "description": "横幅文字,如『SimNow 模拟盘』『国信测试环境』『实盘』"
+          }
+        },
+        "required": [
+          "label",
+          "display"
+        ],
+        "additionalProperties": true
+      },
+      "Meta": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "string"
+          },
+          "phase": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "server_timezone": {
+            "type": "string"
+          },
+          "exchange_timezone": {
+            "type": "string",
+            "const": "Asia/Shanghai"
+          },
+          "environment": {
+            "$ref": "#/components/schemas/Environment"
+          },
+          "polling_hint_seconds": {
+            "type": "integer"
+          },
+          "capabilities": {
+            "type": "object",
+            "properties": {
+              "live": {
+                "type": "boolean"
+              },
+              "equity": {
+                "type": "boolean"
+              },
+              "control": {
+                "type": "boolean"
+              },
+              "stream": {
+                "type": "boolean"
+              },
+              "research_detail": {
+                "type": "boolean"
+              },
+              "data_views": {
+                "type": "boolean"
+              },
+              "nodes": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "live",
+              "equity",
+              "control",
+              "stream",
+              "research_detail",
+              "data_views",
+              "nodes"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "version",
+          "phase",
+          "server_time",
+          "server_timezone",
+          "exchange_timezone",
+          "environment",
+          "polling_hint_seconds",
+          "capabilities"
+        ],
+        "additionalProperties": true
+      },
+      "Reason": {
+        "type": "object",
+        "properties": {
+          "section": {
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/Level"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "section",
+          "level",
+          "text"
+        ],
+        "additionalProperties": true
+      },
+      "Brief": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/SectionState"
+          },
+          "level": {
+            "$ref": "#/components/schemas/Level"
+          },
+          "headline": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "level",
+          "headline"
+        ],
+        "additionalProperties": true
+      },
+      "Overview": {
+        "type": "object",
+        "properties": {
+          "server_time": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "level": {
+            "$ref": "#/components/schemas/Level"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Reason"
+            }
+          },
+          "sections": {
+            "type": "object",
+            "properties": {
+              "trading": {
+                "$ref": "#/components/schemas/Brief"
+              },
+              "alerts": {
+                "$ref": "#/components/schemas/Brief"
+              },
+              "days": {
+                "$ref": "#/components/schemas/Brief"
+              },
+              "recording": {
+                "$ref": "#/components/schemas/Brief"
+              },
+              "research": {
+                "$ref": "#/components/schemas/Brief"
+              }
+            },
+            "required": [
+              "trading",
+              "alerts",
+              "days",
+              "recording",
+              "research"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "server_time",
+          "level",
+          "reasons",
+          "sections"
+        ],
+        "additionalProperties": true
+      },
+      "Heartbeat": {
+        "type": "object",
+        "properties": {
+          "process": {
+            "type": "string",
+            "enum": [
+              "running",
+              "stopped",
+              "unknown"
+            ]
+          },
+          "last_beat_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "age_seconds": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "process",
+          "last_beat_at",
+          "age_seconds"
+        ],
+        "additionalProperties": true
+      },
+      "Guard": {
+        "type": "object",
+        "properties": {
+          "account_masked": {
+            "type": "string",
+            "description": "账号只保留头尾各 2 位,服务器脱敏"
+          },
+          "day": {
+            "type": "string"
+          },
+          "day_start_equity": {
+            "type": "number"
+          },
+          "last_equity": {
+            "type": "number"
+          },
+          "peak_equity": {
+            "type": "number"
+          },
+          "daily_pnl": {
+            "type": "number",
+            "description": "last_equity - day_start_equity,服务器计算(元)"
+          },
+          "drawdown_from_peak": {
+            "type": "number",
+            "description": "peak_equity - last_equity(元,>=0)"
+          },
+          "daily_locked_day": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hard_locked": {
+            "type": "boolean"
+          },
+          "hard_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limits": {
+            "type": "object",
+            "properties": {
+              "daily_loss_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "hard_drawdown_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "daily_loss_yuan",
+              "hard_drawdown_yuan"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "account_masked",
+          "day",
+          "day_start_equity",
+          "last_equity",
+          "peak_equity",
+          "daily_pnl",
+          "drawdown_from_peak",
+          "daily_locked_day",
+          "hard_locked",
+          "hard_reason",
+          "limits"
+        ],
+        "additionalProperties": true
+      },
+      "TradingData": {
+        "type": "object",
+        "properties": {
+          "heartbeat": {
+            "$ref": "#/components/schemas/Heartbeat"
+          },
+          "guard": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Guard"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pause": {
+            "type": "object",
+            "properties": {
+              "paused": {
+                "type": "boolean"
+              },
+              "since": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              }
+            },
+            "required": [
+              "paused",
+              "since"
+            ],
+            "additionalProperties": true
+          },
+          "live_admission": {
+            "type": "object",
+            "properties": {
+              "approved": {
+                "type": "boolean",
+                "description": "实盘准入批准文件是否存在。存在不等于正在实盘。"
+              }
+            },
+            "required": [
+              "approved"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "heartbeat",
+          "guard",
+          "pause",
+          "live_admission"
+        ],
+        "additionalProperties": true
+      },
+      "EventRow": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/Severity"
+          },
+          "name": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "day",
+          "level",
+          "name",
+          "count"
+        ],
+        "additionalProperties": true
+      },
+      "AlertsData": {
+        "type": "object",
+        "properties": {
+          "outbox": {
+            "type": "object",
+            "properties": {
+              "pending": {
+                "type": "integer"
+              },
+              "oldest_age_seconds": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "pending",
+              "oldest_age_seconds"
+            ],
+            "additionalProperties": true
+          },
+          "recent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EventRow"
+            }
+          }
+        },
+        "required": [
+          "outbox",
+          "recent"
+        ],
+        "additionalProperties": true
+      },
+      "DayRow": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string"
+          },
+          "started": {
+            "type": "integer"
+          },
+          "trades": {
+            "type": "integer"
+          },
+          "clean": {
+            "type": "boolean"
+          },
+          "has_severe": {
+            "type": "boolean"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "level": {
+                  "$ref": "#/components/schemas/Severity"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "level",
+                "name",
+                "count"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "first_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ts": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "heartbeat": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "day",
+          "started",
+          "trades",
+          "clean",
+          "has_severe",
+          "events",
+          "first_ts",
+          "last_ts",
+          "heartbeat"
+        ],
+        "additionalProperties": true
+      },
+      "DaysData": {
+        "type": "object",
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DayRow"
+            }
+          },
+          "checklist": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "checked": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "text",
+                "checked"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "longest_clean_streak": {
+            "type": "integer"
+          },
+          "required_streak": {
+            "type": "integer"
+          },
+          "missing_weekdays": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "days",
+          "checklist",
+          "longest_clean_streak",
+          "required_streak",
+          "missing_weekdays"
+        ],
+        "additionalProperties": true
+      },
+      "RecordingData": {
+        "type": "object",
+        "properties": {
+          "wrapper_running": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "symbols": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "heartbeat_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "last_tick": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_bar": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data_warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "wrapper_running",
+          "status",
+          "profile",
+          "symbols",
+          "started_at",
+          "heartbeat_at",
+          "last_tick",
+          "last_bar",
+          "last_error",
+          "data_warning"
+        ],
+        "additionalProperties": true
+      },
+      "RunBrief": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "pattern": "^[0-9]{8}-[0-9]{6}-[0-9]{6}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "backtest",
+              "gate",
+              "evaluate"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "passed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "strategy_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headline": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "kind",
+          "status",
+          "passed",
+          "strategy_file",
+          "headline"
+        ],
+        "additionalProperties": true
+      },
+      "ResearchData": {
+        "type": "object",
+        "properties": {
+          "quota": {
+            "type": "object",
+            "properties": {
+              "used": {
+                "type": "integer"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "window_hours": {
+                "type": "integer"
+              },
+              "next_release_in_seconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "used",
+              "limit",
+              "window_hours",
+              "next_release_in_seconds"
+            ],
+            "additionalProperties": true
+          },
+          "approvals_count": {
+            "type": "integer"
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "approved": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "name",
+                "sha256",
+                "approved"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "recent_runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunBrief"
+            }
+          }
+        },
+        "required": [
+          "quota",
+          "approvals_count",
+          "pending",
+          "recent_runs"
+        ],
+        "additionalProperties": true
+      },
+      "RunDetail": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "backtest",
+              "gate",
+              "evaluate"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "passed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "strategy_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "strategy_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "确定性中文报告,纯文本,按原样显示(保留换行)"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "params": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "metrics": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "diagnosis": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "selection": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "windows": {
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "run_id",
+          "kind"
+        ],
+        "additionalProperties": true
+      },
+      "DocData": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "enum": [
+              "unattended-log",
+              "simnow-drills"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "markdown": {
+            "type": "string",
+            "description": "Markdown 原文。前端须用禁用 HTML 的渲染器或纯文本显示,不得直接插入 DOM"
+          }
+        },
+        "required": [
+          "key",
+          "title",
+          "markdown"
+        ],
+        "additionalProperties": true
+      },
+      "LiveData": {
+        "type": "object",
+        "properties": {
+          "account": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "balance": {
+                    "type": "number"
+                  },
+                  "available": {
+                    "type": "number"
+                  },
+                  "margin": {
+                    "type": "number"
+                  },
+                  "frozen": {
+                    "type": "number"
+                  },
+                  "currency": {
+                    "type": "string",
+                    "const": "CNY"
+                  }
+                },
+                "required": [
+                  "balance",
+                  "available",
+                  "margin",
+                  "frozen",
+                  "currency"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "positions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vt_symbol": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string",
+                  "enum": [
+                    "long",
+                    "short",
+                    "net"
+                  ]
+                },
+                "volume": {
+                  "type": "integer"
+                },
+                "avg_price": {
+                  "type": "number"
+                },
+                "pnl": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "vt_symbol",
+                "direction",
+                "volume",
+                "avg_price",
+                "pnl"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "open_orders": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vt_orderid": {
+                  "type": "string"
+                },
+                "vt_symbol": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string",
+                  "enum": [
+                    "long",
+                    "short",
+                    "net"
+                  ]
+                },
+                "offset": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "number"
+                },
+                "volume": {
+                  "type": "integer"
+                },
+                "traded": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "vt_orderid",
+                "vt_symbol",
+                "direction",
+                "offset",
+                "price",
+                "volume",
+                "traded",
+                "status",
+                "time"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "trades_today": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vt_tradeid": {
+                  "type": "string"
+                },
+                "vt_symbol": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string",
+                  "enum": [
+                    "long",
+                    "short",
+                    "net"
+                  ]
+                },
+                "offset": {
+                  "type": "string"
+                },
+                "price": {
+                  "type": "number"
+                },
+                "volume": {
+                  "type": "integer"
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "vt_tradeid",
+                "vt_symbol",
+                "direction",
+                "offset",
+                "price",
+                "volume",
+                "time"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "ticks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vt_symbol": {
+                  "type": "string"
+                },
+                "last_price": {
+                  "type": "number"
+                },
+                "bid_price_1": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "ask_price_1": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "volume": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "time": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "vt_symbol",
+                "last_price",
+                "bid_price_1",
+                "ask_price_1",
+                "volume",
+                "time"
+              ],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "account",
+          "positions",
+          "open_orders",
+          "trades_today",
+          "ticks"
+        ],
+        "additionalProperties": true
+      },
+      "EquityData": {
+        "type": "object",
+        "properties": {
+          "interval": {
+            "type": "string",
+            "enum": [
+              "1m",
+              "5m",
+              "1h",
+              "1d"
+            ]
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "t": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "equity": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "t",
+                "equity"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "day_start_equity": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "interval",
+          "points",
+          "day_start_equity"
+        ],
+        "additionalProperties": true
+      },
+      "PauseRequest": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "type": "string",
+            "const": "PAUSE"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "confirm",
+          "reason"
+        ],
+        "additionalProperties": true
+      },
+      "ResumeRequest": {
+        "type": "object",
+        "properties": {
+          "confirm": {
+            "type": "string",
+            "const": "RESUME"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "confirm",
+          "reason"
+        ],
+        "additionalProperties": true
+      },
+      "ControlResult": {
+        "type": "object",
+        "properties": {
+          "paused": {
+            "type": "boolean"
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "audit_id": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "paused",
+          "since",
+          "audit_id"
+        ],
+        "additionalProperties": true
+      },
+      "AuditEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "pause",
+              "resume"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "rejected"
+            ]
+          },
+          "remote_addr": {
+            "type": "string",
+            "description": "最后一段打码"
+          }
+        },
+        "required": [
+          "id",
+          "at",
+          "actor",
+          "action",
+          "reason",
+          "result",
+          "remote_addr"
+        ],
+        "additionalProperties": true
+      },
+      "AuditData": {
+        "type": "object",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            }
+          }
+        },
+        "required": [
+          "entries"
+        ],
+        "additionalProperties": true
+      },
+      "CandidateView": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "screening": {
+            "type": "object",
+            "properties": {
+              "passed": {
+                "type": "boolean"
+              },
+              "findings": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "passed",
+              "findings"
+            ],
+            "additionalProperties": true
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "n": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "n",
+                "text"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "review_command": {
+            "type": "string",
+            "description": "供人复制到本机终端的批准命令。网页不提供批准按钮。"
+          }
+        },
+        "required": [
+          "name",
+          "sha256",
+          "approved",
+          "screening",
+          "lines",
+          "review_command"
+        ],
+        "additionalProperties": true
+      },
+      "RunList": {
+        "type": "object",
+        "properties": {
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunBrief"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "runs",
+          "next_cursor"
+        ],
+        "additionalProperties": true
+      },
+      "DataSegments": {
+        "type": "object",
+        "properties": {
+          "segments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "train",
+                    "validation",
+                    "test"
+                  ]
+                },
+                "from": {
+                  "type": "string"
+                },
+                "to": {
+                  "type": "string"
+                },
+                "rows": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "test_consumed": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "key",
+                "label",
+                "kind",
+                "from",
+                "to",
+                "rows",
+                "test_consumed"
+              ],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "segments"
+        ],
+        "additionalProperties": true
+      },
+      "DrillsData": {
+        "type": "object",
+        "properties": {
+          "scenarios": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "result": {
+                  "type": "string",
+                  "enum": [
+                    "pass",
+                    "fail",
+                    "skipped",
+                    "unknown"
+                  ]
+                },
+                "summary": {
+                  "type": "string"
+                },
+                "at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "name",
+                "title",
+                "result",
+                "summary",
+                "at"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "source_doc": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenarios",
+          "source_doc"
+        ],
+        "additionalProperties": true
+      },
+      "RecordingQuality": {
+        "type": "object",
+        "properties": {
+          "symbols": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "vt_symbol": {
+                  "type": "string"
+                },
+                "days": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "day": {
+                        "type": "string"
+                      },
+                      "expected_bars": {
+                        "type": "integer"
+                      },
+                      "actual_bars": {
+                        "type": "integer"
+                      },
+                      "complete": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "day",
+                      "expected_bars",
+                      "actual_bars",
+                      "complete"
+                    ],
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "required": [
+                "vt_symbol",
+                "days"
+              ],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "symbols"
+        ],
+        "additionalProperties": true
+      },
+      "ConfigView": {
+        "type": "object",
+        "properties": {
+          "risk": {
+            "type": "object",
+            "properties": {
+              "capital_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "per_trade_loss_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "daily_limit_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "hard_limit_yuan": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "capital_yuan",
+              "per_trade_loss_yuan",
+              "daily_limit_yuan",
+              "hard_limit_yuan"
+            ],
+            "additionalProperties": true
+          },
+          "symbols": {
+            "type": "object",
+            "properties": {
+              "live": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "history": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "live",
+              "history"
+            ],
+            "additionalProperties": true
+          },
+          "thresholds": {
+            "type": "object",
+            "properties": {
+              "heartbeat_stale_seconds": {
+                "type": "number"
+              },
+              "live_snapshot_stale_seconds": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "heartbeat_stale_seconds",
+              "live_snapshot_stale_seconds"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "risk",
+          "symbols",
+          "thresholds"
+        ],
+        "additionalProperties": true
+      },
+      "NodesData": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string",
+                  "enum": [
+                    "trader",
+                    "recorder",
+                    "research"
+                  ]
+                },
+                "environment": {
+                  "$ref": "#/components/schemas/Environment"
+                },
+                "level": {
+                  "$ref": "#/components/schemas/Level"
+                },
+                "last_seen": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "date-time"
+                },
+                "reachable": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "id",
+                "label",
+                "role",
+                "environment",
+                "level",
+                "last_seen",
+                "reachable"
+              ],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "additionalProperties": true
+      },
+      "WhoAmI": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "viewer",
+              "operator",
+              "admin"
+            ]
+          }
+        },
+        "required": [
+          "user",
+          "role"
+        ],
+        "additionalProperties": true
+      }
+    }
+  }
+}

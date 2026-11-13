@@ -1,0 +1,8 @@
+{
+  "state": "missing",
+  "as_of": null,
+  "age_seconds": null,
+  "stale_after_seconds": 60.0,
+  "message": "心跳与风控状态文件都不存在",
+  "data": null
+}

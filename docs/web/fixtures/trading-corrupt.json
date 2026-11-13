@@ -1,0 +1,8 @@
+{
+  "state": "corrupt",
+  "as_of": "2026-11-13T08:29:50+08:00",
+  "age_seconds": 10.0,
+  "stale_after_seconds": 60.0,
+  "message": "account_guard.json 损坏",
+  "data": null
+}

@@ -1,0 +1,26 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 86400.0,
+  "message": null,
+  "data": {
+    "source_doc": "docs/simnow-drills.md",
+    "scenarios": [
+      {
+        "name": "latency",
+        "title": "成交→持仓回报延迟",
+        "result": "pass",
+        "summary": "0.177 秒",
+        "at": "2026-11-12"
+      },
+      {
+        "name": "disconnect",
+        "title": "断线与自动重连",
+        "result": "pass",
+        "summary": "切网 240 秒,恢复后 2 秒重连",
+        "at": "2026-11-12"
+      }
+    ]
+  }
+}

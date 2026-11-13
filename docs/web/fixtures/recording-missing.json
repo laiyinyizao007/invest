@@ -1,0 +1,8 @@
+{
+  "state": "missing",
+  "as_of": null,
+  "age_seconds": null,
+  "stale_after_seconds": 60.0,
+  "message": "录制状态文件不存在(录制未启动,或不在本机)",
+  "data": null
+}

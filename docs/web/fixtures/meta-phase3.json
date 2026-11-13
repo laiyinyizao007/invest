@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "phase": 3,
+  "server_time": "2026-11-13T08:30:00+08:00",
+  "server_timezone": "Asia/Shanghai",
+  "exchange_timezone": "Asia/Shanghai",
+  "environment": {
+    "label": "simnow",
+    "display": "SimNow 模拟盘"
+  },
+  "polling_hint_seconds": 5,
+  "capabilities": {
+    "live": true,
+    "equity": true,
+    "control": true,
+    "stream": false,
+    "research_detail": true,
+    "data_views": false,
+    "nodes": false
+  }
+}

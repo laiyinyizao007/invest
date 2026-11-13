@@ -1,0 +1,59 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 600.0,
+  "message": null,
+  "data": {
+    "days": [
+      {
+        "day": "2026-11-12",
+        "started": 3,
+        "trades": 6,
+        "clean": false,
+        "has_severe": true,
+        "events": [
+          {
+            "level": "severe",
+            "name": "当日熔断",
+            "count": 1
+          },
+          {
+            "level": "warning",
+            "name": "行情停更",
+            "count": 2
+          }
+        ],
+        "first_ts": "2026-11-12 21:00:03",
+        "last_ts": "2026-11-12 23:59:40",
+        "heartbeat": "4s 前"
+      },
+      {
+        "day": "2026-11-11",
+        "started": 1,
+        "trades": 0,
+        "clean": true,
+        "has_severe": false,
+        "events": [],
+        "first_ts": "2026-11-11 09:00:01",
+        "last_ts": "2026-11-11 15:00:00",
+        "heartbeat": null
+      }
+    ],
+    "checklist": [
+      {
+        "text": "连续 >= 5 个交易日无人值守:已记录 2 天",
+        "checked": false
+      },
+      {
+        "text": "告警全部到达手机",
+        "checked": null
+      }
+    ],
+    "longest_clean_streak": 1,
+    "required_streak": 5,
+    "missing_weekdays": [
+      "2026-11-09"
+    ]
+  }
+}

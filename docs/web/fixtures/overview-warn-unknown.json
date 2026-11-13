@@ -1,0 +1,43 @@
+{
+  "server_time": "2026-11-13T08:30:00+08:00",
+  "level": "unknown",
+  "reasons": [
+    {
+      "section": "trading",
+      "level": "unknown",
+      "text": "心跳文件不存在:无法判断交易进程是否在运行"
+    },
+    {
+      "section": "recording",
+      "level": "warn",
+      "text": "录制进程已停滞(stalled)"
+    }
+  ],
+  "sections": {
+    "trading": {
+      "state": "missing",
+      "level": "unknown",
+      "headline": "无心跳"
+    },
+    "alerts": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "无待补发"
+    },
+    "days": {
+      "state": "ok",
+      "level": "warn",
+      "headline": "连续无异常 0/5 天"
+    },
+    "recording": {
+      "state": "ok",
+      "level": "warn",
+      "headline": "stalled"
+    },
+    "research": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "额度 0/5"
+    }
+  }
+}

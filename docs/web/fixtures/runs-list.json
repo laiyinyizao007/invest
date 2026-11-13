@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "run_id": "20261112-210000-000000",
+      "kind": "evaluate",
+      "status": "ok",
+      "passed": false,
+      "strategy_file": "demo_breakout.py",
+      "headline": "结论: 未通过(7 项未过)"
+    }
+  ],
+  "next_cursor": null
+}

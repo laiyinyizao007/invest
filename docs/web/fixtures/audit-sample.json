@@ -1,0 +1,29 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 3600.0,
+  "message": null,
+  "data": {
+    "entries": [
+      {
+        "id": 17,
+        "at": "2026-11-13T08:31:00+08:00",
+        "actor": "operator-a",
+        "action": "pause",
+        "reason": "盘前检查发现行情异常",
+        "result": "ok",
+        "remote_addr": "127.0.0.x"
+      },
+      {
+        "id": 16,
+        "at": "2026-11-12T22:00:00+08:00",
+        "actor": "operator-a",
+        "action": "resume",
+        "reason": null,
+        "result": "rejected",
+        "remote_addr": "127.0.0.x"
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 3600.0,
+  "message": null,
+  "data": {
+    "symbols": [
+      {
+        "vt_symbol": "C2701.DCE",
+        "days": [
+          {
+            "day": "2026-11-12",
+            "expected_bars": 345,
+            "actual_bars": 345,
+            "complete": true
+          },
+          {
+            "day": "2026-11-11",
+            "expected_bars": 345,
+            "actual_bars": 331,
+            "complete": false
+          }
+        ]
+      }
+    ]
+  }
+}

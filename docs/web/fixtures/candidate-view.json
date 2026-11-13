@@ -1,0 +1,28 @@
+{
+  "name": "demo_breakout.py",
+  "sha256": "9f2c5a1d0b7e4c33a1f0e8d6b2c4a7f1e3d5b9a0c2e4f6a8b0d2c4e6f8a0b1c2",
+  "approved": false,
+  "screening": {
+    "passed": true,
+    "findings": []
+  },
+  "lines": [
+    {
+      "n": 1,
+      "text": "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy"
+    },
+    {
+      "n": 2,
+      "text": ""
+    },
+    {
+      "n": 3,
+      "text": "class Candidate(TrendAtr15mStrategy):"
+    },
+    {
+      "n": 4,
+      "text": "    breakout_n = 48"
+    }
+  ],
+  "review_command": "python scripts/research_api.py review --strategy demo_breakout.py"
+}

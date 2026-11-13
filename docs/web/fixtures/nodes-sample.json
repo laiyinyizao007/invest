@@ -1,0 +1,35 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 60.0,
+  "message": null,
+  "data": {
+    "nodes": [
+      {
+        "id": "trader-1",
+        "label": "交易机(运行机)",
+        "role": "trader",
+        "environment": {
+          "label": "simnow",
+          "display": "SimNow 模拟盘"
+        },
+        "level": "ok",
+        "last_seen": "2026-11-13T08:30:00+08:00",
+        "reachable": true
+      },
+      {
+        "id": "recorder-1",
+        "label": "录制机",
+        "role": "recorder",
+        "environment": {
+          "label": "unknown",
+          "display": "未知"
+        },
+        "level": "unknown",
+        "last_seen": null,
+        "reachable": false
+      }
+    ]
+  }
+}

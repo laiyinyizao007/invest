@@ -1,0 +1,4 @@
+{
+  "error": "缺少或错误的 CSRF 令牌",
+  "code": "csrf"
+}

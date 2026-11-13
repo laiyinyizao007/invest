@@ -1,0 +1,14 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 300.0,
+  "message": null,
+  "data": {
+    "outbox": {
+      "pending": 0,
+      "oldest_age_seconds": null
+    },
+    "recent": []
+  }
+}

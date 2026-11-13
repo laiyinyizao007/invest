@@ -1,0 +1,22 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 120.0,
+  "message": null,
+  "data": {
+    "wrapper_running": true,
+    "status": "stalled",
+    "profile": "simnow",
+    "symbols": [
+      "C2701.DCE",
+      "MA701.CZCE"
+    ],
+    "started_at": "2026-11-13T00:00:10+00:00",
+    "heartbeat_at": "2026-11-13T00:29:58+00:00",
+    "last_tick": null,
+    "last_bar": null,
+    "last_error": "已连接但 90 秒内未订阅到任何合约",
+    "data_warning": null
+  }
+}

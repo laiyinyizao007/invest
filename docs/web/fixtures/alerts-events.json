@@ -1,0 +1,27 @@
+{
+  "state": "ok",
+  "as_of": "2026-11-13T08:30:00+08:00",
+  "age_seconds": 4.0,
+  "stale_after_seconds": 300.0,
+  "message": null,
+  "data": {
+    "outbox": {
+      "pending": 3,
+      "oldest_age_seconds": 412.0
+    },
+    "recent": [
+      {
+        "day": "2026-11-12",
+        "level": "warning",
+        "name": "行情停更",
+        "count": 2
+      },
+      {
+        "day": "2026-11-12",
+        "level": "severe",
+        "name": "当日熔断",
+        "count": 1
+      }
+    ]
+  }
+}
