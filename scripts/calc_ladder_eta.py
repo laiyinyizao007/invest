@@ -97,6 +97,21 @@ def run_daily_pnls(bars, params: dict) -> dict:
     return out
 
 
+def run_pooled_daily_pnls(bars, params: dict, windows) -> dict:
+    """按**三个验证段分别回放**再拼成一条序列,与 `research_gate.run_gate` 的口径一致。
+
+    为什么不能连着跑一段:真实链路里每个验证段是一次独立的回测(段与段之间不持仓、
+    指标也不跨段归并)。连着跑会让持仓跨过 2023-01-01 的段边界,那就不是同一件事了。
+    """
+    merged: dict = {}
+    for start, end in windows:
+        segment = [b for b in bars if start <= b.datetime <= end]
+        if not segment:
+            continue
+        merged.update(run_daily_pnls(segment, params))
+    return merged
+
+
 def sharpe(pnls: list[float], capital: float) -> float:
     return ce.annualized_sharpe(pnls, capital)
 
@@ -159,8 +174,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"窗口定义变了:验证段现在是 {seg_start:%Y-%m-%d}~{seg_end:%Y-%m-%d},"
                   f"与本脚本硬编码的 {VALID_START:%Y-%m-%d}~{VALID_END:%Y-%m-%d} 不一致;先改脚本再改结论")
             return 2
+        # 与真实链路一致:三个验证段**分别**回放再拼接(段间不持仓)
+        seg_windows = [(w.valid_start, w.valid_end) for w in build_windows()]
     else:
         win_start, win_end = TRAIN_START, TRAIN_END
+        seg_windows = [(TRAIN_START, TRAIN_END)]
 
     df = pd.read_csv(a.data, parse_dates=["datetime"])
     df = df[(df["datetime"] >= win_start) & (df["datetime"] <= win_end)]
@@ -172,8 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     pairs = adjacent_pairs()
     results = []
     for i, (pa, pb) in enumerate(pairs):
-        a_pnls = run_daily_pnls(bars, pa)
-        b_pnls = run_daily_pnls(bars, pb)
+        a_pnls = run_pooled_daily_pnls(bars, pa, seg_windows)
+        b_pnls = run_pooled_daily_pnls(bars, pb, seg_windows)
         if not a_pnls or not b_pnls:
             print(f"第 {i + 1} 对 {pa} vs {pb}:无成交,跳过")
             continue

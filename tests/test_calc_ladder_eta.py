@@ -4,7 +4,7 @@
 数据相关的部分(`--data`)是标定时的输入,不是逻辑。
 """
 import random
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import calc_ladder_eta as eta
 
@@ -71,3 +71,26 @@ def test_the_floor_is_applied_before_the_factor():
     """下限先于系数生效:噪声极小的时候 η 至少是 0.25,不能因为乘了 1.5 反而更小。"""
     assert max(eta.ETA_FLOOR, eta.ETA_FACTOR * 0.01) == eta.ETA_FLOOR
     assert max(eta.ETA_FLOOR, eta.ETA_FACTOR * 0.73) > eta.ETA_FLOOR
+
+
+def test_the_pooled_run_splits_the_window_instead_of_running_through_it(monkeypatch):
+    """三个验证段必须**分别**回放。
+
+    真实链路里每个验证段是一次独立回测(段与段之间不持仓);连着跑一整段会让持仓
+    跨过段边界,标的与流水线就不是同一件事,标出来的 η 也就对不上实际汇报口径。"""
+    from types import SimpleNamespace
+
+    calls: list[tuple] = []
+
+    def fake_run(bars, params):
+        calls.append((bars[0].datetime, bars[-1].datetime))
+        return {}
+
+    monkeypatch.setattr(eta, "run_daily_pnls", fake_run)
+    bars = [SimpleNamespace(datetime=d) for d in
+            [datetime(2022, 7, 1), datetime(2022, 12, 31), datetime(2023, 1, 1), datetime(2023, 6, 30)]]
+    eta.run_pooled_daily_pnls(bars, {}, [(datetime(2022, 7, 1), datetime(2022, 12, 31)),
+                                          (datetime(2023, 1, 1), datetime(2023, 6, 30))])
+    assert len(calls) == 2
+    assert calls[0][0] == datetime(2022, 7, 1) and calls[0][1] == datetime(2022, 12, 31)
+    assert calls[1][0] == datetime(2023, 1, 1) and calls[1][1] == datetime(2023, 6, 30)
