@@ -152,3 +152,35 @@ def test_the_seed_files_are_byte_identical_to_what_the_generator_produces():
     spec.loader.exec_module(gen)
     for name, content in gen.mock_files().items():
         assert (web / "lovable-seed" / name).read_text(encoding="utf-8") == content, name
+
+
+def test_the_log_parse_cache_does_not_wipe_itself_when_it_fills_up(tmp_path):
+    """日志文件每天多一个。超过上限后如果每次新增都 clear() 全部缓存,
+    所有日志会被反复重解析(面板跑几个月就会踩到)。逐出最久没用的那个即可。"""
+    from dashboard import collectors as col
+
+    root = tmp_path / "repo"
+    d = root / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True)
+    for i in range(col.PARSE_CACHE_MAX + 5):
+        (d / f"vt_2026010{i % 9 + 1}.log").write_text(
+            f"2026-01-0{i % 9 + 1} 09:00:00 | INFO | R | 已启动\n", encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    col._PARSE_CACHE.clear()
+    col._PARSE_CACHE_USED.clear()
+    col.collect_days(settings, NOW)
+    assert len(col._PARSE_CACHE) <= col.PARSE_CACHE_MAX
+    # 缓存里应当还留着大部分文件,而不是每次新增都清空
+    assert len(col._PARSE_CACHE) > 1, "缓存被整体清空了(每次新增都会重解析所有日志)"
+
+
+def test_a_deeply_nested_json_line_in_a_ledger_is_reported_not_crashing(tmp_path):
+    """深层嵌套的 JSON 会抛 RecursionError(不是 ValueError)——不该漏成未处理异常。"""
+    from dashboard import evolution as ev
+
+    root = tmp_path / "repo"
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / "camp.jsonl").write_text("[" * 100_000 + "]" * 100_000 + "\n", encoding="utf-8")
+    with pytest.raises(ev.EvolutionError):
+        ev.read_campaign(d, "camp")

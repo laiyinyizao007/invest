@@ -41,7 +41,7 @@ _ACCOUNT_EXACT = frozenset({"account"})        # 泛用词 user / login 不放�
 # 规则:password / passwd / pwd / passphrase 在任何位置都算;单独的 pass 只在它是整个键或位于键末尾时才算(userpass、dbpass)。
 _SECRET_WORDS = ("password", "passwd", "passphrase", "pwd", "secret", "token", "authcode", "appid", "apikey", "credential", "privatekey",
                  "authorization", "cookie", "sessionid", "session")
-# 单独的 pass:必须在**规范化之前**判断,因为去掉分隔符后 user-pass 与 bypass 无法区分。
+# 单独的 pass:必须在**去掉分隔符之前**判断(只做 NFKC 规范化,不做 _norm_key 的去分隔符),因为去掉分隔符后 user-pass 与 bypass 无法区分。
 # 只有『整个键就是 pass』或『以分隔符加 pass 结尾』(user-pass、db_pass、DB.PASS)才算;bypass / compass 不算。
 _LONE_PASS = re.compile(r"(?i)(?:^|[-_.\s])pass$")
 

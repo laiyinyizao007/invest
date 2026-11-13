@@ -275,6 +275,7 @@ class _ParseState:
 
 
 _PARSE_CACHE: dict[str, _ParseState] = {}
+_PARSE_CACHE_USED: dict[str, float] = {}    # 逐出用:每个日志文件最近一次被用到的时间
 
 
 CHUNK_BYTES = 1 << 20
@@ -342,6 +343,8 @@ def _parse_cached(path: Path) -> ls.DayStats:
         return ls.parse_day_log(path)
     with _PARSE_LOCK:
         state = _PARSE_CACHE.get(key)
+        if state is not None:
+            _PARSE_CACHE_USED[key] = time.time()
         try:
             if state is not None and (st.st_mtime_ns, st.st_size) == (state.mtime_ns, state.size):
                 pass                                                          # 没变:直接用
@@ -354,9 +357,16 @@ def _parse_cached(path: Path) -> ls.DayStats:
                 state.mtime_ns, state.size = st.st_mtime_ns, st.st_size
             else:                                                             # 首次 / 被截断 / 被改写 / 被替换:全量
                 state = _full_parse(path, key, st)
-                if len(_PARSE_CACHE) >= PARSE_CACHE_MAX and key not in _PARSE_CACHE:
-                    _PARSE_CACHE.clear()
+                if key not in _PARSE_CACHE:
+                    # 逐出**最久没用**的那个,而不是 clear() 全部:
+                    # 日志文件每天多一个,超过上限后每次新增都会清空缓存 → 所有日志被反复重解析
+                    # (面板跑了几个月就会踩到)。被逐出的文件下次用到时重新解析,只是慢一点。
+                    while len(_PARSE_CACHE) >= PARSE_CACHE_MAX:
+                        oldest = min(_PARSE_CACHE, key=lambda k: _PARSE_CACHE_USED.get(k, 0.0))
+                        del _PARSE_CACHE[oldest]
+                        _PARSE_CACHE_USED.pop(oldest, None)
                 _PARSE_CACHE[key] = state
+                _PARSE_CACHE_USED[key] = time.time()
         except OSError:
             _PARSE_CACHE.pop(key, None)
             return ls.parse_day_log(path)
@@ -1155,6 +1165,8 @@ def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> Non
     if hash_key is not None:
         # 逐出**最久没用**的。之前按插入顺序逐出,而 dict 对已存在的键重新赋值并不改变插入顺序——
         # 于是**每次刷新一个已存在的键都会逐出一个无关条目**(缓存被摊薄),而不是热条目被挤掉。
+        # 先刷新本键的时间戳:否则它带着旧时间戳参与逐出,可能被立刻淘汰掉。
+        _EVOLUTION_SUMMARY_USED[hash_key] = now
         if hash_key in _EVOLUTION_SUMMARY_CACHE:
             del _EVOLUTION_SUMMARY_CACHE[hash_key]
         while len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
@@ -1162,7 +1174,6 @@ def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> Non
             del _EVOLUTION_SUMMARY_CACHE[oldest]
             _EVOLUTION_SUMMARY_USED.pop(oldest, None)
         _EVOLUTION_SUMMARY_CACHE[hash_key] = summary
-        _EVOLUTION_SUMMARY_USED[hash_key] = now
     if len(_EVOLUTION_TTL_CACHE) >= _EVOLUTION_TTL_CACHE_MAX:
         for k in sorted(_EVOLUTION_TTL_CACHE, key=lambda x: _EVOLUTION_TTL_CACHE[x]["at"])[: len(_EVOLUTION_TTL_CACHE) - _EVOLUTION_TTL_CACHE_MAX + 1]:
             del _EVOLUTION_TTL_CACHE[k]

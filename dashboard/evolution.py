@@ -157,7 +157,8 @@ def read_campaign(directory: Path, campaign_id: str) -> list[Record]:
             raise EvolutionError("台账行数超过上限")
         try:
             rows.append(parse_record(m.loads(line)))
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError:深层嵌套的 JSON 会抛它(不是 ValueError)——不该漏成未处理异常
             raise EvolutionError("台账里有无法解析的行") from exc
     rows.sort(key=lambda r: (r.generation, r.created_at or ""))
     return rows
