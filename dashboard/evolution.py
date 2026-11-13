@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import difflib
-import json
+import hashlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +25,6 @@ MAX_HEATMAP_BYTES = 4 * 1024 * 1024
 MAX_HEATMAP_CELLS = 200_000
 CAMPAIGN_ID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 SHA256 = r"[0-9a-f]{64}"
-
-RECORD_FIELDS = ("campaign_id", "generation", "candidate_sha256", "parent_sha256", "run_id", "status",
-                 "sharpe", "total_return", "max_drawdown", "dsr", "n_trials", "fail_reason", "reflection",
-                 "created_at", "cell", "diagnosis")
-
 
 class EvolutionError(Exception):
     """读取失败。消息里不含本机路径。"""
@@ -54,7 +49,6 @@ class Record:
     created_at: str | None
     cell: str | None
     diagnosis: dict | None
-    raw: dict
 
     def brief(self) -> dict:
         """给前端的精简视图。**不含**反思原文以外的自由文本;reflection 单独字段、限长。"""
@@ -101,10 +95,16 @@ def parse_record(row: Any) -> Record:
     if n_trials is not None and (not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials < 0):
         raise EvolutionError("台账记录的 n_trials 非法")
     diagnosis = row.get("diagnosis")
+    parent = row.get("parent_sha256")
+    if parent is not None:
+        # 父代哈希要么没有,要么是合法的 64 位十六进制。**不截断**:截断出来的哈希是废的,
+        # 前端拿它去请求差异会得到 404,看起来像『父代源码不在』。
+        if not isinstance(parent, str) or len(parent) != 64 or any(c not in "0123456789abcdef" for c in parent):
+            raise EvolutionError("台账记录的 parent_sha256 非法")
     return Record(
         generation=generation,
         candidate_sha256=sha,
-        parent_sha256=_text(row.get("parent_sha256"), 64),
+        parent_sha256=parent,
         run_id=_text(row.get("run_id"), 32),
         status=_text(row.get("status"), 64),
         sharpe=_num(row.get("sharpe")),
@@ -117,7 +117,6 @@ def parse_record(row: Any) -> Record:
         created_at=_text(row.get("created_at"), 40),
         cell=_text(row.get("cell"), 64),
         diagnosis=diagnosis if isinstance(diagnosis, dict) else None,
-        raw=row,
     )
 
 
@@ -158,17 +157,22 @@ def read_campaign(directory: Path, campaign_id: str) -> list[Record]:
             raise EvolutionError("台账行数超过上限")
         try:
             rows.append(parse_record(m.loads(line)))
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError:深层嵌套的 JSON 会抛它(不是 ValueError)——不该漏成未处理异常
             raise EvolutionError("台账里有无法解析的行") from exc
     rows.sort(key=lambda r: (r.generation, r.created_at or ""))
     return rows
 
 
 def campaigns(directory: Path) -> list[str]:
-    """战役列表(文件名即战役号)。只取直接位于目录内、名字合规的文件。"""
+    """战役列表(文件名即战役号)。只取直接位于目录内、名字合规的文件。
+
+    **按修改时间倒序**(新的在前):超出一次统计上限时被略过的是**最旧**的那些,
+    而不是按名字排在后面的那些——否则『未统计』可能正好落在最新的战役上。
+    """
     if not directory.is_dir():
         return []
-    out = []
+    out: list[tuple[float, str]] = []
     for path in directory.glob("*.jsonl"):
         if path.is_symlink():
             continue
@@ -178,10 +182,11 @@ def campaigns(directory: Path) -> list[str]:
         try:
             if path.resolve(strict=True).parent != directory.resolve():
                 continue
+            mtime = path.stat().st_mtime
         except OSError:
             continue
-        out.append(name)
-    return sorted(out)
+        out.append((mtime, name))
+    return [name for _, name in sorted(out, key=lambda x: (-x[0], x[1]))]
 
 
 def _percentile(values: list[float], q: float) -> float | None:
@@ -228,15 +233,30 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
             "p25_sharpe": _percentile(sharpes, 0.25),
             "p75_sharpe": _percentile(sharpes, 0.75),
             "best_total_return": None if not returns else round(max(returns), 4),
+            # 均值也要给:只给『最好』的那条会高估整个种群,画出来的收益曲线会偏乐观。
+            "mean_total_return": round(sum(returns) / len(returns), 4) if returns else None,
+            "mean_max_drawdown": round(sum(drawdowns) / len(drawdowns), 4) if drawdowns else None,
             "worst_max_drawdown": None if not drawdowns else round(max(drawdowns), 4),
             "cells": sorted({r.cell for r in group if r.cell}),
         })
     flags: list[dict] = []
-    best = max((p["elite_sharpe"] for p in points if p["elite_sharpe"] is not None), default=None)
-    if best is not None and len(points) >= stagnant_generations:
+    if len(points) >= stagnant_generations:
         tail = points[-stagnant_generations:]
-        if all(p["elite_sharpe"] is not None and p["elite_sharpe"] <= best + stagnant_epsilon for p in tail):
-            flags.append({"kind": "stagnant", "text": f"连续 {stagnant_generations} 代精英夏普没有提升(最高 {best})",
+        # 基准取**窗口之前**的历史最好。拿全局最好当基准是错的:窗口内的最好值恰好等于全局最好时,
+        # 『窗口内每代都没超过全局最好』恒成立 —— 一个正在进步的战役也会被判成停滞(文案与事实相反)。
+        before = points[:-stagnant_generations]
+        baseline = max((p["elite_sharpe"] for p in before if p["elite_sharpe"] is not None), default=None)
+        window_best = max((p["elite_sharpe"] for p in tail if p["elite_sharpe"] is not None), default=None)
+        if baseline is None:
+            # 战役开头就没有更早的代可比较:用窗口第一代当基准(从头到尾一样平,也是停滞)
+            baseline = tail[0]["elite_sharpe"]
+        # 『连续 N 代』要求代号是**连续的**:代号跳号(1、7、30)说明中间有代没跑,
+        # 那不是连续 N 代停滞,只是记录稀疏。稀疏时不给停滞提示(宁可不说,不说错)。
+        contiguous = all(tail[i]["generation"] == tail[i - 1]["generation"] + 1 for i in range(1, len(tail)))
+        if (baseline is not None and window_best is not None and contiguous
+                and window_best <= baseline + stagnant_epsilon
+                and all(p["elite_sharpe"] is not None for p in tail)):
+            flags.append({"kind": "stagnant", "text": f"连续 {stagnant_generations} 代精英夏普没有提升(窗口前最高 {baseline})",
                           "level": "warn"})
     for point in points:
         if point["elite_sharpe"] is not None and point["mean_sharpe"] is not None:
@@ -249,11 +269,21 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
             "latest_generation": points[-1]["generation"] if points else None}
 
 
+def _really_inside(path: Path, directory: Path) -> bool:
+    """文件解析后的真实位置必须直接位于 directory 内。符号链接/junction 指向目录外的一律不算。"""
+    try:
+        return path.resolve(strict=True).parent == directory.resolve()
+    except OSError:
+        return False
+
+
 def read_heatmap(directory: Path, run_id: str) -> dict | None:
     """读某个运行的参数网格得分表,并切成二维(第三轴取 best_cell)。文件不存在返回 None。"""
     path = directory / f"{run_id}.json"
     if not path.exists():
         return None
+    if not _really_inside(path, directory):
+        raise EvolutionError("热力图文件是链接,指向目录之外")     # 与研究结果文件同一口径:不读目录外的文件
     try:
         if path.stat().st_size > MAX_HEATMAP_BYTES:
             raise EvolutionError("热力图文件超过大小上限")
@@ -327,7 +357,17 @@ def read_heatmap(directory: Path, run_id: str) -> dict | None:
 
 
 def candidate_source(directory: Path, sha256: str) -> str | None:
-    """按哈希取候选源码。目录里找不到就返回 None(不猜、不按名字找)。"""
+    """按哈希取候选源码。目录里找不到就返回 None(不猜、不按名字找)。
+
+    **不做缓存**:候选只有几十个、每个 ≤256 KB,读一遍算哈希也就几十毫秒;
+    而按元数据(大小/mtime)做缓存会在『同长度改写并恢复 mtime』后返回旧源码——审阅接口给出
+    磁盘上已经不存在的代码,比慢更糟。
+    """
+    return _scan_candidate_source(directory, sha256)
+
+
+def _scan_candidate_source(directory: Path, sha256: str) -> str | None:
+    """按哈希找候选源码:读遍目录里的 .py,比对内容哈希。**不按名字找**。"""
     if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
         return None
     if not directory.is_dir():
@@ -343,7 +383,6 @@ def candidate_source(directory: Path, sha256: str) -> str | None:
             raw = path.read_bytes()
         except OSError:
             continue
-        import hashlib
         if hashlib.sha256(raw).hexdigest() == sha256:
             try:
                 return raw.decode("utf-8")

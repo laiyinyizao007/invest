@@ -78,15 +78,33 @@ def mock_file(names, header):
     return "\n".join(out) + "\n"
 
 
+PHASE1_HEADER = "// 阶段①示例数据(全部虚构)。键 = fixtures 文件名;对应接口见 docs/web/fixtures/manifest.json。"
+LATER_HEADER = "// 阶段②到⑤的示例数据(全部虚构)。"
+
+
+def seed_names() -> tuple[list[str], list[str]]:
+    """(阶段①的样例名, 其余样例名)。提成模块级常量,好让测试逐字节断言种子文件。"""
+    manifest = json.loads((WEB / "fixtures" / "manifest.json").read_text(encoding="utf-8"))
+    phase1 = [m["fixture"] for m in manifest if m["fixture"].startswith(("meta-phase1", "overview", "trading", "alerts", "days", "recording-r", "recording-s", "recording-m", "research", "run-", "doc-", "error-unauthorized", "error-not-found", "error-rate"))]
+    later = [m["fixture"] for m in manifest if m["fixture"] not in phase1]
+    return phase1, later
+
+
+def mock_files() -> dict[str, str]:
+    """两个 mock-data 文件的内容(名字 → 内容)。测试据此逐字节断言,改样例忘改种子就会红。"""
+    phase1, later = seed_names()
+    return {"mock-data.phase1.ts": mock_file(phase1, PHASE1_HEADER),
+            "mock-data.later.ts": mock_file(later, LATER_HEADER)}
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     (OUT / "api-types.ts").write_text(types_file(), encoding="utf-8")
     manifest = json.loads((WEB / "fixtures" / "manifest.json").read_text(encoding="utf-8"))
-    phase1 = [m["fixture"] for m in manifest if m["fixture"].startswith(("meta-phase1", "overview", "trading", "alerts", "days", "recording-r", "recording-s", "recording-m", "research", "run-", "doc-", "error-unauthorized", "error-not-found", "error-rate"))]
-    later = [m["fixture"] for m in manifest if m["fixture"] not in phase1]
-    (OUT / "mock-data.phase1.ts").write_text(mock_file(phase1, "// 阶段①示例数据(全部虚构)。键 = fixtures 文件名;对应接口见 docs/web/fixtures/manifest.json。"), encoding="utf-8")
-    (OUT / "mock-data.later.ts").write_text(mock_file(later, "// 阶段②到⑤的示例数据(全部虚构)。"), encoding="utf-8")
+    for name, content in mock_files().items():
+        (OUT / name).write_text(content, encoding="utf-8")
     (OUT / "mock-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    phase1, later = seed_names()
     print("phase1:", len(phase1), "later:", len(later))
 
 

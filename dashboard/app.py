@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import re
 import time
@@ -173,6 +174,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
 
     @app.exception_handler(Exception)
     async def unexpected(request: Request, exc: Exception):
+        # 记堆栈:不外泄细节给客户端,但服务端必须留痕,否则半夜出问题无从查起
+        logging.exception("面板处理请求时发生未捕获异常:%s %s", request.method, request.url.path)
         return error_response(500, "服务器内部错误", code="internal")
 
     def require_token(request: Request) -> None:
@@ -264,7 +267,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     if settings.raw.get("evolution", {}).get("enabled"):
         @get("/api/research/evolution")
         def evolution_list():
-            return respond(col._collect_safely("evolution", col.collect_evolution, settings, clock()).section)
+            # **裸数据**(与 curve/log/heatmap 同族端点一致):state/level/message 放在数据里。
+            return respond(col.evolution_list_payload(settings, clock()))
 
         @get("/api/research/evolution/{campaign_id}/curve")
         def evolution_curve(campaign_id: str):

@@ -89,6 +89,7 @@ python scripts/status_server.py               # 启动,默认 127.0.0.1:8770
 - **环境标签**:在 `config/status_dashboard.json` 里设 `environment`(`simnow` / `guoxin-test` / `live`)。不设则页面横幅显示『环境未知』——面板不读 `.env`,不会猜。
 - **状态目录**:默认 `data/state`(直接用 Python 运行的机器);Docker 运行则在配置里把 `state_dir` 指向挂载出来的 `runtime/data/state`,`log_dirs` 默认 `runtime/vntrader/log`。**不要把 `.vntrader/log` 加进去**——单元测试会污染它。
 - **面板必须与交易运行时在同一台机器**(它读同一批文件)。杀掉面板不影响交易;它不写任何被读取的文件(测试强制)。
+- **进化视图(阶段④)默认关闭**:在 `config/status_dashboard.json` 里设 `"evolution": {"enabled": true}` 才会注册那 6 个接口;关闭时总览里也没有进化区块(一个用户打不开的子系统不该出现在总览里)。数据由引擎侧写进 `data/research/evolution/` 与 `data/research/heatmaps/`,面板只读。
 - 前端未构建时 `/` 显示占位页;API 可直接用(带令牌)。前端构建与入库见 `docs/web/05-lovable-guide.md`。
 
 #### `scripts/unattended_report.py` —— 无人值守验收的证据
@@ -175,6 +176,9 @@ python scripts/run_headless.py --check
 
 ## 6. SimNow 阶段验收
 - 连续无人工干预运行 ≥ 5 个交易日,含夜盘与至少一次周末;
+  **连续段的口径(2026-11-13 用户拍板)**:**只有严重事件才打断**;警告(连接断开、行情停更、网关错误、当日禁止开仓、账户变更、委托被拒)
+  不打断,但会被**数出来**和连续段一起给出(『连续无严重事件 5/5 天,期间 N 次警告』),不会因为放宽口径而悄悄变宽。
+  无法判断的日子(日志损坏、尾部不完整)与缺日志的工作日仍然打断。
   **"交易日"的算法**(`scripts/unattended_report.py::longest_clean_streak()`):只有**工作日(周一~周五)**计入连续段,
   **周末即使有日志文件也不计入**(容器常驻,周末照样有日志,夜盘跨零点还会写进周六的文件 ——
   把它们算成交易日会让验收结论凭空多出两天)。周末的**严重**事件(紧急平仓、熔断、硬锁定、对账失败)仍然**打断**连续段;

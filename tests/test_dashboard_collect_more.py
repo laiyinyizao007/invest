@@ -6,6 +6,7 @@ import os
 import pytest
 
 from dashboard import collectors as col, config
+from risk.report import backtest_stats_row
 
 NOW = 1_800_000_000.0
 
@@ -75,7 +76,10 @@ def test_recording_missing_and_corrupt(tmp_path):
 
 def test_recording_unknown_status_value_is_not_reported_as_healthy(tmp_path):
     rec(tmp_path, status="future_status")
-    assert col.collect_recording(S(tmp_path), NOW).level != "ok"
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.level != "ok"
+    # 契约规定前端『先看 state』:认不出来的状态 = 无法判断,区块状态不能是 ok(否则渲染成绿卡片)
+    assert r.section["state"] != "ok"
 
 
 # ---------------------------------------------------------------- 研究
@@ -211,6 +215,8 @@ def test_overview_is_ok_only_when_core_sections_are_ok_and_optional_ones_may_be_
     o = col.collect_overview(S(tmp_path), NOW)
     assert o["level"] == "ok" and o["reasons"] == []
     assert o["sections"]["recording"]["state"] == "missing" and o["sections"]["research"]["state"] == "missing"
+    assert o["level"] == "ok"
+    # evolution 由 evolution.enabled 门控:阶段①默认关着,总览里就不该出现它
     assert set(o["sections"]) == {"trading", "alerts", "days", "recording", "research"}
 
 
@@ -430,7 +436,7 @@ def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_
 
 def test_valid_runs_of_each_kind_are_accepted(tmp_path):
     base = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00", "report": "结论: x"}
-    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": {"sharpe": 1.0}}),
+    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})}),
           ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}}),
           ("20261112-210000-000003", {**base, "kind": "gate", "passed": False, "failures": ["f"]}),
           ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X", "message": "m"}}),
@@ -470,3 +476,41 @@ def test_invalid_runs_older_than_the_displayed_window_are_still_counted(tmp_path
     res(tmp_path, runs=good + bad)
     r, runs = _runs_of(tmp_path)
     assert len(runs) == 10 and r.level == "warn" and "1 个运行结果" in r.section["message"]
+
+
+def test_an_oversized_document_is_marked_as_truncated_not_silently_cut(tmp_path):
+    """运行手册被砍掉一半还显示成完整的一篇,人会照着缺步骤的操作——必须能看出来。"""
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("x" * (col.MAX_DOC_BYTES + 100), encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is True
+    assert len(d["markdown"]) == col.MAX_DOC_BYTES
+
+
+def test_a_document_within_the_limit_is_not_marked_truncated(tmp_path):
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("# 标题\n正文\n", encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is False and d["markdown"].startswith("# 标题")
+
+
+def test_the_run_detail_exposes_the_backtest_statistics(tmp_path):
+    """回测的数字在 stats 里(收益/夏普/往返笔数)。少了它,前端只能从报告文本里读,画不了图。"""
+    row = backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2,
+                               "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0,
+                               "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})
+    res(tmp_path, runs=[(RID, {"kind": "backtest", "strategy_file": "d.py",
+                               "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00",
+                               "report": "沙盒回测", "stats": row})])
+    d = col.get_run(S(tmp_path), RID)
+    assert d is not None and d["stats"] is not None
+    assert d["stats"]["round_trips"] == 78 and d["stats"]["sharpe"] == 1.2
+    assert d["metrics"] is None

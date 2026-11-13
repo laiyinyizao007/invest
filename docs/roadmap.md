@@ -259,6 +259,7 @@ flowchart TB
 | Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
 | 增量调度器 | DSH `@goodandready/dsh-cron` 短任务 `ensure`/`watchdog`，不写 Python 常驻调度器；生命周期边界见 `docs/adr/20261111-market-recording-and-dsh-orchestration.md` | 阶段一并行副线立即建设；先完成 dummy worker Windows 生命周期实测 | §4「缺自动化调度」/Issue #13 |
 | 只读状态页(Web 监控面板)——**后端 fork 自 `vnpy_webtrader` 1.1.0(MIT)并改造,委托类接口与 RPC 全部删除** | `dashboard/` 纯逻辑包 + `dashboard/app.py` + `scripts/status_server.py` + 静态单页 + `requirements-dashboard.txt`;只读文件、独立进程、仅监听 127.0.0.1;实时持仓/资金(阶段②)与「暂停开仓」(阶段③)另立 ADR | 阶段一并行副线;ADR 确认后开工,阶段①计划见 `docs/plans/20261112-status-dashboard-plan.md`;完整 Web 规划(五阶段、契约、前端交接)见 `docs/web/README.md`;前端用 React + Lovable 构建,计划见 `docs/plans/20261112-web-frontend-lovable-plan.md` | `docs/adr/20261112-status-dashboard.md` |
+| 进化引擎三视图(曲线/热力图/变异日志)——**只读展示,进化回路由毕昇工作流承载** | `dashboard/evolution.py` + 阶段④的 6 个只读接口 + `docs/web/08-evolution-views.md`;台账与热力图文件由引擎侧产出 | 引擎侧阶段 3 产出台账与热力图;前端按示例数据开发 | ADR `20261113-evolution-dashboard.md` |
 | 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
 | 主力换月自动化 | 扩展 `scripts/build_continuous.py` 的 rolls 派生逻辑(换月数据实际在这里生成,不在 `import_minute.py`)→ runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
 | CTP 行情自录 | 官方 `vnpy_datarecorder` 独立无头进程，数据写 `.vntrader_record/database.db`；由 wrapper + DSH 短任务 `ensure`/`watchdog` 管理，不挂交易 runtime | 阶段一并行副线；先完成生命周期实测，再做 SimNow/国信测试 profile 验收 | 要点梳理 §3.1 / Issue #13 |

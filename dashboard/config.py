@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,8 @@ DEFAULTS: dict = {
     "stale_after_seconds": {"trading": 60.0, "alerts": 300.0, "days": 600.0, "recording": 120.0, "research": 3600.0, "docs": 86400.0},
     "docs": {"unattended-log": "docs/unattended-log.md", "simnow-drills": "docs/simnow-drills.md"},
     "docs_titles": {"unattended-log": "无人值守运行记录", "simnow-drills": "SimNow 演练记录"},
-    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50},
+    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50,
+                "summary_ttl": 30.0},   # 战役摘要缓存的秒数:总览每 8 秒轮询,不能每次都重读全部台账
     "days_default": 14,
     "recent_runs": 10,
     "limits": {"daily_loss_yuan": None, "hard_drawdown_yuan": None},      # None = 取风控默认值
@@ -88,6 +90,23 @@ class Settings:
         return float(self.raw["stale_after_seconds"][name])
 
 
+def _check_evolution(cfg: Any) -> None:
+    """进化面板的配置取值。**非法值在启动时就被拒**,而不是让页面在半夜 500
+    (config.load 的既定约定:非法即抛 ConfigError,由入口转为拒绝启动)。"""
+    if not isinstance(cfg, dict):
+        raise ConfigError("evolution 必须是对象")
+    if not isinstance(cfg.get("enabled"), bool):
+        raise ConfigError("evolution.enabled 必须是 true/false")
+    for key in ("stagnant_generations", "log_limit"):
+        value = cfg.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"evolution.{key} 必须是正整数")
+    for key in ("stagnant_epsilon", "overfit_mean_gap", "summary_ttl"):
+        value = cfg.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ConfigError(f"evolution.{key} 必须是非负有限数")
+
+
 def _resolve(root: Path, rel: str, what: str) -> Path:
     path = (root / rel).resolve()
     if root != path and root not in path.parents:
@@ -123,6 +142,7 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
         v = raw["limits"][key]
         if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0):
             raise ConfigError(f"limits.{key} 必须是正数或 null")
+    _check_evolution(raw.get("evolution"))
     root = root.resolve()
     paths = {
         "state_dir": _resolve(root, raw["state_dir"], "state_dir"),

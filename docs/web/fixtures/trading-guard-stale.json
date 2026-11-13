@@ -1,6 +1,6 @@
 {
   "state": "stale",
-  "as_of": "2026-11-13T08:30:00+08:00",
+  "as_of": "2026-11-13T08:29:56+08:00",
   "age_seconds": 4.0,
   "stale_after_seconds": 60.0,
   "message": "风控状态文件已落后 1440 分钟(运行时至少每分钟落盘一次):当前权益、盈亏、锁定状态可能不是最新",
@@ -35,5 +35,6 @@
     "live_admission": {
       "approved": false
     }
-  }
+  },
+  "level": "unknown"
 }

@@ -41,7 +41,7 @@ _ACCOUNT_EXACT = frozenset({"account"})        # 泛用词 user / login 不放�
 # 规则:password / passwd / pwd / passphrase 在任何位置都算;单独的 pass 只在它是整个键或位于键末尾时才算(userpass、dbpass)。
 _SECRET_WORDS = ("password", "passwd", "passphrase", "pwd", "secret", "token", "authcode", "appid", "apikey", "credential", "privatekey",
                  "authorization", "cookie", "sessionid", "session")
-# 单独的 pass:必须在**规范化之前**判断,因为去掉分隔符后 user-pass 与 bypass 无法区分。
+# 单独的 pass:必须在**去掉分隔符之前**判断(只做 NFKC 规范化,不做 _norm_key 的去分隔符),因为去掉分隔符后 user-pass 与 bypass 无法区分。
 # 只有『整个键就是 pass』或『以分隔符加 pass 结尾』(user-pass、db_pass、DB.PASS)才算;bypass / compass 不算。
 _LONE_PASS = re.compile(r"(?i)(?:^|[-_.\s])pass$")
 
@@ -58,13 +58,19 @@ def is_account_key(key: str) -> bool:
 
 # ---- 文本里的泄露形态 ----
 # 敏感词 = / : 值。值取到空白、分号或逗号为止;Authorization 要连 scheme 带凭据一起吞(Basic xxx / Bearer xxx)。
-_ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|auth[_-]?code|app[_-]?id)\b(\s*[=:]\s*)[^\s;,&]+")
+# 赋值形态:`password=x`、`password: x`,以及**带引号的 JSON 键**(`"password": "x"`)。
+# 引号形态曾被漏掉:日志或候选代码里的 JSON 字面量会把秘密原样带出去。
+_ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|auth[_-]?code|app[_-]?id)\b"
+                     r"(\s*[\"']?\s*[=:]\s*[\"']?)[^\s;,\"'&]+")
 _AUTH_HEADER = re.compile(r"(?i)\b(authorization|proxy-authorization)\b(\s*[=:]\s*)(?:(?:basic|bearer|digest|token)\s+)?[^\s;,]+")
 _COOKIE = re.compile(r"(?i)\b(set-cookie|cookie)\b(\s*[=:]\s*)[^\r\n]+")
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}")
 _CTP_ENV = re.compile(r"(?i)\bCTP_[A-Z0-9_]+\s*[=:]\s*\S+")
 
 _UNC = re.compile(r"\\\\[?.]?\\?[^\s\"'<>|*?]+")                                                    # \\server\share  \\?\C:\...  \\.\pipe\x
+# 零宽/方向控制字符:能拆开路径结构(C:\u200bUsers)。**不删除它们**(那会改动与路径无关的原文),
+# 而是让路径规则容忍它们——路径被整段替换时这些字符随之消失,路径之外的原文一个字节不动。
+_ZW_CLASS = "[\u200b-\u200f\u2060\ufeff\u202a-\u202e]"
 # 盘符后接反斜杠,或接**单个**正斜杠:`https://x` 里的 `s:/` 后面还有一个 `/`,所以不会被当成盘符;而 `fooC:\Users` 这种紧贴字母的写法仍会命中
 # 反斜杠写法:目录名里允许单个空格(`C:\Users\Alice Smith\x.txt`——空格后面必须还有反斜杠才算目录的一部分,所以普通句子不会被吞掉);
 # 正斜杠写法:盘符前不能是字母数字/斜杠/点(挡住 URL 路径里的 `a:/b`),而反斜杠写法不加这个限制(`fooC:\Users` 仍要命中)。
@@ -74,7 +80,8 @@ _WIN_PATH = re.compile(r"[A-Za-z](?:[\u200b-\u200f\u2060\ufeff\u202a-\u202e]*)?:
 # 引号包围的路径可以含空格(C:\Users\Alice Smith\...):整段替换,否则只遮住空格之前的部分
 _QUOTED_PATH = re.compile(r"(?P<q>[\"'])(?:[A-Za-z]:[\\/]|\\\\|/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library)/)[^\"'<>|*?\r\n]*(?P=q)")
 # 全角冒号/斜杠写成的盘符路径(C：＼Users＼x):只在确实含全角路径字符时才替换,半角版本由 _WIN_PATH 处理
-_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ][:：][\\/＼／][^\s\"'<>|*?]*")
+_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ]" + _ZW_CLASS + r"*[:：]" + _ZW_CLASS + r"*[\\/＼／][^\s\"'<>|*?]*"
+                             r"|[Ａ-Ｚａ-ｚ]" + _ZW_CLASS + r"*[\\/＼／][^\s\"'<>|*?]*")   # 全角盘符**没有冒号**的写法(Ｃ\Users)
 _FULLWIDTH_MARKS = "：＼／"
 _PCT_U = re.compile(r"(?i)%u([0-9a-f]{4})")                                                       # 非标准的 %uXXXX 写法,只用于检测副本
 _ENC_WIN_PATH = re.compile(r"(?i)\b[a-z]%3a(?:%5c|%2f)[^\s\"'<>]*")                                  # C%3A%5CUsers%5C...
@@ -82,8 +89,21 @@ _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|e
 _PCT_TOKEN = re.compile(r"[^\s\"'<>]*%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})[^\s\"'<>]*")                                   # 含百分号编码的片段
 _DECODE_ROUNDS = 8                                                                                 # 解码到稳定为止,最多 8 轮(%5C、%255C、%25255C…);更深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
-# 没有盘符的 Windows 根路径(`\Users\Alice\...`):盘符路径有规则,这个形态曾被漏掉
-_WIN_ROOTED_PATH = re.compile(r"(?<![\w.:/\\])\\(?:Users|Windows|ProgramData|Program Files|Applications|home|tmp|opt|srv|usr|var|etc|Volumes|Library|private)\\?[^\s\"'<>|*?]*")
+# 没有盘符的 Windows 根路径(`\Users\Alice\...`):盘符路径有规则,这个形态曾被漏掉。
+# 目录名里也可以夹零宽字符(`\Us\u200bers\Alice\...`),所以名字本身按『每个字符之间都允许零宽』来写。
+_ROOT_NAMES = ("Users", "Windows", "ProgramData", "Program Files", "Applications",
+                "home", "tmp", "opt", "srv", "usr", "var", "etc", "Volumes", "Library", "private")
+
+
+def _zw_tolerant(literal: str) -> str:
+    """让一个固定字符串容忍零宽字符插在字符之间(Us<ZW>ers)。"""
+    zw = _ZW_CLASS + "*"
+    return "".join(part + zw for part in literal)
+
+
+_WIN_ROOTED_PATH = re.compile(r"(?<![\w.:/\\])\\" + _ZW_CLASS + "*"
+                              + "(?:" + "|".join(_zw_tolerant(name) for name in _ROOT_NAMES) + ")"
+                              + r"\\?[^\s\"'<>|*?]*")
 
 
 def mask_account(value: object) -> str:

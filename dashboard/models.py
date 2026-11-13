@@ -40,12 +40,21 @@ class Clock:
         return self.now
 
 
+# state 决定**内容能不能看**(missing/corrupt 时 data 为 null),level 决定**徽标长什么样**。
+# 两者分开,前端才能区分『数据是坏的』(state=unknown)和『有些内容没列出来/没检查』(state=ok + level=warn)。
+_STATE_LEVEL = {"ok": "ok", "stale": "warn", "missing": "unknown", "corrupt": "unknown", "unknown": "unknown"}
+
+
 def section(state: str, data: Any = None, *, as_of: float | None = None, now: float, stale_after: float | None = None,
-            message: str | None = None) -> dict:
-    """构造区块外壳。as_of / now 为 epoch 秒;age 由服务器计算。"""
+            message: str | None = None, level: str | None = None) -> dict:
+    """构造区块外壳。as_of / now 为 epoch 秒;age 由服务器计算。
+
+    `level` 缺省按 state 推导;需要区分『没检查/没列出』与『读不出来』时显式给。
+    """
     age = None if as_of is None else round(max(now - as_of, 0.0), 1)
     return {
         "state": state,
+        "level": level if level is not None else _STATE_LEVEL.get(state, "unknown"),
         "as_of": None if as_of is None else iso(as_of),
         "age_seconds": age,
         "stale_after_seconds": stale_after,

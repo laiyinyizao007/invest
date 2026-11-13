@@ -1,6 +1,6 @@
 {
   "state": "ok",
-  "as_of": "2026-11-13T08:30:00+08:00",
+  "as_of": "2026-11-13T08:29:56+08:00",
   "age_seconds": 4.0,
   "stale_after_seconds": 3600.0,
   "message": null,
@@ -29,5 +29,6 @@
         "headline": "结论: 未通过(7 项未过)"
       }
     ]
-  }
+  },
+  "level": "ok"
 }

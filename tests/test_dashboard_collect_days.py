@@ -381,7 +381,12 @@ def test_garbage_does_not_hide_behind_a_valid_log_but_also_does_not_poison_it(tm
     log(tmp_path, "20261111", CLEAN)
     _garbage_log(tmp_path)                                                   # 另一天是垃圾
     d = col.collect_days(settings(tmp_path), NOW).section["data"]
-    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                    # 垃圾那天不出现,更不会显示成『无异常』
+    # 垃圾那天**要在表里**(带 trusted=false),但绝不能显示成『无异常』:
+    # 曾经它既不在表里、也不在缺天清单里——用户根本看不到那天存在。
+    days = {x["day"]: x for x in d["days"]}
+    assert set(days) == {"2026-11-11", "2026-11-12"}
+    assert days["2026-11-12"]["trusted"] is False and days["2026-11-12"]["clean"] is False
+    assert days["2026-11-11"]["trusted"] is True and days["2026-11-11"]["clean"] is True
 
 
 def test_a_log_with_one_recognisable_line_among_noise_counts(tmp_path):
@@ -639,7 +644,10 @@ def test_an_unreadable_log_is_surfaced_even_when_another_day_is_fine(tmp_path):
         assert r.level == "unknown", collect.__name__
         assert "无法识别" in json.dumps(r.reasons, ensure_ascii=False) or "无法识别" in (r.section["message"] or ""), collect.__name__
     d = col.collect_days(settings(tmp_path), NOW).section["data"]
-    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                          # 数据仍显示好的那天,但级别不是 ok
+    # 好的那天照常显示,坏的那天也在表里(标着 trusted=false)——两边都消失才是问题
+    days = {x["day"]: x for x in d["days"]}
+    assert set(days) == {"2026-11-11", "2026-11-12"}
+    assert days["2026-11-12"]["trusted"] is False and days["2026-11-12"]["clean"] is False
 
 
 def test_real_log_format_is_trusted(tmp_path):
@@ -649,3 +657,34 @@ def test_real_log_format_is_trusted(tmp_path):
             "2026-11-10 13:58:30.001 | ERROR | MainEngine | 启动失败: x\n")
     _raw_log(tmp_path, "20261110", real)
     assert col.collect_days(settings(tmp_path), NOW).section["data"]["days"][0]["started"] == 0
+
+
+def _quiet_day(tmp_path, day, extra=()):
+    iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    log(tmp_path, day, [f"{iso} 09:00:01.000 | INFO | r | 已启动", *[f"{iso} {ln}" for ln in extra]])
+
+
+def test_warnings_do_not_break_the_streak_but_are_counted_and_shown(tmp_path):
+    """用户 2026-11-13 拍板:只有严重事件才打断连续段;警告不打断,但要数出来、显示出来。
+    (实盘数据里 11-10/11-11 只有『连接断开』警告,旧口径下连续段是 0 天。)"""
+    for day in ("20261109", "20261110", "20261111", "20261112", "20261113"):
+        extra = ["21:00:00.000 | WARNING | x | 连接断开"] if day in ("20261110", "20261111") else []
+        _quiet_day(tmp_path, day, extra)
+    for f in (tmp_path / "runtime" / "vntrader" / "log").glob("vt_*.log"):
+        os.utime(f, (NOW - 5, NOW - 5))                                         # 日志是新鲜的,标题才是连续段而不是『长时间未更新』
+    r = col.collect_days(settings(tmp_path), NOW)
+    d = r.section["data"]
+    assert d["longest_clean_streak"] == 5 and d["checklist"][0]["checked"] is True
+    assert d["streak_warning_count"] == 2                                    # 连续段里的 2 次警告被数出来了
+    assert "连续无严重事件 5/5 天" in r.headline and "2 次警告" in r.headline     # 且显示在标题里,没被藏起来
+    by_day = {x["day"]: x for x in d["days"]}
+    assert by_day["2026-11-10"]["clean"] is False                              # 表里那天仍然不是『一个事件都没有』
+    assert by_day["2026-11-10"]["has_severe"] is False
+
+
+def test_a_severe_event_still_breaks_the_streak_on_the_dashboard(tmp_path):
+    for day in ("20261109", "20261110", "20261111", "20261112", "20261113"):
+        extra = ["21:00:00.000 | ERROR | g | [ERROR] 硬锁定: 回撤"] if day == "20261111" else []
+        _quiet_day(tmp_path, day, extra)
+    d = col.collect_days(settings(tmp_path), NOW).section["data"]
+    assert d["longest_clean_streak"] == 2 and d["checklist"][0]["checked"] is False

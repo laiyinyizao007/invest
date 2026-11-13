@@ -16,6 +16,7 @@ export interface SectionBase {
   age_seconds?: number | null;
   stale_after_seconds?: number | null;
   message?: string | null;
+  level: "ok" | "warn" | "critical" | "unknown";
 }
 
 export interface ApiError {
@@ -70,6 +71,7 @@ export interface Overview {
     days: Brief;
     recording: Brief;
     research: Brief;
+    evolution?: EvolutionSection;
   };
 }
 
@@ -139,6 +141,8 @@ export interface DayRow {
   first_ts: string | null;
   last_ts: string | null;
   heartbeat: string | null;
+  trusted: boolean;
+  tail_uncertain: boolean;
 }
 
 export interface DaysData {
@@ -150,6 +154,7 @@ export interface DaysData {
   longest_clean_streak: number;
   required_streak: number;
   missing_weekdays: Array<string>;
+  streak_warning_count: number;
 }
 
 export interface RecordingData {
@@ -205,12 +210,14 @@ export interface RunDetail {
   selection?: Record<string, unknown> | null;
   windows?: unknown[] | null;
   error?: Record<string, unknown> | null;
+  stats?: Record<string, unknown> | null;
 }
 
 export interface DocData {
   key: "unattended-log" | "simnow-drills";
   title: string;
   markdown: string;
+  truncated: boolean;
 }
 
 export interface LiveData {
@@ -386,9 +393,15 @@ export interface WhoAmI {
   role: "viewer" | "operator" | "admin";
 }
 
-/** 战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。 */
+/** 进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。 */
 export interface EvolutionList {
   campaigns: Array<EvolutionCampaign>;
+  total: number;
+  checked: number;
+  unscanned: number;
+  state: "ok" | "missing" | "unknown";
+  level: "ok" | "warn" | "critical" | "unknown";
+  message: string | null;
 }
 
 export interface EvolutionCampaign {
@@ -421,6 +434,8 @@ export interface EvolutionPoint {
   best_total_return: number | null;
   worst_max_drawdown: number | null;
   cells: Array<string>;
+  mean_total_return?: number | null;
+  mean_max_drawdown?: number | null;
 }
 
 /** 服务端的提示标志。**是提示,不是结论**;文案已写明依据。 */
@@ -499,6 +514,13 @@ export interface CandidateDiff {
   to_sha256: string;
   diff: string;
   available: boolean;
+}
+
+/** 总览里的进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着)。 */
+export interface EvolutionSection {
+  state: string;
+  level: string;
+  headline: string;
 }
 
 /** 区块外壳:先看 state,再决定是否渲染 data。 */

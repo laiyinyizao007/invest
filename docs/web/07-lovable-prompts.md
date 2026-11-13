@@ -140,8 +140,10 @@
 
 关键规则(请严格遵守):
 1. StateBadge:state 取值 ok / stale / missing / corrupt / unknown;收到任何未知取值一律按 unknown 渲染,绝不当作 ok。每个状态都是"图标 + 颜色 + 文字"三件套(按设计文档 §4 的表)。
-2. SectionCard:接收一个 Section<T>(包含 state、as_of、age_seconds、message、data)。
-   - state=ok:正常渲染内容。
+2. SectionCard:接收一个 Section<T>(包含 state、level、as_of、age_seconds、message、data)。
+   - **state 决定内容能不能看,level 决定徽标**——两件事,别混:
+     `state=ok` + `level=warn` = 内容是好的,但有些内容没列出来/没检查(例如超出显示上限)→ 正常渲染,加一个『部分内容未列出』的警示徽标;
+     `state=unknown` = 有些数据读不出来 → 内容照常渲染,但加『部分数据无法读取』的提示徽标(不等于『没有数据』)。
    - state=stale:内容保留、整体 60% 不透明度、卡片头显示"数据已过期"徽标,不用绿色。
    - state=missing:不渲染内容,显示"未找到数据来源"和 message。
    - state=corrupt:不渲染内容,显示"数据来源损坏或正在被写入"和 message。
@@ -170,7 +172,7 @@
 
 规格:
 1. 外壳的环境横幅取 meta.environment;总状态条显示 overview.level(ok→"一切正常"、warn→"需要关注"、critical→"严重"、unknown→"无法判断")和最多 3 条 reasons,点击某条跳转到对应页面。level 由服务器给出,前端不得自行计算;未知取值按 unknown。
-2. 五张摘要卡(交易与风控、告警、无人值守、行情录制、研究沙盒),每张显示 headline、StateBadge 和"N 秒前"(用 overview.server_time 即可),点击进入对应页。
+2. 摘要卡(交易与风控、告警、无人值守、行情录制、研究沙盒;`capabilities.evolution` 为真时多一张进化卡——总览的 `sections` 里会多出 `evolution`,默认没有,要容忍它不存在),每张显示 headline、StateBadge 和"N 秒前"(用 overview.server_time 即可),点击进入对应页。
 3. 卡片排序:critical → warn → unknown → ok;同级别按固定顺序。
 4. 布局按设计文档 §5.2:桌面 12 列 Bento 网格,手机单列。
 5. 自动刷新用 P2 的轮询 Hook。
@@ -223,7 +225,8 @@
 
 补充:
 1. /alerts:待补发队列 pending>0 时显示警告"有告警因断网等原因尚未送达手机",并显示最老一条的年龄;recent 事件按日期倒序、severe 在前,级别用徽标(严重/警告)。pending=0 且 recent 为空时显示"无待补发,近期无异常事件"(这是空态,与 missing 不同)。
-2. /days:顶部进度"longest_clean_streak / required_streak 天";每日表列:日期、启动次数、成交笔数(0 显示"—")、事件徽标列表(无事件写"无异常")、心跳;has_severe 的行整行加严重标记。
+2. /days:顶部进度"longest_clean_streak / required_streak 天"(口径:只有严重事件打断;旁边必须显示 streak_warning_count 次警告);每日表列:日期、启动次数、成交笔数(0 显示"—")、事件徽标列表(无事件写"无异常")、心跳;has_severe 的行整行加严重标记。
+   **但 `trusted=false` 的行不能写"无异常"**——那天的日志读不懂,`events` 可能是空的但事件被藏起来了。这种行显示"日志无法识别,这天无法判断"(尾行没写完的 `tail_uncertain=true` 显示"日志正在写入");`clean` 也是 false,不计入连续天数。
 3. 验收清单:checked 为 true/false/null,null 显示"需人工核对"而不是未勾选。
 4. missing_weekdays 非空时显示"以下工作日没有日志:…"。
 5. first_ts / last_ts 是北京时间的无时区字符串,按北京时间解释并标注。

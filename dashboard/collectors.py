@@ -6,16 +6,19 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dashboard import evolution as ev
 from dashboard import models as m
+from risk.report import BACKTEST_STATS_KEYS
 from dashboard.config import PAUSE_FLAG_NAME, Settings
 from dashboard.safe import mask_account
 from evidence import logstats as ls
@@ -27,6 +30,14 @@ class Result:
     level: str
     headline: str
     reasons: list[dict] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """把级别写进区块外壳。
+
+        `state` 决定内容能不能看,`level` 决定徽标:前端要能区分
+        『数据是坏的』(state=unknown)和『有些内容没列出来/没检查』(state=ok + level=warn)。
+        """
+        self.section["level"] = self.level
 
 
 def _num(value: Any) -> bool:
@@ -136,8 +147,9 @@ def collect_trading(settings: Settings, now: float) -> Result:
     sampled_ts = guard.pop("_sampled_ts") if guard is not None else None
     guard_future = (guard_mtime is not None and guard_mtime - now > CLOCK_SKEW_TOLERANCE) or (sampled_ts is not None and sampled_ts - now > CLOCK_SKEW_TOLERANCE)
     guard_unverifiable = guard is not None and sampled_ts is None
-    basis = [t for t in (sampled_ts, guard_mtime) if t is not None]
-    guard_age = None if guard is None or sampled_ts is None else round(max(now - min(basis), 0.0), 1)
+    # 年龄只看**采样时刻**:文件写入时间不是权益新鲜度的证据(风控进程每分钟重写文件,网关断开时它照样是新的)。
+    # (原来取 sampled_ts 与文件 mtime 的较小者,把两个不同时钟混在一起,测试里用假时钟就会失真。)
+    guard_age = None if guard is None or sampled_ts is None else round(max(now - sampled_ts, 0.0), 1)
     if guard is not None:
         guard["as_of"] = None if sampled_ts is None else m.iso(sampled_ts)
         guard["age_seconds"] = guard_age
@@ -264,6 +276,7 @@ class _ParseState:
 
 
 _PARSE_CACHE: dict[str, _ParseState] = {}
+_PARSE_CACHE_USED: dict[str, float] = {}    # 逐出用:每个日志文件最近一次被用到的时间
 
 
 CHUNK_BYTES = 1 << 20
@@ -331,6 +344,8 @@ def _parse_cached(path: Path) -> ls.DayStats:
         return ls.parse_day_log(path)
     with _PARSE_LOCK:
         state = _PARSE_CACHE.get(key)
+        if state is not None:
+            _PARSE_CACHE_USED[key] = time.time()
         try:
             if state is not None and (st.st_mtime_ns, st.st_size) == (state.mtime_ns, state.size):
                 pass                                                          # 没变:直接用
@@ -343,9 +358,16 @@ def _parse_cached(path: Path) -> ls.DayStats:
                 state.mtime_ns, state.size = st.st_mtime_ns, st.st_size
             else:                                                             # 首次 / 被截断 / 被改写 / 被替换:全量
                 state = _full_parse(path, key, st)
-                if len(_PARSE_CACHE) >= PARSE_CACHE_MAX and key not in _PARSE_CACHE:
-                    _PARSE_CACHE.clear()
+                if key not in _PARSE_CACHE:
+                    # 逐出**最久没用**的那个,而不是 clear() 全部:
+                    # 日志文件每天多一个,超过上限后每次新增都会清空缓存 → 所有日志被反复重解析
+                    # (面板跑了几个月就会踩到)。被逐出的文件下次用到时重新解析,只是慢一点。
+                    while len(_PARSE_CACHE) >= PARSE_CACHE_MAX:
+                        oldest = min(_PARSE_CACHE, key=lambda k: _PARSE_CACHE_USED.get(k, 0.0))
+                        del _PARSE_CACHE[oldest]
+                        _PARSE_CACHE_USED.pop(oldest, None)
                 _PARSE_CACHE[key] = state
+                _PARSE_CACHE_USED[key] = time.time()
         except OSError:
             _PARSE_CACHE.pop(key, None)
             return ls.parse_day_log(path)
@@ -354,10 +376,19 @@ def _parse_cached(path: Path) -> ls.DayStats:
 
 
 def warm_up(settings: Settings) -> None:
-    """启动时预热日志解析缓存,让用户第一次打开页面时已经是热的(60 MB 日志冷解析约 11 秒)。
+    """启动时预热解析缓存,让用户第一次打开页面时已经是热的
+    (60 MB 日志冷解析约 11 秒;进化台账同理,50 个战役 ≈ 300 MB)。
+
     预热只是优化:任何异常都吞掉,绝不能阻止服务启动。"""
     try:
         _days(settings)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # 进化台账也要预热:总览每 8 秒轮询一次,冷启动后第一个请求要 11 秒就足够拖慢页面。
+        # 只在开关打开时预热(阶段①默认关着,没理由去读那些文件)。
+        if settings.raw.get("evolution", {}).get("enabled"):
+            collect_evolution(settings, time.time())
     except Exception:  # noqa: BLE001
         pass
 
@@ -374,8 +405,10 @@ def _all_log_files(settings: Settings) -> list[Path]:
 def _days(settings: Settings, *, only_trusted: bool = True) -> list[ls.DayStats]:
     """按天汇总。
 
-    only_trusted=True(默认):只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
-    only_trusted=False:全部日志(用于判断『某天到底有没有日志』:日志存在但不可信 ≠ 没有日志)。
+    only_trusted=False:全部日志。**不可信的那天也要在表里**(带 `trusted=false` 标记):
+    曾经它既不在每日表里(被过滤掉),也不在缺天清单里(按『实际存在的日志』算)——用户根本看不到那天存在,
+    只能靠区块 message 才知道。缺两天 vs 那天无法判断,是不一样的。
+    only_trusted=True:只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
     """
     merged: dict[str, ls.DayStats] = {}
     files = _log_files(settings) if only_trusted else _all_log_files(settings)
@@ -414,11 +447,26 @@ def _heartbeat_day_label(settings: Settings, now: float) -> tuple[str, str] | No
     return day, (f"{age:.0f} 秒前" if age <= settings.stale_after("trading") else f"已停 {age / 3600:.1f} 小时")
 
 
+def _streak_headline(streak: int, warnings: int = 0) -> str:
+    """连续天数的标题。
+
+    连续天数可以**超过**要求(已经达标之后继续跑),写成『9/5 天』读起来像出了错,
+    所以超过要求时换个说法。
+    """
+    # 警告不打断连续段,但**必须被数出来**:否则放宽口径后,『连续 5 天』里夹着多少次连接断开就看不见了
+    tail = f",期间 {warnings} 次警告" if warnings else ""
+    if streak > REQUIRED_STREAK:
+        return f"连续无严重事件 {streak} 天(要求 {REQUIRED_STREAK} 天,已达标){tail}"
+    return f"连续无严重事件 {streak}/{REQUIRED_STREAK} 天{tail}"
+
+
 def collect_days(settings: Settings, now: float, limit: int | None = None) -> Result:
     limit = limit or settings.raw["days_default"]
     stale_after = settings.stale_after("days")
-    days = _days(settings)
-    if not days:
+    days = _days(settings, only_trusted=False)      # 表里要包含不可信的那天(带 trusted 标记)
+    if not any(d.trusted for d in days):
+        # 一个可信的日志都没有:要么全坏了(corrupt),要么根本没有(missing)。
+        # 『部分不可信』不在这里——那属于下面的正常路径:表里看得到那天,并标着 trusted=false。
         bad = _unreadable_logs(settings)
         if bad:
             tail = _tail_uncertain_logs(settings)
@@ -436,6 +484,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     streak = ls.longest_clean_streak(days)
+    # 口径(用户 2026-11-13 拍板):只有严重事件或无法判断的日子才打断连续段;警告不打断,但要数出来
+    streak_warnings = ls.streak_warning_count(days)
     # 缺天要按**实际存在的日志**判断:日志存在但不可信 ≠ 没有日志(两者都要保守,但文案不能错)
     missing_days = ls.missing_weekdays(_days(settings, only_trusted=False))
     hb = _heartbeat_day_label(settings, now)
@@ -443,6 +493,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     for stats in reversed(days[-limit:]):
         rows.append({
             "day": stats.day, "started": stats.started, "trades": stats.trades, "clean": stats.clean, "has_severe": stats.has_severe,
+            # trusted=false:那天无法判断(日志损坏,或尾部正在写)。clean 已经是 false,不会进连续无异常的统计。
+            "trusted": stats.trusted, "tail_uncertain": stats.tail_uncertain,
             "events": _events(stats),
             "first_ts": f"{stats.day} {stats.first_ts}" if stats.first_ts else None,
             "last_ts": f"{stats.day} {stats.last_ts}" if stats.last_ts else None,
@@ -451,16 +503,27 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     raw_items = ls.acceptance_checklist(days)
     checklist = [{"text": _checklist_item(t), "checked": (streak >= REQUIRED_STREAK) if i == 0 else None} for i, t in enumerate(raw_items)]
     data = {"days": rows, "checklist": checklist, "longest_clean_streak": streak, "required_streak": REQUIRED_STREAK,
-            "missing_weekdays": missing_days}
+            "streak_warning_count": streak_warnings, "missing_weekdays": missing_days}
 
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
+    # 严重事件的判据是『**最新的可信天**』,与 collect_alerts 同一口径:
+    # - 不能用『最新的天』:最新那天正在写(不可信)时,前一天已确认的硬锁定会被降级成『有日志无法识别』;
+    # - 也不能用『历史任意一天』:43 天前的一次硬锁定会把总状态条永久钉在 critical,
+    #   等到今天真的硬锁定时反而看不出来(严重级别被历史事件占住了)。
+    trusted_days = _days(settings, only_trusted=True)
+    latest_trusted = trusted_days[-1] if trusted_days else None
     bad_logs = _unreadable_logs(settings)
+    if bad_logs and state == "ok":
+        # **有数据没显示 → 状态不能是 ok**:契约规定前端『先看 state』,ok 会渲染成绿卡片。
+        # (不可信的那天在表里可见、clean=false、不进连续段;但区块整体仍要知道『有几天无法判断』。)
+        state = "unknown"
     bad_msg = f"有 {bad_logs} 个日志文件内容无法识别(格式变了、被写坏或日期与文件名不符),这些天不能算作『无异常』"
     reasons: list[dict] = []
-    if latest.has_severe:
-        level, headline = "critical", f"{latest.day} 有严重事件"
-        reasons.append(_reason("days", "critical", f"{latest.day} 日志里有严重事件:" + "、".join(n for (lv, n) in latest.events if lv == "严重")))
+    if latest_trusted is not None and latest_trusted.has_severe:
+        level, headline = "critical", f"{latest_trusted.day} 有严重事件"
+        reasons.append(_reason("days", "critical", f"{latest_trusted.day} 日志里有严重事件:"
+                                + "、".join(n for (lv, n) in latest_trusted.events if lv == "严重")))
     elif bad_logs:
         # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
         # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
@@ -481,10 +544,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         level, headline = "warn", "日志长时间未更新"
         reasons.append(_reason("days", "warn", "每日日志长时间没有更新(交易进程可能已停止)"))
     elif latest.events or missing_days:
-        level, headline = "warn", f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+        level, headline = "warn", _streak_headline(streak, streak_warnings)
         reasons.append(_reason("days", "warn", "最新一天有警告级事件" if latest.events else f"有 {len(missing_days)} 个工作日没有日志"))
     else:
-        level, headline = "ok", f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+        level, headline = "ok", _streak_headline(streak, streak_warnings)
     notes = [x for x in ({"stale": "每日日志长时间未更新", "corrupt": FUTURE_LOG_MESSAGE}.get(state), bad_msg if bad_logs else None) if x]
     return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=";".join(notes) or None), level, headline, reasons)
 
@@ -547,6 +610,8 @@ def collect_alerts(settings: Settings, now: float) -> Result:
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     # 没有任何非空日志 = 没有『进程在运行』的证据;空队列不能被解读成『一切正常』
     state = m.freshness(newest, now, stale_after) if newest is not None else "unknown"
+    if bad_logs and state == "ok":
+        state = "unknown"        # 有日志读不懂 = 有些天无法判断,区块不能显示正常
     latest = days[-1] if days else None
     reasons: list[dict] = []
     if latest and latest.has_severe:
@@ -650,6 +715,10 @@ def collect_recording(settings: Settings, now: float) -> Result:
     else:
         level, headline = "unknown", f"未知状态 {status}"                 # 不认识的取值绝不当作正常
         reasons.append(_reason("recording", "unknown", f"录制状态取值无法识别:{status}"))
+        if state == "ok":
+            # 状态取值认不出来 = 无法判断录制情况,区块状态不能是 ok(契约规定前端先看 state,ok 会渲染成绿卡片)
+            state = "unknown"
+            message = f"录制状态取值无法识别:{status}"
     return Result(m.section(state, data, as_of=hb, now=now, stale_after=stale_after, message=message), level, headline, reasons)
 
 
@@ -760,7 +829,26 @@ def _valid_run(run_id: str, body: Any) -> bool:
         return (not failures) if passed else bool(failures)             # 通过 ⇔ 没有失败项(risk/candidate_eval.py:passed = not failures)
     if "passed" in body:
         return False                        # backtest 没有『通过』这个概念,带了就矛盾
-    return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
+    if errored:
+        return True                         # 策略报错没有统计数字
+    stats = body.get("stats")
+    if not isinstance(stats, dict):
+        return False
+    return _stats_look_like_backtest(stats)
+
+
+def _stats_look_like_backtest(stats: dict) -> bool:
+    """回测统计是不是像真的:含那几个核心字段,且是有限数。
+
+    键集来自 `risk.report.backtest_stats_row`——**与沙盒落盘用的是同一个函数**。
+    (曾在这里另写一份键集,写成了 vnpy 原始字段 `total_trade_count`,而落盘的是投影后的 `round_trips`,
+    结果每一个真实回测结果都被判成损坏、从列表里消失。)
+    """
+    for key in BACKTEST_STATS_KEYS:
+        value = stats.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            return False
+    return True
 
 
 def _brief_run(run_id: str, result: dict) -> dict:
@@ -800,7 +888,10 @@ def collect_research(settings: Settings, now: float) -> Result:
 
     ledger_path = results_dir / "submissions.jsonl"
     runs = _run_files(results_dir)
-    pending_files = sorted(f for f in pending_dir.glob("*.py") if _really_inside(f, pending_dir)) if pending_dir.is_dir() else []
+    # **按 mtime 倒序**:「只显示最近 N 个」得是真的最近。按文件名排序的话,带时间戳的候选名
+    # 恰恰是最新的那批会被丢掉——审阅时最容易漏的就是新候选。
+    pending_files = sorted((f for f in pending_dir.glob("*.py") if _really_inside(f, pending_dir)),
+                           key=lambda f: (-(f.stat().st_mtime if f.exists() else 0), f.name)) if pending_dir.is_dir() else []
     if not (results_dir.is_dir() or pending_dir.is_dir() or ledger_path.exists()):
         sec = m.section("missing", None, now=now, message="未找到研究沙盒目录(沙盒未部署或尚未使用)")
         return Result(sec, "unknown", "沙盒未部署", [_reason("research", "unknown", "未找到研究沙盒目录")])
@@ -836,14 +927,15 @@ def collect_research(settings: Settings, now: float) -> Result:
         return Result(sec, "unknown", "批准记录损坏", [_reason("research", "unknown", "批准记录损坏:无法判断哪些候选已批准,请人工检查")])
     approved_hashes = set(approvals) if isinstance(approvals, dict) else set()
 
-    pending, unreadable_pending = [], 0
+    # 两个计数必须分开:**读不出来**(文件坏了/超上限,→ state=unknown)与**没列出**(超出显示上限,
+    # 文件其实完好,→ state=ok + level=warn)。混在一起时,超出上限的文件会被说成『无法读取』——假话。
+    pending, unreadable_pending, over_limit_pending = [], 0, max(len(pending_files) - MAX_PENDING_LISTED, 0)
     for p in pending_files[:MAX_PENDING_LISTED]:
         sha = _sha256(p)
         if sha is None:
-            unreadable_pending += 1                        # 读不了或超过上限:计数并暴露,不静默消失
+            unreadable_pending += 1                        # 读不了或超过大小上限:计数并暴露,不静默消失
             continue
         pending.append({"name": p.name, "sha256": sha, "approved": sha in approved_hashes})
-    unreadable_pending += max(len(pending_files) - MAX_PENDING_LISTED, 0)
 
     recent, unreadable_runs = [], 0
     shown = settings.raw["recent_runs"]
@@ -860,15 +952,24 @@ def collect_research(settings: Settings, now: float) -> Result:
             "approvals_count": len(approved_hashes), "pending": pending, "recent_runs": recent}
 
     problems, notes = [], []
+    if unscanned:
+        # 超出扫描上限的旧结果**从未被校验**:里面若有损坏文件就彻底不可见。
+        # 要明确说明(不是静默),但它与『读出来是坏的』不同:前者只是没检查,后者是坏了——
+        # 所以进 notes(notes 只影响 level=warn,state 仍是 ok),真正读坏的才进 problems(state=unknown)。
+        notes.append(f"更早的 {unscanned} 个运行结果未检查(它们的状态未知,不能当作正常)")
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
-    if unscanned:
-        notes.append(f"更早的 {unscanned} 个运行结果未检查")
     if unreadable_pending:
         problems.append(f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
+    if over_limit_pending:
+        # 只是没列出(文件是好的)→ 进 notes:level=warn,state 仍是 ok。与运行结果的处理一致。
+        notes.append(f"有 {over_limit_pending} 个待审候选未列出(只显示最近 {MAX_PENDING_LISTED} 个)")
     reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
     if problems:
         level, headline = "warn", "有数据无法显示"
+    elif notes:
+        # 只是『有些内容没列出/没检查』:内容是好的,给 warn 徽标即可(state 仍是 ok)
+        level, headline = "warn", "部分内容未列出"
     elif used >= limit:
         level, headline = "warn", f"额度已用尽 {used}/{limit}"
         reasons = [_reason("research", "warn", f"迭代额度已用尽({used}/{limit}),新候选会被网关拒绝")]
@@ -876,7 +977,10 @@ def collect_research(settings: Settings, now: float) -> Result:
         level, headline = "ok", f"额度 {used}/{limit}"
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
-    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now, message=";".join(problems + notes) or None),
+    # 有数据没显示 → 状态不是 ok(契约:前端先看 state,ok 会渲染成绿卡片)
+    section_state = "unknown" if problems else "ok"
+    return Result(m.section(section_state, data, as_of=max(activity) if activity else None, now=now,
+                            message=";".join(problems + notes) or None),
                   level, headline, reasons)
 
 
@@ -911,6 +1015,9 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
             "strategy_sha256": body.get("strategy_sha256") if isinstance(body.get("strategy_sha256"), str) else None,
             "report": body.get("report") if isinstance(body.get("report"), str) else None,
             "failures": strings("failures"), "params": obj("params"), "metrics": obj("metrics"),
+            # backtest 的数字在 stats 里(收益/夏普/往返笔数…),gate/evaluate 在 metrics 里。
+            # 少了 stats,前端就无法把回测的数字画成图表或单独高亮——只能从报告文本里读。
+            "stats": obj("stats"),
             "diagnosis": obj("diagnosis"), "selection": obj("selection"),
             "windows": body.get("windows") if isinstance(body.get("windows"), list) else None, "error": obj("error")}
 
@@ -920,45 +1027,63 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
 MAX_DOC_BYTES = 500_000
 
 
-def _read_limited(path: Path, limit: int) -> str | None:
+def _read_limited(path: Path, limit: int) -> tuple[str, bool] | None:
+    """读文件并返回 (内容, 是否被截断)。
+
+    **截断要能看出来**:运行手册被砍掉一半还显示成完整的一篇,人会照着缺步骤的操作——
+    这是"看起来正常其实不是"。超出上限就明确标记,前端据此显示"已截断"。
+    """
     try:
         with path.open("rb") as fh:
             raw = fh.read(limit + 1)
     except OSError:
         return None
-    return raw[:limit].decode("utf-8", errors="replace")
+    truncated = len(raw) > limit
+    return raw[:limit].decode("utf-8", errors="replace"), truncated
 
 
 def get_doc(settings: Settings, key: str) -> dict | None:
     """按键取文档。键必须精确等于白名单里的键,不接受任何路径。"""
     if not isinstance(key, str) or key not in settings.paths["docs"]:
         return None
-    text = _read_limited(settings.paths["docs"][key], MAX_DOC_BYTES)
-    if text is None:
+    read = _read_limited(settings.paths["docs"][key], MAX_DOC_BYTES)
+    if read is None:
         return None
-    return {"key": key, "title": settings.raw["docs_titles"][key], "markdown": text}
+    text, truncated = read
+    return {"key": key, "title": settings.raw["docs_titles"][key], "markdown": text, "truncated": truncated}
 
 
 # ---------------------------------------------------------------- 总览
 
 CORE = ("trading", "alerts", "days")
-OPTIONAL = ("recording", "research")                 # 没部署时只显示『缺失』,不拖低总体级别
 _ORDER = {"critical": 0, "unknown": 1, "warn": 2, "ok": 3}
 
 
 def _collect_safely(name: str, func, settings: Settings, now: float) -> Result:
-    """单个来源出任何异常都只影响它自己的区块,且异常细节不外泄。"""
+    """单个来源出任何异常都只影响它自己的区块,且异常细节不外泄。
+
+    **但要记日志**:提示语说的是『详见服务端日志』——不记日志的话那句话就是假的,
+    半夜出问题无从查起。堆栈只进服务端日志,不进响应。
+    """
     try:
         return func(settings, now)
     except Exception:  # noqa: BLE001
+        logging.exception("面板采集器 %s 失败(该区块按『无法判断』显示)", name)
         sec = m.section("unknown", None, now=now, message=f"{name} 采集失败(详见服务端日志)")
         return Result(sec, "unknown", "采集失败", [_reason(name, "unknown", f"{name} 采集失败,无法判断")])
 
 
 def collect_all(settings: Settings, now: float) -> dict[str, Result]:
-    # 按名字在模块里现查(而不是在定义处绑定函数对象),这样测试可以替换单个 collector 来验证隔离性
+    """采集各区块。按名字在模块里现查(而不是在定义处绑定函数对象),这样测试可以替换单个 collector 来验证隔离性。
+
+    **evolution 由配置开关决定要不要采**:阶段①默认关着,路由也没注册——一个用户根本打不开的子系统
+    不该在总览里出现,更不该因为它的台账坏了就把总状态条染成『需要关注』(那是虚假告警)。
+    """
+    names = ["trading", "alerts", "days", "recording", "research"]
+    if settings.raw.get("evolution", {}).get("enabled"):
+        names.append("evolution")
     return {name: _collect_safely(name, globals()[f"collect_{name}"], settings, now)
-            for name in ("trading", "alerts", "days", "recording", "research")}
+            for name in names}
 
 
 def collect_overview(settings: Settings, now: float) -> dict:
@@ -975,11 +1100,108 @@ def collect_overview(settings: Settings, now: float) -> dict:
 
 # ---------------------------------------------------------------- 进化引擎(只读)
 # 引擎侧(毕昇工作流与研究网关)写台账与热力图,面板只读。详见 docs/adr/20261113-evolution-dashboard.md。
-from dashboard import evolution as ev                                     # noqa: E402
-
-
 class EvolutionUnavailable(Exception):
     """台账损坏或读不了:与『战役不存在』不同,调用方要能区分(404 vs 数据不可信)。"""
+
+
+# 战役摘要的缓存:台账是**引擎侧追加写**的,列表接口每次都要读完所有台账(实测 8 个战役 × 2 万条 = 2.9 秒),
+# 而前端每 30 秒轮询一次。缓存键是 (路径, **内容哈希**):用元数据(大小/mtime)会被『同长度改写并恢复 mtime』骗过,
+# 返回旧摘要——那会让面板显示一个已经不存在的最好夏普。
+# 曲线与日志接口**不读缓存**,每次现读。
+# **两类键必须分开计数**:混在一个 dict 里时,每个战役占两个条目,有效容量只剩一半
+# (上限 64 → 只能缓存 32 个战役),而淘汰方式是 clear() —— 越过 32 个战役后每次写入都清空缓存,
+# TTL 永远不命中,总览每 8 秒轮询就重读一次全部台账(实测 50 个战役 = 300 MB ≈ 9 秒/请求)。
+_EVOLUTION_SUMMARY_CACHE: dict = {}      # (路径, 内容哈希) → 摘要      上限 _EVOLUTION_CACHE_MAX
+_EVOLUTION_TTL_CACHE: dict = {}          # 路径 → {at, summary}         上限 _EVOLUTION_TTL_CACHE_MAX
+_EVOLUTION_SUMMARY_USED: dict = {}       # (路径, 内容哈希) → 最近命中时间(逐出用)
+EVOLUTION_SUMMARY_TTL = 30.0              # 摘要缓存的存活秒数:总览每 8 秒轮询一次,不能每次都重读全部台账
+_EVOLUTION_CACHE_MAX = 128
+_EVOLUTION_TTL_CACHE_MAX = 128
+MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
+
+
+def _campaign_summary(settings: Settings, name: str) -> dict:
+    """一个战役的摘要(代数、最新代、最好夏普、最后时间)。"""
+    directory = settings.paths["evolution_dir"]
+    path = directory / f"{name}.jsonl"
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ev.EvolutionError("台账无法读取") from exc
+    # 缓存键是**内容哈希**,不是元数据:同长度改写并恢复 mtime 后,元数据看不出来,哈希能。
+    # 但算哈希也要读完整个文件,而总览每 8 秒轮询一次 → 加一个短 TTL:TTL 内直接用缓存(不再读盘),
+    # 过期后强制重算(这样『同长度改写』最多藏一个 TTL 的时间)。
+    now = time.time()
+    ttl = float(settings.raw.get("evolution", {}).get("summary_ttl", EVOLUTION_SUMMARY_TTL))
+    cached = _EVOLUTION_TTL_CACHE.get(str(path))
+    if cached is not None and now - cached["at"] < ttl:
+        return cached["summary"]
+    try:
+        # 超限的台账不必整份哈希:read_campaign 自己会按体积上限拒掉。
+        # (否则一个 929 MB 的超限台账,每个 TTL 窗口都要被完整读一遍 + 哈希一遍。)
+        if stat.st_size > ev.MAX_LEDGER_BYTES:
+            raise ev.EvolutionError("台账超过大小上限")
+        key = (str(path), _file_digest(path))
+        summary = _EVOLUTION_SUMMARY_CACHE.get(key)
+        if summary is not None:
+            _remember_summary(str(path), key, summary, now)
+            return summary
+        records = ev.read_campaign(directory, name)
+    except ev.EvolutionError as exc:
+        # **失败路径也要缓存**:损坏/超限的台账不进缓存的话,每个请求都会重读并重新哈希整个文件
+        # (一个 929 MB 的超限台账 = 每请求约 1 秒)。这里缓存一条『损坏』摘要,
+        # **连同原始错误消息**——否则第一次显示『台账超过大小上限』、第二次变成笼统的『台账损坏或读不了』,文案会跳。
+        summary = {"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
+                   "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)}
+        _remember_summary(str(path), None, summary, now)
+        raise
+    sharpes = [r.sharpe for r in records if r.sharpe is not None]
+    summary = {
+        "campaign_id": name,
+        "generations": len({r.generation for r in records}),
+        "latest_generation": max((r.generation for r in records), default=None),
+        "records": len(records),
+        "updated_at": records[-1].created_at if records else None,
+        "best_sharpe": round(max(sharpes), 4) if sharpes else None,
+        "state": "ok" if records else "missing",
+        "message": None,
+    }
+    _remember_summary(str(path), key, summary, now)
+    return summary
+
+
+def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> None:
+    """把摘要写进两个缓存。**淘汰按上限逐出最旧的**,不是 clear() 全部清空。"""
+    if hash_key is not None:
+        # 逐出**最久没用**的。之前按插入顺序逐出,而 dict 对已存在的键重新赋值并不改变插入顺序——
+        # 于是**每次刷新一个已存在的键都会逐出一个无关条目**(缓存被摊薄),而不是热条目被挤掉。
+        # 先刷新本键的时间戳:否则它带着旧时间戳参与逐出,可能被立刻淘汰掉。
+        _EVOLUTION_SUMMARY_USED[hash_key] = now
+        if hash_key in _EVOLUTION_SUMMARY_CACHE:
+            del _EVOLUTION_SUMMARY_CACHE[hash_key]
+        while len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
+            oldest = min(_EVOLUTION_SUMMARY_CACHE, key=lambda k: _EVOLUTION_SUMMARY_USED.get(k, 0.0))
+            del _EVOLUTION_SUMMARY_CACHE[oldest]
+            _EVOLUTION_SUMMARY_USED.pop(oldest, None)
+        _EVOLUTION_SUMMARY_CACHE[hash_key] = summary
+    if len(_EVOLUTION_TTL_CACHE) >= _EVOLUTION_TTL_CACHE_MAX:
+        for k in sorted(_EVOLUTION_TTL_CACHE, key=lambda x: _EVOLUTION_TTL_CACHE[x]["at"])[: len(_EVOLUTION_TTL_CACHE) - _EVOLUTION_TTL_CACHE_MAX + 1]:
+            del _EVOLUTION_TTL_CACHE[k]
+    _EVOLUTION_TTL_CACHE[path_key] = {"at": now, "summary": summary}
+
+
+def _file_digest(path: Path) -> str:
+    """文件内容的 SHA-256。读不了就返回空串(下面的读取会再报一次错)。"""
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
 
 
 def collect_evolution(settings: Settings, now: float) -> Result:
@@ -987,37 +1209,59 @@ def collect_evolution(settings: Settings, now: float) -> Result:
     directory = settings.paths["evolution_dir"]
     names = ev.campaigns(directory)
     campaigns = []
-    for name in names:
+    unscanned = max(len(names) - MAX_CAMPAIGNS_SUMMARIZED, 0)
+    for name in names[:MAX_CAMPAIGNS_SUMMARIZED]:
         try:
-            records = ev.read_campaign(directory, name)
+            campaigns.append(_campaign_summary(settings, name))
         except ev.EvolutionError as exc:
             campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
                               "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
-            continue
-        sharpes = [r.sharpe for r in records if r.sharpe is not None]
-        campaigns.append({
-            "campaign_id": name,
-            "generations": len({r.generation for r in records}),
-            "latest_generation": max((r.generation for r in records), default=None),
-            "records": len(records),
-            "updated_at": records[-1].created_at if records else None,
-            "best_sharpe": round(max(sharpes), 4) if sharpes else None,
-            "state": "ok" if records else "missing",
-            "message": None,
-        })
-    data = {"campaigns": campaigns}
+    # 裸数据(与 curve/log/heatmap 一致):state/level/message 放在**数据里**,不是 Section 外壳。
+    # 之前这个端点返回 Section 外壳、契约与样例却是裸数据 → 真实响应通不过自己的契约,
+    # 前端照 api-types.ts 写 resp.campaigns,mock 有值而生产是 undefined。
+    data = {"campaigns": campaigns, "total": len(names), "checked": len(names) - unscanned, "unscanned": unscanned}
+    # **状态用 state 表达**:端点只返回 Section(没有 level 字段),而契约规定前端『先看 state』。
+    # 『部分未检查』或『有损坏台账』= 无法判断全部 → state=unknown(不是 ok,卡片不能是绿的)。
     state = "ok" if campaigns else "missing"
     message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
+    reasons: list[dict] = []
+    if unscanned:
+        # **没检查 ≠ 没问题**:剩下的战役可能有坏台账,区块不能显示正常。
+        # (与 research 的区别是实质的:research 的 recent_runs 本来就只显示最近 N 个,
+        #  超上限的是**更旧的**结果,没列出来不算少显示了内容 → state=ok + level=warn;
+        #  evolution 的 campaigns 是**全部**战役,少列了就是少了内容 → state=unknown。)
+        message = ";".join(filter(None, [message, f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,"
+                                                 f"还有 {unscanned} 个未检查(它们的状态未知)"]))   # 未检查的是字典序靠后的那些
+        state = "unknown"
+        reasons.append(_reason("evolution", "warn",
+                                f"还有 {unscanned} 个战役未检查:它们的状态未知,不能当作正常"))
     # 台账损坏 = 无法判断这个战役的状态,整体不能显示正常(『不制造虚假安心』)
     broken = [c["campaign_id"] for c in campaigns if c["state"] == "corrupt"]
-    reasons = [_reason("evolution", "warn", f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断")] if broken else []
     if broken:
         message = ";".join(filter(None, [message, f"{len(broken)} 个战役的台账损坏或读不了"]))
-        state = "ok"                       # 区块数据仍然可用(其它战役正常),但级别与横幅要说清楚
-        level, headline = "warn", f"{len(campaigns)} 个战役({len(broken)} 个台账损坏)"
+        state = "unknown"
+        reasons.append(_reason("evolution", "warn",
+                                f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断"))
+        level, headline = "warn", f"已检查 {data['checked']}/{data['total']} 个战役({len(broken)} 个台账损坏)"
+    elif unscanned:
+        level, headline = "warn", f"已检查 {data['checked']}/{data['total']} 个战役"
     else:
         level, headline = ("ok", f"{len(campaigns)} 个战役") if campaigns else ("unknown", "暂无战役")
     return Result(m.section(state, data, now=now, message=message), level, headline, reasons)
+
+
+def evolution_list_payload(settings: Settings, now: float) -> dict:
+    """进化战役列表的**裸数据**响应(与 curve/log/heatmap 同族端点一致)。
+
+    state/level/message 放在数据里。四个计数字段**始终在**(没有战役时是 0),
+    否则前端按契约读 `campaigns`/`total` 会拿到 undefined。
+    """
+    result = _collect_safely("evolution", collect_evolution, settings, now)
+    section = result.section
+    data = section.get("data") or {}
+    return {"campaigns": data.get("campaigns", []), "total": data.get("total", 0),
+            "checked": data.get("checked", 0), "unscanned": data.get("unscanned", 0),
+            "state": section["state"], "level": section["level"], "message": section["message"]}
 
 
 def get_evolution_curve(settings: Settings, campaign_id: str) -> dict | None:
@@ -1050,7 +1294,10 @@ def get_evolution_log(settings: Settings, campaign_id: str, cursor: str = "", li
         offset = max(int(cursor), 0) if cursor else 0
     except ValueError:
         return None
-    limit = max(1, min(int(limit), 200))
+    # 默认页大小与上限都取配置(evolution.log_limit):调用方可以给更小的,不能超过配置的上限。
+    # (曾在这里还写死一个 200,配置成 500 会被静默截到 200——配置项有一半是摆设。)
+    default = max(1, int(settings.raw["evolution"].get("log_limit", 50)))
+    limit = max(1, min(int(limit), default))
     page = records[offset: offset + limit]
     rows = [{**r.brief(), "reflection": r.reflection, "created_at": r.created_at} for r in page]
     next_cursor = str(offset + len(page)) if offset + len(page) < len(records) else None
@@ -1066,11 +1313,20 @@ def get_heatmap(settings: Settings, run_id: str) -> dict | None:
         raise EvolutionUnavailable("热力图文件损坏或读不了") from exc
 
 
+def _pending_dir(settings: Settings) -> Path:
+    """待审候选目录。**用沙盒配置里的路径**,不要写死:写死会出现两份真相
+    (沙盒把目录改到别处时,面板会去找错地方,于是显示『源码已不在』)。"""
+    cfg, err = _research_cfg(settings)
+    rel = cfg["paths"]["pending_dir"] if err is None else "pending_strategies"
+    inside = _inside(settings.root, rel)
+    return inside if inside is not None else settings.root / "pending_strategies"
+
+
 def get_candidate_code(settings: Settings, sha256: str) -> dict | None:
     """候选源码(按哈希找)。找不到不是错误:found=False,前端显示『源码已不在』而不是报错。"""
     if not _matches(sha256, ev.SHA256):
         return None
-    source = ev.candidate_source(settings.root / "pending_strategies", sha256)
+    source = ev.candidate_source(_pending_dir(settings), sha256)
     lines = [] if source is None else [{"n": i, "text": line} for i, line in enumerate(source.splitlines(), start=1)]
     return {"sha256": sha256, "found": source is not None, "language": "python", "lines": lines}
 
@@ -1079,7 +1335,7 @@ def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> d
     """两个候选的差异。父代源码不在(被清理了)时 available=False,不是错误。"""
     if not _matches(sha256, ev.SHA256) or not _matches(parent_sha256, ev.SHA256):
         return None
-    directory = settings.root / "pending_strategies"
+    directory = _pending_dir(settings)
     before = ev.candidate_source(directory, parent_sha256)
     after = ev.candidate_source(directory, sha256)
     if before is None or after is None:
@@ -1089,5 +1345,7 @@ def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> d
 
 
 def _matches(value: str, pattern: str) -> bool:
-    import re as _re
-    return isinstance(value, str) and _re.fullmatch(pattern, value) is not None
+    """完整匹配一个格式(战役号、哈希、run_id)。不匹配就返回 False——不猜、不裁剪。"""
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+# MARKER_TEST

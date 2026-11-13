@@ -400,7 +400,10 @@ def test_the_campaign_list_matches_the_contract_field_by_field(tmp_path):
     ledger(tmp_path, [row(gen=1, sha="a" * 64)])
     from dashboard import collectors as col
     r = col.collect_evolution(settings(tmp_path), NOW)
-    check("#/components/schemas/EvolutionList", r.section["data"])
+    # 端点返回的是**裸数据**(state/level/message 在数据里),契约也这么写
+    check("#/components/schemas/EvolutionList",
+          {**(r.section["data"] or {}), "state": r.section["state"],
+           "level": r.section["level"], "message": r.section["message"]})
     check("#/components/schemas/EvolutionCampaign", r.section["data"]["campaigns"][0])
 
 
@@ -443,3 +446,139 @@ def test_the_reflection_text_is_sanitized_before_it_leaves_the_process(tmp_path)
     body = r.text
     assert "Alice" not in body and "secret.env" not in body
     assert "<path>" in body
+
+
+def test_the_candidate_directory_comes_from_the_sandbox_config_not_a_hardcoded_path(tmp_path):
+    """沙盒把待审目录改到别处时,面板必须跟着改:写死路径会显示『源码已不在』。"""
+    import hashlib
+    from dashboard import collectors as col
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "research_sandbox.json").write_text(json.dumps({
+        "iteration": {"max_iterations": 5, "window_hours": 24},
+        "paths": {"pending_dir": "other_pending", "results_dir": "data/research",
+                  "approvals_file": "data/research-control/approvals.json"}}), encoding="utf-8")
+    other = tmp_path / "other_pending"
+    other.mkdir()
+    src = "class C: pass\n"
+    sha = hashlib.sha256(src.encode()).hexdigest()
+    (other / "x.py").write_bytes(src.encode())
+    s = settings(tmp_path)
+    out = col.get_candidate_code(s, sha)
+    assert out is not None and out["found"] is True
+
+
+def test_a_heatmap_file_that_is_a_symlink_out_of_the_directory_is_refused(tmp_path):
+    """与研究结果文件同一口径:符号链接/junction 指向目录外的一律不读。"""
+    import os
+
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"axes": {"a": [1.0], "b": [2.0], "c": [3.0]}, "scores": [[0, 0, 0, 1.0]]}),
+                        encoding="utf-8")
+    d = tmp_path / "heatmaps"
+    d.mkdir()
+    link = d / "20261112-210000-000000.json"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        pytest.skip("无法创建符号链接")
+    with pytest.raises(ev.EvolutionError):
+        ev.read_heatmap(d, "20261112-210000-000000")
+
+
+def test_the_stagnation_flag_requires_consecutive_generation_numbers(tmp_path):
+    """代号跳号(1、7、30)说明中间有代没跑,那不是『连续 5 代停滞』。"""
+    from dashboard import evolution as ev
+    records = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                                "sharpe": 1.0}) for g in (1, 7, 30, 44, 60)]
+    sparse = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)
+    assert not [f for f in sparse["flags"] if f["kind"] == "stagnant"], "代号稀疏时不该说『连续停滞』"
+    dense = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                               "sharpe": 1.0}) for g in range(1, 6)]
+    flags = ev.curve(dense, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["flags"]
+    assert [f for f in flags if f["kind"] == "stagnant"]
+
+
+def test_the_percentiles_match_the_standard_interpolation():
+    """曲线上的 P25/P75 是服务端算的,前端不重算——算错了整张图就是错的。"""
+    from dashboard import evolution as ev
+    assert ev._percentile([1, 2, 3, 4], 0.25) == 1.75
+    assert ev._percentile([1, 2, 3, 4], 0.75) == 3.25
+    assert ev._percentile([1, 2, 3], 0.5) == 2.0
+    assert ev._percentile([], 0.25) is None
+    assert ev._percentile([7.0], 0.75) == 7.0
+
+
+def test_the_curve_counts_candidates_without_a_sharpe_in_the_generation_count():
+    """一代里有的候选还没跑出夏普:代数要算上它们,但均值与分位数只算有值的。"""
+    from dashboard import evolution as ev
+    records = [
+        ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                         "sharpe": 2.0, "total_return": 0.1, "max_drawdown": 0.1}),
+        ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "b" * 64,
+                         "sharpe": None, "total_return": None, "max_drawdown": None}),
+    ]
+    point = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["points"][0]
+    assert point["count"] == 2 and point["elite_sharpe"] == 2.0 and point["mean_sharpe"] == 2.0
+
+
+def test_the_log_page_size_comes_from_the_configuration(tmp_path):
+    """evolution.log_limit 是默认页大小,也是上限:调用方不能要更大的页。"""
+    from dashboard import collectors as col
+
+    ledger(tmp_path, [row(gen=1, sha=f"{i:064x}") for i in range(10)])
+    s = settings(tmp_path)
+    s.raw["evolution"]["log_limit"] = 3
+    page = col.get_evolution_log(s, "camp-2026-11")
+    assert page is not None and len(page["records"]) == 3 and page["next_cursor"] == "3"
+    bigger = col.get_evolution_log(s, "camp-2026-11", "", 100)
+    assert bigger is not None and len(bigger["records"]) == 3
+
+
+def test_a_malformed_parent_hash_is_rejected_not_truncated(tmp_path):
+    """截断出来的哈希是废的:前端拿它请求差异会 404,看起来像『父代源码不在』。"""
+    from dashboard import evolution as ev
+    for bad in ("b" * 63, "b" * 65, "Z" * 64, 123):
+        with pytest.raises(ev.EvolutionError):
+            ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                             "parent_sha256": bad})
+    ok = ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                          "parent_sha256": "b" * 64})
+    assert ok.parent_sha256 == "b" * 64
+
+
+def test_the_campaign_list_is_ordered_by_modification_time_newest_first(tmp_path):
+    """超出统计上限时被略过的应该是**最旧**的战役,不是按名字排在后面的。"""
+    import os
+
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    for i, age in enumerate((0, 100, 200)):                 # 三个战役,mtime 依次更旧
+        p = d / f"camp{i}.jsonl"
+        p.write_text("{}\n", encoding="utf-8")
+        os.utime(p, (NOW - age, NOW - age))
+    assert ev.campaigns(d) == ["camp0", "camp1", "camp2"]
+
+
+def test_the_diff_compares_the_parent_source_with_the_candidate_source(tmp_path):
+    """差异是『父代源码 → 本代源码』;父代不在了要说 available=False,不能给出空 diff 让人以为没有差异。"""
+    import hashlib
+
+    from dashboard import collectors as col
+
+    d = tmp_path / "pending_strategies"
+    d.mkdir(parents=True)
+    src1 = "class C:\n    x = 1\n"
+    src2 = "class C:\n    x = 2\n"
+    (d / "gen1.py").write_bytes(src1.encode())
+    (d / "gen2.py").write_bytes(src2.encode())
+    sha1 = hashlib.sha256(src1.encode()).hexdigest()
+    sha2 = hashlib.sha256(src2.encode()).hexdigest()
+    s = settings(tmp_path)
+    out = col.get_candidate_diff(s, sha2, sha1)
+    assert out is not None and out["available"] is True
+    assert "-    x = 1" in out["diff"] and "+    x = 2" in out["diff"]
+    # 父代源码不在
+    missing = col.get_candidate_diff(s, sha2, "f" * 64)
+    assert missing is not None and missing["available"] is False and missing["diff"] == ""

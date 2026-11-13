@@ -1,22 +1,23 @@
 {
   "state": "ok",
-  "as_of": "2026-11-13T08:30:00+08:00",
-  "age_seconds": 4.0,
+  "as_of": "2026-11-13T08:29:58+08:00",
+  "age_seconds": 2.0,
   "stale_after_seconds": 120.0,
   "message": null,
   "data": {
     "wrapper_running": true,
-    "status": "running",
+    "status": "recording",
     "profile": "simnow",
     "symbols": [
       "C2701.DCE",
       "MA701.CZCE"
     ],
-    "started_at": "2026-11-13T00:00:10+00:00",
-    "heartbeat_at": "2026-11-13T00:29:58+00:00",
+    "started_at": "2026-11-13T08:00:10+08:00",
+    "heartbeat_at": "2026-11-13T08:29:58+08:00",
     "last_tick": "2026-11-13T08:29:57",
     "last_bar": "2026-11-13T08:29:00",
     "last_error": null,
     "data_warning": null
-  }
+  },
+  "level": "ok"
 }

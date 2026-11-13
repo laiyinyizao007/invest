@@ -8,8 +8,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("jsonschema", reason="契约测试需要 jsonschema(见 requirements.txt)")
-from jsonschema import Draft202012Validator  # noqa: E402
+# jsonschema 只在 requirements.txt 里,不在 requirements-dashboard.txt(状态页后端的依赖)里。
+# 所以**不要在模块级 importorskip** —— 那会让整个模块(包括与 jsonschema 无关的
+# 『种子与生成器逐字节一致』断言)在只装了面板依赖的环境里静默消失。
+# 需要 jsonschema 的用例各自跳过;其余用例照常跑。
+def _validator_class():
+    return pytest.importorskip("jsonschema", reason="这个用例需要 jsonschema(见 requirements.txt)").Draft202012Validator
 
 WEB = Path(__file__).resolve().parents[1] / "docs" / "web"
 SPEC = json.loads((WEB / "status-api.openapi.json").read_text(encoding="utf-8"))
@@ -30,9 +34,9 @@ def _schema_for(method: str, path: str, status: int) -> dict:
     return resp["content"]["application/json"]["schema"]
 
 
-def _validator(schema: dict) -> Draft202012Validator:
+def _validator(schema: dict):
     # $ref 形如 #/components/schemas/X,根文档需要有 components 键
-    return Draft202012Validator({**schema, "components": COMPONENTS})
+    return _validator_class()({**schema, "components": COMPONENTS})
 
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=[m["fixture"] for m in MANIFEST])
@@ -81,7 +85,9 @@ def test_sections_never_hide_a_missing_state_behind_ok():
     for entry in MANIFEST:
         payload = json.loads((WEB / "fixtures" / f"{entry['fixture']}.json").read_text(encoding="utf-8"))
         if isinstance(payload, dict) and payload.get("state") in {"missing", "corrupt"}:
-            assert payload["data"] is None, entry["fixture"]
+            # 裸数据形态的样例(如进化战役列表)没有 data 字段,只有 Section 外壳的才有
+            if "data" in payload:
+                assert payload["data"] is None, entry["fixture"]
 
 
 def test_fixtures_contain_no_real_looking_secrets_or_absolute_paths():

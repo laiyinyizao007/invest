@@ -4,6 +4,7 @@ import json
 import pytest
 
 from dashboard import collectors as col
+from risk.report import backtest_stats_row
 from dashboard import safe
 from evidence import logstats as ls
 
@@ -79,7 +80,7 @@ def test_contradictory_result_shapes_are_rejected(body):
     {"kind": "gate", "passed": False, "failures": ["f"]},
     {"kind": "evaluate", "passed": False, "failures": ["无法选参: x"], "kind_detail": "selection-only"},
     {"kind": "gate", "status": "strategy_error", "passed": False, "error": {"type": "ValueError", "message": "m"}},
-    {"kind": "backtest", "stats": {"sharpe_ratio": 1.2}},
+    {"kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})},
     {"kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}},
 ])
 def test_real_result_shapes_are_still_accepted(body):
@@ -88,7 +89,8 @@ def test_real_result_shapes_are_still_accepted(body):
 
 def test_passed_is_not_exposed_for_a_backtest():
     """backtest 没有『通过』这个概念,展示层也不该给出这个字段。"""
-    brief = col._brief_run("20261112-210000-000000", {**BASE, "kind": "backtest", "stats": {"sharpe": 1.0}})
+    brief = col._brief_run("20261112-210000-000000",
+                           {**BASE, "kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})})
     assert brief["passed"] is None
 
 
@@ -154,3 +156,59 @@ def test_no_marker_prefix_is_missed_when_the_tail_is_truncated():
             for prefix in ("", "前文 ", "a | b "):
                 line = f"2026-11-13 09:00:00 | ERROR | Runtime | {prefix}{marker[:cut]}".encode("utf-8")
                 assert _parse(PREFIX + line).trusted is False, (marker, cut, prefix)
+
+
+# ---------------------------------------------------------------- 对抗性审查发现
+@pytest.mark.parametrize("text,leak", [
+    ('payload={"password": "hunter2"}', "hunter2"),          # 带引号的 JSON 键曾被漏掉
+    ('{"api_key": "AKIA1234567890"}', "AKIA1234567890"),
+    ("'token': 'abcdef123456'", "abcdef123456"),
+    ('cfg = {"secret": "s3cr3tvalue"}', "s3cr3tvalue"),
+])
+def test_a_quoted_json_key_does_not_leak_its_value(text, leak):
+    """日志与候选代码里的 JSON 字面量:键带引号时,赋值规则曾匹配不到。"""
+    assert leak not in safe.scrub_text(text), safe.scrub_text(text)
+
+
+def test_the_campaign_list_does_not_reread_every_ledger_on_every_request(tmp_path):
+    """列表接口每次轮询都要读完所有台账(实测 8 个战役 × 2 万条 = 2.9 秒)。摘要要缓存。"""
+    import time
+
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    row = {"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64, "parent_sha256": None,
+           "run_id": "20261112-210000-000001", "status": "evaluated", "sharpe": 0.4, "total_return": 0.03,
+           "max_drawdown": 0.19, "dsr": 0.3, "n_trials": 4, "fail_reason": None, "reflection": "x",
+           "created_at": "2026-11-12T21:00:00", "cell": "c", "diagnosis": None}
+    for i in range(4):
+        (d / f"camp{i}.jsonl").write_text("".join(json.dumps({**row, "generation": g}) + "\n"
+                                                 for g in range(1, 5001)), encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    col.collect_evolution(settings, 1_800_000_000.0)            # 第一次:读盘
+    t0 = time.perf_counter()
+    col.collect_evolution(settings, 1_800_000_000.0)            # 第二次:应命中缓存
+    assert time.perf_counter() - t0 < 0.3
+
+
+def test_the_campaign_list_says_honestly_when_it_did_not_scan_every_campaign(tmp_path, monkeypatch):
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    for i in range(5):
+        (d / f"camp{i}.jsonl").write_text(json.dumps({
+            "campaign_id": f"camp{i}", "generation": 1, "candidate_sha256": "a" * 64, "parent_sha256": None,
+            "run_id": "20261112-210000-000001", "status": "evaluated", "sharpe": 0.4, "total_return": 0.03,
+            "max_drawdown": 0.19, "dsr": 0.3, "n_trials": 4, "fail_reason": None, "reflection": "x",
+            "created_at": "2026-11-12T21:00:00", "cell": "c", "diagnosis": None}) + "\n", encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    monkeypatch.setattr(col, "MAX_CAMPAIGNS_SUMMARIZED", 2)
+    r = col.collect_evolution(settings, 1_800_000_000.0)
+    assert r.section["data"]["unscanned"] == 3
+    assert "未检查" in (r.section["message"] or "")

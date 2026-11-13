@@ -27,7 +27,7 @@
     "days": {
       "state": "ok",
       "level": "warn",
-      "headline": "连续无异常 0/5 天"
+      "headline": "连续无严重事件 0/5 天"
     },
     "recording": {
       "state": "ok",

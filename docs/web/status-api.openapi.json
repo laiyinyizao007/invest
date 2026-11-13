@@ -1476,9 +1476,20 @@
               "null"
             ],
             "description": "给人看的说明,例如『文件不存在』『JSON 损坏』"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warn",
+              "critical",
+              "unknown"
+            ],
+            "description": "严重程度,决定徽标。**与 state 分开**:state 决定内容能不能看(missing/corrupt 时 data 为 null),level 决定徽标——这样前端能区分『数据是坏的』(state=unknown)与『有些内容没列出来/没检查』(state=ok + level=warn)。"
           }
         },
         "required": [
+          "level",
           "state"
         ],
         "additionalProperties": true
@@ -1688,14 +1699,18 @@
               },
               "research": {
                 "$ref": "#/components/schemas/Brief"
+              },
+              "evolution": {
+                "$ref": "#/components/schemas/EvolutionSection",
+                "description": "进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着,路由也没注册)——前端要容���这个键不存在。"
               }
             },
             "required": [
-              "trading",
               "alerts",
               "days",
               "recording",
-              "research"
+              "research",
+              "trading"
             ],
             "additionalProperties": true
           }
@@ -2012,18 +2027,28 @@
               "string",
               "null"
             ]
+          },
+          "trusted": {
+            "type": "boolean",
+            "description": "该天的日志是否可信;false 时这一行不能显示成『无异常』"
+          },
+          "tail_uncertain": {
+            "type": "boolean",
+            "description": "只是最后一行还没写完(文件可能正在写);true 时该天暂时无法判断"
           }
         },
         "required": [
-          "day",
-          "started",
-          "trades",
           "clean",
-          "has_severe",
+          "day",
           "events",
           "first_ts",
+          "has_severe",
+          "heartbeat",
           "last_ts",
-          "heartbeat"
+          "started",
+          "tail_uncertain",
+          "trades",
+          "trusted"
         ],
         "additionalProperties": true
       },
@@ -2059,7 +2084,8 @@
             }
           },
           "longest_clean_streak": {
-            "type": "integer"
+            "type": "integer",
+            "description": "最长连续『无严重事件』的交易日数。**警告不打断**,只有严重事件、无法判断的日子、缺日志的工作日才打断(用户 2026-11-13 拍板)"
           },
           "required_streak": {
             "type": "integer"
@@ -2069,14 +2095,20 @@
             "items": {
               "type": "string"
             }
+          },
+          "streak_warning_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "上面那段连续段里的警告次数。警告不打断连续段,但必须显示出来,不能让放宽的口径把它们藏起来"
           }
         },
         "required": [
-          "days",
           "checklist",
+          "days",
           "longest_clean_streak",
+          "missing_weekdays",
           "required_streak",
-          "missing_weekdays"
+          "streak_warning_count"
         ],
         "additionalProperties": true
       },
@@ -2087,7 +2119,8 @@
             "type": "boolean"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "description": "录制进程写的状态。实际取值:starting / connecting / recording / connected / degraded / stalled / stopping / stopped。**认不出的取值一律按 unknown 处理**(区块降级),前端不要为没出现过的取值写分支。"
           },
           "profile": {
             "type": [
@@ -2358,6 +2391,13 @@
               "object",
               "null"
             ]
+          },
+          "stats": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "backtest 的回测统计(收益/夏普/最大回撤/往返笔数…);gate/evaluate 用 metrics"
           }
         },
         "required": [
@@ -2382,12 +2422,17 @@
           "markdown": {
             "type": "string",
             "description": "Markdown 原文。前端须用禁用 HTML 的渲染器或纯文本显示,不得直接插入 DOM"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "文档超过大小上限被截断。前端必须显示『已截断』提示——半篇运行手册看起来是完整的一篇"
           }
         },
         "required": [
           "key",
           "title",
-          "markdown"
+          "markdown",
+          "truncated"
         ],
         "additionalProperties": true
       },
@@ -3205,17 +3250,61 @@
       },
       "EvolutionList": {
         "type": "object",
-        "description": "战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。",
+        "description": "进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。",
         "properties": {
           "campaigns": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EvolutionCampaign"
             }
+          },
+          "total": {
+            "type": "integer",
+            "description": "战役总数"
+          },
+          "checked": {
+            "type": "integer",
+            "description": "本次实际统计的战役数"
+          },
+          "unscanned": {
+            "type": "integer",
+            "description": "未检查的战役数(>0 时区块级别为 warn)"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "missing",
+              "unknown"
+            ],
+            "description": "区块状态:没有战役是 missing;有战役没被统计或台账损坏是 unknown"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warn",
+              "critical",
+              "unknown"
+            ],
+            "description": "严重程度(徽标用)"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "说明,例如『还有 N 个战役未检查』"
           }
         },
         "required": [
-          "campaigns"
+          "campaigns",
+          "checked",
+          "level",
+          "message",
+          "state",
+          "total",
+          "unscanned"
         ],
         "additionalProperties": true
       },
@@ -3357,7 +3446,8 @@
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "description": "该代最好的一条的收益"
           },
           "worst_max_drawdown": {
             "type": [
@@ -3371,6 +3461,20 @@
               "type": "string"
             },
             "description": "该代出现的质量多样性格子"
+          },
+          "mean_total_return": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "该代所有候选的平均收益(画收益曲线用这个;只用最好的一条会高估种群)"
+          },
+          "mean_max_drawdown": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "该代所有候选的平均最大回撤"
           }
         },
         "required": [
@@ -3763,6 +3867,27 @@
           "to_sha256",
           "diff",
           "available"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionSection": {
+        "type": "object",
+        "description": "总览里的进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着)。",
+        "properties": {
+          "state": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string"
+          },
+          "headline": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "level",
+          "headline"
         ],
         "additionalProperties": true
       }

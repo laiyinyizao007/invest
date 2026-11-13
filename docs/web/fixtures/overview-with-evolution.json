@@ -1,0 +1,38 @@
+{
+  "server_time": "2026-11-13T08:30:00+08:00",
+  "level": "ok",
+  "reasons": [],
+  "sections": {
+    "trading": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "运行中 · 当日 -129.5 元"
+    },
+    "alerts": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "无待补发"
+    },
+    "days": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "连续无严重事件 1/5 天"
+    },
+    "recording": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "录制中"
+    },
+    "research": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "额度 2/5"
+    },
+    "evolution": {
+      "state": "ok",
+      "level": "ok",
+      "headline": "3 个战役"
+    }
+  },
+  "data": null
+}

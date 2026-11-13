@@ -62,6 +62,7 @@
 2. **未知取值按 unknown。** `state`/`level` 出现不认识的值 → 灰色『无法判断』。禁止 `default` 分支落到 ok。
 3. **年龄用 `age_seconds`。** 不用浏览器时钟减时间戳。两个例外:『距上次刷新』这种前端自己的计时。
 4. **`unknown` ≠ `ok`。** 总状态条、徽标都要有独立外观。
+   **`state` 与 `level` 各管一件事**:`state` 决定**内容能不能渲染**(missing/corrupt 时 data 为 null),`level` 决定**徽标长什么样**。所以 `state=ok` + `level=warn` 是常态(内容是好的,只是有些内容没列出/没检查),这时要正常渲染内容并加一个警示徽标,而不是当成异常。
 5. **空态 ≠ 缺失。** `state=ok` 且列表为空 → 『无』;`state=missing` → 『未找到数据来源』。
 6. **`null` 显示 `—`,不是 0。** 尤其是 `daily_pnl`、`peak_equity` 这类金额。
 7. **不重算服务器算好的值**:`level`、`reasons`、`daily_pnl`、`drawdown_from_peak`。
@@ -157,6 +158,23 @@ flowchart LR
 | 修改/批准/下单类接口 | **不会提供**,见 ADR 的『明确不做』 |
 | 跨域(CORS) | 不提供;页面与 API 同源 |
 | 在页面里展示完整账号/路径 | 不会提供;服务器脱敏,前端不得尝试还原 |
+
+## 8b. 能力开关(`GET /api/meta` 的 `capabilities`)
+
+**哪些页面显示,由 `capabilities` 决定,不是由你猜**。启动时取一次 `/api/meta`,按下面的开关决定导航与入口:
+
+| 开关 | 为真时 | 现在 |
+|---|---|---|
+| `live` | 显示「实时」页(`/api/live`) | 假(阶段②未上线) |
+| `equity` | 显示「权益曲线」页(`/api/equity`) | 假 |
+| `control` | 显示「控制」页(`/api/control/*`);还需 `whoami.role` 为 `operator` 以上 | 假 |
+| `stream` | 允许用 WebSocket/SSE | **恒为假**:阶段①②只用轮询 |
+| `research_detail` | 可点进单次运行的详情(`/api/research/runs/{run_id}`) | 真 |
+| `data_views` | 显示候选审阅、运行列表、数据与演练、配置等阶段④页面 | 假 |
+| `nodes` | 显示「节点」页(`/api/nodes`) | 假 |
+| `evolution` | 显示进化引擎三视图(`/api/research/evolution*`) | 假(阶段④未上线;读取侧已就绪,等引擎侧产出数据) |
+
+**开关为假时**:不显示入口,也**不要**直接调那个接口——阶段②③④的接口在对应阶段上线前**不存在**,调用会得到 404。
 
 ## 9. 沟通与变更
 
