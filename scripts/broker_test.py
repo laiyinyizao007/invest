@@ -1,14 +1,16 @@
 """国信看穿式/程序化测试取证运行器:在期货公司测试环境里逐项演示,留下脱敏、可追溯的证据与证据图。
 
 做的事(对应国信《外部接入系统技术测试报告》):
-    穿透式 ①登录 ②行情 ③委托(开/平仓) ④撤单 ⑤成交 ⑥流量控制 ⑦异常自动退出
-    程序化 1.1 连通 1.2 基础交易 2.1 连接断开监测 2.2 报撤单笔数 2.3 重复报单 3.1 阈值与预警
-           4.1 指令检查 4.2 柜台错误提示 5.1 暂停交易 5.2 批量撤单(未实现,选测) 6.1 日志
+    穿透式演示 ①登录 ②行情 ③委托(开/平仓) ④撤单 ⑤成交 ⑥流量控制 ⑦异常自动退出(20260717 版模板已无穿透专章,仅留存证据)
+    外部接入 1.1 连通 1.2 基础交易 2.1 稳定运行(持续下单 200 笔)
+    程序化补充 3.1 连接断开监测 3.2 报撤单笔数 3.3 重复报单(选测) 4.1 阈值与预警 5.1 指令检查 5.2 柜台错误提示
+           6.1 暂停交易 6.2 批量撤单(未实现,选测) 7.1 日志
+    (内部测试项 ID 仍是 P1.1…P6.1,与模板编号的对应见 broker_evidence.TEMPLATE_NO;--only 用内部 ID)
 结果写到 `data/broker_test/<时间戳>/`:evidence.json + images/*.png,再用 `scripts/broker_report.py` 填进国信模板。
 
 用法(在运行机上,项目根目录,.env 已按国信测试环境参数填好,CTP_ENVIRONMENT=测试):
     python scripts/broker_test.py --confirm-broker-test
-    python scripts/broker_test.py --confirm-broker-test --interactive        # 含 2.1 断网演练(提示你断网/恢复)
+    python scripts/broker_test.py --confirm-broker-test --interactive        # 含 3.1 断网演练(提示你断网/恢复)
     python scripts/broker_test.py --confirm-broker-test --resume data/broker_test/<目录>   # 非交易时段先跑一遍,交易时段补测
 
 安全约束(同 penetration_check.py):
@@ -66,7 +68,9 @@ OUT_ROOT = bootstrap.ROOT / "data" / "broker_test"
 DAILY_RULE, SIZE_RULE, DUP_RULE = "每日上限检查", "委托规模检查", "重复报单检查"
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN = 0, 1, 2, 3
 # 会向柜台发委托的测试项:这些步骤之前必须先确认账户空仓
-ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P2.3", "P3.1", "T6", "P4.2", "P5.1"})
+ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1"})
+STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
+STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
 
 
 # ======================= 上下文与工具 =======================
@@ -99,6 +103,9 @@ class Ctx:
     contract: object | None = None
     tick: object | None = None
     in_session: bool = False
+    clock: Callable[[], float] = time.monotonic   # 稳定运行计时用;测试里可注入
+    stability_interval: float = 0.1               # 稳定运行逐笔下单间隔(秒),避开柜台流控
+    stability_wait: float = 60.0                  # 等全部委托回报/撤单终态的上限
 
     def rule(self, name: str):
         return self.risk_engine.rules.get(name)
@@ -139,13 +146,15 @@ class Book:
         self.items: dict[str, Evidence] = {}
         self._clean = clean or (lambda text: text)       # 落盘即脱敏:evidence.json 里不留未脱敏文本
 
-    def add(self, item: str, status: str, summary: str, shots: list[Shot], started_at: str) -> None:
+    def add(self, item: str, status: str, summary: str, shots: list[Shot], started_at: str, metrics: dict | None = None) -> None:
         summary = self._clean(summary)
         shots = [Shot(s.label, [self._clean(line) for line in s.lines], s.image) for s in shots]
         old = self.items.get(item)
         if old is None:
-            self.items[item] = Evidence(item, status, summary, started_at, list(shots))
+            self.items[item] = Evidence(item, status, summary, started_at, list(shots), dict(metrics or {}))
             return
+        if metrics:
+            old.metrics.update(metrics)
         old.shots.extend(shots)
         old.status = _combine(old.status, status)
         if summary and summary not in old.summary:
@@ -560,6 +569,85 @@ def step_pause(ctx: Ctx, book: Book) -> None:
     book.add("P5.1", PASS if ok else FAIL, "" if ok else "暂停/恢复行为或告警不符合预期", [Shot("", lines)], started)
 
 
+def step_stability(ctx: Ctx, book: Book, total: int | None = None) -> None:
+    """P1.3(模板 2.1 稳定运行):经风控链持续下单 N 笔(程序化系统 200 笔),记录下单到全部回报的耗时。
+
+    演示期间临时抬高会被 200 笔拦住的风控上限(日委托/撤单、活动委托、重复报单、撤单锁定),演示后还原——
+    取证状态目录是隔离的,这里验证的是「持续下单是否稳定」而不是风控阈值(阈值由 4.1 单独演示)。
+    撤单锁定的计数(cancel_count)也一并回退,否则清场撤单会让后续步骤落入「当日撤单锁定」。
+    """
+    started = ctx.now()
+    total = total or STABILITY_ORDERS
+    if ctx.tick is None or not ctx.in_session:
+        reason = "非交易时段或没有 Tick,委托不会被柜台正常接受,请在交易时段补测"
+        book.add("P1.3", SKIP, reason, [Shot(f"{total}笔", [reason])], started)
+        return
+    lifted: list[tuple[object, str, object]] = []
+
+    def lift(rule, attr: str) -> None:
+        if rule is not None and hasattr(rule, attr):
+            lifted.append((rule, attr, getattr(rule, attr)))
+            setattr(rule, attr, STABILITY_LIMIT)
+
+    daily, active, dup, guard = ctx.rule(DAILY_RULE), ctx.rule("活动委托检查"), ctx.rule(DUP_RULE), ctx.rule(ACCOUNT_RULE_NAME)
+    for rule, attrs in ((daily, ("total_order_limit", "contract_order_limit", "total_cancel_limit", "contract_cancel_limit")),
+                        (active, ("active_order_limit",)), (dup, ("duplicate_order_limit",)), (guard, ("cancel_lock_limit",))):
+        for attr in attrs:
+            lift(rule, attr)
+    saved_cancel_count = getattr(guard, "cancel_count", None)
+    ids: list[str] = []
+    blocked = 0
+    elapsed_acked = elapsed_sent = 0.0
+    final: dict[str, int] = {}
+    leftover = 0
+    try:
+        t0 = ctx.clock()
+        for n in range(total):
+            oid = send(ctx, make_req(ctx, price=probe_price(ctx)))
+            if oid:
+                ids.append(oid)
+            else:
+                blocked += 1
+            if ctx.stability_interval:
+                ctx.sleep(ctx.stability_interval)
+        elapsed_sent = ctx.clock() - t0
+
+        def all_acked() -> bool:
+            for oid in ids:
+                order = ctx.collector.order_of(oid)
+                if order is None or order.status == Status.SUBMITTING:
+                    return False
+            return True
+
+        ctx.wait_until(all_acked, ctx.stability_wait)
+        elapsed_acked = ctx.clock() - t0
+        for oid in ids:
+            order = ctx.collector.order_of(oid)
+            key = order.status.value if order is not None else "无回报"
+            final[key] = final.get(key, 0) + 1
+    finally:
+        cancel_active(ctx, ids)                                   # 无论如何清场:不留 200 笔挂单
+        ctx.wait_until(lambda: all(not (ctx.collector.order_of(o) and ctx.collector.order_of(o).is_active()) for o in ids),
+                       ctx.stability_wait)
+        leftover = sum(1 for o in ids if ctx.collector.order_of(o) is not None and ctx.collector.order_of(o).is_active())
+        for rule, attr, value in lifted:
+            setattr(rule, attr, value)
+        if guard is not None and saved_cancel_count is not None:
+            guard.cancel_count = saved_cancel_count
+    rejected = final.get(Status.REJECTED.value, 0)
+    silent = final.get("无回报", 0) + final.get(Status.SUBMITTING.value, 0)
+    ok = len(ids) == total and rejected == 0 and silent == 0
+    lines = [f"{ctx.now()} 持续下单 {total} 笔(买开 1 手,不易成交的限价,逐笔间隔 {ctx.stability_interval}s)",
+             f"经风控放行 {len(ids)} 笔,被本地风控拦截 {blocked} 笔",
+             f"下单耗时 {elapsed_sent:.1f} 秒;至全部回报到达共 {elapsed_acked:.1f} 秒",
+             "委托终态分布:" + ("、".join(f"{k} {v}" for k, v in sorted(final.items())) or "-"),
+             "清场:演示委托已全部撤销" if not leftover else f"⚠ 仍有 {leftover} 笔演示委托未撤销,请人工处理"]
+    summary = "" if ok else f"放行 {len(ids)}/{total} 笔,拒单 {rejected},无回报 {silent}"
+    book.add("P1.3", PASS if ok else FAIL, summary, [Shot(f"{total}笔", lines)], started,
+             metrics={"orders": total, "accepted": len(ids), "rejected": rejected, "elapsed_seconds": round(elapsed_acked, 1),
+                      "send_seconds": round(elapsed_sent, 1)})
+
+
 def step_connection(ctx: Ctx, book: Book) -> None:
     """P2.1:半自动——提示操作者断开网络再恢复,从网关日志读检测时间线。"""
     started = ctx.now()
@@ -567,7 +655,7 @@ def step_connection(ctx: Ctx, book: Book) -> None:
         book.add("P2.1", MANUAL, "需要人工断网演练:加 --interactive 运行,或在运行中手动断开/恢复网络后用 --resume 补测",
                  [Shot("", ["未执行断网演练(非交互模式)"])], started)
         return
-    print("\n[2.1 连接断开监测] 请在提示后**断开运行机的网络**(拔网线/禁用网卡),"
+    print("\n[3.1 连接断开监测] 请在提示后**断开运行机的网络**(拔网线/禁用网卡),"
           f"约 10-30 秒后**恢复**;脚本最多监测 {ctx.disconnect_timeout:.0f} 秒。")
     input("准备好后按回车开始监测...")
     mark = ctx.log_mark()
@@ -715,6 +803,8 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         step_counter_errors(ctx, book)
     if not gated and want("P5.1"):
         step_pause(ctx, book)
+    if not gated and want("P1.3"):
+        step_stability(ctx, book)
     if want("P2.1"):
         step_connection(ctx, book)
     if want("T7"):
@@ -754,7 +844,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--symbol", default="", help="测试合约,如 c2701.DCE(默认取 .env 的 LIVE_VT_SYMBOL)")
     parser.add_argument("--confirm-broker-test", action="store_true", help="确认目标是期货公司的测试环境")
-    parser.add_argument("--interactive", action="store_true", help="执行需要人工配合的 2.1 断网演练")
+    parser.add_argument("--interactive", action="store_true", help="执行需要人工配合的 3.1 断网演练")
     parser.add_argument("--resume", type=Path, default=None, help="在已有证据目录上增量补测(新的 SKIP 不覆盖旧的 PASS/FAIL)")
     parser.add_argument("--out-dir", type=Path, default=None, help="证据输出目录(默认 data/broker_test/<时间戳>)")
     parser.add_argument("--only", default="", help="只跑指定测试项,逗号分隔,如 T3,P4.1")

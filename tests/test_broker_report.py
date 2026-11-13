@@ -21,6 +21,7 @@ def evidences(**overrides):
     base = {}
     for item in be.ITEMS:
         base[item] = be.Evidence(item, be.PASS, "", "2026-11-11 10:00:00", [be.Shot("", ["line"])])
+    base["P1.3"] = be.Evidence("P1.3", be.PASS, "", "2026-11-11 10:00:00", [be.Shot("200笔", ["line"])], {"orders": 200, "elapsed_seconds": 37.4})
     base.update(overrides)
     return base
 
@@ -99,33 +100,73 @@ def test_set_checks_prefix_fallback_for_labels_with_suffix():
 
 # ---------- 整份报告 ----------
 
+def conclusion_rows(doc):
+    """结果表里的两个「测试结论」行:(外部接入, 程序化补充)。"""
+    results = table_with(doc, "1.1")
+    rows = [tr.findall(br.TC) for tr in results.findall(br.TR) if br.text_of(tr.findall(br.TC)[0]).strip().startswith("测试结论")]
+    assert len(rows) == 2
+    return rows
+
+
 def test_report_fills_fields_and_checks_results(tmp_path):
     outcome, doc = build(tmp_path, evidences())
     text = br.text_of(doc.body)
     assert "——invest系统" in text and "2026年11月11日" in text and "XXXX" not in text
-    pen = table_with(doc, "AppID类型")
-    assert checked_labels(br.find_row(pen, "AppID类型")[1][1]) == ["直连的交易者"]
-    assert checked_labels(br.find_row(pen, "测试接入系统名称")[1][1]) == ["CTP"]
-    assert "☑自动开平仓" in br.text_of(br.find_row(pen, "软件功能")[1][1]) and "□批量下单" in br.text_of(br.find_row(pen, "软件功能")[1][1])
-    results = table_with(doc, "1.1")
-    for prefix in ("1.1", "1.2", "2.1", "2.2", "3.1", "4.1", "4.2", "5.1", "6.1"):
-        assert checked_labels(br.find_row(results, prefix)[1][2]) == ["通过"], prefix
-    assert checked_labels(br.find_row(results, "2.3")[1][2]) == ["通过"]      # 选测项取证为 PASS 则勾通过
-    assert checked_labels(br.find_row(results, "测试结论")[1][1]) == ["通过"]
-    top = table_with(doc, "AppID/RelayAppID")                              # 穿透表之一
-    assert br.text_of(br.find_row(top, "AppID/RelayAppID")[1][1]) == "client_invest_1.0"
     summary = [t for t in doc.body.findall(br.TBL) if br.find_row(t, "提测方")][0]
+    assert br.text_of(br.find_row(summary, "测试系统名称")[1][1]) == "invest" and br.text_of(br.find_row(summary, "测试系统名称")[1][3]) == "1.0"
+    assert br.text_of(br.find_row(summary, "AppID/RelayAppID")[1][1]) == "client_invest_1.0"
+    assert br.text_of(br.find_row(summary, "测试账号")[1][1]) == "12345678"
+    assert checked_labels(br.find_row(summary, "连接模式")[1][1]) == ["直连的交易者"]
+    assert checked_labels(br.find_row(summary, "交易信息系统名称")[1][1]) == ["CTP"]
+    functions = br.text_of(br.find_row(summary, "测试系统功能")[1][1])
+    assert "☑止盈止损" in functions and "□批量下单" in functions
     assert br.text_of(br.find_row(summary, "联系人")[1][2]) == "联系人乙"
     phone_row = br.find_row(summary, "电话")[1]
     assert br.text_of(phone_row[2]) == "13800000000" and br.text_of(phone_row[4]) == "a@b.c"
-    assert br.text_of(br.find_row(summary, "程序化交易系统")[1][1]).startswith("测试机型号:Dell XPS")
+    assert br.text_of(br.find_row(summary, "测试系统设备")[1][1]).startswith("测试机型号:Dell XPS")
+    results = table_with(doc, "1.1")
+    for prefix in ("1.1", "1.2", "2.1", "3.1", "3.2", "4.1", "5.1", "5.2", "6.1", "7.1"):
+        assert checked_labels(br.find_row(results, prefix)[1][2]) == ["通过"], prefix
+    assert checked_labels(br.find_row(results, "3.3")[1][2]) == ["通过"]      # 选测项取证为 PASS 则勾通过
+    external, programmatic = conclusion_rows(doc)
+    assert checked_labels(external[1]) == ["通过"] and checked_labels(programmatic[1]) == ["通过"]
+    assert outcome.warnings == []
+
+
+def test_new_numbering_maps_each_item_to_its_own_row_not_the_old_numbers(tmp_path):
+    """旧版把「连接监测」编成 2.1;新模板 2.1 是「稳定运行」、连接监测是 3.1——只有 P2.1(连接监测)失败时,必须是 3.1 行变「不通过」,2.1 不受影响。"""
+    evs = evidences(**{"P2.1": be.Evidence("P2.1", be.FAIL, "没有检测到断开", "t", [be.Shot("", ["x"])])})
+    _, doc = build(tmp_path, evs)
+    results = table_with(doc, "1.1")
+    assert checked_labels(br.find_row(results, "3.1")[1][2]) == ["不通过"]
+    assert checked_labels(br.find_row(results, "2.1")[1][2]) == ["通过"]
+    external, programmatic = conclusion_rows(doc)
+    assert checked_labels(external[1]) == ["通过"] and checked_labels(programmatic[1]) == []
+
+
+def test_stability_seconds_are_filled_from_metrics_and_image_follows_the_200_line(tmp_path):
+    _, doc = build(tmp_path, evidences())
+    paras = [el for el in doc.body if el.tag == br.P]
+    texts = ["DRAW" if el.find(f".//{{{br.W_NS}}}drawing") is not None else br.text_of(el).strip() for el in paras]
+    assert any(t.startswith("2）持续下单200笔，耗时约 37.4 秒") for t in texts)
+    assert any(t.startswith("1）持续下单50笔，耗时约     秒") for t in texts)      # 50 笔是非程序化系统的项,不填
+    i = next(n for n, t in enumerate(texts) if t.startswith("2）持续下单200笔"))
+    assert "DRAW" in texts[i + 1:i + 3]
+
+
+def test_stability_without_metrics_is_reported_not_guessed(tmp_path):
+    evs = evidences()
+    evs["P1.3"] = be.Evidence("P1.3", be.PASS, "", "t", [be.Shot("200笔", ["x"])])
+    outcome, doc = build(tmp_path, evs)
+    assert "耗时约 N 秒" in "\n".join(outcome.missing)
+    assert any(br.text_of(el).startswith("2）持续下单200笔，耗时约     秒") for el in doc.body if el.tag == br.P)
 
 
 def test_gray_hint_color_is_not_copied_into_filled_text(tmp_path):
     _, doc = build(tmp_path, evidences())
-    pen = table_with(doc, "AppID类型")
-    cell = br.find_row(pen, "测试账户")[1][1]
-    assert cell.find(".//w:color", NS) is None and br.text_of(cell) == "12345678"
+    summary = [t for t in doc.body.findall(br.TBL) if br.find_row(t, "提测方")][0]
+    cell = br.find_row(summary, "AppID/RelayAppID")[1][1]
+    assert cell.find(".//w:color", NS) is None and br.text_of(cell) == "client_invest_1.0"
 
 
 def test_never_defaults_to_pass_failed_or_skipped_mandatory_items_stay_unchecked(tmp_path):
@@ -134,33 +175,41 @@ def test_never_defaults_to_pass_failed_or_skipped_mandatory_items_stay_unchecked
         "P3.1": be.Evidence("P3.1", be.SKIP, "需交易时段", "t", [be.Shot("", ["x"])]),
         "P2.3": be.Evidence("P2.3", be.SKIP, "选测", "t", [be.Shot("", ["x"])]),
         "P5.2": be.Evidence("P5.2", be.SKIP, "未实现", "t", [be.Shot("", ["x"])]),
-        "T3": be.Evidence("T3", be.FAIL, "开仓未成交", "t", [be.Shot("", ["x"])]),
     })
     del evs["P4.2"]                                                         # 完全没有取证结果
     outcome, doc = build(tmp_path, evs)
     results = table_with(doc, "1.1")
     assert checked_labels(br.find_row(results, "1.1")[1][2]) == ["不通过"]
-    assert checked_labels(br.find_row(results, "3.1")[1][2]) == []         # 必测项 SKIP:不勾,模板预勾选的「通过」被重置
-    assert checked_labels(br.find_row(results, "4.2")[1][2]) == []
-    assert checked_labels(br.find_row(results, "2.3")[1][2]) == ["未测试"]  # 选测项 SKIP → 未测试
-    assert checked_labels(br.find_row(results, "5.2")[1][2]) == ["未测试"]
-    assert checked_labels(br.find_row(results, "测试结论")[1][1]) == []     # 必测项未全过 → 不勾结论
-    pen = table_with(doc, "①登录")
-    abnormal = checked_labels(br.find_row(pen, "③")[1][3])
-    assert len(abnormal) == 1 and abnormal[0].startswith("异常") and "开仓未成交" in abnormal[0]   # 原因追加在「异常：」之后
+    assert checked_labels(br.find_row(results, "4.1")[1][2]) == []         # 必测项 SKIP:不勾,模板预勾选的「通过」被重置
+    assert checked_labels(br.find_row(results, "5.2")[1][2]) == []
+    assert checked_labels(br.find_row(results, "3.3")[1][2]) == ["未测试"]  # 选测项 SKIP → 未测试
+    assert checked_labels(br.find_row(results, "6.2")[1][2]) == ["未测试"]
+    external, programmatic = conclusion_rows(doc)
+    assert checked_labels(external[1]) == [] and checked_labels(programmatic[1]) == []     # 必测项未全过 → 不勾结论
     joined = "\n".join(outcome.missing)
-    assert "1.1 连通性" in joined and "3.1 阈值设置" in joined and "4.2 接收柜台错误提示" in joined and "必测项未全部通过" in joined
+    assert "1.1 连通性" in joined and "4.1 阈值设置" in joined and "5.2 接收柜台错误提示" in joined and "必测项未全部通过" in joined
     assert "签字/盖章" in joined
+
+
+def test_template_preticked_collection_rows_are_reset_not_defaulted_to_pass(tmp_path):
+    """「看穿式采集」两行模板预勾了「通过」:是否通过由国信评估,脚本一律重置并在缺失清单里提示。"""
+    outcome, doc = build(tmp_path, evidences())
+    results = table_with(doc, "1.1")
+    assert checked_labels(br.find_row(results, "采集信息的完整性")[1][2]) == []
+    assert checked_labels(br.find_row(results, "采集信息的正确性")[1][2]) == []
+    assert "看穿式采集" in "\n".join(outcome.missing)
 
 
 def test_guosen_filled_areas_are_untouched(tmp_path):
     template = build_template(tmp_path / "t.docx")
     before = br.Docx(template)
-    gx_before = etree.tostring(table_with(before, "完整性"))
-    gx_final_before = etree.tostring(br.find_row(table_with(before, "测试结论"), "测试人员(国信期货)")[0])
+    gx_before = etree.tostring(table_with(before, "技术评估意见"))
+    gx_final_before = [etree.tostring(tr) for tr in table_with(before, "测试结论").findall(br.TR)
+                       if br.text_of(tr).startswith("测试人员(国信期货)")]
     _, doc = build(tmp_path, evidences())
-    assert etree.tostring(table_with(doc, "完整性")) == gx_before
-    assert etree.tostring(br.find_row(table_with(doc, "测试结论"), "测试人员(国信期货)")[0]) == gx_final_before
+    assert etree.tostring(table_with(doc, "技术评估意见")) == gx_before
+    assert [etree.tostring(tr) for tr in table_with(doc, "测试结论").findall(br.TR)
+            if br.text_of(tr).startswith("测试人员(国信期货)")] == gx_final_before
 
 
 def test_images_are_embedded_with_relationships_and_content_type(tmp_path):
@@ -183,17 +232,25 @@ def test_images_follow_their_anchor_labels(tmp_path):
     texts = ["DRAW" if el.find(f".//{{{br.W_NS}}}drawing") is not None else br.text_of(el).strip() for el in paras]
     start = texts.index("1.2.基础交易功能（包含开仓、平仓、撤单）")
     window = texts[start:start + 10]
-    assert window.index("开仓") + 1 == window.index("DRAW")                    # 图紧跟各自的小标题之后
-    assert window.index("平仓") < window.index("撤单")
+    assert window.index("1）开仓") + 1 == window.index("DRAW")                  # 图紧跟各自的小标题之后
+    assert window.index("2）平仓") < window.index("3）撤单")
     assert window.count("DRAW") == 3
 
 
-def test_penetration_images_go_after_the_numbered_screenshot_anchor(tmp_path):
-    _, doc = build(tmp_path, evidences())
+def test_every_item_with_a_shot_lands_in_its_own_section(tmp_path):
+    """每个测试项的图都落在模板里自己编号的小节下(旧编号映射会把图插进别的小节)。"""
+    evs = {k: be.Evidence(k, be.PASS, "", "t", [be.Shot("", [k])], {"orders": 200, "elapsed_seconds": 1}) for k in br.TEMPLATE_NO}
+    _, doc = build(tmp_path, evs)
     paras = [el for el in doc.body if el.tag == br.P]
-    texts = ["DRAW" if el.find(f".//{{{br.W_NS}}}drawing") is not None else br.text_of(el).strip() for el in paras]
-    i = next(n for n, t in enumerate(texts) if t.startswith("（请按序号附截图"))
-    assert "DRAW" in texts[i + 1:i + 4] and any(t.startswith("③") for t in texts[i + 1:i + 12])
+    current, seen = None, {}
+    for el in paras:
+        t = br.text_of(el).strip()
+        m = br.HEADING.match(t)
+        if m and f"{m.group(1)}.{m.group(2)}" in br.SECTION_NO:
+            current = f"{m.group(1)}.{m.group(2)}"
+        if el.find(f".//{{{br.W_NS}}}drawing") is not None and current:
+            seen[current] = seen.get(current, 0) + 1
+    assert seen == {no: 1 for no in br.TEMPLATE_NO.values()}
 
 
 def test_missing_context_values_are_reported_not_silently_blank(tmp_path):
@@ -208,8 +265,21 @@ def test_unrecognized_template_fails_loudly(tmp_path):
         z.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
         z.writestr("word/document.xml", f'<w:document xmlns:w="{br.W_NS}"><w:body><w:p/></w:body></w:document>')
         z.writestr("word/_rels/document.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
-    with pytest.raises(ValueError, match="程序化测试报告"):
+    with pytest.raises(ValueError, match="程序化补充测试报告"):
         br.build_report(bad, tmp_path, tmp_path / "o.docx", ctx(), evidences())
+
+
+def test_old_layout_template_is_rejected_instead_of_filled_with_new_numbers(tmp_path):
+    """旧版模板(第二封面叫「程序化测试报告」、编号不同)必须明确拒绝,不能按新编号错填。"""
+    old = build_template(tmp_path / "old.docx")
+    with zipfile.ZipFile(old) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    parts["word/document.xml"] = parts["word/document.xml"].replace("程序化补充测试报告".encode(), "程序化测试报告".encode())
+    with zipfile.ZipFile(old, "w") as z:
+        for n, data in parts.items():
+            z.writestr(n, data)
+    with pytest.raises(ValueError, match="20260717"):
+        br.build_report(old, tmp_path, tmp_path / "o.docx", ctx(), evidences())
 
 
 def test_report_cli_needs_template_and_evidence(tmp_path, capsys):
@@ -275,12 +345,13 @@ def test_save_load_roundtrip_and_merge_semantics(tmp_path):
 
 
 def test_optional_item_fail_blocks_the_conclusion_check(tmp_path):
-    """选测项(如 P2.3)取证为 FAIL 时不勾「测试结论:通过」,并在缺失清单里点名。"""
+    """选测项(如 P2.3=模板 3.3)取证为 FAIL 时不勾程序化补充的「测试结论:通过」,并在缺失清单里点名;外部接入部分不受影响。"""
     evs = evidences(**{"P2.3": be.Evidence("P2.3", be.FAIL, "重复报单未被拦截", "t", [be.Shot("", ["x"])])})
     outcome, doc = build(tmp_path, evs)
     results = table_with(doc, "1.1")
-    assert checked_labels(br.find_row(results, "2.3")[1][2]) == ["不通过"]
-    assert checked_labels(br.find_row(results, "测试结论")[1][1]) == []
+    assert checked_labels(br.find_row(results, "3.3")[1][2]) == ["不通过"]
+    external, programmatic = conclusion_rows(doc)
+    assert checked_labels(external[1]) == ["通过"] and checked_labels(programmatic[1]) == []
     assert "P2.3" in "\n".join(outcome.missing) and "选测项" in "\n".join(outcome.missing)
 
 

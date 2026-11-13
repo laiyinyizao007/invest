@@ -116,6 +116,58 @@ def test_threshold_cancel_metric_is_skipped_off_session(tmp_path):
         e.main.close()
 
 
+# ---------- P1.3 稳定运行(模板 2.1)----------
+
+def test_stability_sends_all_orders_records_metrics_and_cleans_up(env):
+    daily = env.risk.rules["每日上限检查"]
+    dup, active = env.risk.rules["重复报单检查"], env.risk.rules["活动委托检查"]
+    before = (daily.total_order_limit, daily.total_cancel_limit, dup.duplicate_order_limit, active.active_order_limit,
+              env.rule.cancel_lock_limit, env.rule.cancel_count)
+    env.ctx.stability_interval = 0
+    bt.step_stability(env.ctx, env.book, total=30)
+    ev = item(env, "P1.3")
+    assert ev.status == be.PASS, ev.summary
+    assert ev.metrics["orders"] == 30 and ev.metrics["accepted"] == 30 and ev.metrics["rejected"] == 0
+    assert [s.label for s in ev.shots] == ["30笔"]
+    assert len(env.gw.sent) == 30                                   # 30 笔全部经风控放行到了柜台(超过活动委托上限 10 也没被拦)
+    assert all(not o.is_active() for o in map(env.collector.order_of, env.gw.orders) if o is not None)    # 清场:不留挂单
+    after = (daily.total_order_limit, daily.total_cancel_limit, dup.duplicate_order_limit, active.active_order_limit,
+             env.rule.cancel_lock_limit, env.rule.cancel_count)
+    assert after == before                                          # 临时抬高的上限与撤单锁定计数都已还原
+
+
+def test_stability_fails_when_the_counter_rejects_orders_and_still_restores_limits(env):
+    env.gw.mode = "reject"
+    env.ctx.stability_interval = 0
+    limit = env.risk.rules["活动委托检查"].active_order_limit
+    bt.step_stability(env.ctx, env.book, total=5)
+    ev = item(env, "P1.3")
+    assert ev.status == be.FAIL and ev.metrics["rejected"] == 5
+    assert env.risk.rules["活动委托检查"].active_order_limit == limit
+
+
+def test_stability_is_skipped_off_session(tmp_path):
+    e = Env(tmp_path, in_session=False)
+    try:
+        bt.step_stability(e.ctx, e.book)
+        ev = e.book.items["P1.3"]
+        assert ev.status == be.SKIP and "交易时段" in ev.summary and e.gw.sent == []
+    finally:
+        e.main.close()
+
+
+def test_stability_restores_limits_even_if_sending_raises(env, monkeypatch):
+    limit = env.risk.rules["每日上限检查"].total_order_limit
+    monkeypatch.setattr(bt, "send", lambda ctx, req: (_ for _ in ()).throw(RuntimeError("boom")))
+    with pytest.raises(RuntimeError):
+        bt.step_stability(env.ctx, env.book, total=3)
+    assert env.risk.rules["每日上限检查"].total_order_limit == limit
+
+
+def test_stability_is_gated_by_flat_check_like_other_order_steps():
+    assert "P1.3" in bt.ORDER_ITEMS
+
+
 # ---------- P5.1 暂停交易 ----------
 
 def test_pause_step_blocks_opens_allows_closes_and_restores(env):
@@ -276,7 +328,7 @@ def test_run_steps_stops_after_failed_login_and_runs_everything_otherwise(tmp_pa
         e.gw.mode = "fill"
         e.gw.position_lag = False
         assert bt.run_steps(e.ctx, e.book) is True
-        assert set(e.book.items) == set(be.ITEMS)                               # 18 项都有结果
+        assert set(e.book.items) == set(be.ITEMS)                               # 全部测试项都有结果
         assert e.book.items["P2.1"].status == be.MANUAL
     finally:
         e.main.close()
