@@ -119,6 +119,8 @@ def select_params(*, candidate_cls: type, grid: Any, bars: Sequence, runner: Run
         "n_cells": len(scores), "valid_cells": valid, "min_round_trips": min_round_trips,
         "best_cell": None, "best_params": None, "best_smoothed": None, "best_sharpe": None, "on_plateau": False,
         "plateau": {"cell": None, "scores": [[*idx, "-inf" if v == NEG_INF else v] for idx, v in sorted(scores.items())]},
+        # 每个**有效**格子的年化夏普(往返笔数够的那些):供账本记录逐试验夏普。无效格子的夏普没有统计意义,不入样本。
+        "cell_sharpes": [sharpes[idx] for idx, v in sorted(scores.items()) if v != NEG_INF],
         "note": "",
     }
     if not smooth:

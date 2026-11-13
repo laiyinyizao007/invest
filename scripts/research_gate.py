@@ -7,11 +7,13 @@
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Callable, Sequence
 
 from research_grid import GridError, select_params
 from risk import candidate_eval as ce
+from risk.dsr import MAX_TRIAL_SHARPE, merge_stats, sharpe_stats as sharpe_stats_of
 from risk.diagnosis import diagnose
 
 TEST_SEGMENT_START = datetime(2024, 1, 1)   # 与 walk_forward_optimizer.TEST_SEGMENT_START 保持一致(有测试锁定)
@@ -44,7 +46,8 @@ def _random_params(random_cls: type, params: dict) -> dict:
 
 def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], bars: Sequence, runner: Runner,
              random_cls: type, random_runs: int = ce.DEFAULT_RANDOM_RUNS, data_adjusted: bool, on_plateau: bool,
-             capital: float, prior_trials: int | None = None) -> dict:
+             capital: float, prior_trials: int | None = None,
+             sharpe_stats: tuple[int, float, float] | None = None) -> dict:
     """prior_trials = 已累计的试验次数(含被淘汰者,由调用方从 risk/trial_ledger.py 读取),作为 DSR 的去通胀次数。
     不提供时 DSR 记为未计算,门槛按未通过处理(fail-closed)。"""
     slices = [(name, slice_bars(bars, start, end)) for name, start, end in windows]
@@ -64,7 +67,8 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
                 for p, (_, chunk) in zip(probs, slices)]
         random_sharpes.append(ce.pool_oos(runs, capital)["sharpe"])
 
-    result = ce.evaluate(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials=prior_trials)
+    result = ce.evaluate(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials=prior_trials,
+                         sharpe_stats=sharpe_stats)
     result["windows"] = [
         {"name": name, "bars": len(chunk), "round_trips": res["round_trips"], "maxdd_pct": res["maxdd_pct"],
          "maxdd_yuan": res["maxdd_yuan"], "sharpe": ce.annualized_sharpe(res["daily_pnls"], capital)}
@@ -84,7 +88,8 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
 
 def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,
                    max_cells: int, min_round_trips: int, select_window: tuple[datetime, datetime],
-                   validation_windows: Sequence[Window], data_adjusted: bool = True, prior_trials: int | None = None) -> dict:
+                   validation_windows: Sequence[Window], data_adjusted: bool = True, prior_trials: int | None = None,
+                   sharpe_stats: tuple[int, float, float] | None = None) -> dict:
     """选参 + 门槛评估:候选在类上声明 `param_grid`,先在**选参窗口**(止于第一个验证窗口之前)扫网格选参并判定参数高原,
     再用选出的参数在**滚动验证窗口**上做完整门槛评估。选参数据与评估数据不重叠,样本外因此成立。
 
@@ -97,17 +102,24 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
         raise GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
     selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
                               max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
-    summary = {k: v for k, v in selection.items() if k != "plateau"}      # 完整得分表留在服务端,不回传给外层
+    summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes")}   # 完整得分表留在服务端,不回传给外层
+    # 本次扫过的每个有效格子的**日**夏普(= 年化 / √240,与 DSR 同一口径):入账本,并并入本次 DSR 的经验方差
+    # 限幅到 ±MAX_TRIAL_SHARPE:真实网格里偶有极端格子(几笔全盈利之类)夏普极大,不限幅会让整批样本因越界被父进程丢弃;
+    # 父进程的校验仍然拒绝越界值——那才是伪造。限幅只会让 V 略小于"不限幅",而 V 有理论值作下限,不会更松。
+    cell_sharpes = [max(-MAX_TRIAL_SHARPE, min(MAX_TRIAL_SHARPE, s / math.sqrt(ce.TRADING_DAYS_PER_YEAR)))
+                    for s in selection.get("cell_sharpes", [])]
     summary["plateau_cell"] = selection["plateau"]["cell"]
     cells_run = int(selection["n_cells"])
-    trials = None if prior_trials is None else {"prior": prior_trials, "grid_cells": cells_run, "total": prior_trials + cells_run}
+    trials = None if prior_trials is None else {"prior": prior_trials, "grid_cells": cells_run, "total": prior_trials + cells_run,
+                                                "cell_sharpes": cell_sharpes}
+    merged_stats = merge_stats(sharpe_stats or (0, 0.0, 0.0), sharpe_stats_of(cell_sharpes))
     if selection["best_params"] is None:
         return {"passed": False, "failures": ["无法选参: " + selection["note"]], "params": None,
                 "selection": summary, "kind_detail": "selection-only", "trials": trials}
     result = run_gate(candidate_cls=candidate_cls, params=selection["best_params"], windows=validation_windows, bars=bars,
                       runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
                       on_plateau=selection["on_plateau"], capital=capital,
-                      prior_trials=None if trials is None else trials["total"])
+                      prior_trials=None if trials is None else trials["total"], sharpe_stats=merged_stats)
     result["trials"] = trials
     result["params"] = selection["best_params"]
     result["selection"] = summary

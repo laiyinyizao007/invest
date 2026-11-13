@@ -210,7 +210,8 @@ def test_evaluation_counts_this_runs_grid_cells_on_top_of_prior_trials():
     result = evaluate(prior_trials=10)
 
     assert result["metrics"]["n_trials"] == 10 + 27                       # 3x3x3 = 27 个格子
-    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert {k: result["trials"][k] for k in ("prior", "grid_cells", "total")} == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert len(result["trials"]["cell_sharpes"]) <= 27          # 只有往返笔数够的有效格子入样本
 
 
 def test_evaluation_without_prior_trials_fails_closed():
@@ -225,4 +226,77 @@ def test_selection_only_failure_still_reports_the_cells_it_consumed():
     result = evaluate(runner=make_runner(trips=3), prior_trials=10)
 
     assert result["passed"] is False
-    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert {k: result["trials"][k] for k in ("prior", "grid_cells", "total")} == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert len(result["trials"]["cell_sharpes"]) <= 27          # 只有往返笔数够的有效格子入样本
+
+
+# ---------- 阶段 3:DSR 的经验方差(V = max(V_经验, 1/(T-1)),只能更严) ----------
+
+def _wide_stats(seed=5, n=60, sd=0.2):
+    import random
+
+    from risk.dsr import sharpe_stats
+    rng = random.Random(seed)
+    return sharpe_stats([rng.gauss(0.0, sd) for _ in range(n)])
+
+
+def test_gate_without_prior_sharpes_reports_insufficient_samples():
+    """没有账本样本时 DSR 退回理论值——这件事要写进结果,不得静默。"""
+    result = run(prior_trials=300)
+    assert result["dsr_variance"]["basis"] == "insufficient_samples"
+    assert result["dsr_variance"]["n_sharpes"] == 0
+
+
+def test_gate_with_dispersed_prior_sharpes_is_stricter_and_says_so():
+    # 温和的候选(日夏普约 0.12):DSR 不会被饱和在 1.0,才看得出 V 变大之后的差别
+    mild = make_runner(candidate_pnl=-0.9)
+    loose = run(prior_trials=300, runner=mild)["metrics"]["dsr"]
+    result = run(prior_trials=300, runner=mild, sharpe_stats=_wide_stats())
+    assert result["dsr_variance"]["basis"] == "empirical"
+    assert 0.0 < result["metrics"]["dsr"] < loose < 1.0
+
+
+def test_gate_with_few_prior_sharpes_falls_back_to_theory_and_equals_the_old_dsr():
+    few = _wide_stats(n=10)
+    result = run(prior_trials=300, sharpe_stats=few)
+    assert result["dsr_variance"]["basis"] == "insufficient_samples"
+    assert result["metrics"]["dsr"] == run(prior_trials=300)["metrics"]["dsr"]
+
+
+def test_evaluation_folds_this_runs_cell_sharpes_into_the_variance():
+    """本次扫过的格子夏普也是试验样本:并入先验之后再算 DSR 的 V。"""
+    prior = _wide_stats(n=15)                                              # 先验 15 条 < 20:单靠它不够
+    result = evaluate(prior_trials=10, sharpe_stats=prior)
+    cells = len(result["trials"]["cell_sharpes"])
+    assert result["dsr_variance"]["n_sharpes"] == prior[0] + cells
+    assert cells > 0
+
+
+def test_evaluation_with_prior_sharpes_never_has_a_higher_dsr_than_without():
+    base = evaluate(prior_trials=10)["metrics"]["dsr"]
+    with_stats = evaluate(prior_trials=10, sharpe_stats=_wide_stats())["metrics"]["dsr"]
+    assert with_stats <= base + 1e-12
+
+
+def test_cell_sharpes_are_daily_not_annualized():
+    """入账本的是日夏普(= 年化 / √240),与 DSR 同一口径;否则 V 会被放大 240 倍而把一切卡死。"""
+    import math
+
+    import research_grid as rgrid
+    from risk import candidate_eval as ce
+    mild = make_runner(candidate_pnl=-0.9)
+    result = evaluate(prior_trials=10, runner=mild)
+    selection = rgrid.select_params(candidate_cls=GridCand, grid=GridCand.param_grid, bars=EVAL_BARS, runner=mild,
+                                    capital=10_000, max_cells=100, min_round_trips=10, window=SELECT)
+    expected = [s / math.sqrt(ce.TRADING_DAYS_PER_YEAR) for s in selection["cell_sharpes"]]
+    assert result["trials"]["cell_sharpes"] == pytest.approx(expected)
+    assert expected and all(abs(s) < 1.0 for s in expected)
+
+
+def test_extreme_cell_sharpes_are_clamped_so_one_outlier_cannot_void_the_whole_batch():
+    """真实网格里偶有极端格子(几笔全盈利)夏普极大:限幅到上限,整批样本才不会被父进程当成越界丢掉。"""
+    from risk.dsr import MAX_TRIAL_SHARPE
+    result = evaluate(prior_trials=10)                                   # 这个假执行器的夏普极大(日夏普远超 1)
+    sharpes = result["trials"]["cell_sharpes"]
+    assert sharpes and all(abs(s) <= MAX_TRIAL_SHARPE for s in sharpes)
+    assert max(sharpes) == MAX_TRIAL_SHARPE
