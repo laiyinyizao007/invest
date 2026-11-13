@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,23 @@ class Settings:
         return float(self.raw["stale_after_seconds"][name])
 
 
+def _check_evolution(cfg: Any) -> None:
+    """进化面板的配置取值。**非法值在启动时就被拒**,而不是让页面在半夜 500
+    (config.load 的既定约定:非法即抛 ConfigError,由入口转为拒绝启动)。"""
+    if not isinstance(cfg, dict):
+        raise ConfigError("evolution 必须是对象")
+    if not isinstance(cfg.get("enabled"), bool):
+        raise ConfigError("evolution.enabled 必须是 true/false")
+    for key in ("stagnant_generations", "log_limit"):
+        value = cfg.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"evolution.{key} 必须是正整数")
+    for key in ("stagnant_epsilon", "overfit_mean_gap"):
+        value = cfg.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ConfigError(f"evolution.{key} 必须是非负有限数")
+
+
 def _resolve(root: Path, rel: str, what: str) -> Path:
     path = (root / rel).resolve()
     if root != path and root not in path.parents:
@@ -123,6 +141,7 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
         v = raw["limits"][key]
         if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0):
             raise ConfigError(f"limits.{key} 必须是正数或 null")
+    _check_evolution(raw.get("evolution"))
     root = root.resolve()
     paths = {
         "state_dir": _resolve(root, raw["state_dir"], "state_dir"),

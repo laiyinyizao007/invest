@@ -225,3 +225,22 @@ def test_the_junction_fallback_detects_a_reparse_point_without_path_is_junction(
                         if str(p).endswith("junctionish") else real_lstat(p, *a, **k))
     assert config._is_link(OldStylePath(tmp_path / "junctionish")) is True
     assert config._is_link(OldStylePath(tmp_path / "plain")) is False
+
+
+@pytest.mark.parametrize("over", [
+    {"log_limit": "abc"}, {"log_limit": None}, {"log_limit": 0}, {"log_limit": -1}, {"log_limit": 1.5},
+    {"stagnant_generations": "abc"}, {"stagnant_generations": 0}, {"stagnant_generations": -3},
+    {"stagnant_epsilon": "abc"}, {"stagnant_epsilon": -1.0}, {"stagnant_epsilon": float("inf")},
+    {"overfit_mean_gap": "abc"}, {"overfit_mean_gap": -0.5}, {"enabled": "yes"},
+])
+def test_illegal_evolution_settings_are_refused_at_startup_not_at_request_time(tmp_path, over):
+    """非法配置要在启动时被拒(config.load 的既定约定),而不是让页面在半夜 500。"""
+    cfg = _write(tmp_path, {"evolution": over})
+    with pytest.raises(c.ConfigError, match="evolution"):
+        c.load(path=cfg, root=tmp_path)
+
+
+def test_legal_evolution_settings_are_accepted(tmp_path):
+    cfg = _write(tmp_path, {"evolution": {"enabled": True, "stagnant_generations": 3, "log_limit": 20,
+                                          "stagnant_epsilon": 0.1, "overfit_mean_gap": 1.0}})
+    assert c.load(path=cfg, root=tmp_path).raw["evolution"]["enabled"] is True

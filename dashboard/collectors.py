@@ -375,8 +375,10 @@ def _all_log_files(settings: Settings) -> list[Path]:
 def _days(settings: Settings, *, only_trusted: bool = True) -> list[ls.DayStats]:
     """按天汇总。
 
-    only_trusted=True(默认):只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
-    only_trusted=False:全部日志(用于判断『某天到底有没有日志』:日志存在但不可信 ≠ 没有日志)。
+    only_trusted=False:全部日志。**不可信的那天也要在表里**(带 `trusted=false` 标记):
+    曾经它既不在每日表里(被过滤掉),也不在缺天清单里(按『实际存在的日志』算)——用户根本看不到那天存在,
+    只能靠区块 message 才知道。缺两天 vs 那天无法判断,是不一样的。
+    only_trusted=True:只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
     """
     merged: dict[str, ls.DayStats] = {}
     files = _log_files(settings) if only_trusted else _all_log_files(settings)
@@ -418,8 +420,10 @@ def _heartbeat_day_label(settings: Settings, now: float) -> tuple[str, str] | No
 def collect_days(settings: Settings, now: float, limit: int | None = None) -> Result:
     limit = limit or settings.raw["days_default"]
     stale_after = settings.stale_after("days")
-    days = _days(settings)
-    if not days:
+    days = _days(settings, only_trusted=False)      # 表里要包含不可信的那天(带 trusted 标记)
+    if not any(d.trusted for d in days):
+        # 一个可信的日志都没有:要么全坏了(corrupt),要么根本没有(missing)。
+        # 『部分不可信』不在这里——那属于下面的正常路径:表里看得到那天,并标着 trusted=false。
         bad = _unreadable_logs(settings)
         if bad:
             tail = _tail_uncertain_logs(settings)
@@ -444,6 +448,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     for stats in reversed(days[-limit:]):
         rows.append({
             "day": stats.day, "started": stats.started, "trades": stats.trades, "clean": stats.clean, "has_severe": stats.has_severe,
+            # trusted=false:那天无法判断(日志损坏,或尾部正在写)。clean 已经是 false,不会进连续无异常的统计。
+            "trusted": stats.trusted, "tail_uncertain": stats.tail_uncertain,
             "events": _events(stats),
             "first_ts": f"{stats.day} {stats.first_ts}" if stats.first_ts else None,
             "last_ts": f"{stats.day} {stats.last_ts}" if stats.last_ts else None,
@@ -457,6 +463,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
     bad_logs = _unreadable_logs(settings)
+    if bad_logs and state == "ok":
+        # **有数据没显示 → 状态不能是 ok**:契约规定前端『先看 state』,ok 会渲染成绿卡片。
+        # (不可信的那天在表里可见、clean=false、不进连续段;但区块整体仍要知道『有几天无法判断』。)
+        state = "unknown"
     bad_msg = f"有 {bad_logs} 个日志文件内容无法识别(格式变了、被写坏或日期与文件名不符),这些天不能算作『无异常』"
     reasons: list[dict] = []
     if latest.has_severe:
@@ -548,6 +558,8 @@ def collect_alerts(settings: Settings, now: float) -> Result:
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     # 没有任何非空日志 = 没有『进程在运行』的证据;空队列不能被解读成『一切正常』
     state = m.freshness(newest, now, stale_after) if newest is not None else "unknown"
+    if bad_logs and state == "ok":
+        state = "unknown"        # 有日志读不懂 = 有些天无法判断,区块不能显示正常
     latest = days[-1] if days else None
     reasons: list[dict] = []
     if latest and latest.has_severe:
@@ -896,7 +908,10 @@ def collect_research(settings: Settings, now: float) -> Result:
         level, headline = "ok", f"额度 {used}/{limit}"
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
-    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now, message=";".join(problems + notes) or None),
+    # 有数据没显示 → 状态不是 ok(契约:前端先看 state,ok 会渲染成绿卡片)
+    section_state = "unknown" if problems else "ok"
+    return Result(m.section(section_state, data, as_of=max(activity) if activity else None, now=now,
+                            message=";".join(problems + notes) or None),
                   level, headline, reasons)
 
 
@@ -931,6 +946,9 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
             "strategy_sha256": body.get("strategy_sha256") if isinstance(body.get("strategy_sha256"), str) else None,
             "report": body.get("report") if isinstance(body.get("report"), str) else None,
             "failures": strings("failures"), "params": obj("params"), "metrics": obj("metrics"),
+            # backtest 的数字在 stats 里(收益/夏普/往返笔数…),gate/evaluate 在 metrics 里。
+            # 少了 stats,前端就无法把回测的数字画成图表或单独高亮——只能从报告文本里读。
+            "stats": obj("stats"),
             "diagnosis": obj("diagnosis"), "selection": obj("selection"),
             "windows": body.get("windows") if isinstance(body.get("windows"), list) else None, "error": obj("error")}
 

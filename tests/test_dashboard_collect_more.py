@@ -495,3 +495,17 @@ def test_a_document_within_the_limit_is_not_marked_truncated(tmp_path):
     s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
     d = col.get_doc(s, "unattended-log")
     assert d is not None and d["truncated"] is False and d["markdown"].startswith("# 标题")
+
+
+def test_the_run_detail_exposes_the_backtest_statistics(tmp_path):
+    """回测的数字在 stats 里(收益/夏普/往返笔数)。少了它,前端只能从报告文本里读,画不了图。"""
+    row = backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2,
+                               "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0,
+                               "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})
+    res(tmp_path, runs=[(RID, {"kind": "backtest", "strategy_file": "d.py",
+                               "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00",
+                               "report": "沙盒回测", "stats": row})])
+    d = col.get_run(S(tmp_path), RID)
+    assert d is not None and d["stats"] is not None
+    assert d["stats"]["round_trips"] == 78 and d["stats"]["sharpe"] == 1.2
+    assert d["metrics"] is None

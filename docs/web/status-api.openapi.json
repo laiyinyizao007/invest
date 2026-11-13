@@ -2358,6 +2358,13 @@
               "object",
               "null"
             ]
+          },
+          "stats": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "backtest 的回测统计(收益/夏普/最大回撤/往返笔数…);gate/evaluate 用 metrics"
           }
         },
         "required": [

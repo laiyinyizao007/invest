@@ -381,7 +381,12 @@ def test_garbage_does_not_hide_behind_a_valid_log_but_also_does_not_poison_it(tm
     log(tmp_path, "20261111", CLEAN)
     _garbage_log(tmp_path)                                                   # 另一天是垃圾
     d = col.collect_days(settings(tmp_path), NOW).section["data"]
-    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                    # 垃圾那天不出现,更不会显示成『无异常』
+    # 垃圾那天**要在表里**(带 trusted=false),但绝不能显示成『无异常』:
+    # 曾经它既不在表里、也不在缺天清单里——用户根本看不到那天存在。
+    days = {x["day"]: x for x in d["days"]}
+    assert set(days) == {"2026-11-11", "2026-11-12"}
+    assert days["2026-11-12"]["trusted"] is False and days["2026-11-12"]["clean"] is False
+    assert days["2026-11-11"]["trusted"] is True and days["2026-11-11"]["clean"] is True
 
 
 def test_a_log_with_one_recognisable_line_among_noise_counts(tmp_path):
@@ -639,7 +644,10 @@ def test_an_unreadable_log_is_surfaced_even_when_another_day_is_fine(tmp_path):
         assert r.level == "unknown", collect.__name__
         assert "无法识别" in json.dumps(r.reasons, ensure_ascii=False) or "无法识别" in (r.section["message"] or ""), collect.__name__
     d = col.collect_days(settings(tmp_path), NOW).section["data"]
-    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                          # 数据仍显示好的那天,但级别不是 ok
+    # 好的那天照常显示,坏的那天也在表里(标着 trusted=false)——两边都消失才是问题
+    days = {x["day"]: x for x in d["days"]}
+    assert set(days) == {"2026-11-11", "2026-11-12"}
+    assert days["2026-11-12"]["trusted"] is False and days["2026-11-12"]["clean"] is False
 
 
 def test_real_log_format_is_trusted(tmp_path):

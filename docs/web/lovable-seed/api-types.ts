@@ -205,6 +205,7 @@ export interface RunDetail {
   selection?: Record<string, unknown> | null;
   windows?: unknown[] | null;
   error?: Record<string, unknown> | null;
+  stats?: Record<string, unknown> | null;
 }
 
 export interface DocData {

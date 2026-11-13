@@ -142,6 +142,7 @@
 1. StateBadge:state 取值 ok / stale / missing / corrupt / unknown;收到任何未知取值一律按 unknown 渲染,绝不当作 ok。每个状态都是"图标 + 颜色 + 文字"三件套(按设计文档 §4 的表)。
 2. SectionCard:接收一个 Section<T>(包含 state、as_of、age_seconds、message、data)。
    - state=ok:正常渲染内容。
+   - state=unknown:内容照常渲染,但要显示『部分数据无法读取』的提示徽标(不等于『没有数据』)。
    - state=stale:内容保留、整体 60% 不透明度、卡片头显示"数据已过期"徽标,不用绿色。
    - state=missing:不渲染内容,显示"未找到数据来源"和 message。
    - state=corrupt:不渲染内容,显示"数据来源损坏或正在被写入"和 message。
