@@ -35,9 +35,7 @@ class Result:
         `state` 决定内容能不能看,`level` 决定徽标:前端要能区分
         『数据是坏的』(state=unknown)和『有些内容没列出来/没检查』(state=ok + level=warn)。
         """
-        self.section.setdefault("level", self.level)
-        if self.section.get("level") != self.level:
-            self.section["level"] = self.level
+        self.section["level"] = self.level
 
 
 def _num(value: Any) -> bool:
@@ -865,7 +863,10 @@ def collect_research(settings: Settings, now: float) -> Result:
 
     ledger_path = results_dir / "submissions.jsonl"
     runs = _run_files(results_dir)
-    pending_files = sorted(f for f in pending_dir.glob("*.py") if _really_inside(f, pending_dir)) if pending_dir.is_dir() else []
+    # **按 mtime 倒序**:「只显示最近 N 个」得是真的最近。按文件名排序的话,带时间戳的候选名
+    # 恰恰是最新的那批会被丢掉——审阅时最容易漏的就是新候选。
+    pending_files = sorted((f for f in pending_dir.glob("*.py") if _really_inside(f, pending_dir)),
+                           key=lambda f: (-(f.stat().st_mtime if f.exists() else 0), f.name)) if pending_dir.is_dir() else []
     if not (results_dir.is_dir() or pending_dir.is_dir() or ledger_path.exists()):
         sec = m.section("missing", None, now=now, message="未找到研究沙盒目录(沙盒未部署或尚未使用)")
         return Result(sec, "unknown", "沙盒未部署", [_reason("research", "unknown", "未找到研究沙盒目录")])
@@ -901,14 +902,15 @@ def collect_research(settings: Settings, now: float) -> Result:
         return Result(sec, "unknown", "批准记录损坏", [_reason("research", "unknown", "批准记录损坏:无法判断哪些候选已批准,请人工检查")])
     approved_hashes = set(approvals) if isinstance(approvals, dict) else set()
 
-    pending, unreadable_pending = [], 0
+    # 两个计数必须分开:**读不出来**(文件坏了/超上限,→ state=unknown)与**没列出**(超出显示上限,
+    # 文件其实完好,→ state=ok + level=warn)。混在一起时,超出上限的文件会被说成『无法读取』——假话。
+    pending, unreadable_pending, over_limit_pending = [], 0, max(len(pending_files) - MAX_PENDING_LISTED, 0)
     for p in pending_files[:MAX_PENDING_LISTED]:
         sha = _sha256(p)
         if sha is None:
-            unreadable_pending += 1                        # 读不了或超过上限:计数并暴露,不静默消失
+            unreadable_pending += 1                        # 读不了或超过大小上限:计数并暴露,不静默消失
             continue
         pending.append({"name": p.name, "sha256": sha, "approved": sha in approved_hashes})
-    unreadable_pending += max(len(pending_files) - MAX_PENDING_LISTED, 0)
 
     recent, unreadable_runs = [], 0
     shown = settings.raw["recent_runs"]
@@ -933,9 +935,10 @@ def collect_research(settings: Settings, now: float) -> Result:
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
     if unreadable_pending:
-        problems.append(f"有 {unreadable_pending} 个待审候选未列出(只显示最近 {MAX_PENDING_LISTED} 个)"
-                        if unreadable_pending > MAX_PENDING_LISTED else
-                        f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
+        problems.append(f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
+    if over_limit_pending:
+        # 只是没列出(文件是好的)→ 进 notes:level=warn,state 仍是 ok。与运行结果的处理一致。
+        notes.append(f"有 {over_limit_pending} 个待审候选未列出(只显示最近 {MAX_PENDING_LISTED} 个)")
     reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
     if problems:
         level, headline = "warn", "有数据无法显示"
@@ -1044,7 +1047,7 @@ def _collect_safely(name: str, func, settings: Settings, now: float) -> Result:
 def collect_all(settings: Settings, now: float) -> dict[str, Result]:
     # 按名字在模块里现查(而不是在定义处绑定函数对象),这样测试可以替换单个 collector 来验证隔离性
     return {name: _collect_safely(name, globals()[f"collect_{name}"], settings, now)
-            for name in ("trading", "alerts", "days", "recording", "research")}
+            for name in ("trading", "alerts", "days", "recording", "research", "evolution")}
 
 
 def collect_overview(settings: Settings, now: float) -> dict:
