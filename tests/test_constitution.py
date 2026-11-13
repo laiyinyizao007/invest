@@ -6,6 +6,7 @@ docs/adr/20261113-evolution-engine.md 阶段 2。清单只能追加,不能删减
 import dataclasses
 import json
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -98,8 +99,79 @@ def test_order_calls_are_rejected_in_candidate_code(call):
 
 
 def test_param_grid_literal_must_not_name_protected_parameters():
+    """param_grid 里出现受保护参数必须被拦。
+
+    这条检查的实际范围是**任何字典字面量**(不只是 param_grid)——受保护参数出现在哪个字典里
+    都是把底线写进候选自己的配置。提示语因此写"字典字面量"而不是"param_grid":
+    对着一个与 param_grid 毫无关系的字典说"param_grid 含受保护参数",会把改候选的人带偏。"""
     src = 'class C:\n    param_grid = {"risk_budget": [100, 200, 300], "fast_window": [1, 2, 3], "atr_mult": [1, 2, 3]}\n'
-    assert any("risk_budget" in f and "param_grid" in f for f in screen(src))
+    assert any("risk_budget" in f and "字典字面量" in f for f in screen(src))
+
+
+def test_protected_parameter_in_any_dict_literal_is_rejected():
+    """受保护参数出现在**任何**字典字面量里都要被拦,不限于 param_grid。"""
+    src = 'class C:\n    def entry_signal(self):\n        d = {"risk_budget": 1}\n        return 0\n'
+    assert any("risk_budget" in f for f in screen(src))
+
+
+# ---------- 框架的"按名 setter":update_setting ----------
+
+def test_by_name_setter_call_is_rejected():
+    """`self.update_setting(dict(risk_budget=1e12))` 必须被静态层拦下。
+
+    vnpy 的 `CtaTemplate.update_setting` 会把字典里的键**按键名** setattr 到实例上,
+    而模板的 `parameters` 列表里正好有四个受保护参数(risk_budget / max_daily_losses /
+    atr_window / history_vt_symbol)。第 5 轮外部复核实测:改之前三层防线全绿,
+    `self.risk_budget` 由 300.0 变成 1e12,`within_budget` 因此返回 True——
+    单笔风险预算被彻底改掉。
+    名字在源码里既不是属性赋值也不是字典键(是 ast.keyword.arg),按语法位置筛查看不见它,
+    所以必须显式拦"按名 setter"这一类入口。"""
+    src = ("class C:\n"
+           "    def entry_signal(self):\n"
+           "        self.update_setting(dict(risk_budget=1e12))\n"
+           "        return 0\n")
+    findings = screen(src)
+    assert any("update_setting" in f and "按名 setter" in f for f in findings), findings
+
+
+def test_by_name_setter_alias_is_rejected():
+    """取别名再调用同样要拦:`f = self.update_setting` 之后调用点看不出是谁。"""
+    src = ("class C:\n"
+           "    def entry_signal(self):\n"
+           "        f = self.update_setting\n"
+           "        f({})\n"
+           "        return 0\n")
+    findings = screen(src)
+    assert any("update_setting" in f for f in findings), findings
+
+
+def test_candidate_may_not_define_a_by_name_setter():
+    """候选自己定义 update_setting 也要拦:引擎初始化时会调用它。"""
+    src = ("class C:\n"
+           "    def update_setting(self, setting):\n"
+           "        self.risk_budget = 1e12\n")
+    findings = screen(src)
+    assert any("update_setting" in f and "按名 setter" in f for f in findings), findings
+
+
+def test_protected_parameter_as_keyword_argument_is_rejected():
+    """受保护参数作为**关键字参数**出现也要拦:`dict(risk_budget=…)` 里它是 ast.keyword.arg。"""
+    src = ("class C:\n"
+           "    def entry_signal(self):\n"
+           "        d = dict(risk_budget=1e12)\n"
+           "        return 0\n")
+    findings = screen(src)
+    assert any("risk_budget" in f and "关键字参数" in f for f in findings), findings
+
+
+def test_protected_parameter_keyword_is_case_insensitive():
+    """大小写不敏感,与 check_params 同一把尺子(Risk_Budget 与 risk_budget 是两个属性)。"""
+    src = ("class C:\n"
+           "    def entry_signal(self):\n"
+           "        d = dict(Risk_Budget=1e12)\n"
+           "        return 0\n")
+    findings = screen(src)
+    assert any("Risk_Budget" in f for f in findings), findings
 
 
 def test_syntax_errors_fail_closed():
@@ -220,6 +292,18 @@ def test_runtime_rejects_overriding_a_protected_member():
         risk_budget = 1e9
 
     assert any("risk_budget" in f for f in runtime(Bad))
+
+
+def test_runtime_rejects_defining_a_by_name_setter():
+    """候选不得自己定义按名 setter。
+
+    引擎初始化时会调用 `update_setting`,候选在这里改写底线,静态层之外的路径也会中招。
+    这条不依赖"模板恰好有同名成员"——即使模板没有 update_setting,候选也不许定义它。"""
+    class Bad(Template):
+        def update_setting(self, setting):
+            self.risk_budget = 1e12
+
+    assert any("update_setting" in f for f in runtime(Bad))
 
 
 def test_runtime_rejects_overriding_a_method_even_through_an_intermediate_class():
@@ -377,6 +461,7 @@ def test_grid_forbidden_axes_come_from_the_constitution_not_a_second_copy():
 
 def test_family_root_of_the_real_template_is_the_application_base_not_abc():
     """家族根应当是 TrendAtrStrategy(应用层基类),不是 abc.ABC。"""
+    pytest.importorskip("vnpy.trader.setting")     # 这三个用例要真实模板,没有 vnpy 的环境跳过
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
     root = const.family_root(TrendAtr15mStrategy)
     assert root.__name__ == "TrendAtrStrategy", f"家族根算成了 {root.__name__}"
@@ -384,6 +469,7 @@ def test_family_root_of_the_real_template_is_the_application_base_not_abc():
 
 def test_a_plain_real_candidate_is_not_rejected_for_metaclass_generated_members():
     """空候选类不该因为 ABCMeta 自动生成的 _abc_impl 被拒。"""
+    pytest.importorskip("vnpy.trader.setting")
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
     c = const.default()
     findings = const.check_class(TrendAtr15mStrategy, TrendAtr15mStrategy, c)
@@ -392,6 +478,7 @@ def test_a_plain_real_candidate_is_not_rejected_for_metaclass_generated_members(
 
 def test_a_real_daily_family_candidate_is_accepted():
     """日线族候选(只继承 TrendAtrStrategy)不该被当成重写模板成员。"""
+    pytest.importorskip("vnpy.trader.setting")
     from strategies.trend_atr_strategy import TrendAtrStrategy
     c = const.default()
 
@@ -488,116 +575,134 @@ def test_constitution_file_cannot_swap_allowed_and_protected(tmp_path):
         const.load(_write(tmp_path, BASE | {"protected_names": ["entry_signal"]}))
 
 
+# ---------- "只能追加"的历史守卫 ----------
+
+# 守卫本体在 tools/check_constitution_history.py:只用标准库 + git。
+# CI 跑的是那个**脚本**而不是 pytest——pytest 的 conftest 会 import segment_ledger →
+# bootstrap → vnpy,在只装 pytest 的 CI 上根本收集不起来(第 6 轮 codex 实测:退出码 4)。
+# 守卫跑不起来 = 没人执行 = 这份宪法的保护承诺是空的。
+from tools.check_constitution_history import (  # noqa: E402
+    BUILTIN_REGISTRY,
+    BUILTIN_SETS,
+    HistoryUnavailable,
+    check_all,
+    check_constitution_file,
+    check_registry_completeness,
+    const_string_set,
+    removed_protections,
+)
+
+ROOT = Path(const.CONSTITUTION_FILE.parent.parent)
+
+
 def test_constitution_history_is_append_only():
     """清单的历史追加项不得被删除:load() 只与代码里的内置集合合并,察觉不到文件里的删除。
 
     "只能追加"必须靠版本控制来保证——每次提交后的清单,相对上一次提交只能增不能减。
-    这个检查在 CI 里跑,防止有人改配置时顺手删掉一条保护。
 
     浅克隆(git clone --depth=1 / actions/checkout 的 fetch-depth: 1)下 `git log` 只能看到
     一个提交,检查会"看起来通过"实则根本没比对——那种情况必须报错而不是跳过:
     查不了等于没查,不能让它冒充通过。CI 需要完整历史(fetch-depth: 0)。"""
+    try:
+        problems = check_all(ROOT)
+    except HistoryUnavailable as exc:
+        pytest.fail(f"无法检查宪法历史(fail-closed): {exc}")
+    assert not problems, "宪法历史守卫发现问题:" + chr(10) + chr(10).join("  " + x for x in problems)
+
+
+def test_history_guard_would_notice_a_shrunk_protection():
+    """这条检查自己必须能发现"内置保护被删"——否则它自己失效时没有任何测试会报警。
+
+    早先的提取器只认 tuple/list,而 `BUILTIN_PROTECTED_NAMES` 的定义是 `tuple + tuple`,
+    于是这个最大的一组受保护成员从来没进过比对:删掉 `on_disconnect` 之后
+    Constitution Guard 依然全绿(第 5 轮 codex 实测)。这个用例是那道 mutation 的守卫。"""
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    assert '"on_disconnect"' in source
+    shrunk = source.replace('"on_disconnect",', "", 1)
+    assert shrunk != source, "源码里找不到 on_disconnect,用例本身失效了"
+    removed = removed_protections(shrunk, source, BUILTIN_SETS)
+    assert "on_disconnect" in removed.get("BUILTIN_PROTECTED_NAMES", set()), removed
+
+
+def test_registry_covers_every_registered_constant():
+    """注册表里的每个常量都必须能被提取器解析——有一个解析不了,那条保护就是没被守着。"""
+    for rel, names in BUILTIN_REGISTRY:
+        source = (ROOT / rel).read_text(encoding="utf-8")
+        parsed = const_string_set(source, names)
+        for name in names:
+            assert name in parsed, f"{rel} 的 {name} 解析不出字符串集合(注册表与源码不一致)"
+
+
+def test_registry_covers_every_string_set_constant():
+    """源码里新增一个字符串集合型的内置保护常量时,必须同时登记进历史守卫。
+
+    漏登记 = 那个常量的历史守卫是空的,而它自己不会报警:
+    当年 `BUILTIN_PROTECTED_NAMES` 正是不该漏的那一组,却因为提取器不认 BinOp 从未被比对过。"""
+    problems = check_registry_completeness(ROOT)
+    assert not problems, chr(10).join(problems)
+
+
+def test_adding_an_unregistered_protection_constant_is_noticed():
+    """守卫的完整性检查自己必须能发现"新增了没登记的常量"。"""
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    added = source + chr(10) + 'BUILTIN_MADE_UP_PROTECTION = ("x", "y")' + chr(10)
+    parsed = const_string_set(added, ("BUILTIN_MADE_UP_PROTECTION",))
+    assert "BUILTIN_MADE_UP_PROTECTION" in parsed, "提取器认不出新常量,用例本身失效了"
+
+
+def test_a_manifest_may_not_point_at_a_template_outside_the_whitelist(tmp_path):
+    """清单的 template 必须落在**那一版**的内置白名单里。
+
+    只改清单里的 template 就等于绕开了白名单——白名单才是真正限制"能换成哪个模板"的东西。
+    第 7 轮独立复核指出早先的写法("当前白名单 vs 旧白名单不相等才报")只在白名单从未增长过时成立:
+    白名单一旦在历史上涨过,那条检查就永远不报(隔离克隆里先给白名单加一项、再改清单的 template,
+    守卫退出码 0)。现在按逐个版本检查,不再依赖历史的形状。"""
     import json
     import subprocess
 
-    root = str(const.CONSTITUTION_FILE.parent.parent)
+    repo = tmp_path / "repo"
+    (repo / "config").mkdir(parents=True)
+    (repo / "risk").mkdir()
+    manifest = repo / "config" / "immutable_constitution.json"
+    source = repo / "risk" / "constitution.py"
 
     def git(*args):
-        return subprocess.run(["git", *args], capture_output=True, text=True, cwd=root)
+        return subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+                               *args], cwd=str(repo), capture_output=True, encoding="utf-8", errors="replace")
 
-    shallow = git("rev-parse", "--is-shallow-repository")
-    if shallow.returncode == 0 and shallow.stdout.strip() == "true":
-        pytest.fail("仓库是浅克隆,无法比对清单历史(清单只能追加的检查需要完整历史;"
-                    "CI 请用 fetch-depth: 0)")
+    def commit(template: str, allowed: tuple[str, ...], message: str = "manifest"):
+        manifest.write_text(json.dumps({
+            "version": 1, "template": template, "allowed_overrides": [], "protected_names": [],
+            "protected_parameters": [], "forbidden_order_calls": [], "protected_module_attrs": [],
+        }), encoding="utf-8")
+        source.write_text("BUILTIN_ALLOWED_TEMPLATES = " + repr(allowed) + chr(10), encoding="utf-8")
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", message)
 
-    out = git("log", "--format=%H", "--", "config/immutable_constitution.json")
-    if out.returncode != 0:
-        pytest.fail(f"git 不可用,无法检查清单历史(fail-closed): {out.stderr.strip()}")
-    commits = [h.strip() for h in out.stdout.split() if h.strip()]
-    if len(commits) < 2:
-        # 仓库历史是完整的(上面已排除浅克隆),清单确实只有一个版本:还没有"上一次"可比,
-        # 不存在被删的可能,这不是检查没生效。
-        pytest.skip("清单文件自建立起只提交过一次,暂无可比对的历史版本")
+    commit("pkg:A", ("pkg:A", "pkg:B"))
+    commit("pkg:B", ("pkg:A", "pkg:B"))            # 换成白名单里的另一个模板 → 合法
+    assert not check_constitution_file(repo), "白名单内的模板切换被误报了"
 
-    def read(rev):
-        raw = git("show", f"{rev}:config/immutable_constitution.json")
-        if raw.returncode != 0:
-            pytest.fail(f"无法读取历史版本 {rev}: {raw.stderr.strip()}")
-        return json.loads(raw.stdout)
-
-    current = read(commits[0])
-    for rev in commits[1:]:
-        older = read(rev)
-        for field in ("allowed_overrides", "protected_names", "protected_parameters",
-                      "forbidden_order_calls", "protected_module_attrs"):
-            removed = set(older.get(field, [])) - set(current.get(field, []))
-            assert not removed, f"{field} 里的 {sorted(removed)} 在后续提交中被删除了(清单只能追加)"
+    # 白名单先涨过一次(历史上真实存在过的形状),再把清单指向白名单之外的模板
+    commit("pkg:B", ("pkg:A", "pkg:B", "pkg:C"), "widen the whitelist")
+    commit("pkg:X", ("pkg:A", "pkg:B", "pkg:C"), "point outside the whitelist")
+    problems = check_constitution_file(repo)
+    assert problems, "清单指向白名单之外的模板,守卫却没有报出来"
+    assert any("template" in p for p in problems), problems
 
 
-BUILTIN_SETS = (
-    "BUILTIN_ALLOWED_OVERRIDES",
-    "BUILTIN_PROTECTED_NAMES",
-    "BUILTIN_PROTECTED_PARAMETERS",
-    "BUILTIN_FORBIDDEN_ORDER_CALLS",
-    "BUILTIN_PROTECTED_MODULE_ATTRS",
-    "BUILTIN_FORBIDDEN_DUNDERS",
-)
+def test_the_ci_workflow_runs_the_guard_without_installing_the_trading_stack():
+    """CI 必须跑那个独立脚本,而不是 pytest。
 
-
-def test_builtin_protections_are_never_shrunk():
-    """代码里的内置保护项也不许被删掉。
-
-    清单文件只能追加,靠的是上面那个历史比对;但**内置**的保护项写在
-    `risk/constitution.py` 的常量里,那个比对看不见它们——把
-    `BUILTIN_PROTECTED_PARAMETERS` 里的 `risk_budget` 删掉,其它检查一样全绿,
-    而候选已经可以改写风控底线了。这条检查把历史版本里的常量也读出来比对。"""
-    import ast
-    import subprocess
-
-    root = str(const.CONSTITUTION_FILE.parent.parent)
-
-    def git(*args):
-        # 显式按 utf-8 解码:系统默认编码在中文 Windows 上是 cp1252,会解不出仓库里的中文注释。
-        return subprocess.run(["git", *args], capture_output=True, cwd=root, encoding="utf-8",
-                              errors="replace")
-
-    shallow = git("rev-parse", "--is-shallow-repository")
-    if shallow.returncode == 0 and shallow.stdout.strip() == "true":
-        pytest.fail("仓库是浅克隆,无法比对内置保护项的历史(fail-closed)")
-
-    out = git("log", "--format=%H", "--", "risk/constitution.py")
-    if out.returncode != 0:
-        pytest.fail(f"git 不可用,无法检查内置保护项(fail-closed): {out.stderr.strip()}")
-    commits = [h.strip() for h in out.stdout.split() if h.strip()]
-    if len(commits) < 2:
-        pytest.skip("宪法模块自建立起只提交过一次,暂无可比对的历史版本")
-
-    def sets_of(source):
-        """从源码里取出各内置常量定义的字符串集合;常量不存在则返回空 dict。"""
-        found = {}
-        for node in ast.parse(source).body:
-            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                continue
-            target = node.targets[0]
-            if not isinstance(target, ast.Name) or target.id not in BUILTIN_SETS:
-                continue
-            if not isinstance(node.value, (ast.Tuple, ast.List)):
-                continue
-            values = [e.value for e in node.value.elts
-                      if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-            found[target.id] = set(values)
-        return found
-
-    current = sets_of(open(str(const.CONSTITUTION_FILE.parent.parent / "risk" / "constitution.py"),
-                           encoding="utf-8").read())
-    for rev in commits:
-        raw = git("show", f"{rev}:risk/constitution.py")
-        if raw.returncode != 0:
-            continue
-        older = sets_of(raw.stdout)
-        for name, values in older.items():
-            removed = values - current.get(name, set())
-            assert not removed, f"{name} 里的 {sorted(removed)} 在后续提交中被删除了(内置保护只能增不能减)"
+    pytest 的 conftest 会 import vnpy,只装 pytest 的 CI 上会直接收集失败(退出码 4)——
+    守卫于是在 CI 上一次都没跑过,却看起来"配好了"(第 6 轮 codex 实测)。"""
+    workflow = (ROOT / ".github" / "workflows" / "constitution-guard.yml").read_text(encoding="utf-8")
+    assert "check_constitution_history.py" in workflow, "CI 没有调用独立守卫脚本"
+    assert "fetch-depth: 0" in workflow, "CI 必须拉完整历史,否则比对无从谈起"
+    installs = [ln.strip() for ln in workflow.splitlines()
+                if ln.strip().startswith("run:") and "pip install" in ln]
+    assert not installs, f"宪法层不该安装交易环境依赖: {installs}"
 
 
 # ---------- 别名绕过:下单接口与 dunder 同样拦引用 ----------
@@ -612,3 +717,46 @@ def test_aliasing_an_order_call_is_rejected(snippet):
     src = f"class C:\n    def entry_signal(self):\n        {snippet}\n        return 0\n"
     findings = screen(src)
     assert findings, f"未拦下: {snippet}"
+
+
+def test_the_false_positive_on_ordinary_identifiers_is_intentional():
+    """局部变量/参数恰好叫 `cover`/`short`/`buy` 会被拒——这是有意的,不是 AST 检查的缺陷。
+
+    静态层按名字拦,不做作用域解析,所以 `cover = True` 这种普通写法也会命中下单接口名单。
+    这是 fail-closed 的取舍:宁可误伤让人来看,不可放过一个真绕过(第 5 轮两轮复核都实测确认)。
+    这个用例把"有意为之"钉住——以后有人看到误报就放松规则时,会先撞到这里。
+    正确的放宽方式是做作用域解析,不是删掉这条规则。"""
+    src = "class C:\n    def entry_signal(self):\n        cover = True\n        return 1 if cover else 0\n"
+    findings = screen(src)
+    assert any("cover" in f for f in findings), findings
+
+
+# ---------- 第 6 轮 codex 的 L3/L4/L5:静态层的三处口径不一致 ----------
+
+def test_a_dict_literal_with_a_differently_cased_protected_key_is_rejected():
+    """字典键与参数层同一把尺子(大小写不敏感)。
+
+    精确比对会让 `{"Risk_Budget": 1}` 放行,而参数层的 `check_params` 早就按
+    不敏感比对了——两处口径分裂迟早变成漏洞。"""
+    findings = const.screen_source("d = {'Risk_Budget': 1}" + chr(10))
+    assert findings, "大小写不同的受保护参数名必须被拦下"
+
+
+def test_a_dict_literal_with_a_protected_member_name_is_rejected():
+    """字典键也要查受保护**成员**,不只受保护参数——与 check_params 用的同一把尺子。"""
+    findings = const.screen_source("d = {'on_disconnect': 1}" + chr(10))
+    assert findings, "受保护成员名出现在字典字面量里必须被拦下"
+
+
+def test_assigning_a_forbidden_dunder_in_a_class_body_is_rejected():
+    """`class C: __setattr__ = print` 这种**赋值**形式的定义同样要拦。
+
+    此前静态层只看 `def` 形式,赋值形式能溜过去(运行时层能抓到,但那时已经在跑候选了)。"""
+    findings = const.screen_source("class C:" + chr(10) + "    __setattr__ = print" + chr(10))
+    assert findings and any("__setattr__" in f for f in findings), findings
+
+
+def test_assigning_a_by_name_setter_in_a_class_body_is_rejected():
+    """`class C: update_setting = print` 同理:按名 setter 的赋值形式也要拦。"""
+    findings = const.screen_source("class C:" + chr(10) + "    update_setting = print" + chr(10))
+    assert findings and any("update_setting" in f for f in findings), findings

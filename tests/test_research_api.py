@@ -200,6 +200,15 @@ def make_strategy(tree, body="class S: pass\n"):
     return path
 
 
+def approve(path):
+    """记录一次人工批准。
+
+    子入口自己查审批记录(哈希谁都能自己算,"人看过代码"这条前提不能靠父入口担保),
+    所以直接调用子入口的用例必须先走一次批准,否则被拒的是"未批准"而不是被测的那一条。
+    """
+    api.rs.record_approval(path, api.settings()[1]["approvals_file"])
+
+
 def test_approve_records_hash_and_unlocks_backtest_without_confirm_flag(tree, monkeypatch, capsys):
     path = make_strategy(tree)
     assert run("approve", "--strategy", "s.py") == api.EXIT_OK
@@ -292,8 +301,9 @@ def test_invalid_config_refuses_every_command(tree, monkeypatch, capsys):
     assert run("results") == api.EXIT_REFUSED and "配置非法" in capsys.readouterr().err
 
 
-def test_child_refuses_when_file_changed_after_approval(tmp_path):
-    f = tmp_path / "s.py"
+def test_child_refuses_when_file_changed_after_approval(tree):
+    # 候选必须放在 pending_strategies/ 内:子入口自己会查这条,否则拒绝原因会变成"路径不对"
+    f = tree / "pending_strategies" / "s.py"
     f.write_text("class S: pass\n", encoding="utf-8")
     sha = api.rs.file_sha256(f)
     f.write_text("class S:\n    x = 1\n", encoding="utf-8")                 # 批准之后被改动(TOCTOU)
@@ -420,8 +430,8 @@ def test_evaluate_cli_and_child_parsers():
     assert args.random_runs == 50 and child.random_runs == 50 and child.sha256 == "abc"
 
 
-def test_evaluate_child_refuses_a_file_changed_after_approval(tmp_path):
-    f = tmp_path / "s.py"
+def test_evaluate_child_refuses_a_file_changed_after_approval(tree):
+    f = tree / "pending_strategies" / "s.py"
     f.write_text("class S: pass\n", encoding="utf-8")
     sha = api.rs.file_sha256(f)
     f.write_text("class S:\n    x = 1\n", encoding="utf-8")
@@ -733,12 +743,12 @@ def test_ordinary_params_are_accepted(tree, monkeypatch):
     assert result["kind"] == "backtest"
 
 
-def test_child_refuses_a_candidate_that_overrides_a_protected_member(tmp_path, monkeypatch):
+def test_child_refuses_a_candidate_that_overrides_a_protected_member(tree, monkeypatch):
     """候选在类体里改写风控底线:静态筛查在提交时就拒绝,这里守住第二道(文件被替换的 TOCTOU 情形)。"""
-    path = tmp_path / "s.py"
+    path = tree / "pending_strategies" / "s.py"
     path.write_text("class S:\n    risk_budget = 99999.0\n", encoding="utf-8")
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
-                                           "--random-runs", "5", "--sha256", api.rs.file_sha256(path)])
+                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
 
     assert api.run_evaluate_child(args) == api.EXIT_REFUSED
 
@@ -755,9 +765,10 @@ def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree,
         "        return 1\n"
     )
     path = make_strategy(tree, body)
+    approve(path)
     args = api.build_parser().parse_args(
         ["_gate_child", "--file", str(path), "--cls", "S", "--params", "{}",
-         "--on-plateau", "0", "--sha256", api.rs.file_sha256(path), "--random-runs", "1"])
+         "--on-plateau", "0", "--sha256", api.rs.file_sha256(path), "--random-runs", "20"])
 
     monkeypatch.setattr(api.const, "check_class",
                         lambda *a, **k: ["测试注入:候选重写了受保护成员 risk_budget"])
@@ -810,9 +821,9 @@ def test_a_stale_pyc_cannot_replace_the_hashed_source(tmp_path, monkeypatch):
     assert cls.VALUE == "GOOD", "执行的不是被哈希的那份源码"
 
 
-def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tmp_path):
+def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tree):
     """子入口是独立的信任边界:绕过父入口直接传受保护参数,必须一样被拒。"""
-    f = tmp_path / "s.py"
+    f = tree / "pending_strategies" / "s.py"
     f.write_text("class S: pass\n", encoding="utf-8")
     sha = api.rs.file_sha256(f)
     bad = '{"risk_budget": 1000000000}'
@@ -822,11 +833,11 @@ def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tmp_
     assert api.run_child(args) == api.EXIT_REFUSED
 
     args = api.build_parser().parse_args(["_gate_child", "--file", str(f), "--cls", "S", "--params", bad,
-                                          "--on-plateau", "0", "--sha256", sha, "--random-runs", "1"])
+                                          "--on-plateau", "0", "--sha256", sha, "--random-runs", "20"])
     assert api.run_gate_child(args) == api.EXIT_REFUSED
 
 
-def test_evaluate_child_really_runs_the_evaluation(tmp_path, monkeypatch, capsys):
+def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     """evaluate 子进程必须真的走到评估那一步。
 
     早先统一入口的重构漏掉了 `cfg = rc.load()`,而 `cfg` 的使用点包在宽泛的
@@ -836,7 +847,7 @@ def test_evaluate_child_really_runs_the_evaluation(tmp_path, monkeypatch, capsys
     import types as pytypes
 
     body = "from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    VALUE = 'GOOD'\n"
-    path = tmp_path / "s.py"
+    path = tree / "pending_strategies" / "s.py"
     path.write_text(body, encoding="utf-8")
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
 
@@ -870,8 +881,9 @@ def test_evaluate_child_really_runs_the_evaluation(tmp_path, monkeypatch, capsys
                       ("strategies.random_entry_15m_strategy", rnd)):
         monkeypatch.setitem(sys.modules, name, mod)
 
+    approve(path)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
-                                          "--random-runs", "1", "--sha256", api.rs.file_sha256(path)])
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
     code = api.run_evaluate_child(args)
     out = capsys.readouterr().out
 
@@ -898,3 +910,153 @@ def test_the_saved_backtest_stats_are_exactly_what_the_dashboard_validates():
     assert "total_trade_count" not in row               # 落盘的形状里没有它
     for key in BACKTEST_STATS_KEYS:
         assert key in row and isinstance(row[key], (int, float))
+# ---------- 第 6 轮:隐藏入口的信任边界要闭合(数值参数、路径、导入期错误) ----------
+
+def test_child_entrypoints_refuse_a_negative_prior_trials(tree, capsys):
+    """`--prior-trials` 为负必须被拒:evaluate 路径会先做 `prior + 格子数` 再算 DSR,
+    负数让 N 变小,而 DSR 随 N 增大而变严——于是**晋级门槛被放松**。
+    (gate 路径不加分号,负数会被 candidate_eval 的 `n_trials >= 1` 拦下,evaluate 路径漏了。)"""
+    path = make_strategy(tree, "class S: pass\n")
+    approve(path)
+    sha = api.rs.file_sha256(path)
+    for cmd in (["_gate_child", "--params", "{}", "--on-plateau", "0", "--random-runs", "20"],
+                ["_evaluate_child", "--random-runs", "20"]):
+        argv = cmd + ["--file", str(path), "--cls", "S", "--sha256", sha, "--prior-trials", "-5"]
+        args = api.build_parser().parse_args(argv)
+        code = api.run_gate_child(args) if cmd[0] == "_gate_child" else api.run_evaluate_child(args)
+        assert code == api.EXIT_REFUSED, cmd
+        assert "prior-trials" in capsys.readouterr().err
+
+
+def test_child_entrypoints_refuse_random_runs_out_of_bounds(tree, capsys):
+    """`--random-runs` 越界必须被拒:子进程自身没有超时(超时只由父进程兜),
+    直接调用即可拖资源。父入口本来就用同一把配置尺子量,子入口不能比父入口松。"""
+    path = make_strategy(tree, "class S: pass\n")
+    approve(path)
+    sha = api.rs.file_sha256(path)
+    args = api.build_parser().parse_args(["_gate_child", "--file", str(path), "--cls", "S", "--params", "{}",
+                                          "--on-plateau", "0", "--sha256", sha, "--random-runs", "999999999"])
+    assert api.run_gate_child(args) == api.EXIT_REFUSED
+    assert "random-runs" in capsys.readouterr().err
+
+
+def test_child_entrypoints_refuse_a_file_outside_the_pending_directory(tree, capsys):
+    """候选文件必须在 pending_strategies/ 内:子入口能被直接调用,
+    不该假设 `--file` 是父进程给的——否则可以直接指向仓库里任何 .py。"""
+    outside = tree / "not_pending.py"
+    outside.write_text("class S: pass\n", encoding="utf-8")
+    args = api.build_parser().parse_args(["_child", "--file", str(outside), "--cls", "S", "--key", "CADJ",
+                                          "--segment", "train", "--params", "{}",
+                                          "--sha256", api.rs.file_sha256(outside)])
+    assert api.run_child(args) == api.EXIT_REFUSED
+    assert "pending_strategies" in capsys.readouterr().err
+
+
+def test_child_refuses_an_unknown_segment_with_the_refusal_code(tree, capsys):
+    """非法 --segment 的退出码必须是"拒绝"(2),不是未捕获异常的 1。
+
+    `rs.segment_window` 原来在受控异常处理之外,直接调用子入口会带 traceback 退出 1。"""
+    path = make_strategy(tree, "class S: pass\n")
+    approve(path)
+    args = api.build_parser().parse_args(["_child", "--file", str(path), "--cls", "S", "--key", "CADJ",
+                                          "--segment", "train", "--params", "{}",
+                                          "--sha256", api.rs.file_sha256(path)])
+    args.segment = "test"                                  # 绕过 parser 的 choices,模拟直接调用
+    assert api.run_child(args) == api.EXIT_REFUSED
+    assert "测试段" in capsys.readouterr().err
+
+
+def test_an_import_time_error_comes_back_as_a_structured_error(tree, monkeypatch, capsys):
+    """候选在**导入期**出错,要按结构化错误回传,而不是带 traceback 退出 1。
+
+    契约:所有候选侧的失败都走 `{"error": ...}` 这条通道,LLM 才拿得到诊断信息;
+    早先这类异常直接冒泡,父进程只报"回测失败(详情见本机日志)"。"""
+    path = make_strategy(tree, "import totally_missing_module_xyz\nclass S: pass\n")
+    approve(path)
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code = api.run_evaluate_child(args)
+    out = capsys.readouterr().out
+    assert code == api.EXIT_OK
+    payload = json.loads(out.split(api.CHILD_MARK)[-1])
+    assert "error" in payload, payload
+
+
+def test_a_candidate_file_with_a_bom_still_loads(tree, monkeypatch):
+    """带 BOM 的候选文件要能正常载入。
+
+    早先走标准文件载入器时 BOM 会被自动剥掉;改成自己读字节编译之后,
+    BOM 会留在源码里让 compile 报"invalid non-printable character U+FEFF"——
+    这是"同一份字节"改造带来的行为差异,不该悄悄存在。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_bytes("﻿from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    VALUE = 'GOOD'\n".encode("utf-8"))
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    cls = api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert cls.VALUE == "GOOD"
+
+
+# ---------- 第 6 轮 codex 的 H1/H2/M2/M3/L6 ----------
+
+def test_the_parent_side_screen_also_accepts_a_bom_candidate(tree):
+    """父入口的筛查与子入口的载入必须对 BOM 一致。
+
+    父入口此前按纯 utf-8 读文件,BOM 留在字符串里让 `ast.parse` 报"语法错误",
+    于是同一份带 BOM 的候选在父入口被拒、在子入口却能过——而 ADR 写的是
+    "BOM 候选与无 BOM 候选行为一致"。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_bytes(("from vnpy_ctastrategy import CtaTemplate" + chr(10)
+                      + "class S(CtaTemplate):" + chr(10) + "    pass" + chr(10)).encode("utf-8-sig"))
+    cfg = api.rc.load()
+    findings = api.screen(path, cfg)
+    assert not findings, findings
+
+
+def test_the_recorded_hash_matches_the_approved_hash_for_a_crlf_file(tree, monkeypatch):
+    """结果里记的 sha256 必须与批准记录里的同一个值。
+
+    此前结果里的哈希取的是 `read_text` 之后的文本,而 read_text 会做通用换行转换:
+    CRLF 文件于是算出一个与批准哈希**必然不同**的值(与并发无关,是确定性的),
+    审计人拿结果里的哈希去比对 approvals 文件会查无此项。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_bytes(b"class S: pass" + b"\r" + b"\n")
+    api.rs.record_approval(path, tree / "data" / "research-control" / "approvals.json")
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"stats": {}, "pnls": []})
+    result = api.backtest_job(strategy="s.py", cls="S", key="CADJ", segment="train", params={})
+    assert result["strategy_sha256"] == api.rs.file_sha256(path)
+
+
+def test_a_child_refusal_reaches_the_caller_with_its_reason():
+    """子进程的"拒绝"必须原样传到父层。
+
+    早先一律压成"回测失败(退出码 3)",于是子入口里那些拒绝的原因只进了本机 stderr,
+    永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。"""
+    import subprocess
+    import sys
+
+    with pytest.raises(api.JobError) as excinfo:
+        api.spawn_child([sys.executable, "-c", "import sys; sys.stderr.write('参数 risk_budget 属于受保护项'); sys.exit(2)"], 30)
+    assert excinfo.value.code == api.EXIT_REFUSED
+    assert "risk_budget" in excinfo.value.message
+
+
+def test_a_child_entrypoint_refuses_a_candidate_that_was_never_approved(tree, capsys):
+    """子入口必须自己查审批记录。
+
+    `--sha256` 只证明"文件没变",不证明"人看过":哈希谁都能自己算。子入口能被直接调用,
+    不查审批就能跑一份从未被人审阅过的候选——那正是这套设计最核心的前提。"""
+    path = make_strategy(tree, "class S: pass" + chr(10))
+    args = api.build_parser().parse_args(["_child", "--file", str(path), "--cls", "S", "--key", "CADJ",
+                                          "--segment", "train", "--params", "{}",
+                                          "--sha256", api.rs.file_sha256(path)])
+    assert api.run_child(args) == api.EXIT_REFUSED
+    assert "批准" in capsys.readouterr().err
+
+
+def test_a_missing_class_is_a_refusal_not_a_failure(tree, monkeypatch):
+    """`--cls` 指向不存在的类是**参数错误**,退出码应为"拒绝"(2)而不是"失败"(3)。"""
+    path = make_strategy(tree, "class S: pass" + chr(10))
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as excinfo:
+        api.import_candidate(path, "NoSuchClass", api.rs.file_sha256(path))
+    assert excinfo.value.code == api.EXIT_REFUSED

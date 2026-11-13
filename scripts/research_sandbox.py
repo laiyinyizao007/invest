@@ -35,9 +35,66 @@ FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "
                    "type"}      # type(self).__base__ 之类的反射入口
 FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
 
+# 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
+# `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,
+# 而调用点完全看不出被调的是谁(第 7 轮实测:静态层与沙盒层当时都返回空列表,
+# 底线由 300 变成 1e12,within_budget 随之放行)。
+# 名单只收两类:dunder 形状的名字(执行入口一定是这类),
+# 以及"按名字改写/反射"的内建名(getattr/setattr/eval/globals 之类)。
+# **不含** `open`/`type`:交易数据里 "status": "open" 这种字段名很常见,
+# 按字符串一律拦会把正常候选整片拒掉——误报面远大于收益。
+FORBIDDEN_STRINGS = FORBIDDEN_ATTRS | {
+    "__import__", "__getattribute__", "__setattr__", "__delattr__",
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "globals", "locals", "vars", "input",
+}
+
 ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
              "LOCALAPPDATA", "PROGRAMDATA", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "PYTHONIOENCODING", "TZ", "VIRTUAL_ENV",
              "INVEST_C15_DATA", "RESEARCH_SANDBOX_CONFIG")      # 数据路径与配置路径(均不含凭据)
+
+# 执行候选时**不给**的内建:属性改写、反射、动态执行、文件访问、类型系统入口。
+#
+# 为什么是"不给"而不是"再禁一批名字"(第 7 轮复核实测):
+# 静态层能封住**已知的写法**,封不住**能力**——
+#   e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)
+# 这条路径上的每个名字(回溯、帧、内建字典)都不在禁用名单里,静态层与沙盒层都返回空列表;
+# 而 `unittest.mock.patch.object(self, 'risk_budget', 1e12)` 只要能 import 就能改写实例属性。
+# 与其继续枚举反射路径(枚举不完,而且每加一批都要配测试),不如把能力本身收走:
+# 候选执行时的内建字典里**没有 setattr**,那么无论它怎么拿到内建字典都没用——
+# 连 `frame.f_builtins` 也只会拿到这份受限字典。
+#
+# 代价:候选用到这些名字会得到 NameError(而不是静默放行),由人在批准前看出来。
+UNSAFE_BUILTINS = frozenset({
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "open",
+    "globals", "locals", "vars", "breakpoint", "input",
+    "type", "object",                       # 类型系统入口:__mro__/__subclasses__ 是万能钥匙
+    "help", "exit", "quit", "license", "credits",
+})
+
+# 这些模块能改写任意对象的属性(`unittest.mock.patch.object`)或拿到内建本身,同样禁掉。
+EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
+
+
+def safe_builtins(forbidden_modules: Sequence[str] = ()) -> dict:
+    """候选执行时用的**最小内建集合**:去掉 `UNSAFE_BUILTINS`,并把 `__import__` 换成受限版。
+
+    受限导入器只放行不在禁用名单里的模块——候选必须能 import(模板与策略基类就是这么来的),
+    但 `import builtins` / `import unittest.mock` 这类"拿到内建或改写属性能力"的入口必须关上。
+    """
+    import builtins as _builtins
+
+    blocked = set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES) | set(forbidden_modules)
+    real_import = _builtins.__import__
+
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.split(".")[0]
+        if root in blocked:
+            raise ImportError(f"禁止导入 {name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
+    safe["__import__"] = restricted_import
+    return safe
 
 
 class SandboxError(ValueError):
@@ -87,14 +144,19 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
         for name in names:
             if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in forbidden_calls:
-            # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
-            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in forbidden_calls:
+                # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
+            elif node.id in FORBIDDEN_ATTRS:
+                # 受禁属性名同样要拦**裸名**:`__builtins__` 是 exec 注入到 globals 里的字典,
+                # 裸名就能拿到(`f = __builtins__['__import__']`),只拦 `x.__builtins__` 是不够的。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过反射检查)")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
         # 属性名当字符串用:operator.attrgetter('__dict__')(self) 能绕开"禁止访问 __dict__"的
         # 属性写法(调用点看不出访问的是什么)。这些名字作为字符串出现时一律拒绝。
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_ATTRS:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_STRINGS:
             findings.append(f"第 {node.lineno} 行: 禁止引用 {node.value} 字符串")
     return findings
 

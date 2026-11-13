@@ -50,7 +50,7 @@
 - 重启触发条件(任一):接入第二个品种;滚动窗口 ≥ 8;出现新的未消耗测试段。重启须新 ADR。
 
 ### 沿用的硬约束
-- 风控底线不参与优化,进化只允许重写 `entry_signal` 与 `param_grid`。
+- 风控底线不参与优化,进化只允许重写白名单里的成员:`entry_signal`、`param_grid`、`parameters` 与可搜索参数(`fast_window`/`slow_window`/`atr_mult`/`take_profit_r`)。白名单以 `BUILTIN_ALLOWED_OVERRIDES` 为准。
 - 迭代上限(5 次 / 24 小时)、`max_source_bytes`、网关路由白名单不放宽。
 - 流程内任何节点不得写 `approved/`、`promotion_approval.json` 或实盘配置;上线仍须"人工批准 → `record_promotion.py` → SimNow → 另行授权实盘"。
 - 测试段(2024-01-01 起)已消耗一次,不得用于选择或进化反馈。
@@ -137,7 +137,27 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 ### 梯子步长 η:按配对日盈亏差的标准差定
 - **方法**:参考 Blum & Hardt 无参变体,用**配对差**的标准差估计噪声尺度——两条候选在同一验证窗口上的逐日盈亏之差,标准差比各自标准差小得多(共同的市场波动互相抵消)。取 `η ≈ 1.5 × SE(配对差)`,并设下限 **0.25 夏普**,避免在异常安静的窗口里算出 0.03 这种没意义的步长。
 - **为什么不用 0.1**:3 年样本的夏普标准误约 0.84,1.5 年验证窗口约 1.2;步长 0.1 只有噪声的约 1/12,梯子会不停汇报,等于没有。
-- **数值何时算出来**:需要 CADJ/MAADJ 的复权连续日线序列。**本开发环境没有该序列**(`~/.vntrader` 下无数据库,`data/` 下只有分钟原始数据,复权日线由 `scripts/build_continuous.py --symbol C --save` 写入 vn.py 数据库,在有数据的环境里构建)。因此 η 的**数值**必须在有该数据的环境里算出,并在生成第一份候选**之前**写进本 ADR;**方法**现在就定死。
+- **数值(已于 2026-11-13 算出并登记,早于任何候选生成)**:**η = 1.10 夏普**。
+  - **标定脚本**:`scripts/calc_ladder_eta.py`(可复跑,`--window valid|train` 切换标定段);
+    **数据**:`C:/Dev/data/invest/derived/C_15m_adj.csv`(玉米 15 分钟复权连续,在仓库之外)。
+  - **窗口**:正式标定用**池化验证段 2022-07-01 ~ 2023-12-31**(n=367 个交易日)——就是阶梯实际汇报成绩的那一段;
+    η 必须与"测量成绩的那段"的样本量与噪声尺度匹配,用别的段估出来的 η 放上去会失配。
+    **测试段(2024-01-01 起)全程未触碰**。该段早已被消耗,不得复用。
+  - **回放口径**:三个验证段**分别**回放再拼成一条序列,与 `research_gate.run_gate` 一致(段与段之间不持仓)。
+    先前按"连着跑一整段"估过一次,得 SE 中位数 0.7297(η=1.095);按流水线口径重算是 0.7306(η=1.096),
+    相差 0.1%——口径差异不影响结论,登记值不变。
+  - **候选对**:网格里"相邻一步"的参数对(`fast` 10→…→30、`slow` 40→…→90,`atr_mult` 固定 1.5,共 60 对),
+    即变异能造出的最小差异;每对在同一段上各跑一次,取**逐日盈亏之差**。
+  - **估法**:对配对日盈亏做**分块自助**(块长 5 个交易日,2000 次重采样),每次重采样算一次 ΔSharpe,
+    2000 次的标准差即 SE(ΔSharpe)。分块而非逐日独立重采样:日盈亏自相关,逐日重采样会低估方差。
+  - **结果**:SE 中位数 **0.7306**(最小 0.4568,最大 1.0674),取中位数而非均值——单对的 SE 受个别参数组合影响很大,
+    中位数对离群组合稳健。**η = max(0.25, 1.5 × 0.7306) = 1.096 → 取 1.10**(下限未触发)。
+  - **交叉校验**:解析式 SE(配对差标准差 / 池化波动 × √240 / √n)与自助值同量级
+    (26/80 vs 26/90:自助 0.670 / 解析 0.670;30/40 vs 30/50:自助 1.063 / 解析 0.878)。
+  - **敏感性**:同一方法在 W1 训练段(2020-07-22 ~ 2022-06-30)上得 SE 中位数 0.6731、η = 1.010,
+    与验证段的 1.095 相差 8%——说明这个步长不是某一个窗口的偶然。取**两者中较大的**(1.10)作为登记值。
+  - **性质**:η 是**汇报阈值**(阶梯什么时候更新汇报值),**不是晋级门槛**;与 DSR 0.95 互相独立,不受其影响。
+    它越大,阶梯越"粘"(很少更新汇报值),误差随提交次数增长得越慢;这正是想要的保守性。
 - **取整方向**:我们是"越大越好"的夏普,更新条件取反(新成绩比历史最佳高出至少 η 才汇报,汇报值取整到 η 的倍数)。
 
 ### 第二个品种:数据准备现在做,PBO 仍然延后
@@ -158,9 +178,9 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 三层防线:
 | 层 | 位置 | 拦什么 |
 |---|---|---|
-| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、下单/撤单接口、禁用内建函数的**引用**、`param_grid` 含受保护参数、**受禁 dunder 的定义与引用**(见下)、自定义 metaclass、类装饰器 |
-| 运行时(执行前) | `research_api.import_candidate` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类;不得定义受禁 dunder;不得自定义 metaclass |
-| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数或成员(此前 `backtest`/`gate` 不校验参数键名),**大小写不敏感**比对;子进程入口(`_child`/`_gate_child`)自己再查一遍——子入口是独立的信任边界 |
+| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、下单/撤单接口、禁用内建函数的**引用**、**框架的"按名 setter"**、受保护参数作为**关键字参数**或字典键出现、**受禁 dunder 的定义与引用**(见下)、自定义 metaclass、类装饰器 |
+| 运行时(执行前) | `research_api.import_candidate` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类;不得定义受禁 dunder;不得定义按名 setter;不得自定义 metaclass |
+| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数或成员(此前 `backtest`/`gate` 不校验参数键名),**大小写不敏感**比对;子进程入口(`_child`/`_gate_child`/`_evaluate_child`)自己再查一遍——子入口是独立的信任边界 |
 
 要点:
 - **家族而非模板**:要求继承"模板所属家族"(MRO 里最靠近 object 的**应用层**基类),不要求继承 15 分钟模板本身——研究与沙盒也跑日线族。家族根必须排除 vnpy 框架基类与 `abc.ABC`;早先按"祖先名字/模块"猜测会把 `abc.ABC` 当成家族根,连带把模板自身成员误判为"候选重写",导致**每个真实候选都被拒**。
@@ -169,6 +189,10 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 - `research_grid.FORBIDDEN_AXES` 改为从清单派生,避免两处各写一份而漂移。
 - **清单的 `template` 只能取内置白名单内的类**:换成任意可导入的类(如 vnpy 的 `CtaTemplate`)会让继承约束形同虚设;要换模板必须改代码、走代码评审。
 - **"只能追加"靠版本控制保证**:`load()` 只与代码里的内置集合合并,察觉不到文件里的删除。清单相对上一次提交只增不减,由 CI 检查(`test_constitution_history_is_append_only`)逐个历史版本比对;**内置**保护项写在代码常量里,那个比对看不见,另由 `test_builtin_protections_are_never_shrunk` 从历史版本里把常量读出来比对(否则把 `BUILTIN_PROTECTED_PARAMETERS` 里的 `risk_budget` 删掉,其它检查一样全绿)。两个检查都需要**完整历史**:CI 必须 `fetch-depth: 0`,浅克隆下检查直接失败而不是跳过——查不了等于没查,不能让它冒充通过。
+  - 第 5 轮复核发现这条检查**曾经形同虚设**:提取器只认 `tuple`/`list` 字面量,而 `BUILTIN_PROTECTED_NAMES` 的定义是 `(...) + BUILTIN_PROTECTED_PARAMETERS`(一个 BinOp),于是这个最大的一组受保护成员从来没进过比对——删掉 `on_disconnect` 之后 Constitution Guard 照样全绿(两轮外部复核都独立复现了)。现已改为受控的常量表达式求值(支持字面量、常量之间的 `+`、同文件常量引用),并**fail-closed**:注册表里的常量解析不出来就报错,而不是静默跳过。
+  - 内置保护的范围也扩了:除了 `risk/constitution.py` 的七个常量,沙盒层的 `FORBIDDEN_MODULES`/`FORBIDDEN_CALLS`/`FORBIDDEN_ATTRS` 一并纳入历史比对(它们同样挡着模块导入与反射入口)。
+  - 历史列表用 `git log --full-history`:默认的历史简化会把"与某个父提交内容相同"的合并提交剪掉(那种提交不比也不会漏内容,但列表更直白)。
+  - 清单文件至今只有一个历史版本,此时"平凡通过"而不是 `skip`——CI 输出里的 `1 skipped` 与 pass 长得一样,让人以为检查跑过了。
 
 ### 拦"引用"而不是拦"调用"
 `f = object.__setattr__` 之后 `f(self, "risk_budget", 1e9)` 的调用点是裸名字,AST 看不见被调的是谁;实测这个写法**真的能击穿风控底线**(`within_budget(100.0, 10.0, inst.risk_budget)` 在改写后返回 True)。因此静态层一律拦**引用**:
@@ -176,10 +200,134 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 - 下单/撤单接口(`buy`/`sell`/`send_order`/`cancel_all` …)的任何 `ast.Attribute` 引用与裸名字引用;
 - 禁用内建函数(`getattr`/`setattr`/`delattr`/`vars`/`globals`/`locals`/`eval`/`exec`/`compile`/`open`/`__import__`/`input`/`type`)的任何名字引用。
 
-同样地,`operator.attrgetter('__dict__')(self)` 把属性名当字符串用,绕开了"禁止访问 `__dict__`"的属性写法检查——`operator` 模块整体禁用,受禁属性名作为**字符串常量**出现也一律拒绝(这些 token 在候选源码里按保留字处理,文档字符串里提到也会被拒,这是有意的保守取舍)。
+同样地,`operator.attrgetter('__dict__')(self)` 把属性名当字符串用,绕开了"禁止访问 `__dict__`"的属性写法检查——`operator` 模块整体禁用,受禁属性名作为**字符串常量**出现也一律拒绝。
+
+**关于字符串常量的准确口径(第 5 轮更正)**:沙盒层对 `FORBIDDEN_ATTRS`(`__dict__`、`__class__` 等)的检查是**完全相等**匹配,不是子串匹配。所以 `X = "__dict__"` 会被拒,而文档字符串里"提到"某个名字(比如 `"""we use __dict__ here"""`)**不会**被拒——早先这份 ADR 写的是"文档字符串里提到也会被拒",说过头了,以本段为准。
+
+### 框架的"按名 setter":不给"按键名改写"留任何入口
+
+第 5 轮复核实测出的一条活的绕过:`CtaTemplate.update_setting(setting)` 会把字典里的键**按键名** `setattr` 到实例上,
+而模板的 `parameters` 列表里正好有四个受保护参数(`risk_budget`/`max_daily_losses`/`atr_window`/`history_vt_symbol`)。
+于是候选只要写
+
+```python
+self.update_setting(dict(risk_budget=1e12))
+```
+
+就能把单笔风险预算从 300 改成 1e12——而这个名字在源码里既不是属性赋值也不是字典键(是 `ast.keyword.arg`),
+按语法位置筛查看不见它。实测改之前:静态层返回空列表、运行时类校验返回空列表、候选被接受,
+`within_budget(100, 10, 1e12)` 返回 True(真实底线 300 时返回 False)。
+
+处理:
+- 新增 `BUILTIN_FORBIDDEN_BY_NAME_SETTERS`(`update_setting`),**任何引用**都拦(不只调用),取别名同样拦;
+- 候选自己定义 `update_setting` 也拦(引擎初始化时会调用它),类体里写成赋值(`update_setting = 3`)同样拦;
+- 受保护参数作为**关键字参数**出现也拦(`dict(risk_budget=…)`),按大小写不敏感比对,与参数层同一把尺子。
+
+### 第 7 轮补记:另一条同类入口——`__builtins__['setattr']`
+
+第 6 轮复核实测出**同一个后果**的另一条路径,静态层与沙盒层当时都返回空列表:
+
+```python
+__builtins__['setattr'](self, 'risk_budget', 1e12)     # 底线 300 → 1e12,within_budget 随之放行
+```
+
+`exec(code, module.__dict__)` 会往候选的 globals 里注入一个 `__builtins__` **字典**,
+里面就有 `setattr`。此前只有 `x.__builtins__` 这种**属性写法**被拦,裸名与字符串形式都漏了。
+处理(在沙盒层,因为它本来就是"禁用内建与反射入口"那一层):
+- 受禁属性名(`__builtins__`/`__dict__`/`__class__`/`__mro__` 等)的**裸名**引用一律拒;
+- 这些名字以及 `setattr`/`getattr`/`eval`/`exec`/`globals`/`locals`/`vars`/`__import__`/`compile`/`input`
+  作为**字符串常量**出现也拒;
+- `import builtins` 早就在模块禁用名单里(`FORBIDDEN_MODULES`),不另开口子。
+
+**为什么不把 `open`/`type` 也按字符串拒**:交易数据里 `"status": "open"` 这种字段值很常见,
+按字符串一律拒会把正常候选整片拒掉——误报面远大于收益。真正危险的是"按名字改写/反射"这一类。
+
+### 执行时的能力隔离:不给,而不是再禁一批名字
+
+第 7 轮复核(`gpt-5.6-sol`)指出:前面这些**静态**规则封住的是**已知写法**,不是能力本身。
+实测两条等价后果的路径,静态层与沙盒层都返回空列表:
+
+```python
+e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)   # 经异常回溯拿到内建字典
+from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能改写任意对象属性的模块
+```
+
+继续枚举反射路径是枚举不完的(每加一批名字都要配测试,而且总有下一个)。所以改成**把能力收走**:
+候选执行时(`exec(code, module.__dict__)`)显式给一份**最小内建集合**
+(`scripts/research_sandbox.py::safe_builtins`):
+
+- `setattr`/`delattr`/`getattr`/`eval`/`exec`/`compile`/`open`/`globals`/`locals`/`vars`/`type`/`object` 等一律**不给**;
+- `__import__` 换成**受限导入器**:只放行不在禁用名单里的模块(`builtins`、`unittest.mock` 等已加进名单);
+- 其余内建(`len`/`range`/`min`/`max`/`sum`/`sorted`/`isinstance`/`hasattr`/`Exception` 等)照常给。
+
+这样一来:无论候选怎么绕,**它能拿到的内建字典里就没有 `setattr`**——
+连 `frame.f_builtins` 也只会拿到这份受限字典(帧的 `f_builtins` 取自模块 globals 的 `__builtins__`)。
+`unittest.mock` 那条路则由受限导入器直接关上。
+
+代价:候选用到这些名字会得到 `NameError`/`AttributeError`(而不是静默放行),由人在批准前看出来;
+`type(...)` 这种常见写法也会失效。这是本项目一贯的 fail-closed 取舍。
+
+**这不是安全边界的终点**:容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)
+与"运行前由人读过代码"仍然是真正的边界。能力隔离只是把"静态黑名单挡不住的那部分"又收了一层。
+
+### 关于"vnpy 全家只有一处按名 setter"这句话的更正
+
+早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
+更准确的说法:`update_setting` 是**候选能直接调用**的那一处;此外还有
+`vnpy_ctastrategy/engine.py` 里 CTA 引擎按 `strategy.variables` 恢复变量的路径,
+以及 `vnpy_spreadtrading/template.py` 的对应实现。后两处当前无害:
+`variables` 是模板成员、候选改不了(运行时层会拦),而且引擎恢复的值来自引擎自己的状态,不是调用方给的。
+但这是"白名单恰好不含它"的巧合,不是文档承诺的不变量——所以给 `BUILTIN_ALLOWED_OVERRIDES`
+加新名字之前,必须先确认它不在 `variables`/`parameters` 里。
+
+### 保留标识符与误报(有意为之)
+
+静态层按 AST 里的**名字**拦,不做作用域解析,所以下列写法一律被拒(第 5、7 轮复核都实测确认):
+局部变量或函数参数恰好叫 `cover`/`short`/`buy`/`sell`/`type`/`open`/`vars` 等;
+与交易无关的对象上恰好有个叫 `buy` 的属性;文档字符串里提到 `__dict__` 这类 token。
+`cover`/`short` 在期货策略里是极普通的词("回补空头"),LLM 生成的候选会常规踩中。
+
+这是 **fail-closed 的有意取舍**:宁可误伤让人来看,不可放过一个真绕过。代价与范围已登记在
+"已知残余风险"一节。静态层不是安全边界,为减少误报而做不可靠的局部数据流推断会把防线改薄,所以不做。
+
+**保留字清单(候选作者一侧要查的就是这份)**:清单的单一事实来源是代码里的常量,
+下面这份是从代码抄出来的快照;改动常量时要同步改这里,并跑
+`tests/test_research_sandbox.py::test_the_reserved_word_table_matches_the_code`
+(它逐个核对本表里的名字与代码常量是否一致)。
+
+| 类别 | 名字 | 出处 |
+|---|---|---|
+| 受保护参数(不得出现在设置字典、网格、字典键、关键字参数里) | `risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_PARAMETERS` |
+| 受保护成员(不得在类体里重写) | 见 `BUILTIN_PROTECTED_NAMES`(含 `on_trade`/`on_bar`/`_try_enter`/`guard`/`trail` 等) | `risk/constitution.py` |
+| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
+| 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
+| 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
+| 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
+| 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |
+| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator` | `research_sandbox.FORBIDDEN_MODULES` |
 
 ### 哈希、筛查、编译、执行必须是同一份字节
 早先 `import_candidate` 用 `spec.loader.exec_module()` 载入候选:Python 默认的 `.pyc` 只比对源文件的 mtime 与大小,不确认字节码对应当前内容,于"人工批准的、算过哈希的、过了静态筛查的源码"和"实际执行的字节码"可以不是一回事;分开打开文件还留下 TOCTOU 窗口。现在只读一次字节,对同一份内容做完哈希、筛查、编译、执行(不再走 `SourceFileLoader`),`__pycache__` 里的旧字节码没有机会生效。
+
+第 5 轮补记、第 7 轮更正后的细节:
+- **模块元数据**:用 `types.ModuleType` 建壳,再手工挂上 `__spec__`/`__loader__`/`__package__`
+  (取自 `spec_from_file_location`,但**不调用** `exec_module`)——执行的仍是上面编译好的、经过校验的那份字节。
+  相对导入前后都不可用(候选是顶层模块,不在包里),这不是本次改造引入的回归。
+  注意 `__loader__` 仍指向 `SourceFileLoader`:候选若自己去调 `__loader__.get_code(__name__)`,
+  仍能取到 `__pycache__` 里的字节码缓存——那属于候选自伤,不改变"执行的是校验过的那份字节"这一事实,
+  但结论要写准:不是"字节码没有机会生效",而是"**我们执行的不是**字节码缓存"。
+- **BOM**:自己读字节之后,UTF-8 BOM 会留在源码里让 `compile` 报 `invalid non-printable character U+FEFF`,
+  而旧的 `SourceFileLoader` 会自动剥掉——这是"同一份字节"带来的行为差异。现在用 `utf-8-sig` 解码(哈希仍对原始字节算),
+  并且**父入口与子入口走同一个读取器** `read_candidate()`——早先只有子入口改了口径,
+  于是同一份带 BOM 的候选在父入口被拒、在子入口却能过(第 6 轮 codex 实测)。
+- **审计锚点用原始字节的哈希**:结果里记的 `strategy_sha256` 早先是从 `read_text()` 的文本再哈希,
+  而文本模式会做通用换行转换(CRLF → LF),本仓库工作区里的 `.py` 又都是 CRLF——
+  于是记录里的哈希与批准记录里的哈希**必然不同**,审计链断在换行上。现在统一用 `rs.file_sha256(path)`。
+- **导入期异常走结构化回传**:候选在 import 期报错(缺模块、模块级副作用出错、`raise SystemExit()`)
+  不再带 traceback 退出 1,而是按 `{"error": ...}` 回传给父进程,LLM 那条反馈通道才拿得到诊断信息(此前只报"回测失败")。
 
 ### 受禁 dunder 与元类
 `object.__setattr__(self, "risk_budget", 1e9)` 能在运行时直接改写实例上的风控底线,而属性形式的 `__setattr__` 不在静态筛查原有的赋值检查覆盖范围内,运行时又因"所有 dunder 一律忽略"而漏掉——两层防线同时失效。因此:
@@ -189,7 +337,55 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 
 **静态层不是安全边界**:AST 黑名单无法封闭 Python 的动态能力(运行时构造的属性名、字节码、导入期副作用都绕得开)。它的定位是纵深防御的一层,真正的边界是容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)与"运行前由人读过代码"这两条前提。
 
-**已知残余风险**:候选若在模块导入期用 `import` 副作用改写模板模块的成员,静态层未必拦得住;彻底解决要把风控底线移出候选实例属性、存到候选无法触及的引擎侧对象里。已登记为后续项。
+**已知残余风险**:
+1. 候选若在模块导入期用 `import` 副作用改写模板模块的成员,静态层未必拦得住。
+2. 第 5 轮实测的 `update_setting` 绕过、第 7 轮实测的 `__builtins__['setattr']` 绕过、第 7 轮实测的
+   `frame.f_builtins.setattr` 与 `unittest.mock.patch.object` 绕过,静态层已**拦截已知写法**,
+   执行时也**不再给候选改写属性的能力**(见"执行时的能力隔离")——但它们暴露的是一类更一般的问题:
+   **按名字改写实例属性的入口**。彻底解决要把风控底线移出候选实例属性、
+   存到候选够不着的引擎侧对象里(模板的 `parameters` 列表里之所以有 `risk_budget`,就是因为底线现在是实例属性)。
+   已登记为后续项,不在阶段 2 范围内。
+3. 静态层按名字拦,不做作用域解析,保留标识符误伤普通写法(见"保留标识符与误报")。这是有意的取舍。
+4. **隐藏子入口仍然信任调用方给的 `--prior-trials`**:子入口只查"非负",不读试验账本,
+   所以直接调用 `_evaluate_child --prior-trials 0` 会让 DSR 用比真实累计更小的 N——**放松晋级门槛**;
+   而且子入口**自己不写账本**,直接调用可以无限次白嫖评估而不增加试验次数。
+   彻底解决要么让子入口以账本为准(而不是信调用方给的数字),要么让子入口自己也记账。
+   已登记为后续项(第 7 轮 codex 提出)。
+5. **本仓库没有跑全量测试的 CI**:`.github/workflows/` 里只有宪法守卫一条与代码相关的作业,
+   全量测试(2249+ 条)只在本地跑。宪法守卫那条作业此前恒红(见下一节),所以"CI 绿"这件事在本仓库里
+   从来没有成立过。已登记为后续项:要么加一条装好环境的测试作业,要么明确承认"测试靠本地跑"并写进 README。
+
+## 隐藏子入口的信任模型
+
+`research_api.py` 里的 `_child`/`_gate_child`/`_evaluate_child` 是**隐藏入口**:能被直接调用,
+所以不能假设父进程已经查过什么。第 5 轮复核把这条边界补齐了——现在每个子入口自己复查:
+
+| 输入 | 谁负责 | 拒了会怎样 |
+|---|---|---|
+| `--params` 设置字典 | `child_params()` | 受保护参数(含大小写变体)被拒,退出码 2 |
+| `--random-runs` | `child_int_args()` | 超出配置边界 `rc.INT_BOUNDS[("gate","random_runs")]` 被拒(与父入口同一把尺子) |
+| `--prior-trials` | `child_int_args()` | 负数被拒——负数会让 evaluate 路径的 DSR 用更小的 N,**放松晋级门槛** |
+| `--key` / `--segment` | parser 的 `choices` + `run_child` 里的 `segment_window` | 非法值退出码 2(此前是未捕获异常的 1) |
+| `--on-plateau` | parser 的 `choices` | 只接受 `0`/`1` |
+| `--file` | `child_file()` | 文件必须在 `pending_strategies/` 内 |
+| 审批记录 | `child_approved()` | 未被人审阅过的候选不许跑——`--sha256` 只证明"文件没变",不证明"人看过" |
+
+早先这里只复查了设置字典,其余输入仍依赖父入口——"独立信任边界"这句话当时是说过头的。
+子入口的"拒绝"(退出码 2)现在也**原样传到父层**:此前一律被压成"回测失败",
+原因只进了本机 stderr,进不了返回给调用方/LLM 的结果里,而那条通道正是为"把诊断送回去"设计的。
+
+### 宪法守卫为什么是一个独立脚本(`tools/check_constitution_history.py`)
+
+守卫本体只用标准库 + git,**不依赖 pytest,也不依赖 vnpy**。早先它寄生在 pytest 用例里,
+CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 import `segment_ledger` →
+`bootstrap` → `vnpy.trader.setting`,在只装 pytest 的 CI 上**收集阶段就失败**(退出码 4),
+守卫于是在 CI 上一次都没跑过,却看起来"配好了"(第 6 轮 codex 实测;第 7 轮我本地复现了同样的失败)。
+现在 CI 直接跑那个脚本,退出码契约是:0 通过 / 1 发现问题 / 2 环境不可用(浅克隆、git 不可用——同样是失败)。
+
+守卫还多做了两件事:
+- **注册表完整性**:源码里新增一个字符串集合型的内置保护常量而没登记进历史比对,守卫会报出来
+  (当年 `BUILTIN_PROTECTED_NAMES` 正是这样漏掉的);
+- **换模板要同时改白名单**:清单里的 `template` 改了而内置白名单 `BUILTIN_ALLOWED_TEMPLATES` 没跟着改,守卫会报出来。
 
 ## 明确不做
 无人值守连续迭代(4c,须单独评审)、仪表盘审批按钮、PBO/CPCV、多品种扩展、新增测试段。
@@ -200,8 +396,16 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 - Bisheng 可被 Dify/LangGraph 替换的条款不变:所有判定逻辑在仓库内的纯函数,flow 只做编排。
 
 ## 验证
-`tests/test_trial_ledger.py`(只增不减、损坏 fail-closed)、`tests/test_dsr.py`(N 增大 DSR 单调下降、已知数值对照)、
-`tests/test_promotion_gate.py`(第 9 条独立触发)。
+- 阶段 1:`tests/test_trial_ledger.py`(只增不减、损坏 fail-closed)、`tests/test_dsr.py`(N 增大 DSR 单调下降、已知数值对照)、
+  `tests/test_promotion_gate.py`(第 9 条独立触发)。
+- 阶段 2:`tests/test_constitution.py`(静态筛查、运行时类校验、清单只增不减、内置保护只增不减——含"删掉一个受保护成员必须被发现"的 mutation 自检)、
+  `tests/test_research_sandbox.py`(沙盒路径与筛查)、`tests/test_research_api.py`(三层校验的入口行为、隐藏入口的信任边界、
+  `.pyc` 绕过、导入期错误结构化回传)。CI 另有 `.github/workflows/constitution-guard.yml`,直接跑独立守卫脚本
+  `tools/check_constitution_history.py`(不装 pytest、更不装 vnpy,`fetch-depth: 0`)。
+- 外部复核的原始记录:第 5 轮 codex(`gpt-5.6-sol`)**40.5/50,未通过**;第 5 轮另一轮独立复核(`MiniMax-M3`)**33/50,未通过**;
+  第 6 轮独立复核(`MiniMax-M3`)**32/50,未通过**(报出第 5 轮两轮都没报出的 `__builtins__['setattr']` 绕过,
+  以及"宪法守卫在 CI 上收集即失败"这一事实)。三轮的发现均已逐条复现后修复并各配了回归测试。
 
 ## 未完成
-阶段 1 已实现(Issue #15);阶段 2–4 未实现;阶段 4 另受 Bisheng 模型配额阻塞(见 `PROJECTWIKI.md`)。
+阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,三轮复核的阻塞项已修,第 7 轮复核结果见 `CHANGELOG.md`);
+阶段 3–4 未实现;阶段 4 另受 Bisheng 模型配额阻塞(见 `PROJECTWIKI.md`)。

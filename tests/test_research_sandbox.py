@@ -267,3 +267,107 @@ def test_screen_rejects_the_operator_module():
     """operator.attrgetter('__dict__') 是反射入口:属性名可以是字符串,绕开属性名检查。"""
     findings = rs.screen_source("import operator\noperator.attrgetter('__dict__')(self)\n")
     assert findings and any("operator" in f for f in findings), findings
+
+
+# ---------- 第 6 轮 codex 的 M1:受禁名字的**裸名**与**字符串**形式 ----------
+
+def test_screen_flags_a_bare_builtins_reference():
+    """裸名 `__builtins__` 也必须拦。
+
+    `exec(code, module.__dict__)` 会自动往候选的 globals 里塞一个 `__builtins__`
+    (里面就有 `__import__`),而受禁属性名此前只拦 `x.__builtins__` 这种属性写法——
+    裸名写法完全看不见:静态层 0 findings,候选照样能拿到执行入口。"""
+    findings = rs.screen_source("f = __builtins__['__import__']" + chr(10) + "f('os')" + chr(10))
+    assert findings and any("__builtins__" in f for f in findings), findings
+
+
+def test_screen_flags_a_string_form_of_the_import_entry():
+    """入口藏在字符串里也要拦:`'__import__'` 这种字符串不是属性名,属性检查看不见。"""
+    findings = rs.screen_source("name = '__import__'" + chr(10))
+    assert findings and any("__import__" in f for f in findings), findings
+
+
+def test_screen_does_not_reject_ordinary_words_that_merely_look_like_builtins():
+    """普通词不按字符串拒:`type`/`open` 这类词在候选代码里太常见(字典键、注释都会命中),
+    一律拒绝会把正常候选整片拒掉。真正危险的是 dunder 形状的那些。"""
+    findings = rs.screen_source("KIND = {'type': 'ema', 'open': 3}" + chr(10))
+    assert not findings, findings
+
+
+# ---------- 执行时的能力隔离:不靠枚举名字,靠"不给" ----------
+
+def test_safe_builtins_do_not_expose_the_dangerous_ones():
+    """候选执行时拿到的内建集合里,不该有属性改写与反射的入口。"""
+    safe = rs.safe_builtins()
+    for name in ("setattr", "delattr", "getattr", "eval", "exec", "compile", "open",
+                 "globals", "locals", "vars", "type", "object"):
+        assert name not in safe, f"{name} 仍在候选可见的内建里"
+
+
+def test_safe_builtins_keep_the_ordinary_ones():
+    """常用内建必须留着,否则正常候选全被 NameError 打断。"""
+    safe = rs.safe_builtins()
+    for name in ("len", "range", "min", "max", "sum", "abs", "sorted", "round",
+                 "int", "float", "str", "bool", "list", "dict", "set", "tuple",
+                 "enumerate", "zip", "isinstance", "hasattr", "print", "Exception",
+                 "ValueError", "TypeError", "__build_class__"):
+        assert name in safe, f"{name} 不该被拿掉"
+
+
+def test_safe_builtins_block_the_modules_that_can_patch_attributes():
+    """`unittest.mock.patch.object` 能改写任意对象的属性,必须导不进来。"""
+    safe = rs.safe_builtins()
+    try:
+        safe["__import__"]("unittest.mock")
+    except ImportError as exc:
+        assert "unittest" in str(exc)
+    else:
+        pytest.fail("unittest.mock 竟然能导入")
+
+
+def test_safe_builtins_still_allow_ordinary_imports():
+    """候选必须能 import(模板就是这么来的)。"""
+    safe = rs.safe_builtins()
+    module = safe["__import__"]("json")
+    assert module.dumps({"a": 1}) == '{"a": 1}'
+
+
+def test_safe_builtins_honour_the_configured_extra_blocklist():
+    """配置里追加的禁用模块,在受限导入器里同样生效。"""
+    safe = rs.safe_builtins(forbidden_modules=("json",))
+    try:
+        safe["__import__"]("json")
+    except ImportError:
+        pass
+    else:
+        pytest.fail("配置禁用模块竟然能导入")
+
+
+def test_the_reserved_word_table_matches_the_code():
+    """ADR 里的保留字清单必须与代码常量一致——清单是候选作者唯一的查处,漂了就等于没有。
+
+    这条用例把 ADR `docs/adr/20261113-evolution-engine.md` 的"保留标识符与误报"一节
+    与代码里的常量逐个核对:表里出现的名字必须真的在代码里,代码里受禁的名字也必须在表里。"""
+    import pathlib
+    import re
+
+    adr = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "adr" / "20261113-evolution-engine.md")
+    text = adr.read_text(encoding="utf-8")
+    section = text.split("### 保留标识符与误报", 1)[1].split("### ", 1)[0]
+
+    def listed(*names):
+        for name in names:
+            assert f"`{name}`" in section, f"ADR 的保留字表里没有 {name}"
+
+    listed(*rs.FORBIDDEN_MODULES)
+    listed(*rs.FORBIDDEN_CALLS)
+    listed(*rs.FORBIDDEN_ATTRS)
+    listed(*rs.FORBIDDEN_STRINGS)
+    listed(*rs.UNSAFE_BUILTINS)
+    listed(*rs.EXTRA_FORBIDDEN_MODULES)
+    # 宪法层的名单
+    from risk import constitution as const
+    listed(*const.BUILTIN_PROTECTED_PARAMETERS)
+    listed(*const.BUILTIN_FORBIDDEN_DUNDERS)
+    listed(*const.BUILTIN_FORBIDDEN_BY_NAME_SETTERS)
+    listed(*const.BUILTIN_FORBIDDEN_ORDER_CALLS)

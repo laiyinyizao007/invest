@@ -9,12 +9,13 @@
 
 明确不存在:下单、查账户、改风控参数、连 CTP、访问测试段。输出一律是 JSON,便于程序化消费。
 威胁模型见 scripts/research_sandbox.py 文件头:这是纵深防御而非沙盒,运行前须由人读过代码。
-退出码:0 成功;2 被拒绝/参数错误;3 回测失败;124 超时。
+退出码:0 成功;1 未预期异常(traceback);2 被拒绝/参数错误;3 回测失败;124 超时。
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -126,6 +127,39 @@ class JobError(Exception):
         self.message = message
 
 
+class CandidateError(Exception):
+    """候选代码自身在**导入期**出的错(语法之外的运行时错误、缺模块、模块级副作用报错)。
+
+    与 JobError 分开:JobError 是"宪法/配置拒绝了这份候选"(退出码 2),
+    CandidateError 是"这份候选自己跑不起来"(属于研究中的正常结果)。
+    两者都走结构化回传,免得 LLM 那条反馈通道因为一个 import 错误就断掉——
+    早先这类异常直接带 traceback 退出 1,父进程只报"回测失败",候选拿不到诊断信息。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+def _child_reason(stderr: str) -> str:
+    """从子进程的 stderr 里取出拒绝原因(最后一行非空输出)。
+
+    子进程的"拒绝"(退出码 2)必须**原样传到父层**:早先一律压成"回测失败(退出码 3)",
+    于是子入口里那些拒绝(受保护参数、路径越界、审批缺失)的原因只进了本机 stderr,
+    永远进不了返回给调用方/LLM 的结果里——而那条通道正是为"把诊断送回去"设计的。
+
+    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。"""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return "子进程拒绝执行(原因见本机日志)"
+    reason = lines[-1]
+    # Windows 盘符路径(含带空格的目录)、POSIX 绝对路径、引号里的整段路径都要盖住:
+    # 早先只处理"不含空格的盘符路径",`C:\Program Files\...` 这类只替换掉前半段。
+    reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", reason)
+    reason = re.sub(r"(?<![\w.])/(?:[^\s\"']*/)*[^\s\"']*", "<路径>", reason)
+    reason = re.sub(r"\"[^\"]*\"|'[^']*'", "<路径>", reason)
+    return reason[:200]
+
+
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -140,6 +174,10 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
     if proc.returncode != 0 or line is None:
         # 详细输出只留在本机 stderr;回传给调用方的 message 不含子进程原始输出(可能含本机路径)
         print("失败:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
+        if proc.returncode == EXIT_REFUSED:
+            # 子进程的"拒绝"要**原样传到父层**,不能一律压成"回测失败":
+            # 子入口自己复查的那些项(受保护参数、路径越界、审批缺失)的原因必须能回到调用方。
+            raise JobError(EXIT_REFUSED, "拒绝执行:" + _child_reason(stderr))
         raise JobError(EXIT_FAILED, "回测失败(详情见本机日志)")
     return json.loads(line[len(CHILD_MARK):])
 
@@ -147,19 +185,47 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
 NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
 
 
-def check_approval(path: Path, paths: dict, confirm: bool) -> None:
-    """人工批准检查,未通过抛 JobError。confirm=True(仅本机 CLI 可传)等价于「我现在读过并批准」,会记录哈希。"""
+def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = None) -> None:
+    """人工批准检查,未通过抛 JobError。confirm=True(仅本机 CLI 可传)等价于「我现在读过并批准」,会记录哈希。
+
+    `sha256` 是**已经读出来的那份字节**的哈希:父进程只读一次候选文件,
+    审批检查、静态筛查、传给子进程的哈希、结果里记的哈希全部用这同一个值——
+    否则"审批时看到的""筛查时看到的""执行时校验的""结果里记的"可能是四份不同的内容。"""
     try:
         if confirm:
             rs.record_approval(path, paths["approvals_file"])
+        elif sha256 is not None:
+            if sha256 not in rs._load_approvals(paths["approvals_file"]):
+                raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
         elif not rs.is_approved(path, paths["approvals_file"]):
             raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
 
 
+def read_candidate(path: Path) -> tuple[bytes, str]:
+    """读候选文件:返回(原始字节, 源码文本)。
+
+    **读一次,各处都用同一份**:
+    - 解码统一 `utf-8-sig`:带 BOM 的候选(Windows 编辑器常见)在标准 loader 下能正常导入,
+      若按纯 `utf-8` 解码,BOM 会留在字符串里让 `ast.parse` 报"语法错误"——
+      于是同一份带 BOM 的候选在父入口被拒、在子入口却能过,两处行为不一致(第 6 轮 codex 实测)。
+    - 哈希、筛查、编译、执行都基于这同一份字节,分开打开文件会留下 TOCTOU 窗口。"""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        # 同样不带路径(exc 里通常带文件名);细节留在本机日志里
+        raise JobError(EXIT_REFUSED, "策略文件无法读取或不可读") from None
+    try:
+        return raw, raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
+
+
 def screen(path: Path, cfg: dict) -> list[str]:
-    return rs.screen_source(path.read_text(encoding="utf-8"), cfg["screening"]["extra_forbidden_modules"],
+    """静态筛查。与 `import_candidate` 共用同一个读取器,免得两处解码口径不一致。"""
+    _, source = read_candidate(path)
+    return rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
                             cfg["screening"]["extra_forbidden_calls"])
 
 
@@ -190,6 +256,56 @@ def child_params(args) -> dict:
     return params
 
 
+def child_int_args(args) -> tuple[int, int]:
+    """子进程自己校验两个整数参数:`--random-runs` 与 `--prior-trials`。
+
+    这两个也是调用方给的值,不能假设父进程查过:
+    - `--random-runs` 越界会让子进程跑巨量随机入场对照(子进程自身没有超时,超时只由父进程兜),
+      直接调用即可拖资源;
+    - `--prior-trials` 为负更糟:evaluate 路径会先做 `prior + 格子数` 再算 DSR,
+      负数会让 N 变小,而 DSR 随 N 增大而变严——于是**门槛被放松**。
+      (gate 路径不加分号,负数会被 candidate_eval 的 `n_trials >= 1` 拦下,evaluate 路径漏了。)
+
+    返回 (random_runs, prior_trials);prior_trials 为 None 表示不参与 DSR。"""
+    random_runs = getattr(args, "random_runs", None)
+    low, high = rc.INT_BOUNDS[("gate", "random_runs")]
+    if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
+        raise JobError(EXIT_REFUSED, f"--random-runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    prior = getattr(args, "prior_trials", None)
+    if prior is not None:
+        if isinstance(prior, bool) or not isinstance(prior, int) or prior < 0:
+            raise JobError(EXIT_REFUSED, "--prior-trials 必须是非负整数")
+    return random_runs, prior
+
+
+def child_file(path: Path) -> Path:
+    """子进程自己确认候选文件仍在 pending 目录内。
+
+    父入口用 `resolve_pending` 解析过路径,但子入口能被直接调用,
+    不该假设路径是父进程给的——否则可以直接把 `--file` 指到仓库里任何 .py。"""
+    cfg = rc.load()
+    try:
+        return rs.resolve_pending(str(path), bootstrap.ROOT, cfg["paths"]["pending_dir"])
+    except rs.SandboxError:
+        # 消息里不带路径:拒绝原因会回传给调用方,而回传的约定是不含本机路径
+        raise JobError(EXIT_REFUSED, "策略文件不在 pending_strategies/ 目录内") from None
+
+
+def child_approved(path: Path) -> None:
+    """子进程自己查审批记录。
+
+    `--sha256` 只证明"文件没变",**不证明"人看过"**——哈希谁都能自己算。
+    子入口能被直接调用,不查审批就能跑一份从未被人审阅过的候选,
+    而"运行前由人读过代码"正是这套设计最核心的前提(威胁模型的第一条)。
+    审批记录按**内容哈希**存,所以文件一改就自动失效。"""
+    _, paths = settings()
+    try:
+        if not rs.is_approved(path, paths["approvals_file"]):
+            raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
 def check_candidate_class(candidate: type) -> None:
     """运行时校验候选类:必须继承模板,且不得重写白名单以外的模板成员(含类创建后打的补丁)。"""
     try:
@@ -212,16 +328,9 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     而用 `spec.loader.exec_module()` 载入时,Python 可能从 `__pycache__` 里取时间戳有效的旧 `.pyc`
     ——那意味着人工批准的、算过哈希的、过了静态筛查的源码,和实际执行的字节码**不是一回事**。
     所以这里只读一次字节,再对同一份内容做完所有事。"""
-    try:
-        raw = Path(path).read_bytes()
-    except OSError as exc:
-        raise JobError(EXIT_REFUSED, f"策略文件无法读取: {exc}") from exc
+    raw, source = read_candidate(path)                      # 读一次,哈希与筛查都用这同一份
     if hashlib.sha256(raw).hexdigest() != sha256:            # 批准之后文件被改动(TOCTOU):拒绝运行
         raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
-    try:
-        source = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
     cfg = rc.load()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
                                 cfg["screening"]["extra_forbidden_calls"])
@@ -231,13 +340,37 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         code = compile(source, str(path), "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise JobError(EXIT_REFUSED, f"策略文件语法错误: {exc}") from exc
+    # 模块元数据用标准 loader 准备(保留 __spec__/__loader__/__package__),
+    # 但**不调用** exec_module:执行的是上面编译好的、经过校验的那份字节,
+    # .pyc 没有机会生效(那正是第 4 轮修掉的 .pyc 绕过)。
     module = types.ModuleType("pending_strategy")
     module.__file__ = str(path)
-    exec(code, module.__dict__)                               # noqa: S102 —— 执行的就是上面校验过的那份字节
+    try:
+        spec = importlib.util.spec_from_file_location("pending_strategy", path)
+        if spec is not None:
+            module.__spec__ = spec
+            module.__loader__ = spec.loader
+            module.__package__ = spec.parent or ""
+            module.__name__ = spec.name
+    except Exception:                                        # noqa: BLE001 - 元数据拿不到不该拦住执行
+        pass
+    # 候选执行时用**最小内建集合**:静态层能封住已知的写法,封不住能力本身——
+    # `e.__traceback__.tb_frame.f_builtins.setattr(...)` 这类路径上的名字都不在禁用名单里,
+    # 而 `unittest.mock.patch.object` 只要能 import 就能改写实例属性。
+    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
+    # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
+    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"])
+    try:
+        exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
+    except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
+        # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
+        # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
+        raise CandidateError(describe_error(exc)) from exc
     from vnpy_ctastrategy import CtaTemplate
     candidate = getattr(module, cls_name, None)
     if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
-        raise JobError(EXIT_FAILED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
+        # 找不到类 = 调用方要了一个候选里没有的类,是**参数错误**(拒绝),不是运行失败
+        raise JobError(EXIT_REFUSED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
     check_candidate_class(candidate)                          # 运行时再查一次:挡住批准后被替换的候选
     return candidate
 
@@ -296,10 +429,10 @@ def review_job(strategy: str, input_fn=None, write=print) -> dict:
     静态筛查不过的直接拒绝,不提问。批准只能在本机由人触发,外层没有任何端点能调用它。"""
     cfg, paths = settings()
     path = resolve_strategy(strategy, cfg)
-    source = path.read_text(encoding="utf-8")
+    raw, source = read_candidate(path)           # 字节数按原始字节算:换行转换后的长度不是文件真实大小
     sha = rs.file_sha256(path)
     findings = screen(path, cfg)
-    write(f"文件: {path.name}   大小: {len(source.encode('utf-8'))} 字节   sha256: {sha}")
+    write(f"文件: {path.name}   大小: {len(raw)} 字节   sha256: {sha}")
     write("静态筛查: " + ("通过" if not findings else "未通过"))
     for finding in findings:
         write(f"  - {finding}")
@@ -341,16 +474,21 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     if not isinstance(params, dict):
         raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
     check_params_allowed(params)
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    # 只读一次:哈希、筛查、审批、子进程参数、结果记录全部用这同一份字节。
+    raw, source = read_candidate(path)
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
-           "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", rs.file_sha256(path)]
+           "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", strategy_sha]
     body = spawn_child(cmd, timeout)
     if "error" in body:                    # 策略自身报错是研究中的正常结果:记录下来供反馈,而不是当作网关故障
         result = {"kind": "backtest", "status": "strategy_error", "strategy_file": path.name,
-                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": key,
+                  "strategy_sha256": strategy_sha, "class": cls, "key": key,
                   "segment": segment, "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"),
                   "error": body["error"]}
         save_with_report(result, paths)
@@ -358,7 +496,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
 
     from risk.diagnosis import diagnose
     result = {
-        "kind": "backtest", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "kind": "backtest", "strategy_file": path.name, "strategy_sha256": strategy_sha,
         "class": cls, "key": key, "segment": segment, "params": params,
         "window": [f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"], "ran_at": datetime.now().isoformat(timespec="seconds"),
         "stats": body["stats"], "diagnosis": diagnose(body["stats"], body["pnls"]),
@@ -404,24 +542,28 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
     check_params_allowed(params)
     on_plateau, plateau_note = plateau
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
     trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
-           "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path),
+           "--on-plateau", "1" if on_plateau else "0", "--sha256", strategy_sha,
            "--prior-trials", str(trials)]
     body = spawn_child(cmd, timeout)
     if "error" in body:
         result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
-                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": "C15",
+                  "strategy_sha256": strategy_sha, "class": cls, "key": "C15",
                   "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"), "error": body["error"]}
         save_with_report(result, paths)
         return result
     result = {
-        "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "kind": "gate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
         "class": cls, "key": "C15", "params": params, "plateau_note": plateau_note,
         "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
@@ -451,18 +593,22 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     low, high = rc.INT_BOUNDS[("gate", "random_runs")]
     if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path), "--prior-trials", str(prior)]
+           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior)]
     body = spawn_child(cmd, timeout)
     if "error" not in body:
         top_up_grid_trials(paths, body)
-    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
     if "error" in body:
@@ -537,24 +683,32 @@ def run_gate_child(args) -> int:
     from research_gate import engine_runner, run_gate
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
-    path = Path(args.file)
     try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
+        random_runs, prior_trials = child_int_args(args)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    if args.on_plateau not in ("0", "1"):
+        print("--on-plateau 只能是 0 或 1", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
+                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=args.prior_trials)
+                          prior_trials=prior_trials)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -569,21 +723,30 @@ def run_evaluate_child(args) -> int:
     from research_gate import engine_runner, run_evaluation
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
-    path = Path(args.file)
+    try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
+        random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
     cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
         result = run_evaluation(
             candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
-            random_runs=args.random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
             min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=args.prior_trials)
+            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -595,17 +758,27 @@ def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
-    start, end = rs.segment_window(args.key, args.segment)
     try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
     try:
-        strategy_class = import_candidate(Path(args.file), args.cls, args.sha256)
+        start, end = rs.segment_window(args.key, args.segment)
+    except rs.SandboxError as exc:
+        # 测试段/未知品种在这里被拒:退出码必须是"拒绝"(2),不能是未捕获异常的 1
+        print(str(exc), file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        strategy_class = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     try:
         stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
@@ -667,12 +840,16 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("run_id", nargs="?", default="")
     rr.set_defaults(func=cmd_results)
     child = sub.add_parser("_child")           # 内部使用
-    for name in ("file", "cls", "key", "segment", "params", "sha256"):
+    for name in ("file", "cls", "params", "sha256"):
         child.add_argument(f"--{name}", required=True)
+    # 隐藏入口的取值范围也在这里先卡一道:子进程能被直接调用,不该假设父进程查过
+    child.add_argument("--key", required=True, choices=rs.KEYS)
+    child.add_argument("--segment", required=True, choices=rs.SEGMENTS)
     child.set_defaults(func=run_child)
     gchild = sub.add_parser("_gate_child")     # 内部使用
-    for name in ("file", "cls", "params", "on-plateau", "sha256"):
+    for name in ("file", "cls", "params", "sha256"):
         gchild.add_argument(f"--{name}", required=True)
+    gchild.add_argument("--on-plateau", required=True, choices=("0", "1"))
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.add_argument("--prior-trials", type=int, default=None)
     gchild.set_defaults(func=run_gate_child)

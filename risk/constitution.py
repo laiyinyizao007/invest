@@ -1,5 +1,10 @@
 """不可变宪法:候选策略能改什么、不能改什么的机器可校验清单。
 
+**这里的每一层都是纵深防御,不是安全边界**:AST 黑名单封不住 Python 的动态能力
+(运行时构造的名字、字节码、导入期副作用都绕得开)。真正的边界是容器隔离
+(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)与"运行前由人读过代码"。
+本模块单独阅读时请把这句放在心里——它挡的是"明面上的越权写法"。
+
 为什么需要:`risk-floor-immutability` ADR 说"风控底线永不优化",但此前只靠两条软约束保证——
 候选继承基类、以及 `research_grid.FORBIDDEN_AXES` 不让风控参数进网格。缺口有三处:
 1. 候选可以直接在类体里写 `risk_budget = 99999`,把底线改掉;
@@ -9,7 +14,8 @@
 设计(见 docs/adr/20261113-evolution-engine.md 阶段 2):
 - 内置清单在代码里(BUILTIN_*),清单文件 `config/immutable_constitution.json` **只能追加**,不能删减内置项;
 - 静态筛查 `screen_source`(看 AST):拒绝覆盖受保护成员、实例上改写受保护属性、改写受保护模块函数、
-  调用下单接口、param_grid 里出现受保护参数。**新增**成员不在静态层管(模板成员名单在运行时才知道);
+  **引用**下单接口或受禁 dunder(不只是调用)、引用框架的"按名 setter"、
+  受保护参数作为关键字参数或字典键出现。**新增**成员不在静态层管(模板成员名单在运行时才知道);
 - 运行时 `check_class`(对照模板类的真实成员):候选必须继承模板;不得重写白名单以外的**模板成员**
   (含中间基类与类创建后打的补丁)。候选自己新增的成员(新指标、新辅助方法)允许;
 - 运行时 `check_params`:拒绝调用方在设置字典里指定受保护参数;
@@ -88,6 +94,24 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     "__setattr__", "__delattr__", "__getattribute__", "__getattr__",
     "__init_subclass__", "__set_name__",
 )
+
+# 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
+# 候选能**直接调用**的只有 CtaTemplate.update_setting 一处:
+#   for name in self.parameters: if name in setting: setattr(self, name, setting[name])
+# (另有两处按名恢复的路径——CTA 引擎按 strategy.variables 恢复变量、spreadtrading 的对应实现——
+#  它们由框架自己调用,当前无害是因为 variables 是模板成员、候选改不了,不是这里的名单保证的。)
+# 而模板的 parameters 列表里正好有四个受保护参数(risk_budget / max_daily_losses /
+# atr_window / history_vt_symbol),于是候选只要写
+#     self.update_setting(dict(risk_budget=1e12))
+# 就能把风控底线改掉——而这个名字在源码里既不是属性赋值也不是字典键,
+# 按语法位置筛查看不见它(第 5 轮外部复核实测:静态层与运行时层全绿,底线从 300 被改成 1e12)。
+# 所以这一类入口**整体禁用**:不是逐个补 API,而是不给"按名改写"留任何入口。
+#
+# 但要说清楚:静态层封的是**已知写法**,不是能力本身——同一条后果还能从别的路径拿到
+# (第 7 轮实测:经异常回溯拿到 frame.f_builtins 里的 setattr;以及 unittest.mock.patch.object)。
+# 真正把能力收走的是**执行时不给这些内建**(scripts/research_sandbox.py::safe_builtins):
+# 候选的内建字典里没有 setattr,那些路径就都不成立。
+BUILTIN_FORBIDDEN_BY_NAME_SETTERS = ("update_setting",)
 
 # 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。
 # 它们不是候选"重写"的产物,比对成员时必须忽略,否则每个真实候选都会被误判。
@@ -231,17 +255,26 @@ def _is_protected(name: str, c: Constitution) -> bool:
     return name in c.protected_names or name in c.protected_parameters
 
 
+def _protected_lower(c: Constitution) -> set[str]:
+    """受保护项的小写形式:与 `check_params` 同一口径(大小写不敏感)。
+
+    `Risk_Budget` 与 `risk_budget` 是两个不同的属性,精确匹配会让这条路径绕过参数校验;
+    静态层的关键字参数检查用同一把尺子,免得两处口径不一致。"""
+    return {name.lower() for name in c.protected_names} | {name.lower() for name in c.protected_parameters}
+
+
 def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     """静态筛查:返回可疑构造的中文说明;空列表表示未发现问题。**不是安全保证**,只是纵深防御的一层。
 
     检查项:
     - 类体内覆盖受保护成员或方法
-    - 类体内定义受禁 dunder(如 `__setattr__`)
+    - 类体内定义受禁 dunder(如 `__setattr__`)或"按名 setter"
     - 自定义 metaclass、使用类装饰器
     - 实例上改写或删除受保护属性
     - 改写受保护的风控模块函数
     - 引用受禁 dunder(裸名或别名)、引用下单/撤单接口(裸名或别名)
-    - `param_grid` 字面量里含受保护参数
+    - 引用框架的"按名 setter"(`update_setting`):它能把调用方的字典按键名 setattr 到实例上
+    - 受保护参数作为关键字参数(`dict(risk_budget=…)`)或字典键出现
 
     语法错误在这里报(fail-closed):解析不过就等于没筛查,返回空列表会让"没查"看起来像"查过没问题"。
     静态层不判断"是否重写了模板成员"——模板成员名单要到运行时才知道;那一层由 `check_class` 负责。"""
@@ -257,12 +290,21 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             for name in sorted(_class_body_names(node)):
                 if _is_protected(name, c):
                     findings.append(f"第 {node.lineno} 行: 类 {node.name} 覆盖了受保护成员 {name}")
+                elif name in BUILTIN_FORBIDDEN_DUNDERS:
+                    # `class C: __setattr__ = print` 这种**赋值**形式的定义,
+                    # 与 `def __setattr__` 一样是候选自定义受禁 dunder,静态层也要拦
+                    # (运行时层能抓到,但那时已经在跑候选了)。
+                    findings.append(f"第 {node.lineno} 行: 类 {node.name} 定义了受禁的 {name}(可绕过属性改写检查)")
+                elif name in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                    findings.append(f"第 {node.lineno} 行: 类 {node.name} 定义了受禁的按名 setter {name}(可按键名改写实例属性)")
             for stmt in node.body:
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if _is_protected(stmt.name, c):
                         findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 重写了受保护方法 {stmt.name}")
                     elif stmt.name in BUILTIN_FORBIDDEN_DUNDERS:
                         findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 定义了受禁的 {stmt.name}(可绕过属性改写检查)")
+                    elif stmt.name in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                        findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 定义了受禁的按名 setter {stmt.name}(可按键名改写实例属性)")
             # 自定义元类:元类的 __setattr__ 能在类创建时改写属性,绕开成员比对
             for kw in node.keywords:
                 if kw.arg == "metaclass":
@@ -296,6 +338,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             # `f(self, "risk_budget", 1e9)` 同样能改写实例属性,而调用点已经看不出是谁了。
             if node.attr in BUILTIN_FORBIDDEN_DUNDERS:
                 findings.append(f"第 {node.lineno} 行: 禁止引用 {node.attr}(可绕过属性改写检查)")
+            elif node.attr in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                # 框架的按名 setter:名字出现在这里就说明候选想按键名改写实例属性。
+                findings.append(f"第 {node.lineno} 行: 禁止引用按名 setter {node.attr}(可按键名改写实例属性)")
             elif node.attr in c.forbidden_order_calls:
                 # 下单接口同理拦**引用**:`f = self.buy` 之后 `f(1, 1)` 的调用点看不出是下单。
                 findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.attr}")
@@ -305,12 +350,26 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             # 裸名字的引用同样要拦:`__setattr__(self, ...)`、`buy(...)`、以及先取别名再调用。
             if node.id in BUILTIN_FORBIDDEN_DUNDERS:
                 findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写检查)")
+            elif node.id in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                findings.append(f"第 {node.lineno} 行: 禁止引用按名 setter {node.id}(可按键名改写实例属性)")
             elif node.id in c.forbidden_order_calls:
                 findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.id}")
+        elif isinstance(node, ast.keyword) and node.arg:
+            # 关键字参数是**按名**传参的另一个入口:`dict(risk_budget=1e12)` 里这个名字
+            # 是 ast.keyword.arg,既不是属性赋值也不是字典键,按语法位置筛查看不见。
+            # 与 check_params 一样按大小写不敏感比对。
+            if _is_protected(node.arg, c) or node.arg.lower() in _protected_lower(c):
+                findings.append(f"第 {node.lineno} 行: 关键字参数 {node.arg} 属于受保护项,不得由候选指定")
         elif isinstance(node, ast.Dict):
+            # 字典字面量的键:与参数层同一把尺子(大小写不敏感,且受保护**成员**同样算数)。
+            # 早先这里只精确比对 protected_parameters,与 check_params 的口径不一致。
+            protected_lower = _protected_lower(c)
             for key in node.keys:
-                if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in c.protected_parameters:
-                    findings.append(f"第 {node.lineno} 行: param_grid 含受保护参数 {key.value}")
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if _is_protected(key.value, c):
+                        findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}")
+                    elif key.value.lower() in protected_lower:
+                        findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}(仅大小写不同)")
     return findings
 
 
@@ -327,8 +386,7 @@ def check_params(params: object, c: Constitution | None = None) -> list[str]:
     if not isinstance(params, dict):
         return ["params 必须是 JSON 对象"]
     findings = []
-    protected_lower = {name.lower() for name in c.protected_parameters}
-    protected_lower |= {name.lower() for name in c.protected_names}
+    protected_lower = _protected_lower(c)
     for key in params:
         if not isinstance(key, str):
             findings.append(f"参数名非法: {key!r}")
@@ -406,6 +464,9 @@ def check_class(candidate: type, template: type, c: Constitution | None = None) 
         for name in sorted(vars(klass)):
             if name in BUILTIN_FORBIDDEN_DUNDERS:
                 findings.append(f"候选定义了受禁的 {name}({klass.__name__}):可绕过属性改写检查")
+                continue
+            if name in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                findings.append(f"候选定义了受禁的按名 setter {name}({klass.__name__}):可按键名改写实例属性")
                 continue
             # 元类自动注入的成员(ABCMeta 给每个类塞 _abc_impl)不是候选"重写"的产物
             if name in METACLASS_GENERATED:
