@@ -164,10 +164,14 @@ def read_campaign(directory: Path, campaign_id: str) -> list[Record]:
 
 
 def campaigns(directory: Path) -> list[str]:
-    """战役列表(文件名即战役号)。只取直接位于目录内、名字合规的文件。"""
+    """战役列表(文件名即战役号)。只取直接位于目录内、名字合规的文件。
+
+    **按修改时间倒序**(新的在前):超出一次统计上限时被略过的是**最旧**的那些,
+    而不是按名字排在后面的那些——否则『未统计』可能正好落在最新的战役上。
+    """
     if not directory.is_dir():
         return []
-    out = []
+    out: list[tuple[float, str]] = []
     for path in directory.glob("*.jsonl"):
         if path.is_symlink():
             continue
@@ -177,10 +181,11 @@ def campaigns(directory: Path) -> list[str]:
         try:
             if path.resolve(strict=True).parent != directory.resolve():
                 continue
+            mtime = path.stat().st_mtime
         except OSError:
             continue
-        out.append(name)
-    return sorted(out)
+        out.append((mtime, name))
+    return [name for _, name in sorted(out, key=lambda x: (-x[0], x[1]))]
 
 
 def _percentile(values: list[float], q: float) -> float | None:

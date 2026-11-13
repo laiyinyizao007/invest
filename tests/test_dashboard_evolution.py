@@ -543,3 +543,16 @@ def test_a_malformed_parent_hash_is_rejected_not_truncated(tmp_path):
     ok = ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
                           "parent_sha256": "b" * 64})
     assert ok.parent_sha256 == "b" * 64
+
+
+def test_the_campaign_list_is_ordered_by_modification_time_newest_first(tmp_path):
+    """超出统计上限时被略过的应该是**最旧**的战役,不是按名字排在后面的。"""
+    import os
+
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    for i, age in enumerate((0, 100, 200)):                 # 三个战役,mtime 依次更旧
+        p = d / f"camp{i}.jsonl"
+        p.write_text("{}\n", encoding="utf-8")
+        os.utime(p, (NOW - age, NOW - age))
+    assert ev.campaigns(d) == ["camp0", "camp1", "camp2"]
