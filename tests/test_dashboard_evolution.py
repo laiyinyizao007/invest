@@ -402,3 +402,27 @@ def test_the_campaign_list_matches_the_contract_field_by_field(tmp_path):
     r = col.collect_evolution(settings(tmp_path), NOW)
     check("#/components/schemas/EvolutionList", r.section["data"])
     check("#/components/schemas/EvolutionCampaign", r.section["data"]["campaigns"][0])
+
+
+@pytest.mark.parametrize("bad", ["../../etc/passwd", "..", "a/b", "a\b", "camp.jsonl", "camp\n", "%2e%2e",
+                                 "x" * 100, "camp-2026-11\x00"])
+def test_a_campaign_id_that_tries_to_escape_is_refused(tmp_path, bad):
+    """战役号会拼进文件路径:必须挡住路径穿越。"""
+    from dashboard import collectors as col
+    s = settings(tmp_path)
+    assert col.get_evolution_curve(s, bad) is None
+    assert col.get_evolution_log(s, bad) is None
+
+
+@pytest.mark.parametrize("bad", ["../../secret", "a/b", "not-a-hash", "A" * 64, "x" * 64])
+def test_a_sha_that_tries_to_escape_is_refused(tmp_path, bad):
+    from dashboard import collectors as col
+    s = settings(tmp_path)
+    assert col.get_candidate_code(s, bad) is None
+    assert col.get_candidate_diff(s, bad, "a" * 64) is None
+
+
+def test_the_diff_endpoint_refuses_a_parent_that_is_not_a_hash(tmp_path):
+    from dashboard import collectors as col
+    s = settings(tmp_path)
+    assert col.get_candidate_diff(s, "a" * 64, "../../secret") is None
