@@ -741,3 +741,37 @@ def test_child_refuses_a_candidate_that_overrides_a_protected_member(tmp_path, m
                                            "--random-runs", "5", "--sha256", api.rs.file_sha256(path)])
 
     assert api.run_evaluate_child(args) == api.EXIT_REFUSED
+
+
+# ---- 回归:三个子进程入口必须走同一套三层校验 ----
+# 早先三个入口各复制一遍流程,gate 入口漏掉了运行时类校验,整条 gate 路径只剩静态筛查一层。
+
+def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree, monkeypatch, capsys):
+    """gate 子进程必须做运行时类校验:静态筛查放行的候选也要在这里被拒。"""
+    body = (
+        "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy\n"
+        "class S(TrendAtr15mStrategy):\n"
+        "    def entry_signal(self):\n"
+        "        return 1\n"
+    )
+    path = make_strategy(tree, body)
+    args = api.build_parser().parse_args(
+        ["_gate_child", "--file", str(path), "--cls", "S", "--params", "{}",
+         "--on-plateau", "0", "--sha256", api.rs.file_sha256(path), "--random-runs", "1"])
+
+    monkeypatch.setattr(api.const, "check_class",
+                        lambda *a, **k: ["测试注入:候选重写了受保护成员 risk_budget"])
+
+    code = api.run_gate_child(args)
+    err = capsys.readouterr().err
+    assert code == api.EXIT_REFUSED
+    assert "受保护" in err
+
+
+def test_all_three_child_entrypoints_go_through_the_same_validation_function(tree, monkeypatch):
+    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。"""
+    import inspect
+    for name in ("run_child", "run_evaluate_child", "run_gate_child"):
+        source = inspect.getsource(getattr(api, name))
+        assert "import_candidate(" in source, f"{name} 没走统一入口"
+        assert "check_candidate_class(" not in source, f"{name} 仍在自己做校验,会漏"

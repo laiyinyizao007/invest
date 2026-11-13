@@ -29,7 +29,9 @@ try:
     from risk.constitution import load as _load_constitution
     FORBIDDEN_AXES = set(_load_constitution().protected_parameters)
 except Exception:                                    # noqa: BLE001 - 清单缺失/非法时的兜底
-    FORBIDDEN_AXES = {"risk_budget", "max_daily_losses", "atr_window", "history_vt_symbol"}
+    # 兜底取内置集合本身(不是另抄一份):否则内置清单加了项而这里没同步,会静默少拦。
+    from risk.constitution import default as _default_constitution
+    FORBIDDEN_AXES = set(_default_constitution().protected_parameters)
 
 Runner = Callable[[type, dict, list, float], dict]
 

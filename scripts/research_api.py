@@ -186,6 +186,26 @@ def check_candidate_class(candidate: type) -> None:
         raise JobError(EXIT_REFUSED, "拒绝执行: 候选类不符合不可变宪法:" + "; ".join(findings))
 
 
+def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
+    """在子进程里载入候选类,并**统一**做完三层校验(哈希、静态筛查、运行时类校验)。
+
+    三层校验必须走同一个入口:早先三个子进程各自复制一遍流程,结果 gate 入口漏掉了
+    运行时类校验,整条 gate 路径只剩静态筛查一层。复制粘贴的防线会漏,这里收敛成一个函数。"""
+    if rs.file_sha256(path) != sha256:                        # 批准之后文件被改动(TOCTOU):拒绝运行
+        raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
+    if screen(path, rc.load()):
+        raise JobError(EXIT_REFUSED, "静态筛查未通过")
+    spec = importlib.util.spec_from_file_location("pending_strategy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from vnpy_ctastrategy import CtaTemplate
+    candidate = getattr(module, cls_name, None)
+    if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
+        raise JobError(EXIT_FAILED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
+    check_candidate_class(candidate)                          # 运行时再查一次:挡住批准后被替换的候选
+    return candidate
+
+
 def require_clean(path: Path, cfg: dict) -> None:
     findings = screen(path, cfg)
     if findings:
@@ -482,20 +502,11 @@ def run_gate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
-    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    if screen(path, rc.load()):
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    from vnpy_ctastrategy import CtaTemplate
-    cls = getattr(module, args.cls, None)
-    if not (isinstance(cls, type) and issubclass(cls, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
+    try:
+        cls = import_candidate(path, args.cls, args.sha256)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
@@ -518,26 +529,11 @@ def run_evaluate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
-    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    cfg = rc.load()
-    if screen(path, cfg):
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    from vnpy_ctastrategy import CtaTemplate
-    candidate = getattr(module, args.cls, None)
-    if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
-    try:                                                       # 运行时再查一次:文件在批准后被替换(TOCTOU)时静态筛查可能已失效
-        check_candidate_class(candidate)
+    try:
+        candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
-        return EXIT_REFUSED
+        return exc.code
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
     try:
@@ -558,25 +554,11 @@ def run_child(args) -> int:
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     start, end = rs.segment_window(args.key, args.segment)
-    if rs.file_sha256(Path(args.file)) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    if screen(Path(args.file), rc.load()):         # 子进程再筛一次,防止文件在两步之间被替换
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", args.file)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    strategy_class = getattr(module, args.cls, None)
-    from vnpy_ctastrategy import CtaTemplate
-    if not (isinstance(strategy_class, type) and issubclass(strategy_class, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
-    try:                                                       # 同上:挡住批准后被替换的候选
-        check_candidate_class(strategy_class)
+    try:
+        strategy_class = import_candidate(Path(args.file), args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
-        return EXIT_REFUSED
+        return exc.code
     try:
         stats, _, trades = run_backtest(strategy_class, json.loads(args.params), args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0

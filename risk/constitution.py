@@ -36,6 +36,13 @@ CONSTITUTION_FILE = Path(__file__).resolve().parents[1] / "config" / "immutable_
 # ---- 内置清单(清单文件只能追加,不能删减) ----
 BUILTIN_TEMPLATE = "strategies.trend_atr_15m_strategy:TrendAtr15mStrategy"
 
+# 清单文件里 template 只能取这些内置模板之一:模板是"哪些成员受保护"的基准,
+# 换成别的类(如 vnpy 的 CtaTemplate)会让继承约束形同虚设。要换模板必须改代码、走代码评审。
+BUILTIN_ALLOWED_TEMPLATES = (
+    "strategies.trend_atr_15m_strategy:TrendAtr15mStrategy",
+    "strategies.trend_atr_strategy:TrendAtrStrategy",
+)
+
 _TEMPLATE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$")
 
 # 风控底线与固定参数:不得被候选覆盖,不得进设置字典,不得进 param_grid
@@ -74,6 +81,18 @@ BUILTIN_PROTECTED_MODULE_ATTRS = (
 BUILTIN_ALLOWED_OVERRIDES = (
     "entry_signal", "param_grid", "parameters", "fast_window", "slow_window", "atr_mult", "take_profit_r",
 )
+
+# 候选不得定义、也不得调用的 dunder:它们能在运行时改写属性,绕开静态筛查与成员比对。
+# __init__ 例外(它本来就在受保护名单里,单独处理)。
+BUILTIN_FORBIDDEN_DUNDERS = (
+    "__setattr__", "__delattr__", "__getattribute__", "__getattr__",
+    "__init_subclass__", "__set_name__",
+)
+
+# 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。
+# 它们不是候选"重写"的产物,比对成员时必须忽略,否则每个真实候选都会被误判。
+METACLASS_GENERATED = ("_abc_impl",)
+
 
 
 class ConstitutionError(Exception):
@@ -128,6 +147,12 @@ def load(path: Path | None = None) -> Constitution:
     template = data.get("template")
     if not isinstance(template, str) or not _TEMPLATE_RE.match(template):
         raise ConstitutionError("不可变宪法清单的 template 必须是 '模块路径:类名' 形式")
+    # 模板只能取内置白名单里的类:换成任意可导入的类(如 vnpy 的 CtaTemplate)会让继承约束形同虚设。
+    # 要换模板必须改代码、走代码评审。
+    if template not in BUILTIN_ALLOWED_TEMPLATES:
+        raise ConstitutionError(
+            f"不可变宪法清单的 template 不在内置白名单内: {template!r};"
+            f"可选: {', '.join(BUILTIN_ALLOWED_TEMPLATES)}")
     for field in ("allowed_overrides", "protected_names", "protected_parameters",
                   "forbidden_order_calls", "protected_module_attrs"):
         if field not in data:
@@ -146,11 +171,21 @@ def load(path: Path | None = None) -> Constitution:
         raise ConstitutionError("allowed_overrides 不得包含内置受保护参数(清单只能追加,不能放宽底线)")
     if protected_params & builtin.allowed_overrides:
         raise ConstitutionError("protected_parameters 不得与内置允许重写的成员冲突")
+    # 文件自身新增的项之间也不能互相抵消:同一个名字既在白名单又在受保护名单里时,
+    # 白名单在运行时优先生效,新增的保护会静默失效——必须报错而不是让它生效。
+    # 冲突要在**合并后**的集合上查:文件新增的 protected_names 也可能撞上内置白名单。
+    effective_allowed = allowed | builtin.allowed_overrides
+    effective_protected = (protected_names | builtin.protected_names) | (protected_params | builtin.protected_parameters)
+    if effective_allowed & effective_protected:
+        clash = ", ".join(sorted(effective_allowed & effective_protected))
+        raise ConstitutionError(f"白名单与受保护清单冲突({clash}):白名单会胜出,保护将失效")
+    if protected_names & protected_params:
+        raise ConstitutionError("protected_names 与 protected_parameters 有重叠:同一项被登记两次")
 
     return Constitution(
         version=1,
         template=template,
-        allowed_overrides=allowed | builtin.allowed_overrides,
+        allowed_overrides=effective_allowed,
         protected_names=protected_names | builtin.protected_names,
         protected_parameters=protected_params | builtin.protected_parameters,
         forbidden_order_calls=order_calls | builtin.forbidden_order_calls,
@@ -208,8 +243,18 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 if _is_protected(name, c):
                     findings.append(f"第 {node.lineno} 行: 类 {node.name} 覆盖了受保护成员 {name}")
             for stmt in node.body:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_protected(stmt.name, c):
-                    findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 重写了受保护方法 {stmt.name}")
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if _is_protected(stmt.name, c):
+                        findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 重写了受保护方法 {stmt.name}")
+                    elif stmt.name in BUILTIN_FORBIDDEN_DUNDERS:
+                        findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 定义了受禁的 {stmt.name}(可绕过属性改写检查)")
+            # 自定义元类:元类的 __setattr__ 能在类创建时改写属性,绕开成员比对
+            for kw in node.keywords:
+                if kw.arg == "metaclass":
+                    findings.append(f"第 {node.lineno} 行: 类 {node.name} 不得自定义 metaclass")
+            # 类装饰器:装饰器可以在类创建后改写它
+            for dec in node.decorator_list:
+                findings.append(f"第 {node.lineno} 行: 类 {node.name} 不得使用类装饰器")
         elif isinstance(node, ast.AnnAssign):
             target = node.target
             if isinstance(target, ast.Name) and _is_protected(target.id, c):
@@ -235,10 +280,18 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             if _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute) and node.func.attr in c.forbidden_order_calls:
-                findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({node.func.attr})")
-            elif isinstance(node.func, ast.Name) and node.func.id in c.forbidden_order_calls:
-                findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({node.func.id})")
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in c.forbidden_order_calls:
+                    findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.attr})")
+                elif func.attr in BUILTIN_FORBIDDEN_DUNDERS:
+                    # object.__setattr__(self, "risk_budget", 1e9):改写实例属性,绕开静态赋值检查
+                    findings.append(f"第 {node.lineno} 行: 禁止通过 {func.attr}() 改写属性")
+            elif isinstance(func, ast.Name):
+                if func.id in c.forbidden_order_calls:
+                    findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.id})")
+                elif func.id in BUILTIN_FORBIDDEN_DUNDERS:
+                    findings.append(f"第 {node.lineno} 行: 禁止调用 {func.id}()")
         elif isinstance(node, ast.Dict):
             for key in node.keys:
                 if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in c.protected_parameters:
@@ -249,16 +302,25 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
 # ---------- 运行时校验 ----------
 
 def check_params(params: object, c: Constitution | None = None) -> list[str]:
-    """校验调用方给的设置字典:不得包含受保护参数(否则风控底线可被请求方绕过)。"""
+    """校验调用方给的设置字典:不得包含受保护参数(否则风控底线可被请求方绕过)。
+
+    受保护参数按**大小写不敏感**比对:vn.py 的 `update_setting` 直接 `setattr(self, name, ...)`,
+    而 Python 属性名区分大小写,`Risk_Budget` 与 `risk_budget` 是两个不同的属性——
+    候选只要自定义 `__setattr__` 就能把 `Risk_Budget` 重定向到真正的 `risk_budget`。
+    精确匹配会让这条路径完全绕过参数校验。"""
     c = c or default()
     if not isinstance(params, dict):
         return ["params 必须是 JSON 对象"]
     findings = []
+    protected_lower = {name.lower() for name in c.protected_parameters}
+    protected_lower |= {name.lower() for name in c.protected_names}
     for key in params:
         if not isinstance(key, str):
             findings.append(f"参数名非法: {key!r}")
         elif _is_protected(key, c):
             findings.append(f"参数 {key} 属于受保护项,不得由调用方指定")
+        elif key.lower() in protected_lower:
+            findings.append(f"参数 {key} 与受保护参数仅大小写不同,不得由调用方指定")
     return findings
 
 
@@ -279,15 +341,27 @@ def template_members(template: type) -> set[str]:
     return names
 
 
+def _is_framework_class(klass: type) -> bool:
+    """框架/标准库基类:不属于策略家族(要排除掉,否则家族根会算成 abc.ABC)。"""
+    return (klass.__module__ in ("abc", "builtins")
+            or klass.__name__ == "object"
+            or klass.__module__.startswith("vnpy")
+            or klass.__name__ in ("CtaTemplate", "Template"))
+
+
 def family_root(template: type) -> type:
-    """模板所属策略家族的根:模板自己往上,第一个不是 vnpy CtaTemplate 的祖先。
+    """模板所属策略家族的根:MRO 里最靠近 object 的**应用层**基类。
 
     要求继承家族根而不是模板本身:研究与沙盒也会跑日线族(TrendAtrStrategy 的子类),
-    只认 15 分钟模板会把它们误拒。"""
-    ancestors = [k for k in template.__mro__[1:]
-                 if k.__name__ not in ("object", "CtaTemplate", "Template")
-                 and not k.__module__.startswith("vnpy")]
-    return ancestors[-1] if ancestors else template
+    只认 15 分钟模板会把它们误拒。
+
+    真实继承链:
+        TrendAtr15mStrategy -> TrendAtrStrategy -> CtaTemplate -> ABC -> object
+    家族根是 TrendAtrStrategy。早先的实现靠"祖先名字不是 CtaTemplate/Template 且模块不以 vnpy 开头"
+    来过滤,于是 abc.ABC(模块名 "abc",不在 vnpy 下)被当成了应用层基类,
+    导致:①家族根算成 ABC;②模板自身的成员被误判为"候选重写",每一个真实候选都被拒。"""
+    application = [k for k in template.__mro__ if not _is_framework_class(k)]
+    return application[-1] if application else template
 
 
 def check_class(candidate: type, template: type, c: Constitution | None = None) -> list[str]:
@@ -300,6 +374,10 @@ def check_class(candidate: type, template: type, c: Constitution | None = None) 
     if not (isinstance(candidate, type) and issubclass(candidate, root)):
         return [f"候选类必须继承模板家族 {root.__name__}"]
 
+    # 自定义元类:元类的 __setattr__ 能在类创建时改写属性,绕开成员比对
+    if type(candidate) is not type(template):
+        findings.append(f"候选类不得自定义 metaclass(实际 {type(candidate).__name__})")
+
     members = template_members(template) | template_members(root)
     # 候选直接继承模板时,模板自身的成员不算"候选重写";候选只继承家族根时,家族根也不算。
     stop_at = template if (isinstance(candidate, type) and issubclass(candidate, template)) else root
@@ -310,7 +388,15 @@ def check_class(candidate: type, template: type, c: Constitution | None = None) 
         chain.append(klass)
 
     for klass in chain:
-        for name in sorted(n for n in vars(klass) if not _is_dunder(n)):
+        for name in sorted(vars(klass)):
+            if name in BUILTIN_FORBIDDEN_DUNDERS:
+                findings.append(f"候选定义了受禁的 {name}({klass.__name__}):可绕过属性改写检查")
+                continue
+            # 元类自动注入的成员(ABCMeta 给每个类塞 _abc_impl)不是候选"重写"的产物
+            if name in METACLASS_GENERATED:
+                continue
+            if _is_dunder(name):
+                continue
             if name in c.allowed_overrides:
                 continue
             if _is_protected(name, c):

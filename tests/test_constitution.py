@@ -354,3 +354,150 @@ def test_forbidden_order_call_by_bare_name_is_rejected():
 
 def test_check_params_rejects_non_dict():
     assert const.check_params([1], const.default()) == ["params 必须是 JSON 对象"]
+
+
+def test_grid_forbidden_axes_come_from_the_constitution_not_a_second_copy():
+    """两处各写一份会漂移:内置清单加了风控参数而网格这处没同步,就静默少拦了。"""
+    import research_grid
+    from risk.constitution import default
+
+    assert research_grid.FORBIDDEN_AXES == set(default().protected_parameters)
+
+
+# ============================================================================
+# 回归:codex 第 2 轮发现的绕过路径
+# ============================================================================
+
+# ---- 缺陷 1:真实模板的 MRO 含 abc.ABC,family_root 判断错误 ----
+# 真实 MRO:TrendAtr15mStrategy -> TrendAtrStrategy -> CtaTemplate -> ABC -> object
+# 旧实现按"祖先名字不是 CtaTemplate/Template 且模块不以 vnpy 开头"过滤,
+# 于是 abc.ABC 被当成了家族根,模板自身的成员被误判为"候选重写"。
+
+def test_family_root_of_the_real_template_is_the_application_base_not_abc():
+    """家族根应当是 TrendAtrStrategy(应用层基类),不是 abc.ABC。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+    root = const.family_root(TrendAtr15mStrategy)
+    assert root.__name__ == "TrendAtrStrategy", f"家族根算成了 {root.__name__}"
+
+
+def test_a_plain_real_candidate_is_not_rejected_for_metaclass_generated_members():
+    """空候选类不该因为 ABCMeta 自动生成的 _abc_impl 被拒。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+    c = const.default()
+    findings = const.check_class(TrendAtr15mStrategy, TrendAtr15mStrategy, c)
+    assert findings == [], findings
+
+
+def test_a_real_daily_family_candidate_is_accepted():
+    """日线族候选(只继承 TrendAtrStrategy)不该被当成重写模板成员。"""
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+    c = const.default()
+
+    class Cand(TrendAtrStrategy):
+        def entry_signal(self) -> int:
+            return 1
+
+    findings = const.check_class(Cand, TrendAtrStrategy, c)
+    assert findings == [], findings
+
+
+# ---- 缺陷 2:__setattr__ / type.__setattr__ 绕过静态筛查与运行时校验 ----
+
+@pytest.mark.parametrize("snippet", [
+    'object.__setattr__(self, "risk_budget", 10**12)',
+    'type.__setattr__(self, "risk_budget", 10**12)',
+    'super(type(self), self).__setattr__("risk_budget", 10**12)',
+])
+def test_dunder_attribute_mutation_is_rejected(snippet):
+    """object/type.__setattr__ 能直接改掉实例上的风控底线,静态层必须拦。"""
+    src = f"class C:\n    def entry_signal(self):\n        {snippet}\n        return 0\n"
+    findings = screen(src)
+    assert findings, f"未拦下: {snippet}"
+
+
+@pytest.mark.parametrize("snippet", [
+    "def __setattr__(self, name, value):\n        return object.__setattr__(self, name, value)",
+    "def __delattr__(self, name):\n        return object.__delattr__(self, name)",
+    "def __getattribute__(self, name):\n        return object.__getattribute__(self, name)",
+])
+def test_defining_mutation_dunders_is_rejected(snippet):
+    """候选自定义 __setattr__ 等,可把任意请求参数重定向到受保护属性。"""
+    src = f"class C:\n    {snippet}\n"
+    findings = screen(src)
+    assert findings, snippet
+
+
+def test_runtime_rejects_a_candidate_defining_setattr():
+    """静态层可能漏(动态构造),运行时层还要拦一道。"""
+
+    class Tmpl:
+        risk_budget = 300.0
+
+        def entry_signal(self):
+            return 0
+
+    class Bad(Tmpl):
+        def __setattr__(self, name, value):
+            return object.__setattr__(self, name, value)
+
+    findings = const.check_class(Bad, Tmpl, const.default())
+    assert any("__setattr__" in f for f in findings), findings
+
+
+# ---- 缺陷 3:参数名大小写绕过 ----
+
+def test_params_reject_case_variants_of_protected_parameters():
+    """Risk_Budget / RISK_BUDGET 能绕过精确匹配,再配合自定义 __setattr__ 改写底线。"""
+    c = const.default()
+    for key in ("Risk_Budget", "RISK_BUDGET", "risk_budget"):
+        assert any("受保护" in f for f in const.check_params({key: 1.0}, c)), key
+
+
+# ---- 缺陷 4:清单的 template 可被改成任意可导入类 ----
+
+def test_constitution_file_cannot_replace_the_template(tmp_path):
+    """template 换成别的类会显著放松继承约束;模板只能在内置白名单里选。"""
+    payload = BASE | {"template": "vnpy_ctastrategy.template:CtaTemplate"}
+    with pytest.raises(const.ConstitutionError):
+        const.load(_write(tmp_path, payload))
+
+
+def test_constitution_file_cannot_swap_allowed_and_protected(tmp_path):
+    """同一名字同时进白名单与受保护清单时必须报错,而不是 allow 静默胜出。"""
+    with pytest.raises(const.ConstitutionError):
+        const.load(_write(tmp_path, BASE | {"allowed_overrides": ["risk_budget"]}))
+    with pytest.raises(const.ConstitutionError):
+        const.load(_write(tmp_path, BASE | {"protected_names": ["entry_signal"]}))
+
+
+def test_constitution_history_is_append_only():
+    """清单的历史追加项不得被删除:load() 只与代码里的内置集合合并,察觉不到文件里的删除。
+
+    "只能追加"必须靠版本控制来保证——每次提交后的清单,相对上一次提交只能增不能减。
+    这个检查在 CI 里跑,防止有人改配置时顺手删掉一条保护。"""
+    import json
+    import subprocess
+
+    def committed(path):
+        out = subprocess.run(["git", "log", "--format=%H", "--", path],
+                             capture_output=True, text=True, cwd=str(const.CONSTITUTION_FILE.parent.parent))
+        if out.returncode != 0:
+            pytest.skip("git 不可用,跳过清单历史检查")
+        return [h.strip() for h in out.stdout.split() if h.strip()]
+
+    commits = committed("config/immutable_constitution.json")
+    if len(commits) < 2:
+        pytest.skip("清单文件只有一个版本,无需检查历史")
+
+    def read(rev):
+        raw = subprocess.run(["git", "show", f"{rev}:config/immutable_constitution.json"],
+                             capture_output=True, text=True, cwd=str(const.CONSTITUTION_FILE.parent.parent))
+        return json.loads(raw.stdout)
+
+    current = read(commits[0])
+    for rev in commits[1:]:
+        older = read(rev)
+        for field in ("allowed_overrides", "protected_names", "protected_parameters",
+                      "forbidden_order_calls", "protected_module_attrs"):
+            removed = set(older.get(field, [])) - set(current.get(field, []))
+            assert not removed, f"{field} 里的 {sorted(removed)} 在后续提交中被删除了(清单只能追加)"
