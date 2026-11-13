@@ -385,3 +385,58 @@ def test_the_best_cell_detail_stays_out_of_the_selection_summary():
     """摘要是给外层看的:最佳格子的逐笔盈亏等明细只在引擎一侧用,不进摘要。"""
     result = evaluate(prior_trials=10, runner=_runner_with_behavior())
     assert "best_detail" not in result["selection"]
+
+
+# ---------- 阶段 3(第 15 轮 codex 的 Critical):报错带"阶段"标记,验证窗口回放里的报错原文不外传 ----------
+
+def _raising_runner(where, message="close=2728.0"):
+    """在指定的窗口里抛错的执行器:`select` 在选参窗口(3 根 K 线)里抛,`validate` 在验证窗口里抛。"""
+    base = make_runner()
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        in_select = len(bars) == 3 and strategy_class.__name__ == "GridCand"
+        if (where == "select" and in_select) or (where == "validate" and not in_select):
+            raise ValueError(message)
+        return base(strategy_class, setting, bars, cost_multiplier)
+    return runner
+
+
+def test_an_error_in_the_selection_window_is_tagged_selection():
+    with pytest.raises(ValueError) as exc:
+        evaluate(prior_trials=10, runner=_raising_runner("select"))
+    assert exc.value.invest_phase == "selection"
+
+
+def test_an_error_while_replaying_the_validation_windows_is_tagged_validation():
+    with pytest.raises(ValueError) as exc:
+        evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert exc.value.invest_phase == "validation"
+
+
+def test_a_grid_declaration_error_is_tagged_declaration():
+    class NoGrid:
+        parameters = ["a", "b", "c"]
+
+    with pytest.raises(rg.GridError) as exc:
+        rg.run_evaluation(candidate_cls=NoGrid, bars=EVAL_BARS, runner=make_runner(), random_cls=Rand, random_runs=3,
+                          capital=10_000, max_cells=100, min_round_trips=10, select_window=SELECT,
+                          validation_windows=[W1, W2], prior_trials=1)
+    assert getattr(exc.value, "invest_phase", None) == "declaration"
+
+
+def test_run_gate_alone_tags_its_errors_validation_because_its_whole_run_is_the_validation_window():
+    with pytest.raises(ValueError) as exc:
+        run(runner=_raising_runner("validate"), prior_trials=5)
+    assert exc.value.invest_phase == "validation"
+
+
+def test_the_innermost_tag_wins():
+    """从 run_gate 里抛出的错标 validation,不会被外层的 run_evaluation 改标成 selection。"""
+    with pytest.raises(ValueError) as exc:
+        evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert exc.value.invest_phase == "validation"
+
+
+def test_tagging_does_not_change_the_exception_type_or_message():
+    with pytest.raises(ValueError, match="close=2728.0"):
+        evaluate(prior_trials=10, runner=_raising_runner("validate"))

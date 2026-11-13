@@ -125,3 +125,27 @@ def test_prior_statistics_come_from_the_ledger(paths):
     assert api.prior_sharpe_stats(paths) == (0, 0.0, 0.0)
     api.record_job_sharpes(paths, body(cells=(0.1, 0.2)))
     assert api.prior_sharpe_stats(paths)[0] == 3
+
+
+# ---------- describe_error 带阶段(第 15 轮 codex 的 Critical) ----------
+
+def test_describe_error_carries_the_phase_the_orchestrator_tagged():
+    exc = ValueError("close=2728.0")
+    exc.invest_phase = "validation"
+    out = api.describe_error(exc)
+    assert out["phase"] == "validation" and out["type"] == "ValueError"
+
+
+def test_an_explicit_phase_wins_over_the_tag():
+    exc = ValueError("x")
+    exc.invest_phase = "validation"
+    assert api.describe_error(exc, "declaration")["phase"] == "declaration"
+
+
+def test_a_grid_error_is_a_declaration_error_even_without_a_tag():
+    from research_grid import GridError
+    assert api.describe_error(GridError("param_grid 必须恰好 3 个参数"))["phase"] == "declaration"
+
+
+def test_an_untagged_error_has_no_phase_and_is_therefore_treated_as_validation_downstream():
+    assert api.describe_error(ValueError("x"))["phase"] is None

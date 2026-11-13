@@ -249,3 +249,60 @@ def test_other_json_files_in_the_results_directory_are_not_results_either(tmp_pa
         assert status == 404 and "a" * 64 not in dumped(out), name
     status, out = call(app, "GET", "/research/feedback")
     assert status == 200 and out["traces"] == []
+
+
+# ---------- 第 15 轮 codex 的 Critical(端到端):报错消息里带着验证窗口的原始数字 ----------
+
+LEAKED_MESSAGE = "oos_pnl=8184.000000 close=2728.000000"
+LEAK_NUMBERS = ("8184", "2728", "oos_pnl", "close=")
+
+
+def validation_error_result(kind="evaluate"):
+    return {"run_id": "e-val", "kind": kind, "class": "C", "status": "strategy_error", "passed": False,
+            "error": {"type": "ValueError", "message": LEAKED_MESSAGE, "phase": "validation"}}
+
+
+@pytest.mark.parametrize("route, kind", [("/research/evaluate", "evaluate"), ("/research/gate", "gate")])
+def test_a_validation_replay_error_message_never_reaches_the_outer_response(tmp_path, route, kind):
+    app = make_app(tmp_path, jobs=jobs_returning(validation_error_result(kind)))
+    status, out = call(app, "POST", route, {"strategy": "a.py", "class": "C"})
+    assert status == 200 and out["status"] == "strategy_error"
+    text = dumped(out)
+    for number in LEAK_NUMBERS:
+        assert number not in text, number
+
+
+@pytest.mark.parametrize("view", ["report", "text"])
+def test_the_report_and_text_views_do_not_carry_it_either(tmp_path, view):
+    app = make_app(tmp_path, jobs=jobs_returning(validation_error_result()))
+    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": view})[1]
+    for number in LEAK_NUMBERS:
+        assert number not in dumped(out), number
+
+
+def test_results_and_feedback_do_not_carry_it_either(tmp_path):
+    app = make_app(tmp_path)
+    seed(app, validation_error_result())
+    for path in ("/research/results/e-val", "/research/feedback"):
+        status, out = call(app, "GET", path)
+        assert status == 200, path
+        for number in LEAK_NUMBERS:
+            assert number not in dumped(out), (path, number)
+    trace = call(app, "GET", "/research/feedback")[1]["traces"][0]
+    assert trace["run_id"] == "e-val" and "ValueError" in trace["failures"][0] and "验证窗口回放" in trace["failures"][0]
+
+
+def test_a_selection_window_error_keeps_its_message_so_the_candidate_can_be_debugged(tmp_path):
+    result = validation_error_result()
+    result["error"] = {"type": "IndexError", "message": "list index out of range", "phase": "selection"}
+    app = make_app(tmp_path, jobs=jobs_returning(result))
+    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]
+    assert out["error"] == {"type": "IndexError", "phase": "selection", "message": "list index out of range"}
+
+
+def test_an_error_with_no_phase_is_withheld_until_proven_open(tmp_path):
+    result = validation_error_result()
+    del result["error"]["phase"]
+    app = make_app(tmp_path, jobs=jobs_returning(result))
+    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]
+    assert out["error"]["message"] is None and "2728" not in dumped(out)

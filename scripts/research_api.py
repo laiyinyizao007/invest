@@ -75,7 +75,7 @@ _PATH_LIKE = re.compile(r"(?:[A-Za-z]:[\\/]|/(?:app|usr|home|tmp|root)/)[^\s\"')
 _EXC_LINE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))\b:?\s*(.*)$")
 
 
-def describe_error(exc: BaseException) -> dict:
+def describe_error(exc: BaseException, phase: str | None = None) -> dict:
     """把策略运行时异常压成 {type, message}:取 traceback 末尾的异常行,抹掉本机路径,截断到 200 字符。
 
     注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,所以限长并只保留可打印字符。"""
@@ -88,7 +88,9 @@ def describe_error(exc: BaseException) -> dict:
             break
     msg = _PATH_LIKE.sub("<path>", msg)
     msg = "".join(ch for ch in msg if ch.isprintable())[:200]
-    return {"type": name.split(".")[-1], "message": msg}
+    # 阶段:调用方显式给的优先;其次是编排代码打在异常上的标记(research_gate._tag_phase);声明错误(GridError)是声明期。
+    phase = phase or getattr(exc, "invest_phase", None) or ("declaration" if name.split(".")[-1] == "GridError" else None)
+    return {"type": name.split(".")[-1], "message": msg, "phase": phase}
 
 
 def trials_path(paths: dict) -> Path:
@@ -472,7 +474,7 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
-        raise CandidateError(describe_error(exc)) from exc
+        raise CandidateError(describe_error(exc, "declaration")) from exc
     # 第二个实参**当场**拍:必须是"这一次调用"的新快照,不能是提前存好的变量或它的拷贝
     # (宪法历史守卫按这条核对执行点:拿拷贝比对,指纹必然一致,第四层形同虚设)。
     tampered = const.check_protected_state(protected_before, const.snapshot_protected_state())

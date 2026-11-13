@@ -50,6 +50,7 @@ MAX_TRACE_TEXT = 300
 LADDER_EXHAUSTED = ("验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,需要人工续期"
                     "(选参窗口的信息、/research/feedback 里已揭示过的结果不受影响)")
 LADDER_UNAVAILABLE = "梯子状态或揭示存档不可用(fail-closed):拒绝给出任何验证窗口的信息,请人工检查"
+PHASE_LABELS = {"declaration": "声明期", "selection": "选参窗口回放", "validation": "验证窗口回放"}
 RESULT_KINDS = ("evaluate", "gate", "backtest")      # 只有这几种 JSON 是"运行结果";results 目录里别的 *.json 不是
 VALID_SEGMENT_REFUSED = ("验证段的回测不能经网关直接读取:它会绕过梯子直接给出验证窗口的完整统计。"
                          "验证窗口的成绩只经 /research/evaluate(或 /research/gate)按梯子量化后给出")
@@ -473,7 +474,10 @@ class GatewayApp:
                 continue
             error = view.get("error") if isinstance(view.get("error"), dict) else None
             if view.get("status") == "strategy_error" and error:
-                failures = [f"策略运行报错: {error.get('type')}: {str(error.get('message') or '')[:MAX_TRACE_TEXT]}"]
+                detail = str(error.get("message") or "报错原文仅人可见")[:MAX_TRACE_TEXT]      # 验证窗口回放里的原文已在视图里去掉
+                where = PHASE_LABELS.get(error.get("phase")) or (
+                    "训练段回测" if view.get("kind") == "backtest" and error.get("message") else "验证窗口回放")
+                failures = [f"策略运行报错({error.get('type') or '自定义异常'},{where}): {detail}"]
             else:
                 failures = list(view.get("failed_checks") or [])[:MAX_TRACE_FAILURES]
             failed = view.get("status") == "strategy_error" or (view.get("kind") in ("gate", "evaluate") and not view.get("passed"))

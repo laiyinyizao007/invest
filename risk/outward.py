@@ -24,6 +24,7 @@ DSR、成本翻倍夏普……);外层看到的是它的**净化视图**,由本�
 """
 from __future__ import annotations
 
+import builtins
 import json
 import math
 import os
@@ -44,6 +45,15 @@ CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 KINDS = ("evaluate", "gate", "backtest")
 MAX_ERROR_MESSAGE = 300
+PHASES = ("declaration", "selection", "validation")
+# 报错原文**只在这些阶段放出**:声明期(我们自己写的消息)与选参窗口回放(进化回路放开的那一层)。
+# 验证窗口回放里的报错原文不出去:候选的普通 bug(`assert pnl > 0, f"pnl {pnl}"`)就会把验证窗口的原始数字
+# 塞进消息,而梯子一次都不扣(第 15 轮 codex 的 Critical,端到端复现过)。没有阶段标记的按验证窗口处理(fail-closed)。
+OPEN_PHASES = ("declaration", "selection")
+# 异常类型的封闭集合:内建异常的名字 + 我们自己的声明期错误。候选自己定义的异常类名是自由文本,不放行。
+STANDARD_ERROR_TYPES = frozenset(
+    name for name in dir(builtins) if isinstance(getattr(builtins, name), type)
+    and issubclass(getattr(builtins, name), BaseException)) | {"GridError", "SandboxError", "ConstitutionError"}
 MAX_STORED_BYTES = 64 * 1024
 # 训练段回测给外层的统计(选参那一层,放开)。不含验证/测试段的任何东西。
 BACKTEST_STATS = ("return_pct", "maxdd_pct", "maxdd_yuan", "sharpe", "round_trips", "end_balance", "net_pnl", "total_cost")
@@ -130,9 +140,13 @@ def build_outward(result: dict) -> dict:
     }
     if view["status"] == "strategy_error":
         error = result.get("error") if isinstance(result.get("error"), dict) else {}
-        etype, message = error.get("type"), error.get("message")
-        view["error"] = {"type": etype[:60] if isinstance(etype, str) and CLASS_NAME.fullmatch(etype[:60]) else None,
-                         "message": message[:MAX_ERROR_MESSAGE] if isinstance(message, str) else None}
+        etype, message, phase = error.get("type"), error.get("message"), error.get("phase")
+        phase = phase if phase in PHASES else None
+        # 训练段回测整段都是放开的那一层;其余看阶段标记
+        message_is_open = phase in OPEN_PHASES or (kind == "backtest" and result.get("segment") == "train")
+        view["error"] = {"type": etype if isinstance(etype, str) and etype in STANDARD_ERROR_TYPES else None,
+                         "phase": phase,
+                         "message": message[:MAX_ERROR_MESSAGE] if message_is_open and isinstance(message, str) else None}
     if kind in ("evaluate", "gate"):
         view["passed"] = result.get("passed") is True
         ids = result.get("failed_check_ids")
@@ -158,7 +172,10 @@ def outward_report(view: dict) -> str:
     lines = [f"run {view.get('run_id')}:{view.get('kind')}"]
     if view.get("status") == "strategy_error":
         error = view.get("error") or {}
-        lines.append(f"策略运行报错:{error.get('type')}: {error.get('message')}")
+        fallback = "训练段回测" if view.get("kind") == "backtest" and error.get("message") else "验证窗口回放"
+        where = {"declaration": "声明期", "selection": "选参窗口回放", "validation": "验证窗口回放"}.get(error.get("phase"), fallback)
+        detail = error.get("message") or "报错原文仅人可见(验证窗口回放中的报错原文不外传:消息里可能带着验证窗口的数字)"
+        lines.append(f"策略运行报错({error.get('type') or '自定义异常'},{where}):{detail}")
         return chr(10).join(lines)
     if "passed" in view:
         lines.append("门槛:通过" if view["passed"] else "门槛:未通过")
@@ -192,6 +209,12 @@ _ALLOWED = {"version", "run_id", "kind", "status", "class", "error", "passed", "
 def validate_view(view: Any) -> bool:
     """存档读回来之后的校验:键都在白名单里、梯子块是有限数。不合法就当损坏。"""
     if not isinstance(view, dict) or not set(view) <= _ALLOWED or view.get("version") != VIEW_VERSION:
+        return False
+    error = view.get("error")
+    if error is not None and (not isinstance(error, dict) or not set(error) <= {"type", "phase", "message"}
+                              or error.get("phase") not in (None, *PHASES)
+                              or (error.get("message") is not None and error.get("phase") not in OPEN_PHASES
+                                  and view.get("kind") != "backtest")):
         return False
     ladder = view.get("ladder")
     if ladder is not None:

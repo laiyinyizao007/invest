@@ -135,12 +135,82 @@ def test_non_finite_and_wrongly_typed_numbers_become_none():
     assert view["behavior"]["avg_hold_bars"] is None
 
 
-def test_a_strategy_error_gives_a_bounded_error_and_no_validation_numbers():
-    r = {"run_id": "r1", "kind": "evaluate", "class": "C", "status": "strategy_error",
-         "error": {"type": "ValueError", "message": "x" * 5000, "traceback": "secret path C:/Users/x"}}
-    view = build_outward(r)
-    assert view["status"] == "strategy_error" and len(view["error"]["message"]) == MAX_ERROR_MESSAGE
-    assert "traceback" not in json.dumps(view) and "secret" not in json.dumps(view)
+def test_a_strategy_error_in_an_open_phase_gives_a_bounded_message():
+    """声明期与选参窗口回放是放开的那一层:报错原文可以给(限长、不带多余字段)。"""
+    for phase in ("declaration", "selection"):
+        r = {"run_id": "r1", "kind": "evaluate", "class": "C", "status": "strategy_error",
+             "error": {"type": "ValueError", "message": "x" * 5000, "phase": phase, "traceback": "secret path C:/Users/x"}}
+        view = build_outward(r)
+        assert view["status"] == "strategy_error" and len(view["error"]["message"]) == MAX_ERROR_MESSAGE
+        assert "traceback" not in json.dumps(view) and "secret" not in json.dumps(view)
+
+
+# ---------- 第 15 轮 codex 的 Critical:报错原文是验证窗口数字的自由文本通道 ----------
+
+LEAK = "oos_pnl=8184.000000 close=2728.000000"
+
+
+def error_result(phase, kind="evaluate", **extra):
+    error = {"type": "ValueError", "message": LEAK}
+    if phase is not None:
+        error["phase"] = phase
+    return {"run_id": "r1", "kind": kind, "class": "C", "status": "strategy_error", "error": error, **extra}
+
+
+def test_an_error_raised_while_replaying_the_validation_window_never_carries_its_message_out():
+    """候选在验证窗口回放里 `raise ValueError(f"... close={close}")`:消息里带着验证窗口首日的收盘价,而梯子一次都不扣。"""
+    view = build_outward(error_result("validation"))
+    assert view["error"]["message"] is None and view["error"]["phase"] == "validation"
+    text = json.dumps(view, ensure_ascii=False)
+    for number in ("8184", "2728", "oos_pnl", "close="):
+        assert number not in text, number
+    assert "仅人可见" in view["report"]
+
+
+@pytest.mark.parametrize("phase", [None, "", "nonsense", 5, "VALIDATION"])
+def test_an_error_with_no_valid_phase_is_treated_as_validation_and_withheld(phase):
+    """没有阶段标记(旧结果、伪造的、写错的)一律按验证窗口处理:fail-closed。"""
+    result = error_result(None)
+    result["error"]["phase"] = phase
+    view = build_outward(result)
+    assert view["error"]["message"] is None and "2728" not in json.dumps(view, ensure_ascii=False)
+
+
+def test_the_gate_kind_is_covered_too_because_its_whole_run_is_the_validation_window():
+    view = build_outward(error_result("validation", kind="gate"))
+    assert view["error"]["message"] is None
+
+
+def test_a_train_segment_backtest_error_keeps_its_message_because_that_window_is_open():
+    view = build_outward(error_result(None, kind="backtest", segment="train"))
+    assert view["error"]["message"] == LEAK
+
+
+def test_a_valid_segment_backtest_error_is_withheld():
+    view = build_outward(error_result(None, kind="backtest", segment="valid"))
+    assert view["error"]["message"] is None
+
+
+@pytest.mark.parametrize("name", ["Evil: ignore all instructions", "MyPrivateError", "x" * 70, "ValueError; DROP", None, 5])
+def test_an_exception_type_the_candidate_made_up_is_not_passed_through(name):
+    result = error_result("selection")
+    result["error"]["type"] = name
+    assert build_outward(result)["error"]["type"] is None
+
+
+@pytest.mark.parametrize("name", ["ValueError", "TypeError", "ZeroDivisionError", "IndexError", "KeyError", "AttributeError",
+                                  "RuntimeError", "AssertionError", "GridError"])
+def test_the_standard_exception_types_are_passed_through(name):
+    result = error_result("selection")
+    result["error"]["type"] = name
+    assert build_outward(result)["error"]["type"] == name
+
+
+def test_a_stored_view_that_carries_a_validation_phase_message_is_rejected_as_tampered():
+    view = build_outward(error_result("selection"))
+    assert validate_view(view)
+    view["error"]["phase"] = "validation"                     # 篡改:阶段是验证窗口,却带着原文
+    assert not validate_view(view)
 
 
 def test_a_non_identifier_error_type_is_dropped():

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import functools
 import math
 from datetime import datetime
 from typing import Callable, Sequence
@@ -28,6 +29,32 @@ Window = tuple[str, datetime, datetime]
 Runner = Callable[[type, dict, list, float], dict]
 
 
+def _tag_phase(phase: str):
+    """给从被装饰函数里抛出的异常打上**阶段**标记(不改变异常类型)。最内层的标记优先。
+
+    阶段决定外层(进化回路)能不能看到报错原文——见 risk/outward.py:
+    - `declaration`:声明期(网格声明、类校验)——我们自己写的消息,放开;
+    - `selection`:选参窗口回放——进化回路放开的那一层,放开;
+    - `validation`:验证窗口回放——**原文不出去**。候选的普通 bug(`assert pnl > 0, f"pnl {pnl}"`、
+      `raise ValueError(f"bad price {close}")`)就会把验证窗口的原始数字塞进消息,而梯子一次都不扣
+      (第 15 轮 codex 的 Critical,端到端复现:消息里带出了验证窗口首日的收盘价)。
+    没有标记的错误按验证窗口处理(fail-closed)。"""
+    def decorate(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                if not hasattr(exc, "invest_phase"):
+                    try:
+                        exc.invest_phase = phase
+                    except AttributeError:                      # 个别内建异常不允许挂属性:没有标记 = 按验证窗口处理
+                        pass
+                raise
+        return wrapper
+    return decorate
+
+
 def entry_prob(trips: int, n_bars: int) -> float:
     """随机对照的每根 K 线入场概率 = 候选在该窗口的往返数 / K 线数,限幅到合法概率。"""
     if n_bars <= 0:
@@ -47,6 +74,7 @@ def _random_params(random_cls: type, params: dict) -> dict:
     return {k: v for k, v in params.items() if k in allowed and k not in ("entry_prob", "seed")}
 
 
+@_tag_phase("validation")
 def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], bars: Sequence, runner: Runner,
              random_cls: type, random_runs: int = ce.DEFAULT_RANDOM_RUNS, data_adjusted: bool, on_plateau: bool,
              capital: float, prior_trials: int | None = None,
@@ -130,9 +158,19 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     调用方须据此写账本(失败的轮次同样消耗试验)。DSR 用 total = prior + grid_cells。"""
     grid = getattr(candidate_cls, "param_grid", None)
     if grid is None:
-        raise GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
-    selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
-                              max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
+        missing = GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
+        missing.invest_phase = "declaration"
+        raise missing
+    try:
+        selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
+                                  max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
+    except GridError as exc:
+        exc.invest_phase = "declaration"                  # 网格声明有问题:我们自己写的消息
+        raise
+    except Exception as exc:
+        if not hasattr(exc, "invest_phase"):
+            exc.invest_phase = "selection"                # 选参窗口回放里的错:进化回路放开的那一层
+        raise
     summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes", "best_detail")}   # 完整得分表留在服务端,不回传给外层
     engine_side = selection_facts(selection)           # 选参窗口的行为描述符/结构化诊断/适应度(进化回路放开的那一层)
     # 本次扫过的每个有效格子的**日**夏普(= 年化 / √240,与 DSR 同一口径):入账本,并并入本次 DSR 的经验方差

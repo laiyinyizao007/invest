@@ -398,12 +398,15 @@ def test_plain_source_is_stored_unchanged(tmp_path):
 
 def test_feedback_includes_strategy_errors_with_type_and_message(tmp_path):
     app = make_app(tmp_path)
-    seed_result(app, "20261112-210000-000000", kind="backtest", status="strategy_error", **{"class": "Candidate", "key": "CADJ"},
+    seed_result(app, "20261112-210000-000000", kind="backtest", status="strategy_error", segment="train",
+                **{"class": "Candidate", "key": "CADJ"},
                 error={"type": "ValueError", "message": "too many values to unpack (expected 3)"})
 
     traces = call(app, "GET", "/research/feedback")[1]["traces"]
 
-    assert len(traces) == 1 and traces[0]["failures"] == ["策略运行报错: ValueError: too many values to unpack (expected 3)"]
+    # 训练段回测整段都是放开的那一层:报错原文给(调试用);验证窗口回放里的报错原文不给(见 test_outward.py)
+    assert len(traces) == 1 and traces[0]["failures"] == [
+        "策略运行报错(ValueError,训练段回测): too many values to unpack (expected 3)"]
 
 
 # ---------- evaluate:选参 + 门槛评估 ----------
