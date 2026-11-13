@@ -140,7 +140,7 @@ Cache-Control: no-store            (仅 /api/*)
 | `/api/alerts` | 待补发队列文件 + 当日日志 | 300 秒 |
 | `/api/days` | 每日日志解析。**只统计有内容的日志**:0 字节的日志文件既不是活动证据也不代表『无异常』;新鲜度取最新非空日志的修改时间 | 600 秒 |
 | `/api/recording` | 录制进程的 `status.json`(每 5 秒心跳) | 120 秒 |
-| `/api/research` | 提交账本 + 运行结果目录 | **不判过期**(每次请求现读,不依赖周期性写入的进程;`state` 要么 ok 要么 missing / corrupt) |
+| `/api/research` | 提交账本 + 运行结果目录 | **不判过期**(每次请求现读,不依赖周期性写入的进程;`state` 取值与其它区块一致:`ok` / `unknown`(有数据没显示)/ `missing` / `corrupt`) |
 | `/api/live`(②) | 运行时写出的快照文件 | 15 秒 |
 | `/api/equity`(②) | 状态页自己追加的权益序列 | 600 秒 |
 

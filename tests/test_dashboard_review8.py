@@ -6,6 +6,8 @@
    `round_trips`,结果**每一个真实回测都被判成损坏、从列表里消失**,而测试全绿。
 所以夹具从真实投影路径生成,面板用同一份键集。
 """
+import json
+
 import pytest
 
 from dashboard import collectors as col
@@ -44,3 +46,45 @@ def test_a_backtest_without_usable_statistics_is_not_accepted(stats):
 def test_a_strategy_error_backtest_still_needs_no_statistics():
     assert _ok({"kind": "backtest", "status": "strategy_error",
                 "error": {"type": "X", "message": "m"}})
+
+
+# ---------------------------------------------------------------- codex 第八次复核的发现
+def test_unscanned_research_results_make_the_block_unknown(tmp_path):
+    """超出扫描上限的旧结果从未被校验:里面若有坏文件就彻底不可见。这属于『有数据没显示』,state 不能是 ok。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    res = root / "data" / "research"
+    res.mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "config" / "research_sandbox.json").write_text(json.dumps({
+        "iteration": {"max_iterations": 5, "window_hours": 24},
+        "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
+                  "approvals_file": "data/research-control/approvals.json"}}), encoding="utf-8")
+    for i in range(col.MAX_RUNS_SCANNED + 5):
+        rid = f"20261112-210000-{i:06d}"
+        (res / f"{rid}.json").write_text(json.dumps({
+            "kind": "gate", "strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r",
+            "ran_at": "2026-11-12T21:00:00", "run_id": rid, "passed": True, "failures": []}), encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    r = col.collect_research(settings, 1_800_000_000.0)
+    assert r.section["state"] == "unknown", "有结果文件没被检查,区块不能显示正常"
+    assert "未检查" in (r.section["message"] or "")
+
+
+def test_a_severe_event_on_an_earlier_day_is_not_hidden_by_an_untrusted_latest_day(tmp_path):
+    """最新那天不可信(正在写)时,前一天已确认的硬锁定不能被降级成『有日志无法识别』。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    d = root / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True)
+    (d / "vt_20261111.log").write_text(
+        "2026-11-11 09:00:00 | INFO | R | 已启动\n2026-11-11 10:00:00 | ERROR | R | 硬锁定\n", encoding="utf-8")
+    (d / "vt_20261112.log").write_text("2026-11-12 09:00:00 | INFO | R | 已启动\n" + chr(0x200B), encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    r = col.collect_days(settings, 1_800_000_000.0)
+    assert r.level == "critical", f"级别应为 critical,实际 {r.level}({r.headline})"
+    assert "2026-11-11" in r.headline

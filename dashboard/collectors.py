@@ -462,6 +462,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
+    # 严重事件的判据是『**最新的有严重事件的天**』,不是『最新的天』:
+    # 最新那天不可信(正在写)时,前一天已确认的硬锁定不能被降级成『有日志无法识别』。
+    severe_days = [d for d in days if d.has_severe]
+    latest_severe = severe_days[-1] if severe_days else None
     bad_logs = _unreadable_logs(settings)
     if bad_logs and state == "ok":
         # **有数据没显示 → 状态不能是 ok**:契约规定前端『先看 state』,ok 会渲染成绿卡片。
@@ -469,9 +473,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         state = "unknown"
     bad_msg = f"有 {bad_logs} 个日志文件内容无法识别(格式变了、被写坏或日期与文件名不符),这些天不能算作『无异常』"
     reasons: list[dict] = []
-    if latest.has_severe:
-        level, headline = "critical", f"{latest.day} 有严重事件"
-        reasons.append(_reason("days", "critical", f"{latest.day} 日志里有严重事件:" + "、".join(n for (lv, n) in latest.events if lv == "严重")))
+    if latest_severe is not None:
+        level, headline = "critical", f"{latest_severe.day} 有严重事件"
+        reasons.append(_reason("days", "critical", f"{latest_severe.day} 日志里有严重事件:"
+                                + "、".join(n for (lv, n) in latest_severe.events if lv == "严重")))
     elif bad_logs:
         # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
         # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
@@ -892,6 +897,10 @@ def collect_research(settings: Settings, now: float) -> Result:
             "approvals_count": len(approved_hashes), "pending": pending, "recent_runs": recent}
 
     problems, notes = [], []
+    if unscanned:
+        # 超出扫描上限的旧结果**从未被校验**:里面若有损坏文件就彻底不可见。
+        # 所以它属于『有数据没显示』,不能只放在 notes 里(state 仍是 ok 就会渲染成绿卡片)。
+        problems.append(f"更早的 {unscanned} 个运行结果未检查(它们的状态未知,不能当作正常)")
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
     if unscanned:
@@ -909,7 +918,7 @@ def collect_research(settings: Settings, now: float) -> Result:
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
     # 有数据没显示 → 状态不是 ok(契约:前端先看 state,ok 会渲染成绿卡片)
-    section_state = "unknown" if problems else "ok"
+    section_state = "unknown" if (problems or unscanned) else "ok"
     return Result(m.section(section_state, data, as_of=max(activity) if activity else None, now=now,
                             message=";".join(problems + notes) or None),
                   level, headline, reasons)
