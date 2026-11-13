@@ -412,3 +412,31 @@ def test_section_numbers_are_matched_as_whole_tokens_not_prefixes():
     tbl = etree.fromstring(f'<root xmlns:w="{br.W_NS}">' + table(row(cell("1.10.其他"), cell("x")), row(cell("1.1.连通性"), cell("y"))) + "</root>")[0]
     hit = br.find_numbered_row(tbl, "1.1")
     assert br.text_of(hit[1][0]) == "1.1.连通性"
+
+
+def test_watermark_banner_is_inserted_at_the_top_of_the_body(tmp_path):
+    """预演报告必须一眼看出「不是国信环境」——模板正文里预填的是国信的 BrokerID/前置。"""
+    evs = evidences()
+    template = build_template(tmp_path / "template.docx")
+    out_dir = render_images(tmp_path, evs)
+    outcome = br.build_report(template, out_dir, tmp_path / "out.docx", ctx(), evs,
+                              watermark="SimNow 预演 · 非国信测试环境 · 不可提交国信")
+    doc = br.Docx(outcome.path)
+    first_paragraph = doc.body[0]
+    assert br.text_of(first_paragraph) == "SimNow 预演 · 非国信测试环境 · 不可提交国信"
+
+
+def test_official_report_name_is_refused_for_non_guosin_evidence(tmp_path):
+    """证据连的不是国信环境时,不能用正式报告文件名(否则会产出一份「自称国信环境」的文件)。"""
+    evs = evidences()
+    out_dir = render_images(tmp_path, evs)
+    (out_dir / "connection.json").write_text(
+        '[{"at": "2026-11-13T21:05:01", "environment": "实盘", "trade_front": "182.254.243.31:30001",'
+        ' "market_front": "182.254.243.31:30011", "broker_id": "9999", "app_id": "simnow_client_test"}]',
+        encoding="utf-8")
+    assert br.non_guoxin_connections(out_dir) == ["BrokerID=9999 交易前置=182.254.243.31:30001"]
+    (out_dir / "connection.json").write_text(
+        '[{"at": "2026-11-13T21:05:01", "environment": "测试", "trade_front": "121.13.218.19:41285",'
+        ' "market_front": "121.13.218.19:41293", "broker_id": "8030", "app_id": "guoxin_client"}]',
+        encoding="utf-8")
+    assert br.non_guoxin_connections(out_dir) == []

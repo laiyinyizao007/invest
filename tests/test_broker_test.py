@@ -476,6 +476,31 @@ def test_run_steps_only_order_items_with_a_position_gates_every_order_step(tmp_p
         e.main.close()
 
 
+def test_flat_gate_says_which_failure_it_was(tmp_path):
+    """闸门失败必须说清是「有持仓」还是「查不到持仓」——两种原因的处理方式完全不同。"""
+    e = Env(tmp_path)
+    try:
+        e.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
+        e.gw.set_position(Direction.LONG, 1)
+        assert bt.run_steps(e.ctx, e.book, only={"P4.2"}) is True
+        summary = e.book.items["P4.2"].summary
+        assert "已有持仓" in summary and "查不到持仓" not in summary      # 有持仓:不说查不到
+        assert e.ctx.flat_reason.startswith("账户已有持仓")
+    finally:
+        e.main.close()
+
+    e2 = Env(tmp_path / "b")
+    try:
+        e2.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
+        e2.gw.td_api.connect_status = False                            # 查不到持仓:连接断了
+        assert bt.run_steps(e2.ctx, e2.book, only={"P4.2"}) is True
+        summary = e2.book.items["P4.2"].summary
+        assert "查不到持仓" in summary and "已有持仓" not in summary
+        assert e2.ctx.flat_reason.startswith("交易连接断开")
+    finally:
+        e2.main.close()
+
+
 def test_pause_step_cleans_flag_and_orders_when_sending_raises(env, monkeypatch):
     def boom(ctx, req=None):
         raise RuntimeError("模拟发送中途崩溃")

@@ -47,6 +47,11 @@ def isolate_state(name: str) -> bool:
 
     必须在导入会加载 `vnpy.trader.logger` 的模块之前调用；返回值也会暴露
     当前进程是否仍处于安全导入顺序，调用方可据此拒绝连接真实柜台。
+
+    如果日志模块**已经被导入过**(同一个进程里先导入了别的工具),vn.py 的文件 sink
+    早就按当时的 TEMP_DIR 建好了,之后再改 TEMP_DIR 对它无效——日志会继续写进
+    旧目录(实盘目录)。这时把旧 sink 摘掉、按新的隔离目录重新挂上,
+    隔离才是真的隔离,而不是名义上的。
     """
     global _STATE_NAME, ISOLATED
     if not name or Path(name).name != name:
@@ -56,8 +61,65 @@ def isolate_state(name: str) -> bool:
     from vnpy.trader import utility
     utility.TEMP_DIR = state_root
     _STATE_NAME = name
-    ISOLATED = "vnpy.trader.logger" not in sys.modules
+    ISOLATED = _rebind_log_sink(state_root)
     return ISOLATED
+
+
+def logger_log_dir() -> Path | None:
+    """vn.py 的日志文件实际落在哪个目录(拿不到就返回 None)。
+
+    vnpy.trader.logger 在**导入时**按当时的 TEMP_DIR 建好文件 sink,所以想知道
+    "日志到底写去哪了"只能问 sink 本身,不能只看 TEMP_DIR。
+    """
+    if "vnpy.trader.logger" not in sys.modules:
+        return None
+    try:
+        from vnpy.trader.logger import logger
+    except Exception:      # noqa: BLE001  日志模块坏了不该拖垮整个流程
+        return None
+    for handler in getattr(logger._core, "handlers", {}).values():
+        sink = getattr(handler, "_sink", None)
+        path = getattr(sink, "_path", None)
+        if path:
+            return Path(path).parent
+    return None
+
+
+def _rebind_log_sink(state_root: Path) -> bool:
+    """把 vn.py 的日志文件 sink 挪到隔离目录。返回是否成功。
+
+    日志模块还没被导入时不用做任何事:它稍后建 sink 时会自己用新的 TEMP_DIR。
+    已经导入过时,旧 sink 是按旧目录建好的,不挪就等于没隔离。
+    """
+    if "vnpy.trader.logger" not in sys.modules:
+        return True
+    try:
+        import vnpy.trader.logger as vnpy_logger_mod
+        from vnpy.trader.logger import logger
+    except Exception:      # noqa: BLE001
+        return False
+    handlers = getattr(logger._core, "handlers", {})
+    file_handlers = [(hid, h) for hid, h in handlers.items()
+                     if getattr(getattr(h, "_sink", None), "_path", None)]
+    if not file_handlers:
+        return True
+    fmt = getattr(vnpy_logger_mod, "format", None)
+    log_dir = state_root / "log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    for handler_id, handler in file_handlers:
+        old_path = Path(getattr(handler._sink, "_path"))
+        # 先挂新的再摘旧的:挂失败时旧 sink 还在,日志不会凭空消失
+        try:
+            logger.add(sink=str(log_dir / old_path.name),
+                       level=getattr(handler, "levelno", None) or "INFO",
+                       format=fmt if isinstance(fmt, str) else "{message}")
+        except Exception:      # noqa: BLE001  挪不动就如实说没成功
+            return False
+        logger.remove(handler_id)
+    return True
 
 
 def load_env(env: Mapping[str, str] | None = None) -> Mapping[str, str]:

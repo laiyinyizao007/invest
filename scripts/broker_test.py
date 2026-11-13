@@ -56,6 +56,7 @@ from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
 from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
+from ctp_tools.simnow import normalize_address  # noqa: E402
 from ctp_tools.penetration import (  # noqa: E402
     MILESTONE_LABELS, MILESTONES, Run, check_target, do_order_cancel, limit_down_price, mask_account, redact,
     wait_milestones,
@@ -83,6 +84,11 @@ FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上�
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
 
 
+def _allowed_addresses(raw: str) -> set[str]:
+    """解析 BROKER_TEST_ALLOWED_TD/MD:逗号(或分号)分隔的 host:port,统一归一化。"""
+    return {normalize_address(x) for x in raw.replace(";", ",").split(",") if x.strip()}
+
+
 # ======================= 上下文与工具 =======================
 
 @dataclass
@@ -103,6 +109,7 @@ class Ctx:
     cancel_wait: float = 8.0             # 等撤单确认的时间
     probe_seq: int = 0                   # 演示委托的价格序号:每笔演示委托用不同价格,避免重复报单规则的累计计数跨步骤污染
     flat: bool | None = None             # 账户是否已确认空仓(None = 还没查)
+    flat_reason: str = ""                # 空仓闸门失败的具体原因(有持仓 / 连接断开)
     started_wall: datetime = field(default_factory=datetime.now)   # 本次运行开始时刻,日志归因用
     alerts: list[dict] = field(default_factory=list)
     trades: list = field(default_factory=list)
@@ -205,8 +212,19 @@ def probe_price(ctx: Ctx) -> float:
 
 def ensure_flat(ctx: Ctx) -> bool:
     """所有会发单的步骤之前的统一闸门:账户必须空仓。有持仓(或连接断开查不准)就不发任何演示委托——
-    "无仓位可平""暂停期间平仓"这类平仓单在有持仓时会真的平掉仓位。"""
+    "无仓位可平""暂停期间平仓"这类平仓单在有持仓时会真的平掉仓位。
+
+    失败原因分两种,分开记,否则事后只看证据分不清是"账户真有持仓"还是"查不到持仓":
+    - 有持仓:列出来是哪几个合约、多少手,人工去平;
+    - 连接断开/查不到:柜台连接在查询期间断了,或持仓查询没有回报,这时平仓单更不能发。
+    """
     held, connected = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
+    if held:
+        ctx.flat_reason = f"账户已有持仓:{'、'.join(held)}(请先人工平仓再重跑)"
+    elif not connected:
+        ctx.flat_reason = "交易连接断开,查不到持仓,无法确认账户空仓"
+    else:
+        ctx.flat_reason = ""
     ctx.flat = (not held) and connected
     return ctx.flat
 
@@ -818,7 +836,8 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
     if order_items:
         gated = not ensure_flat(ctx)
         if gated:
-            reason = "账户已有持仓或交易连接断开,查不准持仓:已中止所有会发单的演示(平仓类演示单会真的平掉仓位),请先人工处理后重跑"
+            reason = (f"{ctx.flat_reason}:已中止所有会发单的演示"
+                      "(平仓类演示单会真的平掉仓位),请先人工处理后重跑")
             for name in sorted(order_items):
                 book.add(name, FAIL, reason, [Shot("", [reason])], ctx.now())
     if not gated and want("T3", "T5", "P1.2"):
@@ -903,22 +922,37 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return EXIT_CONFIG
-    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test)
+    if not ISOLATED:
+        print("状态目录隔离未生效(vnpy 日志模块在设置 TEMP_DIR 之前已被导入),取证日志会写进实盘目录,拒绝运行。"
+              "请直接用 python scripts/broker_test.py 启动,不要从别的模块导入它。", file=sys.stderr)
+        return EXIT_CONFIG
+    # 前置地址白名单:由一键流程注入,或写在 .env 的 BROKER_TEST_ALLOWED_TD/MD 里。
+    # 没有白名单时,「柜台环境=测试」这一句不足以证明连的是期货公司的测试机——
+    # 那台机器只按环境变量判断,不校验地址,所以这里必须自己校验。
+    allowed_td = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_TD", "")) or None
+    allowed_md = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_MD", "")) or None
+    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test, allowed_td)
     print(note, file=sys.stderr if not ok else sys.stdout)
     if not ok:
         return EXIT_CONFIG
-    print(f"交易前置 {setting['交易服务器']} / 行情前置 {setting['行情服务器']} —— 请确认这是国信给的**测试**前置地址"
-          "(测试版 API 无法与生产前置握手,但脚本不校验测试环境的地址)。")
+    if setting["柜台环境"] == "测试" and not allowed_td:
+        print("柜台环境=测试 但没有配置前置地址白名单(BROKER_TEST_ALLOWED_TD),拒绝连接:"
+              "「测试」这个标记不说明连的是哪台机器。请用一键流程(它会注入白名单),"
+              "或在 .env 里写 BROKER_TEST_ALLOWED_TD=host:port[,host:port]。", file=sys.stderr)
+        return EXIT_CONFIG
+    md_address = normalize_address(setting["行情服务器"])
+    if allowed_md and md_address not in allowed_md:
+        print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
+        return EXIT_CONFIG
+    print(f"交易前置 {setting['交易服务器']} / 行情前置 {setting['行情服务器']} —— "
+          f"白名单校验通过(BROKER_TEST_ALLOWED_TD={sorted(allowed_td) if allowed_td else '未设置,SimNow 场景按 SimNow 白名单'}、"
+          f"BROKER_TEST_ALLOWED_MD={sorted(allowed_md) if allowed_md else '未设置'})。")
     only = {x.strip() for x in args.only.split(",") if x.strip()} or None
     unknown = (only or set()) - set(ITEMS)
     if unknown:
         print(f"未知测试项:{sorted(unknown)};可用:{list(ITEMS)}", file=sys.stderr)
         return EXIT_CONFIG
 
-    if not ISOLATED:
-        print("状态目录隔离未生效(vnpy 日志模块在设置 TEMP_DIR 之前已被导入),取证日志会写进实盘目录,拒绝运行。"
-              "请直接用 python scripts/broker_test.py 启动,不要从别的模块导入它。", file=sys.stderr)
-        return EXIT_CONFIG
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
     from vnpy_ctp import CtpGateway

@@ -14,6 +14,7 @@
 模板含国信测试环境的 IP/端口,**不入库**,用 --template 传路径(或环境变量 BROKER_REPORT_TEMPLATE)。
 """
 import argparse
+import json
 import os
 import re
 import struct
@@ -33,6 +34,8 @@ import bootstrap  # noqa: F401
 from lxml import etree
 
 from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
+from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
+from ctp_tools.simnow import normalize_address  # noqa: E402
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -528,6 +531,33 @@ def _fill_stability_seconds(ev: Evidence | None, paras: list | None, outcome: Ou
     set_paragraph_text(target, filled)
 
 
+def add_banner(doc: Docx, text: str) -> None:
+    """在正文最前面插一段醒目的提示(预演报告用)。
+
+    模板正文里预填的是国信的 BrokerID/前置地址,预演跑在 SimNow 上时,不加提示就会变成
+    一份「自称国信环境」的报告,存在误交的风险。
+    """
+    body = doc.body
+    p = etree.Element(P)
+    ppr = etree.SubElement(p, PPR)
+    jc = etree.SubElement(ppr, w("jc"))
+    jc.set(w("val"), "center")
+    run = etree.SubElement(p, R)
+    rpr = etree.SubElement(run, RPR)
+    etree.SubElement(rpr, w("b"))
+    color = etree.SubElement(rpr, w("color"))
+    color.set(w("val"), "C00000")
+    sz = etree.SubElement(rpr, w("sz"))
+    sz.set(w("val"), "32")
+    t = etree.SubElement(run, T)
+    t.text = text
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    if len(body):
+        body[0].addprevious(p)
+    else:
+        body.append(p)
+
+
 def fill_covers(doc: Docx, ctx: ReportContext) -> None:
     replace_in_paragraphs(doc.body, "XXXX系统", f"{ctx.system_name}系统")
     replace_in_paragraphs(doc.body, "XXXX年XX月XX日", f"{ctx.report_date:%Y年%m月%d日}")
@@ -537,7 +567,7 @@ def fill_covers(doc: Docx, ctx: ReportContext) -> None:
 
 
 def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: ReportContext,
-                 evidences: dict[str, Evidence] | None = None) -> Outcome:
+                 evidences: dict[str, Evidence] | None = None, watermark: str = "") -> Outcome:
     doc = Docx(template)
     doc.evidence_dir = evidence_dir
     evs = evidences if evidences is not None else load_evidence(evidence_dir)
@@ -545,6 +575,8 @@ def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: Report
     _, boundary, end = split_parts(doc)
     fill_report(doc, ctx, evs, outcome, boundary, end)
     fill_covers(doc, ctx)
+    if watermark:
+        add_banner(doc, watermark)
     for missing_image in doc.missing_images:
         outcome.warnings.append(f"证据图缺失,未插入:{missing_image}")
         outcome.missing.append(f"证据图缺失:{missing_image}")
@@ -578,6 +610,28 @@ def context_from_env(env, info: dict | None = None) -> ReportContext:
     )
 
 
+def non_guoxin_connections(evidence_dir: Path) -> list[str]:
+    """证据目录里记录了「不是国信测试环境」的连接记录(预演/其它环境),返回可读描述。"""
+    path = evidence_dir / "connection.json"
+    if not path.exists():
+        return []
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(records, dict):
+        records = [records]
+    bad = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        broker_id = str(record.get("broker_id", ""))
+        front = normalize_address(str(record.get("trade_front", "")))
+        if broker_id != GUOXIN_TEST_BROKER_ID or front not in GUOXIN_TEST_TD:
+            bad.append(f"BrokerID={broker_id} 交易前置={front or '未知'}")
+    return bad
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--template", type=Path, default=os.environ.get("BROKER_REPORT_TEMPLATE") or None,
@@ -585,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence", type=Path, required=True, help="broker_test.py 生成的证据目录")
     parser.add_argument("--out", type=Path, default=None, help="输出 docx(默认在证据目录里)")
     parser.add_argument("--no-terminal-info", action="store_true", help="不采集本机终端信息(机型/CPU/内存/硬盘栏留空)")
+    parser.add_argument("--watermark", default="", help="在正文最前面插入的提示文字(预演报告用它标明不可提交国信)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
@@ -601,7 +656,15 @@ def main(argv: list[str] | None = None) -> int:
         info = collect_terminal_info.collect()
     ctx = context_from_env(os.environ, info)
     out = args.out or (args.evidence / f"国信外部接入系统技术测试报告-{ctx.app_id or 'noappid'}.docx")
-    outcome = build_report(Path(args.template), args.evidence, out, ctx)
+    if args.out is None:
+        # 正式报告名 + 模板正文里预填的国信 BrokerID/前置 = 一份「自称国信环境」的文件。
+        # 证据不是国信环境(预演等)时,拒绝用正式文件名。
+        bad = non_guoxin_connections(args.evidence)
+        if bad:
+            print(f"拒绝用正式报告文件名:证据里的连接不是国信测试环境({'; '.join(bad)})。"
+                  "预演或其它环境的证据请用 --out 指定带「预演」字样的文件名。", file=sys.stderr)
+            return 2
+    outcome = build_report(Path(args.template), args.evidence, out, ctx, watermark=args.watermark)
     print(f"报告已生成:{outcome.path}")
     for line in outcome.warnings:
         print(f"  ⚠ {line}", file=sys.stderr)

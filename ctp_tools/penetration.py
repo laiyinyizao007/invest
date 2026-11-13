@@ -80,11 +80,19 @@ class Run:
         return any(s.status == "FAIL" for s in self.steps)
 
 
-def check_target(environment: str, td_address: str, confirmed: bool) -> tuple[bool, str]:
-    """目标环境闸门。返回 (是否放行, 说明)。生产 API 没有任何强制放行的出口。"""
+def check_target(environment: str, td_address: str, confirmed: bool,
+                 allowed_td: set[str] | None = None) -> tuple[bool, str]:
+    """目标环境闸门。返回 (是否放行, 说明)。生产 API 没有任何强制放行的出口。
+
+    allowed_td:本次允许连接的前置地址表(已归一化的 host:port)。给了就必须在表内——
+    「柜台环境=测试」本身不说明连的是哪台机器,只靠这一句放行等于没有闸门。
+    """
     if not confirmed:
         return False, "未加 --confirm-broker-test。本脚本会连接并发出测试委托,请确认目标是期货公司的测试环境。"
     address = normalize_address(td_address)
+    if allowed_td is not None and address not in allowed_td:
+        return False, (f"交易前置 {address} 不在本次允许的前置地址表 {sorted(allowed_td)} 内,拒绝连接。"
+                       "地址表由 BROKER_TEST_ALLOWED_TD 指定(一键流程会自动注入)。")
     if environment == "测试":
         return True, f"目标:期货公司看穿式测试环境(柜台环境=测试),交易前置 {address}。"
     if is_simnow_address(address):

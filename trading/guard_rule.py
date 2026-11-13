@@ -27,7 +27,8 @@ from pathlib import Path
 from vnpy.event import Event
 from vnpy.trader.constant import Direction, Offset, OrderType, Status
 from vnpy.trader.event import EVENT_LOG
-from vnpy.trader.logger import ERROR
+from logging import ERROR  # 标准库的级别常量:不要从 vnpy.trader.logger 引,
+# 那会把日志模块(在导入时就按 TEMP_DIR 建好文件 sink)提前拉进来,隔离目录就名不副实了
 from vnpy.trader.object import LogData, OrderData, OrderRequest
 from vnpy.trader.utility import round_to
 from vnpy_ctastrategy.base import APP_NAME as CTA_APP_NAME

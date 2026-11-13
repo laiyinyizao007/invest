@@ -148,7 +148,7 @@ flowchart LR
 > 每个模块一行;详细职责、约束与修复经过见 [`docs/modules.md`](docs/modules.md)(按下列路径查找小节)。纪律机制与穿透式监管工具的决策见 `docs/adr/20261111-*.md`。
 
 **数据**
-- `scripts/bootstrap.py`:所有脚本的统一启动入口(固定工作目录与中国时区,须先于 `vnpy.trader.database` 导入)。
+- `scripts/bootstrap.py`:所有脚本的统一启动入口(固定工作目录与中国时区,须先于 `vnpy.trader.database` 导入)。`isolate_state()` 切 vn.py 的临时目录(TEMP_DIR)并**重绑日志文件 sink**:`vnpy.trader.logger` 在导入时就按当时的 TEMP_DIR 建好文件 sink,之后再改 TEMP_DIR 无效,不重绑就等于没隔离;`logger_log_dir()` 回答「日志到底落在哪个目录」。
 - `scripts/fetch_data.py`:新浪行情下载→清洗→存 vn.py 数据库/CSV(分钟线只返回最近约 1023 根,须定期增量运行)。
 - `scripts/record_market_data.py`、`scripts/record_market_data_wrapper.py`:官方 DataRecorder 行情录制与独立子进程生命周期管理；连行情前置，并受限地连交易前置（仅认证+查合约，发单/撤单/查资金/查持仓在代码层硬性禁止）。**验证程度**：SimNow 第二套 7x24 前置已验证认证/登录/合约/订阅/tick/优雅停止，但该环境行情时间不可信，正式库 0 行；SimNow 第一套前置交易时段录制已验收（2026-11-12 夜盘：Tick/1 分钟 K 线入正式库、数据自洽、自动重连正常），**DSH 重启实测与国信测试环境未验证；「连接成功但长时间不订阅」已加 `stalled` 检测与 watchdog 重启**，详见 runbook「验收记录」与 ADR 修订。
 - `scripts/record_market_incremental.py`:DSH 调用的有界、可重入增量任务；通过锁、超时和结果状态文件保护定时补数。
@@ -187,7 +187,10 @@ flowchart LR
 - `scripts/unattended_report.py`:无人值守每日证据表与验收清单、Webhook 连通性自检。
 - `scripts/collect_terminal_info.py`、`scripts/penetration_check.py`:穿透式监管的终端信息采集与看穿式测试环境演练(脱敏报告)。
 - `scripts/broker_test.py`、`scripts/broker_evidence.py`、`scripts/broker_report.py`:国信测试报告的取证运行器(19 项,含 2.1 稳定运行;证据渲染成图;每次运行向 `connection.json` 留痕实际连接的环境)、证据模型与渲染、docx 报告生成器(lxml 填国信 20260717 版模板,只支持新版,不默认勾通过,不碰国信填写区)。
-  取证运行器的硬约束:**发单前统一过空仓闸门**(有持仓一笔不发)、演示委托用唯一价格(不污染重复报单计数)、测试前置地址靠人工确认(脚本无法判别)、异常也清场(解除暂停标志、还原阈值)。
+  取证运行器的硬约束:**发单前统一过空仓闸门**(有持仓一笔不发)、演示委托用唯一价格(不污染重复报单计数)、**前置地址白名单在运行期再校验一次**(`BROKER_TEST_ALLOWED_TD/MD`,`ctp_tools/broker_targets.py` 是唯一来源:「柜台环境=测试」本身不说明连的是哪台机器)、异常也清场(解除暂停标志、还原阈值)。
+- `scripts/guoxin_oneclick.py`(+ `scripts/guoxin_oneclick.cmd`):国信测试一键流程(检查 → 切档案 → 取证 → 出报告 → 列人工事项),另有 `--rehearsal` 走 SimNow 预演。闸门校验的是**运行时生效环境**(进程环境变量会盖住 `.env`,不一致直接拒绝),跑完把 `.env` 还原;预演产出的报告用独立文件名 + 正文水印,**不能交国信**;证据目录写 `mode.json`,`--resume` 时拒绝跨模式补测(防止 SimNow 结果覆盖国信证据)。
+- `scripts/flatten_positions.py`:清场工具——把账户里的残留持仓平掉,让空仓闸门能放行(残留仓位会让**所有**发单项变成 FAIL,报告看起来像代码坏了,其实是账户状态)。默认只看不动,真发单要 `--confirm-flatten`;只允许模拟盘;平多挂买一/平空挂卖一,上期所拆今仓昨仓;收尾复查持仓为 0,没成交的单一律撤掉;留痕写 `data/flatten/*.json`。
+- `scripts/probe_position.py`:只读探针(查询持仓/资金,不下单)。支持 `--profile` 指定档案,输出连接里程碑,用来区分「前置没开」「客户端被拒」「账号没授权」。
 - 标记区重写约定(演练/采集/无人值守报告共用):见 `docs/modules.md`「标记区重写的共同约定」。
 
 ## 6. API 手册(脚本内部接口)
