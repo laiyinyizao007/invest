@@ -230,20 +230,22 @@ def test_feedback_returns_at_most_configured_number_of_latest_failures(tmp_path)
     app = make_app(tmp_path, feedback={"limit": 3})
     for i in range(6):
         seed_result(app, f"20261112-21000{i}-000000", kind="gate", passed=False, failures=[f"失败{i}"],
-                    **{"class": "S", "key": "C15"}, diagnosis={"weakest": "sharpe", "summary": "s"})
+                    failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"},
+                    diagnosis={"weakest": "sharpe", "summary": "s"})
     seed_result(app, "20261112-219999-000000", kind="gate", passed=True, failures=[], **{"class": "S", "key": "C15"})
 
     status, body = call(app, "GET", "/research/feedback")
 
     assert status == 200 and len(body["traces"]) == 3
     assert [t["run_id"] for t in body["traces"]] == ["20261112-210005-000000", "20261112-210004-000000", "20261112-210003-000000"]
-    assert all(t["failures"] and "source" not in t for t in body["traces"])
+    assert all(t["failures"] == ["sharpe_low"] and "source" not in t for t in body["traces"])   # 稳定 ID,不是中文句子
 
 
 def test_feedback_limit_follows_config(tmp_path):
     app = make_app(tmp_path, feedback={"limit": 1})
     for i in range(3):
-        seed_result(app, f"20261112-21000{i}-000000", kind="gate", passed=False, failures=["x"], **{"class": "S", "key": "C15"})
+        seed_result(app, f"20261112-21000{i}-000000", kind="gate", passed=False, failures=["x"],
+                    failed_check_ids=["dsr_low"], **{"class": "S", "key": "C15"})
 
     assert len(call(app, "GET", "/research/feedback")[1]["traces"]) == 1
 
@@ -524,20 +526,31 @@ def test_ledger_keeps_only_entries_inside_the_window(tmp_path):
 
 # ---------- view=report:只回精炼报告(体积小,工作流结果节点直接展示) ----------
 
-FULL = {"run_id": "r1", "passed": False, "report": "结论: 未通过", "metrics": {"x": 1}, "windows": [1, 2, 3], "failures": ["a"]}
+FULL = {"run_id": "r1", "passed": False, "report": "结论: 未通过", "metrics": {"x": 1}, "windows": [1, 2, 3], "failures": ["a"],
+        "failed_check_ids": ["sharpe_low"]}
+
+
+def full_of(kind):
+    """给每个路由一个与它真实返回同类的落盘结果(kind 决定净化视图里有哪些字段)。"""
+    extra = {"segment": "train", "stats": {"sharpe": 1.0}} if kind == "backtest" else {}
+    return {**FULL, "kind": kind, **extra}
 
 
 def test_view_report_returns_only_the_compact_fields(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL), backtest_job=lambda **kw: dict(FULL),
-                                                  gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x")))
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: full_of("evaluate"),
+                                                  backtest_job=lambda **kw: full_of("backtest"),
+                                                  gate_job=lambda **kw: full_of("gate"), plateau_from_data=lambda d: (True, "x")))
 
     for path, body in (("/research/evaluate", {"strategy": "a.py", "class": "C"}),
                        ("/research/gate", {"strategy": "a.py", "class": "C"}),
                        ("/research/backtest", {"strategy": "a.py", "class": "C", "key": "CADJ", "segment": "train"})):
         status, out = call(app, "POST", path, {**body, "view": "report"})
-        assert status == 200 and out == {"run_id": "r1", "passed": False, "report": "结论: 未通过"}, path
+        assert status == 200 and set(out) <= {"run_id", "passed", "status", "report"} and out["run_id"] == "r1", path
+        assert out["status"] == "ok" and "run r1" in out["report"], path          # 报告由净化视图生成,不是落盘的原文
         full = call(app, "POST", path, body)[1]
-        assert "metrics" in full and "failures" in full                  # 默认仍是完整结果
+        # 默认也只是净化视图:落盘的完整记录(验证窗口成绩、带数字的中文失败原因)不外泄
+        assert "metrics" not in full and "failures" not in full and "windows" not in full, path
+        assert full["version"] == 1 and "report" in full, path
 
 
 def test_unknown_view_is_rejected_before_running_anything(tmp_path):
@@ -548,9 +561,10 @@ def test_unknown_view_is_rejected_before_running_anything(tmp_path):
 
 
 def test_blank_view_means_full_result(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: full_of("evaluate")))
 
-    assert "metrics" in call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": ""})[1]
+    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": ""})[1]
+    assert out["version"] == 1 and out["failed_checks"] == ["sharpe_low"] and "metrics" not in out
 
 
 def test_view_report_keeps_strategy_error_status(tmp_path):
@@ -559,18 +573,18 @@ def test_view_report_keeps_strategy_error_status(tmp_path):
 
     out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "report"})[1]
 
-    assert out["status"] == "strategy_error" and out["report"].startswith("策略运行报错")
+    assert out["status"] == "strategy_error" and "策略运行报错" in out["report"]
 
 
 # ---------- view=text:纯文本报告(给毕昇结果节点直接展示,不显示成带 \n 转义的 JSON) ----------
 
 def test_view_text_returns_plain_text_with_the_run_id(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: full_of("evaluate")))
 
     status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
 
     assert status == 200 and isinstance(payload, gw.PlainText)
-    assert payload.startswith("结论: 未通过") and "run_id: r1" in payload
+    assert payload.startswith("run r1") and "门槛:未通过" in payload and "run_id: r1" in payload
 
 
 def test_errors_stay_json_even_when_text_view_is_requested(tmp_path):
@@ -588,7 +602,7 @@ def test_server_sends_text_view_as_text_plain():
     import threading
     import urllib.request
     app = make_app_for_server()
-    app.jobs = SimpleNamespace(evaluate_job=lambda **kw: dict(FULL))
+    app.jobs = SimpleNamespace(evaluate_job=lambda **kw: full_of("evaluate"))
     server = gw.build_server(app, "127.0.0.1", 0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
@@ -601,7 +615,7 @@ def test_server_sends_text_view_as_text_plain():
         server.shutdown()
         server.server_close()
 
-    assert resp.headers["Content-Type"].startswith("text/plain") and body.startswith("结论: 未通过")
+    assert resp.headers["Content-Type"].startswith("text/plain") and body.startswith("run r1") and "门槛:未通过" in body
 
 
 def test_ledger_write_failure_leaves_no_candidate_file(tmp_path):

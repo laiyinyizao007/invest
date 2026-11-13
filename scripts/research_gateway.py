@@ -30,6 +30,8 @@ from typing import Callable
 import bootstrap
 import research_config as rc
 import research_sandbox as rs
+from risk.ladder import Ladder, LadderError, LadderExhausted
+from risk.outward import OutwardError, RevealStore, reveal
 from risk.trial_ledger import TrialLedgerError, record_trials
 
 ROUTES = {
@@ -45,6 +47,11 @@ CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 MIN_TOKEN_LENGTH = 32
 MAX_TRACE_FAILURES = 8
 MAX_TRACE_TEXT = 300
+LADDER_EXHAUSTED = ("验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,需要人工续期"
+                    "(选参窗口的信息、/research/feedback 里已揭示过的结果不受影响)")
+LADDER_UNAVAILABLE = "梯子状态或揭示存档不可用(fail-closed):拒绝给出任何验证窗口的信息,请人工检查"
+VALID_SEGMENT_REFUSED = ("验证段的回测不能经网关直接读取:它会绕过梯子直接给出验证窗口的完整统计。"
+                         "验证窗口的成绩只经 /research/evaluate(或 /research/gate)按梯子量化后给出")
 
 
 class GatewayError(RuntimeError):
@@ -328,6 +335,37 @@ class GatewayApp:
             return status, PlainText(f"{payload.get('report', '')}\n\n(run_id: {payload.get('run_id', '?')})")
         return outcome
 
+    # ---- 对外揭示(risk/outward.py):外层看到的一切都从这里过 ----
+    def _ladder(self) -> Ladder:
+        return Ladder(Path(self.paths["results_dir"]) / "ladder.json")
+
+    def _reveal_store(self) -> RevealStore:
+        return RevealStore(Path(self.paths["results_dir"]) / "outward")
+
+    def _ladder_precheck(self):
+        """跑会产生验证窗口数字的作业**之前**先看梯子还有没有查询:用尽了就不必白跑一次(也不白耗试验次数)。"""
+        try:
+            left = self._ladder().status()["queries_left"]
+        except LadderError:
+            return 500, {"error": LADDER_UNAVAILABLE}
+        return (429, {"error": LADDER_EXHAUSTED}) if left <= 0 else None
+
+    def _reveal(self, result: dict, *, allow_query: bool = True):
+        """落盘结果 → 净化视图。梯子用尽 429;梯子/存档损坏 500(fail-closed,不放出任何验证窗口信息)。"""
+        try:
+            view = reveal(result, ladder=self._ladder(), store=self._reveal_store(), allow_query=allow_query)
+        except LadderExhausted:
+            return 429, {"error": LADDER_EXHAUSTED}
+        except (LadderError, OutwardError):
+            return 500, {"error": LADDER_UNAVAILABLE}
+        return 200, view
+
+    def _reveal_outcome(self, outcome: tuple):
+        status, payload = outcome
+        if status != 200 or not isinstance(payload, dict):
+            return outcome                                   # 作业层的错误原样返回(不含验证窗口信息)
+        return self._reveal(payload)
+
     def _run_job(self, func, **kwargs):
         import research_api as api
         if not self._busy.acquire(blocking=False):
@@ -349,11 +387,13 @@ class GatewayApp:
             return 400, {"error": "strategy/class/key/segment 必须是字符串,class 必须是合法标识符"}
         if key not in rs.KEYS or segment not in rs.SEGMENTS:
             return 400, {"error": f"key 只能是 {list(rs.KEYS)},segment 只能是 {list(rs.SEGMENTS)}"}
+        if segment == "valid":
+            return 403, {"error": VALID_SEGMENT_REFUSED}
         params = _lenient_object(data.get("params"), "params") or {}
         view = _view(data)
         # confirm 固定为 False:批准只能由本机 CLI 触发,请求体里的同名字段被忽略
-        return self._shape(self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
-                                         params=params, confirm=False), view)
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment, params=params, confirm=False)), view)
 
     def _gate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -366,8 +406,12 @@ class GatewayApp:
         if plateau_data is not None:
             plateau = self.jobs.plateau_from_data(plateau_data)
         view = _view(data)
-        return self._shape(self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
-                                         random_runs=random_runs, confirm=False), view)
+        refused = self._ladder_precheck()
+        if refused:
+            return refused
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
+            random_runs=random_runs, confirm=False)), view)
 
     def _evaluate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -376,19 +420,29 @@ class GatewayApp:
         random_runs = _lenient_int(data.get("random_runs"), "random_runs")
         # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
         view = _view(data)
-        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False), view)
+        refused = self._ladder_precheck()
+        if refused:
+            return refused
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False)), view)
 
     def _results(self, _data, params):
         run_id = params["run_id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
             return 400, {"error": "非法的 run_id"}
         try:
-            return 200, rs.load_result(run_id, self.paths["results_dir"])
+            result = rs.load_result(run_id, self.paths["results_dir"])
         except rs.SandboxError:
             return 404, {"error": "没有这条结果"}
+        # 落盘的是给人看的完整记录;外层只看净化视图。第一次读到带验证窗口数字的 run 才消耗一次梯子查询,之后回放
+        return self._reveal(result)
 
     def _feedback(self, _data, _params):
-        """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。"""
+        """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
+
+        只取**已经向外层揭示过**的 run(或根本没有验证窗口数字的 run):一次 `/feedback` 要扫很多 run,
+        不能让一次读取悄悄烧掉一批梯子查询,也不能把从未揭示过的验证窗口数字带出去。
+        失败原因是门槛检查项的稳定 ID,不是带验证窗口数字的中文句子。"""
         limit = self.cfg["feedback"]["limit"]
         traces = []
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
@@ -396,21 +450,24 @@ class GatewayApp:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
                 continue
-            failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
-            diagnosis = result.get("diagnosis") or {}
-            weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
-            error = result.get("error")
-            if result.get("status") == "strategy_error" and isinstance(error, dict):
-                failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
-            failed = bool(failures) if (result.get("kind") in ("gate", "evaluate") or failures) else weakest is not None
+            status, view = self._reveal(result, allow_query=False)
+            if status != 200:
+                return status, view
+            if view is None:                                    # 从未揭示过:不在这里揭示
+                continue
+            error = view.get("error") if isinstance(view.get("error"), dict) else None
+            if view.get("status") == "strategy_error" and error:
+                failures = [f"策略运行报错: {error.get('type')}: {str(error.get('message') or '')[:MAX_TRACE_TEXT]}"]
+            else:
+                failures = list(view.get("failed_checks") or [])[:MAX_TRACE_FAILURES]
+            failed = view.get("status") == "strategy_error" or (view.get("kind") in ("gate", "evaluate") and not view.get("passed"))
             if not failed:
                 continue
-            cls = result.get("class")
+            diagnosis = view.get("selection_diagnosis") if isinstance(view.get("selection_diagnosis"), dict) else {}
             traces.append({
-                "run_id": run_id, "kind": result.get("kind"), "key": result.get("key"),
-                "class": cls if isinstance(cls, str) and CLASS_NAME.match(cls) else None,
-                "weakest": weakest if isinstance(weakest, str) else None, "failures": failures,
-                "summary": str(diagnosis.get("summary", ""))[:MAX_TRACE_TEXT] if isinstance(diagnosis, dict) else "",
+                "run_id": run_id, "kind": view.get("kind"), "class": view.get("class"),
+                "weakest": diagnosis.get("weakest"), "failures": failures,
+                "summary": str(view.get("report", ""))[:MAX_TRACE_TEXT * 2],
             })
             if len(traces) >= limit:
                 break
