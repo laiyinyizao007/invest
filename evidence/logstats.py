@@ -70,6 +70,9 @@ class DayStats:
     # 这份日志是否像一份真实的 vn.py 日志(状态页用它决定能不能把『没有事件』当成『这一天无异常』)。
     # 默认 True:unattended_report 等既有使用者不关心这个,行为完全不变。判据见 DayLogParser.trusted。
     trusted: bool = True
+    # 尾部不完整:最后一行没有换行结尾,且它有可能是某个事件关键字的前缀(『硬锁定』被截成『硬』)。
+    # 这与『日志损坏』不同:文件可能只是正在写。两者都要保守(不把这一天算作无异常),但提示文案要分开。
+    tail_uncertain: bool = False
 
     @property
     def clean(self) -> bool:
@@ -145,6 +148,7 @@ class DayLogParser:
         self._first_record_day = ""   # 第一条记录的日期(应与文件名日期一致)
         self._truncated_tail = False  # 文件末尾停在多字节字符中间(只在 finish() 处理尾行时才可能为真;追加后字符补全则不会再出现)
         self._bad_encoding = False    # 出现过非法 UTF-8:日志不可信(曾用替换字符『修复』,坏字节落在关键字中间时严重事件会被藏起来)
+        self._tail_partial = ""       # 没有换行结尾的最后一行(可能只写了一半);用来判断它是否可能是某个关键字的前缀
 
     def feed(self, data: bytes) -> None:
         buf = self._pending + data
@@ -159,6 +163,7 @@ class DayLogParser:
         """文件到此为止:把没有换行结尾的最后一行也算进去(全量解析就是这个语义)。"""
         if self._pending:
             text, self._pending = self._decode(self._pending, tail=True), b""
+            self._tail_partial = text
             self._consume(text)
 
     def _decode(self, raw: bytes, *, tail: bool) -> str:
@@ -207,6 +212,7 @@ class DayLogParser:
         c._started_ok, c._start_attempts, c._pending = self._started_ok, self._start_attempts, self._pending
         c._lines, c._records, c._first_record_day = self._lines, self._records, self._first_record_day
         c._bad_encoding, c._truncated_tail = self._bad_encoding, self._truncated_tail
+        c._tail_partial = self._tail_partial
         return c
 
     def trusted(self) -> bool:
@@ -218,8 +224,27 @@ class DayLogParser:
         0. 没有出现过非法 UTF-8(codex 第 3 轮复核:坏字节落在『当日熔断』中间时,替换后关键字不匹配,日志却仍被判为干净)。
         3. 记录占非空行的比例不低于 20%(容忍 traceback 续行,挡住『一行合规 + 大量垃圾』)。
         不可信的日志不能被解读成『这一天无异常』(G8 复核:一行合规加任意垃圾曾被判为干净的一天)。"""
-        return (not self._bad_encoding and not self._truncated_tail and self._records >= 1 and self._first_record_day == self.day
+        return (not self._bad_encoding and not self._truncated_tail and not self._tail_may_hide_event()
+                and self._records >= 1 and self._first_record_day == self.day
                 and self._records >= MIN_RECORD_RATIO * self._lines)
+
+    def _tail_may_hide_event(self) -> bool:
+        """没有换行结尾的最后一行,可能只写了一半。
+
+        **截断落在字符边界上**(更常见)不会有任何解码异常信号:『硬锁定』被截成『硬』时解码完全成功,
+        但关键字不匹配 → 这一行看起来『没有事件』。只要这行有可能是某个关键字的前缀,这一天就不能算作『无异常』。
+        与关键字完全无关的一行(比如正在写的普通 INFO 行)不受影响——否则正在写入的日志会一直显示未知。
+        关键字**已经完整出现**的行不算(事件已被识别并计入)。
+        """
+        if not self._tail_partial:
+            return False
+        for marker in EVENT_MARKERS:
+            if marker in self._tail_partial:
+                continue                      # 事件已完整出现并被计入,不是『被藏起来』
+            for cut in range(1, len(marker)):
+                if marker[:cut] in self._tail_partial:
+                    return True
+        return False
 
     def snapshot(self, log_path: str = "") -> DayStats:
         """当前已知的全部内容,**包括还没有换行结尾的最后一行**;不改变解析器自己的状态。
@@ -232,7 +257,7 @@ class DayLogParser:
             view.finish()
         return DayStats(day=view.day, started=max(view._started_ok, view._start_attempts), trades=view.trades,
                         events=Counter(view.events), first_ts=view.first_ts, last_ts=view.last_ts, log_path=log_path,
-                        trusted=view.trusted())
+                        trusted=view.trusted(), tail_uncertain=view._tail_may_hide_event())
 
 
 def parse_day_log(path: Path) -> DayStats:

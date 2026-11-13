@@ -225,11 +225,21 @@ def _log_files(settings: Settings) -> list[Path]:
 
 
 def _unreadable_logs(settings: Settings) -> int:
-    """非空、但没有任何可识别时间戳的日志文件数(格式变了或被写坏)。与『一个日志都没找到』是两回事。"""
+    """非空、但内容不可信的日志文件数(格式变了、被写坏,或尾部正在写)。与『一个日志都没找到』是两回事。"""
     n = 0
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
             n += sum(1 for f in d.glob("vt_*.log") if _nonempty(f) and not _parse_cached(f).trusted)
+    return n
+
+
+def _tail_uncertain_logs(settings: Settings) -> int:
+    """只是**尾部不完整**(文件可能正在写)的日志数。与『日志损坏』分开:两者都不能把那天算作无异常,但提示文案不同。"""
+    n = 0
+    for d in settings.paths["log_dirs"]:
+        if d.is_dir():
+            n += sum(1 for f in d.glob("vt_*.log")
+                     if _nonempty(f) and not _parse_cached(f).trusted and _parse_cached(f).tail_uncertain)
     return n
 
 
@@ -395,6 +405,13 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     if not days:
         bad = _unreadable_logs(settings)
         if bad:
+            tail = _tail_uncertain_logs(settings)
+            if tail and tail == bad:
+                # 只是正在写(尾部不完整),不是坏了:不能据此判断,但也别说是『损坏』
+                msg = (f"有 {bad} 个日志文件的最后一行还没写完(可能正在写),"
+                       "这些天暂时不能算作『无异常』")
+                return Result(m.section("unknown", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志正在写入",
+                              [_reason("days", "unknown", msg)])
             msg = f"有 {bad} 个日志文件,但内容无法识别(格式变了或被写坏),不能据此判断无人值守情况"
             return Result(m.section("corrupt", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志无法识别",
                           [_reason("days", "unknown", msg)])
@@ -430,7 +447,14 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     elif bad_logs:
         # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
         # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
-        level, headline = "unknown", "有日志无法识别"
+        tail_only = _tail_uncertain_logs(settings) == bad_logs
+        if tail_only:
+            # 只是尾部还没写完(文件正在写):仍然不能把那天算作『无异常』,但不是『坏了』
+            bad_msg = (f"有 {bad_logs} 个日志文件的最后一行还没写完(可能正在写),这些天暂时不能算作『无异常』")
+            headline = "有日志正在写入"
+        else:
+            headline = "有日志无法识别"
+        level = "unknown"
         reasons.append(_reason("days", "unknown", bad_msg))
     elif state == "corrupt":
         # 日志文件的修改时间在未来(时钟回拨或文件异常):不能据此判断新鲜度。严重事件是日志内容,仍照常报 critical(上一分支)

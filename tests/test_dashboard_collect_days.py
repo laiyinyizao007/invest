@@ -304,8 +304,12 @@ def test_a_half_written_last_line_is_not_counted_until_it_is_complete(tmp_path):
     col.collect_days(s, NOW)
     with open(p, "ab") as fh:
         fh.write("2026-11-12 22:30:00.000 | ERROR | x | [ERROR] 对账".encode("utf-8"))      # 写了一半
-    before = col.collect_days(s, NOW).section["data"]
-    assert not any(e["name"] == "对账失败" for day in before["days"] for e in day["events"])
+    before = col.collect_days(s, NOW).section
+    # 『对账』是『对账失败』的前缀:这行还没写完,这一天暂时不能算作『无异常』——数据要么不给,要么不含这一天
+    if before["data"] is not None:
+        assert not any(e["name"] == "对账失败" for day in before["data"]["days"] for e in day["events"])
+    else:
+        assert "没写完" in (before["message"] or "")
     with open(p, "ab") as fh:
         fh.write("失败\n".encode("utf-8"))
     after = col.collect_days(s, NOW).section["data"]
