@@ -61,6 +61,7 @@ from vnpy_ctastrategy import CtaTemplate  # noqa: E402
 
 from risk.account_guard import trading_day  # noqa: E402
 from strategies.trend_atr_strategy import ENTRY_SESSIONS  # noqa: E402
+from ctp_tools.profile import load_profile  # noqa: E402
 from trading.runtime import EXIT_OK, RuntimeConfig, TradingRuntime, build_ctp_setting  # noqa: E402
 
 BEGIN_MARK = "<!-- BEGIN DRILLS -->"
@@ -1026,6 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="⚠ 危险:交易服务器地址不在已知 SimNow 地址表里时强制放行,可能连上真实资金账户")
     parser.add_argument("--confirm-any-address-trades", action="store_true",
                         help="⚠⚠ 危险:配合 --allow-any-address,允许在非白名单地址上执行会真实下单的场景")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.simnow);默认用项目 .env")
     args = parser.parse_args(argv)
 
     # `drill.py list` 与 `drill.py --list` 都认:运行手册里写的是前者。
@@ -1034,8 +1036,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name:12s} {desc}")
         return 0
 
-    bootstrap.load_env()
-    env = dict(os.environ)
+    # 配置解析只走 ctp_tools.profile(档案 > .env > 进程环境),与取证/清场/探针一致。
+    try:
+        _profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if _profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断该连哪个账户,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for _conflict in _profile.hard_conflicts:
+            print(f"  - {_conflict}", file=sys.stderr)
+        return 2
+    for _note in _profile.notes:
+        print(f"⚠ {_note}(已按档案取值)", file=sys.stderr)
+    env = dict(_profile.env)
 
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
     if not symbol:

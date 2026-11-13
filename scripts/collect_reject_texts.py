@@ -41,12 +41,13 @@ import bootstrap
 from vnpy.event import Event, EventEngine
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType
 from vnpy.trader.engine import MainEngine
-from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_TICK
+from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK
 from vnpy.trader.logger import ERROR
 from vnpy.trader.object import ContractData, LogData, OrderData, OrderRequest, TickData
 from vnpy.trader.utility import round_to
 
 from trading.graceful_exit import logout_ctp
+from ctp_tools.profile import load_profile
 from trading.runtime import build_ctp_setting
 
 # SimNow 地址白名单放在 scripts/simnow_guard.py,采集脚本与演练脚本共用同一套约束。
@@ -70,10 +71,25 @@ def main(argv: list[str] | None = None) -> int:
                         help="⚠ 危险:交易服务器地址不在已知 SimNow 地址表里时,强制放行。"
                              "期货公司生产 API 的地址一定不在表内,加了这个开关就可能连上**真实资金账户**。"
                              "只有在你确信目标是别的模拟/测试环境时才用")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.simnow);默认用项目 .env")
     args = parser.parse_args(argv)
 
-    bootstrap.load_env()
-    env = os.environ
+    # 配置解析只走 ctp_tools.profile(档案 > .env > 进程环境),与取证/清场/探针一致:
+    # 这个工具会发真实委托,按进程环境连、而清场按 .env 连,就可能不是同一个账户。
+    try:
+        profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断该连哪台机器,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for conflict in profile.hard_conflicts:
+            print(f"  - {conflict}", file=sys.stderr)
+        return 2
+    for note in profile.notes:
+        print(f"⚠ {note}(已按档案取值)", file=sys.stderr)
+    env = profile.env
 
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
     if not symbol:
@@ -115,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     event_engine.register(EVENT_ORDER, collector.on_order)
     event_engine.register(EVENT_TICK, collector.on_tick)
     event_engine.register(EVENT_CONTRACT, collector.on_contract)
+    event_engine.register(EVENT_POSITION, collector.on_position)
+    event_engine.register(EVENT_ACCOUNT, collector.on_account)   # 持仓查询「没有行」时用账户回报证明柜台在应答
 
     print(f"连接 {symbol} ...")
     main_engine.connect(gateway_setting, "CTP")
@@ -151,7 +169,8 @@ def _collect(args, symbol: str, gateway_setting, event_engine, main_engine, coll
     # 发单前先查持仓:"无持仓时平仓"场景发的是平仓单,账户上若本来就有这个合约的持仓,
     # 那张单会**真的把仓位平掉**。所以有持仓就中止采集,不做任何委托。
     has_pos, pos_connected = symbol_has_position(
-        main_engine, symbol, wait=float(getattr(args, "position_check_timeout", 15.0)))
+        main_engine, symbol, wait=float(getattr(args, "position_check_timeout", 15.0)),
+        collector=collector)
     if has_pos:
         print(f"⚠ 账户上已有持仓,已中止采集(平仓场景会真的平掉仓位)。"
               f"请先确认并清空持仓后再采集。", file=sys.stderr)
@@ -219,7 +238,7 @@ def _collect(args, symbol: str, gateway_setting, event_engine, main_engine, coll
         time.sleep(1.0)
 
     # 跑完查持仓:本脚本的所有委托都不该成交,有非零持仓就是意外,必须告警
-    positions, connected = check_positions(main_engine, symbol)
+    positions, connected = check_positions(main_engine, collector=collector)
     if positions:
         print(f"⚠ 发现未平持仓 {positions},请立即人工核对并平仓!", file=sys.stderr)
     elif not connected:

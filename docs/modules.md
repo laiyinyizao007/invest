@@ -106,7 +106,7 @@
   开仓仍在规则链上被物理拦截。硬拒绝锁定时规则发
   FATAL「严重错误,已停止策略开仓」并带错误码;平仓拒单永不锁离场。
 
-### `scripts/collect_reject_texts.py`(SimNow 真实废单文本采集)
+### `scripts/collect_reject_texts.py`(SimNow 真实废单文本采集;配置走 `ctp_tools.profile`,支持 `--profile`)
 - **只连已知 SimNow 地址**:白名单 `SIMNOW_TD_ADDRESSES`(官网公布的第一套 30001/30002/30003 / 第二套 40001)。
   `--confirm-simnow` 只是布尔开关,挡不住"配置写错连上真券商";地址不在表内直接拒绝连接,
   确有别的模拟环境才用 `--allow-any-address` 强制放行(会打警告)。
@@ -171,14 +171,47 @@
 - 计数器(`sent`/`failed`/`dropped`)由发送线程与后台线程同时写,`+=` 不是原子操作 → 用独立的 `_counter_lock` 保护。
 
 ### `scripts/simnow_guard.py`(SimNow 前置机地址白名单)
-- `SIMNOW_TD_ADDRESSES`:官网公布的第一套 `182.254.243.31:30001` / `:30002` / `:30003` 与第二套 `:40001`。
-  **第二套官网只公布了 40001**(行情 40011)—— 40002/40003 是按第一套编号规律外推出来的,没有官方背书,不收。
+- **现在是 `ctp_tools/simnow.py` 的转发层,不再自带地址表**。
+  原因:地址表原来在本文件和 `ctp_tools/simnow.py` 里各存一份,迟早漂移 —— 历史上漂移过两次
+  (`broker_targets` 与 `ctp_tools/simnow` 的 SimNow 交易地址不一致;2026-11-13 又发现本文件的副本
+  少了第二套的行情前置 40011)。白名单是「能不能连上那台机器」的**唯一**判据,必须只有一份。
+  `scripts/collect_reject_texts.py` 与 `scripts/drill.py` 仍按原路径导入,行为不变。
+- 地址表(现在住在 `ctp_tools/simnow.py`):
+  - 交易 `SIMNOW_TD_ADDRESSES`:官网公布的第一套 `182.254.243.31:30001` / `:30002` / `:30003` 与第二套 `:40001`。
+    **第二套官网只公布了 40001** —— 40002/40003 是按第一套编号规律外推出来的,没有官方背书,不收。
+  - 行情 `SIMNOW_MD_ADDRESSES`:第一套 `:30011` 与第二套 `:40011`。官网没有单独列出 40011,
+    它的背书是**我们自己跑通过**(2026-11-12 用第二套完成认证、登录、合约查询,`c2701.DCE` 与
+    `MA701.CZCE` 能订阅到、tick 持续到达,见 `docs/runbook-market-recording.md` 第 4 步)。
 - `normalize_address(td_address)`:去掉 `tcp://` 前缀、首尾空格、路径部分,归一化成 `host:port`。
   不归一化就会因为"长得不一样"被误判成非 SimNow,逼人用逃生舱,反而削弱了防线。
 - `check_simnow_address(td_address, allow_any)`:地址不在表内**默认拒绝连接** —— `--confirm-simnow` 只是布尔开关,
   挡不住"配置写错"；CTP 的"柜台环境=实盘"是 SimNow 与期货公司生产 API 共用的,**只能靠前置机地址区分**。
   `--allow-any-address` 是逃生舱,会打出"可能连上真实资金账户"的醒目警告。
-- 被 `scripts/collect_reject_texts.py` 与 `scripts/drill.py` 共用。
+
+### `ctp_tools/`(取证与穿透测试的共用实现,2026-11-13 起纳入覆盖率统计)
+- **`profile.py`——唯一**的档案解析入口:`load_profile(profile, root)` → `Profile(env, hard_conflicts, notes)`。
+  优先级 **指定档案 > 项目 `.env` > 进程环境变量**。
+  - **硬冲突(hard_conflicts)**:来源之间**互相矛盾**、只能靠猜才能往下走的(例如进程环境里的
+    `CTP_*` 与项目 `.env` 不一致,且没有指定档案)→ 调用方一律**拒绝运行**(退出码 2)。
+  - **软提示(notes)**:操作员已经**明说**要用的档案(指定了 `--profile`)—— 进程环境的残留值
+    只提示、不拦截。不这样分流的话,`--profile .env.guoxin` 会被上一次运行残留的 `CTP_*` 变量挡住,
+    这个用法根本没法用。
+  - 地址白名单键(`BROKER_TEST_ALLOWED_TD/MD`)按**归一化集合**比较(顺序/空白不算冲突);
+    只在进程环境里、`.env` 与档案都没有的 `CTP_*` 键同样报硬冲突(它们会静默生效)。
+  - `broker_test.py` / `penetration_check.py` / `probe_position.py` / `flatten_positions.py` /
+    `collect_reject_texts.py` / `drill.py` / `broker_report.py` **全部**走它(均支持 `--profile`),
+    不再各写一份 `dotenv_values`(解析方式与运行时不一致 = 闸门看到的值和柜台拿到的值不同)。
+- **`broker_targets.py`——可信前置地址的唯一出处**:
+  - `KNOWN_TD` / `KNOWN_MD`:代码里写死的「可信前置全集」(国信测试前置 + SimNow)。白名单只能取其**子集**。
+  - `allowed_for_broker(broker_id)` / `resolve_allowed_for_broker(...)`:**地址集与经纪商代码绑定**——
+    国信档只认国信前置,SimNow 档只认 SimNow 前置。两个环境是**不同的账户、不同的柜台**,
+    白名单能混搭的话,清场可能平到不是取证那个账户的仓位上。未知 BrokerID → 两个空集(没有「默认放行」)。
+- **`collector.py`——持仓按「本次查询回报」取,不读 OMS 快照**:
+  - `query_positions(main_engine, collector)` → `(rows, "ok"|"empty"|"untrusted")`。
+    vnpy_ctp 只在持仓查询回报 `last=True` 时推送**本次返回的**行(回报结束即清空网关缓存),
+    而 vn.py 的 `OmsEngine` **从不删除**条目 —— 平掉的仓位会永远留在 OMS 缓存里。
+    按 OMS 快照判断空仓,平仓成功后仍会说「账户有持仓」,取证运行器后面所有发单步骤都会被闸门挡住。
+  - `"empty"`(通道在线但没有行)= 账户确实没有持仓;`"untrusted"`(查询发不出去或通道不在线)= **说什么都是猜**,一律不放行发单。
 
 ### `scripts/drill.py`(SimNow 实测演练:把运行手册第 5 节做成可重复执行)
 - 场景:`latency`(成交→持仓回报延迟)、`tick-stale`(行情断流→看门狗告警)、`disconnect`(交易连接断开→告警与自动重连)、

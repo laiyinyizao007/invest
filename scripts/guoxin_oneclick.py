@@ -55,6 +55,7 @@ from ctp_tools.broker_targets import (  # noqa: E402
     SIMNOW_TD,
 )
 from ctp_tools.collector import in_trading_session  # noqa: E402
+from ctp_tools.profile import describe_env_value  # noqa: E402  (打印配置值的唯一脱敏出处)
 from ctp_tools.simnow import normalize_address  # noqa: E402
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -69,22 +70,8 @@ GATED_KEYS = (
     "CTP_ENVIRONMENT", "CTP_BROKER_ID", "CTP_TD_ADDRESS", "CTP_MD_ADDRESS",
     "BROKER_TEST_ALLOWED_TD", "BROKER_TEST_ALLOWED_MD",
 )
-# 这几个键参与「生效环境」校验,但值不能原样打印(密码/授权码是凭据)。
-SECRET_KEYS = ("CTP_PASSWORD", "CTP_AUTH_CODE")
-
-
-def describe_env_value(key: str, value: str) -> str:
-    """把环境变量的值变成可以安全打印的形式。"""
-    if key in SECRET_KEYS:
-        return "(已隐藏)"
-    if key == "CTP_USERNAME":
-        try:
-            from ctp_tools.penetration import mask_account
-
-            return mask_account(value)
-        except Exception:  # noqa: BLE001  打印不出来也不能把原文漏出去
-            return "(已隐藏)"
-    return repr(value)
+# 打印配置值的脱敏规则与凭据键表只住在 ctp_tools/profile.py(describe_env_value / SECRET_KEYS):
+# 两份实现迟早漂移,而漂移的方向往往是「某一处开始打印原文」。
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -216,12 +203,97 @@ def child_env(effective: dict[str, str], extra: dict[str, str]) -> dict[str, str
     return env
 
 
+_CURRENT_CHILD: subprocess.Popen | None = None
+
+
+def terminate_child(grace: float = 30.0) -> None:
+    """父进程被 Ctrl+C/终止时,先礼后兵地收掉还在跑的子进程。
+
+    子进程用独立进程组启动(为了能给它单发 CTRL_BREAK),控制台的 Ctrl+C 到不了它;
+    父进程一退,它就成了孤儿,继续在柜台上发单(200 笔稳定运行),没人收尾、没人撤单。
+    """
+    proc = _CURRENT_CHILD
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGINT)
+    except (OSError, ValueError):
+        pass
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        print("子进程没有在限时内收尾,强制结束(柜台上可能留有委托,请人工核对)。", file=sys.stderr)
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def run_child(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float) -> int:
+    """跑一个子进程,超时**先礼后兵**。
+
+    直接强杀(SIGKILL)的话,子进程里正在跑的收尾逻辑(撤单、登出、
+    解除暂停标志)一个都不会执行 —— 柜台上可能留着演示委托,
+    下一轮运行就带着脏状态开始。所以超时后先发中断信号,给它 30 秒自己收工,
+    还不动才强杀。
+
+    Windows 上没有 SIGINT 给别人的进程用,靠 `CREATE_NEW_PROCESS_GROUP` +
+    `CTRL_BREAK_EVENT` 达到同样效果。
+    """
+    global _CURRENT_CHILD
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, creationflags=creationflags)
+    except OSError as exc:
+        print(f"启动子进程失败:{exc!r}", file=sys.stderr)
+        return EXIT_CRASH
+    _CURRENT_CHILD = proc
+    try:
+        return _wait_child(proc, timeout)
+    finally:
+        _CURRENT_CHILD = None
+
+
+def _wait_child(proc: subprocess.Popen, timeout: float) -> int:
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"子进程超过 {timeout:.0f}s 还没结束,先请它自己收尾(撤单/登出)。", file=sys.stderr)
+    try:
+        if os.name == "nt":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            proc.send_signal(signal.SIGINT)
+    except (OSError, ValueError) as exc:
+        print(f"发中断信号失败({exc!r}),直接终止。", file=sys.stderr)
+    try:
+        return proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        print("子进程 30 秒内没有收尾,强制结束(柜台上可能留有委托,请人工核对)。", file=sys.stderr)
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return EXIT_CRASH
+
+
 def mode_of(rehearsal: bool) -> str:
     return "rehearsal" if rehearsal else "guoxin"
 
 
 def write_mode_marker(out_dir: Path, mode: str, env: dict[str, str]) -> None:
-    """在证据目录里写下本次的模式与实际连接的前置,--resume 时据此拒绝模式混用。"""
+    """在证据目录里写下本次的模式与实际连接的前置,--resume 时据此拒绝模式混用。
+
+    **补测时不覆盖已有的 mode.json**:那文件是这个目录的「身份」,
+    覆盖它等于把原来那次运行的记录改掉(而且 created_at 会变成补测时间,
+    看不出这份证据是什么时候产生的)。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = out_dir / "mode.json"
+    if marker_path.exists():
+        return
     marker = {
         "mode": mode,
         "broker_id": env.get("CTP_BROKER_ID", ""),
@@ -230,8 +302,7 @@ def write_mode_marker(out_dir: Path, mode: str, env: dict[str, str]) -> None:
         "md_front": normalize_address(env.get("CTP_MD_ADDRESS", "")),
         "created_at": datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S"),
     }
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "mode.json").write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
+    marker_path.write_text(json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def check_resume_mode(resume_dir: Path, mode: str) -> list[str]:
@@ -327,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     step("2/5 切换档案")
     target = ROOT / ".env"
     original_env = target.read_bytes() if target.exists() else None
+    wrote_env = {"done": False}
 
     def restore_env() -> None:
         """把 .env 还原成运行前的版本(幂等,多处调用都安全)。"""
@@ -340,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     # 被 Ctrl+C / kill 打断时也要还原:进程被 SIGKILL 时无法还原,
     # 所以额外把备份文件留好,便于事后手工恢复。
     def _on_signal(signum, _frame):        # noqa: ANN001
+        terminate_child()          # 先收子进程(撤单/登出),再还原 .env,最后才退出
         restore_env()
         raise KeyboardInterrupt
 
@@ -358,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copy2(target, backup)
         print(f"当前 .env 与{label}不同,已另存为 {backup.name}")
     shutil.copy2(source, target)
+    wrote_env["done"] = True
     print(f"已写入 {target}(.env 被 gitignore,不会提交)")
 
     try:
@@ -366,26 +440,37 @@ def main(argv: list[str] | None = None) -> int:
         out_dir = args.resume or (ROOT / "data" / "broker_test" / (("rehearsal-" if args.rehearsal else "") + now.strftime("%Y%m%d-%H%M%S")))
         write_mode_marker(out_dir, mode_of(args.rehearsal), env)
         cmd = [python_exe(), str(ROOT / "scripts" / "broker_test.py"), "--confirm-broker-test", "--out-dir", str(out_dir)]
+        if args.rehearsal:
+            # 预演连的是 SimNow,不是国信:取证运行器必须知道这一点,
+            # 否则它会拒绝(它出的是国信的报告),或者产出「自称国信」的证据。
+            cmd.append("--rehearsal")
         if args.resume:
             cmd = [python_exe(), str(ROOT / "scripts" / "broker_test.py"), "--confirm-broker-test", "--resume", str(args.resume)]
+            if args.rehearsal:
+                cmd.append("--rehearsal")
         if not args.no_interactive:
             cmd.append("--interactive")
             print("提示:运行到「3.1 连接断开监测」会让你按回车,然后请断开本机网络、看到提示后恢复。")
         # 前置地址白名单下推给取证脚本:运行期再校验一次,而不是只在一键流程里查一遍。
         allowed_td = ",".join(sorted(SIMNOW_TD if args.rehearsal else ALLOWED_TD))
         allowed_md = ",".join(sorted(SIMNOW_MD if args.rehearsal else ALLOWED_MD))
-        child = child_env(env, {"BROKER_TEST_ALLOWED_TD": allowed_td, "BROKER_TEST_ALLOWED_MD": allowed_md,
-                                "PYTHONIOENCODING": "utf-8"})
-        try:
-            code = subprocess.call(cmd, cwd=ROOT, timeout=TEST_TIMEOUT, env=child)
-        except subprocess.TimeoutExpired:
-            print(f"取证运行超时({TEST_TIMEOUT}s)已终止。", file=sys.stderr)
-            code = EXIT_CRASH
+        # 档案里已经写了白名单就用档案的(子进程还会与代码里的可信全集求交集,只能收窄);
+        # 没写才用这里的全集兜底。两边都有而不相等,子进程会把它判成硬冲突(预演档案
+        # 只写了 :30001,而这里的 SimNow 全集有 4 个地址)。
+        extra = {"PYTHONIOENCODING": "utf-8"}
+        if not env.get("BROKER_TEST_ALLOWED_TD"):
+            extra["BROKER_TEST_ALLOWED_TD"] = allowed_td
+        if not env.get("BROKER_TEST_ALLOWED_MD"):
+            extra["BROKER_TEST_ALLOWED_MD"] = allowed_md
+        child = child_env(env, extra)
+        code = run_child(cmd, ROOT, child, TEST_TIMEOUT)
+        if code == EXIT_CRASH:
+            print(f"取证运行超时或异常退出({TEST_TIMEOUT}s 上限),已终止。", file=sys.stderr)
         print(f"\n取证运行退出码 {code}(0=全过 1=有失败 2=配置错 3=登录失败 4=异常退出)")
         if code in (EXIT_CONFIG, EXIT_LOGIN):
             print("没有登录成功或配置有误,不生成报告。把上面的输出贴给我。", file=sys.stderr)
             return code
-        if code == EXIT_CRASH:
+        if code not in (EXIT_OK, EXIT_FAILED):     # 4(崩溃/超时)或任何别的退出码:都按异常处理
             print("取证运行异常退出(崩溃/超时),不生成报告——半份证据不能当报告用。把上面的输出贴给我。", file=sys.stderr)
             return code
 
@@ -399,10 +484,8 @@ def main(argv: list[str] | None = None) -> int:
                 "--template", str(template)]
         if report_out is not None:
             rcmd += ["--out", str(report_out), "--watermark", "SimNow 预演 · 非国信测试环境 · 不可提交国信"]
-        try:
-            rcode = subprocess.call(rcmd, cwd=ROOT, timeout=REPORT_TIMEOUT,
-                                    env=child_env(env, {"PYTHONIOENCODING": "utf-8"}))
-        except subprocess.TimeoutExpired:
+        rcode = run_child(rcmd, ROOT, child_env(env, {"PYTHONIOENCODING": "utf-8"}), REPORT_TIMEOUT)
+        if rcode == EXIT_CRASH:
             print(f"报告生成超时({REPORT_TIMEOUT}s),证据仍在:", out_dir, file=sys.stderr)
             return EXIT_CRASH
         if rcode != 0:
@@ -427,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
             pass
         return EXIT_OK if code == EXIT_OK else EXIT_FAILED
     finally:
+        terminate_child()          # 任何退出路径都不留孤儿子进程
         # 用完把原来的 .env 还回去:否则这台机器上别的运行会静默切到国信测试账号。
         restore_env()
 

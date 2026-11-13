@@ -294,6 +294,12 @@ def test_report_cli_end_to_end(tmp_path, capsys, monkeypatch):
     out_dir = render_images(tmp_path, evidences())
     monkeypatch.setenv("BROKER_TEST_SYSTEM_NAME", "invest")
     monkeypatch.setenv("CTP_APP_ID", "client_invest_1.0")
+    # 配置解析走 ctp_tools.profile;这里只关心报告生成,不读真实项目 .env(里面是别的 AppID)
+    import os
+
+    from ctp_tools.profile import Profile
+
+    monkeypatch.setattr(br, "load_profile", lambda profile="", root=None: Profile(env=dict(os.environ), hard_conflicts=[], notes=[]))
     out = tmp_path / "final.docx"
     assert br.main(["--evidence", str(out_dir), "--template", str(template), "--out", str(out), "--no-terminal-info"]) == 0
     assert out.exists() and "报告里还缺什么" in capsys.readouterr().out

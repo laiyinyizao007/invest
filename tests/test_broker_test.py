@@ -18,7 +18,9 @@ from trading.safe_risk import SafeRiskManagerApp  # noqa: E402
 from vnpy.event import Event  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset  # noqa: E402
 from vnpy.trader.engine import MainEngine  # noqa: E402
-from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_TICK, EVENT_TIMER, EVENT_TRADE  # noqa: E402
+from vnpy.trader.event import (  # noqa: E402
+    EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TIMER, EVENT_TRADE,
+)
 
 
 class Env:
@@ -40,6 +42,7 @@ class Env:
         self.trades: list = []
         for ev, fn in ((EVENT_LOG, self.collector.on_log), (EVENT_ORDER, self.collector.on_order),
                        (EVENT_TICK, self.collector.on_tick), (EVENT_CONTRACT, self.collector.on_contract),
+                       (EVENT_POSITION, self.collector.on_position),
                        (EVENT_GUARD_ALERT, lambda e: self.alerts.append(e.data)), (EVENT_TRADE, lambda e: self.trades.append(e.data))):
             self.event_engine.register(ev, fn)
         self.gw.push_contract()
@@ -64,6 +67,16 @@ def env(tmp_path):
     yield e
     e.main.close()
 
+
+
+def _profile_from_os():
+    """让 main() 按**当前进程环境变量**解析配置(绕开真实的 .env 文件)。
+
+    配置解析现在只走 ctp_tools.profile.load_profile,不再走 bootstrap.load_env。
+    """
+    from ctp_tools.profile import Profile
+
+    return Profile(env=dict(os.environ), hard_conflicts=[], notes=[])
 
 def item(env, name) -> be.Evidence:
     return env.book.items[name]
@@ -392,11 +405,18 @@ def test_main_refuses_without_confirmation_and_for_production(monkeypatch, capsy
     env = {"CTP_USERNAME": "u", "CTP_PASSWORD": "pw_secret_1", "CTP_BROKER_ID": "8030", "CTP_TD_ADDRESS": "10.0.0.1:1",
            "CTP_MD_ADDRESS": "10.0.0.1:2", "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2", "LIVE_VT_SYMBOL": "c2701.DCE",
            "CTP_ENVIRONMENT": "测试"}
-    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
+    monkeypatch.setattr(bt, "load_profile", lambda profile="", root=None: _profile_from_os())
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert bt.main([]) == bt.EXIT_CONFIG and "--confirm-broker-test" in capsys.readouterr().err
+    # 白名单为空 → 拒绝(「柜台环境=测试」不说明连的是哪台机器)
     monkeypatch.setenv("CTP_ENVIRONMENT", "实盘")
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG and "白名单" in capsys.readouterr().err
+    # 地址在可信表内、但柜台环境是「实盘」→ 生产 API,拒绝
+    monkeypatch.setenv("CTP_TD_ADDRESS", "121.13.218.19:41285")
+    monkeypatch.setenv("CTP_MD_ADDRESS", "121.13.218.19:41293")
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "121.13.218.19:41285")
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_MD", "121.13.218.19:41293")
     assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG and "生产 API" in capsys.readouterr().err
     monkeypatch.setenv("CTP_ENVIRONMENT", "测试")
     assert bt.main(["--confirm-broker-test", "--only", "NOPE"]) == bt.EXIT_CONFIG
@@ -416,7 +436,7 @@ def _guoxin_env(monkeypatch, **over):
            "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2", "LIVE_VT_SYMBOL": "c2701.DCE",
            "CTP_ENVIRONMENT": "测试"}
     env.update(over)
-    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
+    monkeypatch.setattr(bt, "load_profile", lambda profile="", root=None: _profile_from_os())
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     return env
@@ -428,6 +448,28 @@ def test_market_data_front_must_be_whitelisted_too(monkeypatch, capsys):
     assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
     err = capsys.readouterr().err
     assert "行情前置" in err and "BROKER_TEST_ALLOWED_MD" in err
+
+
+def test_whitelist_cannot_widen_beyond_the_trusted_addresses(monkeypatch, capsys):
+    """白名单与地址同在 .env 里,采信它等于自己给自己发通行证。
+
+    所以白名单只能**收窄**:不在可信地址表内的地址,哪怕同时写进
+    CTP_TD_ADDRESS 和 BROKER_TEST_ALLOWED_TD,也不放行。
+    """
+    _guoxin_env(monkeypatch, CTP_TD_ADDRESS="10.0.0.1:41285",
+                BROKER_TEST_ALLOWED_TD="10.0.0.1:41285",
+                BROKER_TEST_ALLOWED_MD="121.13.218.19:41293")
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "可信地址表" in err and "已丢弃" in err and "拒绝连接" in err
+
+
+def test_a_whitelist_outside_the_trusted_table_is_dropped_and_reported(monkeypatch, capsys):
+    _guoxin_env(monkeypatch, BROKER_TEST_ALLOWED_TD="10.0.0.1:41285,121.13.218.19:41285",
+                BROKER_TEST_ALLOWED_MD="121.13.218.19:41293")
+    assert bt.main(["--confirm-broker-test", "--only", "NOPE"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "10.0.0.1:41285" in err and "已丢弃" in err
 
 
 def test_market_data_front_outside_the_whitelist_is_refused(monkeypatch, capsys):
@@ -466,7 +508,7 @@ def test_final_safety_is_quiet_when_clean_and_never_raises(env):
 
 
 def test_main_refuses_to_connect_when_state_isolation_did_not_take_effect(monkeypatch, capsys):
-    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
+    monkeypatch.setattr(bt, "load_profile", lambda profile="", root=None: _profile_from_os())
     for k, v in {"CTP_USERNAME": "u", "CTP_PASSWORD": "pw_secret_1", "CTP_BROKER_ID": "8030", "CTP_TD_ADDRESS": "10.0.0.1:1",
                  "CTP_MD_ADDRESS": "10.0.0.1:2", "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2",
                  "LIVE_VT_SYMBOL": "c2701.DCE", "CTP_ENVIRONMENT": "测试"}.items():
@@ -529,7 +571,11 @@ def test_flat_gate_says_which_failure_it_was(tmp_path):
     e2 = Env(tmp_path / "b")
     try:
         e2.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
-        e2.gw.td_api.connect_status = False                            # 查不到持仓:连接断了
+        # 断线:vnpy_ctp 只清 login_status,connect_status 一直是 True
+        # (ctp_gateway.py 的 onFrontDisconnected)。以前这里只改 connect_status,
+        # 于是「断线」这个场景根本没被测到——闸门照样放行。
+        e2.gw.td_api.login_status = False
+        assert e2.gw.td_api.connect_status is True                      # 陷阱:连接标志不会变
         assert bt.run_steps(e2.ctx, e2.book, only={"P4.2"}) is True
         summary = e2.book.items["P4.2"].summary
         assert "查不到持仓" in summary and "已有持仓" not in summary
@@ -592,3 +638,79 @@ def test_session_and_evidence_timestamps_use_beijing_time_not_host_local_time(mo
     now = bt.beijing_now()
     assert (now.hour, now.weekday()) == (10, 4)
     assert bt.in_trading_session(now) is True
+
+
+def test_the_evidence_runner_refuses_a_non_guoxin_target_without_the_rehearsal_flag(monkeypatch, capsys):
+    """这个取证运行器出的是**国信**的报告:连着别的环境生成的证据,
+    目录名和内容都长得像正式证据,事后很容易被当成国信环境的结果交上去。
+    """
+    _guoxin_env(monkeypatch,
+                CTP_BROKER_ID="9999",
+                CTP_ENVIRONMENT="实盘",
+                CTP_TD_ADDRESS="182.254.243.31:30001",
+                CTP_MD_ADDRESS="182.254.243.31:30011",
+                BROKER_TEST_ALLOWED_TD="182.254.243.31:30001",
+                BROKER_TEST_ALLOWED_MD="182.254.243.31:30011")
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "--rehearsal" in err, "非国信目标必须要求显式声明预演"
+
+
+def test_the_rehearsal_flag_passes_the_gate_but_still_stops_before_connecting(monkeypatch, capsys):
+    """显式声明预演后不再被那道闸门挡住;后面仍然要过别的闸门。
+
+    这里用「状态目录隔离未生效」把它挡在连接之前 —— 测试绝不能真的去连柜台。
+    """
+    _guoxin_env(monkeypatch,
+                CTP_BROKER_ID="9999",
+                CTP_ENVIRONMENT="实盘",
+                CTP_TD_ADDRESS="182.254.243.31:30001",
+                CTP_MD_ADDRESS="182.254.243.31:30011",
+                BROKER_TEST_ALLOWED_TD="182.254.243.31:30001",
+                BROKER_TEST_ALLOWED_MD="182.254.243.31:30011")
+    monkeypatch.setattr(bt, "ISOLATED", False)
+    assert bt.main(["--confirm-broker-test", "--rehearsal"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "--rehearsal" not in err and "隔离" in err
+
+
+def test_the_connection_record_states_which_environment_it_was(monkeypatch):
+    """证据目录要能自证是在哪台机器上跑出来的,不能靠人记得。"""
+    _guoxin_env(monkeypatch)
+    guoxin = bt.connection_info({"经纪商代码": "8030", "柜台环境": "测试",
+                                  "交易服务器": "121.13.218.19:41285", "行情服务器": "121.13.218.19:41293",
+                                  "产品名称": "client_x_1.0"})
+    assert guoxin["mode"] == "guoxin"
+    rehearsal = bt.connection_info({"经纪商代码": "9999", "柜台环境": "实盘",
+                                    "交易服务器": "182.254.243.31:30001", "行情服务器": "182.254.243.31:30011",
+                                    "产品名称": "client_x_1.0"})
+    assert rehearsal["mode"] == "rehearsal"
+
+
+def test_connection_mode_follows_the_rehearsal_flag_even_for_the_guoxin_broker():
+    """对 8030 跑预演也必须标成预演(mode 以 --rehearsal 为准,并与经纪商代码交叉校验)。"""
+    assert bt.connection_info(SETTING, now=datetime(2026, 11, 12, 21, 0))["mode"] == "guoxin"
+    assert bt.connection_info(SETTING, now=datetime(2026, 11, 12, 21, 0), rehearsal=True)["mode"] == "rehearsal"
+    other = {**SETTING, "经纪商代码": "9999"}
+    assert bt.connection_info(other, now=datetime(2026, 11, 12, 21, 0))["mode"] == "rehearsal"
+
+
+def test_a_step_that_raises_does_not_discard_the_evidence_already_collected(tmp_path, monkeypatch):
+    """任一步抛异常也要保住已采到的证据:这一步记 FAIL,后面的发单演示因状态不明而中止。"""
+    e = Env(tmp_path)
+    try:
+        e.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
+        monkeypatch.setattr(bt, "in_trading_session", lambda dt: True)
+        e.gw.mode = "fill"
+        e.gw.position_lag = False
+
+        def boom(ctx, book):
+            raise RuntimeError("柜台炸了 pw_secret_1")
+
+        monkeypatch.setattr(bt, "step_basic_trade", boom)
+        assert bt.run_steps(e.ctx, e.book, only={"T3", "P4.1"}) is True        # 不抛
+        assert e.book.items["T3"].status == be.FAIL
+        assert "RuntimeError" in e.book.items["T3"].summary
+        assert "P4.1" in e.book.items                                         # 不发单的步骤照常出证据
+    finally:
+        e.main.close()

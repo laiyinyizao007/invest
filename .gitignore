@@ -40,3 +40,6 @@ docs/*.rar
 
 # 研究沙盒镜像的离线轮子(体积大,由 fetch_wheels.sh 生成)
 docker/research/wheelhouse/
+
+# 一次性探针脚本(临时用,不进版本库)
+_iso_test.py

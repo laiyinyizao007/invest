@@ -46,7 +46,7 @@ ISOLATED = bootstrap.isolate_state(BT_ROOT.name)
 from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status  # noqa: E402
 from vnpy.trader.engine import MainEngine  # noqa: E402
-from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_TICK, EVENT_TRADE  # noqa: E402
+from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TRADE  # noqa: E402
 from vnpy.trader.object import OrderRequest, SubscribeRequest  # noqa: E402
 from vnpy.trader.utility import round_to  # noqa: E402
 
@@ -55,8 +55,9 @@ from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
 from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
-from ctp_tools.broker_targets import SIMNOW_MD  # noqa: E402
+from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, resolve_allowed_for_broker  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
+from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.penetration import (  # noqa: E402
     MILESTONE_LABELS, MILESTONES, Run, check_target, do_order_cancel, limit_down_price, mask_account, redact,
     wait_milestones,
@@ -76,17 +77,12 @@ def beijing_now() -> datetime:
 
 OUT_ROOT = bootstrap.ROOT / "data" / "broker_test"
 DAILY_RULE, SIZE_RULE, DUP_RULE = "每日上限检查", "委托规模检查", "重复报单检查"
-EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN = 0, 1, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN, EXIT_CRASH = 0, 1, 2, 3, 4
 # 会向柜台发委托的测试项:这些步骤之前必须先确认账户空仓
 ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1"})
 STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
 FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上限(秒)
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
-
-
-def _allowed_addresses(raw: str) -> set[str]:
-    """解析 BROKER_TEST_ALLOWED_TD/MD:逗号(或分号)分隔的 host:port,统一归一化。"""
-    return {normalize_address(x) for x in raw.replace(";", ",").split(",") if x.strip()}
 
 
 # ======================= 上下文与工具 =======================
@@ -218,7 +214,8 @@ def ensure_flat(ctx: Ctx) -> bool:
     - 有持仓:列出来是哪几个合约、多少手,人工去平;
     - 连接断开/查不到:柜台连接在查询期间断了,或持仓查询没有回报,这时平仓单更不能发。
     """
-    held, connected = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
+    held, connected = check_positions(ctx.main_engine, wait=ctx.position_wait, early_exit=False,
+                                      collector=ctx.collector)
     if held:
         ctx.flat_reason = f"账户已有持仓:{'、'.join(held)}(请先人工平仓再重跑)"
     elif not connected:
@@ -293,7 +290,8 @@ def step_basic_trade(ctx: Ctx, book: Book) -> None:
         for item in ("T3", "T5", "P1.2"):
             book.add(item, SKIP, reason, [Shot(lbl, [reason]) for lbl in (("开仓", "平仓") if item == "P1.2" else ("",))], started)
         return
-    held, connected = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
+    held, connected = check_positions(ctx.main_engine, wait=ctx.position_wait, early_exit=False,
+                                      collector=ctx.collector)
     if held or not connected:
         reason = f"账户已有持仓 {held}" if held else "交易连接断开,无法确认账户空仓"
         for item in ("T3", "T5", "P1.2"):
@@ -318,9 +316,16 @@ def step_basic_trade(ctx: Ctx, book: Book) -> None:
     close_ok = close_order is not None and close_order.status == Status.ALLTRADED
     close_lines = [f"卖平 1 手 @ {sell_px}(对手价) 委托号 {close_id or '-'}",
                    f"终态 {close_order.status.value if close_order else '无回报'}  成交 {getattr(close_order, 'traded', 0)} 手"]
-    after, _ = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
-    flat = not after
-    close_lines.append("平仓后账户空仓" if flat else f"⚠ 平仓后仍有持仓 {after},请立即人工平仓")
+    after, after_connected = check_positions(ctx.main_engine, wait=ctx.position_wait, early_exit=False,
+                                          collector=ctx.collector)
+    flat = not after and after_connected
+    if after:
+        close_lines.append(f"⚠ 平仓后仍有持仓 {after},请立即人工平仓")
+    elif not after_connected:
+        # 通道断了 → 这次查询是空的,不能说「平仓后账户空仓」
+        close_lines.append("⚠ 平仓后交易通道不在线,持仓查询不可信,无法确认账户已空,请人工核对")
+    else:
+        close_lines.append("平仓后账户空仓")
     trade_lines = [ctx.clean(f"成交回报 {t.vt_symbol} {t.direction.value}{t.offset.value} {t.volume}@{t.price} 成交号 {t.tradeid}")
                    for t in ctx.trades[-4:]] or ["(未收到成交回报)"]
     everything = open_ok and close_ok and flat
@@ -807,9 +812,14 @@ def final_safety(ctx: Ctx) -> list[str]:
                 notes.append(f"⚠⚠ 收尾:发出撤单请求后仍有 {left}/{len(active)} 笔委托未确认撤销,请立即人工撤单!")
             else:
                 notes.append(f"收尾:撤销了 {len(active)} 笔遗留委托(已确认)")
-        held, _ = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
+        held, connected = check_positions(ctx.main_engine, wait=ctx.position_wait, early_exit=False,
+                                      collector=ctx.collector)
         if held:
             notes.append(f"⚠⚠ 收尾发现账户有持仓 {held},请立即人工平仓!")
+        elif not connected:
+            # 「查不到持仓」不等于「没有持仓」:通道不在线时这次查询是空的,
+            # 不能当成「账户是空的」交差(那会让一次断线的运行看起来是干净的)。
+            notes.append("⚠⚠ 收尾:交易通道不在线,持仓查询不可信,无法确认账户是否空仓,请人工核对!")
     except Exception as exc:     # noqa: BLE001  兜底本身不能崩
         notes.append(f"收尾检查出错:{exc!r},请人工核对账户是否有遗留委托/持仓")
     return notes
@@ -829,8 +839,25 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         return True
     ctx.contract = c
     ctx.in_session = in_trading_session(beijing_now())
+    failed_steps: list[str] = []
+
+    def guarded(items: tuple[str, ...], fn, *fn_args):
+        """单步抛异常不能带走整次取证:已采到的证据要保住,这一步记 FAIL,继续往下。
+
+        返回 (是否抛了异常, 步骤返回值)。
+        """
+        try:
+            return False, fn(*fn_args)
+        except Exception as exc:      # noqa: BLE001  任何异常都转成证据
+            reason = ctx.clean(f"步骤 {fn.__name__} 抛出异常:{type(exc).__name__}: {exc}")[:300]
+            failed_steps.append(fn.__name__)
+            for name in items:
+                if name in ITEMS:
+                    book.add(name, FAIL, reason, [Shot("", [reason])], ctx.now())
+            return True, None
+
     if want("T2", "T3", "T4", "T5"):
-        step_market(ctx, book)
+        guarded(("T2",), step_market, ctx, book)
     order_items = ORDER_ITEMS if only is None else (only & ORDER_ITEMS)
     gated = False
     if order_items:
@@ -841,35 +868,39 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
             for name in sorted(order_items):
                 book.add(name, FAIL, reason, [Shot("", [reason])], ctx.now())
     if not gated and want("T3", "T5", "P1.2"):
-        step_basic_trade(ctx, book)
-        if ctx.in_session and ctx.tick is not None and not ensure_flat(ctx):
+        crashed, _ = guarded(("T3", "T5", "P1.2"), step_basic_trade, ctx, book)
+        if crashed:
+            gated = True                       # 异常时委托/持仓状态不明:后面的发单演示一律中止
+        elif ctx.in_session and ctx.tick is not None and not ensure_flat(ctx):
             gated = True                                   # 平仓演示没把账户带回空仓:后面的发单演示全部中止
             book.add("P1.2", FAIL, "开平仓演示后账户没有回到空仓,已中止后续发单演示", [Shot("", ["账户未回到空仓"])], ctx.now())
     if not gated and want("T4", "P1.2"):
-        step_cancel(ctx, book)
+        gated = guarded(("T4", "P1.2"), step_cancel, ctx, book)[0] or gated
     if want("P2.2"):
-        step_counts(ctx, book)
+        guarded(("P2.2",), step_counts, ctx, book)
     dup = {}
     if not gated and want("P2.3", "P3.1", "T6"):
-        dup = step_duplicate(ctx, book)
+        crashed, result = guarded(("P2.3",), step_duplicate, ctx, book)
+        dup = result or {}
+        gated = crashed or gated
     if not gated and want("P3.1", "T6"):
-        step_threshold(ctx, book, dup)
+        gated = guarded(("P3.1", "T6"), step_threshold, ctx, book, dup)[0] or gated
     if want("P4.1"):
-        step_validity(ctx, book)
+        guarded(("P4.1",), step_validity, ctx, book)
     if not gated and want("P4.2"):
-        step_counter_errors(ctx, book)
+        gated = guarded(("P4.2",), step_counter_errors, ctx, book)[0] or gated
     if not gated and want("P5.1"):
-        step_pause(ctx, book)
+        gated = guarded(("P5.1",), step_pause, ctx, book)[0] or gated
     if not gated and want("P1.3"):
-        step_stability(ctx, book)
+        gated = guarded(("P1.3",), step_stability, ctx, book)[0] or gated
     if want("P2.1"):
-        step_connection(ctx, book)
+        guarded(("P2.1",), step_connection, ctx, book)
     if want("T7"):
-        step_exit(ctx, book)
+        guarded(("T7",), step_exit, ctx, book)
     if want("P5.2"):
-        step_batch_cancel(ctx, book)
+        guarded(("P5.2",), step_batch_cancel, ctx, book)
     if want("P6.1"):
-        step_logs(ctx, book)         # 最后做:前面各步产生的日志才齐
+        guarded(("P6.1",), step_logs, ctx, book)         # 最后做:前面各步产生的日志才齐
     return True
 
 
@@ -885,15 +916,22 @@ def print_summary(evs: list[Evidence]) -> None:
         print(f"\n{len(missing)} 项不是「通过」:SKIP 的在交易时段用 --resume 补测;MANUAL 的需人工演练;FAIL 的先排查。")
 
 
-def connection_info(setting: dict, now: datetime | None = None) -> dict:
-    """本次连接的环境事实。不含用户名/密码/授权编码;AppID 只留掩码。"""
+def connection_info(setting: dict, now: datetime | None = None, rehearsal: bool = False) -> dict:
+    """本次连接的环境事实。不含用户名/密码/授权编码;AppID 只留掩码。
+
+    `mode` 写明这份证据是「国信测试环境」还是「预演」——证据目录本身要能自证,
+    不能靠人记得它是在哪台机器上跑出来的。
+    """
+    broker_id = str(setting["经纪商代码"])
     return {
         "at": (now or datetime.now()).isoformat(timespec="seconds"),
         "environment": setting["柜台环境"],
         "trade_front": setting["交易服务器"],
         "market_front": setting["行情服务器"],
-        "broker_id": setting["经纪商代码"],
+        "broker_id": broker_id,
         "app_id": mask_account(setting["产品名称"]),
+        # 以 --rehearsal 为准,并与经纪商代码交叉校验:对 8030 跑预演也必须标成预演
+        "mode": "guoxin" if (broker_id == GUOXIN_TEST_BROKER_ID and not rehearsal) else "rehearsal",
     }
 
 
@@ -907,12 +945,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default="", help="只跑指定测试项,逗号分隔,如 T3,P4.1")
     parser.add_argument("--connect-timeout", type=float, default=120.0)
     parser.add_argument("--disconnect-timeout", type=float, default=120.0)
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin);默认用项目 .env")
+    parser.add_argument("--rehearsal", action="store_true",
+                        help="明确这是预演(连的不是国信测试环境)。证据会被标成 rehearsal,"
+                             "产出的报告不能提交国信")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
 
-    bootstrap.load_env()
-    env = os.environ
+    # 配置解析只走 ctp_tools.profile:清场工具、穿透检查、取证运行器必须
+    # 用**同一套**优先级(档案 > .env > 进程环境),否则「清场平的账户」和
+    # 「取证连的账户」可能不是同一个。
+    try:
+        profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    if profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断该连哪台机器,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for c in profile.hard_conflicts:
+            print(f"  - {c}", file=sys.stderr)
+        return EXIT_CONFIG
+    for note in profile.notes:
+        print(f"⚠ {note}(已按档案取值)", file=sys.stderr)
+    env = profile.env
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
     if not symbol:
         print("未指定合约:--symbol 或 .env 的 LIVE_VT_SYMBOL", file=sys.stderr)
@@ -927,40 +984,44 @@ def main(argv: list[str] | None = None) -> int:
               "请直接用 python scripts/broker_test.py 启动,不要从别的模块导入它。", file=sys.stderr)
         return EXIT_CONFIG
     # 前置地址白名单:由一键流程注入,或写在 .env 的 BROKER_TEST_ALLOWED_TD/MD 里。
-    # 没有白名单时,「柜台环境=测试」这一句不足以证明连的是期货公司的测试机——
-    # 那台机器只按环境变量判断,不校验地址,所以这里必须自己校验。
-    allowed_td = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_TD", "")) or None
-    allowed_md = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_MD", "")) or None
+    # 「柜台环境=测试」这一句不足以证明连的是期货公司的测试机——那台机器只按
+    # 环境变量判断,不校验地址,所以这里必须自己校验。
+    #
+    # 而且白名单**只能收窄不能放宽**:BROKER_TEST_ALLOWED_TD 与 CTP_TD_ADDRESS
+    # 同在 .env 里,直接采信它等于自己给自己发通行证(改两个键就能把账号密码
+    # 发给任意机器)。所以这里与代码里写死的可信地址全集求交集,
+    # 交集之外的地址一律拒绝(见 ctp_tools.broker_targets.resolve_allowed)。
+    allowed_td, allowed_md, dropped_td, dropped_md = resolve_allowed_for_broker(
+        setting["经纪商代码"], env.get("BROKER_TEST_ALLOWED_TD", ""), env.get("BROKER_TEST_ALLOWED_MD", ""))
+    for label, dropped in (("交易", dropped_td), ("行情", dropped_md)):
+        if dropped:
+            print(f"⚠ {label}前置白名单里的 {dropped} 不属于经纪商代码 {setting['经纪商代码']!r} "
+                  "对应的可信地址表,已丢弃(白名单与地址同源,采信它等于自证清白)。", file=sys.stderr)
     ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test, allowed_td)
     print(note, file=sys.stderr if not ok else sys.stdout)
     if not ok:
         return EXIT_CONFIG
-    if setting["柜台环境"] == "测试" and not allowed_td:
-        print("柜台环境=测试 但没有配置前置地址白名单(BROKER_TEST_ALLOWED_TD),拒绝连接:"
-              "「测试」这个标记不说明连的是哪台机器。请用一键流程(它会注入白名单),"
-              "或在 .env 里写 BROKER_TEST_ALLOWED_TD=host:port[,host:port]。", file=sys.stderr)
+    if setting["经纪商代码"] != GUOXIN_TEST_BROKER_ID and not args.rehearsal:
+        # 这个取证运行器出的是**国信**的报告:连着别的环境(SimNow 之类)生成的证据,
+        # 目录名和内容都长得像正式证据,事后很容易被当成国信环境的结果交上去。
+        print(f"目标不是国信测试环境(BrokerID={setting['经纪商代码']!r}),已退出:"
+              "这个取证运行器产出的证据会填进国信的报告模板。确属预演请加 --rehearsal"
+              "(证据会被标成 rehearsal,报告不能提交国信)。", file=sys.stderr)
         return EXIT_CONFIG
     md_address = normalize_address(setting["行情服务器"])
-    if allowed_td and not allowed_md:
-        # 交易前置查了、行情前置没查,等于留了半个口子:行情前置喂回来的盘口价
-        # 会**直接变成委托价**,连错行情前置 = 用假价格下单(演示委托可能因此成交,留下持仓)。
-        print("交易前置白名单已配置但行情前置白名单(BROKER_TEST_ALLOWED_MD)没配置,拒绝连接:"
-              "行情前置的盘口价会直接变成委托价,必须和交易前置一样校验。请用一键流程"
-              "(它会同时注入两个白名单),或在 .env 里写 BROKER_TEST_ALLOWED_MD=host:port[,host:port]。",
-              file=sys.stderr)
+    # 行情前置同样要查:行情前置喂回来的盘口价会**直接变成委托价**,
+    # 连错行情前置 = 用假价格下单(演示委托可能因此成交,留下持仓)。
+    if not allowed_md:
+        print("行情前置白名单为空(BROKER_TEST_ALLOWED_MD 没配,或里面没有可信地址),拒绝连接:"
+              "行情前置的盘口价会直接变成委托价,必须和交易前置一样校验。", file=sys.stderr)
         return EXIT_CONFIG
-    if allowed_md:
-        if md_address not in allowed_md:
-            print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
-            return EXIT_CONFIG
-    elif md_address not in SIMNOW_MD:
-        print(f"行情前置 {md_address} 不在任何白名单内(也没有配置 BROKER_TEST_ALLOWED_MD),拒绝连接。"
-              "行情前置喂回来的盘口价会直接变成委托价,不能靠「交易前置是白名单内的」来推定它也是。",
+    if md_address not in allowed_md:
+        print(f"行情前置 {md_address} 不在可信前置地址表 {sorted(allowed_md)} 内,拒绝连接。"
+              "行情前置的盘口价会直接变成委托价,不能靠「交易前置是白名单内的」来推定它也是。",
               file=sys.stderr)
         return EXIT_CONFIG
     print(f"交易前置 {setting['交易服务器']} / 行情前置 {setting['行情服务器']} —— "
-          f"白名单校验通过(BROKER_TEST_ALLOWED_TD={sorted(allowed_td) if allowed_td else '未设置,SimNow 场景按 SimNow 白名单'}、"
-          f"BROKER_TEST_ALLOWED_MD={sorted(allowed_md) if allowed_md else '未设置'})。")
+          f"白名单校验通过(允许的交易前置 {sorted(allowed_td)}、行情前置 {sorted(allowed_md)})。")
     only = {x.strip() for x in args.only.split(",") if x.strip()} or None
     unknown = (only or set()) - set(ITEMS)
     if unknown:
@@ -983,6 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
     event_engine.register(EVENT_ORDER, collector.on_order)
     event_engine.register(EVENT_TICK, collector.on_tick)
     event_engine.register(EVENT_CONTRACT, collector.on_contract)
+    event_engine.register(EVENT_POSITION, collector.on_position)
+    event_engine.register(EVENT_ACCOUNT, collector.on_account)   # 持仓查询「没有行」时用账户回报证明柜台在应答
     secrets = tuple(s for s in (env.get("CTP_PASSWORD", ""), env.get("CTP_AUTH_CODE", ""), env.get("CTP_APP_ID", ""),
                                 env.get("CTP_USERNAME", ""), env.get("WEBHOOK_URL", ""), env.get("WEBHOOK_TELEGRAM_CHAT_ID", "")) if s)
     from run_headless import build_notifier
@@ -1012,7 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
     evidences = merge_evidence(load_evidence(out_dir) if args.resume else {}, book.list())
     cjk = render_all(evidences, out_dir, secrets)
     save_evidence(out_dir, evidences)
-    save_connection_info(out_dir, connection_info(setting, started_at))
+    save_connection_info(out_dir, connection_info(setting, started_at, rehearsal=args.rehearsal))
     if not cjk:
         print("⚠ 没找到支持中文的字体(msyh.ttc/simhei.ttf),证据图里的中文会显示为方框;可设环境变量 BROKER_REPORT_FONT 指定字体。", file=sys.stderr)
     for note in notes:
@@ -1034,10 +1097,10 @@ if __name__ == "__main__":
         code = main()
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-    except Exception:
-        import traceback
+    except BaseException:      # noqa: BLE001  崩溃/被中断:必须与「有失败项(1)」区分,
+        import traceback       # 一键流程只对 0/1 出报告,半份证据不能当报告用
         traceback.print_exc()
-        code = 1
+        code = EXIT_CRASH
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

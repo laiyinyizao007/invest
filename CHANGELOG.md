@@ -5,6 +5,27 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+- G8 第二轮**复审**(codex CLI 两次独立复核,35/50)的整改落地(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
+  - **一键取证流程会被自己拦死(Critical)**:父进程把排序后的白名单下推给子进程,而 `.env` 里是手写顺序;`load_profile` 按字符串比 → 判硬冲突 → 子进程退出码 2。现在 `BROKER_TEST_ALLOWED_TD/MD` 按**归一化集合**比较。
+  - **柜台静默拒掉持仓查询会被判「空仓」(Critical)**:vnpy_ctp 的 TD 侧没有 `onRspError`,又丢弃 `reqQryInvestorPosition` 的返回码,被流控拒掉时零行零日志,与空仓无法区分。现在「没有行」必须有一次**账户资金回报**作证(`_probe_counter_replies`),拿不到就判不可信;各脚本补注册 `EVENT_ACCOUNT`。
+  - **`reconcile_filled` 漏报余仓、丢多空方向(High)**:按 `(合约, 持仓方向)` 对账,并检查初始快照之外冒出来的持仓——不再「已平空 + 退出码 0」。
+  - **`collect_reject_texts` / `drill` / `broker_report` 迁到 `load_profile`(High)**:新增 `--profile` 与硬冲突闸门,不再用 `bootstrap.load_env()`(进程环境赢)与清场(`.env` 赢)优先级相反。
+  - **一键流程 Ctrl+C 后子进程变孤儿(High)**:`terminate_child()` 先礼后兵地收掉独立进程组里的取证子进程,再还原 `.env`;运行前没有 `.env` 时,还原改为删除本次写入的档案。
+  - **崩溃与「有失败项」共用退出码 1(High)**:`broker_test` / `penetration_check` 未捕获异常(含 Ctrl+C)返回 4;一键流程只对 0/1 出报告。
+  - Medium:`trade_live` 拿不到 `login_status` 时失败关闭(不再退回恒为 True 的 `connect_status`);`check_positions` 无采集器路径查询异常判不可信;`symbol_has_position` 任一轮不可信即整体不可信;进程环境里独有的 `CTP_*` 键报硬冲突;`SECRET_KEYS` 补 webhook 键;取证运行器每步用 `guarded()` 包住,抛异常只记该步 FAIL、不丢已采到的证据;证据 `mode` 以 `--rehearsal` 为准;穿透演练发单前加空仓闸门;探针 BrokerID 未知时拒绝(不再退回可信全集);删除 `guoxin_oneclick` 里的死代码。
+- G8 双轮审查第二轮(codex CLI,评分 34/50)的整改全部落地(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
+  - **`--profile` 之前永远用不了**:`load_profile` 把「来源互相矛盾、只能靠猜」和「操作员的显式意图」混在一起,上一次运行残留的 `CTP_*` 会把 `python scripts/flatten_positions.py --profile .env.guoxin` 永久挡在退出码 2 上。现在返回 `Profile(env, hard_conflicts, notes)`:**硬冲突**才拒绝运行,**软提示**只打 ⚠。
+  - **OMS 里的旧仓位让清场和后面每个空仓闸门失效**:vn.py 的 `OmsEngine` 只写不删,平掉的仓位永远留在缓存里。持仓一律改取**本次查询回报**(`collector.query_positions`,回报结束即清网关缓存),并加**成交对账**(`reconcile_filled`):初始持仓手数与实际成交量逐合约比对,差额对不上就报出来,**不允许报「已平空」**。
+  - **白名单按经纪商代码绑定**(`allowed_for_broker` / `resolve_allowed_for_broker`):国信档只认国信前置,SimNow 档只认 SimNow 前置(两个是不同的账户、不同的柜台);未知 BrokerID → 空集,没有「默认放行」。取证与穿透脚本也改用它。
+  - **档案解析统一到一个入口**:取证运行器与穿透脚本不再各写一份解析,改用 `ctp_tools.profile.load_profile`,闸门看到的值 = 柜台拿到的值;`bootstrap.load_dotenv` 改 `encoding="utf-8-sig"`(BOM 文件的键名会带上 BOM 字符)。
+  - **子进程超时不再伪装成失败**:一键流程的 `run_child` 超时返回 `EXIT_CRASH`,调用方单独处理(超时与「跑完但失败」必须能分开看)。
+  - **单独跑取证运行器不再产出「自称国信」的证据**:非 `8030` 的经纪商代码必须显式加 `--rehearsal`,连接记录里写明 `mode`(guoxin / rehearsal)。
+  - **SimNow 第二套补上行情前置 40011**(来历:2026-11-12 我们自己跑通第二套的记录),`scripts/simnow_guard.py` 改成 `ctp_tools/simnow.py` 的转发层 —— 地址表原来有两份,已经漂移过两次。
+  - 若干 Low:`check_positions` 那个从不被使用的 `symbol` 形参删掉(它是账户级语义)、探针里错误的 `vt_symbol` 转换删掉、清场的 `confirmed=True` 不再写死、清场在持仓非空时不再忽略查询可信度。
+
+  - **冲突信息里带出了凭据原文(G7)**:档案解析的冲突/提示信息原先直接打印环境变量的值,密码、授权码、AppID 会跟着进 stderr(也可能进证据文件)。现在脱敏规则集中在 `ctp_tools.profile.describe_env_value`(一键流程那份并入同一处,避免两份实现漂移),凭据一律「(已隐藏)」、账号只留头尾各 2 位,并补了断言。
+  - **采集脚本的空仓检查还在读 OMS 快照**:`symbol_has_position` 现在也能传采集器,走「本次查询回报」那条路(`collect_reject_texts.py` 已接上),避免陈旧快照把采集白白中止一次。
+
 ### Changed（变更）
 - **行情前置(MD)地址也要查白名单**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):`broker_test.py` / `penetration_check.py` 原来只校验交易前置(`penetration_check.py` 连交易前置的地址都不查,只看「柜台环境=测试」这个标记),行情前置连到哪台机器都不管。风险是实的:行情前置喂回来的盘口价与跌停价会**直接变成委托价**,连错行情前置 = 用假价格下单,演示委托可能因此成交并留下持仓。现在统一收紧:交易前置配了白名单就必须同时配行情前置白名单;行情前置不在白名单内一律拒绝;没配白名单时,行情前置至少要在 SimNow 行情地址表内(`ctp_tools/broker_targets.SIMNOW_MD`)。三处同步(`broker_test.py` / `penetration_check.py` / `flatten_positions.py`),补 5 个单测。
 - 清场工具的定价改用**合约的最小变动价位**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):原来取 `PositionData.contract`,而 vnpy 根本不填这个属性 → 取不到时按 1 计价,国债(0.001)/股指(0.2)这类品种的价格不是整数倍,柜台会以「价格非法」拒单,平仓就平不掉(还容易被误当成柜台问题)。现在从合约信息取 pricetick,取不到就在留痕里写明;另外持仓有几个合约就订阅几个——原来只订阅一个合约,多持仓时其余合约拿不到对手价,定价会退化成 0 而拒单。补 4 个单测。
@@ -29,6 +50,27 @@
 - **实测记录(2026-11-13 23:11–23:26)**:国信测试前置 `121.13.218.19:41285` / `120.86.114.57:41285` 从本机 **TCP 连得上(15–21ms)但 CTP 握手没有回应**,网关日志只有 `连接断开,原因4097`(网络读失败),连「连接成功」都没出现;换成 `柜台环境=实盘`(bIsProductionMode=true)同样如此,说明不是环境开关问题。同机同时段连 SimNow 第一套前置(182.254.243.31:30001)正常(登录成功、持仓查询返回 `c2701.DCE Long 3`),所以客户端本身没问题——**是国信前置没有对我们开放会话**(待与国信技术部确认:是否只在交易时段开放、是否需要登记来源 IP、是否要求 API 6.7.13)。
 - **复测记录(2026-11-13 23:48)**:用只读探针分别打**电信**(`121.13.218.19`)与**联通**(`120.86.114.57`)两套前置,结果一致——TCP 建立后 CTP 握手无回应,每 6 秒一次 `连接断开,原因4097`,交易与行情两个前置都一样,**两套前置都不是「电信不通」的问题**。下一轮复测安排在交易时段内(北京时间周一 09:00 起)再做,以便区分「只在交易时段开放」与「需要登记来源 IP」。
 - 国信测试报告适配 20260717 版模板(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):新模板是单文档两部分——外部接入(1.1 连通 / 1.2 基础交易 / **2.1 稳定运行**)+ 程序化补充(3.1–7.1),**没有穿透 T1–T7 专章**,章节整体重编号。`broker_report.py` 只支持新模板:内部测试项 ID 不变,经 `broker_evidence.TEMPLATE_NO` 映射到模板编号;两个「测试结论」行分别按外部接入/程序化补充判定;「看穿式采集」两行模板预勾的「通过」一律重置(由国信评估);旧版模板明确报错而不是按旧号错填(旧号下连接监测的 2.1 会错配到新模板的「稳定运行」)。新增取证项 `P1.3 稳定运行`(经风控链持续下单 200 笔,记录耗时,「耗时约 N 秒」填空由实测值回填;演示期间临时抬高会被 200 笔拦住的风控上限并还原,含撤单锁定计数),纳入空仓闸门。穿透 T1–T7 仍会运行并留存证据,但不再写进报告。API 6.7.13 的 `bIsProductionMode`(测试须传 false)已由 `vnpy_ctp` 的「柜台环境=测试」覆盖,无需改动。
+
+### Fixed（修复）
+- G8 双轮审查第二轮(codex CLI)提出的 29 条(8 High / 12 Medium / 9 Low,评分 34/50 < 45 发布线)全部整改,重点是几条会让**闸门形同虚设**的高危项(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
+  - **白名单自证清白**:`BROKER_TEST_ALLOWED_TD/MD` 与 `CTP_TD_ADDRESS` 同源,同改即可放行任意地址。新增 `ctp_tools/broker_targets.py` 写死「可信前置全集」(国信测试前置 + SimNow),白名单只能取其**子集**(`resolve_allowed`),全集外的地址丢弃并告警;**白名单为空即拒绝连接**(操作员必须明确说出连哪台,代码不替他决定)。`check_target` 不再接受空表/None。
+  - **判活看错了字段**:vnpy_ctp 断线只清 `login_status`(`connect_status` 恒为 True),用后者判活的话断线后查询照样「成功」返回空持仓。空仓闸门与持仓查询统一改读 `collector.trade_live()`;**「查不到持仓」与「没有持仓」彻底分开**(清场工具新增退出码 4 = 查询不可信),查不准一律不放行发单。
+  - **今昨仓拆分不可靠**:vnpy_ctp 只在**纯昨仓**时写 `yd_volume`,今昨混合仓拆出的「平今手数」会超过实际今仓、被柜台拒单。新增 `split_is_reliable()`,不可靠时**不自动发单**,只提示人工平仓。
+  - **撤单不等终态**:撤单请求发出 ≠ 撤成功。收尾兜底撤单改为等到终态,超时/失败的单独列出来(退出码仍是「未平干净」)。
+  - **探针没有闸门**:只读探针要登录(等于把账号密码发给那台机器),改为按可信前置全集放行;输出脱敏(账号掩码、密码/授权码/AppID 不打印)。
+  - **一键流程覆盖目录身份**:证据目录的 `mode.json`(记录**第一次**运行的前置与时间)不再被 `--resume` 补测改写。
+  - **一键流程强杀子进程**:子进程超时改为**先礼后兵**——先发中断信号给它 30 秒自己撤单/登出收尾,还不动才强杀(强杀会在柜台上留下演示委托)。
+  - 其余 Medium/Low:新增 `ctp_tools/profile.py` 作为**唯一**的档案解析入口(优先级 档案 > `.env` > 进程环境变量,冲突必须报出来;探针与清场共用,不再各写一份 `dotenv_values`)、清场工具支持 `--profile` 并在进程环境与档案冲突时拒绝运行(否则平掉的是另一个账户的仓位)、`--profile` 缺失/冲突的退出码、白名单外地址的告警、行情前置同样查白名单、`bootstrap` 日志 sink 重绑的边界、探针退出码与 CLI 参数对齐。
+  - 文档同批更新:ADR `docs/adr/20261111-broker-test-compliance.md` §5 硬约束表(新增 5 行、白名单与人工核对并存)与 2026-11-13 修订节、`docs/broker-filing.md` §5c(清场必须带 `--profile .env.guoxin`)、`PROJECTWIKI.md` §5。
+- 第三轮自查与 codex 复核补上的 8 条(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
+  - **最小变动价位取错来源**:vn.py 的 `PositionData` 没有 `contract` 属性 → 取到 `None` → 价位退化成 1.0,非整数倍品种的平仓单会被柜台拒单。改为从合约信息取 `pricetick`(`main_engine.get_contract` → `collector.contract_of` 兜底)。
+  - **只订阅了一个合约**:多持仓时其余合约没有对手价 → 定价 0 → 拒单。改为订阅**全部**持仓合约。
+  - **行情前置地址从未校验**:行情价会直接变成委托价,连错行情前置 = 用假价格下单(演示委托可能成交、留下持仓)。`broker_test.py` / `flatten_positions.py` / `penetration_check.py` 三处一律走 `KNOWN_MD` 白名单交集。
+  - **档案与进程环境的优先级不一致**:`bootstrap.load_env()` 用 `dotenv.load_dotenv(override=False)`(进程环境赢),而 `ctp_tools/profile.py` 曾让 `.env` 赢 → 取证运行器与清场工具可能连到**不同的前置**,清场就可能平错账户的仓位。`load_profile` 现在报出**两层**冲突(①进程环境 vs `.env`;②档案 vs 生效配置),清场工具发现任一冲突即拒绝运行。
+  - **凭据类环境变量不参与冲突判定**:可能「连的是国信地址、登的是另一个账号」。冲突判定扩到全部 `CTP_*`(含 `CTP_USERNAME`/`CTP_PASSWORD`/`CTP_AUTH_CODE`/`CTP_APP_ID`)。
+  - **冲突提示原样打印环境变量值**(违反 G7):冲突信息里的凭据一律脱敏。
+  - **子进程继承来路不明的 `CTP_*`**:一键流程改用 `child_env()`,只把**闸门校验过的那一份**环境传给子进程。
+  - **探针 CLI 与文档不符、默认调用会 KeyError**:改为 `argparse`,优先级写明(指定档案 > `.env` > 进程环境),缺什么报什么。
 
 ### Changed（变更）
 - 状态页后端方案由『不使用 vnpy_webtrader』改为『fork 并改造』(用户决定,2026-11-12;仅文档):ADR 新增『fork 范围』——上游 MIT,保留版权与许可证全文;逐项处置(保留应用骨架与静态托管模式;删除 JWT 登录与写死密钥、订阅与下单撤单接口、WebSocket 与 RPC、全部 `vnpy` import;`WebEngine` 不装进交易进程);列出 FastAPI 默认行为与契约的冲突及处理(关闭自动文档、统一错误形状、关闭斜杠重定向、安全响应头、强制回环);Web 依赖隔离在 `requirements-dashboard.txt`,不进交易环境。计划 T6 拆为 T6a–T6g。如实记录:改造后上游残留代码很少,价值主要是许可证谱系与起步骨架;若 FastAPI 默认行为的处理成本高于收益,可回退到完全自写后端。

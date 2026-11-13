@@ -35,6 +35,7 @@ from lxml import etree
 
 from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
 from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
+from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -638,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="国信模板 docx(不入库;也可用环境变量 BROKER_REPORT_TEMPLATE)")
     parser.add_argument("--evidence", type=Path, required=True, help="broker_test.py 生成的证据目录")
     parser.add_argument("--out", type=Path, default=None, help="输出 docx(默认在证据目录里)")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin)取账号/AppID 等;默认用项目 .env")
     parser.add_argument("--no-terminal-info", action="store_true", help="不采集本机终端信息(机型/CPU/内存/硬盘栏留空)")
     parser.add_argument("--watermark", default="", help="在正文最前面插入的提示文字(预演报告用它标明不可提交国信)")
     args = parser.parse_args(argv)
@@ -649,12 +651,25 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.evidence / "evidence.json").exists():
         print(f"证据目录里没有 evidence.json:{args.evidence}。请先运行 scripts/broker_test.py。", file=sys.stderr)
         return 2
-    bootstrap.load_env()
+    # 配置解析只走 ctp_tools.profile(档案 > .env > 进程环境),与取证/清场/探针一致。
+    try:
+        _profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if _profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断报告里该填哪个账户,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for _conflict in _profile.hard_conflicts:
+            print(f"  - {_conflict}", file=sys.stderr)
+        return 2
+    for _note in _profile.notes:
+        print(f"⚠ {_note}(已按档案取值)", file=sys.stderr)
     info = None
     if not args.no_terminal_info and sys.platform == "win32":
         import collect_terminal_info
         info = collect_terminal_info.collect()
-    ctx = context_from_env(os.environ, info)
+    ctx = context_from_env(_profile.env, info)
     out = args.out or (args.evidence / f"国信外部接入系统技术测试报告-{ctx.app_id or 'noappid'}.docx")
     if args.out is None:
         # 正式报告名 + 模板正文里预填的国信 BrokerID/前置 = 一份「自称国信环境」的文件。

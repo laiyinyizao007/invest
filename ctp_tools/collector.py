@@ -88,8 +88,36 @@ class Collector:
         self.log_lines: list[str] = []
         # 登录失败的日志文本:等合约表的时候如果登录就失败了,再等下去只是浪费时间
         self.login_failures: list[str] = []
+        # **持仓查询回报的行**(不是 OMS 快照,见 `query_positions` 的说明):
+        # 网关每次查询回报只推送**本次返回的**行,已平掉的合约不会再出现。
+        self.position_rows: list = []
+        # 账户资金回报计数:持仓查询「没有行」时,用它证明柜台确实在应答(见 query_positions)
+        self.account_count = 0
         # 事件线程写、主线程读:用一把锁把列表的读取变成一致的快照
         self.lock = threading.Lock()
+
+    def on_position(self, event: Event) -> None:
+        """收持仓查询回报的行。
+
+        必须自己收:vn.py 的 OMS 只做 `self.positions[id] = position`,**从不删除条目**,
+        所以平掉仓之后 OMS 里那条旧持仓永远还在(见 `query_positions` 的说明)。
+        """
+        with self.lock:
+            self.position_rows.append(event.data)
+
+    def on_account(self, event: Event) -> None:
+        with self.lock:
+            self.account_count += 1
+
+    def mark_positions(self) -> int:
+        """记下当前已收到的持仓行数(发查询前记,之后 `positions_since` 只看新的)。"""
+        with self.lock:
+            return len(self.position_rows)
+
+    def positions_since(self, mark: int) -> list:
+        """取 `mark` 之后收到的持仓行(=某次查询回报返回的全部行)。"""
+        with self.lock:
+            return list(self.position_rows[mark:])
 
     def on_log(self, event: Event) -> None:
         log: LogData = event.data
@@ -311,7 +339,8 @@ def positions_of_symbol(positions: list[str], symbol: str) -> list[str]:
     return [p for p in positions if p.split(" ")[0] == symbol]
 
 
-def symbol_has_position(main_engine, symbol: str, wait: float = 15.0) -> tuple[bool, bool]:
+def symbol_has_position(main_engine, symbol: str, wait: float = 15.0,
+                        collector=None) -> tuple[bool, bool]:
     """发单前确认账户是否**已有持仓**。
 
     返回 (是否有持仓, 连接是否正常)。发单前必须查:
@@ -330,34 +359,145 @@ def symbol_has_position(main_engine, symbol: str, wait: float = 15.0) -> tuple[b
     而且要**查两轮**:CTP 对空账户**不推送任何持仓事件**,所以"没收到回报"既可能是
     真的空仓,也可能是回报还没到。只查一轮的话,SimNow 高负载下回报延迟就会造成误判。
     第二轮再查一次,任一轮看到持仓就中止。
+
+    collector:给了就走**查询回报**这条路(权威,见 `query_positions`);
+    不给只能退回 OMS 快照(可能陈旧 —— 陈旧只会**误报有持仓**、从而中止采集,
+    属于安全方向,但会白白挡住一次采集)。
     """
     seen: list[str] = []
     connected = True
     for round_wait in (wait, wait / 2):
-        positions, connected = check_positions(main_engine, symbol, wait=round_wait, early_exit=False)
+        positions, round_ok = check_positions(main_engine, wait=round_wait, early_exit=False,
+                                              collector=collector)
+        connected = connected and round_ok       # 任一轮不可信 = 整体不可信
         seen.extend(positions)
         if positions:
             break
     return bool(seen), connected
 
 
-def check_positions(main_engine, symbol: str, wait: float = 3.0,
-                    early_exit: bool = True) -> tuple[list[str], bool]:
-    """查询并返回非零持仓(本脚本不应留下任何持仓,有就是意外)。
+def trade_live(main_engine) -> bool:
+    """交易通道当前是否在线(可作为「查到的数据可信」的判据)。
+
+    必须看 `login_status`,不能看 `connect_status`:vnpy_ctp 的
+    `onFrontDisconnected` 只把 `login_status` 清掉,`connect_status` 一直是 True
+    (见 vnpy_ctp/gateway/ctp_gateway.py)。用 `connect_status` 判活的话,
+    断线之后查询照样"成功",返回空持仓 —— 空仓闸门就成了摆设:
+    明明连不上柜台,却被判成"账户是空的",于是照常发演示委托。
+
+    拿不到 `login_status` 属性 = 不知道通道状态 → 判不在线(失败关闭):
+    退回 `connect_status` 的话,断线后它恒为 True,空仓闸门就失效了。
+    """
+    td_api = getattr(main_engine.get_gateway("CTP"), "td_api", None)
+    if td_api is None or not hasattr(td_api, "login_status"):
+        return False
+    return bool(td_api.login_status)
+
+
+def query_positions(main_engine, collector, wait: float = 5.0,
+                    quiet: float = 1.2) -> tuple[list, str]:
+    """按「**本次查询回报返回的行**」取持仓,而不是 OMS 快照。
+
+    为什么不能只看 OMS(vn.py 的 `OmsEngine`):
+    - `vnpy_ctp` 只在持仓查询回报的 `last=True` 时推送**本次返回的**行
+      (ctp_gateway.py:`if last: for position in self.positions.values(): on_position(...)`;
+      回报结束后 `self.positions.clear()`),所以已经平掉的合约**不会再出现**;
+    - 而 `OmsEngine.process_position_event` 只做 `self.positions[id] = position`,
+      **从不删除条目**。
+    合起来的后果:平仓成功后,OMS 里那条旧持仓永远留着 —— 平仓工具会说
+    「未平干净,仍有持仓」,取证运行器的空仓闸门会把**后面所有发单步骤**判成
+    「账户已有持仓」而全部中止。仓库自己在 `trading/guard_rule.py:16` 记过同一件事:
+    「按**成交量**对账,而不是反复读取 OMS 持仓」。
+
+    返回 (持仓行, 状态):
+    - "ok":收到了本次查询的回报(可能为空行=账户确实没有持仓);
+    - "empty":没有收到行,但通道在线(CTP 对空账户**不推送任何持仓事件**,
+      所以「没有行」在通道在线时就是「没有持仓」);
+    - "untrusted":查询发不出去或通道不在线 —— 这时说什么都是猜。
+    """
+    gateway = main_engine.get_gateway("CTP")
+    mark = collector.mark_positions()
+    try:
+        gateway.query_position()
+    except Exception:      # noqa: BLE001  查询发不出去 = 不可信
+        return [], "untrusted"
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        rows = collector.positions_since(mark)
+        if rows:
+            # 网关在 last=True 时一次性推送全部行;等一小段「安静窗口」,
+            # 确认回报已经发完(否则可能只拿到前半截)。
+            end = time.monotonic() + quiet
+            while time.monotonic() < end:
+                time.sleep(0.05)
+                more = collector.positions_since(mark)
+                if len(more) > len(rows):
+                    rows = more
+                    end = time.monotonic() + quiet
+            return rows, "ok"
+        time.sleep(0.1)
+    if not trade_live(main_engine):
+        return [], "untrusted"
+    # 「没有行」有两种可能:账户真的空 / 柜台根本没应答。vnpy_ctp 的 TD 侧
+    # 没有 onRspError、也丢弃 reqQryInvestorPosition 的返回码,被流控拒掉时
+    # 零行零日志 —— 看起来和空仓一模一样。所以要拿一个**可观测的应答**证明
+    # 柜台在说话:查一次账户资金,收到回报才算「确实空仓」。
+    if not _probe_counter_replies(main_engine, collector):
+        return [], "untrusted"
+    return [], "empty"
+
+
+def _probe_counter_replies(main_engine, collector, wait: float = 4.0) -> bool:
+    """发一次账户资金查询,等回报到达;到了 = 柜台在应答(持仓查询没回行就是真的没有)。
+
+    采集器没有 `account_count`(旧桩)→ 无法证明 → 判不可信(失败关闭)。
+    查询流控是每秒一次,所以先隔 1.1s 再发,免得探针本身被拒。
+    """
+    if not hasattr(collector, "account_count"):
+        return False
+    time.sleep(1.1)
+    with collector.lock:
+        before = collector.account_count
+    try:
+        main_engine.get_gateway("CTP").query_account()
+    except Exception:      # noqa: BLE001
+        return False
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        with collector.lock:
+            if collector.account_count > before:
+                return trade_live(main_engine)
+        time.sleep(0.1)
+    return False
+
+
+def check_positions(main_engine, wait: float = 3.0,
+                    early_exit: bool = True, collector=None) -> tuple[list[str], bool]:
+    """查询并返回**账户级**的非零持仓(本脚本不应留下任何持仓,有就是意外)。
+
+    **这是账户级的,不是某个合约的**:空仓闸门要的是「账户上没有任何持仓」。
+    以前这里有个 `symbol` 形参,但所有调用方都要的是账户级结果,而这个参数
+    被**完全忽略**——留着它只会让人以为返回的是那个合约的持仓。
+    形参已经删掉:要按合约过滤,自己用 `positions_of_symbol()`。
 
     注意:**连接断了的时候这个检查没有意义**——查不到持仓不等于没有持仓。
     连接状态在返回里一并给出(第二个元素),调用方据此提示人工核对。
+    判活看 `login_status`(见 `trade_live` 的说明),断线时这个值是 False。
 
     early_exit=True(默认):一看到非零持仓就返回,适合"跑完后的收尾检查"。
     early_exit=False:始终等满 wait 窗口,适合"发单前的安全检查"——
     给 CTP 的异步持仓回报留出到达时间,避免拿到过期的空仓结论。
+
+    collector:给了就用**查询回报**里的行(权威,见 `query_positions`);
+    没给只能退回 OMS 快照(可能陈旧,只用于没有采集器的场景)。
     """
+    if collector is not None and hasattr(collector, "mark_positions"):
+        return _check_positions_by_query(main_engine, wait, collector)
     gateway = main_engine.get_gateway("CTP")
-    connected = bool(getattr(getattr(gateway, "td_api", None), "connect_status", False))
     try:
         gateway.query_position()
-    except Exception:
-        pass
+    except Exception:      # noqa: BLE001  查询发不出去 = 不可信,不能继续用 OMS 快照当结论
+        return [], False
     deadline = time.monotonic() + wait
     found: list[str] = []
     while time.monotonic() < deadline:
@@ -366,5 +506,26 @@ def check_positions(main_engine, symbol: str, wait: float = 3.0,
         if found and early_exit:
             break
         time.sleep(0.5)
-    return found, connected
+    # 判活放在**查询之后**:查询期间断线的话,这次查到的持仓就是旧的/空的,
+    # 拿它当"账户是空的"用,等于在断线的柜台上下单。
+    return found, trade_live(main_engine)
+
+
+def _check_positions_by_query(main_engine, wait: float, collector) -> tuple[list[str], bool]:
+    """按查询回报判断持仓;「没有行」要查两轮才算空仓。
+
+    CTP 对空账户**不推送任何持仓事件**,所以第一轮没有行时,分不清是
+    「账户真的空」还是「回报还没到」。查两轮(两轮都没有行且通道在线)才算空。
+    """
+    round_wait = max(1.0, min(wait, 5.0))
+    for _round in range(2):
+        rows, status = query_positions(main_engine, collector, wait=round_wait)
+        if status == "ok":
+            found = [f"{p.vt_symbol} {p.direction.value} {p.volume}"
+                     for p in rows if getattr(p, "volume", 0) > 0]
+            return found, trade_live(main_engine)
+        if status == "untrusted":
+            return [], False
+    return [], trade_live(main_engine)
+
 

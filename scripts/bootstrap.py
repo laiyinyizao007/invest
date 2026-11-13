@@ -119,11 +119,39 @@ def _rebind_log_sink(state_root: Path) -> bool:
         except Exception:      # noqa: BLE001  挪不动就如实说没成功
             return False
         logger.remove(handler_id)
+    # 复核:剩下的文件 sink 必须**全部**落在隔离目录里。
+    # 不复核的话,「挂上了但路径不对」会被当成隔离成功,日志(含账号与资金信息)
+    # 继续写进实盘目录 —— 那比不隔离还糟:调用方以为已经隔离了。
+    return _log_sinks_under(state_root)
+
+
+def _log_sinks_under(state_root: Path) -> bool:
+    """当前所有文件 sink 是否都落在 state_root 下面。"""
+    try:
+        from vnpy.trader.logger import logger
+    except Exception:      # noqa: BLE001
+        return False
+    root = state_root.resolve()
+    for handler in getattr(logger._core, "handlers", {}).values():
+        path = getattr(getattr(handler, "_sink", None), "_path", None)
+        if not path:
+            continue
+        try:
+            if not Path(path).resolve().is_relative_to(root):
+                return False
+        except OSError:
+            return False
     return True
 
 
 def load_env(env: Mapping[str, str] | None = None) -> Mapping[str, str]:
-    """加载项目 `.env`，保留调用进程已注入的环境变量优先级。"""
+    """加载项目 `.env`，保留调用进程已注入的环境变量优先级。
+
+    `encoding="utf-8-sig"`:Windows 编辑器保存的 `.env` 常带 BOM。
+    不剥掉的话,第一个键会变成 `﻿CTP_USERNAME`(BOM 粘在键名上),
+    dotenv 解析出来的键名和别处(`dotenv_values(..., encoding="utf-8-sig")`)
+    对不上 —— 同一份文件,两条解析路径给出两套键名,闸门看到的和柜台拿到的就不一样。
+    """
     from dotenv import load_dotenv
-    load_dotenv(ROOT / ".env", override=False)
+    load_dotenv(ROOT / ".env", override=False, encoding="utf-8-sig")
     return os.environ if env is None else env
