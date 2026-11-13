@@ -376,8 +376,9 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
         raise CandidateError(describe_error(exc)) from exc
-    protected_after = const.snapshot_protected_state()
-    tampered = const.check_protected_state(protected_before, protected_after)
+    # 第二个实参**当场**拍:必须是"这一次调用"的新快照,不能是提前存好的变量或它的拷贝
+    # (宪法历史守卫按这条核对执行点:拿拷贝比对,指纹必然一致,第四层形同虚设)。
+    tampered = const.check_protected_state(protected_before, const.snapshot_protected_state())
     if tampered:
         raise JobError(EXIT_REFUSED, "候选在导入期改写了受保护的框架对象:"
                        + chr(10) + "  " + (chr(10) + "  ").join(tampered))

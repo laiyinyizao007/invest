@@ -37,6 +37,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
+import inspect
 import json
 import re
 import sys
@@ -145,8 +146,7 @@ BUILTIN_PROTECTED_CONTAINERS = (
 # 两者都能被**调用**写入:`self.am.update_bar(fake_bar)`、`self.bg.update_bar(bar)`
 # 会往回测里插一根假 K 线(第 11 轮 codex 实测:端到端四层防线全绿,
 # 而 skipped_by_budget 由 0 变成 3928、成交数由 212 变成 2——回测结果被完全改写)。
-BUILTIN_PROTECTED_CONTAINER_SCOPE = (
-    "am",
+BUILTIN_PROTECTED_CONTAINER_SCOPE = BUILTIN_PROTECTED_CONTAINERS + (
     "bg",
 )
 
@@ -166,6 +166,18 @@ BUILTIN_PROTECTED_CONTAINER_MUTATORS = (
     # numpy 数组的写入型方法(原地改写,对象身份不变)
     "fill", "itemset", "put", "resize", "copyto", "setfield", "setflags",
     "byteswap",
+    # dunder 写入口(第 12 轮 codex 的 High 1 变体②):
+    # `self.am.close.__setitem__(slice(None), self.am.close)` 与按名调用一样
+    # 能原地改写行情数组,而 dunder 名字按名是拦不到的(只有 __setattr__ 之类在禁名单里)。
+    "__setitem__", "__delitem__", "__iadd__", "__imul__", "__ior__",
+)
+
+# 受保护容器上的**视图型方法**:返回的是原数组的视图(与原数组共享内存),
+# 拿到它再改,改的还是回测数据本身(第 12 轮 codex 的 High 1 变体①的同一类)。
+#
+# `flatten`/`copy` 不在此列:它们返回的是**副本**,拿到也改不到回测数据。
+BUILTIN_PROTECTED_CONTAINER_VIEWS = (
+    "view", "reshape", "ravel", "squeeze", "transpose",
 )
 
 # 候选不得调用的下单/撤单接口
@@ -599,24 +611,119 @@ def _module_attr_owner_ok(name: str, path: list[str]) -> bool:
     return owner is None or owner in path
 
 
-def _container_alias(value: ast.AST) -> str | None:
-    """把受保护**容器**里的东西取出来另存——之后就能原地改写它。
+def _container_reference(node: ast.AST) -> str | None:
+    """表达式是否**直接引用**受保护容器(`am`/`bg`)本身或它的某个属性。
 
-    `am` 里装的是行情数组(close/open/high/low…),拿到别名之后
-    `arr[0] = 999` 改的就是**回测数据本身**(伪造价格 → 伪造收益),
-    而静态层按名字看,`arr` 只是个普通局部变量。
+    `am` 里装的是行情数组(close/open/high/low…),`bg` 里装的是日线/窗口线——
+    两者都能被**原地改写**,拿到别名之后改的就是**回测数据本身**
+    (伪造价格 → 伪造收益),而静态层按名字看,`arr` 只是个普通局部变量。
 
-    只拦**裸属性**(`arr = self.am.close`):带下标的(`x = self.am.close[-1]` 取到的是
-    一个数)与带调用的(`x = self.am.atr(14)`)都不算取别名,放行。"""
-    if not isinstance(value, ast.Attribute):
+    范围比 `BUILTIN_PROTECTED_CONTAINERS` 宽:那条名单只列了 `am`,
+    而 `bg`(BarGenerator)是同一类容器——`self.bg.update_bar(fake_bar)`
+    往回测里插一根假 K 线,和 `self.am.update_bar(fake_bar)` 是一回事
+    (第 11 轮之后的自查实测:静态层两条都放过)。
+
+    只认**裸属性**(`arr = self.am.close`):带下标的(`x = self.am.close[-1]` 取到的是
+    一个数)与带调用的(`x = self.am.atr(14)`)都不算引用容器本身。"""
+    if isinstance(node, ast.Attribute):
+        path = _attr_path(node)
+        if not path:
+            return None
+        for index, segment in enumerate(path):
+            if index == 0:
+                # 裸名不算容器:`am`/`bg` 是 ArrayManager/BarGenerator 的常见缩写,
+                # 候选写 `am = []` 再 `am.append(x)` 是它自己的列表
+                # (第 12 轮 codex 的 Medium 1:按裸名一刀切是**误报**)。
+                continue
+            if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
+                return ".".join(path[index:])
         return None
-    path = _attr_path(value)
-    if not path:
+    if isinstance(node, ast.Subscript):
+        # `self.am.close[:]` 切出来的是**视图**(不是副本):拿到就能原地改写。
+        # 第 12 轮 codex 的 High 1 变体①:视图把 ATR 从 40 压到 2.86,
+        # ¥300 单笔预算当场失效(诚实模板 0 成交,候选成交 2 笔),四层防线全绿。
+        # `self.am.close[-1]` 取到的是一个数(副本),不是视图,放行。
+        if isinstance(node.slice, ast.Slice):
+            return _container_reference(node.value)
         return None
-    for index, segment in enumerate(path):
-        if segment in BUILTIN_PROTECTED_CONTAINERS:
-            return ".".join(path[index:])
+    if isinstance(node, ast.Call):
+        # `self.am.close.reshape(-1)` 返回的也是**视图**(与原数组共享内存):
+        # 拿到它再 `arr[0] = 9`,改的还是回测数据本身。
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            path = _attr_path(func)
+            if path and path[-1] in BUILTIN_PROTECTED_CONTAINER_VIEWS:
+                return _container_reference(func)
+        return None
     return None
+
+
+def _container_escape_findings(tree: ast.AST) -> list[tuple[int, str]]:
+    """受保护容器的引用**流出去**的地方(取别名 / 传参 / 装容器 / 返回)。
+
+    为什么必须按"流出去"判,而不是按"改写"判:改写点可以藏在任何地方,
+    而引用一旦离开原处,按名字的检查就再也看不见它——
+        g = self.bg            # 取别名
+        g.update_bar(fake_bar) # 这里看不出 g 是谁,四层防线全部放行
+    所以静态层封的是**交出引用**这个动作,而不是改写本身。
+
+    放行的正当用法(必须放行,否则正常候选会被整片拒掉):
+    - 就地读取:`self.am.close[-1]`(取到的是一个数)
+    - 只读方法的调用:`self.am.sma(5)`、`self.am.atr(14)`
+    """
+    findings: list[tuple[int, str]] = []
+
+    def escape(expr: ast.AST | None, why: str) -> None:
+        if expr is None:
+            return
+        ref = _container_reference(expr)
+        if ref:
+            findings.append((expr.lineno, f"不得把受保护容器 {ref} {why}"))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, (ast.Tuple, ast.List)) \
+                        and isinstance(node.value, (ast.Tuple, ast.List)):
+                    # `a, _ = self.am.close, 0`:按元素逐个查
+                    for element in node.value.elts:
+                        escape(element, "取出来另存")
+                else:
+                    escape(node.value, "取出来另存")
+        elif isinstance(node, ast.AnnAssign):
+            # `a: list = self.am.close`:带注解的赋值也是"另存"
+            escape(node.value, "取出来另存")
+        elif isinstance(node, ast.NamedExpr):
+            # `(a := self.am.close)`:海象表达式同样是"另存"
+            escape(node.value, "取出来另存")
+        elif isinstance(node, ast.Call):
+            # `helper(self.am)`:把容器交给别人,别人就能在里面改
+            for arg in node.args:
+                escape(arg, "传给出调用")
+            for keyword in node.keywords:
+                escape(keyword.value, "传给出调用")
+        elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+            escape(node.value, "返回出去")
+        elif isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+            for element in node.elts:
+                escape(element, "装进容器")
+        elif isinstance(node, ast.Dict):
+            for value in node.values:
+                escape(value, "装进容器")
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            escape(node.elt, "装进容器")
+        elif isinstance(node, ast.DictComp):
+            escape(node.key, "装进容器")
+            escape(node.value, "装进容器")
+        elif isinstance(node, ast.arguments):
+            for default in list(node.defaults) + [d for d in node.kw_defaults if d is not None]:
+                escape(default, "作为默认参数传出去")
+        elif isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                escape(base, "作为基类传出去")
+            for keyword in node.keywords:
+                escape(keyword.value, "传给出调用")
+    return findings
 
 
 def _container_mutator_call(node: ast.Call, c: Constitution) -> str | None:
@@ -638,7 +745,13 @@ def _container_mutator_call(node: ast.Call, c: Constitution) -> str | None:
     method = path[-1]
     if method not in BUILTIN_PROTECTED_CONTAINER_MUTATORS:
         return None
-    for index, segment in enumerate(path[:-1]):
+    receiver = path[:-1]
+    for index, segment in enumerate(receiver):
+        if index == 0:
+            # 裸名不算容器:`am = []` 之后 `am.append(x)` 改的是候选自己的列表。
+            # 第 12 轮 codex 的 Medium 1:第 11 轮的 Low 1 只放宽了赋值路径,
+            # 变更型方法调用路径照旧按裸名拒,会把正常候选整片拒掉。
+            continue
         if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
             return ".".join(path[index:])
     return None
@@ -750,13 +863,6 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     violation = _write_violation(target.value, c)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
-                elif isinstance(target, ast.Name):
-                    # 把受保护容器里的东西取出来另存:拿到别名之后原地改写就绕开了名字
-                    alias = _container_alias(node.value)
-                    if alias:
-                        findings.append(
-                            f"第 {node.lineno} 行: 不得把受保护容器 {alias} 取出来另存"
-                            "(拿到别名之后可以原地改写它)")
         elif isinstance(node, ast.AugAssign):
             target = node.target
             if isinstance(target, ast.Attribute):
@@ -844,6 +950,11 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                         findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}")
                     elif key.value.lower() in protected_lower:
                         findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}(仅大小写不同)")
+    # 受保护容器的引用**流出去**的地方:取别名/传参/装容器/返回。
+    # 必须在最后统一判——它要看的是"这个引用落在什么位置上",
+    # 而位置信息只有走完整棵树才认得全(赋值、海象、调用实参、返回、字面量)。
+    for lineno, message in _container_escape_findings(tree):
+        findings.append(f"第 {lineno} 行: {message}(拿到之后可以原地改写它, 伪造回测结果)")
     return findings
 
 
@@ -995,7 +1106,27 @@ def _shadowed_template_callables(strategy: object, template: type) -> list[str]:
 # 仓库根目录与候选目录:只有**不在候选目录里**的仓库内代码才享有
 # "可以重写内部方法"的特权(候选受这条规矩约束,仓库内代码不受)。
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_REPO_PENDING_DIR = _REPO_ROOT / "pending_strategies"
+
+
+def _repo_pending_dir() -> Path:
+    """候选目录的路径(单一事实来源:配置里的 `paths.pending_dir`)。
+
+    第 12 轮 codex 的 Medium 2:候选目录此前在宪法里**写死**成 `pending_strategies`,
+    而配置(`config/research_sandbox.json` 的 `paths.pending_dir`)是**可以改**的——
+    两者不一致时,豁免会静默扩大到全部候选(候选放在配置允许的别的目录里,
+    却被当成"仓库自己的代码")。所以这里按配置取,配置读不到才退回默认值。"""
+    import json
+    import os
+
+    name = "pending_strategies"
+    config_path = os.environ.get("RESEARCH_SANDBOX_CONFIG") or (
+        _REPO_ROOT / "config" / "research_sandbox.json")
+    try:
+        cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        name = str(cfg["paths"]["pending_dir"])
+    except Exception:                                           # noqa: BLE001 - 读不到就退回默认值
+        pass
+    return _REPO_ROOT / name
 
 
 def _is_in_repo_strategy_class(klass: type) -> bool:
@@ -1008,10 +1139,21 @@ def _is_in_repo_strategy_class(klass: type) -> bool:
     - `tests/` 里的测试替身(`AlwaysLong`、`Chatty`……)也照抄了这些方法。
     "候选不得重写受保护成员"这条规矩约束的是**候选**,不是人审过的仓库内代码。
 
-    候选一律从 `pending_strategies/` 载入(模块名 `pending_strategy`),
+    候选一律从候选目录(`paths.pending_dir`,默认 `pending_strategies/`)载入,
     仓库内的代码在 `strategies/`、`tests/` 等目录里。这里按**模块文件所在路径**判定,
-    不看类自己声明的 `__module__` 字符串——候选在类体里写 `__module__ = "strategies.x"`
-    骗不过去:sys.modules 里那个模块的 `__file__` 不会落在仓库目录里。"""
+    不看类自己声明的 `__module__` 字符串。
+
+    第 12 轮 codex 的 Medium 2:光看 `__module__` 指向的模块是不够的——
+    候选可以在类体里写 `__module__ = "strategies.trend_atr_15m_strategy"`,
+    那个模块**确实**在仓库目录里,于是豁免生效。所以还要加一条:
+    这个类必须**确实定义在**它声称的那个模块里。
+
+    判据不能是"`vars(module)` 里有没有这个名字"——函数里就地定义的类
+    (测试替身 `Chatty` 就是)本来就不在模块字典里,那样判会把仓库自己的代码也拒掉。
+    真正的判据是**文件**:这个类的源码文件,必须就是那个模块的文件。
+    - 仓库里就地定义的替身:两者都是 `tests/test_xxx.py` → 相同 → 豁免;
+    - 候选伪造 `__module__`:类是候选文件里定义的,模块文件却指向 `strategies/` → 不同 → 不豁免;
+    - 候选没伪造:类与模块都在候选目录 → 候选目录判定直接拒。"""
     module = sys.modules.get(getattr(klass, "__module__", "") or "")
     if module is None:
         return False
@@ -1024,7 +1166,44 @@ def _is_in_repo_strategy_class(klass: type) -> bool:
         return False
     if not path.is_relative_to(_REPO_ROOT):
         return False
-    return not path.is_relative_to(_REPO_PENDING_DIR)
+    if path.is_relative_to(_repo_pending_dir()):
+        return False
+    return _class_defined_in_module_file(klass, path)
+
+
+def _class_defined_in_module_file(klass: type, module_file: Path) -> bool:
+    """这个类是不是**真的**定义在那个模块的文件里。
+
+    两种正当情况都要放行:
+    1. **模块里就有这个类**(`vars(module)[name] is klass`)——仓库自己的策略类是这种。
+       伪造 `__module__` 的候选进不来:那个模块的字典里并没有它。
+       (注意这一条要放在最前面:别的测试往仓库类上打补丁(加了个 lambda)时,
+       类字典里会多出**别的文件**的函数,按"代码文件"判就会误伤仓库自己的类。)
+    2. **就地定义的类**(函数里定义的测试替身 `Chatty`):它本来就不在模块字典里,
+       只能看它自己写的代码落在哪个文件——`__code__.co_filename` 才是定义位置。
+       `inspect.getfile(cls)` 对类是循环的(按 `cls.__module__` 查模块文件),
+       正好被伪造的 `__module__` 骗过,所以不能用它。
+
+    判定取"**至少有一个**自己写的成员来自那个模块文件":别的测试往仓库类上
+    挂过补丁(比如把 `__getattribute__` 挂上去再"还原"成继承来的那个),
+    类字典里会多出**别的文件**的函数——要求"全部来自"会把仓库自己的类误伤。
+    """
+    module = sys.modules.get(getattr(klass, "__module__", "") or "")
+    if module is not None and getattr(module, klass.__name__, None) is klass:
+        return True
+    own_files = set()
+    for value in vars(klass).values():
+        code = getattr(value, "__code__", None)
+        if code is not None:
+            own_files.add(code.co_filename)
+    for filename in own_files:
+        try:
+            source_file = Path(filename).resolve()
+        except OSError:                                        # noqa: BLE001 - 拿不准就当不可信
+            continue
+        if source_file == module_file:
+            return True
+    return False
 
 
 def _runtime_class_dict_violations(strategy: object, template: type, c: Constitution) -> list[str]:
@@ -1451,4 +1630,113 @@ def check_class(candidate: type, template: type, c: Constitution | None = None) 
                 findings.append(f"候选重写了受保护成员 {name}({klass.__name__})")
             elif name in members:
                 findings.append(f"候选重写了模板成员 {name},但它不在允许重写的白名单里({klass.__name__})")
+    return findings
+
+
+# ---------- 运行时第五层:行情数据完整性 ----------
+
+# ArrayManager 的四个价格数组 ↔ BarData 的四个价格字段。
+_PRICE_ARRAY_FIELDS = (
+    ("open_array", "open_price"),
+    ("high_array", "high_price"),
+    ("low_array", "low_price"),
+    ("close_array", "close_price"),
+)
+
+
+def snapshot_market_data(strategy: object) -> dict:
+    """拍一份行情容器的基准(累计根数 + 容器里价格取值的集合)。
+
+    基准必须在**预热之后、回放之前**拍:日线族的 `on_init` 会先加载一段历史日线
+    做预热(那些根数也记在 `am.count` 里),把预热算进回放根数会误判成"凭空多出来的 K 线"。
+    回放脚本的做法是包住引擎的 `new_bar`:第一次回放前拍基准(见 `scripts/backtest_lib.py`)。"""
+    am = getattr(strategy, "am", None)
+    if am is None:
+        return {}
+    count = getattr(am, "count", None)
+    size = getattr(am, "size", None)
+    if not isinstance(count, int) or not isinstance(size, int):
+        return {}
+    values: dict[str, set] = {}
+    for array_name, _ in _PRICE_ARRAY_FIELDS:
+        array = getattr(am, array_name, None)
+        if array is None:
+            continue
+        try:
+            values[array_name] = {float(value) for value in array}
+        except (TypeError, ValueError):
+            values[array_name] = set()
+    return {"count": count, "size": size, "values": values}
+
+
+def check_market_data_integrity(strategy: object, bars, baseline: dict | None = None) -> list[str]:
+    """核对策略手里的行情容器与引擎喂过的 K 线一致(不可变宪法的运行时第五层)。
+
+    静态层按名字封,总有封不到的写法:视图(`self.am.close[:]`)、dunder 写入口
+    (`self.am.close.__setitem__(...)`)、别名(`x = self.bg`)。
+    第 12 轮 codex 的 High 1 实测:这三条都能让候选把 ATR 从 40 压到 2.86,
+    ¥300 单笔风险预算当场失效(诚实模板 0 成交,候选成交 2 笔),而四层防线全绿。
+
+    这一层封的是**数据本身**,不是写法:回测跑完之后,容器里的 K 线必须还是
+    引擎喂进去的那些。候选只要插一根、改一根、或把价格换成没出现过的数,这里就报出来。
+
+    口径:
+    - `baseline` 是**预热之后**拍的基准(累计根数与当时容器里的价格取值);
+      没有它就退回"把全部累计根数都当回放根数"的粗口径(日线族会误报,只用于独立排查);
+    - 回放根数 = 回放后的累计根数 - 基准累计根数;多于引擎喂的根数 → 有 K 线是凭空来的;
+    - 容器里的每个价格都必须**真实出现过**(基准里已有的 + 引擎喂过的)——改价、插假 K 线都露馅;
+    - 回放根数恰好等于喂入根数(一 K 线一更新)时,再逐值比一遍:容器尾部必须与喂入尾部相等。
+    """
+    findings: list[str] = []
+    am = getattr(strategy, "am", None)
+    if am is None:
+        return findings
+    count = getattr(am, "count", None)
+    size = getattr(am, "size", None)
+    if not isinstance(count, int) or not isinstance(size, int):
+        return findings
+    fed = list(bars or [])
+    base_count = 0
+    base_values: dict = {}
+    if baseline:
+        base_count = int(baseline.get("count", 0) or 0)
+        base_values = baseline.get("values") or {}
+    replayed = count - base_count
+    if replayed > len(fed):
+        findings.append(
+            f"行情容器里回放阶段累计了 {replayed} 根 K 线,而引擎只喂了 {len(fed)} 根(有 K 线是凭空来的)")
+        return findings
+    pool: set[float] = set()
+    for values in base_values.values():
+        pool |= set(values)
+    for bar in fed:
+        for _, field in _PRICE_ARRAY_FIELDS:
+            try:
+                pool.add(float(getattr(bar, field, 0.0)))
+            except (TypeError, ValueError):
+                continue
+    window = min(size, len(fed))
+    exact = replayed == len(fed) and len(fed) > 0
+    for array_name, field in _PRICE_ARRAY_FIELDS:
+        array = getattr(am, array_name, None)
+        if array is None:
+            continue
+        try:
+            actual = [float(value) for value in array]
+        except (TypeError, ValueError):
+            continue
+        unknown = [value for value in actual if value not in pool]
+        if unknown:
+            findings.append(
+                f"行情容器的 {array_name} 里有 {len(unknown)} 个价格不是引擎喂过的"
+                "(有人在回测途中改写了行情数据)")
+            continue
+        if not exact or window <= 0:
+            continue
+        tail = actual[-window:]
+        expected = [float(getattr(bar, field, 0.0)) for bar in fed[-window:]]
+        if tail != expected:
+            findings.append(
+                f"行情容器的 {array_name} 与引擎喂进来的 {field} 对不上"
+                "(有人在回测途中改写了行情数据)")
     return findings

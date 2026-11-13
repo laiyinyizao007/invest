@@ -646,13 +646,107 @@ codex 在独立 clone 上实测四种改法,都能让 `tools/check_constitution_
 #### 第 11 轮之后仍然存在的残余缺口(如实记录)
 
 1. **第四层仍是"前后差分"**:候选若在回测途中"改 -> 用 -> 还原",差分看不出来(与第 10 轮同)。
-2. **指纹覆盖六个包段、约 4600 个键**:一次快照约 5 毫秒(首张约 490 毫秒,含模块预载);
+2. **指纹覆盖六个包段、约 4600 个键**:一次快照约 8 毫秒(实测 7.3-10.1 毫秒,中位 8.2;首张约 490 毫秒,含模块预载);
    真实回测与候选导入前后均**零虚假 diff**(已实测)。
 3. **`vnpy.trader.database` 不在指纹范围内**:研究链路不用数据库取数,当前没有暴露路径;
    若将来研究链路改从数据库读数据,这一条必须重新评估。
 4. **候选 import 一个新的 vnpy 子模块并改写它**:静态层按名字看不见(该模块不在受保护名单里),
    指纹也只在"运行期新加载的受保护模块"这一层报——已登记为后续项。
 5. **PBO/CSCV 仍然延后**,与本轮无关。
+
+### 第 12 轮补记:容器的**视图与别名**、执行点守卫的**数据流**,以及运行期第五层(行情数据完整性)
+
+第 12 轮 codex CLI 深度分析(**38.5/50,需改进,不建议发布**)端到端实测复现了第 11 轮的修复,
+并报出 2 条 High / 2 条 Medium / 2 条 Low,逐条处理如下。
+
+#### High 1 —— 容器规则只挡"写/取别名",不挡"视图 / dunder 写入口 / bg 别名"
+
+codex 在 120 根合成 15 分钟 K 线上端到端实测:`self.am.close[:]`(numpy 视图)、
+`self.am.close.__setitem__(...)`(dunder 写入口)、`x = self.bg` 再 `x.update_bar(fake)`
+(别名),静态层与沙盒层都返回 `[]`,第 3/4 层也不覆盖活实例——**四层防线全绿**,
+而 ATR 被从 40 压到 2.86、`skipped_by_budget` 由 1 变 0,诚实模板 0 成交而候选成交 2 笔:
+**¥300 单笔风险预算被架空**。
+
+根因:"按名字禁止变更型方法"只覆盖了**直接调用**。numpy 的**视图**与 dunder 写入口可以在
+不改写容器本身的前提下改写它的内容;而别名一旦被取走,调用点已经看不出被调的是谁。
+
+修法分两层:
+- **静态层**:新增 `BUILTIN_PROTECTED_CONTAINER_VIEWS`(`view`/`reshape`/`ravel`/`squeeze`/`transpose`),
+  这些方法返回的还是同一块内存;变更型方法名单补上 dunder 写入口
+  (`__setitem__`/`__delitem__`/`__iadd__`/`__imul__`/`__ior__`);
+  并新增"**交出引用**"检查(`_container_escape_findings`):把容器存进名字(赋值 / 带注解 / 海象 / 元组解包)、
+  传给出调用、返回出去、装进容器、作为默认参数——凡是让引用**流出去**的动作一律拒。
+  容器只许**就地**使用(读 `self.am.close[-1]`、读调用 `self.am.sma(5)`)。
+- **运行期第五层**(`check_market_data_integrity`):回测结束后把行情容器与引擎**真正喂过的** K 线
+  逐值比对——回放根数不得多于喂入根数(凭空多出来的 K 线),容器里的每个价格都必须**真实出现过**
+  (基准里已有的 + 引擎喂过的),回放根数与喂入根数一致时再逐值比一遍尾部(被改写的行情)。
+  这一层**不依赖静态分析**,所以尚未被枚举出来的写路径也一并兜住。
+
+  **基准必须拍在预热之后**:日线族的 `on_init` 会先加载一段历史日线做预热,那些根数同样记在
+  `am.count` 里——把"累计根数"直接当成"回放根数",就会把**预热**误判成"凭空多出来的 K 线",
+  整个日线研究链路都会在回测结束时 fail-closed(本轮修复时真的踩到了:14 条既有测试同时变红)。
+  现在回测脚本包住引擎的 `new_bar`,第一次回放前拍一份基准(`snapshot_market_data`)。
+
+#### High 2 —— 第四层执行点守卫仍能被"形态"绕过
+
+codex 在独立 clone 上实测五种改法,守卫都能 **exit 0** 而第四层已经失效:
+把比对挪进**永不被调用的函数**;第二个实参写成语义相同但语法不同的
+`dict(const.snapshot_protected_state())`;新执行入口只在**注释**里写上那两个名字;
+新执行入口用 `eval(compile(...))` 跑候选;新执行入口只 `import` 一个已覆盖的模块。
+
+修法:守卫从"名字与计数"升级为**数据流 + 作用域 + 可达性 + AST 覆盖**:
+- 第二个实参必须**就是**一次 `snapshot_protected_state()` 调用(不能是变量,不能包一层);
+- 快照调用与比对调用必须在**同一个函数作用域**内;
+- 所在函数必须在仓库里**被调用过**(死函数不算);
+- 执行入口的识别改为 **AST 为准**(注释里的名字不算数),并覆盖裸 `exec`/`eval`/`compile`
+  与属性形式的 `import_module`/`run_path`/`run_module`;
+- 新增 `check_constitution_module_is_clean`:宪法模块自身不得出现裸 `exec`/`eval`/`compile`。
+
+#### Medium 1 —— 裸局部名 `am.append(...)` 被误拒
+
+第 11 轮承诺"裸局部名 `am`/`bg` 不再按裸名一刀切",但只放宽了**赋值**路径,变更型方法的
+**调用**路径照旧按裸名拒——`am = []` 再 `am.append(x)` 会被整片拒掉,常规候选会被误伤。
+修法:受保护容器的判定改为**路径级**——只有作用域段出现在接收者路径的第 2 段及以后
+(`self.am.update_bar` ✓、`s.am.update_bar` ✓)才算命中;裸名 `am.append` 放行。
+
+#### Medium 2 —— 伪造 `__module__` 能买"仓库自己的类"豁免
+
+运行期类字典检查给"仓库自己的策略类"开了豁免(它们合法地重写内部方法)。候选只要在类体里写
+`__module__ = "strategies.trend_atr_15m_strategy"`,字符串就与仓库里的模块名对上了,豁免生效——
+越权的 `get_size` 改写被放过。
+修法:豁免的判定必须是"这个类**确实定义在**它声称的模块里"。
+
+判据不能是"`vars(module)` 里有没有这个名字"——**函数里就地定义的类**本来就不在模块字典里
+(`tests/test_x.py` 里的 `Chatty` 就是),那样判会把仓库自己的代码也拒掉(实测 14 条既有测试变红)。
+也不能是 `inspect.getfile(cls)`——它对类是循环的(按 `cls.__module__` 查模块文件),正好被伪造的
+`__module__` 骗过。真正的判据是**类体里自己的代码落在哪个文件**:自己写的函数/lambda 的
+`__code__.co_filename` 才是定义位置。于是:
+- 仓库里就地定义的替身:代码文件 == 模块文件 → 豁免;
+- 候选伪造 `__module__ = "strategies.xxx"`:代码文件是候选文件,模块文件在 `strategies/` → 不同 → 不豁免;
+- 类体里没有自己的函数(只继承)时,退回"模块字典里就有这个类"来判断。
+
+顺带修正:待审目录不再写死,而是从 `RESEARCH_SANDBOX_CONFIG` 指向的配置文件里读 `pending_dir`
+(默认 `pending_strategies`)。
+
+#### Low 1 / Low 2 —— 文档与实测不符
+
+- **Low 1**:保留字表少了两组名字(容器视图型方法、dunder 写入口),已补到上表
+  (该表仍是单一事实来源,由 `tests/test_research_sandbox.py::test_the_reserved_word_table_matches_the_code` 逐个核对)。
+- **Low 2**:三处与实测不符的断言——①"伪造 `__module__` 能骗过豁免"那是**漏洞**不是保证(已在 Medium 2 修掉);
+  ②"裸局部名 `am.append` 一律拒"是第 11 轮的半成品(已在 Medium 1 修掉);
+  ③"一次快照约 5 毫秒"实测为 7.3-10.1 毫秒(中位 8.2),已改。
+
+#### 第 12 轮之后仍然存在的残余缺口(如实记录)
+
+1. 第五层只覆盖**行情容器**(价格数组与 K 线根数);候选若改写的是别的引擎状态(例如持仓或委托的内部字段),
+   第五层看不见——但那些字段落在第三层(受保护成员)与第四层(身份指纹)范围内。
+1b. 第五层的"逐值比尾部"只在**一根 K 线对应一次容器更新**时成立(当前的日线族与 15 分钟族都是);
+   若将来出现"一根 K 线不更新容器"的家族,那一段只能靠"价格必须真实出现过"这条兜底。
+2. 第五层比对的是"喂入的 K 线 vs 容器里的价格";若引擎本身喂错(不是候选造成的),它也会报出来——**故意的**:宁可多报。
+3. 第四层仍是"前后差分":候选若在回测途中"改 -> 用 -> 还原",差分看不出来(与第 9/10/11 轮同)。
+4. 容器静态规则是**语法级**的:候选若用反射拿到容器——但 `getattr` 在执行期根本不提供
+   (`safe_builtins` 已移除),静态层也把 `getattr` 列为禁用内建。
+5. PBO/CSCV 仍然延后,与本轮无关。
 
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
@@ -691,7 +785,8 @@ codex 在独立 clone 上实测四种改法,都能让 `tools/check_constitution_
 | 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day` | `BUILTIN_PROTECTED_READ_ATTRS` |
 | 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
 | 受保护容器的**范围**(这些名字上的容器受保护) | `am`、`bg` | `BUILTIN_PROTECTED_CONTAINER_SCOPE` |
-| 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |
+| 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap`、`__setitem__`、`__delitem__`、`__iadd__`、`__imul__`、`__ior__` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |
+| 受保护容器上的**视图型方法**(返回的还是同一块内存,改它等于改容器) | `view`、`reshape`、`ravel`、`squeeze`、`transpose` | `BUILTIN_PROTECTED_CONTAINER_VIEWS` |
 | 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员;支持点号路径前缀) | `risk`、`strategies`、`vnpy_ctastrategy`、`vnpy.trader.constant`、`vnpy.trader.object`、`vnpy.trader.utility` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |

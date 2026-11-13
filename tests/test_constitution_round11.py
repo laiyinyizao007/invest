@@ -82,9 +82,23 @@ def test_the_static_layer_allows_a_local_variable_named_am():
     findings = screen(
         "def entry_signal(self):\n"
         "    am = self.am.sma(self.fast_window, array=True)\n"
-        "    bg = self.bg\n"
+        "    bg = list(range(3))\n"
         "    return 1\n")
     assert not findings, findings
+
+
+def test_the_static_layer_refuses_taking_the_bar_generator_itself():
+    """第 12 轮 codex 的 High 1 变体③:`bg` 与 `am` 是同一类容器。
+
+    `x = self.bg` 之后 `x.update_bar(fake_bar)` 往回测里插一根假 K 线,
+    而调用点已经看不出 x 是谁——所以容器**本身**也不许取出来另存。
+    (裸局部名 `bg = list(range(3))` 仍然放行:那是候选自己的列表。)"""
+    findings = screen(
+        "def entry_signal(self):\n"
+        "    x = self.bg\n"
+        "    x.update_bar(fake_bar)\n"
+        "    return 1\n")
+    assert findings, "取走 BarGenerator 没被拦下"
 
 
 def test_the_static_layer_still_refuses_a_class_attribute_named_am():

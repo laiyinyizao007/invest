@@ -66,13 +66,16 @@ def run_engine(
     _protected = _protected_state_snapshot()
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
+    _market = _install_market_baseline(engine)
     engine.load_data()
     if not engine.history_data:
         raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
-    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
+                               bars=engine.history_data,
+                               market_baseline=_market.get("market"))
     return engine
 
 
@@ -126,11 +129,33 @@ def run_engine_bars(
     _protected = _protected_state_snapshot()          # 同 run_engine:基准拍在构造实例之前
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
+    _market = _install_market_baseline(engine)
     engine.history_data = list(bars)
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
-    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
+                               bars=engine.history_data,
+                               market_baseline=_market.get("market"))
     return engine
+
+
+def _install_market_baseline(engine) -> dict:
+    """包住引擎的 `new_bar`:第一次回放前拍一份行情容器基准(此时预热已经结束)。
+
+    日线族的 `on_init` 会先加载一段历史日线做预热,那些根数同样记在 `am.count` 里——
+    不把预热单独剥出来,就会把"预热"误判成"凭空多出来的 K 线"(第 12 轮补记的实测教训)。"""
+    from risk import constitution as const
+
+    holder: dict = {}
+    original = engine.new_bar
+
+    def new_bar_with_baseline(data):
+        if "market" not in holder:
+            holder["market"] = const.snapshot_market_data(engine.strategy)
+        original(data)
+
+    engine.new_bar = new_bar_with_baseline
+    return holder
 
 
 def _risk_floor_snapshot(strategy) -> dict:
@@ -148,7 +173,8 @@ def _protected_state_snapshot() -> dict:
 
 
 def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float,
-                               protected_before: dict | None = None) -> None:
+                               protected_before: dict | None = None,
+                               bars=None, market_baseline: dict | None = None) -> None:
     """回测跑完后核对风控底线还在(不可变宪法的运行时第三层)。
 
     静态筛查拦的是"写法",类校验拦的是"类字典"——两者都看不见**回测途中**
@@ -167,6 +193,11 @@ def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float,
     findings = const.check_instance_state(strategy, expected_size=expected_size, snapshot=snapshot)
     if protected_before is not None:
         findings.extend(const.check_protected_state(protected_before, const.snapshot_protected_state()))
+    if bars is not None:
+        # 第五层:行情容器必须还是引擎喂进去的那些 K 线。
+        # 静态层按名字封,总有封不到的写法(视图、dunder 写入口、别名);
+        # 第 12 轮 codex 的 High 1 实测那三条能把 ¥300 单笔风险预算架空。
+        findings.extend(const.check_market_data_integrity(strategy, bars, market_baseline))
     if findings:
         raise RuntimeError("风控底线在回测途中被改写(fail-closed):" + "; ".join(findings))
 
