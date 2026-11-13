@@ -114,10 +114,19 @@ BUILTIN_PROTECTED_STATE_OBJECTS = (
 )
 
 # 受保护的**属性路径**:整条路径都不许引用(写或取别名)。
-# "am.array" 是行情数组本体——`arr = self.am.array` 之后 `arr[-1] = 999`
-# 就能改写已经走过的价格。numpy 标量(`self.am.close`)是取不出来的副本,不在此列。
+# 注:vnpy 的 ArrayManager 里**没有** `array` 这个属性(真实的是 `close_array`/`open_array`/…),
+# 所以这一条本身几乎匹配不到东西;真正把行情数组护住的是下面的"容器不得取别名"规则
+# (`arr = self.am.close` 之后 `arr[-1] = 999` 改的是**回测数据本身**)。
+# 这条留着是因为历史守卫对内置清单只查"只增不减",删条目会被判为违规。
 BUILTIN_PROTECTED_PATHS = (
     "am.array",
+)
+
+# 受保护的**容器**:装着可变对象、拿到别名就能原地改写的那些。
+# `guard`/`trail`/`cta_engine` 连引用都不许(见 BUILTIN_PROTECTED_STATE_OBJECTS);
+# `am` 必须能读(`self.am.close[-1]` 是候选存在的意义),但**不得把它里面的东西取出来另存**。
+BUILTIN_PROTECTED_CONTAINERS = (
+    "am",
 )
 
 # 候选不得调用的下单/撤单接口
@@ -408,13 +417,39 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
         self.guard.max_losses = 999     # 解除当日连亏熔断
         self.cta_engine.size = 0.001    # 把止损距离算出来的风险金额压到接近 0
     受保护的对象是**实例属性**,不在类字典里,`check_class` 比不出来(第 7 轮 codex 实测)。
-    这里改成解析整条属性路径:路径落在受保护成员上就是越权。"""
-    rest = _path_after_self(target)
-    if not rest:
+
+    现在的规则:属性路径里**任何一段**命中受保护成员就算越权。
+    - 看整条路径而不是末段:末段只有 `max_losses`/`size` 这种名字,
+      而 `guard`/`cta_engine`/`am` 才是"装着风控判定的那些对象"。
+    - 不限根:只认 `self.` 开头的话,`s = self` 之后的 `s.risk_budget = 1e12`
+      会从静态层溜过去(第 8 轮自查实测)。
+    """
+    path = _attr_path(target)
+    if not path:
         return None
-    head = rest[0]
-    if head in c.protected_names or head in c.protected_parameters:
-        return ".".join(rest)
+    for index, segment in enumerate(path):
+        if segment in c.protected_names or segment in c.protected_parameters:
+            return ".".join(path[index:])
+    return None
+
+
+def _container_alias(value: ast.AST) -> str | None:
+    """把受保护**容器**里的东西取出来另存——之后就能原地改写它。
+
+    `am` 里装的是行情数组(close/open/high/low…),拿到别名之后
+    `arr[0] = 999` 改的就是**回测数据本身**(伪造价格 → 伪造收益),
+    而静态层按名字看,`arr` 只是个普通局部变量。
+
+    只拦**裸属性**(`arr = self.am.close`):带下标的(`x = self.am.close[-1]` 取到的是
+    一个数)与带调用的(`x = self.am.atr(14)`)都不算取别名,放行。"""
+    if not isinstance(value, ast.Attribute):
+        return None
+    path = _attr_path(value)
+    if not path:
+        return None
+    for index, segment in enumerate(path):
+        if segment in BUILTIN_PROTECTED_CONTAINERS:
+            return ".".join(path[index:])
     return None
 
 
@@ -498,6 +533,11 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                 elif target.attr in c.protected_module_attrs:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
+            elif isinstance(target, ast.Subscript):
+                # `self.am.close[0] = 999`:改的是被下标取到的那个对象(行情数组本体)
+                violation = _write_violation(target.value, c)
+                if violation:
+                    findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and _is_protected(target.id, c):
@@ -508,10 +548,25 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                     elif target.attr in c.protected_module_attrs:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
+                elif isinstance(target, ast.Subscript):
+                    violation = _write_violation(target.value, c)
+                    if violation:
+                        findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+                elif isinstance(target, ast.Name):
+                    # 把受保护容器里的东西取出来另存:拿到别名之后原地改写就绕开了名字
+                    alias = _container_alias(node.value)
+                    if alias:
+                        findings.append(
+                            f"第 {node.lineno} 行: 不得把受保护容器 {alias} 取出来另存"
+                            "(拿到别名之后可以原地改写它)")
         elif isinstance(node, ast.AugAssign):
             target = node.target
             if isinstance(target, ast.Attribute):
                 violation = _write_violation(target, c)
+                if violation:
+                    findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+            elif isinstance(target, ast.Subscript):
+                violation = _write_violation(target.value, c)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
             elif isinstance(target, ast.Name) and _is_protected(target.id, c):

@@ -877,6 +877,54 @@ def test_reading_the_market_data_is_still_allowed():
     assert screen(src) == []
 
 
+# ---------- 第 8 轮自查发现的两个缺口(别名改写 + 行情数组被原地改写) ----------
+
+@pytest.mark.parametrize("statement", [
+    "s = self\n        s.risk_budget = 1e12",          # 给 self 取别名之后改底线
+    "o = object()\n        o.risk_budget = 1e12",      # 根不是 self 也要拦
+    "s = self\n        s.am.close = [1.0]",
+])
+def test_writing_a_protected_member_is_rejected_whatever_the_root_is(statement):
+    """写受保护成员不看根:只认 `self.` 开头的话,`s = self` 之后就绕过去了。
+
+    早先的实现只按 `self.` 开头的路径判定(第 8 轮自查实测:三种写法静态层全返回空列表),
+    现在改成"属性路径里任何一段命中受保护成员就算越权"。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement!r} 未被拦下:{findings}"
+
+
+@pytest.mark.parametrize("statement", [
+    "self.am.close[0] = 999.0",     # 原地改写行情数组(下标赋值)
+    "self.am.close_array[-1] = 999.0",
+])
+def test_writing_into_the_price_array_in_place_is_rejected(statement):
+    """下标赋值改的是被取到的那个对象本身——行情数组被改 = 回测数据被伪造。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement!r} 未被拦下:{findings}"
+
+
+def test_binding_the_price_array_to_another_name_is_rejected():
+    """`arr = self.am.close` 之后 `arr[0] = 999` 改的是同一个数组——别名也不许取。
+
+    vn.py 的 ArrayManager 里 `close` 是 property,返回的就是 `close_array` 本身
+    (不是副本),所以"取出来再改"和"直接改"是一回事。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        arr = self.am.close\n        arr[0] = 999.0\n        return 0\n")
+    findings = screen(src)
+    assert findings and any("容器" in f for f in findings), findings
+
+
+def test_reading_a_single_price_is_still_allowed():
+    """取别名这条不许太宽:带下标的读(取到的是一个数)与带调用的读都要放行。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        close = self.am.close[-1]\n"
+           "        atr = self.am.atr(14)\n"
+           "        return 1 if close > 0 else 0\n")
+    assert screen(src) == []
+
+
 # ---------- 运行时第三层:回测跑完之后核对受保护对象的实例状态 ----------
 
 class _FakeGuard:
