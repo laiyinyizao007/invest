@@ -37,3 +37,10 @@ def test_session_windows_use_given_beijing_time():
     assert g.in_session(datetime(2026, 11, 13, 15, 42)) is False       # 周五收盘后
     assert g.in_session(datetime(2026, 11, 13, 10, 20)) is False       # 日盘小休
     assert g.in_session(datetime(2026, 11, 14, 10, 0)) is False        # 周六
+
+
+def test_rehearsal_profile_accepts_simnow_and_refuses_guoxin_or_unknown_hosts():
+    simnow = good_env() | {"CTP_BROKER_ID": "9999", "CTP_TD_ADDRESS": "182.254.243.31:30001", "CTP_ENVIRONMENT": "实盘"}
+    assert g.check_simnow_env(simnow) == []
+    assert any("9999" in p for p in g.check_simnow_env(good_env()))                       # 国信档案不能当预演档案
+    assert any("SimNow" in p for p in g.check_simnow_env(simnow | {"CTP_TD_ADDRESS": "8.8.8.8:1"}))

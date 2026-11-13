@@ -5,6 +5,7 @@
     python scripts/guoxin_oneclick.py --no-interactive   # 不做断网演练(3.1 标「待人工」)
     python scripts/guoxin_oneclick.py --resume data/broker_test/<目录>   # 在已有证据上补测并重新出报告
     python scripts/guoxin_oneclick.py --check-only    # 只做检查,不登录、不发单
+    python scripts/guoxin_oneclick.py --rehearsal     # SimNow 预演:用 .env.simnow 把整条流程演一遍(报告不能交给国信)
 
 安全:只放行国信测试环境(CTP_ENVIRONMENT=测试、BrokerID 8030、前置在国信给的地址表内);
 不通过就退出,不会连接。一次流程只登录一次(国信会检查频繁登录),所以不自动重试。
@@ -57,6 +58,21 @@ def check_env(env: dict[str, str]) -> list[str]:
     return problems
 
 
+def check_simnow_env(env: dict[str, str]) -> list[str]:
+    """预演档案检查:只放行 SimNow(BrokerID 9999 + 地址在 SimNow 白名单内)。"""
+    sys.path.insert(0, str(ROOT))
+    from ctp_tools.simnow import is_simnow_address, normalize_address
+    problems = []
+    if env.get("CTP_BROKER_ID") != "9999":
+        problems.append(f"预演档案的 CTP_BROKER_ID 应为 9999,当前 {env.get('CTP_BROKER_ID')!r}")
+    if not is_simnow_address(normalize_address(env.get("CTP_TD_ADDRESS", ""))):
+        problems.append(f"交易前置 {env.get('CTP_TD_ADDRESS')!r} 不是 SimNow 地址")
+    for key in ("CTP_USERNAME", "CTP_PASSWORD", "CTP_APP_ID", "CTP_AUTH_CODE", "LIVE_VT_SYMBOL"):
+        if not env.get(key):
+            problems.append(f"缺少 {key}")
+    return problems
+
+
 def in_session(now: datetime) -> bool:
     if now.weekday() >= 5:
         return False
@@ -98,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-interactive", action="store_true", help="不做 3.1 断网演练")
     parser.add_argument("--resume", type=Path, default=None, help="在已有证据目录上补测")
     parser.add_argument("--check-only", action="store_true", help="只检查,不登录不发单")
+    parser.add_argument("--rehearsal", action="store_true", help="SimNow 预演(.env.simnow):演练流程,产出的报告不能提交国信")
     parser.add_argument("--yes", action="store_true", help="跳过「前置地址确认」提示(非交互环境用)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
@@ -111,23 +128,28 @@ def main(argv: list[str] | None = None) -> int:
               "建议北京时间 21:10–22:30(夜盘)或日盘开盘后再跑;如只是演练可继续。")
         if not args.check_only and not args.yes and input("仍要继续?输入 y 继续:").strip().lower() != "y":
             return 1
-    source = find_file(".env.guoxin")
+    profile = ".env.simnow" if args.rehearsal else ".env.guoxin"
+    label = "SimNow 预演档案" if args.rehearsal else "国信档案"
+    source = find_file(profile)
     if source is None:
-        print("找不到 .env.guoxin(国信测试档案)。", file=sys.stderr)
+        print(f"找不到 {profile}({label})。", file=sys.stderr)
         return 2
     env = read_env(source)
-    problems = check_env(env)
+    problems = check_simnow_env(env) if args.rehearsal else check_env(env)
     if problems:
-        print("国信档案检查未通过,已退出(没有连接任何环境):", file=sys.stderr)
+        print(f"{label}检查未通过,已退出(没有连接任何环境):", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         return 2
-    print(f"国信档案 {source} 检查通过:环境=测试 BrokerID={env['CTP_BROKER_ID']} 交易={env['CTP_TD_ADDRESS']} 行情={env['CTP_MD_ADDRESS']}")
+    print(f"{label} {source} 检查通过:环境={env['CTP_ENVIRONMENT']} BrokerID={env['CTP_BROKER_ID']} 交易={env['CTP_TD_ADDRESS']} 行情={env['CTP_MD_ADDRESS']}")
     template = find_file(f"docs/{TEMPLATE_NAME}")
     if template is None:
         print(f"找不到报告模板 docs/{TEMPLATE_NAME}", file=sys.stderr)
         return 2
     print(f"报告模板 {template}")
+    if args.rehearsal:
+        print("⚠ 预演模式:连的是 SimNow,不是国信测试环境。证据与报告只用来验证流程,**不能交给国信**;"
+              "SimNow 的柜台错误文本、流控、成交规则都和国信不同。")
     if args.check_only:
         print("--check-only:到此为止。")
         return 0
@@ -140,13 +162,13 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copy2(source, target)
     print(f"已写入 {target}(.env 被 gitignore,不会提交)")
     if not args.yes:
-        answer = input(f"请确认 {env['CTP_TD_ADDRESS']} 是国信给的测试前置(不是 SimNow/生产)。确认输入 y:").strip().lower()
+        answer = input(f"请确认 {env['CTP_TD_ADDRESS']} " + ("是 SimNow 前置。确认输入 y:" if args.rehearsal else "是国信给的测试前置(不是 SimNow/生产)。确认输入 y:")).strip().lower()
         if answer != "y":
             print("未确认,已退出。")
             return 1
 
     step("3/5 取证运行(会向国信测试环境发委托;脚本先确认空仓,有持仓则一笔不发)")
-    out_dir = args.resume or (ROOT / "data" / "broker_test" / now.strftime("%Y%m%d-%H%M%S"))
+    out_dir = args.resume or (ROOT / "data" / "broker_test" / (("rehearsal-" if args.rehearsal else "") + now.strftime("%Y%m%d-%H%M%S")))
     cmd = [python_exe(), str(ROOT / "scripts" / "broker_test.py"), "--confirm-broker-test", "--out-dir", str(out_dir)]
     if args.resume:
         cmd = [python_exe(), str(ROOT / "scripts" / "broker_test.py"), "--confirm-broker-test", "--resume", str(args.resume)]
@@ -167,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
         return rcode
 
     step("5/5 还需要你手动完成")
+    if args.rehearsal:
+        print(f"预演完成:{out_dir}\n流程跑通后,正式运行去掉 --rehearsal。预演产出的报告**不能**提交国信。")
+        return 0 if code == 0 else 1
     print(f"""证据与报告目录:{out_dir}
   1. 看上面「报告里还缺什么」;FAIL 项不要重跑(会多一次登录),把输出贴给我分析。
   2. 「未测试/待人工」项在交易时段用:python scripts/guoxin_oneclick.py --resume "{out_dir}"
