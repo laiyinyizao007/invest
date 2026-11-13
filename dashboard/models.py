@@ -53,10 +53,23 @@ def section(state: str, data: Any = None, *, as_of: float | None = None, now: fl
     }
 
 
+CLOCK_SKEW_TOLERANCE = 60.0          # 允许文件时间戳比本机时钟超前这么多秒(两台机器/NTP 校时的正常误差)
+
+
+def is_future(ts: float | None, now: float) -> bool:
+    """时间戳超出时钟误差地在未来(时钟回拨或文件异常)——不能当作『刚更新』的证据。"""
+    return ts is not None and ts - now > CLOCK_SKEW_TOLERANCE
+
+
 def freshness(as_of: float | None, now: float, stale_after: float) -> str:
-    """按年龄判定 ok / stale;as_of 为空 -> unknown。未来时间戳(时钟回拨)按 0 岁算,但不视为更新鲜的证据。"""
+    """按年龄判定 ok / stale / corrupt / unknown。
+
+    as_of 为空 -> unknown;**在未来(超出时钟误差)-> corrupt**,而不是按 0 岁算『新鲜』
+    (G8 复核:日志文件的未来 mtime 曾被当成刚更新,可长期保持绿色)。未来检查放在这个共用函数里,新增数据来源不会漏。"""
     if as_of is None:
         return "unknown"
+    if is_future(as_of, now):
+        return "corrupt"
     return "ok" if max(now - as_of, 0.0) <= stale_after else "stale"
 
 

@@ -12,10 +12,14 @@ def settings(tmp_path):
 
 
 def log(tmp_path, day, lines, dirname="runtime/vntrader/log"):
+    """写一份每日日志。把行首的日期改成文件名的日期,保证夹具自洽(面板要求『记录日期 = 文件名日期』,
+    否则被移植的日志会被判不可信——那条规则有专门的测试,不要靠夹具自相矛盾来触发)。"""
     d = tmp_path / dirname
     d.mkdir(parents=True, exist_ok=True)
     p = d / f"vt_{day}.log"
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    fixed = [(iso + ln[10:]) if len(ln) > 10 and ln[4] == "-" and ln[7] == "-" else ln for ln in lines]
+    p.write_text("\n".join(fixed) + "\n", encoding="utf-8")
     return p
 
 
@@ -182,13 +186,15 @@ def test_unchanged_logs_are_read_only_once_across_collectors_and_requests(tmp_pa
     log(tmp_path, "20261111", CLEAN)
     log(tmp_path, "20261112", SEVERE)
     col._PARSE_CACHE.clear()
-    read = _spy(monkeypatch)
+    cold, incremental = [], _spy(monkeypatch)
+    real_full = col._full_parse
+    monkeypatch.setattr(col, "_full_parse", lambda path, key, st: (cold.append(path.name), real_full(path, key, st))[1])
     s = settings(tmp_path)
     col.collect_days(s, NOW)
     col.collect_alerts(s, NOW)
     col.collect_overview(s, NOW)
-    assert sorted(name for name, _ in read) == ["vt_20261111.log", "vt_20261112.log"]      # 每个文件只读一次,且都是从头读(冷)
-    assert all(start == 0 for _, start in read)
+    assert sorted(cold) == ["vt_20261111.log", "vt_20261112.log"]          # 每个文件只做一次冷解析,跨 collector、跨请求共用
+    assert incremental == []                                                # 之后没有任何增量数据读取:日志没变
 
 
 def test_a_changed_log_is_read_from_its_old_end_and_unchanged_ones_are_not_read_at_all(tmp_path, monkeypatch):
@@ -461,3 +467,181 @@ def test_a_replaced_log_whose_tail_bytes_happen_to_match_is_still_fully_reparsed
     cold = col.collect_days(s, NOW).section["data"]["days"][0]
     assert got == cold
     assert not any(e["name"] == "对账失败" for e in got["events"]), "旧文件的计数不应混进新文件"
+
+
+# ---------------------------------------------------------------- codex 复核 #3:日志的未来 mtime
+
+def test_a_log_dated_in_the_future_is_not_fresh_evidence(tmp_path):
+    """曾经:freshness() 用 max(now - as_of, 0),日志 mtime 在未来会被当成『刚更新』(心跳与风控文件有未来检查,日志漏了)。"""
+    p = log(tmp_path, "20261112", CLEAN)
+    os.utime(p, (NOW + 86400, NOW + 86400))
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.section["state"] == "corrupt" and r.level == "unknown", collect.__name__
+        assert "未来" in r.section["message"], collect.__name__
+
+
+def test_small_clock_skew_in_a_log_mtime_is_tolerated(tmp_path):
+    p = log(tmp_path, "20261112", CLEAN)
+    os.utime(p, (NOW + 20, NOW + 20))
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "ok"
+
+
+def test_freshness_is_the_shared_place_for_the_future_check():
+    from dashboard import models
+    assert models.freshness(NOW + 10_000, NOW, 60) == "corrupt"
+    assert models.freshness(NOW + 20, NOW, 60) == "ok"
+    assert models.freshness(NOW - 10, NOW, 60) == "ok" and models.freshness(NOW - 100, NOW, 60) == "stale"
+    assert models.freshness(None, NOW, 60) == "unknown"
+
+
+def test_a_future_log_mtime_never_hides_a_severe_event_in_the_log_content(tmp_path):
+    """时间戳怪不能掩盖日志内容里的严重事件:区块 state 是 corrupt,但 level 仍是 critical。"""
+    p = log(tmp_path, "20261112", SEVERE)
+    os.utime(p, (NOW + 86400, NOW + 86400))
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.level == "critical", collect.__name__
+
+
+# ---------------------------------------------------------------- codex 复核 #1:同长度的中间改写
+
+def test_a_same_length_rewrite_in_the_middle_with_head_and_tail_untouched_is_detected(tmp_path):
+    """codex 的复现:首次日志无异常;保持开头与末尾字节不变,把中间 12 个 ASCII 字节原地换成同为 12 字节的『启动失败』。
+    头 64 + 尾 64 字节的指纹原样不变,缓存曾继续使用旧结果,严重事件永久不显示。现在校验整个已读前缀的哈希。"""
+    head = "2026-11-12 09:00:01.000 | INFO | runtime | " + "x" * 40 + "\n"
+    middle_old = "2026-11-12 09:00:02.000 | INFO | runtime | abcdefghijkl 正常运行\n"
+    middle_new = "2026-11-12 09:00:02.000 | INFO | runtime | 启动失败 正常运行\n"
+    tail = "2026-11-12 09:00:03.000 | INFO | runtime | " + "y" * 40 + "\n"
+    assert len("abcdefghijkl".encode()) == len("启动失败".encode()) == 12
+    old_b = (head + middle_old + tail).encode("utf-8")
+    new_b = (head + middle_new + tail).encode("utf-8")
+    assert len(old_b) == len(new_b) and old_b[:64] == new_b[:64] and old_b[-64:] == new_b[-64:] and old_b != new_b
+    p = tmp_path / "runtime" / "vntrader" / "log" / "vt_20261112.log"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(old_b)
+    s = settings(tmp_path)
+    col._PARSE_CACHE.clear()
+    assert col.collect_days(s, NOW).section["data"]["days"][0]["events"] == []
+    st = p.stat()
+    p.write_bytes(new_b)
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))        # mtime 变了(哪怕只是更新),大小没变
+    got = col.collect_days(s, NOW).section["data"]["days"][0]
+    col._PARSE_CACHE.clear()
+    cold = col.collect_days(s, NOW).section["data"]["days"][0]
+    assert got == cold
+    assert any(e["name"] == "启动失败" for e in got["events"]), "同长度的中间改写必须被发现"
+
+
+def test_a_rewrite_that_also_grows_the_file_and_keeps_head_and_tail_of_the_old_part_is_detected(tmp_path):
+    head = "2026-11-12 09:00:01.000 | INFO | runtime | " + "x" * 40 + "\n"
+    middle_old = "2026-11-12 09:00:02.000 | INFO | runtime | abcdefghijkl 正常运行\n"
+    middle_new = "2026-11-12 09:00:02.000 | INFO | runtime | 启动失败 正常运行\n"
+    tail = "2026-11-12 09:00:03.000 | INFO | runtime | " + "y" * 40 + "\n"
+    old_b = (head + middle_old + tail).encode("utf-8")
+    new_b = (head + middle_new + tail).encode("utf-8") + "2026-11-12 09:00:04.000 | INFO | runtime | 追加\n".encode("utf-8")
+    p = tmp_path / "runtime" / "vntrader" / "log" / "vt_20261112.log"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(old_b)
+    s = settings(tmp_path)
+    col._PARSE_CACHE.clear()
+    col.collect_days(s, NOW)
+    p.write_bytes(new_b)
+    got = col.collect_days(s, NOW).section["data"]["days"][0]
+    col._PARSE_CACHE.clear()
+    assert got == col.collect_days(s, NOW).section["data"]["days"][0]
+    assert any(e["name"] == "启动失败" for e in got["events"])
+
+
+def test_pure_appends_are_still_read_incrementally_not_reparsed(tmp_path, monkeypatch):
+    p = log(tmp_path, "20261112", CLEAN)
+    s = settings(tmp_path)
+    col._PARSE_CACHE.clear()
+    col.collect_days(s, NOW)
+    old_end = p.stat().st_size
+    read = _spy(monkeypatch)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write("2026-11-12 22:30:00.000 | ERROR | x | [ERROR] 对账失败\n")
+    col.collect_days(s, NOW)
+    assert read == [("vt_20261112.log", old_end)]                           # 数据读取仍然只从旧末尾开始
+
+
+def test_touching_a_log_without_changing_it_keeps_the_cache(tmp_path, monkeypatch):
+    """只是 mtime 变了、内容没变(比如被备份工具碰了一下):前缀哈希相同,不需要重新解析。"""
+    p = log(tmp_path, "20261112", CLEAN)
+    s = settings(tmp_path)
+    col._PARSE_CACHE.clear()
+    col.collect_days(s, NOW)
+    st = p.stat()
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 7_000_000_000))
+    read = _spy(monkeypatch)
+    col.collect_days(s, NOW)
+    assert read == []
+
+
+# ---------------------------------------------------------------- codex 复核 #2:日志可信度
+
+def _raw_log(tmp_path, day, text):
+    d = tmp_path / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"vt_{day}.log"
+    p.write_text(text, encoding="utf-8")
+    os.utime(p, (NOW - 5, NOW - 5))
+    return p
+
+
+def test_codex_exact_repro_one_plausible_line_plus_garbage_is_not_a_clean_day(tmp_path):
+    """codex 的复现:第一行勉强像时间戳,第二行是任意垃圾 -> 曾判为 state=ok, clean=True。"""
+    _raw_log(tmp_path, "20261112", "2026-11-12 09:00:00 | INFO | boot\nTHIS IS ARBITRARY GARBAGE WITHOUT LOG FORMAT\n")
+    r = col.collect_days(settings(tmp_path), NOW)
+    assert r.section["state"] == "corrupt" and r.level == "unknown"
+
+
+def test_a_line_must_look_like_a_full_record_not_just_start_with_a_date(tmp_path):
+    """只取前 19 字符能当时间戳的行,不一定是一条日志记录。要求『时间 | 级别 | 来源』的完整形状。"""
+    for bad in ("2026-11-12 09:00:00 plus arbitrary text that is not a log record at all\n",
+                "2026-11-12 09:00:00\n", "2026-11-12 09:00:00 | | |\n", "2026-11-12 09:00:00 | not a level | x | y\n"):
+        _raw_log(tmp_path, "20261112", bad * 3)
+        assert col.collect_days(settings(tmp_path), NOW).section["state"] == "corrupt", repr(bad)
+
+
+def test_records_must_belong_to_the_day_in_the_file_name(tmp_path):
+    """被移植/重命名的日志:内容是另一天的,不能当作这一天『无异常』的证据。"""
+    _raw_log(tmp_path, "20261112", "2026-10-01 09:00:00.000 | INFO | r | 已启动\n" * 5)
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "corrupt"
+
+
+def test_tracebacks_with_continuation_lines_do_not_make_a_real_log_untrusted(tmp_path):
+    """真实日志里的多行 traceback:续行不是记录,但少量续行不能让整份日志被判不可信。"""
+    lines = ["2026-11-12 09:00:00.000 | INFO | r | 已启动"] + ["2026-11-12 09:00:%02d.000 | INFO | r | 心跳" % i for i in range(1, 11)]
+    lines += ["2026-11-12 09:01:00.000 | ERROR | x | 策略异常", "Traceback (most recent call last):", '  File "x.py", line 1, in f', "ValueError: boom"]
+    _raw_log(tmp_path, "20261112", "\n".join(lines) + "\n")
+    r = col.collect_days(settings(tmp_path), NOW)
+    assert r.section["state"] == "ok" and r.section["data"]["days"][0]["started"] == 1
+
+
+def test_mostly_garbage_with_a_few_valid_records_is_untrusted(tmp_path):
+    lines = ["2026-11-12 09:00:00.000 | INFO | r | 已启动"] + ["garbage line %d" % i for i in range(50)]
+    _raw_log(tmp_path, "20261112", "\n".join(lines) + "\n")
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "corrupt"
+
+
+def test_an_unreadable_log_is_surfaced_even_when_another_day_is_fine(tmp_path):
+    """曾经:只要有一个正常日志,其他损坏日志就被静默排除;今天的日志坏了却显示『昨天是干净的』。"""
+    log(tmp_path, "20261111", CLEAN)
+    _raw_log(tmp_path, "20261112", "garbage only\nmore garbage\n")
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.level == "unknown", collect.__name__
+        assert "无法识别" in json.dumps(r.reasons, ensure_ascii=False) or "无法识别" in (r.section["message"] or ""), collect.__name__
+    d = col.collect_days(settings(tmp_path), NOW).section["data"]
+    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                          # 数据仍显示好的那天,但级别不是 ok
+
+
+def test_real_log_format_is_trusted(tmp_path):
+    """用真实日志的样子(取自 runtime/vntrader/log)确认判据不会误伤。"""
+    real = ("2026-11-10 13:58:29.727 | INFO | RiskEngine | 风控规则[ActiveOrderRule]加载成功\n"
+            "2026-11-10 13:58:29.728 | WARNING | CTP | 连接断开 8193\n"
+            "2026-11-10 13:58:30.001 | ERROR | MainEngine | 启动失败: x\n")
+    _raw_log(tmp_path, "20261110", real)
+    assert col.collect_days(settings(tmp_path), NOW).section["data"]["days"][0]["started"] == 0

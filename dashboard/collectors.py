@@ -40,7 +40,7 @@ def _reason(section: str, level: str, text: str) -> dict:
 # ---------------------------------------------------------------- 交易与风控
 
 HEARTBEAT_MAX_BYTES = 1024           # 心跳文件就是一个数字;更大的一定是异常
-CLOCK_SKEW_TOLERANCE = 60.0          # 允许文件时间戳比本机时钟超前这么多秒(两台机器/NTP 校时的正常误差)
+CLOCK_SKEW_TOLERANCE = m.CLOCK_SKEW_TOLERANCE   # 定义在 models.py(共用的 freshness() 也要用)
 # 风控状态落后多久算陈旧。依据(已核对源码):trading/guard_rule.py::on_timer 每秒调用 guard.update(),
 # risk/account_guard.py::update 在『状态变化』或『距上次落盘 >=60 秒』时 _save();留 3 倍余量。
 # 前提:账户对象已到位(on_timer 里 `if account is not None`)。账户资金还没回报或断线时文件确实不再更新——
@@ -183,6 +183,7 @@ def collect_trading(settings: Settings, now: float) -> Result:
 
 _SEVERITY = {"严重": "severe", "警告": "warning"}
 REQUIRED_STREAK = 5
+FUTURE_LOG_MESSAGE = "日志文件的修改时间在未来(时钟回拨或文件异常):不能据此判断日志是否在更新"
 
 
 def _log_files(settings: Settings) -> list[Path]:
@@ -196,7 +197,7 @@ def _log_files(settings: Settings) -> list[Path]:
     files: list[Path] = []
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
-            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f) and _parse_cached(f).first_ts]
+            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f) and _parse_cached(f).trusted]
     return files
 
 
@@ -205,7 +206,7 @@ def _unreadable_logs(settings: Settings) -> int:
     n = 0
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
-            n += sum(1 for f in d.glob("vt_*.log") if _nonempty(f) and not _parse_cached(f).first_ts)
+            n += sum(1 for f in d.glob("vt_*.log") if _nonempty(f) and not _parse_cached(f).trusted)
     return n
 
 
@@ -217,7 +218,6 @@ def _nonempty(path: Path) -> bool:
 
 
 PARSE_CACHE_MAX = 64
-FINGERPRINT_BYTES = 64
 _PARSE_LOCK = threading.Lock()
 
 
@@ -225,7 +225,7 @@ _PARSE_LOCK = threading.Lock()
 class _ParseState:
     parser: ls.DayLogParser
     offset: int                 # 已喂给解析器的字节数
-    fingerprint: bytes          # 文件开头 + 已读部分末尾的若干字节:用来确认文件只是被追加,没有被替换
+    hasher: "hashlib._Hash"     # 已读前缀 [0, offset) 的 SHA-256 状态:『文件自上次读取以来只是被追加』的证明;追加时增量 update,不重读
     mtime_ns: int
     size: int
 
@@ -233,24 +233,49 @@ class _ParseState:
 _PARSE_CACHE: dict[str, _ParseState] = {}
 
 
+CHUNK_BYTES = 1 << 20
+
+
 def _read_range(path: Path, start: int, end: int | None = None) -> bytes:
+    """喂给解析器的数据读取(只用于『新增部分』)。单独成函数,便于测试断言读了多少、从哪里开始读。"""
     with path.open("rb") as fh:
         fh.seek(start)
         return fh.read() if end is None else fh.read(max(end - start, 0))
 
 
-def _fingerprint(path: Path, offset: int) -> bytes:
-    """文件指纹 = 开头 N 字节 + [offset-N, offset) 这段。用来确认文件自上次读取以来只是被追加。
+def _prefix_sha(path: Path, length: int) -> str | None:
+    """文件前 length 字节的 SHA-256(分块读取,内存恒定)。读到的字节不足 length(文件变短了)返回 None。
 
-    只看末尾不够(G8 复核实测):『旧长度处的末尾相同、更早内容不同、文件更长』的替换文件能骗过它,
-    结果是旧文件的计数混进新文件(对一个干净的新日志报『严重事件』,或反过来漏报)。
-    加上文件开头的字节:追加不会改变开头;不同的日志文件以不同的时间戳开头。
-    固定很小(共 ≤128 字节),单独实现——_read_range 只表示『喂给解析器的数据读取』,便于测试断言读了多少。"""
+    这是『只追加』的**证明**:头尾抽样不是(G8 复核实测:保持开头与末尾字节不变、原地改写中间同长度的内容,
+    抽样指纹不变,缓存继续用旧结果,严重事件永久不显示)。代价可以接受——实测 60 MB 约 80 毫秒、5 MB 约 9 毫秒;
+    日志没变(mtime 与大小都没变)时完全跳过。"""
+    h = hashlib.sha256()
+    remaining = length
     with path.open("rb") as fh:
-        head = fh.read(min(offset, FINGERPRINT_BYTES))
-        fh.seek(max(offset - FINGERPRINT_BYTES, 0))
-        tail = fh.read(min(offset, FINGERPRINT_BYTES))
-    return head + b"|" + tail
+        while remaining > 0:
+            chunk = fh.read(min(CHUNK_BYTES, remaining))
+            if not chunk:
+                return None
+            h.update(chunk)
+            remaining -= len(chunk)
+    return h.hexdigest()
+
+
+def _full_parse(path: Path, key: str, st) -> _ParseState:
+    """全量解析:分块读取,边读边喂解析器、边更新前缀哈希——解析与哈希来自**同一次读取**。
+    以实际读到的字节数为准(文件在读的过程中可能还在增长,多出来的留给下一次增量)。"""
+    parser = ls.DayLogParser(ls._day_from_filename(path))
+    h = hashlib.sha256()
+    total = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(CHUNK_BYTES)
+            if not chunk:
+                break
+            parser.feed(chunk)
+            h.update(chunk)
+            total += len(chunk)
+    return _ParseState(parser, total, h, st.st_mtime_ns, st.st_size)
 
 
 def _parse_cached(path: Path) -> ls.DayStats:
@@ -260,10 +285,11 @@ def _parse_cached(path: Path) -> ls.DayStats:
     各解析一遍,前端每 8 秒轮询一次——日志一大请求就会堆积、耗尽线程池,且恰恰发生在日志刷屏、最需要看状态的时候。
     当天的日志一直在增长,所以光按 (mtime, size) 缓存没用;这里记住解析器和已读偏移,只处理新增的字节。
 
-    什么时候必须全量重解析(宁可慢也不能错):
-    - 文件变小(被截断或轮转);
-    - 文件变大,但已读部分末尾的指纹对不上(整个文件被换成了另一个更大的文件,从旧偏移继续读就是错的)。
-    返回的是副本——调用方(_days)会合并修改 events。整个『校验 + 读取 + 喂入』在锁内完成,避免两个请求同时推进同一个解析器。
+    **何时可以信任缓存**(宁可慢也不能错):
+    - (mtime, size) 都没变:直接用,零成本。
+    - 否则重新计算已读前缀 [0, offset) 的 SHA-256:与保存的相同 = 前面的内容确实没动,只读新增部分继续喂;
+      不同、或文件变短 = 被改写/截断/替换,**全量重解析**。头尾抽样不够(同长度的中间改写能骗过它)。
+    返回的是快照副本。整个『校验 + 读取 + 喂入』在锁内完成,避免两个请求同时推进同一个解析器。
     """
     key = str(path)
     try:
@@ -275,14 +301,15 @@ def _parse_cached(path: Path) -> ls.DayStats:
         try:
             if state is not None and (st.st_mtime_ns, st.st_size) == (state.mtime_ns, state.size):
                 pass                                                          # 没变:直接用
-            elif state is not None and st.st_size >= state.offset and _fingerprint(path, state.offset) == state.fingerprint:
-                state.parser.feed(_read_range(path, state.offset, st.st_size))   # 只追加:读新增部分
-                state.offset, state.size, state.mtime_ns = st.st_size, st.st_size, st.st_mtime_ns
-                state.fingerprint = _fingerprint(path, state.offset)
-            else:                                                             # 首次 / 被截断 / 被替换:全量
-                parser = ls.DayLogParser(ls._day_from_filename(path))
-                parser.feed(_read_range(path, 0, st.st_size))
-                state = _ParseState(parser, st.st_size, _fingerprint(path, st.st_size), st.st_mtime_ns, st.st_size)
+            elif state is not None and st.st_size >= state.offset and _prefix_sha(path, state.offset) == state.hasher.hexdigest():
+                if st.st_size > state.offset:                                 # 前缀没动:只读新增部分,哈希对象增量 update(不重读整个前缀)
+                    fresh = _read_range(path, state.offset, st.st_size)
+                    state.parser.feed(fresh)
+                    state.hasher.update(fresh)
+                    state.offset += len(fresh)
+                state.mtime_ns, state.size = st.st_mtime_ns, st.st_size
+            else:                                                             # 首次 / 被截断 / 被改写 / 被替换:全量
+                state = _full_parse(path, key, st)
                 if len(_PARSE_CACHE) >= PARSE_CACHE_MAX and key not in _PARSE_CACHE:
                     _PARSE_CACHE.clear()
                 _PARSE_CACHE[key] = state
@@ -371,10 +398,21 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
+    bad_logs = _unreadable_logs(settings)
+    bad_msg = f"有 {bad_logs} 个日志文件内容无法识别(格式变了、被写坏或日期与文件名不符),这些天不能算作『无异常』"
     reasons: list[dict] = []
     if latest.has_severe:
         level, headline = "critical", f"{latest.day} 有严重事件"
         reasons.append(_reason("days", "critical", f"{latest.day} 日志里有严重事件:" + "、".join(n for (lv, n) in latest.events if lv == "严重")))
+    elif bad_logs:
+        # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
+        # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
+        level, headline = "unknown", "有日志无法识别"
+        reasons.append(_reason("days", "unknown", bad_msg))
+    elif state == "corrupt":
+        # 日志文件的修改时间在未来(时钟回拨或文件异常):不能据此判断新鲜度。严重事件是日志内容,仍照常报 critical(上一分支)
+        level, headline = "unknown", "日志时间异常"
+        reasons.append(_reason("days", "unknown", FUTURE_LOG_MESSAGE))
     elif state == "stale":
         level, headline = "warn", "日志长时间未更新"
         reasons.append(_reason("days", "warn", "每日日志长时间没有更新(交易进程可能已停止)"))
@@ -383,8 +421,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         reasons.append(_reason("days", "warn", "最新一天有警告级事件" if latest.events else f"有 {len(missing_days)} 个工作日没有日志"))
     else:
         level, headline = "ok", f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
-    message = "每日日志长时间未更新" if state == "stale" else None
-    return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=message), level, headline, reasons)
+    notes = [x for x in ({"stale": "每日日志长时间未更新", "corrupt": FUTURE_LOG_MESSAGE}.get(state), bad_msg if bad_logs else None) if x]
+    return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=";".join(notes) or None), level, headline, reasons)
 
 
 def _outbox(settings: Settings, now: float) -> tuple[int, float | None, str]:
@@ -424,11 +462,12 @@ def collect_alerts(settings: Settings, now: float) -> Result:
         msg = "待补发告警队列无法读取或异常增长:无法确认有没有告警尚未送达手机"
         return Result(m.section("corrupt", None, as_of=m.mtime(settings.paths["state_dir"] / "webhook_outbox.jsonl"), now=now,
                                 stale_after=stale_after, message=msg), "unknown", "告警队列异常", [_reason("alerts", "unknown", msg)])
-    bad_logs = 0 if days else _unreadable_logs(settings)
-    if bad_logs:
+    bad_logs = _unreadable_logs(settings)
+    if bad_logs and not days:
         msg = f"有 {bad_logs} 个日志文件,但内容无法识别(格式变了或被写坏),不能据此确认没有新告警"
         return Result(m.section("corrupt", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志无法识别",
                       [_reason("alerts", "unknown", msg)])
+    bad_msg = f"有 {bad_logs} 个日志文件内容无法识别,不能据此确认这些天没有新告警"
     if not days and outbox_state == "missing":
         sec = m.section("missing", None, now=now, stale_after=stale_after, message="未找到告警队列和每日日志")
         return Result(sec, "unknown", "无数据来源", [_reason("alerts", "unknown", "未找到告警队列和日志:无法判断告警情况")])
@@ -452,15 +491,22 @@ def collect_alerts(settings: Settings, now: float) -> Result:
     elif pending:
         level, headline = "warn", f"待补发 {pending} 条"
         reasons.append(_reason("alerts", "warn", f"有 {pending} 条告警尚未送达手机(断网等原因暂存)"))
+    elif bad_logs:
+        # 有日志读不懂——哪怕另一天是好的。坏掉的那天不能被当成『没有告警』
+        level, headline = "unknown", "有日志无法识别"
+        reasons.append(_reason("alerts", "unknown", bad_msg))
     elif latest and latest.events:
         level, headline = "warn", "近期有警告事件"
         reasons.append(_reason("alerts", "warn", f"{latest.day} 有警告级事件"))
-    elif state in ("stale", "unknown"):
-        level, headline = "unknown", "数据已过期" if state == "stale" else "无法判断"
-        reasons.append(_reason("alerts", "unknown", "告警数据已过期,无法确认当前没有新告警"))
+    elif state in ("stale", "unknown", "corrupt"):
+        level, headline = "unknown", {"stale": "数据已过期", "corrupt": "日志时间异常"}.get(state, "无法判断")
+        text = FUTURE_LOG_MESSAGE if state == "corrupt" else "告警数据已过期,无法确认当前没有新告警"
+        reasons.append(_reason("alerts", "unknown", text))
     else:
         level, headline = "ok", "无待补发"
-    return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after), level, headline, reasons)
+    notes = [x for x in (FUTURE_LOG_MESSAGE if state == "corrupt" else None, bad_msg if bad_logs else None) if x]
+    message = ";".join(notes) or None
+    return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=message), level, headline, reasons)
 
 
 # ---------------------------------------------------------------- 行情录制

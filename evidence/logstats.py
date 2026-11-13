@@ -3,6 +3,7 @@
 从 `scripts/unattended_report.py` 抽出(2026-11-12),只依赖标准库:状态页(`dashboard/`)与该脚本共用同一份实现,
 状态页不能经 `scripts/bootstrap.py` 间接加载 vnpy。`unattended_report.py` 重新导出了这里的全部名字,既有调用与测试不受影响。
 """
+import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -66,6 +67,9 @@ class DayStats:
     first_ts: str = ""
     last_ts: str = ""
     log_path: str = ""
+    # 这份日志是否像一份真实的 vn.py 日志(状态页用它决定能不能把『没有事件』当成『这一天无异常』)。
+    # 默认 True:unattended_report 等既有使用者不关心这个,行为完全不变。判据见 DayLogParser.trusted。
+    trusted: bool = True
 
     @property
     def clean(self) -> bool:
@@ -87,6 +91,13 @@ class DayStats:
             detail = "无异常"
         trades = str(self.trades) if self.trades else "-"
         return (f"| {self.day} | {self.started} | {trades} | {detail} | {heartbeat or '-'} |")
+
+
+# 一条真实的日志记录:`日期 时间[.毫秒] | 级别 | 来源 | 内容`(取自 runtime/vntrader/log 的真实样子)。
+# 比 _parse_ts 严格得多:_parse_ts 只看前 19 个字符,『2026-11-12 09:00:00 加任意垃圾』也算有时间戳。
+# 状态页用它判断一份日志是否可信;_parse_ts 的行为不变(unattended_report 和它的 46 个测试依赖它)。
+RECORD = re.compile(r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}(?:\.\d+)? \| (DEBUG|INFO|WARNING|ERROR|CRITICAL|SUCCESS|TRACE) \| [^|]*\| ?")
+MIN_RECORD_RATIO = 0.2          # 记录至少占非空行的这个比例;容忍 traceback 续行,挡住『一行合规 + 大量垃圾』
 
 
 def _parse_ts(line: str) -> str:
@@ -129,6 +140,9 @@ class DayLogParser:
         self._started_ok = 0          # 『已启动』与『启动耗时』各自计数,快照时取较大者——不能只存最终值,否则无法继续累加
         self._start_attempts = 0
         self._pending = b""           # 尚未遇到换行的残余字节(可能切在多字节字符中间,所以按字节缓冲)
+        self._lines = 0               # 非空行数
+        self._records = 0             # 其中形如『时间 | 级别 | 来源 | 内容』的真实日志记录数
+        self._first_record_day = ""   # 第一条记录的日期(应与文件名日期一致)
 
     def feed(self, data: bytes) -> None:
         buf = self._pending + data
@@ -149,6 +163,11 @@ class DayLogParser:
         for line in text.splitlines():
             if not line.strip():
                 continue
+            self._lines += 1
+            record = RECORD.match(line)
+            if record:
+                self._records += 1
+                self._first_record_day = self._first_record_day or record.group(1)
             ts = _parse_ts(line)
             if ts:
                 if not self.first_ts:
@@ -165,9 +184,37 @@ class DayLogParser:
                 if marker in line:
                     self.events[(level, name)] += 1
 
+    def _clone(self) -> "DayLogParser":
+        c = DayLogParser(self.day)
+        c.trades, c.events = self.trades, Counter(self.events)
+        c.first_ts, c.last_ts = self.first_ts, self.last_ts
+        c._started_ok, c._start_attempts, c._pending = self._started_ok, self._start_attempts, self._pending
+        c._lines, c._records, c._first_record_day = self._lines, self._records, self._first_record_day
+        return c
+
+    def trusted(self) -> bool:
+        """这份日志像不像一份真实的 vn.py 日志。三条都要满足:
+        1. 至少有一条完整形状的记录(『时间 | 级别 | 来源 | 内容』,不只是以日期开头)。
+           (逻辑上被第 2 条隐含——没有记录时首条记录日期为空,必然不等于文件名日期。有意保留,把『必须有记录』这个意图写在代码里;
+           变异检查去掉它不会让测试失败,原因就在这里。)
+        2. 第一条记录的日期与文件名日期一致(被移植/重命名的日志不能当这一天的证据);
+        3. 记录占非空行的比例不低于 20%(容忍 traceback 续行,挡住『一行合规 + 大量垃圾』)。
+        不可信的日志不能被解读成『这一天无异常』(G8 复核:一行合规加任意垃圾曾被判为干净的一天)。"""
+        return (self._records >= 1 and self._first_record_day == self.day
+                and self._records >= MIN_RECORD_RATIO * self._lines)
+
     def snapshot(self, log_path: str = "") -> DayStats:
-        return DayStats(day=self.day, started=max(self._started_ok, self._start_attempts), trades=self.trades,
-                        events=Counter(self.events), first_ts=self.first_ts, last_ts=self.last_ts, log_path=log_path)
+        """当前已知的全部内容,**包括还没有换行结尾的最后一行**;不改变解析器自己的状态。
+
+        G8 复核 #10:进程在写入严重事件后崩溃、最后一行没有换行,这一行曾一直留在缓冲里,增量路径永远不显示它,
+        而全量解析会数它——两者不等价,严重事件被漏报。现在在**副本**上处理尾行:快照展示它,
+        解析器自己仍把它留在缓冲里,等真正的换行到来后再正式处理,所以不会数两次。"""
+        view = self._clone()
+        if view._pending:
+            view.finish()
+        return DayStats(day=view.day, started=max(view._started_ok, view._start_attempts), trades=view.trades,
+                        events=Counter(view.events), first_ts=view.first_ts, last_ts=view.last_ts, log_path=log_path,
+                        trusted=view.trusted())
 
 
 def parse_day_log(path: Path) -> DayStats:
