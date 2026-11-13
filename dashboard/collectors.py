@@ -1093,6 +1093,7 @@ class EvolutionUnavailable(Exception):
 # TTL 永远不命中,总览每 8 秒轮询就重读一次全部台账(实测 50 个战役 = 300 MB ≈ 9 秒/请求)。
 _EVOLUTION_SUMMARY_CACHE: dict = {}      # (路径, 内容哈希) → 摘要      上限 _EVOLUTION_CACHE_MAX
 _EVOLUTION_TTL_CACHE: dict = {}          # 路径 → {at, summary}         上限 _EVOLUTION_TTL_CACHE_MAX
+_EVOLUTION_SUMMARY_USED: dict = {}       # (路径, 内容哈希) → 最近命中时间(逐出用)
 EVOLUTION_SUMMARY_TTL = 30.0              # 摘要缓存的存活秒数:总览每 8 秒轮询一次,不能每次都重读全部台账
 _EVOLUTION_CACHE_MAX = 128
 _EVOLUTION_TTL_CACHE_MAX = 128
@@ -1116,17 +1117,22 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
     if cached is not None and now - cached["at"] < ttl:
         return cached["summary"]
     try:
+        # 超限的台账不必整份哈希:read_campaign 自己会按体积上限拒掉。
+        # (否则一个 929 MB 的超限台账,每个 TTL 窗口都要被完整读一遍 + 哈希一遍。)
+        if stat.st_size > ev.MAX_LEDGER_BYTES:
+            raise ev.EvolutionError("台账超过大小上限")
         key = (str(path), _file_digest(path))
         summary = _EVOLUTION_SUMMARY_CACHE.get(key)
         if summary is not None:
             _remember_summary(str(path), key, summary, now)
             return summary
         records = ev.read_campaign(directory, name)
-    except ev.EvolutionError:
+    except ev.EvolutionError as exc:
         # **失败路径也要缓存**:损坏/超限的台账不进缓存的话,每个请求都会重读并重新哈希整个文件
-        # (一个 929 MB 的超限台账 = 每请求约 1 秒)。这里缓存一条『损坏』摘要。
+        # (一个 929 MB 的超限台账 = 每请求约 1 秒)。这里缓存一条『损坏』摘要,
+        # **连同原始错误消息**——否则第一次显示『台账超过大小上限』、第二次变成笼统的『台账损坏或读不了』,文案会跳。
         summary = {"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
-                   "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": "台账损坏或读不了"}
+                   "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)}
         _remember_summary(str(path), None, summary, now)
         raise
     sharpes = [r.sharpe for r in records if r.sharpe is not None]
@@ -1147,10 +1153,15 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
 def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> None:
     """把摘要写进两个缓存。**淘汰按上限逐出最旧的**,不是 clear() 全部清空。"""
     if hash_key is not None:
-        if len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
-            for k in list(_EVOLUTION_SUMMARY_CACHE)[: len(_EVOLUTION_SUMMARY_CACHE) - _EVOLUTION_CACHE_MAX + 1]:
-                del _EVOLUTION_SUMMARY_CACHE[k]
+        # 逐出**最久没用**的:dict 对已存在的键重新赋值不改变插入顺序,按插入顺序逐出会挤掉热条目。
+        if hash_key in _EVOLUTION_SUMMARY_CACHE:
+            del _EVOLUTION_SUMMARY_CACHE[hash_key]
+        while len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
+            oldest = min(_EVOLUTION_SUMMARY_CACHE, key=lambda k: _EVOLUTION_SUMMARY_USED.get(k, 0.0))
+            del _EVOLUTION_SUMMARY_CACHE[oldest]
+            _EVOLUTION_SUMMARY_USED.pop(oldest, None)
         _EVOLUTION_SUMMARY_CACHE[hash_key] = summary
+        _EVOLUTION_SUMMARY_USED[hash_key] = now
     if len(_EVOLUTION_TTL_CACHE) >= _EVOLUTION_TTL_CACHE_MAX:
         for k in sorted(_EVOLUTION_TTL_CACHE, key=lambda x: _EVOLUTION_TTL_CACHE[x]["at"])[: len(_EVOLUTION_TTL_CACHE) - _EVOLUTION_TTL_CACHE_MAX + 1]:
             del _EVOLUTION_TTL_CACHE[k]

@@ -103,3 +103,36 @@ def test_the_startup_warmup_also_warms_the_evolution_summaries(tmp_path, monkeyp
     monkeypatch.setattr(col.ev, "read_campaign", counting)
     col.warm_up(settings)
     assert calls["n"] >= 1, "warm_up 没有预热进化摘要"
+
+
+def test_an_oversized_ledger_is_not_hashed_in_full(tmp_path, monkeypatch):
+    """超限的台账不必整份哈希:read_campaign 自己会按体积上限拒掉。"""
+    root = tmp_path / "repo"
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "huge.jsonl").write_bytes(b"x" * (col.ev.MAX_LEDGER_BYTES + 1024))
+    settings = _settings(root)
+    col.collect_evolution(settings, NOW)                        # 冷:坏台账
+    digests = {"n": 0}
+    real = col._file_digest
+
+    def counting(path):
+        digests["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(col, "_file_digest", counting)
+    col.collect_evolution(settings, NOW)                        # TTL 内
+    assert digests["n"] == 0, f"超限台账被哈希了 {digests['n']} 次"
+
+
+def test_the_cached_corrupt_message_stays_the_same_across_requests(tmp_path):
+    """损坏摘要要连同原始错误消息一起缓存:否则第一次『台账超过大小上限』、第二次变笼统,文案会跳。"""
+    root = tmp_path / "repo"
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "huge.jsonl").write_bytes(b"x" * (col.ev.MAX_LEDGER_BYTES + 1024))
+    settings = _settings(root)
+    first = col.collect_evolution(settings, NOW).section["data"]["campaigns"][0]["message"]
+    second = col.collect_evolution(settings, NOW).section["data"]["campaigns"][0]["message"]
+    assert first == second, (first, second)
+    assert "上限" in first or "损坏" in first
