@@ -1545,6 +1545,21 @@
               "hard_drawdown_yuan"
             ],
             "additionalProperties": true
+          },
+          "as_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "风控状态文件自己的修改时间,与心跳独立。心跳新鲜不代表风控数字是当前值"
+          },
+          "age_seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "风控状态文件距今秒数(服务器计算)。运行时至少每分钟落盘一次,落后 >180 秒区块即为 stale"
           }
         },
         "required": [
@@ -1558,7 +1573,9 @@
           "daily_locked_day",
           "hard_locked",
           "hard_reason",
-          "limits"
+          "limits",
+          "as_of",
+          "age_seconds"
         ],
         "additionalProperties": true
       },

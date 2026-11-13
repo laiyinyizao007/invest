@@ -93,6 +93,8 @@ export interface Guard {
     daily_loss_yuan: number | null;
     hard_drawdown_yuan: number | null;
   };
+  as_of: string | null;
+  age_seconds: number | null;
 }
 
 export interface TradingData {
