@@ -1,12 +1,12 @@
-# ADR: 只读状态页(Web 监控面板)——独立只读进程,不嵌入交易进程,不使用 vnpy_webtrader
+# ADR: 只读状态页(Web 监控面板)——fork 并改造 vnpy_webtrader 的后端,独立只读进程,不嵌入交易进程
 
-- 状态:**待确认**(2026-11-12 提出;阶段①任务分解见 `docs/plans/20261112-status-dashboard-plan.md`;完整 Web 规划与前端交接见 `docs/web/README.md`)
+- 状态:**待确认**(2026-11-12 提出;同日按用户决定由『不使用』修订为『fork 并改造』;阶段①任务分解见 `docs/plans/20261112-status-dashboard-plan.md`;完整 Web 规划与前端交接见 `docs/web/README.md`)
 - 关联:`20261110-bisheng-ai-researcher.md`(第一设计公理:内层必须能在外层宕机时独立运行)、`20261111-risk-floor-immutability.md`(明确不做清单)、`20261111-discipline-enforcement.md`(非策略委托检测)、`20261112-research-sandbox-config-and-approval.md`(令牌与网关写法)、`docs/roadmap.md` §2.5
 
 ## 背景
 
 交易运行时、风控、看门狗、录制、研究沙盒、演练全部是命令行进程,状态散在文件和日志里,对使用者是黑盒:想知道"现在能不能放心"要翻日志。
-用户提出用 VeighNa 官方的 `vnpy_webtrader`(FastAPI + RPC 多进程解耦 + WebSocket 推送)做 Web 界面,并按我们自己的功能修改。
+用户提出用 VeighNa 官方的 `vnpy_webtrader`(FastAPI + RPC 多进程解耦 + WebSocket 推送)做 Web 界面,并按我们自己的功能修改。**用户决定:fork 它并改造**(2026-11-12)。下面是 fork 前核对到的上游事实,它们决定了『改造』具体要改什么。
 
 核对 `vnpy_webtrader` 1.1.0 安装包(2026-11-12)的事实:
 
@@ -23,7 +23,7 @@
 
 ## 决策
 
-1. **新建一个独立的只读状态页进程**(`scripts/status_server.py` + `dashboard/` 纯逻辑包 + 静态单页),**不使用 `vnpy_webtrader`**。借用它的思路:前后端分离、REST 取数;阶段②再评估推送。
+1. **fork `vnpy_webtrader` 1.1.0(MIT)的后端,改造成独立的只读状态页进程**(入口 `scripts/status_server.py`,FastAPI 应用 `dashboard/app.py` 派生自上游 `web.py`,纯逻辑 `dashboard/collectors.py` / `safe.py`,静态单页)。**上游原样不用**:见下节『fork 范围』——保留应用骨架与许可证谱系,改写鉴权与取数,删除全部委托类接口与 RPC。阶段②再评估推送。
 2. **阶段①(本 ADR 范围)只读文件,不碰交易进程**:读心跳、`account_guard.json`、暂停标志、实盘准入文件、每日日志、待补发队列、录制状态、研究沙盒账本与结果、两份证据文档。全部 GET。
 3. **交易路径对面板零依赖**:`dashboard/` 不得 import `trading.*` 或 `vnpy`(AST 测试强制);面板崩溃或被杀,交易心跳不受影响(实机验收时验证)。
 4. **监控页的首要风险是假安心**:每个区块有 `ok / stale / missing / corrupt / unknown` 多态;缺失、过期、损坏一律显示为"未知/过期",不显示成正常;总状态灯取最差;每块显示数据年龄。
@@ -31,6 +31,41 @@
 6. **鉴权与网络**:Bearer 令牌文件(`data/state/status.token`,不入库,常量时间比较),每分钟限流,不开 CORS,**阶段①只允许监听 127.0.0.1**,拒绝非回环地址。经局域网或内网访问须另写 ADR(VPN 或限定局域网,不做公网穿透)。
 7. **前端零外部依赖**:无 CDN、无外链字体,离线可用;日志与告警文本一律 `textContent`(日志里有对端返回的文本,存在注入面);令牌放 `sessionStorage`,走 Authorization 头,不进 URL;响应带 `Content-Security-Policy: default-src 'self'`。
 8. **时区并列显示**:本机时区与北京时间(开发机是太平洋时间,交易按北京时间,已经混淆过)。
+
+## fork 范围
+
+**许可证**:上游为 MIT(版权人 Xiaoyou Chen)。fork 必须保留版权声明与许可证全文。做法:`dashboard/NOTICE-vnpy_webtrader.md` 记录上游版本(1.1.0)、安装包 SHA-256(`cf5b81268767ca20069b2073a32abacfe2eac21c3b09486dec47abc171ff0b16`)、许可证全文与下表;派生文件头部注明来源。测试断言该文件存在且含许可证文本。
+
+**上游逐项处置**(基于 1.1.0 实际代码):
+
+| 上游内容 | 处置 | 理由 |
+|---|---|---|
+| FastAPI 应用骨架、`GET /` 托管静态页的写法 | **保留并改造** | 骨架现成;静态托管改为只服务构建清单内的文件 |
+| `to_dict` 数据对象序列化 | **不用** | 我们的响应走 `Section` 外壳与净化出口,不直接序列化 vn.py 对象 |
+| JWT 登录(`POST /token`、`SECRET_KEY = "test"`、passlib、python-jose、python-multipart) | **删除,换成令牌文件 + 常量时间比较** | 密钥写死是硬伤;`POST /token` 违反『阶段①全部 GET』;同时少掉三个第三方依赖 |
+| `POST /tick/{vt_symbol}`(订阅行情) | **删除** | 订阅属于连接柜台类操作 |
+| `POST /order`、`DELETE /order/{id}` | **删除,永不恢复** | 委托类操作,见『明确不做』 |
+| `GET /tick` `/order` `/trade` `/position` `/account` `/contract` | **改写为 `GET /api/live`**(阶段②) | 数据来自快照文件,不走 RPC;契约见 `docs/web/` |
+| WebSocket `/ws/`、广播、`rpc_callback`、启动时创建 `RpcClient` | **删除**(阶段①②) | 契约只用轮询(`capabilities.stream=false`);面板进程不连交易进程 |
+| `engine.py` 的 `WebEngine`(往 `MainEngine` 注册 `connect` / `send_order` / `cancel_order` 并开 RpcServer) | **不 vendor、不安装进交易进程** | 阶段②备选 (b) 若被采纳,只能是**只注册读取方法**的精简版,须另写 ADR |
+| `ui/widget.py`(Qt 启动器)、`static/index.html`(CDN 版 Vue 2)、图标 | **不 vendor** | 无头运行;前端由前端同事按 `docs/web/` 重做 |
+| 对 `vnpy.*` 的全部 import | **删除** | 面板不得 import `vnpy` / `trading`(AST 测试) |
+
+**诚实地说**:改造之后,上游留下的代码很少(应用骨架、静态托管模式)。fork 的价值主要是**许可证谱系清晰、起步骨架现成**,以及阶段②万一采用只读 RPC 时可以从精简版接上。不应期望它省掉大部分后端工作。
+
+**FastAPI 带来的额外要求**(上游默认行为与我们的契约冲突,必须显式处理):
+
+| 默认行为 | 处理 |
+|---|---|
+| 自动暴露 `/docs`、`/redoc`、`/openapi.json` | 关闭(`docs_url=None, redoc_url=None, openapi_url=None`);契约以仓库里的 OpenAPI 文件为准 |
+| 校验失败返回 `422 {"detail": ...}` | 统一异常处理器,输出契约的 `{"error","code"}`,且不回显请求内容 |
+| 404/405/500 的默认响应体 | 同上;405 带 `Allow` |
+| 路径末尾斜杠自动 307 重定向 | 关闭(`redirect_slashes=False`),避免绕过路由白名单的歧义 |
+| 无安全响应头、无限流 | 中间件统一加 CSP / `nosniff` / `no-store`,并限流 |
+| 绑定地址由 uvicorn 参数决定 | 入口强制回环地址,拒绝其它值 |
+
+**依赖隔离**:新增 `fastapi`、`uvicorn` 放进独立的 `requirements-dashboard.txt`(测试另需 `httpx`),**不并入 `requirements.txt`**——交易机的 venv 与交易镜像不装 Web 依赖,交易路径对面板零依赖在依赖层面也成立。
+**上游更新**:不跟踪上游。升级 `vnpy` 大版本时顺带检查一次上游是否有安全修复,并更新 NOTICE 里的版本记录。
 
 ## 阶段
 
@@ -77,14 +112,16 @@
 
 | 备选 | 为什么不选 |
 |---|---|
-| 直接改造 `vnpy_webtrader` | 见上表:数据范围不对、鉴权硬伤、带下单接口、要嵌入交易进程;去掉这些之后剩下的部分很少,不如自己写 |
+| 原样使用 `vnpy_webtrader`(不改造) | 鉴权硬伤、带下单接口、要嵌入交易进程,不可接受 |
+| **fork 并改造其后端(本决策)** | 采纳。保留许可证谱系与应用骨架;鉴权、取数、路由全部改写,委托类接口与 RPC 全部删除。代价:剩余上游代码很少,价值有限(见『fork 范围』) |
+| 完全自写后端,仅参考上游思路 | 技术上更干净(可用标准库 `http.server`,零新增依赖);用户选择了 fork,保留为被否决的方案。若 fork 后发现 FastAPI 默认行为带来的处理成本高于收益,可回退到此方案 |
 | 只用 `vnpy_webtrader` 的 RPC 通道但自写前端 | 仍须在交易进程里开监听,且仍无鉴权加密;阶段②用写状态文件的方式能避免 |
 | 继续只靠日志和命令行 | 现状,用户已明确反映是黑盒 |
 | 现成监控栈(Grafana / Prometheus) | 为单机单账户引入多个常驻服务,过重;数据源仍是我们的文件,要写同样多的适配 |
 
 ## 后果
 
-- 正面:状态可见;交易路径零改动、零新增依赖;边界由路由枚举测试变成可执行约束。
+- 正面:状态可见;交易路径零改动、零新增依赖(Web 依赖隔离在 `requirements-dashboard.txt`);边界由路由枚举测试变成可执行约束;许可证谱系清晰。
 - 负面:新增一个常驻进程与一份维护面;阶段①看不到实时持仓与资金(只有风控文件里的权益快照);面板必须与交易运行时在**同一台机器**(读同一批文件),远程访问要等阶段②或另写 ADR。
 - 风险:假安心、敏感信息泄露、日志注入、读到写了一半的文件、面板拖累交易、范围蔓延成控制台——缓解措施与对应测试见计划文档。
 

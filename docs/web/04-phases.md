@@ -22,7 +22,7 @@ flowchart LR
 | 页面 | 总览、交易与风控、告警与事件、无人值守、行情录制、研究沙盒、证据文档 |
 | 接口 | `meta`、`overview`、`trading`、`alerts`、`days`、`recording`、`research`、`research/runs/{id}`、`docs/{key}`,全部 GET |
 | 数据来源 | 心跳文件、风控状态 JSON、暂停标志、实盘准入文件、每日日志、待补发队列、录制状态、研究账本与结果、两份证据文档 |
-| 后端工作 | `dashboard/` 纯逻辑包(collectors + 净化层)、`scripts/status_server.py`(鉴权、限流、GET-only、静态托管、安全响应头)、状态页配置文件(环境标签、阈值、端口) |
+| 后端工作 | `dashboard/` 纯逻辑包(collectors + 净化层)、`dashboard/app.py`(**fork 自 `vnpy_webtrader` 1.1.0 后端并改造**:删除委托与 RPC、换鉴权、关闭自动文档)、`scripts/status_server.py`(强制回环)、状态页配置文件(环境标签、阈值、端口)、`requirements-dashboard.txt`(Web 依赖与交易环境隔离)。详见 ADR『fork 范围』 |
 | 对交易系统的改动 | **零**。不改交易进程,不新增依赖 |
 | 触发条件 | ADR 获确认 |
 | 退出标准 | 计划文档 T8 测试矩阵通过;实机逐页核对;杀掉面板后交易心跳不变;G8 双轮审查 ≥45/50 |

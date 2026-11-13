@@ -1,7 +1,7 @@
 # 计划:只读状态页(Web 监控面板)阶段①
 
 - 状态:**待执行**(ADR 待确认后开工)
-- 决策依据:`docs/adr/20261112-status-dashboard.md`(含否决 `vnpy_webtrader` 的理由与"明确不做"清单)
+- 决策依据:`docs/adr/20261112-status-dashboard.md`(**fork 并改造 `vnpy_webtrader` 1.1.0 后端**:逐项处置表、FastAPI 默认行为的处理、依赖隔离、"明确不做"清单)
 - 关联:Issue #1;`docs/roadmap.md` §2.5
 
 ## 目标
@@ -11,7 +11,7 @@
 
 ## 范围
 
-**做**:`dashboard/` 纯逻辑包、`scripts/status_server.py` 薄 HTTP 层、`dashboard/static/` 静态单页、测试、文档同步。
+**做**:`dashboard/` 纯逻辑包、`dashboard/app.py`(派生自上游 `web.py` 的 FastAPI 应用)、`scripts/status_server.py` 入口、`dashboard/static/` 静态单页、`dashboard/NOTICE-vnpy_webtrader.md`、`requirements-dashboard.txt`、测试、文档同步。
 **不做**:任何写操作;发单、撤单、连接、改风控、解锁、批准策略;嵌入 `RpcServer`;公网或内网穿透;取代 `unattended_report.py` 的证据生成。
 
 ## 标准符合性
@@ -19,6 +19,8 @@
 - G1:代码与 PROJECTWIKI / CHANGELOG 同一原子提交。
 - G4:架构图用 Mermaid;接口契约与实现一致(提供 OpenAPI 文件并加"文件路由 == 实现路由"测试,同 `research-gateway.openapi.json` 做法)。
 - G5 / G7:不读 `.env`;账号掩码;日志与告警经 `notify.webhook.redact`;令牌不进版本库。
+- 许可证:上游 MIT,保留版权声明与许可证全文(`dashboard/NOTICE-vnpy_webtrader.md`),派生文件头部注明来源,测试断言其存在。
+- 依赖隔离:Web 依赖只进 `requirements-dashboard.txt`,不进 `requirements.txt`、不进交易镜像。
 - G8:代码生成后两轮审查(`mcp__zen__codereview` + codex),评分 ≥45/50 才收尾。
 - G9:覆盖率 ≥85%。
 - 个人信息只放 `.env`:测试里的账号、姓名一律虚构。
@@ -38,8 +40,8 @@ flowchart LR
   end
   subgraph DB[状态页 独立进程 只读]
     COL[dashboard/collectors.py] --> SAFE[dashboard/safe.py 唯一净化出口]
-    SAFE --> APP[StatusApp 鉴权 限流 GET-only]
-    APP --> SRV[scripts/status_server.py 127.0.0.1]
+    SAFE --> APP[dashboard/app.py 派生自 vnpy_webtrader 鉴权 限流 GET-only]
+    APP --> SRV[scripts/status_server.py 强制回环 127.0.0.1]
     SRV --> UI[dashboard/static 单页 零外链]
   end
   HB --> COL
@@ -60,7 +62,7 @@ flowchart LR
 |---|---|---|
 | `dashboard/collectors.py` | 每个来源一个函数 `(paths, now) -> Section`,`state ∈ ok/stale/missing/corrupt/unknown` | `unattended_report`:`collect_days`、`parse_day_log`、`heartbeat_state`、`heartbeat_day`、`longest_clean_streak`、`missing_weekdays`、`acceptance_checklist`;`record_market_data_wrapper.read_json` 及 stalled 判定;`research_sandbox.load_result` / `is_approved` |
 | `dashboard/safe.py` | 账号掩码、`redact`、相对路径、截断 | `notify.webhook.redact`(脱敏唯一出处) |
-| `scripts/status_server.py` | `StatusApp`(纯逻辑,便于单测)+ `ThreadingHTTPServer` | 令牌文件与限流写法同 `research_gateway.py` |
+| `dashboard/app.py` + `scripts/status_server.py` | FastAPI 应用(**派生自上游 `web.py`**,按 ADR『fork 范围』处置)+ uvicorn 入口(强制回环地址)。路由层只做适配,取数与判断全在 `collectors` | 令牌文件与限流写法同 `research_gateway.py`;上游只保留应用骨架与静态托管模式 |
 | `dashboard/static/` | `index.html`、`app.js`、`style.css` | — |
 
 暂停标志文件名:面板自己定义常量(不 import `trading`),加测试断言与 `trading.guard_rule.PAUSE_FLAG_NAME` 相等。
@@ -86,7 +88,14 @@ flowchart LR
   - 依赖:T1;验收:任意输入字符串经净化后不含账号原文、令牌样式、`CTP_` 变量名样式、绝对路径
 
 ### 阶段 3:服务层
-- [ ] **T6** `StatusApp` + 服务入口:鉴权、限流、GET/HEAD-only、路由白名单、区块级 try/except、令牌文件自动生成(`data/state/status.token`)、拒绝非回环监听、安全响应头(含 CSP)
+- [ ] **T6** fork 并改造(`dashboard/app.py` + `scripts/status_server.py`),拆为子任务:
+  - **T6a 谱系**:`dashboard/NOTICE-vnpy_webtrader.md`(版本 1.1.0、安装包 SHA-256、MIT 全文、处置表);派生文件头部注明来源
+  - **T6b 剥离**:删除 `POST /token`、`/tick` 订阅、`POST/DELETE /order`、WebSocket 与 `rpc_callback`、`RpcClient`、全部 `vnpy.*` import、passlib / python-jose / python-multipart 依赖
+  - **T6c 鉴权**:令牌文件(`data/state/status.token`,不存在则安全随机生成)+ 常量时间比较 + 每分钟限流
+  - **T6d 路由**:契约里阶段①的接口;区块级 try/except;GET/HEAD-only
+  - **T6e FastAPI 默认行为**:关闭 `/docs` `/redoc` `/openapi.json` 与斜杠重定向;统一异常处理器输出 `{"error","code"}` 且不回显请求内容(422/404/405/500);中间件加 CSP / `nosniff` / `no-store`;405 带 `Allow`
+  - **T6f 入口**:拒绝非回环地址;静态托管只服务构建清单内的文件
+  - **T6g 依赖**:新建 `requirements-dashboard.txt`(`fastapi`、`uvicorn`;测试另需 `httpx`),交易侧 `requirements.txt` 与 Dockerfile 不变
   - 依赖:T2–T5;验收:见 T8
 
 ### 阶段 4:前端
@@ -102,6 +111,7 @@ flowchart LR
   - 路径穿越:`/api/docs/..%2f..%2f.env`、`/api/docs/C:\...` 一律 404;静态路由只服务白名单文件名
   - 过期语义:心跳 mtime 超阈值 → `stale`,总灯不为绿
   - 边界:`dashboard/` 不 import `trading` / `vnpy`(AST);暂停标志常量与 trading 一致
+  - fork:应用的**实际路由集合**(`app.routes`)== 契约阶段①的路径集合 + 静态页,且无任何委托类、`/token`、`/docs` 类路由;`/docs` `/redoc` `/openapi.json` 返回 404;非 GET 返回 405 且 JSON 为契约 Error 形状;校验错误(422)不回显输入;`NOTICE-vnpy_webtrader.md` 存在且含 MIT 全文与版权人;`requirements.txt` 与 Dockerfile 不含 fastapi/uvicorn
   - 覆盖率 ≥85%
 - [ ] **T9** 实机验收:用真实 `runtime/data` 与 `.ops` 状态启动,逐卡片核对(可用 playwright 截图);故意删除/损坏一个文件确认降级;**杀掉面板进程,确认交易心跳不变**
   - 依赖:T7、T8
@@ -139,6 +149,10 @@ graph TD
 | 读到写了一半的文件 | 低 | 中 | 状态文件为原子替换;读取失败重试一次后降级为 `corrupt` |
 | Windows 文件锁、大日志拖慢 | 中 | 中 | 只读打开;按 mtime 缓存;限制单次读取字节数 |
 | 面板拖累交易 | 高 | 低 | 独立进程;不共享锁;不 import 交易代码;验收时杀面板确认交易不受影响 |
+| FastAPI 默认行为与契约冲突(自动文档暴露、422 回显输入、斜杠重定向、默认响应体) | 中 | 高 | T6e 显式处理并有测试;被默认行为反复绊倒时回退到完全自写后端(ADR 备选) |
+| 上游残留的危险代码被误引入(委托、订阅、RPC) | 高 | 低 | T6b 删除;路由集合测试 + `dashboard/` 禁 import `vnpy` 的 AST 测试;委托类路径正则测试(`test_web_contract.py` 已有) |
+| 新增 Web 依赖污染交易环境或镜像 | 中 | 中 | `requirements-dashboard.txt` 隔离;测试断言交易侧依赖文件不含 Web 包 |
+| 上游后续安全修复未跟进 | 低 | 中 | 记录版本与 SHA-256;升级 vnpy 大版本时顺带复查 |
 | 范围蔓延成控制台 | 高 | 中 | ADR"明确不做"清单;路由枚举测试把边界变成可执行约束 |
 | 时区混淆(本机太平洋时间 vs 北京时间) | 中 | 高 | 本机时区与北京时间并列显示 |
 
@@ -153,8 +167,10 @@ graph TD
 
 - 方法清晰度:用户采纳了"三步方案"(只读状态页 → 只读实时数据 → 仅安全控制),判定为方法明确,未走澄清与多模型共识环节。
 - planner 分解与专家校验:2026-11-12,`gemini-2.5-pro` 发起、`gemini-3-pro-preview` 完成校验(工具返回完成,未附带修改意见;不能当作独立审查结论,正式审查在 T10 的 G8 双轮)。
+- fork 决定(2026-11-12,用户):由『不使用』改为『fork 并改造』;核对上游许可证为 MIT、依赖为 fastapi / passlib / python-jose / python-multipart / uvicorn / websockets / vnpy(本环境均未安装);据此新增 T6a–T6g 与依赖隔离。
 - 事实核对:`vnpy_webtrader` 1.1.0 安装包(路由、鉴权、前端规模、RPC 注册项)与本仓库状态文件格式(`account_guard.json` 键、心跳机制、可复用函数)均为本次实际读取,而非凭记忆。
 
 ## 修订记录
 
 - 2026-11-12 初版。
+- 2026-11-12 按用户决定改为 fork `vnpy_webtrader` 后端:更新决策依据、范围、架构图、模块边界,T6 拆为 T6a–T6g,补测试项与风险。
