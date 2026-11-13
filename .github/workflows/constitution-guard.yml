@@ -1,0 +1,30 @@
+name: Constitution Guard
+# 不可变宪法清单的"只能追加"靠版本控制保证:每次提交后的清单相对上一次只能增不能减。
+# 这个检查需要**完整历史**,所以必须 fetch-depth: 0——浅克隆下 git log 只看得到一个提交,
+# 检查会"看起来通过"实则根本没比对,所以测试里对浅克隆是 fail-closed(直接失败)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  constitution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 完整历史:否则"只能追加"的比对无从谈起
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      # 宪法层不依赖 vnpy:清单与测试只用标准库,CI 不必装整个交易环境。
+      - name: Check the constitution is append-only
+        run: pytest tests/test_constitution.py -q

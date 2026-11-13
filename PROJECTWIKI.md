@@ -168,6 +168,7 @@ flowchart LR
 **风控(纯逻辑在 `risk/`,vn.py 集成在 `trading/`)**
 - `risk/risk_guard.py`:单笔预算闸、只收紧的移动止损、策略层连亏熔断。
 - `risk/promotion_gate.py`:策略晋级门槛(9 条,含 DSR ≥ 0.95),纯函数;`risk/dsr.py`、`risk/trial_ledger.py`:DSR 与试验次数账本(Issue #15)。
+- `risk/constitution.py` + `config/immutable_constitution.json`:不可变宪法(Issue #16)——候选能改什么、不能改什么的机器可校验清单。三层防线:提交时的静态 AST 筛查、执行前的运行时类校验、请求时的参数校验;清单文件只能追加(相对历史提交只增不减,由 `.github/workflows/constitution-guard.yml` 保证:`fetch-depth: 0` 拉全历史后逐个历史版本比对;仓库是浅克隆时该检查直接失败而不是跳过),文件缺失/非法即 fail-closed。三个子进程入口统一走 `research_api.import_candidate()`,一处不漏。G8:第 1 轮外部复核无 Critical/High;codex 已审 4 轮,第 4 轮(31/50)的 6 项发现逐条复现后修复并各配了会在修复前失败的测试;**第 5 轮因 codex 账号 429 限流未能完成**(期间补了一轮独立外部复核 46/50 作参考,不替代 codex 那一轮),额度恢复后仍需补跑。
 - `risk/account_guard.py`:账户级双层熔断(当日 600 / 累计 2000)、原子落盘、解锁冷却与历史、非策略委托计数。
 - `risk/order_policy.py`:CTP 错误码优先的废单三级分类与有限重试策略。
 - `risk/live_admission.py`:生产 API 的实盘准入检查(需晋级门槛批准文件)。

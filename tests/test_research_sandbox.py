@@ -70,6 +70,18 @@ def test_screen_reports_syntax_error_instead_of_crashing():
     assert any("语法" in f for f in rs.screen_source("def (:\n"))
 
 
+@pytest.mark.parametrize("src, needle", [
+    ("operator.attrgetter('__dict__')(self)\n", "__dict__"),
+    ("x.__class__.__bases__\n", "__class__"),
+])
+def test_screen_flags_forbidden_attr_names_used_as_strings(src, needle):
+    """属性名当字符串用,能绕开"禁止访问 __dict__"的属性写法。
+
+    operator.attrgetter('__dict__')(self) 的调用点看不出访问的是什么,只有字符串本身露馅。"""
+    findings = rs.screen_source(src)
+    assert findings and any(needle in f for f in findings), findings
+
+
 # ---------- 子进程环境白名单 ----------
 
 def test_sandbox_env_drops_trading_credentials_and_unknown_vars():
@@ -209,3 +221,49 @@ def test_sandbox_env_passes_data_and_config_paths_but_still_nothing_secret():
                           "CTP_PASSWORD": "x", "WEBHOOK_URL": "u", "DEEPSEEK_API_KEY": "k"})
 
     assert env == {"INVEST_C15_DATA": "/data/derived/x.csv", "RESEARCH_SANDBOX_CONFIG": "/tmp/c.json"}
+
+
+# ---------- 不可变宪法接入静态筛查 ----------
+
+def test_screen_source_reports_constitution_violations():
+    findings = rs.screen_source("class C:\n    risk_budget = 99999.0\n")
+    assert any("risk_budget" in f for f in findings)
+
+
+def test_screen_source_still_reports_forbidden_imports():
+    findings = rs.screen_source("import os\n")
+    assert any("禁止导入" in f for f in findings)
+
+
+def test_screen_source_accepts_a_well_behaved_candidate():
+    src = "class C:\n    fast_window = 8\n    def entry_signal(self):\n        return 0\n"
+    assert rs.screen_source(src) == []
+
+
+def test_screen_source_does_not_report_new_members():
+    src = "class C:\n    adx_window = 14\n    def helper(self):\n        return 1\n"
+    assert rs.screen_source(src) == []
+
+
+# ---------- 别名绕过:拦引用而不是拦调用 ----------
+
+@pytest.mark.parametrize("src, needle", [
+    ("s = setattr\ns(self, 'risk_budget', 10**12)\n", "setattr"),
+    ("v = vars\nv(self)['risk_budget'] = 10**12\n", "vars"),
+    ("g = getattr\ng(object, '__setattr__')\n", "getattr"),
+    ("d = delattr\nd(self, 'risk_budget')\n", "delattr"),
+    ("t = type\nt(self)\n", "type"),
+])
+def test_screen_flags_an_alias_of_a_forbidden_call(src, needle):
+    """先取别名再调用,调用点已经看不出被调的是谁——所以要拦**引用**。
+
+    `s = setattr` 之后 `s(self, "risk_budget", 10**12)` 的调用点是裸名字,
+    只拦"调用"等于给别名留了门。"""
+    findings = rs.screen_source(src)
+    assert findings and any(needle in f for f in findings), findings
+
+
+def test_screen_rejects_the_operator_module():
+    """operator.attrgetter('__dict__') 是反射入口:属性名可以是字符串,绕开属性名检查。"""
+    findings = rs.screen_source("import operator\noperator.attrgetter('__dict__')(self)\n")
+    assert findings and any("operator" in f for f in findings), findings

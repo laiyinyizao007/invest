@@ -23,7 +23,15 @@ FIRST_VALIDATION_START = datetime(2022, 7, 1)
 AXES = 3
 MIN_AXIS_VALUES = 3
 MAX_AXIS_VALUES = 10
-FORBIDDEN_AXES = {"risk_budget", "max_daily_losses", "atr_window", "history_vt_symbol"}
+# 风控/固定参数:不得进入网格(风控底线永不优化)。取自不可变宪法清单,避免两处各写一份而漂移。
+# 清单不可用时退回内置集合:宁可少拦也不让优化器整体不可用(真正的兜底在 check_params 与运行时类校验)。
+try:
+    from risk.constitution import load as _load_constitution
+    FORBIDDEN_AXES = set(_load_constitution().protected_parameters)
+except Exception:                                    # noqa: BLE001 - 清单缺失/非法时的兜底
+    # 兜底取内置集合本身(不是另抄一份):否则内置清单加了项而这里没同步,会静默少拦。
+    from risk.constitution import default as _default_constitution
+    FORBIDDEN_AXES = set(_default_constitution().protected_parameters)
 
 Runner = Callable[[type, dict, list, float], dict]
 

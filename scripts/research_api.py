@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +29,7 @@ import bootstrap
 import research_config as rc
 import research_sandbox as rs
 from research_grid import MIN_AXIS_VALUES
+from risk import constitution as const
 from risk.report import render_report
 from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
 
@@ -162,6 +163,85 @@ def screen(path: Path, cfg: dict) -> list[str]:
                             cfg["screening"]["extra_forbidden_calls"])
 
 
+def check_params_allowed(params: dict) -> None:
+    """调用方给的设置字典不得包含受保护参数(risk_budget 等):否则风控底线可被请求方绕过。"""
+    try:
+        constitution = const.load()
+    except const.ConstitutionError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+    findings = const.check_params(params, constitution)
+    if findings:
+        raise JobError(EXIT_REFUSED, "拒绝执行: " + "; ".join(findings))
+
+
+def child_params(args) -> dict:
+    """子进程自己解析并校验参数。
+
+    子入口(`_child` / `_gate_child`)是**独立的信任边界**:它能被直接调用,
+    不能假设父进程已经查过参数——否则绕过父入口直接传 `--params '{"risk_budget": 1e9}'`
+    就能改写风控底线。"""
+    try:
+        params = json.loads(args.params)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise JobError(EXIT_REFUSED, f"--params 不是合法 JSON: {exc}") from exc
+    if not isinstance(params, dict):
+        raise JobError(EXIT_REFUSED, "--params 必须是 JSON 对象")
+    check_params_allowed(params)
+    return params
+
+
+def check_candidate_class(candidate: type) -> None:
+    """运行时校验候选类:必须继承模板,且不得重写白名单以外的模板成员(含类创建后打的补丁)。"""
+    try:
+        constitution = const.load()
+        template = const.load_template(constitution)
+    except const.ConstitutionError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+    findings = const.check_class(candidate, template, constitution)
+    if findings:
+        raise JobError(EXIT_REFUSED, "拒绝执行: 候选类不符合不可变宪法:" + "; ".join(findings))
+
+
+def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
+    """在子进程里载入候选类,并**统一**做完三层校验(哈希、静态筛查、运行时类校验)。
+
+    三层校验必须走同一个入口:早先三个子进程各自复制一遍流程,结果 gate 入口漏掉了
+    运行时类校验,整条 gate 路径只剩静态筛查一层。复制粘贴的防线会漏,这里收敛成一个函数。
+
+    哈希、筛查、编译、执行**必须基于同一份字节**:分开打开文件会留下 TOCTOU 窗口,
+    而用 `spec.loader.exec_module()` 载入时,Python 可能从 `__pycache__` 里取时间戳有效的旧 `.pyc`
+    ——那意味着人工批准的、算过哈希的、过了静态筛查的源码,和实际执行的字节码**不是一回事**。
+    所以这里只读一次字节,再对同一份内容做完所有事。"""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件无法读取: {exc}") from exc
+    if hashlib.sha256(raw).hexdigest() != sha256:            # 批准之后文件被改动(TOCTOU):拒绝运行
+        raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
+    cfg = rc.load()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    try:
+        code = compile(source, str(path), "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件语法错误: {exc}") from exc
+    module = types.ModuleType("pending_strategy")
+    module.__file__ = str(path)
+    exec(code, module.__dict__)                               # noqa: S102 —— 执行的就是上面校验过的那份字节
+    from vnpy_ctastrategy import CtaTemplate
+    candidate = getattr(module, cls_name, None)
+    if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
+        raise JobError(EXIT_FAILED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
+    check_candidate_class(candidate)                          # 运行时再查一次:挡住批准后被替换的候选
+    return candidate
+
+
 def require_clean(path: Path, cfg: dict) -> None:
     findings = screen(path, cfg)
     if findings:
@@ -260,6 +340,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
         raise JobError(EXIT_REFUSED, str(exc))
     if not isinstance(params, dict):
         raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
+    check_params_allowed(params)
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
@@ -321,6 +402,7 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     low, high = rc.INT_BOUNDS[("gate", "random_runs")]
     if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    check_params_allowed(params)
     on_plateau, plateau_note = plateau
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
@@ -456,24 +538,20 @@ def run_gate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
-    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    if screen(path, rc.load()):
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    from vnpy_ctastrategy import CtaTemplate
-    cls = getattr(module, args.cls, None)
-    if not (isinstance(cls, type) and issubclass(cls, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
+    try:
+        params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    try:
+        cls = import_candidate(path, args.cls, args.sha256)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
-        result = run_gate(candidate_cls=cls, params=json.loads(args.params), windows=windows, bars=bars,
+        result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
                           runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
                           prior_trials=args.prior_trials)
@@ -492,23 +570,14 @@ def run_evaluate_child(args) -> int:
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
     path = Path(args.file)
-    if rs.file_sha256(path) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    cfg = rc.load()
-    if screen(path, cfg):
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    from vnpy_ctastrategy import CtaTemplate
-    candidate = getattr(module, args.cls, None)
-    if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
+    try:
+        candidate = import_candidate(path, args.cls, args.sha256)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
+    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
         result = run_evaluation(
             candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
@@ -527,22 +596,18 @@ def run_child(args) -> int:
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     start, end = rs.segment_window(args.key, args.segment)
-    if rs.file_sha256(Path(args.file)) != args.sha256:       # 批准之后文件被改动(TOCTOU):拒绝运行
-        print("策略文件在批准后被改动,拒绝运行", file=sys.stderr)
-        return EXIT_REFUSED
-    if screen(Path(args.file), rc.load()):         # 子进程再筛一次,防止文件在两步之间被替换
-        print("静态筛查未通过", file=sys.stderr)
-        return EXIT_REFUSED
-    spec = importlib.util.spec_from_file_location("pending_strategy", args.file)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    strategy_class = getattr(module, args.cls, None)
-    from vnpy_ctastrategy import CtaTemplate
-    if not (isinstance(strategy_class, type) and issubclass(strategy_class, CtaTemplate)):
-        print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
-        return EXIT_FAILED
     try:
-        stats, _, trades = run_backtest(strategy_class, json.loads(args.params), args.key, start, end)
+        params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    try:
+        strategy_class = import_candidate(Path(args.file), args.cls, args.sha256)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    try:
+        stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK

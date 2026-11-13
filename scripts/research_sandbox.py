@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from risk import constitution as const
+
 PENDING_DIR = "pending_strategies"
 SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
@@ -25,8 +27,12 @@ FORBIDDEN_MODULES = {
     "os", "sys", "subprocess", "socket", "ctypes", "shutil", "pathlib", "importlib", "pickle", "marshal",
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
+    "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
 }
-FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input"}
+# 这些名字**任何引用**都拦,不只直接调用:`s = setattr` 之后 `s(self, "risk_budget", 1e9)` 的调用点是裸名字,
+# AST 看不见被调的是谁。只拦调用等于给别名留了门。
+FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input",
+                   "type"}      # type(self).__base__ 之类的反射入口
 FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
 
 ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
@@ -66,6 +72,11 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
     except SyntaxError as exc:
         return [f"语法错误: {exc.msg} (第 {exc.lineno} 行)"]
     findings: list[str] = []
+    try:
+        constitution = const.load()
+    except const.ConstitutionError as exc:
+        return [f"不可变宪法清单不可用(fail-closed): {exc}"]      # 清单坏了就不筛查,一律拒绝
+    findings.extend(const.screen_source(source, constitution))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
@@ -76,10 +87,15 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
         for name in names:
             if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
-            findings.append(f"第 {node.lineno} 行: 禁止调用 {node.func.id}()")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in forbidden_calls:
+            # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
+            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
+        # 属性名当字符串用:operator.attrgetter('__dict__')(self) 能绕开"禁止访问 __dict__"的
+        # 属性写法(调用点看不出访问的是什么)。这些名字作为字符串出现时一律拒绝。
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_ATTRS:
+            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.value} 字符串")
     return findings
 
 
