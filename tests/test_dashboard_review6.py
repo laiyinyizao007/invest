@@ -119,3 +119,38 @@ def test_a_message_containing_a_pipe_still_hides_a_truncated_marker():
     """消息里带竖线时,只取最后一段会丢掉前半段——整行也要检查。"""
     line = "2026-11-13 09:00:00 | ERROR | Runtime | 见 a | 硬锁".encode("utf-8")
     assert _parse(PREFIX + line).trusted is False
+
+
+def test_real_log_lines_are_not_mistaken_for_a_truncated_event():
+    """用仓库里的真实日志做语料:每一条当作未终止的尾行,都不该被判为『藏着事件』。
+
+    (前缀检测曾把『当前权益 10000』误判;真实语料是最直接的回归防线。)
+    """
+    import pathlib
+
+    log_dir = pathlib.Path(__file__).resolve().parents[1] / "runtime" / "vntrader" / "log"
+    if not log_dir.is_dir():
+        pytest.skip("仓库里没有真实日志")
+    samples: list[str] = []
+    for f in sorted(log_dir.glob("vt_*.log")):
+        samples.extend(f.read_text(encoding="utf-8", errors="replace").splitlines())
+        if len(samples) > 3000:
+            break
+    if not samples:
+        pytest.skip("没有可用的真实日志样本")
+    false_positives = []
+    for line in samples:
+        parser = ls.DayLogParser("2026-11-13")
+        parser.feed(b"2026-11-13 08:00:00 | INFO | Runtime | x\n" + line.encode("utf-8"))
+        if not parser.snapshot("x").trusted:
+            false_positives.append(line)
+    assert not false_positives, false_positives[:5]
+
+
+def test_no_marker_prefix_is_missed_when_the_tail_is_truncated():
+    """所有关键字的所有前缀、放在不同前缀文本之后,都要被判为不可信。"""
+    for marker in ls.EVENT_MARKERS:
+        for cut in range(1, len(marker)):
+            for prefix in ("", "前文 ", "a | b "):
+                line = f"2026-11-13 09:00:00 | ERROR | Runtime | {prefix}{marker[:cut]}".encode("utf-8")
+                assert _parse(PREFIX + line).trusted is False, (marker, cut, prefix)
