@@ -25,7 +25,7 @@ invest 是一套自动交易系统(vn.py + CTP)。交易、风控、录制、研
 | 9 | [`06-design-system.md`](06-design-system.md) | 前端、设计 | 设计令牌(对比度实测)、玻璃拟态规则与降级、状态的视觉表达、Bento 布局、组件清单 |
 | 10 | [`07-lovable-prompts.md`](07-lovable-prompts.md) | 用 Lovable 的人 | P0–P14 提示词包,每步带验收点;偏离约束时的纠正话术 |
 | 11 | [`08-evolution-views.md`](08-evolution-views.md) | 前端 | **进化引擎三个视图**:进化曲线、参数热力图、代码与变异日志(数据来自毕昇工作流) |
-| 12 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 严格模式编译通过) |
+| 12 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 5.6 严格模式编译验证,2026-11-13;`tests/test_lovable_seed_typescript.py` 在装了 tsc 的环境里会再编译一遍) |
 
 契约由测试守住:`tests/test_web_contract.py` 校验每个示例都符合 OpenAPI 里的模型,并校验 `lovable-seed/` 与契约同步(不同步则失败,重新生成:`python tools/webgen/gen_lovable_seed.py`)。前端导出物入库前必须通过 `tools/audit_frontend_export.py`。**改接口先改 OpenAPI 和示例,测试通过再改实现。**
 
