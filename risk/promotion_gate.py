@@ -92,9 +92,12 @@ def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> lis
     if m.dsr is None:
         fails.append("DSR 未计算:缺少去通胀检验,不予通过")
     else:
-        if m.n_trials < 1:
-            fails.append("DSR 缺少试验次数:无法核对多重检验的去通胀是否到位,不予通过")
-        if m.dsr < t.min_dsr:
+        # 审计字段严格校验:NaN 比较恒为 False、bool 是 int 的子类,宽松比较会把它们放过
+        if isinstance(m.n_trials, bool) or not isinstance(m.n_trials, int) or m.n_trials < 1:
+            fails.append("DSR 缺少有效的试验次数:无法核对多重检验的去通胀是否到位,不予通过")
+        if isinstance(m.dsr, bool) or not isinstance(m.dsr, (int, float)) or not math.isfinite(m.dsr) or not 0.0 <= m.dsr <= 1.0:
+            fails.append(f"DSR 取值非法({m.dsr!r}):必须是 [0, 1] 内的有限数,不予通过")
+        elif m.dsr < t.min_dsr:
             fails.append(f"DSR {m.dsr:.3f} < {t.min_dsr}(累计试验 {m.n_trials} 次):扣除多重检验后不能排除是运气")
 
     return fails

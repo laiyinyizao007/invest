@@ -69,3 +69,28 @@ def test_unreadable_ledger_fails_closed(tmp_path):
     path.mkdir()                                  # 是目录而不是文件:读取失败
     with pytest.raises(TrialLedgerError):
         total_trials(path)
+
+
+def test_huge_counts_are_rejected_on_write_and_on_read(tmp_path):
+    from risk.trial_ledger import MAX_ENTRY_COUNT
+    path = tmp_path / "trials.jsonl"
+    with pytest.raises(TrialLedgerError):
+        record_trials(path, "grid_cell", MAX_ENTRY_COUNT + 1, at=1.0)
+    path.write_text(json.dumps({"kind": "grid_cell", "count": 10**1000, "at": 1}) + "\n", encoding="utf-8")
+    with pytest.raises(TrialLedgerError):             # 否则 DSR 的尾概率会舍入成 1.0 而永久抛错
+        total_trials(path)
+
+
+def test_accumulated_total_is_capped(tmp_path):
+    from risk.trial_ledger import MAX_ENTRY_COUNT, MAX_TOTAL
+    path = tmp_path / "trials.jsonl"
+    with open(path, "w", encoding="utf-8") as stream:
+        for _ in range(MAX_TOTAL // MAX_ENTRY_COUNT + 2):
+            stream.write(json.dumps({"kind": "grid_cell", "count": MAX_ENTRY_COUNT, "at": 1}) + "\n")
+    with pytest.raises(TrialLedgerError):
+        total_trials(path)
+
+
+def test_gate_run_is_a_valid_kind(tmp_path):
+    path = tmp_path / "trials.jsonl"
+    assert record_trials(path, "gate_run", 1, at=1.0) == 1

@@ -16,7 +16,10 @@ import os
 import threading
 from pathlib import Path
 
-KINDS = ("submission", "grid_cell")
+KINDS = ("submission", "grid_cell", "gate_run")
+# 上限:count 过大时 DSR 的尾概率 1-1/N 会舍入成 1.0 并抛 StatisticsError,账本在语法上有效却让评估永久失败
+MAX_ENTRY_COUNT = 10**9
+MAX_TOTAL = 10**12
 _lock = threading.Lock()
 
 
@@ -36,11 +39,13 @@ def _entries(path: Path) -> list[dict]:
             if not isinstance(data, dict):
                 raise ValueError("记录不是对象")
             count = data.get("count")
-            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-                raise ValueError("count 必须是正整数")
+            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_ENTRY_COUNT:
+                raise ValueError(f"count 必须是 1..{MAX_ENTRY_COUNT} 的整数")
             if data.get("kind") not in KINDS:
                 raise ValueError("未知的 kind")
             entries.append(data)
+        if sum(e["count"] for e in entries) > MAX_TOTAL:
+            raise ValueError(f"累计试验次数超过上限 {MAX_TOTAL}")
     except (OSError, ValueError) as exc:          # JSONDecodeError 是 ValueError 的子类
         raise TrialLedgerError(f"试验账本损坏或无法读取(fail-closed): {exc}") from exc
     return entries
@@ -55,11 +60,13 @@ def record_trials(path: Path, kind: str, count: int, *, at: float) -> int:
     """追加一条试验记录并返回追加后的累计次数。"""
     if kind not in KINDS:
         raise TrialLedgerError(f"未知的试验类型: {kind!r}")
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        raise TrialLedgerError("试验次数必须是正整数")
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_ENTRY_COUNT:
+        raise TrialLedgerError(f"试验次数必须是 1..{MAX_ENTRY_COUNT} 的整数")
     path = Path(path)
     with _lock:
         existing = sum(e["count"] for e in _entries(path))      # 先校验,损坏则不追加
+        if existing + count > MAX_TOTAL:
+            raise TrialLedgerError(f"累计试验次数将超过上限 {MAX_TOTAL}")
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(path, "a", encoding="utf-8") as stream:

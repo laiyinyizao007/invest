@@ -28,6 +28,7 @@ from pathlib import Path
 import bootstrap
 import research_config as rc
 import research_sandbox as rs
+from research_grid import MIN_AXIS_VALUES
 from risk.report import render_report
 from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
 
@@ -94,17 +95,25 @@ def prior_trials(paths: dict) -> int:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
 
 
-def record_grid_trials(paths: dict, body: dict) -> None:
-    """按子进程回报的 trials.grid_cells 记账;失败的评估同样消耗试验。子进程报错(无结果)时不记。"""
+MIN_GRID_CELLS = MIN_AXIS_VALUES ** 3     # 合法网格至少 3 个参数 × 每个 ≥3 个取值
+
+
+def charge_trials(paths: dict, kind: str, count: int) -> int:
+    """在启动子进程**之前**先记账并返回新的累计数:超时、崩溃、后半段异常都不会让试验变成免费的。"""
+    try:
+        return record_trials(trials_path(paths), kind, count, at=time.time())
+    except TrialLedgerError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
+def top_up_grid_trials(paths: dict, body: dict) -> None:
+    """evaluate 已按最小网格预扣 MIN_GRID_CELLS;子进程回报的格子数更大时补记差额(更小的回报不可信,不退还)。"""
     trials = body.get("trials")
     if not isinstance(trials, dict):
         return
     cells = trials.get("grid_cells")
-    if isinstance(cells, int) and not isinstance(cells, bool) and cells > 0:
-        try:
-            record_trials(trials_path(paths), "grid_cell", cells, at=time.time())
-        except TrialLedgerError as exc:
-            raise JobError(EXIT_REFUSED, str(exc)) from exc
+    if isinstance(cells, int) and not isinstance(cells, bool) and cells > MIN_GRID_CELLS:
+        charge_trials(paths, "grid_cell", cells - MIN_GRID_CELLS)
 
 
 class JobError(Exception):
@@ -316,7 +325,7 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
-    trials = max(prior_trials(paths), 1)          # 这次门槛评估本身至少算一次试验,账本为空也不给 0
+    trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
@@ -363,13 +372,14 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
-    prior = prior_trials(paths)
+    prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
+    charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
            "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path), "--prior-trials", str(prior)]
     body = spawn_child(cmd, timeout)
     if "error" not in body:
-        record_grid_trials(paths, body)
+        top_up_grid_trials(paths, body)
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}

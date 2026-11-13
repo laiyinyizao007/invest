@@ -122,3 +122,17 @@ def test_dsr_failure_message_names_trials():
 def test_all_failures_are_reported_together():
     bad = CandidateMetrics(0.5, 1.0, -40.0, -4000, 10, 50.0, 0.0, False, False)
     assert len(check_gate(bad)) >= 7
+
+
+# ---------- check_gate 对审计字段严格 fail-closed ----------
+
+@pytest.mark.parametrize("bad_dsr", [float("nan"), float("inf"), -0.1, 1.5, True])
+def test_non_finite_or_out_of_range_dsr_fails_closed(bad_dsr):
+    fails = check_gate(replace(GOOD, dsr=bad_dsr))
+    assert any("DSR" in f for f in fails), bad_dsr
+
+
+@pytest.mark.parametrize("bad_n", [True, 1.5, float("nan"), -3, 0, "50"])
+def test_invalid_trial_counts_fail_closed(bad_n):
+    fails = check_gate(replace(GOOD, n_trials=bad_n))
+    assert any("试验次数" in f for f in fails), bad_n

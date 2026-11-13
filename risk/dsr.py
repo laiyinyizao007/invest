@@ -51,12 +51,19 @@ def deflated_sharpe(daily_returns: Sequence[float], n_trials: int) -> float:
     t = len(daily_returns)
     if t < 3:
         return 0.0
-    mean, sd, skew, kurt = moments(daily_returns)
-    if sd <= 0:
+    # NaN/inf 比较恒为 False,会让 `dsr < 阈值` 放过候选,所以任何非有限的输入或中间量都按 0.0 处理(fail-closed)
+    if not all(isinstance(r, (int, float)) and not isinstance(r, bool) and math.isfinite(r) for r in daily_returns):
         return 0.0
-    sr = mean / sd
-    denom = 1 - skew * sr + (kurt - 1) / 4 * sr**2
-    if denom <= 0:
+    try:
+        mean, sd, skew, kurt = moments(daily_returns)
+        if not all(math.isfinite(x) for x in (mean, sd, skew, kurt)) or sd <= 0:
+            return 0.0
+        sr = mean / sd
+        denom = 1 - skew * sr + (kurt - 1) / 4 * sr**2
+        if not math.isfinite(denom) or denom <= 0:
+            return 0.0
+        z = (sr - expected_max_sharpe(n_trials, t)) * math.sqrt(t - 1) / math.sqrt(denom)
+        result = _NORM.cdf(z)
+    except (OverflowError, ValueError, ZeroDivisionError):
         return 0.0
-    z = (sr - expected_max_sharpe(n_trials, t)) * math.sqrt(t - 1) / math.sqrt(denom)
-    return _NORM.cdf(z)
+    return result if math.isfinite(result) else 0.0

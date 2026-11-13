@@ -82,3 +82,17 @@ def test_matches_manual_formula():
 def test_invalid_trials_rejected():
     with pytest.raises(ValueError):
         deflated_sharpe(noise(100, 7), 0)
+
+
+# ---------- 非有限输入必须 fail-closed(NaN 比较恒为 False,会绕过 `dsr < 阈值`) ----------
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_returns_give_zero_not_nan(bad):
+    rets = noise(200, 8, mean=0.002)
+    rets[50] = bad
+    assert deflated_sharpe(rets, 10) == 0.0
+
+
+def test_overflowing_moments_give_zero_not_nan():
+    rets = [1e200, -1e200, 1e200, -1e200, 3e200]
+    assert deflated_sharpe(rets, 10) == 0.0

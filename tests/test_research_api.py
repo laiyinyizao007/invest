@@ -593,13 +593,41 @@ def test_failed_evaluations_still_consume_trials(tree, monkeypatch):
     assert _trials(tree) == 54
 
 
-def test_strategy_errors_do_not_write_trials(tree, monkeypatch):
+def test_strategy_errors_still_consume_the_minimum_grid(tree, monkeypatch):
+    """子进程报错也可能已扫过格子(后半段异常):无法区分时按最小网格 27 保守预扣,不让失败变成免费探索。"""
     make_strategy(tree)
     monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "GridError", "message": "x"}})
 
     api.evaluate_job(strategy="s.py", cls="S", confirm=True)
 
-    assert _trials(tree) == 0
+    assert _trials(tree) == 27
+
+
+def test_timeouts_and_crashes_consume_the_minimum_grid_too(tree, monkeypatch):
+    make_strategy(tree)
+
+    def boom(cmd, timeout):
+        raise api.JobError(api.EXIT_TIMEOUT, "超时")
+
+    monkeypatch.setattr(api, "spawn_child", boom)
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 27
+
+
+def test_precharge_is_not_double_counted_with_the_child_report(tree, monkeypatch):
+    make_strategy(tree)
+    _seed_trials(tree, 5)
+    seen = {}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: seen.update(cmd=cmd) or
+                        {"passed": False, "failures": [], "params": None, "selection": {"n_cells": 64}, "metrics": {},
+                         "trials": {"prior": 5, "grid_cells": 64, "total": 69}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _arg(seen["cmd"], "--prior-trials") == "5"        # 子进程拿到的是预扣之前的数,否则 27 会被算两次
+    assert _trials(tree) == 5 + 64
 
 
 def test_corrupt_trial_ledger_refuses_before_spawning(tree, monkeypatch):
@@ -622,11 +650,27 @@ def test_gate_job_counts_itself_as_at_least_one_trial(tree, monkeypatch):
     monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: seen.update(cmd=cmd) or {"passed": False, "failures": [], "metrics": {}})
 
     api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
-    assert _arg(seen["cmd"], "--prior-trials") == "1"                 # 账本为空也不能给 0
+    assert _arg(seen["cmd"], "--prior-trials") == "1" and _trials(tree) == 1        # 账本为空也不能给 0,且这次要落账
+
+    api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+    assert _arg(seen["cmd"], "--prior-trials") == "2" and _trials(tree) == 2        # 反复换参数,N 必须递增
 
     _seed_trials(tree, 40)
     api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
-    assert _arg(seen["cmd"], "--prior-trials") == "40"
+    assert _arg(seen["cmd"], "--prior-trials") == "43" and _trials(tree) == 43
+
+
+def test_gate_attempt_is_recorded_even_when_the_child_times_out(tree, monkeypatch):
+    make_strategy(tree)
+
+    def boom(cmd, timeout):
+        raise api.JobError(api.EXIT_TIMEOUT, "超时")
+
+    monkeypatch.setattr(api, "spawn_child", boom)
+    with pytest.raises(api.JobError):
+        api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+
+    assert _trials(tree) == 1
 
 
 def test_child_parsers_accept_prior_trials():
@@ -635,3 +679,26 @@ def test_child_parsers_accept_prior_trials():
     g = parser.parse_args(["_gate_child", "--file", "f", "--cls", "S", "--params", "{}", "--on-plateau", "0", "--sha256", "a",
                            "--random-runs", "5", "--prior-trials", "9"])
     assert e.prior_trials == 9 and g.prior_trials == 9
+
+
+def test_reported_grid_cells_are_floored_at_the_minimum_possible_grid(tree, monkeypatch):
+    """子进程回报的格子数低于 3×3×3 在 validate_grid 下不可能出现:按下限 27 记账,不信任更小的数字。"""
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout:
+                        {"passed": False, "failures": [], "params": None, "selection": {"n_cells": 1}, "metrics": {},
+                         "trials": {"prior": 0, "grid_cells": 1, "total": 1}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 27
+
+
+def test_reported_grid_cells_above_the_floor_are_recorded_as_is(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout:
+                        {"passed": False, "failures": [], "params": None, "selection": {"n_cells": 64}, "metrics": {},
+                         "trials": {"prior": 0, "grid_cells": 64, "total": 64}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 64
