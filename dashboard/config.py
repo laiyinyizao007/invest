@@ -38,11 +38,14 @@ DEFAULTS: dict = {
     "log_dirs": ["runtime/vntrader/log"],
     "recording_dir": ".ops/recording",
     "research_config": "config/research_sandbox.json",
+    "evolution_dir": "data/research/evolution",     # 谱系台账(引擎侧写,面板只读)
+    "heatmap_dir": "data/research/heatmaps",         # 参数网格得分表(引擎侧写,面板只读)
     "static_dir": "dashboard/static",
     "token_file": "data/dashboard/status.token",           # 面板专属目录,不在任何交易侧目录树里(见 _check_token_location)
     "stale_after_seconds": {"trading": 60.0, "alerts": 300.0, "days": 600.0, "recording": 120.0, "research": 3600.0, "docs": 86400.0},
     "docs": {"unattended-log": "docs/unattended-log.md", "simnow-drills": "docs/simnow-drills.md"},
     "docs_titles": {"unattended-log": "无人值守运行记录", "simnow-drills": "SimNow 演练记录"},
+    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50},
     "days_default": 14,
     "recent_runs": 10,
     "limits": {"daily_loss_yuan": None, "hard_drawdown_yuan": None},      # None = 取风控默认值
@@ -125,6 +128,8 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
         "state_dir": _resolve(root, raw["state_dir"], "state_dir"),
         "recording_dir": _resolve(root, raw["recording_dir"], "recording_dir"),
         "research_config": _resolve(root, raw["research_config"], "research_config"),
+        "evolution_dir": _resolve(root, raw["evolution_dir"], "evolution_dir"),
+        "heatmap_dir": _resolve(root, raw["heatmap_dir"], "heatmap_dir"),
         "static_dir": _resolve(root, raw["static_dir"], "static_dir"),
         "token_file": _resolve(root, raw["token_file"], "token_file"),
         "log_dirs": [_resolve(root, d, "log_dirs") for d in raw["log_dirs"]],
@@ -144,7 +149,15 @@ DASHBOARD_DIR = "data/dashboard"
 def _is_link(path: Path) -> bool:
     """符号链接或 Windows junction(reparse point)。不存在的路径不算链接。"""
     try:
-        return path.is_symlink() or path.is_junction()
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)         # Path.is_junction 是 Python 3.12 才有的
+        if is_junction is not None:
+            return bool(is_junction())
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)  # 旧版本 Windows:直接看 reparse point 属性
+        return bool(attrs & 0x400)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True                           # 无法判断就按有风险处理(fail-closed)
 

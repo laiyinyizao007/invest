@@ -59,7 +59,7 @@ FRONTEND_ROUTES = (
     re.compile(r"^research/runs/[0-9]{8}-[0-9]{6}-[0-9]{6}$"),
     # 阶段②-⑤ 的页面:后端对应阶段上线前前端不显示入口,但直接访问深链接时仍应得到前端页面(由前端按 capabilities 处理)
     re.compile(r"^(live|equity|control|audit|nodes|data|drills|config)$"),
-    re.compile(r"^research/(runs|candidates/[a-z0-9_]{1,40}\.py)$"),
+    re.compile(r"^research/(runs|evolution|candidates/[a-z0-9_]{1,40}\.py)$"),
 )
 
 ERROR_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "bad_request",
@@ -216,7 +216,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
             "server_timezone": str(now.tzinfo), "exchange_timezone": "Asia/Shanghai",
             "environment": settings.environment, "polling_hint_seconds": settings.raw["polling_hint_seconds"],
             "capabilities": {"live": False, "equity": False, "control": False, "stream": False,
-                             "research_detail": True, "data_views": False, "nodes": False},
+                             "research_detail": True, "data_views": False, "nodes": False,
+                             "evolution": bool(settings.raw.get("evolution", {}).get("enabled"))},
         })
 
     @get("/api/overview")
@@ -255,6 +256,49 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     def doc(key: str):
         d = col.get_doc(settings, key)
         return respond(d) if d is not None else error_response(404, "不存在")
+
+    # ---- 阶段④:进化引擎的只读接口 ----
+    # 约定:阶段②–⑤ 的接口在契约里先存在,路由随该阶段上线才注册(阶段①只注册阶段①的接口,有测试守着)。
+    # 这里用配置开关实现同一件事:evolution.enabled 为真时才注册。读取侧已实现并有测试;
+    # 数据由引擎侧产出,没有数据时如实显示缺失。
+    if settings.raw.get("evolution", {}).get("enabled"):
+        @get("/api/research/evolution")
+        def evolution_list():
+            return respond(col._collect_safely("evolution", col.collect_evolution, settings, clock()).section)
+
+        @get("/api/research/evolution/{campaign_id}/curve")
+        def evolution_curve(campaign_id: str):
+            try:
+                payload = col.get_evolution_curve(settings, campaign_id)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"进化台账不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/evolution/{campaign_id}/log")
+        def evolution_log(campaign_id: str, cursor: str = "", limit: int = 50):
+            try:
+                payload = col.get_evolution_log(settings, campaign_id, cursor, limit)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"进化台账不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/runs/{run_id}/heatmap")
+        def run_heatmap(run_id: str):
+            try:
+                payload = col.get_heatmap(settings, run_id)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"热力图不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/candidates/{sha256}/code")
+        def candidate_code(sha256: str):
+            payload = col.get_candidate_code(settings, sha256)
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/candidates/{sha256}/diff")
+        def candidate_diff(sha256: str, parent: str = ""):
+            payload = col.get_candidate_diff(settings, sha256, parent)
+            return respond(payload) if payload is not None else error_response(404, "不存在")
 
     # ---- 静态页:不需要令牌;SPA 回退只对不含扩展名的路径生效,且永不接管 /api ----
     def index_response() -> Response:

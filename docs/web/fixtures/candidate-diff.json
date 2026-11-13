@@ -1,0 +1,6 @@
+{
+  "from_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "to_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "available": true,
+  "diff": "--- parent\n+++ candidate\n@@ -3,4 +3,4 @@\n class Candidate(CtaTemplate):\n-    fast_window = 24\n+    fast_window = 36\n     slow_window = 192\n"
+}

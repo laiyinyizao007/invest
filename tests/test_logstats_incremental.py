@@ -197,12 +197,13 @@ def test_invalid_utf8_makes_the_log_untrusted_whatever_the_chunking():
         assert parser.snapshot("x").trusted is False, cut
 
 
-def test_a_crash_that_cuts_the_last_line_in_the_middle_of_a_character_does_not_make_the_log_untrusted(tmp_path):
-    """进程崩溃时最后一行可能停在多字节字符中间:这是『写到一半』,不是『编码损坏』。"""
+def test_a_crash_that_cuts_the_last_line_in_the_middle_of_a_character_is_untrusted_but_does_not_crash(tmp_path):
+    """进程崩溃时最后一行可能停在多字节字符中间。被截掉的字符可能正是严重事件关键字的一部分(codex 第 3 次复核),
+    所以不能把这一天算作『无异常』;但这不是永久坏编码——字符补全后重新解析即恢复(见 test_dashboard_review3)。"""
     data = (LINES[0] + "\n").encode("utf-8") + "2026-11-12 10:00:00.000 | ERROR | g | [ERROR] 当日熔断".encode("utf-8")[:-2]
     p = tmp_path / "vt_20261112.log"
     p.write_bytes(data)
-    assert ls.parse_day_log(p).trusted is True
+    assert ls.parse_day_log(p).trusted is False
 
 
 def test_full_parse_of_a_file_with_invalid_utf8_is_untrusted(tmp_path):

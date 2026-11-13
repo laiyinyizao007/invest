@@ -228,3 +228,53 @@ def test_remaining_path_forms_found_by_the_second_review_are_scrubbed(text, leak
 ])
 def test_the_wider_path_rules_do_not_damage_ordinary_text(text):
     assert safe.scrub_text(text) == text
+
+
+@pytest.mark.parametrize("text,leak", [
+    (r"读取 \Users\Alice\secret.env 失败", "Alice"),
+    (r"路径 \Windows\Temp\x.tmp", "Temp"),
+    (r"\ProgramData\some\file.db", "ProgramData"),
+    (r"\home\avery\invest\.env", "avery"),
+])
+def test_a_rooted_windows_path_without_a_drive_letter_is_scrubbed(text, leak):
+    """没有盘符的根路径曾被漏掉:盘符路径有规则,这个形态没有。"""
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+@pytest.mark.parametrize("text,leak", [
+    ("C" + chr(0x200B) + ":" + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "x", "alice"),
+    ("C:" + chr(0x200B) + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "x", "alice"),
+    ("C:" + chr(92) + "Users" + chr(92) + "al" + chr(0x200B) + "ice" + chr(92) + "x", "alice"),
+])
+def test_zero_width_characters_inside_a_path_are_still_scrubbed(text, leak):
+    """零宽字符能拆开路径结构。**不靠删除这些字符**(那会改动服务器原文),
+    而是让路径规则容忍它们——路径本身被整段替换,路径之外的文本一个字节都不动。"""
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+def test_zero_width_characters_outside_a_path_are_left_byte_identical():
+    """净化不应改动与路径无关的原文。"""
+    text = "文本" + chr(0x200B) + "中间" + chr(0x200E) + "结束"
+    assert safe.scrub_text(text) == text
+
+
+def test_a_huge_percent_encoded_blob_does_not_cost_unbounded_work():
+    """净化在**输出**末尾才截断,于是输入多大就要处理多大:8 轮解码会被放大。
+    输入也要先截断(截掉的部分本来也不会显示,不会泄露)。"""
+    import time
+
+    blob = "%2f" * 200_000
+    t0 = time.perf_counter()
+    out = safe.scrub_text("x " + blob + " y")
+    assert time.perf_counter() - t0 < 0.2, "净化耗时过长"
+    assert len(out) <= safe.MAX_STR
+
+
+def test_a_secret_straddling_the_truncation_point_does_not_leak_its_prefix():
+    """净化先脱敏再截断。反过来的话,跨过截断点的秘密会只露出前缀(实测泄露 9 个字符)。"""
+    token = "abcdefghij0123456789ABCDEFGHIJ012345"
+    for pad in (1985, 1990, 1995, 1999, 2001, 2005):
+        out = safe.scrub_text("x" * pad + token + " 后缀", secrets=[token])
+        assert not any(token[:n] in out for n in range(8, len(token))), pad

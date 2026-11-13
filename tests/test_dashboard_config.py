@@ -189,3 +189,39 @@ def test_the_token_location_is_verified_again_right_before_the_token_is_created(
             c.verify_token_location(s)
     finally:
         _remove_dir_link(link)
+
+
+def test_the_junction_fallback_detects_a_reparse_point_without_path_is_junction(monkeypatch, tmp_path):
+    """旧 Python 没有 Path.is_junction():退回看 st_file_attributes 的 reparse point 位。
+    真实 junction 的属性是 0x410(含 0x400 = FILE_ATTRIBUTE_REPARSE_POINT)。
+
+    直接用一个**没有** is_junction 方法的路径对象走这条分支——在 Python 3.13 上
+    monkeypatch 删掉 Path.is_junction 并不能删掉底层 PathBase 的实现,那样测不到回退逻辑。
+    """
+    import os
+
+    from dashboard import config
+
+    class OldStylePath:
+        """没有 is_junction 方法的路径对象(模拟 Python 3.11)。"""
+
+        def __init__(self, real):
+            self._real = real
+
+        def is_symlink(self):
+            return False
+
+        def __fspath__(self):
+            return str(self._real)
+
+        def __str__(self):
+            return str(self._real)
+
+    class FakeStat:
+        st_file_attributes = 0x410              # 真实 junction 的属性值
+
+    real_lstat = os.lstat
+    monkeypatch.setattr(config.os, "lstat", lambda p, *a, **k: FakeStat()
+                        if str(p).endswith("junctionish") else real_lstat(p, *a, **k))
+    assert config._is_link(OldStylePath(tmp_path / "junctionish")) is True
+    assert config._is_link(OldStylePath(tmp_path / "plain")) is False

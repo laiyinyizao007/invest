@@ -164,6 +164,12 @@
 | `ConnectionBanner` | 连接中断横幅 |
 | `TokenGate` | 令牌输入层 |
 | `ThemeToggle` | 主题切换 |
+| `EvolutionCurveChart` | 进化曲线:双 Y 轴(夏普/收益)+ P25–P75 带 + 精英/均值两线(见 `08-evolution-views.md` §3) |
+| `EvolutionFlagsBanner` | 服务端提示标志横幅(停滞/过拟合嫌疑),warn 级 |
+| `HeatmapGrid` | 参数热力图:单一色相渐变,**颜色+数值双编码**;无效格用图案(见 `08-evolution-views.md` §4) |
+| `CandidateCodeView` | 带行号的源码(纯文本,不解析 HTML) |
+| `CandidateDiffView` | 统一 diff 视图(纯文本) |
+| `ReflectionNote` | 反思文本块,带『仅供审阅,未进入模型输入』标注 |
 
 ## 7. 动效
 

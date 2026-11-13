@@ -225,11 +225,21 @@ def _log_files(settings: Settings) -> list[Path]:
 
 
 def _unreadable_logs(settings: Settings) -> int:
-    """非空、但没有任何可识别时间戳的日志文件数(格式变了或被写坏)。与『一个日志都没找到』是两回事。"""
+    """非空、但内容不可信的日志文件数(格式变了、被写坏,或尾部正在写)。与『一个日志都没找到』是两回事。"""
     n = 0
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
             n += sum(1 for f in d.glob("vt_*.log") if _nonempty(f) and not _parse_cached(f).trusted)
+    return n
+
+
+def _tail_uncertain_logs(settings: Settings) -> int:
+    """只是**尾部不完整**(文件可能正在写)的日志数。与『日志损坏』分开:两者都不能把那天算作无异常,但提示文案不同。"""
+    n = 0
+    for d in settings.paths["log_dirs"]:
+        if d.is_dir():
+            n += sum(1 for f in d.glob("vt_*.log")
+                     if _nonempty(f) and not _parse_cached(f).trusted and _parse_cached(f).tail_uncertain)
     return n
 
 
@@ -352,12 +362,28 @@ def warm_up(settings: Settings) -> None:
         pass
 
 
-def _days(settings: Settings) -> list[ls.DayStats]:
-    """按天汇总,只统计有内容的日志(与 _log_files 同一口径)。"""
+def _all_log_files(settings: Settings) -> list[Path]:
+    """所有非空日志文件(**不管可信与否**)。用于区分『这天没有日志』与『这天日志不可信』。"""
+    files: list[Path] = []
+    for d in settings.paths["log_dirs"]:
+        if d.is_dir():
+            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f)]
+    return files
+
+
+def _days(settings: Settings, *, only_trusted: bool = True) -> list[ls.DayStats]:
+    """按天汇总。
+
+    only_trusted=True(默认):只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
+    only_trusted=False:全部日志(用于判断『某天到底有没有日志』:日志存在但不可信 ≠ 没有日志)。
+    """
     merged: dict[str, ls.DayStats] = {}
-    for f in _log_files(settings):
+    files = _log_files(settings) if only_trusted else _all_log_files(settings)
+    for f in files:
         stats = _parse_cached(f)
         target = merged.setdefault(stats.day, ls.DayStats(day=stats.day))
+        target.trusted = target.trusted and stats.trusted        # 任一文件不可信 → 那天不可信
+        target.tail_uncertain = target.tail_uncertain or stats.tail_uncertain
         target.started += stats.started
         target.trades += stats.trades
         target.events.update(stats.events)
@@ -395,6 +421,13 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     if not days:
         bad = _unreadable_logs(settings)
         if bad:
+            tail = _tail_uncertain_logs(settings)
+            if tail and tail == bad:
+                # 只是正在写(尾部不完整),不是坏了:不能据此判断,但也别说是『损坏』
+                msg = (f"有 {bad} 个日志文件的最后一行还没写完(可能正在写),"
+                       "这些天暂时不能算作『无异常』")
+                return Result(m.section("unknown", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志正在写入",
+                              [_reason("days", "unknown", msg)])
             msg = f"有 {bad} 个日志文件,但内容无法识别(格式变了或被写坏),不能据此判断无人值守情况"
             return Result(m.section("corrupt", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志无法识别",
                           [_reason("days", "unknown", msg)])
@@ -403,7 +436,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     streak = ls.longest_clean_streak(days)
-    missing_days = ls.missing_weekdays(days)
+    # 缺天要按**实际存在的日志**判断:日志存在但不可信 ≠ 没有日志(两者都要保守,但文案不能错)
+    missing_days = ls.missing_weekdays(_days(settings, only_trusted=False))
     hb = _heartbeat_day_label(settings, now)
     rows = []
     for stats in reversed(days[-limit:]):
@@ -430,7 +464,14 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     elif bad_logs:
         # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
         # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
-        level, headline = "unknown", "有日志无法识别"
+        tail_only = _tail_uncertain_logs(settings) == bad_logs
+        if tail_only:
+            # 只是尾部还没写完(文件正在写):仍然不能把那天算作『无异常』,但不是『坏了』
+            bad_msg = (f"有 {bad_logs} 个日志文件的最后一行还没写完(可能正在写),这些天暂时不能算作『无异常』")
+            headline = "有日志正在写入"
+        else:
+            headline = "有日志无法识别"
+        level = "unknown"
         reasons.append(_reason("days", "unknown", bad_msg))
     elif state == "corrupt":
         # 日志文件的修改时间在未来(时钟回拨或文件异常):不能据此判断新鲜度。严重事件是日志内容,仍照常报 critical(上一分支)
@@ -694,23 +735,38 @@ def _valid_run(run_id: str, body: Any) -> bool:
     sha = body.get("strategy_sha256")
     if not isinstance(sha, str) or not _SHA256.fullmatch(sha):
         return False
-    if not isinstance(body.get("report"), str) or not body["report"].strip() or not isinstance(body.get("ran_at"), str):
+    if not isinstance(body.get("report"), str) or not body["report"].strip() or m.parse_iso(body.get("ran_at")) is None:
         return False
-    if body.get("status") is not None and not isinstance(body["status"], str):
+    status = body.get("status")
+    if status not in (None, "strategy_error"):                          # 真实产出里只有这两种;其他取值(含 "ok"/"complete")是手写或损坏的
         return False
-    errored = body.get("status") == "strategy_error"
-    if errored and not isinstance(body.get("error"), dict):
-        return False
-    if body["kind"] in ("gate", "evaluate"):
-        if not isinstance(body.get("passed"), bool):
+    errored = status == "strategy_error"
+    if errored:
+        err = body.get("error")
+        if not (isinstance(err, dict) and isinstance(err.get("type"), str) and isinstance(err.get("message"), str)):
             return False
-        return errored or (isinstance(body.get("failures"), list) and all(isinstance(x, str) for x in body["failures"]))
+        if not err["type"].strip() or not err["message"].strip():
+            return False
+    elif "error" in body:
+        return False                        # 成功的运行不该带 error 字段(矛盾)
+    if body["kind"] in ("gate", "evaluate"):
+        passed, failures = body.get("passed"), body.get("failures")
+        if not isinstance(passed, bool):
+            return False
+        if errored:
+            return passed is False                                      # 策略报错不可能同时『通过』
+        if not (isinstance(failures, list) and all(isinstance(x, str) for x in failures)):
+            return False
+        return (not failures) if passed else bool(failures)             # 通过 ⇔ 没有失败项(risk/candidate_eval.py:passed = not failures)
+    if "passed" in body:
+        return False                        # backtest 没有『通过』这个概念,带了就矛盾
     return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
 
 
 def _brief_run(run_id: str, result: dict) -> dict:
     kind = result["kind"]                                               # 调用方已用 _valid_run 校验
-    passed = result.get("passed")
+    # passed 只对 gate/evaluate 有意义(backtest 没有『通过』这个概念)
+    passed = result.get("passed") if kind in ("gate", "evaluate") else None
     return {"run_id": run_id, "kind": kind, "status": result.get("status") if isinstance(result.get("status"), str) else None,
             "passed": passed if isinstance(passed, bool) else None,
             "strategy_file": result.get("strategy_file") if isinstance(result.get("strategy_file"), str) else None,
@@ -915,3 +971,123 @@ def collect_overview(settings: Settings, now: float) -> dict:
         "reasons": reasons[:10],
         "sections": {n: {"state": r.section["state"], "level": r.level, "headline": r.headline} for n, r in results.items()},
     }
+
+
+# ---------------------------------------------------------------- 进化引擎(只读)
+# 引擎侧(毕昇工作流与研究网关)写台账与热力图,面板只读。详见 docs/adr/20261113-evolution-dashboard.md。
+from dashboard import evolution as ev                                     # noqa: E402
+
+
+class EvolutionUnavailable(Exception):
+    """台账损坏或读不了:与『战役不存在』不同,调用方要能区分(404 vs 数据不可信)。"""
+
+
+def collect_evolution(settings: Settings, now: float) -> Result:
+    """进化战役列表。可选子系统:没有战役时是 missing,不计入总体级别(不因为还没跑进化就显示整体异常)。"""
+    directory = settings.paths["evolution_dir"]
+    names = ev.campaigns(directory)
+    campaigns = []
+    for name in names:
+        try:
+            records = ev.read_campaign(directory, name)
+        except ev.EvolutionError as exc:
+            campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
+                              "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
+            continue
+        sharpes = [r.sharpe for r in records if r.sharpe is not None]
+        campaigns.append({
+            "campaign_id": name,
+            "generations": len({r.generation for r in records}),
+            "latest_generation": max((r.generation for r in records), default=None),
+            "records": len(records),
+            "updated_at": records[-1].created_at if records else None,
+            "best_sharpe": round(max(sharpes), 4) if sharpes else None,
+            "state": "ok" if records else "missing",
+            "message": None,
+        })
+    data = {"campaigns": campaigns}
+    state = "ok" if campaigns else "missing"
+    message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
+    # 台账损坏 = 无法判断这个战役的状态,整体不能显示正常(『不制造虚假安心』)
+    broken = [c["campaign_id"] for c in campaigns if c["state"] == "corrupt"]
+    reasons = [_reason("evolution", "warn", f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断")] if broken else []
+    if broken:
+        message = ";".join(filter(None, [message, f"{len(broken)} 个战役的台账损坏或读不了"]))
+        state = "ok"                       # 区块数据仍然可用(其它战役正常),但级别与横幅要说清楚
+        level, headline = "warn", f"{len(campaigns)} 个战役({len(broken)} 个台账损坏)"
+    else:
+        level, headline = ("ok", f"{len(campaigns)} 个战役") if campaigns else ("unknown", "暂无战役")
+    return Result(m.section(state, data, now=now, message=message), level, headline, reasons)
+
+
+def get_evolution_curve(settings: Settings, campaign_id: str) -> dict | None:
+    """进化曲线。战役不存在或台账坏了都返回 None(调用方按 404/损坏处理)。"""
+    if not ev.CAMPAIGN_ID or not _matches(campaign_id, ev.CAMPAIGN_ID):
+        return None
+    try:
+        records = ev.read_campaign(settings.paths["evolution_dir"], campaign_id)
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("台账损坏或读不了") from exc
+    if not records:
+        return None
+    cfg = settings.raw["evolution"]
+    payload = ev.curve(records, stagnant_generations=int(cfg["stagnant_generations"]),
+                       stagnant_epsilon=float(cfg["stagnant_epsilon"]), overfit_mean_gap=float(cfg["overfit_mean_gap"]))
+    return {"campaign_id": campaign_id, **payload}
+
+
+def get_evolution_log(settings: Settings, campaign_id: str, cursor: str = "", limit: int = 50) -> dict | None:
+    """变异日志(游标分页)。cursor 是『已显示的记录条数』,不是哈希——简单且够用。"""
+    if not _matches(campaign_id, ev.CAMPAIGN_ID):
+        return None
+    try:
+        records = ev.read_campaign(settings.paths["evolution_dir"], campaign_id)
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("台账损坏或读不了") from exc
+    if not records:
+        return None
+    try:
+        offset = max(int(cursor), 0) if cursor else 0
+    except ValueError:
+        return None
+    limit = max(1, min(int(limit), 200))
+    page = records[offset: offset + limit]
+    rows = [{**r.brief(), "reflection": r.reflection, "created_at": r.created_at} for r in page]
+    next_cursor = str(offset + len(page)) if offset + len(page) < len(records) else None
+    return {"campaign_id": campaign_id, "records": rows, "next_cursor": next_cursor}
+
+
+def get_heatmap(settings: Settings, run_id: str) -> dict | None:
+    if not _matches(run_id, r"[0-9]{8}-[0-9]{6}-[0-9]{6}"):
+        return None
+    try:
+        return ev.read_heatmap(settings.paths["heatmap_dir"], run_id)
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("热力图文件损坏或读不了") from exc
+
+
+def get_candidate_code(settings: Settings, sha256: str) -> dict | None:
+    """候选源码(按哈希找)。找不到不是错误:found=False,前端显示『源码已不在』而不是报错。"""
+    if not _matches(sha256, ev.SHA256):
+        return None
+    source = ev.candidate_source(settings.root / "pending_strategies", sha256)
+    lines = [] if source is None else [{"n": i, "text": line} for i, line in enumerate(source.splitlines(), start=1)]
+    return {"sha256": sha256, "found": source is not None, "language": "python", "lines": lines}
+
+
+def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> dict | None:
+    """两个候选的差异。父代源码不在(被清理了)时 available=False,不是错误。"""
+    if not _matches(sha256, ev.SHA256) or not _matches(parent_sha256, ev.SHA256):
+        return None
+    directory = settings.root / "pending_strategies"
+    before = ev.candidate_source(directory, parent_sha256)
+    after = ev.candidate_source(directory, sha256)
+    if before is None or after is None:
+        return {"from_sha256": parent_sha256, "to_sha256": sha256, "available": False, "diff": ""}
+    return {"from_sha256": parent_sha256, "to_sha256": sha256, "available": True,
+            "diff": ev.diff_text(before, after)}
+
+
+def _matches(value: str, pattern: str) -> bool:
+    import re as _re
+    return isinstance(value, str) and _re.fullmatch(pattern, value) is not None

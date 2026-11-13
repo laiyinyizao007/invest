@@ -523,3 +523,10 @@ def test_a_static_file_replaced_by_a_symlink_to_the_outside_after_startup_is_not
         import pytest
         pytest.skip("本机不允许创建符号链接")
     assert c.get("/assets/app.js").status_code == 404
+
+
+def test_the_evolution_page_path_serves_the_frontend_page(env):
+    """进化视图的前端页面路径:后端阶段④的接口路由随阶段上线,但**页面路径**要能深链接(与 live/equity 等同样处理)。"""
+    _, settings = env
+    r = client(settings).get("/research/evolution")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]

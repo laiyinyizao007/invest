@@ -1,0 +1,86 @@
+{
+  "campaign_id": "camp-2026-11",
+  "records": [
+    {
+      "generation": 1,
+      "candidate_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "parent_sha256": null,
+      "run_id": "20261112-210000-000001",
+      "status": "evaluated",
+      "sharpe": 0.42,
+      "total_return": 0.031,
+      "max_drawdown": 0.19,
+      "dsr": 0.31,
+      "n_trials": 4,
+      "fail_reason": null,
+      "cell": "fast-mid",
+      "diagnosis": {
+        "weakest": "sharpe",
+        "summary": "夏普为负"
+      },
+      "reflection": "反思:震荡市里快慢窗口太近,信号互相抵消。下一步把慢窗口拉长。",
+      "created_at": "2026-11-12T21:00:00"
+    },
+    {
+      "generation": 2,
+      "candidate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "parent_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "run_id": "20261112-210000-000002",
+      "status": "evaluated",
+      "sharpe": 0.78,
+      "total_return": 0.068,
+      "max_drawdown": 0.16,
+      "dsr": 0.55,
+      "n_trials": 4,
+      "fail_reason": null,
+      "cell": "fast-mid",
+      "diagnosis": {
+        "weakest": "drawdown",
+        "summary": "回撤仍偏大"
+      },
+      "reflection": "反思:慢窗口拉长后夏普转正,但回撤偏大。",
+      "created_at": "2026-11-12T21:10:00"
+    },
+    {
+      "generation": 3,
+      "candidate_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "parent_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "run_id": "20261112-210000-000003",
+      "status": "evaluated",
+      "sharpe": 1.94,
+      "total_return": 0.142,
+      "max_drawdown": 0.22,
+      "dsr": 1.31,
+      "n_trials": 5,
+      "fail_reason": null,
+      "cell": "fast-mid",
+      "diagnosis": {
+        "weakest": "drawdown",
+        "summary": "回撤偏大"
+      },
+      "reflection": "反思:本代夏普跳得有点高,可能是撞上了某一段行情。",
+      "created_at": "2026-11-12T21:20:00"
+    },
+    {
+      "generation": 4,
+      "candidate_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "parent_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "run_id": "20261112-210000-000004",
+      "status": "evaluated",
+      "sharpe": 2.1,
+      "total_return": 0.151,
+      "max_drawdown": 0.24,
+      "dsr": 1.44,
+      "n_trials": 5,
+      "fail_reason": null,
+      "cell": "fast-mid",
+      "diagnosis": {
+        "weakest": "drawdown",
+        "summary": "回撤偏大"
+      },
+      "reflection": "反思:连续几代回撤都在 0.2 以上,需要加过滤。",
+      "created_at": "2026-11-12T21:30:00"
+    }
+  ],
+  "next_cursor": null
+}

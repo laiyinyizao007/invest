@@ -239,6 +239,14 @@ flowchart TB
 - **数据**:`GET /api/config`。示例:`config-view`。
 - **内容**:生效的风控预算、合约、阈值。**只读展示,不是编辑器**;不含任何凭据、地址、路径。
 
+### 9.5 进化(曲线 / 热力图 / 变异日志) ④
+- **数据**:`GET /api/research/evolution`、`.../curve`、`.../log`、`GET /api/research/runs/{run_id}/heatmap`、`GET /api/research/candidates/{sha256}/code|diff`。
+  示例:`evolution-list`、`evolution-curve`、`evolution-curve-stagnant`、`evolution-log`、`evolution-heatmap`、`evolution-heatmap-plateau`、`candidate-code`、`candidate-diff`。
+- **内容**:三个视图合成一个页面(左上曲线、右上热力图、下方日志与代码)。
+- **谁在产生数据**:进化回路由**毕昇工作流**承载;面板只读,不驱动进化。
+- **写操作**:**没有**。页面上不得出现注入变异、淘汰、批准、回滚任何按钮。
+- **完整规格**见 [`08-evolution-views.md`](08-evolution-views.md)(含"怎么看好坏"与验收清单)。
+
 ## 10. 页面规格:阶段⑤(远程与多节点)
 
 ### 10.1 节点 ⑤
