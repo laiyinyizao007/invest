@@ -18,7 +18,8 @@ from typing import Any
 from dashboard import models as m
 
 MAX_LEDGER_BYTES = 8 * 1024 * 1024        # 谱系台账总上限
-MAX_LEDGER_LINES = 20_000
+MAX_LEDGER_LINES = 20_000          # 有效记录数上限
+MAX_LEDGER_TOTAL_LINES = 200_000    # 总行数上限(含空行):挡住『几百万空行』这种文件
 MAX_CODE_BYTES = 256 * 1024               # 单份候选源码上限(与待审候选一致)
 MAX_HEATMAP_BYTES = 4 * 1024 * 1024
 MAX_HEATMAP_CELLS = 200_000
@@ -140,7 +141,17 @@ def read_campaign(directory: Path, campaign_id: str) -> list[Record]:
     except UnicodeDecodeError as exc:
         raise EvolutionError("台账不是合法 UTF-8") from exc
     rows: list[Record] = []
-    for line in text.splitlines():
+    lines_seen = 0
+    start = 0
+    while start <= len(text):                      # 逐行扫描:一次性 splitlines() 会把 8 MB 的空行文件变成八百万个列表元素
+        end = text.find("\n", start)
+        if end < 0:
+            end = len(text)
+        line = text[start:end]
+        start = end + 1
+        lines_seen += 1
+        if lines_seen > MAX_LEDGER_TOTAL_LINES:
+            raise EvolutionError("台账总行数超过上限")
         if not line.strip():
             continue
         if len(rows) >= MAX_LEDGER_LINES:

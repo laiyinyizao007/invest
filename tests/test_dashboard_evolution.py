@@ -245,3 +245,19 @@ def test_the_curve_the_ledger_and_the_heatmap_match_the_contract_examples(tmp_pa
     d = heatmap(tmp_path)
     heat = ev.read_heatmap(d, "20261112-210000-000000")
     validate("heatmap", "#/components/schemas/Heatmap", heat)
+
+
+def test_a_ledger_of_millions_of_empty_lines_is_rejected_without_building_a_huge_list(tmp_path):
+    """8 MB 的空行文件:一次性 splitlines() 会产生八百万个列表元素。逐行扫描并在行数超限时立刻停止。"""
+    import tracemalloc
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / f"{CAMPAIGN}.jsonl").write_bytes(b"\n" * (4 * 1024 * 1024))
+    tracemalloc.start()
+    try:
+        with pytest.raises(ev.EvolutionError):
+            ev.read_campaign(d, CAMPAIGN)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 32 * 1024 * 1024, f"峰值内存 {peak // 1024 // 1024} MB"
