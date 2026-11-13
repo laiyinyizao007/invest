@@ -284,3 +284,18 @@ def test_an_empty_ledger_file_is_a_campaign_with_no_data_not_a_broken_one(tmp_pa
     (d / "camp-empty.jsonl").write_text("", encoding="utf-8")
     r = col.collect_evolution(settings(tmp_path), NOW)
     assert r.section["data"]["campaigns"][0]["state"] == "missing"
+
+
+def test_a_corrupt_ledger_is_distinguishable_from_a_missing_campaign(tmp_path):
+    """『战役不存在』与『台账坏了』必须能区分:前者是 404,后者是数据不可信。"""
+    from dashboard import collectors as col
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / "camp-bad.jsonl").write_text("{broken\n", encoding="utf-8")
+    s = settings(tmp_path)
+    with pytest.raises(col.EvolutionUnavailable):
+        col.get_evolution_curve(s, "camp-bad")
+    with pytest.raises(col.EvolutionUnavailable):
+        col.get_evolution_log(s, "camp-bad")
+    assert col.get_evolution_curve(s, "camp-missing") is None      # 不存在 → None(404)
+    assert col.get_evolution_log(s, "camp-missing") is None

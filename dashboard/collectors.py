@@ -930,6 +930,10 @@ def collect_overview(settings: Settings, now: float) -> dict:
 from dashboard import evolution as ev                                     # noqa: E402
 
 
+class EvolutionUnavailable(Exception):
+    """台账损坏或读不了:与『战役不存在』不同,调用方要能区分(404 vs 数据不可信)。"""
+
+
 def collect_evolution(settings: Settings, now: float) -> Result:
     """进化战役列表。可选子系统:没有战役时是 missing,不计入总体级别(不因为还没跑进化就显示整体异常)。"""
     directory = settings.paths["evolution_dir"]
@@ -974,8 +978,8 @@ def get_evolution_curve(settings: Settings, campaign_id: str) -> dict | None:
         return None
     try:
         records = ev.read_campaign(settings.paths["evolution_dir"], campaign_id)
-    except ev.EvolutionError:
-        return None
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("台账损坏或读不了") from exc
     if not records:
         return None
     cfg = settings.raw["evolution"]
@@ -990,8 +994,8 @@ def get_evolution_log(settings: Settings, campaign_id: str, cursor: str = "", li
         return None
     try:
         records = ev.read_campaign(settings.paths["evolution_dir"], campaign_id)
-    except ev.EvolutionError:
-        return None
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("台账损坏或读不了") from exc
     if not records:
         return None
     try:
@@ -1010,8 +1014,8 @@ def get_heatmap(settings: Settings, run_id: str) -> dict | None:
         return None
     try:
         return ev.read_heatmap(settings.paths["heatmap_dir"], run_id)
-    except ev.EvolutionError:
-        return None
+    except ev.EvolutionError as exc:
+        raise EvolutionUnavailable("热力图文件损坏或读不了") from exc
 
 
 def get_candidate_code(settings: Settings, sha256: str) -> dict | None:
