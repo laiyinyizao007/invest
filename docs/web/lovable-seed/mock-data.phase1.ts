@@ -24,4 +24,5 @@ export const mocks: Record<string, unknown> = {
   "error-unauthorized": {"error": "未授权", "code": "unauthorized"},
   "error-not-found": {"error": "不存在", "code": "not_found"},
   "error-rate-limited": {"error": "请求过于频繁", "code": "rate_limited"},
+  "overview-with-evolution": {"server_time": "2026-11-13T08:30:00+08:00", "level": "ok", "reasons": [], "sections": {"trading": {"state": "ok", "level": "ok", "headline": "运行中 · 当日 -129.5 元"}, "alerts": {"state": "ok", "level": "ok", "headline": "无待补发"}, "days": {"state": "ok", "level": "ok", "headline": "连续无异常 1/5 天"}, "recording": {"state": "ok", "level": "ok", "headline": "录制中"}, "research": {"state": "ok", "level": "ok", "headline": "额度 2/5"}, "evolution": {"state": "ok", "level": "ok", "headline": "3 个战役"}}, "data": null},
 };

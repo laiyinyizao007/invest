@@ -123,7 +123,7 @@ flowchart TB
 - **数据**:`GET /api/overview`(+ `GET /api/meta`)。示例:`overview-ok`、`overview-warn-unknown`、`overview-critical`。
 - **内容**:
   1. 环境横幅 + 总状态条(见 §4)。
-  2. 五张摘要卡:交易与风控、告警、无人值守、行情录制、研究沙盒。每张显示 `headline`、区块状态徽标、右上『N 秒前』;点击进入对应页。
+  2. 摘要卡:交易与风控、告警、无人值守、行情录制、研究沙盒(共五张);**`capabilities.evolution` 为真时多一张进化卡**(总览的 `sections` 里会多出 `evolution` 这一项,默认没有——前端要容忍它不存在)。每张显示 `headline`、区块状态徽标、右上『N 秒前』;点击进入对应页。
      徽标用 `sections[n].level`(ok/warn/critical/unknown),不是 `state`——`state` 决定**内容能不能看**,`level` 决定**徽标**。例如『有些内容没列出来/没检查』是 `state=ok` + `level=warn`(内容照常显示,加警示徽标),而『有数据读不出来』是 `state=unknown`(内容仍给得出读得出来的部分,但要提示『部分数据无法读取』)。
   3. 卡片排序:按 `sections[n].level` 的严重程度 `critical` → `unknown` → `warn` → `ok`;同级别按固定顺序。
      **注意 `unknown` 比 `warn` 更严重**(服务器的口径:『不知道』比『知道有点问题』更危险,总状态条也是这么排的)。

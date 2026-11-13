@@ -172,7 +172,7 @@
 
 规格:
 1. 外壳的环境横幅取 meta.environment;总状态条显示 overview.level(ok→"一切正常"、warn→"需要关注"、critical→"严重"、unknown→"无法判断")和最多 3 条 reasons,点击某条跳转到对应页面。level 由服务器给出,前端不得自行计算;未知取值按 unknown。
-2. 五张摘要卡(交易与风控、告警、无人值守、行情录制、研究沙盒),每张显示 headline、StateBadge 和"N 秒前"(用 overview.server_time 即可),点击进入对应页。
+2. 摘要卡(交易与风控、告警、无人值守、行情录制、研究沙盒;`capabilities.evolution` 为真时多一张进化卡——总览的 `sections` 里会多出 `evolution`,默认没有,要容忍它不存在),每张显示 headline、StateBadge 和"N 秒前"(用 overview.server_time 即可),点击进入对应页。
 3. 卡片排序:critical → warn → unknown → ok;同级别按固定顺序。
 4. 布局按设计文档 §5.2:桌面 12 列 Bento 网格,手机单列。
 5. 自动刷新用 P2 的轮询 Hook。

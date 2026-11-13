@@ -362,5 +362,12 @@
     "path": "/api/research/candidates/{sha256}/diff",
     "status": 200,
     "note": "父代源码已不在,无法比较"
+  },
+  {
+    "fixture": "overview-with-evolution",
+    "method": "GET",
+    "path": "/api/overview",
+    "status": 200,
+    "note": "evolution.enabled 为真时的总览:多一段进化区块(默认关着时没有这一段)"
   }
 ]
