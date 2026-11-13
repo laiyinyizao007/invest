@@ -7,3 +7,4 @@
 |---|---|---|
 | [20261110-guard-watchdog-plan.md](20261110-guard-watchdog-plan.md) | `46615c1`(CTP 废单/看门狗改造) | 已完成 |
 | [20261110-walk-forward-optimizer-plan.md](20261110-walk-forward-optimizer-plan.md) | `6cd0fad`,Issue #3 | 已完成 |
+| [20261112-status-dashboard-plan.md](20261112-status-dashboard-plan.md) | ADR `20261112-status-dashboard.md`,Issue #1 | 待执行(ADR 待确认) |
