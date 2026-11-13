@@ -13,18 +13,24 @@
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bootstrap  # noqa: E402  必须最先导入:隔离 vn.py 状态目录
 
 PROBE_ROOT = bootstrap.ROOT / ".vntrader_probe"
 ISOLATED = bootstrap.isolate_state(PROBE_ROOT.name)
+if not ISOLATED:
+    # 日志模块在设置 TEMP_DIR 之前就被导入时,日志会写进实盘目录。
+    # 探针是只读的,但日志里可能有账号和资金信息,不能混进实盘目录。
+    print("状态目录隔离未生效(vnpy 日志模块在设置 TEMP_DIR 之前已被导入),"
+          "探针日志会写进实盘目录,拒绝运行。请直接用 python scripts/probe_position.py 启动。", file=sys.stderr)
+    sys.exit(2)
 
 from ctp_tools.collector import Collector, check_positions, close_engine  # noqa: E402
 from vnpy.event import EventEngine  # noqa: E402
@@ -37,25 +43,52 @@ MILESTONES = ("交易服务器连接成功", "交易服务器授权验证成功"
 
 
 def load_profile(profile: str) -> dict[str, str]:
-    """取档案里的值;进程环境变量优先(dotenv override=False 的同一套语义)。"""
+    """取档案里的值并覆盖 .env。
+
+    优先级:指定的档案 > 项目 .env > 进程环境变量。
+    指定了档案就以档案为准(用户明说要用哪个档案),没指定才吃 .env。
+    """
+    from dotenv import dotenv_values
+
     env = dict(os.environ)
+    base = bootstrap.ROOT / ".env"
+    if base.exists():
+        for key, value in dotenv_values(base, encoding="utf-8-sig").items():
+            if value is not None:
+                env[key] = value
     if profile:
-        from dotenv import dotenv_values
         path = Path(profile)
         if not path.is_absolute():
             path = bootstrap.ROOT / path
-        values = dotenv_values(path, encoding="utf-8-sig")
-        for key, value in values.items():
+        if not path.exists():
+            raise FileNotFoundError(f"找不到档案 {path}")
+        for key, value in dotenv_values(path, encoding="utf-8-sig").items():
             if value is not None:
-                env.setdefault(key, value)
+                env[key] = value
     return env
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin);默认用项目 .env")
+    parser.add_argument("--seconds", type=int, default=60, help="观察多久秒(默认 60)")
+    return parser.parse_args(argv)
+
+
 def main() -> int:
-    profile = sys.argv[1] if len(sys.argv) > 1 else ""
-    seconds = 60
-    env = load_profile(profile)
-    bootstrap.load_env()
+    args = parse_args(sys.argv[1:])
+    profile = args.profile
+    seconds = args.seconds
+    try:
+        env = load_profile(profile)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    missing = [k for k in ("CTP_USERNAME", "CTP_PASSWORD", "CTP_BROKER_ID",
+                            "CTP_TD_ADDRESS", "CTP_MD_ADDRESS") if not env.get(k)]
+    if missing:
+        print(f"档案里缺少 {', '.join(missing)},无法连接。", file=sys.stderr)
+        return 2
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)

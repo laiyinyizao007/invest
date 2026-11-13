@@ -37,13 +37,13 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bootstrap  # noqa: E402  必须最先导入:隔离 vn.py 状态目录 + 统一时区
 
 FLATTEN_ROOT = bootstrap.ROOT / ".vntrader_flatten"
 ISOLATED = bootstrap.isolate_state(FLATTEN_ROOT.name)
 
+from ctp_tools.broker_targets import SIMNOW_MD  # noqa: E402
 from ctp_tools.collector import Collector, check_positions, close_engine  # noqa: E402
 from ctp_tools.penetration import check_target, mask_account  # noqa: E402
 from ctp_tools.simnow import is_simnow_address, normalize_address  # noqa: E402
@@ -96,17 +96,20 @@ def _split_offsets(exchange: Exchange, volume: int, yd_volume: int) -> list[tupl
     return out
 
 
-def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]]) -> list[ClosePlan]:
+def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]],
+                priceticks: dict[str, float] | None = None) -> list[ClosePlan]:
     """把持仓翻译成平仓单计划。
 
     positions:vn.py 的 PositionData 列表(只取 volume > 0 的)
     quotes:    {vt_symbol: (bid_price_1, ask_price_1, last_price)}
+    priceticks:{vt_symbol: 最小变动价位}(取不到就按 1.0)
 
     - 平多(持仓方向 LONG)→ 卖出(SHORT),挂在**买一**上主动打买盘;
     - 平空(持仓方向 SHORT)→ 买入(LONG),挂在**卖一**上主动打卖盘;
     - 方向是 NET(净持仓账户)→ **不猜**:净持仓回报里没有多空之分,
       猜错方向就是"平仓变成开仓",直接放弃并让调用方报错。
     """
+    priceticks = priceticks or {}
     plans: list[ClosePlan] = []
     for pos in positions:
         volume = int(getattr(pos, "volume", 0) or 0)
@@ -115,7 +118,7 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]]) 
         vt_symbol = pos.vt_symbol
         code, _, product = vt_symbol.rpartition(".")
         exchange = getattr(pos, "exchange", None)
-        if exchange is None:
+        if exchange is None or not code:
             continue
         bid, ask, last = quotes.get(vt_symbol, (0.0, 0.0, 0.0))
         if pos.direction == Direction.LONG:
@@ -129,10 +132,12 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]]) 
         if raw_price <= 0:
             raw_price = last
             reason += "(盘口没有对手价,退回最新价)"
-        tick = 1.0
-        contract = getattr(pos, "contract", None)
-        if contract is not None and getattr(contract, "pricetick", 0):
-            tick = float(contract.pricetick)
+        # 最小变动价位必须来自合约:不同品种差别很大(玉米 1,国债 0.001),
+        # 价格不是它的整数倍时柜台会以「价格非法」拒单,平仓就平不掉。
+        tick = float(priceticks.get(vt_symbol, 0) or 0)
+        if tick <= 0:
+            tick = 1.0
+            reason += "(没有合约信息,按最小变动 1 计价)"
         price = round_to(raw_price, tick) if raw_price > 0 else 0.0
         for offset, vol in _split_offsets(exchange, volume, int(getattr(pos, "yd_volume", 0) or 0)):
             plans.append(ClosePlan(
@@ -204,7 +209,9 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_CONFIG
 
     allowed_td = _allowed_addresses(os_env.get("BROKER_TEST_ALLOWED_TD", "")) or None
+    allowed_md = _allowed_addresses(os_env.get("BROKER_TEST_ALLOWED_MD", "")) or None
     address = normalize_address(setting["交易服务器"])
+    md_address = normalize_address(setting["行情服务器"])
     environment = setting["柜台环境"]
     # 目标闸门:SimNow 白名单内,或「测试」环境 + 前置地址白名单。生产 API 一律拒绝。
     if is_simnow_address(address):
@@ -215,6 +222,16 @@ def run(args: argparse.Namespace) -> int:
         print(f"交易前置 {address}(柜台环境={environment})不是 SimNow 地址,"
               "也不是白名单内的测试前置:拒绝连接。平仓是**真的下委托**,生产 API 上没有强制放行开关。",
               file=sys.stderr)
+        return EXIT_CONFIG
+    # 行情前置同样要查:平仓单的价格就是从行情前置的盘口来的,
+    # 连错行情前置 = 用假价格平仓(可能平不掉,也可能成交在错价上)。
+    if allowed_md:
+        if md_address not in allowed_md:
+            print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
+            return EXIT_CONFIG
+    elif md_address not in SIMNOW_MD:
+        print(f"行情前置 {md_address} 不在任何白名单内(也没有配置 BROKER_TEST_ALLOWED_MD),拒绝连接:"
+              "平仓价来自行情前置的盘口,不能靠「交易前置是白名单内的」来推定它也是。", file=sys.stderr)
         return EXIT_CONFIG
     ok, note = check_target(environment, setting["交易服务器"], True, allowed_td)
     print(note)
@@ -263,12 +280,6 @@ def run(args: argparse.Namespace) -> int:
             print(f"{args.connect_timeout:.0f} 秒内没有拿到合约表,持仓查询不可信,放弃。", file=sys.stderr)
             return EXIT_CONFIG
 
-        if symbol:
-            contract = collector.contract_of(symbol)
-            if contract is not None:
-                main_engine.subscribe(SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange), "CTP")
-                time.sleep(min(args.tick_wait, 20.0))     # 等一根 Tick 拿对手价
-
         positions = _wait_positions(main_engine, symbol, args.position_wait)
         held = [f"{p.vt_symbol} {p.direction.value} {p.volume}" for p in positions]
         print(f"当前非零持仓 {len(held)} 项:{held if held else '(空)'}")
@@ -279,7 +290,24 @@ def run(args: argparse.Namespace) -> int:
             out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
             return EXIT_NO_POSITION
 
-        plans = plan_closes(positions, _quotes_from(collector))
+        # 有几份持仓就订阅几个合约:只订阅 --symbol 指定的合约的话,
+        # 别的持仓合约就拿不到对手价,定价会退化成 0 → 拒单。
+        wanted = {p.vt_symbol for p in positions}
+        if symbol:
+            wanted.add(symbol)
+        priceticks: dict[str, float] = {}
+        for vt_symbol in sorted(wanted):
+            contract = main_engine.get_contract(vt_symbol) or collector.contract_of(vt_symbol)
+            if contract is None:
+                print(f"  {vt_symbol}:没有合约信息,跳过订阅")
+                continue
+            main_engine.subscribe(SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange), "CTP")
+            if getattr(contract, "pricetick", 0):
+                priceticks[vt_symbol] = float(contract.pricetick)
+        if wanted:
+            time.sleep(min(args.tick_wait, 20.0))     # 等一根 Tick 拿对手价
+
+        plans = plan_closes(positions, _quotes_from(collector), priceticks)
         if not plans:
             print("有持仓但生成不出平仓单(方向不明或合约信息缺失),请人工在交易客户端平仓。", file=sys.stderr)
             record["结论"] = "无法生成平仓单,需人工处理"

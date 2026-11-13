@@ -90,6 +90,31 @@ def test_no_conflict_when_process_env_matches(monkeypatch):
     assert conflicts == []
 
 
+def test_credential_conflict_is_detected_and_never_printed(monkeypatch):
+    """进程环境变量里的密码/授权码也会盖住档案——只校验地址不校验凭据,
+    就会出现「连的是国信地址、登的是另一个账号」。冲突信息里不能出现明文。"""
+    monkeypatch.setenv("CTP_PASSWORD", "另一个密码")
+    monkeypatch.setenv("CTP_AUTH_CODE", "另一个授权码")
+    _eff, conflicts = g.effective_env(good_env())
+    joined = "\n".join(conflicts)
+    assert "CTP_PASSWORD" in joined and "CTP_AUTH_CODE" in joined
+    assert "另一个密码" not in joined
+    assert "另一个授权码" not in joined
+
+
+def test_child_env_drops_inherited_ctp_keys_and_uses_validated_ones(monkeypatch):
+    """子进程必须拿到闸门校验过的那一份环境,不能继承来路不明的 CTP_*。"""
+    monkeypatch.setenv("CTP_TD_ADDRESS", "8.8.8.8:1")
+    monkeypatch.setenv("CTP_PASSWORD", "遗留密码")
+    eff = dict(good_env())
+    eff["CTP_TD_ADDRESS"] = "121.13.218.19:41285"
+    child = g.child_env(eff, {"BROKER_TEST_ALLOWED_TD": "121.13.218.19:41285"})
+    assert child["CTP_TD_ADDRESS"] == "121.13.218.19:41285"
+    assert child["CTP_PASSWORD"] == "p"
+    assert child["BROKER_TEST_ALLOWED_TD"] == "121.13.218.19:41285"
+    assert "遗留密码" not in " ".join(child.values())
+
+
 def test_session_windows_use_given_beijing_time():
     assert g.in_session(datetime(2026, 11, 13, 21, 30)) is True        # 周五夜盘
     assert g.in_session(datetime(2026, 11, 13, 15, 42)) is False       # 周五收盘后

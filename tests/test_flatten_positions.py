@@ -57,3 +57,31 @@ def test_zero_volume_is_skipped_and_missing_quote_falls_back_to_last():
     assert len(plans) == 1
     assert plans[0].price == 2185.0
     assert "最新价" in plans[0].reason
+
+
+def test_pricetick_comes_from_contract_not_from_position_object():
+    """最小变动价位必须来自合约信息。
+
+    PositionData 上没有 .contract(vnpy 不填这个属性),按 1 计价的话,
+    国债(0.001)、股指(0.2)这类品种的价格不是整数倍,柜台会以「价格非法」拒单,
+    平仓就平不掉——还会误以为是柜台问题。
+    """
+    pos = _pos("T2601", Exchange.CFFEX, Direction.LONG, 1)
+    plans = plan_closes([pos], {"T2601.CFFEX": (3900.123, 3900.222, 3900.1)}, {"T2601.CFFEX": 0.2})
+    assert len(plans) == 1
+    assert plans[0].price == 3900.2          # 3900.123 → 3900.2(0.2 的整数倍)
+    assert "没有合约信息" not in plans[0].reason
+
+
+def test_missing_pricetick_falls_back_to_one_and_says_so():
+    pos = _pos("c2701", Exchange.DCE, Direction.LONG, 1)
+    plans = plan_closes([pos], {"c2701.DCE": (2185.0, 2186.0, 2185.0)})
+    assert plans[0].price == 2185.0
+    assert "没有合约信息" in plans[0].reason
+
+
+def test_position_without_vt_symbol_suffix_is_skipped():
+    """vt_symbol 形如 c2701.DCE;没有交易所后缀时拼不出合约代码,宁可不发单。"""
+    pos = _pos("c2701", Exchange.DCE, Direction.LONG, 3)
+    pos.vt_symbol = "c2701"
+    assert plan_closes([pos], {"c2701": (2185.0, 2186.0, 2185.0)}) == []

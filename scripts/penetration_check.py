@@ -34,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap
 
-sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
 
 from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Offset, OrderType, Status  # noqa: E402
@@ -75,11 +74,18 @@ MILESTONE_LABELS = {
 FAILURE_MARKERS = ("授权验证失败", "交易服务器登录失败", "行情服务器登录失败")
 
 
+from ctp_tools.broker_targets import SIMNOW_MD
 from ctp_tools.penetration import (
     Run, check_target, do_order_cancel, failure_lines, limit_down_price, mask_account,
     milestone_status, package_version, render_report, run_checks as _run_checks,
     trade_connected, wait_milestones,
 )
+from ctp_tools.simnow import normalize_address
+
+
+def _allowed_addresses(raw: str) -> set[str]:
+    """解析 BROKER_TEST_ALLOWED_TD/MD:逗号(或分号)分隔的 host:port,统一归一化。"""
+    return {normalize_address(x) for x in raw.replace(";", ",").split(",") if x.strip()}
 
 
 def run_checks(args, symbol, main_engine, collector, secrets=()):
@@ -112,9 +118,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return EXIT_CONFIG
 
-    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test)
+    # 前置地址白名单:「柜台环境=测试」只是一个标记,不说明连的是哪台机器。
+    # 交易前置与行情前置都要在表内——行情前置喂回来的盘口价会直接变成委托价。
+    allowed_td = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_TD", "")) or None
+    allowed_md = _allowed_addresses(env.get("BROKER_TEST_ALLOWED_MD", "")) or None
+    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test, allowed_td)
     print(note, file=sys.stderr if not ok else sys.stdout)
     if not ok:
+        return EXIT_CONFIG
+    if setting["柜台环境"] == "测试" and not allowed_td:
+        print("柜台环境=测试 但没有配置前置地址白名单(BROKER_TEST_ALLOWED_TD),拒绝连接:"
+              "「测试」这个标记不说明连的是哪台机器。请用一键流程(它会注入白名单),"
+              "或在 .env 里写 BROKER_TEST_ALLOWED_TD=host:port[,host:port]。", file=sys.stderr)
+        return EXIT_CONFIG
+    md_address = normalize_address(setting["行情服务器"])
+    if allowed_td and not allowed_md:
+        print("交易前置白名单已配置但行情前置白名单(BROKER_TEST_ALLOWED_MD)没配置,拒绝连接:"
+              "行情前置的盘口价会直接变成委托价。", file=sys.stderr)
+        return EXIT_CONFIG
+    if allowed_md:
+        if md_address not in allowed_md:
+            print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
+            return EXIT_CONFIG
+    elif md_address not in SIMNOW_MD:
+        print(f"行情前置 {md_address} 不在任何白名单内,拒绝连接。", file=sys.stderr)
         return EXIT_CONFIG
 
     secrets = [env.get("CTP_PASSWORD", ""), env.get("CTP_AUTH_CODE", ""), env.get("CTP_APP_ID", ""),

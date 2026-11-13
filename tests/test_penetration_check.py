@@ -37,6 +37,35 @@ def test_gate_refuses_production_api_with_no_override():
     assert not ok and "生产 API" in note
 
 
+def test_gate_refuses_an_address_outside_the_whitelist():
+    """「柜台环境=测试」不说明连的是哪台机器,必须再查一次地址。"""
+    ok, note = pc.check_target("测试", "10.0.0.1:41205", confirmed=True, allowed_td={"121.13.218.19:41285"})
+    assert not ok and "不在本次允许的前置地址表" in note
+
+
+def test_penetration_script_requires_the_front_whitelist(monkeypatch, capsys):
+    """穿透演练脚本会真的报撤单,没有地址白名单时必须拒绝连接。"""
+    monkeypatch.setattr(pc.bootstrap, "load_env", lambda: __import__("os").environ)
+    monkeypatch.setenv("CTP_ENVIRONMENT", "测试")
+    monkeypatch.setenv("CTP_BROKER_ID", "8030")
+    monkeypatch.setenv("CTP_TD_ADDRESS", "121.13.218.19:41285")
+    monkeypatch.setenv("CTP_MD_ADDRESS", "121.13.218.19:41293")
+    monkeypatch.setenv("CTP_USERNAME", "u")
+    monkeypatch.setenv("CTP_PASSWORD", "p")
+    monkeypatch.setenv("CTP_APP_ID", "a")
+    monkeypatch.setenv("CTP_AUTH_CODE", "c")
+    monkeypatch.setenv("LIVE_VT_SYMBOL", "c2701.DCE")
+    monkeypatch.delenv("BROKER_TEST_ALLOWED_TD", raising=False)
+    monkeypatch.delenv("BROKER_TEST_ALLOWED_MD", raising=False)
+    assert pc.main(["--confirm-broker-test"]) == pc.EXIT_CONFIG
+    assert "白名单" in capsys.readouterr().err
+
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "121.13.218.19:41285")
+    assert pc.main(["--confirm-broker-test"]) == pc.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "行情前置" in err and "BROKER_TEST_ALLOWED_MD" in err
+
+
 def test_redact_replaces_all_secrets_and_ignores_short_values():
     text = "登录 user123 密码 hunter22 授权 AUTHCODE9 完成 ab"
     out = pc.redact(text, ["hunter22", "AUTHCODE9", "user123", "ab", ""])

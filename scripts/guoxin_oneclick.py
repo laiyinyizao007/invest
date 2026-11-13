@@ -58,7 +58,6 @@ from ctp_tools.collector import in_trading_session  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 
 BEIJING = ZoneInfo("Asia/Shanghai")
-BEIJING = ZoneInfo("Asia/Shanghai")
 TEMPLATE_NAME = "国信期货有限责任公司外部接入系统技术测试报告20260717.docx"
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN, EXIT_CRASH = 0, 1, 2, 3, 4
@@ -70,6 +69,22 @@ GATED_KEYS = (
     "CTP_ENVIRONMENT", "CTP_BROKER_ID", "CTP_TD_ADDRESS", "CTP_MD_ADDRESS",
     "BROKER_TEST_ALLOWED_TD", "BROKER_TEST_ALLOWED_MD",
 )
+# 这几个键参与「生效环境」校验,但值不能原样打印(密码/授权码是凭据)。
+SECRET_KEYS = ("CTP_PASSWORD", "CTP_AUTH_CODE")
+
+
+def describe_env_value(key: str, value: str) -> str:
+    """把环境变量的值变成可以安全打印的形式。"""
+    if key in SECRET_KEYS:
+        return "(已隐藏)"
+    if key == "CTP_USERNAME":
+        try:
+            from ctp_tools.penetration import mask_account
+
+            return mask_account(value)
+        except Exception:  # noqa: BLE001  打印不出来也不能把原文漏出去
+            return "(已隐藏)"
+    return repr(value)
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -89,18 +104,23 @@ def effective_env(file_env: dict[str, str]) -> tuple[dict[str, str], list[str]]:
 
     bootstrap.load_env 用的是 load_dotenv(override=False):进程里已有的变量优先,
     .env 只补缺。所以闸门必须校验合成后的结果,而不是只校验文件。
+
+    冲突判定覆盖**所有** CTP_* 键和 LIVE_VT_SYMBOL,不只 GATED_KEYS:
+    账号/密码/授权码同样会被进程环境变量盖掉,只校验地址不校验凭据,
+    就会出现「连的是国信地址、登的是另一个账号」这种最难查的情况。
     """
     eff = dict(file_env)
     conflicts: list[str] = []
     for key, value in os.environ.items():
-        if key in GATED_KEYS:
-            if key not in file_env:
-                conflicts.append(f"{key} 只在进程环境里(={value!r}),档案里没有——运行时它会盖住档案")
-            elif file_env[key] != value:
-                conflicts.append(f"{key} 进程环境变量(={value!r})与档案(={file_env[key]!r})不一致,运行时用进程里的")
-            eff[key] = value
-        elif key.startswith("CTP_") or key == "LIVE_VT_SYMBOL":
-            eff[key] = value
+        if not (key in GATED_KEYS or key.startswith("CTP_") or key == "LIVE_VT_SYMBOL"):
+            continue
+        if key not in file_env:
+            conflicts.append(f"{key} 只在进程环境里(={describe_env_value(key, value)}),"
+                             "档案里没有——运行时它会盖住档案")
+        elif file_env[key] != value:
+            conflicts.append(f"{key} 进程环境变量(={describe_env_value(key, value)})与档案"
+                             f"(={describe_env_value(key, file_env[key])})不一致,运行时用进程里的")
+        eff[key] = value
     return eff, conflicts
 
 
@@ -177,6 +197,23 @@ def python_exe() -> str:
 
 def step(title: str) -> None:
     print(f"\n=== {title} ===", flush=True)
+
+
+def child_env(effective: dict[str, str], extra: dict[str, str]) -> dict[str, str]:
+    """给子进程准备环境变量。
+
+    继承来的 CTP_*/LIVE_VT_SYMBOL **全部清掉**,再放回闸门校验过的那一份:
+    闸门校验的是「档案 + 进程环境」合成后的结果,子进程必须拿到同一个结果,
+    否则会出现「这里校验通过、子进程连到别处」。extra 里的是白名单等运行期参数,
+    优先级最高。
+    """
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("CTP_") or k == "LIVE_VT_SYMBOL" or k in GATED_KEYS)}
+    for key, value in effective.items():
+        if key.startswith("CTP_") or key == "LIVE_VT_SYMBOL" or key in GATED_KEYS:
+            env[key] = value
+    env.update(extra)
+    return env
 
 
 def mode_of(rehearsal: bool) -> str:
@@ -337,10 +374,10 @@ def main(argv: list[str] | None = None) -> int:
         # 前置地址白名单下推给取证脚本:运行期再校验一次,而不是只在一键流程里查一遍。
         allowed_td = ",".join(sorted(SIMNOW_TD if args.rehearsal else ALLOWED_TD))
         allowed_md = ",".join(sorted(SIMNOW_MD if args.rehearsal else ALLOWED_MD))
-        child_env = {**os.environ, "BROKER_TEST_ALLOWED_TD": allowed_td, "BROKER_TEST_ALLOWED_MD": allowed_md,
-                     "PYTHONIOENCODING": "utf-8"}
+        child = child_env(env, {"BROKER_TEST_ALLOWED_TD": allowed_td, "BROKER_TEST_ALLOWED_MD": allowed_md,
+                                "PYTHONIOENCODING": "utf-8"})
         try:
-            code = subprocess.call(cmd, cwd=ROOT, timeout=TEST_TIMEOUT, env=child_env)
+            code = subprocess.call(cmd, cwd=ROOT, timeout=TEST_TIMEOUT, env=child)
         except subprocess.TimeoutExpired:
             print(f"取证运行超时({TEST_TIMEOUT}s)已终止。", file=sys.stderr)
             code = EXIT_CRASH
@@ -364,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
             rcmd += ["--out", str(report_out), "--watermark", "SimNow 预演 · 非国信测试环境 · 不可提交国信"]
         try:
             rcode = subprocess.call(rcmd, cwd=ROOT, timeout=REPORT_TIMEOUT,
-                                    env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                                    env=child_env(env, {"PYTHONIOENCODING": "utf-8"}))
         except subprocess.TimeoutExpired:
             print(f"报告生成超时({REPORT_TIMEOUT}s),证据仍在:", out_dir, file=sys.stderr)
             return EXIT_CRASH

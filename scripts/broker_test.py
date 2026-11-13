@@ -42,7 +42,6 @@ import bootstrap
 BT_ROOT = bootstrap.ROOT / ".vntrader_brokertest"
 ISOLATED = bootstrap.isolate_state(BT_ROOT.name)
 
-sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
 
 from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status  # noqa: E402
@@ -56,6 +55,7 @@ from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
 from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
+from ctp_tools.broker_targets import SIMNOW_MD  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 from ctp_tools.penetration import (  # noqa: E402
     MILESTONE_LABELS, MILESTONES, Run, check_target, do_order_cancel, limit_down_price, mask_account, redact,
@@ -941,8 +941,22 @@ def main(argv: list[str] | None = None) -> int:
               "或在 .env 里写 BROKER_TEST_ALLOWED_TD=host:port[,host:port]。", file=sys.stderr)
         return EXIT_CONFIG
     md_address = normalize_address(setting["行情服务器"])
-    if allowed_md and md_address not in allowed_md:
-        print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
+    if allowed_td and not allowed_md:
+        # 交易前置查了、行情前置没查,等于留了半个口子:行情前置喂回来的盘口价
+        # 会**直接变成委托价**,连错行情前置 = 用假价格下单(演示委托可能因此成交,留下持仓)。
+        print("交易前置白名单已配置但行情前置白名单(BROKER_TEST_ALLOWED_MD)没配置,拒绝连接:"
+              "行情前置的盘口价会直接变成委托价,必须和交易前置一样校验。请用一键流程"
+              "(它会同时注入两个白名单),或在 .env 里写 BROKER_TEST_ALLOWED_MD=host:port[,host:port]。",
+              file=sys.stderr)
+        return EXIT_CONFIG
+    if allowed_md:
+        if md_address not in allowed_md:
+            print(f"行情前置 {md_address} 不在允许的前置地址表 {sorted(allowed_md)} 内,拒绝连接。", file=sys.stderr)
+            return EXIT_CONFIG
+    elif md_address not in SIMNOW_MD:
+        print(f"行情前置 {md_address} 不在任何白名单内(也没有配置 BROKER_TEST_ALLOWED_MD),拒绝连接。"
+              "行情前置喂回来的盘口价会直接变成委托价,不能靠「交易前置是白名单内的」来推定它也是。",
+              file=sys.stderr)
         return EXIT_CONFIG
     print(f"交易前置 {setting['交易服务器']} / 行情前置 {setting['行情服务器']} —— "
           f"白名单校验通过(BROKER_TEST_ALLOWED_TD={sorted(allowed_td) if allowed_td else '未设置,SimNow 场景按 SimNow 白名单'}、"

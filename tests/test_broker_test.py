@@ -410,6 +410,43 @@ def test_pause_flag_helper_is_shared_with_the_cli(tmp_path):
     assert flag.exists() and pause_trading.resume(tmp_path)
 
 
+def _guoxin_env(monkeypatch, **over):
+    env = {"CTP_USERNAME": "u", "CTP_PASSWORD": "pw_secret_1", "CTP_BROKER_ID": "8030",
+           "CTP_TD_ADDRESS": "121.13.218.19:41285", "CTP_MD_ADDRESS": "121.13.218.19:41293",
+           "CTP_APP_ID": "client_x_1.0", "CTP_AUTH_CODE": "auth_secret_2", "LIVE_VT_SYMBOL": "c2701.DCE",
+           "CTP_ENVIRONMENT": "测试"}
+    env.update(over)
+    monkeypatch.setattr(bt.bootstrap, "load_env", lambda: os.environ)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    return env
+
+
+def test_market_data_front_must_be_whitelisted_too(monkeypatch, capsys):
+    """行情前置喂回来的盘口价会直接变成委托价,只校验交易前置等于留了半个口子。"""
+    _guoxin_env(monkeypatch, BROKER_TEST_ALLOWED_TD="121.13.218.19:41285")
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "行情前置" in err and "BROKER_TEST_ALLOWED_MD" in err
+
+
+def test_market_data_front_outside_the_whitelist_is_refused(monkeypatch, capsys):
+    _guoxin_env(monkeypatch, CTP_MD_ADDRESS="8.8.8.8:1",
+                BROKER_TEST_ALLOWED_TD="121.13.218.19:41285",
+                BROKER_TEST_ALLOWED_MD="121.13.218.19:41293")
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
+    assert "行情前置" in capsys.readouterr().err
+
+
+def test_both_fronts_whitelisted_pass_the_gate(monkeypatch, capsys):
+    """两个白名单都配好时,闸门放行(这里靠「未知测试项」提前收住,不会真的去连)。"""
+    _guoxin_env(monkeypatch, BROKER_TEST_ALLOWED_TD="121.13.218.19:41285",
+                BROKER_TEST_ALLOWED_MD="121.13.218.19:41293")
+    assert bt.main(["--confirm-broker-test", "--only", "NOPE"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "未知测试项" in err and "行情前置" not in err
+
+
 # ---------- 收尾兜底 ----------
 
 def test_final_safety_cancels_leftover_orders_and_flags_positions(env):

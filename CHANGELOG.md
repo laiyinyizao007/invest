@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 ### Changed（变更）
+- **行情前置(MD)地址也要查白名单**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):`broker_test.py` / `penetration_check.py` 原来只校验交易前置(`penetration_check.py` 连交易前置的地址都不查,只看「柜台环境=测试」这个标记),行情前置连到哪台机器都不管。风险是实的:行情前置喂回来的盘口价与跌停价会**直接变成委托价**,连错行情前置 = 用假价格下单,演示委托可能因此成交并留下持仓。现在统一收紧:交易前置配了白名单就必须同时配行情前置白名单;行情前置不在白名单内一律拒绝;没配白名单时,行情前置至少要在 SimNow 行情地址表内(`ctp_tools/broker_targets.SIMNOW_MD`)。三处同步(`broker_test.py` / `penetration_check.py` / `flatten_positions.py`),补 5 个单测。
+- 清场工具的定价改用**合约的最小变动价位**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):原来取 `PositionData.contract`,而 vnpy 根本不填这个属性 → 取不到时按 1 计价,国债(0.001)/股指(0.2)这类品种的价格不是整数倍,柜台会以「价格非法」拒单,平仓就平不掉(还容易被误当成柜台问题)。现在从合约信息取 pricetick,取不到就在留痕里写明;另外持仓有几个合约就订阅几个——原来只订阅一个合约,多持仓时其余合约拿不到对手价,定价会退化成 0 而拒单。补 4 个单测。
+- 一键流程的**凭据类环境变量也参与冲突判定**,冲突提示**脱敏**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):`effective_env` 原来只对地址/环境/BrokerID 报冲突,进程环境变量里的 `CTP_USERNAME`/`CTP_PASSWORD`/`CTP_AUTH_CODE` 会静默盖住档案里的值 → 可能出现「连的是国信地址、登的是另一个账号」。现在所有 `CTP_*` 与 `LIVE_VT_SYMBOL` 都参与判定;冲突提示里密码/授权码一律显示「(已隐藏)」、账号走掩码(G7)。另外子进程环境改由 `child_env()` 收敛:清掉继承来的 `CTP_*`/`LIVE_VT_SYMBOL`,放回闸门校验过的那一份,避免「闸门过了、子进程连到别处」。补 3 个单测。
+- 只读探针的 CLI 与文档对齐(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):`--profile`/`--seconds` 之前文档里写了、代码却按 `sys.argv[1]` 取档案;而且档案快照建在 `.env` 加载之前,默认调用会 `KeyError: CTP_USERNAME`。现在用 argparse,档案优先级明确为**指定档案 > 项目 `.env` > 进程环境变量**,缺字段给可读报错;隔离未生效时直接拒绝运行(否则日志会写进实盘目录)。补 3 个单测。
+
 - 国信测试一键流程的环境闸门按 G8 双轮审查(zen codereview + codex)加固(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
   - **闸门校验的是运行时生效环境**:`bootstrap.load_env` 用 `override=False`,进程环境变量里的 `CTP_*` 会盖住 `.env`——原来只校验档案文件,会出现「文件校验通过、实际连到生产前置」。现在合成生效环境后再校验,档案与进程环境不一致直接退出。
   - **前置地址白名单下推到运行期**:新增 `ctp_tools/broker_targets.py` 作为国信测试/SimNow 地址表的唯一来源,一键流程把它注入 `BROKER_TEST_ALLOWED_TD/MD`,`broker_test.py` 在连接前再校验一次;「柜台环境=测试」不再等于「地址随便填都放行」。
