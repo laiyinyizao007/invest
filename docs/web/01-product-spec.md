@@ -124,6 +124,7 @@ flowchart TB
 - **内容**:
   1. 环境横幅 + 总状态条(见 §4)。
   2. 五张摘要卡:交易与风控、告警、无人值守、行情录制、研究沙盒。每张显示 `headline`、区块状态徽标、右上『N 秒前』;点击进入对应页。
+     徽标用 `sections[n].level`(ok/warn/critical/unknown),不是 `state`——`state` 决定**内容能不能看**,`level` 决定**徽标**。例如『有些内容没列出来/没检查』是 `state=ok` + `level=warn`(内容照常显示,加警示徽标),而『有数据读不出来』是 `state=unknown`(内容仍给得出读得出来的部分,但要提示『部分数据无法读取』)。
   3. 卡片排序:`critical` → `warn` → `unknown` → `ok`;同级别按固定顺序。
 - **异常**:任一区块 `missing/corrupt` 时,该卡显示缺失/损坏态,且总状态条不得为 `ok`。
 - **交互**:自动刷新(间隔取 `meta.polling_hint_seconds`);标签页隐藏时暂停。
