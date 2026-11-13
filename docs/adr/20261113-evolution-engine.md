@@ -127,6 +127,24 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 结构性保证已存在:`research_gate.slice_bars` 拒绝任何 ≥ `TEST_SEGMENT_START`(2024-01-01)的 K 线,新数据天然落在该范围之后,评估无法触及。
 尚未做(后续项):专门的前向留出登记(一次性使用账本)与最终确认脚本;持续录入新数据由用户负责。
 
+## 阶段 2:不可变宪法(Issue #16)
+
+清单文件 `config/immutable_constitution.json`,内置清单在 `risk/constitution.py`。**清单只能追加,不能删减内置项**;
+文件缺失或非法一律 fail-closed(拒绝执行),不做"默认放行"。
+
+三层防线:
+| 层 | 位置 | 拦什么 |
+|---|---|---|
+| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、直接下单/撤单、`param_grid` 含受保护参数 |
+| 运行时(执行前) | `research_api.check_candidate_class` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类 |
+| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数(此前 `backtest`/`gate` 不校验参数键名) |
+
+要点:
+- **家族而非模板**:要求继承"模板所属家族"(模板往上第一个非 vnpy 祖先),不要求继承 15 分钟模板本身——研究与沙盒也跑日线族。
+- **静态层不判断"是否重写了模板成员"**:模板成员名单要到运行时才知道,那一层由 `check_class` 负责;静态层只管受保护项与下单接口。候选**新增**成员(新指标、新辅助方法)允许。
+- 白名单 `allowed_overrides` 默认只有 `entry_signal`、`param_grid`、`parameters` 与可搜索参数;试图把受保护项加进白名单一律拒绝(不静默过滤,以免掩盖配置错误)。
+- `research_grid.FORBIDDEN_AXES` 改为从清单派生,避免两处各写一份而漂移。
+
 ## 明确不做
 无人值守连续迭代(4c,须单独评审)、仪表盘审批按钮、PBO/CPCV、多品种扩展、新增测试段。
 

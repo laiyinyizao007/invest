@@ -702,3 +702,42 @@ def test_reported_grid_cells_above_the_floor_are_recorded_as_is(tree, monkeypatc
     api.evaluate_job(strategy="s.py", cls="S", confirm=True)
 
     assert _trials(tree) == 64
+
+
+# ---------- 不可变宪法:参数与运行时类校验 ----------
+
+def test_backtest_refuses_params_that_touch_protected_parameters(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("受保护参数不得启动子进程"))
+
+    with pytest.raises(api.JobError) as exc:
+        api.backtest_job(strategy="s.py", cls="S", key="CADJ", segment="train",
+                          params={"risk_budget": 99999.0}, confirm=True)
+    assert exc.value.code == api.EXIT_REFUSED and "risk_budget" in exc.value.message
+
+
+def test_gate_refuses_params_that_touch_protected_parameters(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("受保护参数不得启动子进程"))
+
+    with pytest.raises(api.JobError):
+        api.gate_job(strategy="s.py", cls="S", params={"max_daily_losses": 99}, plateau=(False, "n"), confirm=True)
+
+
+def test_ordinary_params_are_accepted(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"stats": {}, "pnls": []})
+
+    result = api.backtest_job(strategy="s.py", cls="S", key="CADJ", segment="train",
+                              params={"fast_window": 10}, confirm=True)
+    assert result["kind"] == "backtest"
+
+
+def test_child_refuses_a_candidate_that_overrides_a_protected_member(tmp_path, monkeypatch):
+    """候选在类体里改写风控底线:静态筛查在提交时就拒绝,这里守住第二道(文件被替换的 TOCTOU 情形)。"""
+    path = tmp_path / "s.py"
+    path.write_text("class S:\n    risk_budget = 99999.0\n", encoding="utf-8")
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                           "--random-runs", "5", "--sha256", api.rs.file_sha256(path)])
+
+    assert api.run_evaluate_child(args) == api.EXIT_REFUSED

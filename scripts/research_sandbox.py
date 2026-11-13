@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from risk import constitution as const
+
 PENDING_DIR = "pending_strategies"
 SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
@@ -66,6 +68,11 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
     except SyntaxError as exc:
         return [f"语法错误: {exc.msg} (第 {exc.lineno} 行)"]
     findings: list[str] = []
+    try:
+        constitution = const.load()
+    except const.ConstitutionError as exc:
+        return [f"不可变宪法清单不可用(fail-closed): {exc}"]      # 清单坏了就不筛查,一律拒绝
+    findings.extend(const.screen_source(source, constitution))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]

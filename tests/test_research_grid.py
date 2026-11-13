@@ -141,3 +141,15 @@ def test_result_is_json_serialisable():
 def test_first_validation_start_is_locked_to_the_walk_forward_windows():
     import walk_forward_optimizer as wf
     assert rg.FIRST_VALIDATION_START == wf.build_windows()[0].valid_start
+
+
+# ---------- 不可变宪法:网格不得含受保护参数 ----------
+
+def test_grid_rejects_protected_parameters():
+    from research_grid import GridError, validate_grid
+
+    class C:
+        parameters = ["fast_window", "slow_window", "atr_mult", "risk_budget"]
+
+    with pytest.raises(GridError, match="risk_budget"):
+        validate_grid({"fast_window": [1, 2, 3], "slow_window": [1, 2, 3], "risk_budget": [1, 2, 3]}, C, 100)

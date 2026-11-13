@@ -209,3 +209,25 @@ def test_sandbox_env_passes_data_and_config_paths_but_still_nothing_secret():
                           "CTP_PASSWORD": "x", "WEBHOOK_URL": "u", "DEEPSEEK_API_KEY": "k"})
 
     assert env == {"INVEST_C15_DATA": "/data/derived/x.csv", "RESEARCH_SANDBOX_CONFIG": "/tmp/c.json"}
+
+
+# ---------- 不可变宪法接入静态筛查 ----------
+
+def test_screen_source_reports_constitution_violations():
+    findings = rs.screen_source("class C:\n    risk_budget = 99999.0\n")
+    assert any("risk_budget" in f for f in findings)
+
+
+def test_screen_source_still_reports_forbidden_imports():
+    findings = rs.screen_source("import os\n")
+    assert any("禁止导入" in f for f in findings)
+
+
+def test_screen_source_accepts_a_well_behaved_candidate():
+    src = "class C:\n    fast_window = 8\n    def entry_signal(self):\n        return 0\n"
+    assert rs.screen_source(src) == []
+
+
+def test_screen_source_does_not_report_new_members():
+    src = "class C:\n    adx_window = 14\n    def helper(self):\n        return 1\n"
+    assert rs.screen_source(src) == []

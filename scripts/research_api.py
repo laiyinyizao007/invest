@@ -29,6 +29,7 @@ import bootstrap
 import research_config as rc
 import research_sandbox as rs
 from research_grid import MIN_AXIS_VALUES
+from risk import constitution as const
 from risk.report import render_report
 from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
 
@@ -162,6 +163,29 @@ def screen(path: Path, cfg: dict) -> list[str]:
                             cfg["screening"]["extra_forbidden_calls"])
 
 
+def check_params_allowed(params: dict) -> None:
+    """调用方给的设置字典不得包含受保护参数(risk_budget 等):否则风控底线可被请求方绕过。"""
+    try:
+        constitution = const.load()
+    except const.ConstitutionError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+    findings = const.check_params(params, constitution)
+    if findings:
+        raise JobError(EXIT_REFUSED, "拒绝执行: " + "; ".join(findings))
+
+
+def check_candidate_class(candidate: type) -> None:
+    """运行时校验候选类:必须继承模板,且不得重写白名单以外的模板成员(含类创建后打的补丁)。"""
+    try:
+        constitution = const.load()
+        template = const.load_template(constitution)
+    except const.ConstitutionError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+    findings = const.check_class(candidate, template, constitution)
+    if findings:
+        raise JobError(EXIT_REFUSED, "拒绝执行: 候选类不符合不可变宪法:" + "; ".join(findings))
+
+
 def require_clean(path: Path, cfg: dict) -> None:
     findings = screen(path, cfg)
     if findings:
@@ -260,6 +284,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
         raise JobError(EXIT_REFUSED, str(exc))
     if not isinstance(params, dict):
         raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
+    check_params_allowed(params)
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
@@ -321,6 +346,7 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     low, high = rc.INT_BOUNDS[("gate", "random_runs")]
     if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    check_params_allowed(params)
     on_plateau, plateau_note = plateau
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
@@ -507,6 +533,11 @@ def run_evaluate_child(args) -> int:
     if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
         print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
         return EXIT_FAILED
+    try:                                                       # 运行时再查一次:文件在批准后被替换(TOCTOU)时静态筛查可能已失效
+        check_candidate_class(candidate)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return EXIT_REFUSED
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
     try:
@@ -541,6 +572,11 @@ def run_child(args) -> int:
     if not (isinstance(strategy_class, type) and issubclass(strategy_class, CtaTemplate)):
         print(f"{args.cls} 不存在或不是 CtaTemplate 子类", file=sys.stderr)
         return EXIT_FAILED
+    try:                                                       # 同上:挡住批准后被替换的候选
+        check_candidate_class(strategy_class)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return EXIT_REFUSED
     try:
         stats, _, trades = run_backtest(strategy_class, json.loads(args.params), args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
