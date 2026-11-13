@@ -482,3 +482,39 @@ def test_a_heatmap_file_that_is_a_symlink_out_of_the_directory_is_refused(tmp_pa
         pytest.skip("无法创建符号链接")
     with pytest.raises(ev.EvolutionError):
         ev.read_heatmap(d, "20261112-210000-000000")
+
+
+def test_the_stagnation_flag_requires_consecutive_generation_numbers(tmp_path):
+    """代号跳号(1、7、30)说明中间有代没跑,那不是『连续 5 代停滞』。"""
+    from dashboard import evolution as ev
+    records = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                                "sharpe": 1.0}) for g in (1, 7, 30, 44, 60)]
+    sparse = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)
+    assert not [f for f in sparse["flags"] if f["kind"] == "stagnant"], "代号稀疏时不该说『连续停滞』"
+    dense = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                               "sharpe": 1.0}) for g in range(1, 6)]
+    flags = ev.curve(dense, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["flags"]
+    assert [f for f in flags if f["kind"] == "stagnant"]
+
+
+def test_the_percentiles_match_the_standard_interpolation():
+    """曲线上的 P25/P75 是服务端算的,前端不重算——算错了整张图就是错的。"""
+    from dashboard import evolution as ev
+    assert ev._percentile([1, 2, 3, 4], 0.25) == 1.75
+    assert ev._percentile([1, 2, 3, 4], 0.75) == 3.25
+    assert ev._percentile([1, 2, 3], 0.5) == 2.0
+    assert ev._percentile([], 0.25) is None
+    assert ev._percentile([7.0], 0.75) == 7.0
+
+
+def test_the_curve_counts_candidates_without_a_sharpe_in_the_generation_count():
+    """一代里有的候选还没跑出夏普:代数要算上它们,但均值与分位数只算有值的。"""
+    from dashboard import evolution as ev
+    records = [
+        ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                         "sharpe": 2.0, "total_return": 0.1, "max_drawdown": 0.1}),
+        ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "b" * 64,
+                         "sharpe": None, "total_return": None, "max_drawdown": None}),
+    ]
+    point = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["points"][0]
+    assert point["count"] == 2 and point["elite_sharpe"] == 2.0 and point["mean_sharpe"] == 2.0

@@ -228,7 +228,10 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
     best = max((p["elite_sharpe"] for p in points if p["elite_sharpe"] is not None), default=None)
     if best is not None and len(points) >= stagnant_generations:
         tail = points[-stagnant_generations:]
-        if all(p["elite_sharpe"] is not None and p["elite_sharpe"] <= best + stagnant_epsilon for p in tail):
+        # 『连续 N 代』要求代号是**连续的**:代号跳号(1、7、30)说明中间有代没跑,
+        # 那不是连续 N 代停滞,只是记录稀疏。稀疏时不给停滞提示(宁可不说,不说错)。
+        contiguous = all(tail[i]["generation"] == tail[i - 1]["generation"] + 1 for i in range(1, len(tail)))
+        if contiguous and all(p["elite_sharpe"] is not None and p["elite_sharpe"] <= best + stagnant_epsilon for p in tail):
             flags.append({"kind": "stagnant", "text": f"连续 {stagnant_generations} 代精英夏普没有提升(最高 {best})",
                           "level": "warn"})
     for point in points:
