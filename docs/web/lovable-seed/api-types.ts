@@ -139,6 +139,8 @@ export interface DayRow {
   first_ts: string | null;
   last_ts: string | null;
   heartbeat: string | null;
+  trusted: boolean;
+  tail_uncertain: boolean;
 }
 
 export interface DaysData {

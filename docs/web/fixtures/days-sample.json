@@ -26,7 +26,9 @@
         ],
         "first_ts": "2026-11-12 21:00:03",
         "last_ts": "2026-11-12 23:59:40",
-        "heartbeat": "4s 前"
+        "heartbeat": "4s 前",
+        "trusted": true,
+        "tail_uncertain": false
       },
       {
         "day": "2026-11-11",
@@ -37,7 +39,9 @@
         "events": [],
         "first_ts": "2026-11-11 09:00:01",
         "last_ts": "2026-11-11 15:00:00",
-        "heartbeat": null
+        "heartbeat": null,
+        "trusted": true,
+        "tail_uncertain": false
       }
     ],
     "checklist": [

@@ -2012,18 +2012,28 @@
               "string",
               "null"
             ]
+          },
+          "trusted": {
+            "type": "boolean",
+            "description": "该天的日志是否可信;false 时这一行不能显示成『无异常』"
+          },
+          "tail_uncertain": {
+            "type": "boolean",
+            "description": "只是最后一行还没写完(文件可能正在写);true 时该天暂时无法判断"
           }
         },
         "required": [
-          "day",
-          "started",
-          "trades",
           "clean",
-          "has_severe",
+          "day",
           "events",
           "first_ts",
+          "has_severe",
+          "heartbeat",
           "last_ts",
-          "heartbeat"
+          "started",
+          "tail_uncertain",
+          "trades",
+          "trusted"
         ],
         "additionalProperties": true
       },
