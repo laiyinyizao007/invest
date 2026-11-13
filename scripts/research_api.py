@@ -9,12 +9,13 @@
 
 明确不存在:下单、查账户、改风控参数、连 CTP、访问测试段。输出一律是 JSON,便于程序化消费。
 威胁模型见 scripts/research_sandbox.py 文件头:这是纵深防御而非沙盒,运行前须由人读过代码。
-退出码:0 成功;2 被拒绝/参数错误;3 回测失败;124 超时。
+退出码:0 成功;1 未预期异常(traceback);2 被拒绝/参数错误;3 回测失败;124 超时。
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -126,6 +127,19 @@ class JobError(Exception):
         self.message = message
 
 
+class CandidateError(Exception):
+    """候选代码自身在**导入期**出的错(语法之外的运行时错误、缺模块、模块级副作用报错)。
+
+    与 JobError 分开:JobError 是"宪法/配置拒绝了这份候选"(退出码 2),
+    CandidateError 是"这份候选自己跑不起来"(属于研究中的正常结果)。
+    两者都走结构化回传,免得 LLM 那条反馈通道因为一个 import 错误就断掉——
+    早先这类异常直接带 traceback 退出 1,父进程只报"回测失败",候选拿不到诊断信息。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -190,6 +204,40 @@ def child_params(args) -> dict:
     return params
 
 
+def child_int_args(args) -> tuple[int, int]:
+    """子进程自己校验两个整数参数:`--random-runs` 与 `--prior-trials`。
+
+    这两个也是调用方给的值,不能假设父进程查过:
+    - `--random-runs` 越界会让子进程跑巨量随机入场对照(子进程自身没有超时,超时只由父进程兜),
+      直接调用即可拖资源;
+    - `--prior-trials` 为负更糟:evaluate 路径会先做 `prior + 格子数` 再算 DSR,
+      负数会让 N 变小,而 DSR 随 N 增大而变严——于是**门槛被放松**。
+      (gate 路径不加分号,负数会被 candidate_eval 的 `n_trials >= 1` 拦下,evaluate 路径漏了。)
+
+    返回 (random_runs, prior_trials);prior_trials 为 None 表示不参与 DSR。"""
+    random_runs = getattr(args, "random_runs", None)
+    low, high = rc.INT_BOUNDS[("gate", "random_runs")]
+    if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
+        raise JobError(EXIT_REFUSED, f"--random-runs 必须是 [{low}, {high}] 内的整数(配置边界)")
+    prior = getattr(args, "prior_trials", None)
+    if prior is not None:
+        if isinstance(prior, bool) or not isinstance(prior, int) or prior < 0:
+            raise JobError(EXIT_REFUSED, "--prior-trials 必须是非负整数")
+    return random_runs, prior
+
+
+def child_file(path: Path) -> Path:
+    """子进程自己确认候选文件仍在 pending 目录内。
+
+    父入口用 `resolve_pending` 解析过路径,但子入口能被直接调用,
+    不该假设路径是父进程给的——否则可以直接把 `--file` 指到仓库里任何 .py。"""
+    cfg = rc.load()
+    try:
+        return rs.resolve_pending(str(path), bootstrap.ROOT, cfg["paths"]["pending_dir"])
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
 def check_candidate_class(candidate: type) -> None:
     """运行时校验候选类:必须继承模板,且不得重写白名单以外的模板成员(含类创建后打的补丁)。"""
     try:
@@ -219,7 +267,7 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     if hashlib.sha256(raw).hexdigest() != sha256:            # 批准之后文件被改动(TOCTOU):拒绝运行
         raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
     try:
-        source = raw.decode("utf-8")
+        source = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
     cfg = rc.load()
@@ -231,9 +279,24 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         code = compile(source, str(path), "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise JobError(EXIT_REFUSED, f"策略文件语法错误: {exc}") from exc
+    # 模块元数据用标准 loader 准备(保留 __spec__/__loader__/__package__),
+    # 但**不调用** exec_module:执行的是上面编译好的、经过校验的那份字节,
+    # .pyc 没有机会生效(那正是第 4 轮修掉的 .pyc 绕过)。
     module = types.ModuleType("pending_strategy")
     module.__file__ = str(path)
-    exec(code, module.__dict__)                               # noqa: S102 —— 执行的就是上面校验过的那份字节
+    try:
+        spec = importlib.util.spec_from_file_location("pending_strategy", path)
+        if spec is not None:
+            module.__spec__ = spec
+            module.__loader__ = spec.loader
+            module.__package__ = spec.parent or ""
+            module.__name__ = spec.name
+    except Exception:                                        # noqa: BLE001 - 元数据拿不到不该拦住执行
+        pass
+    try:
+        exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
+    except Exception as exc:                                  # noqa: BLE001 - 候选自身的错,按结构化错误回传
+        raise CandidateError(describe_error(exc)) from exc
     from vnpy_ctastrategy import CtaTemplate
     candidate = getattr(module, cls_name, None)
     if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
@@ -537,24 +600,31 @@ def run_gate_child(args) -> int:
     from research_gate import engine_runner, run_gate
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
-    path = Path(args.file)
     try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
+        random_runs, prior_trials = child_int_args(args)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    if args.on_plateau not in ("0", "1"):
+        print("--on-plateau 只能是 0 或 1", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
+                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=args.prior_trials)
+                          prior_trials=prior_trials)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -569,21 +639,29 @@ def run_evaluate_child(args) -> int:
     from research_gate import engine_runner, run_evaluation
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
-    path = Path(args.file)
+    try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
     cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
         result = run_evaluation(
             candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
-            random_runs=args.random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
             min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=args.prior_trials)
+            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -595,17 +673,26 @@ def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
-    start, end = rs.segment_window(args.key, args.segment)
     try:
+        path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
     try:
-        strategy_class = import_candidate(Path(args.file), args.cls, args.sha256)
+        start, end = rs.segment_window(args.key, args.segment)
+    except rs.SandboxError as exc:
+        # 测试段/未知品种在这里被拒:退出码必须是"拒绝"(2),不能是未捕获异常的 1
+        print(str(exc), file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        strategy_class = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    except CandidateError as exc:
+        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
+        return EXIT_OK
     try:
         stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
@@ -674,12 +761,16 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("run_id", nargs="?", default="")
     rr.set_defaults(func=cmd_results)
     child = sub.add_parser("_child")           # 内部使用
-    for name in ("file", "cls", "key", "segment", "params", "sha256"):
+    for name in ("file", "cls", "params", "sha256"):
         child.add_argument(f"--{name}", required=True)
+    # 隐藏入口的取值范围也在这里先卡一道:子进程能被直接调用,不该假设父进程查过
+    child.add_argument("--key", required=True, choices=rs.KEYS)
+    child.add_argument("--segment", required=True, choices=rs.SEGMENTS)
     child.set_defaults(func=run_child)
     gchild = sub.add_parser("_gate_child")     # 内部使用
-    for name in ("file", "cls", "params", "on-plateau", "sha256"):
+    for name in ("file", "cls", "params", "sha256"):
         gchild.add_argument(f"--{name}", required=True)
+    gchild.add_argument("--on-plateau", required=True, choices=("0", "1"))
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.add_argument("--prior-trials", type=int, default=None)
     gchild.set_defaults(func=run_gate_child)
