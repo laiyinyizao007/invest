@@ -80,7 +80,8 @@ _WIN_PATH = re.compile(r"[A-Za-z](?:[\u200b-\u200f\u2060\ufeff\u202a-\u202e]*)?:
 # 引号包围的路径可以含空格(C:\Users\Alice Smith\...):整段替换,否则只遮住空格之前的部分
 _QUOTED_PATH = re.compile(r"(?P<q>[\"'])(?:[A-Za-z]:[\\/]|\\\\|/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library)/)[^\"'<>|*?\r\n]*(?P=q)")
 # 全角冒号/斜杠写成的盘符路径(C：＼Users＼x):只在确实含全角路径字符时才替换,半角版本由 _WIN_PATH 处理
-_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ]" + _ZW_CLASS + r"*[:：]" + _ZW_CLASS + r"*[\\/＼／][^\s\"'<>|*?]*")
+_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ]" + _ZW_CLASS + r"*[:：]" + _ZW_CLASS + r"*[\\/＼／][^\s\"'<>|*?]*"
+                             r"|[Ａ-Ｚａ-ｚ]" + _ZW_CLASS + r"*[\\/＼／][^\s\"'<>|*?]*")   # 全角盘符**没有冒号**的写法(Ｃ\Users)
 _FULLWIDTH_MARKS = "：＼／"
 _PCT_U = re.compile(r"(?i)%u([0-9a-f]{4})")                                                       # 非标准的 %uXXXX 写法,只用于检测副本
 _ENC_WIN_PATH = re.compile(r"(?i)\b[a-z]%3a(?:%5c|%2f)[^\s\"'<>]*")                                  # C%3A%5CUsers%5C...
