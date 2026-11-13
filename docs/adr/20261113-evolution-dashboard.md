@@ -61,6 +61,25 @@
 | 把反思文本或谱系回灌给 LLM | 提示注入面 + 违反硬记忆预算 |
 | 用曲线上的高分直接放行晋级 | 晋级仍只认 `promotion_gate` 与人工批准;曲线是观察窗口,不是闸门 |
 
+### 2c. 启用与阈值(配置层)
+
+面板侧的配置在 `config/status_dashboard.json`:
+
+```json
+{
+  "evolution": {
+    "enabled": false,          // 阶段④上线时才置 true:为真才注册那 6 个接口(与阶段②-⑤ 的既有约定一致)
+    "stagnant_generations": 5, // 连续多少代没提升算『停滞』
+    "stagnant_epsilon": 0.05,  // 允许的微小提升(夏普)
+    "overfit_mean_gap": 1.0,   // 精英夏普与种群均值差多少算『过拟合嫌疑』(只是提示)
+    "log_limit": 50            // 变异日志的默认页大小与上限
+  }
+}
+```
+
+这些阈值是**经验默认值,不是统计结论**;文案里必须写明是提示。目录位置(`evolution_dir` / `heatmap_dir`)
+也在同一层配置,默认 `data/research/evolution` 与 `data/research/heatmaps`。
+
 ## 后果
 
 - 需要改网关(接受可选谱系字段、写台账)、写毕昇 v4 工作流、扩展状态页后端与前端文档。
