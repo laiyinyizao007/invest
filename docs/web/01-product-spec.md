@@ -156,7 +156,7 @@ flowchart TB
 
 ### 6.4 无人值守 ①
 - **目的**:验收期每天看一眼:连续几天无异常?
-- **数据**:`GET /api/days?limit=14`。示例:`days-sample`。
+- **数据**:`GET /api/days?limit=14`。示例:`days-sample`(**含一天 `trusted=false` 的样例**,供前端看这种行怎么渲染)。
 - **内容**:
   1. 顶部进度:`longest_clean_streak` / `required_streak`(如『1 / 5 天』)。
   2. 每日表:日期、启动次数、成交笔数(0 显示 `—`)、事件(徽标列表,『无异常』用文字)、心跳。`has_severe` 的行整行加严重标记。

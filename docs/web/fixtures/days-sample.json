@@ -42,11 +42,24 @@
         "heartbeat": null,
         "trusted": true,
         "tail_uncertain": false
+      },
+      {
+        "day": "2026-11-10",
+        "started": 0,
+        "trades": 0,
+        "clean": false,
+        "has_severe": false,
+        "events": [],
+        "first_ts": null,
+        "last_ts": null,
+        "heartbeat": null,
+        "trusted": false,
+        "tail_uncertain": false
       }
     ],
     "checklist": [
       {
-        "text": "连续 >= 5 个交易日无人值守:已记录 2 天",
+        "text": "连续 >= 5 个交易日无人值守:已记录 3 天(其中 1 天的日志不可信,不能算作『无异常』,需人工核对)",
         "checked": false
       },
       {
@@ -56,8 +69,6 @@
     ],
     "longest_clean_streak": 1,
     "required_streak": 5,
-    "missing_weekdays": [
-      "2026-11-09"
-    ]
+    "missing_weekdays": []
   }
 }
