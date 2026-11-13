@@ -117,6 +117,22 @@ def _build_recording_case(root, name):
     _write(root, ".ops/recording/status.json", json.dumps(body))
 
 
+# ---------------------------------------------------------------- evolution
+def _build_evolution_case(root, name):
+    """进化区块的台账(每行一条代记录)。"""
+    import hashlib
+
+    d = root / "data" / "research" / "evolution"
+    d.mkdir(parents=True, exist_ok=True)
+    record = {"campaign_id": "camp", "generation": 1, "candidate_sha256": "a" * 64, "parent_sha256": None,
+              "run_id": "20261112-210000-000000", "status": "evaluated", "sharpe": 1.4, "total_return": 0.12,
+              "max_drawdown": 0.08, "dsr": 0.9, "n_trials": 3, "fail_reason": None, "reflection": "反思",
+              "created_at": "2026-11-12T21:00:00", "cell": "fast-mid", "diagnosis": {"weakest": "drawdown"}}
+    if name == "evolution-list-empty":
+        return
+    (d / "camp.jsonl").write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------- research / evolution
 def _build_research_case(root, name):
     (root / "config").mkdir(exist_ok=True)
@@ -134,7 +150,7 @@ def _build_research_case(root, name):
 # ---------------------------------------------------------------- 逐份比对
 TRADING_FIXTURES = list(_trading_scenarios())
 OTHER_FIXTURES = ["days-sample", "alerts-events", "alerts-empty", "recording-running", "recording-stalled",
-                  "recording-missing", "research-sample"]
+                  "recording-missing", "research-sample", "evolution-list", "evolution-list-empty"]
 # 阶段②③④⑤ 尚未实现的接口(没有后端实现,跑不出真实响应):显式跳过并注明原因
 SKIPPED = {
     "equity-sample": "阶段② 权益曲线接口未实现",
@@ -172,6 +188,8 @@ def test_each_other_fixture_matches_what_the_implementation_returns(tmp_path, na
         _build_days_case(root, name)
     elif kind == "recording":
         _build_recording_case(root, name)
+    elif kind == "evolution":
+        _build_evolution_case(root, name)
     else:
         _build_research_case(root, name)
     _fresh_from_fixture(name, root)                      # 时间戳要在采集前设好
@@ -182,6 +200,13 @@ def test_each_other_fixture_matches_what_the_implementation_returns(tmp_path, na
         r = col.collect_alerts(settings, NOW)
     elif kind == "recording":
         r = col.collect_recording(settings, NOW)
+    elif kind == "evolution":
+        payload = col.evolution_list_payload(settings, NOW)      # 裸数据形态:state/level/message 在数据里
+        assert fixture["state"] == payload["state"], (name, fixture["state"], payload["state"])
+        assert fixture["level"] == payload["level"], (name, fixture["level"], payload["level"])
+        assert fixture["total"] == payload["total"] and fixture["checked"] == payload["checked"]
+        assert fixture["unscanned"] == payload["unscanned"]
+        return
     else:
         r = col.collect_research(settings, NOW)
     assert fixture["state"] == r.section["state"], (name, fixture["state"], r.section["state"])
