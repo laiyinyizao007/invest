@@ -215,9 +215,9 @@ def test_overview_is_ok_only_when_core_sections_are_ok_and_optional_ones_may_be_
     o = col.collect_overview(S(tmp_path), NOW)
     assert o["level"] == "ok" and o["reasons"] == []
     assert o["sections"]["recording"]["state"] == "missing" and o["sections"]["research"]["state"] == "missing"
-    # 进化是可选子系统:没部署时不计入总体级别(codex 第十次复核要求它进 overview,否则 level 算了没出口)
-    assert o["sections"]["evolution"]["state"] == "missing" and o["level"] == "ok"
-    assert set(o["sections"]) == {"trading", "alerts", "days", "recording", "research", "evolution"}
+    assert o["level"] == "ok"
+    # evolution 由 evolution.enabled 门控:阶段①默认关着,总览里就不该出现它
+    assert set(o["sections"]) == {"trading", "alerts", "days", "recording", "research"}
 
 
 def test_overview_with_nothing_is_unknown_never_ok(tmp_path):

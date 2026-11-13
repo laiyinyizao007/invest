@@ -46,7 +46,8 @@ DEFAULTS: dict = {
     "stale_after_seconds": {"trading": 60.0, "alerts": 300.0, "days": 600.0, "recording": 120.0, "research": 3600.0, "docs": 86400.0},
     "docs": {"unattended-log": "docs/unattended-log.md", "simnow-drills": "docs/simnow-drills.md"},
     "docs_titles": {"unattended-log": "无人值守运行记录", "simnow-drills": "SimNow 演练记录"},
-    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50},
+    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50,
+                "summary_ttl": 30.0},   # 战役摘要缓存的秒数:总览每 8 秒轮询,不能每次都重读全部台账
     "days_default": 14,
     "recent_runs": 10,
     "limits": {"daily_loss_yuan": None, "hard_drawdown_yuan": None},      # None = 取风控默认值
@@ -100,7 +101,7 @@ def _check_evolution(cfg: Any) -> None:
         value = cfg.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ConfigError(f"evolution.{key} 必须是正整数")
-    for key in ("stagnant_epsilon", "overfit_mean_gap"):
+    for key in ("stagnant_epsilon", "overfit_mean_gap", "summary_ttl"):
         value = cfg.get(key)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
             raise ConfigError(f"evolution.{key} 必须是非负有限数")

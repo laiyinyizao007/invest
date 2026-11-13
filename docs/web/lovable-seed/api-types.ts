@@ -71,6 +71,7 @@ export interface Overview {
     days: Brief;
     recording: Brief;
     research: Brief;
+    evolution?: EvolutionSection;
   };
 }
 
@@ -391,12 +392,15 @@ export interface WhoAmI {
   role: "viewer" | "operator" | "admin";
 }
 
-/** 战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。 */
+/** 进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。 */
 export interface EvolutionList {
   campaigns: Array<EvolutionCampaign>;
   total: number;
   checked: number;
   unscanned: number;
+  state: "ok" | "missing" | "unknown";
+  level: "ok" | "warn" | "critical" | "unknown";
+  message: string | null;
 }
 
 export interface EvolutionCampaign {
@@ -507,6 +511,13 @@ export interface CandidateDiff {
   to_sha256: string;
   diff: string;
   available: boolean;
+}
+
+/** 总览里的进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着)。 */
+export interface EvolutionSection {
+  state: string;
+  level: string;
+  headline: string;
 }
 
 /** 区块外壳:先看 state,再决定是否渲染 data。 */

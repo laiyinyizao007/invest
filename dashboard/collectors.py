@@ -9,6 +9,7 @@ import hashlib
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1031,7 +1032,6 @@ def get_doc(settings: Settings, key: str) -> dict | None:
 # ---------------------------------------------------------------- 总览
 
 CORE = ("trading", "alerts", "days")
-OPTIONAL = ("recording", "research")                 # 没部署时只显示『缺失』,不拖低总体级别
 _ORDER = {"critical": 0, "unknown": 1, "warn": 2, "ok": 3}
 
 
@@ -1045,9 +1045,16 @@ def _collect_safely(name: str, func, settings: Settings, now: float) -> Result:
 
 
 def collect_all(settings: Settings, now: float) -> dict[str, Result]:
-    # 按名字在模块里现查(而不是在定义处绑定函数对象),这样测试可以替换单个 collector 来验证隔离性
+    """采集各区块。按名字在模块里现查(而不是在定义处绑定函数对象),这样测试可以替换单个 collector 来验证隔离性。
+
+    **evolution 由配置开关决定要不要采**:阶段①默认关着,路由也没注册——一个用户根本打不开的子系统
+    不该在总览里出现,更不该因为它的台账坏了就把总状态条染成『需要关注』(那是虚假告警)。
+    """
+    names = ["trading", "alerts", "days", "recording", "research"]
+    if settings.raw.get("evolution", {}).get("enabled"):
+        names.append("evolution")
     return {name: _collect_safely(name, globals()[f"collect_{name}"], settings, now)
-            for name in ("trading", "alerts", "days", "recording", "research", "evolution")}
+            for name in names}
 
 
 def collect_overview(settings: Settings, now: float) -> dict:
@@ -1072,7 +1079,8 @@ class EvolutionUnavailable(Exception):
 # 而前端每 30 秒轮询一次。缓存键是 (路径, **内容哈希**):用元数据(大小/mtime)会被『同长度改写并恢复 mtime』骗过,
 # 返回旧摘要——那会让面板显示一个已经不存在的最好夏普。
 # 曲线与日志接口**不读缓存**,每次现读。
-_EVOLUTION_SUMMARY_CACHE: dict[tuple[str, str], dict] = {}
+_EVOLUTION_SUMMARY_CACHE: dict = {}          # 内容哈希键 → 摘要;路径键 → {at, summary}(带 TTL)
+EVOLUTION_SUMMARY_TTL = 30.0              # 摘要缓存的存活秒数:总览每 8 秒轮询一次,不能每次都重读全部台账
 _EVOLUTION_CACHE_MAX = 64
 MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
 
@@ -1086,11 +1094,18 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
     except OSError as exc:
         raise ev.EvolutionError("台账无法读取") from exc
     # 缓存键是**内容哈希**,不是元数据:同长度改写并恢复 mtime 后,元数据看不出来,哈希能。
-    # 台账最大 8 MB,算一次哈希比重新解析整份台账便宜得多。
+    # 但算哈希也要读完整个文件,而总览每 8 秒轮询一次 → 加一个短 TTL:TTL 内直接用缓存(不再读盘),
+    # 过期后强制重算(这样『同长度改写』最多藏一个 TTL 的时间)。
+    now = time.time()
+    ttl = float(settings.raw.get("evolution", {}).get("summary_ttl", EVOLUTION_SUMMARY_TTL))
+    cached = _EVOLUTION_SUMMARY_CACHE.get(str(path))
+    if cached is not None and now - cached["at"] < ttl:
+        return cached["summary"]
     key = (str(path), _file_digest(path))
-    cached = _EVOLUTION_SUMMARY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    summary = _EVOLUTION_SUMMARY_CACHE.get(key)
+    if summary is not None:
+        _EVOLUTION_SUMMARY_CACHE[str(path)] = {"at": now, "summary": summary}
+        return summary
     records = ev.read_campaign(directory, name)
     sharpes = [r.sharpe for r in records if r.sharpe is not None]
     summary = {
@@ -1106,6 +1121,7 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
     if len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
         _EVOLUTION_SUMMARY_CACHE.clear()
     _EVOLUTION_SUMMARY_CACHE[key] = summary
+    _EVOLUTION_SUMMARY_CACHE[str(path)] = {"at": now, "summary": summary}
     return summary
 
 
@@ -1135,6 +1151,9 @@ def collect_evolution(settings: Settings, now: float) -> Result:
         except ev.EvolutionError as exc:
             campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
                               "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
+    # 裸数据(与 curve/log/heatmap 一致):state/level/message 放在**数据里**,不是 Section 外壳。
+    # 之前这个端点返回 Section 外壳、契约与样例却是裸数据 → 真实响应通不过自己的契约,
+    # 前端照 api-types.ts 写 resp.campaigns,mock 有值而生产是 undefined。
     data = {"campaigns": campaigns, "total": len(names), "checked": len(names) - unscanned, "unscanned": unscanned}
     # **状态用 state 表达**:端点只返回 Section(没有 level 字段),而契约规定前端『先看 state』。
     # 『部分未检查』或『有损坏台账』= 无法判断全部 → state=unknown(不是 ok,卡片不能是绿的)。
@@ -1164,6 +1183,20 @@ def collect_evolution(settings: Settings, now: float) -> Result:
     else:
         level, headline = ("ok", f"{len(campaigns)} 个战役") if campaigns else ("unknown", "暂无战役")
     return Result(m.section(state, data, now=now, message=message), level, headline, reasons)
+
+
+def evolution_list_payload(settings: Settings, now: float) -> dict:
+    """进化战役列表的**裸数据**响应(与 curve/log/heatmap 同族端点一致)。
+
+    state/level/message 放在数据里。四个计数字段**始终在**(没有战役时是 0),
+    否则前端按契约读 `campaigns`/`total` 会拿到 undefined。
+    """
+    result = _collect_safely("evolution", collect_evolution, settings, now)
+    section = result.section
+    data = section.get("data") or {}
+    return {"campaigns": data.get("campaigns", []), "total": data.get("total", 0),
+            "checked": data.get("checked", 0), "unscanned": data.get("unscanned", 0),
+            "state": section["state"], "level": section["level"], "message": section["message"]}
 
 
 def get_evolution_curve(settings: Settings, campaign_id: str) -> dict | None:

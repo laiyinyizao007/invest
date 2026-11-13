@@ -400,7 +400,10 @@ def test_the_campaign_list_matches_the_contract_field_by_field(tmp_path):
     ledger(tmp_path, [row(gen=1, sha="a" * 64)])
     from dashboard import collectors as col
     r = col.collect_evolution(settings(tmp_path), NOW)
-    check("#/components/schemas/EvolutionList", r.section["data"])
+    # 端点返回的是**裸数据**(state/level/message 在数据里),契约也这么写
+    check("#/components/schemas/EvolutionList",
+          {**(r.section["data"] or {}), "state": r.section["state"],
+           "level": r.section["level"], "message": r.section["message"]})
     check("#/components/schemas/EvolutionCampaign", r.section["data"]["campaigns"][0])
 
 
@@ -556,3 +559,26 @@ def test_the_campaign_list_is_ordered_by_modification_time_newest_first(tmp_path
         p.write_text("{}\n", encoding="utf-8")
         os.utime(p, (NOW - age, NOW - age))
     assert ev.campaigns(d) == ["camp0", "camp1", "camp2"]
+
+
+def test_the_diff_compares_the_parent_source_with_the_candidate_source(tmp_path):
+    """差异是『父代源码 → 本代源码』;父代不在了要说 available=False,不能给出空 diff 让人以为没有差异。"""
+    import hashlib
+
+    from dashboard import collectors as col
+
+    d = tmp_path / "pending_strategies"
+    d.mkdir(parents=True)
+    src1 = "class C:\n    x = 1\n"
+    src2 = "class C:\n    x = 2\n"
+    (d / "gen1.py").write_bytes(src1.encode())
+    (d / "gen2.py").write_bytes(src2.encode())
+    sha1 = hashlib.sha256(src1.encode()).hexdigest()
+    sha2 = hashlib.sha256(src2.encode()).hexdigest()
+    s = settings(tmp_path)
+    out = col.get_candidate_diff(s, sha2, sha1)
+    assert out is not None and out["available"] is True
+    assert "-    x = 1" in out["diff"] and "+    x = 2" in out["diff"]
+    # 父代源码不在
+    missing = col.get_candidate_diff(s, sha2, "f" * 64)
+    assert missing is not None and missing["available"] is False and missing["diff"] == ""

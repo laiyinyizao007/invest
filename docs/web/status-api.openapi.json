@@ -1699,14 +1699,18 @@
               },
               "research": {
                 "$ref": "#/components/schemas/Brief"
+              },
+              "evolution": {
+                "$ref": "#/components/schemas/EvolutionSection",
+                "description": "进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着,路由也没注册)——前端要容���这个键不存在。"
               }
             },
             "required": [
-              "trading",
               "alerts",
               "days",
               "recording",
-              "research"
+              "research",
+              "trading"
             ],
             "additionalProperties": true
           }
@@ -2108,7 +2112,8 @@
             "type": "boolean"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "description": "录制进程写的状态。实际取值:starting / connecting / recording / connected / degraded / stalled / stopping / stopped。**认不出的取值一律按 unknown 处理**(区块降级),前端不要为没出现过的取值写分支。"
           },
           "profile": {
             "type": [
@@ -3238,7 +3243,7 @@
       },
       "EvolutionList": {
         "type": "object",
-        "description": "战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。",
+        "description": "进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。",
         "properties": {
           "campaigns": {
             "type": "array",
@@ -3257,12 +3262,41 @@
           "unscanned": {
             "type": "integer",
             "description": "未检查的战役数(>0 时区块级别为 warn)"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "missing",
+              "unknown"
+            ],
+            "description": "区块状态:没有战役是 missing;有战役没被统计或台账损坏是 unknown"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warn",
+              "critical",
+              "unknown"
+            ],
+            "description": "严重程度(徽标用)"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "说明,例如『还有 N 个战役未检查』"
           }
         },
         "required": [
           "campaigns",
-          "total",
           "checked",
+          "level",
+          "message",
+          "state",
+          "total",
           "unscanned"
         ],
         "additionalProperties": true
@@ -3811,6 +3845,27 @@
           "to_sha256",
           "diff",
           "available"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionSection": {
+        "type": "object",
+        "description": "总览里的进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着)。",
+        "properties": {
+          "state": {
+            "type": "string"
+          },
+          "level": {
+            "type": "string"
+          },
+          "headline": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "level",
+          "headline"
         ],
         "additionalProperties": true
       }

@@ -81,7 +81,9 @@ def test_sections_never_hide_a_missing_state_behind_ok():
     for entry in MANIFEST:
         payload = json.loads((WEB / "fixtures" / f"{entry['fixture']}.json").read_text(encoding="utf-8"))
         if isinstance(payload, dict) and payload.get("state") in {"missing", "corrupt"}:
-            assert payload["data"] is None, entry["fixture"]
+            # 裸数据形态的样例(如进化战役列表)没有 data 字段,只有 Section 外壳的才有
+            if "data" in payload:
+                assert payload["data"] is None, entry["fixture"]
 
 
 def test_fixtures_contain_no_real_looking_secrets_or_absolute_paths():

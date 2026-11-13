@@ -6,7 +6,7 @@
   "message": null,
   "data": {
     "wrapper_running": true,
-    "status": "running",
+    "status": "recording",
     "profile": "simnow",
     "symbols": [
       "C2701.DCE",

@@ -76,6 +76,7 @@ def test_the_campaign_summary_cache_notices_a_same_size_rewrite(tmp_path):
     root = tmp_path / "repo"
     d = _make_campaigns(root, 1)
     settings = appconfig.load(path=root / "none.json", root=root)
+    settings.raw["evolution"]["summary_ttl"] = 0.0        # TTL 到期才重算(默认 30 秒,免得总览每 8 秒重读全部台账)
     first = col.collect_evolution(settings, 1_800_000_000.0).section["data"]["campaigns"][0]
     assert first["best_sharpe"] == 0.4
 

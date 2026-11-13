@@ -176,7 +176,7 @@ flowchart TB
 ### 6.5 行情录制 ①
 - **目的**:录制进程是否在正常入库。
 - **数据**:`GET /api/recording`。示例:`recording-running`、`recording-stalled`、`recording-missing`。
-- **内容**:进程状态(`status`:running / stalled / starting …)、合约列表、最近 tick / bar 时间、最后错误、数据警告。
+- **内容**:进程状态(`status`:**starting / connecting / recording / connected / degraded / stalled / stopping / stopped**)、合约列表、最近 tick / bar 时间、最后错误、数据警告。**认不出的取值按 unknown 渲染**(服务端会把区块降级),不要为没出现过的取值写分支。
 - **异常**:`status=stalled` → 警告:『已连接但没有订阅到任何合约』;`missing` → 『录制未启动,或不在本机』。
 - **注意**:`last_tick` 为空是正常现象(非交易时段),不要标红;要结合 `status` 判断。
 

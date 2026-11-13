@@ -264,7 +264,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     if settings.raw.get("evolution", {}).get("enabled"):
         @get("/api/research/evolution")
         def evolution_list():
-            return respond(col._collect_safely("evolution", col.collect_evolution, settings, clock()).section)
+            # **裸数据**(与 curve/log/heatmap 同族端点一致):state/level/message 放在数据里。
+            return respond(col.evolution_list_payload(settings, clock()))
 
         @get("/api/research/evolution/{campaign_id}/curve")
         def evolution_curve(campaign_id: str):
