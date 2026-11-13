@@ -295,6 +295,13 @@ def check_all(root: Path) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv or [])
     root = Path(argv[0]).resolve() if argv else ROOT
+    # Windows 控制台默认是 cp1252,直接打印中文/符号会抛 UnicodeEncodeError——
+    # 那会让**成功路径**也以异常退出(退出码 1),看起来像"检查不通过"。先改成 utf-8。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):  # 老解释器或已被替换的流:不影响结论
+            pass
     try:
         problems = check_all(root)
     except HistoryUnavailable as exc:
