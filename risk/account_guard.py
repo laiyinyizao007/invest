@@ -75,6 +75,9 @@ class AccountGuard:
         self.unlock_history: list[dict] = []   # 人工解锁记录:{at, locked_at, reason, forced}
         self.manual_orders: dict[str, int] = {}  # 交易日(ISO) -> 当日检测到的非策略委托笔数
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
+        # 该权益『被采样』的时刻(账户回报到达柜台网关的时间),不是文件写入时间。只供状态页判断权益是否新鲜:
+        # 网关断开后 vn.py 仍缓存着旧账户对象,定时器照常读到它并落盘,文件 mtime 因此一直是新的。纯可观测字段,不参与任何熔断判断。
+        self.last_sampled_at: datetime | None = None
         self.account_id: str = ""              # 状态所属的账户;换账户时权益基准必须重置(SimNow 2000 万 vs 实盘 1 万)
         self.save_error: str = ""
         self._last_saved_at: datetime | None = None
@@ -118,9 +121,11 @@ class AccountGuard:
 
     # ---------- 更新 ----------
 
-    def update(self, equity: float, now: datetime) -> list[LockEvent]:
+    def update(self, equity: float, now: datetime, sampled_at: datetime | None = None) -> list[LockEvent]:
+        """sampled_at:这笔权益的采样时刻(调用方知道账户回报何时到达);缺省取 now。"""
         if equity is None or math.isnan(equity) or equity <= 0:
             return []  # 无效采样
+        self.last_sampled_at = sampled_at if sampled_at is not None else now
         day = trading_day(now)
         events: list[LockEvent] = []
         changed = False
@@ -220,6 +225,7 @@ class AccountGuard:
         state = {
             "account_id": self.account_id,
             "last_equity": self.last_equity,
+            "sampled_at": self.last_sampled_at.astimezone().isoformat(timespec="seconds") if self.last_sampled_at else None,   # 带时区
             "peak_equity": self.peak_equity,
             "day": self.day.isoformat() if self.day else None,
             "day_start_equity": self.day_start_equity,

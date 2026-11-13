@@ -68,6 +68,13 @@ def _read_heartbeat(path: Path) -> tuple[float | None, str | None]:
     return value, None
 
 
+def _has_offset(text: str) -> bool:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).tzinfo is not None
+    except ValueError:
+        return False
+
+
 def _validate_guard(raw: Any, limits: dict) -> dict | None:
     """校验 account_guard.json 的形状;任何不符合返回 None(调用方按 corrupt 处理)。"""
     if not isinstance(raw, dict):
@@ -82,8 +89,18 @@ def _validate_guard(raw: Any, limits: dict) -> dict | None:
     reason = raw.get("hard_reason")
     if reason is not None and not isinstance(reason, str):
         return None
+    sampled = raw.get("sampled_at")
+    sampled_ts = None
+    if sampled is not None:
+        # 带时区的 ISO 字符串。无时区的会被 parse_iso 当成 UTC——风控进程写的是本地时间,会差 8 小时,所以直接拒绝
+        if not isinstance(sampled, str) or not _has_offset(sampled):
+            return None
+        sampled_ts = m.parse_iso(sampled)
+        if sampled_ts is None:
+            return None
     last, peak, start = float(raw["last_equity"]), float(raw["peak_equity"]), float(raw["day_start_equity"])
     return {
+        "_sampled_ts": sampled_ts,
         "account_masked": mask_account(raw.get("account_id")),
         "day": raw["day"], "day_start_equity": start, "last_equity": last, "peak_equity": peak,
         "daily_pnl": round(last - start, 2), "drawdown_from_peak": round(max(peak - last, 0.0), 2),
@@ -113,13 +130,18 @@ def collect_trading(settings: Settings, now: float) -> Result:
             heartbeat = {"process": "running" if age <= stale_after else "stopped", "last_beat_at": m.iso(hb_ts), "age_seconds": age}
 
     # ---- 风控状态:有自己的年龄。心跳新鲜不代表权益/盈亏/锁定状态是当前值
+    # 年龄按『权益被采样的时刻』算,而不是文件写入时间:网关断开后 vn.py 仍缓存旧账户对象,风控进程照常每分钟落盘,
+    # 文件 mtime 因此一直是新的,权益却已不再刷新(codex 复核 #4)。旧格式文件没有 sampled_at → 无法确认,不显示为新鲜。
     guard_mtime = m.mtime(guard_path)
-    guard_future = guard_mtime is not None and guard_mtime - now > CLOCK_SKEW_TOLERANCE
-    guard_age = None if guard_mtime is None else round(max(now - guard_mtime, 0.0), 1)
+    sampled_ts = guard.pop("_sampled_ts") if guard is not None else None
+    guard_future = (guard_mtime is not None and guard_mtime - now > CLOCK_SKEW_TOLERANCE) or (sampled_ts is not None and sampled_ts - now > CLOCK_SKEW_TOLERANCE)
+    guard_unverifiable = guard is not None and sampled_ts is None
+    basis = [t for t in (sampled_ts, guard_mtime) if t is not None]
+    guard_age = None if guard is None or sampled_ts is None else round(max(now - min(basis), 0.0), 1)
     if guard is not None:
-        guard["as_of"] = None if guard_mtime is None else m.iso(guard_mtime)
+        guard["as_of"] = None if sampled_ts is None else m.iso(sampled_ts)
         guard["age_seconds"] = guard_age
-    guard_stale = guard is not None and (guard_future or (guard_age is not None and guard_age > GUARD_STALE_AFTER))
+    guard_stale = guard is not None and (guard_future or guard_unverifiable or (guard_age is not None and guard_age > GUARD_STALE_AFTER))
 
     flag = state_dir / PAUSE_FLAG_NAME
     paused_at = m.mtime(flag)
@@ -129,7 +151,7 @@ def collect_trading(settings: Settings, now: float) -> Result:
         "pause": {"paused": paused_at is not None, "since": None if paused_at is None else m.iso(paused_at)},
         "live_admission": {"approved": (state_dir / "promotion_approval.json").exists()},
     }
-    as_of = hb_ts if hb_ts is not None else guard_mtime
+    as_of = hb_ts if hb_ts is not None else (sampled_ts if sampled_ts is not None else guard_mtime)
 
     # ---- 区块状态:取最差。顺序即优先级
     if hb_err == "corrupt" or g_err == "corrupt":
@@ -146,7 +168,8 @@ def collect_trading(settings: Settings, now: float) -> Result:
     elif guard_stale:
         state = "stale"
         message = ("风控状态文件的时间戳在未来(时钟回拨或文件异常)" if guard_future else
-                   f"风控状态文件已落后 {guard_age / 60:.0f} 分钟(运行时至少每分钟落盘一次):当前权益、盈亏、锁定状态可能不是最新")
+                   "风控状态文件没有记录权益采样时间(旧格式,需交易进程重启后才会写入):无法确认当前权益、盈亏是否仍在刷新" if guard_unverifiable else
+                   f"权益已 {guard_age / 60:.0f} 分钟没有被刷新(风控进程每分钟落盘,但账户回报停了——网关可能已断开):当前权益、盈亏、锁定状态可能不是最新")
     else:
         state, message = "ok", None
 
@@ -648,8 +671,30 @@ def _headline_of(result: dict) -> str:
     return f"{result.get('kind', '运行')} · {result.get('status', '状态未知')}"
 
 
+RUN_KINDS = ("backtest", "gate", "evaluate")
+MAX_RUNS_SCANNED = 200               # 最多校验多少个运行结果文件(防止结果目录无限增长拖慢请求);超出的在提示里说明
+
+
+def _valid_run(run_id: str, body: Any) -> bool:
+    """运行结果的最小结构(按 scripts/research_api.py 的真实产出定):不符合就当作无法读取,而不是『尽量显示』。
+
+    G8 第 3 轮 #8:曾经 `{}` 被显示成正常的 backtest,未知 kind 被静默改成 backtest。
+    """
+    if not isinstance(body, dict) or body.get("kind") not in RUN_KINDS:
+        return False
+    if not isinstance(body.get("strategy_file"), str):
+        return False
+    if "run_id" in body and body["run_id"] != run_id:                   # 文件被改名或复制
+        return False
+    if body.get("status") is not None and not isinstance(body["status"], str):
+        return False
+    if body["kind"] in ("gate", "evaluate"):
+        return isinstance(body.get("passed"), bool)
+    return body.get("status") == "strategy_error" or isinstance(body.get("stats"), dict)
+
+
 def _brief_run(run_id: str, result: dict) -> dict:
-    kind = result.get("kind") if result.get("kind") in ("backtest", "gate", "evaluate") else "backtest"
+    kind = result["kind"]                                               # 调用方已用 _valid_run 校验
     passed = result.get("passed")
     return {"run_id": run_id, "kind": kind, "status": result.get("status") if isinstance(result.get("status"), str) else None,
             "passed": passed if isinstance(passed, bool) else None,
@@ -730,19 +775,24 @@ def collect_research(settings: Settings, now: float) -> Result:
     unreadable_pending += max(len(pending_files) - MAX_PENDING_LISTED, 0)
 
     recent, unreadable_runs = [], 0
-    for p in runs[: settings.raw["recent_runs"]]:
+    shown = settings.raw["recent_runs"]
+    for i, p in enumerate(runs[:MAX_RUNS_SCANNED]):                     # 不只看最近 N 个:更早的损坏文件也要被发现
         body, e = m.read_json(p, retries=0)
-        if e is None and isinstance(body, dict):
-            recent.append(_brief_run(p.stem, body))
+        if e is None and _valid_run(p.stem, body):
+            if i < shown:
+                recent.append(_brief_run(p.stem, body))
         else:
             unreadable_runs += 1
+    unscanned = max(len(runs) - MAX_RUNS_SCANNED, 0)
     data = {"quota": {"used": used, "limit": limit, "window_hours": int(cfg["iteration"]["window_hours"]),
                       "next_release_in_seconds": None if oldest_in_window is None else int(round(oldest_in_window + window - now))},
             "approvals_count": len(approved_hashes), "pending": pending, "recent_runs": recent}
 
-    problems = []
+    problems, notes = [], []
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
+    if unscanned:
+        notes.append(f"更早的 {unscanned} 个运行结果未检查")
     if unreadable_pending:
         problems.append(f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
     reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
@@ -755,7 +805,7 @@ def collect_research(settings: Settings, now: float) -> Result:
         level, headline = "ok", f"额度 {used}/{limit}"
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
-    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now, message=";".join(problems) or None),
+    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now, message=";".join(problems + notes) or None),
                   level, headline, reasons)
 
 
@@ -776,7 +826,7 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
     except OSError:
         return None
     body, e = m.read_json(path, retries=0)
-    if e or not isinstance(body, dict):
+    if e or not _valid_run(run_id, body):
         return None
     brief = _brief_run(run_id, body)
 

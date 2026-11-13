@@ -177,3 +177,31 @@ def test_an_account_key_holding_an_object_is_recursed_into_not_stringified():
 
 def test_a_secret_key_holding_an_object_is_hidden_entirely():
     assert safe.sanitize({"credentials": {"user": "x", "pass": "y"}}) == {"credentials": "***"}
+
+
+# ---- G8 第 3 轮 #9:编码形式的路径(单层 / 双层百分号编码) ----
+@pytest.mark.parametrize("text,leak", [
+    ("读取 %5C%5Cfileserver%5Cfinance%5C2026.xlsx 失败", "fileserver"),
+    ("读取 %255C%255Cfileserver%255Cfinance 失败", "fileserver"),
+    ("path=%252Fhome%252Favery%252Finvest%252F.env", "avery"),
+    ("path=%2Fusr%2Flocal%2Flib%2Fx.py", "usr"),
+    ("file=C%253A%255CUsers%255Cme%255C.env", "Users"),
+    ("url=https://x/?p=%255C%255Cnas01%255Cbackup", "nas01"),
+    ("see %2FVolumes%2FBackup%2Faccounts.csv", "Backup"),
+])
+def test_encoded_unc_and_double_encoded_paths_are_scrubbed(text, leak):
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+@pytest.mark.parametrize("text", [
+    "进度 100%25 完成", "a%20b%20c", "https://example.com/a%2Fb?q=1%262", "折扣 50% off", "%E4%B8%AD%E6%96%87 (中文)", "sha256=9f2c%5a1d", "比例 3%/4%",
+])
+def test_ordinary_percent_text_is_left_alone(text):
+    assert safe.scrub_text(text) == text
+
+
+def test_urls_are_not_mistaken_for_drive_letter_paths():
+    """曾经 `s://` 被当成盘符 `s:/`,https://example.com 会变成 http<path>。"""
+    assert safe.scrub_text("见 https://example.com/docs 与 ftp://host/x") == "见 https://example.com/docs 与 ftp://host/x"
+    assert "Users" not in safe.scrub_text("file:///C:/Users/me/.env")

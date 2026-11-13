@@ -18,6 +18,7 @@ import re
 import unicodedata
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import unquote
 
 from notify.redact import redact
 
@@ -64,9 +65,11 @@ _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}")
 _CTP_ENV = re.compile(r"(?i)\bCTP_[A-Z0-9_]+\s*[=:]\s*\S+")
 
 _UNC = re.compile(r"\\\\[?.]?\\?[^\s\"'<>|*?]+")                                                    # \\server\share  \\?\C:\...  \\.\pipe\x
-_WIN_PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|*?]*")
+_WIN_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"'<>|*?]*")            # 盘符前不能是字母数字,否则 https://x 里的 s:// 会被当成盘符
 _ENC_WIN_PATH = re.compile(r"(?i)\b[a-z]%3a(?:%5c|%2f)[^\s\"'<>]*")                                  # C%3A%5CUsers%5C...
 _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|etc|tmp|mnt|srv|app|private|workspace|volumes)%2f[^\s\"'<>]*")
+_PCT_TOKEN = re.compile(r"[^\s\"'<>]*%[0-9A-Fa-f]{2}[^\s\"'<>]*")                                   # 含百分号编码的片段
+_DECODE_ROUNDS = 2                                                                                 # 单层与双层编码(%5C、%255C);更深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
 
 
@@ -84,6 +87,23 @@ def clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 1, 0)] + "…"
 
 
+def _decoded_has_path(token: str) -> bool:
+    """对**检测副本**做有界的百分号解码,看解码后是否出现路径。替换作用于原文,所以没有路径的编码文本(%E4%B8%AD、%20)不受影响。"""
+    current = token
+    for _ in range(_DECODE_ROUNDS):
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        current = decoded
+        if _UNC.search(current) or _WIN_PATH.search(current) or _POSIX_PATH.search(current):
+            return True
+    return False
+
+
+def _scrub_encoded_token(match: re.Match) -> str:
+    return "<path>" if _decoded_has_path(match.group(0)) else match.group(0)
+
+
 def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) -> str:
     """文本净化。保留换行与普通内容,只替换已知的泄露形态。"""
     out = redact(text, secrets)
@@ -97,6 +117,7 @@ def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) 
     out = _ENC_WIN_PATH.sub("<path>", out)
     out = _ENC_POSIX_PATH.sub("<path>", out)
     out = _POSIX_PATH.sub("<path>", out)
+    out = _PCT_TOKEN.sub(_scrub_encoded_token, out)
     return clip(out, limit)
 
 

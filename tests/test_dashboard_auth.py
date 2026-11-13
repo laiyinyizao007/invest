@@ -175,3 +175,27 @@ def test_no_temp_files_are_left_behind(tmp_path):
     auth.load_or_create_token(p)
     auth.load_or_create_token(p)
     assert sorted(x.name for x in p.parent.iterdir()) == ["status.token"]
+
+
+# ---- G8 第 3 轮 #5:回退路径与临时文件 ----
+def _leftovers(directory):
+    return sorted(p.name for p in directory.iterdir())
+
+
+def test_fsync_failure_leaves_no_temp_file_containing_the_token(tmp_path, monkeypatch):
+    path = tmp_path / "dash" / "status.token"
+    monkeypatch.setattr(auth.os, "fsync", lambda fd: (_ for _ in ()).throw(OSError("disk error")))
+    with pytest.raises(auth.TokenError):
+        auth.load_or_create_token(path)
+    assert not path.exists()
+    assert _leftovers(path.parent) == []                 # 含令牌的临时文件必须被清掉
+
+
+def test_a_filesystem_without_hard_links_fails_closed_instead_of_publishing_an_empty_file(tmp_path, monkeypatch):
+    path = tmp_path / "dash" / "status.token"
+    monkeypatch.setattr(auth.os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError(1, "not supported")))
+    with pytest.raises(auth.TokenError) as info:
+        auth.load_or_create_token(path)
+    assert not path.exists()                              # 不能留下空文件或半成品:否则下次启动会永久遇到『内容过短』
+    assert _leftovers(path.parent) == []
+    assert str(tmp_path) not in str(info.value) and "硬链接" in str(info.value)

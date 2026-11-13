@@ -50,11 +50,12 @@ def load_or_create_token(path: Path) -> tuple[str, bool]:
     - 新建文件在 POSIX 上收紧为 0600;Windows 依赖用户目录的默认 ACL。
     - **并发首次启动是安全的**:先把令牌写进临时文件,再用 `os.link` 原子发布——目标已存在则失败(不覆盖),
       所以恰好一个创建者成功,其余的读取赢家的文件;而且 `path` 在任何时刻要么不存在、要么内容完整,
-      不存在『文件已创建但还是空的』的窗口。文件系统不支持硬链接时退回 O_EXCL,读取端的短暂重试兜底。
+      不存在『文件已创建但还是空的』的窗口。文件系统不支持硬链接时 fail-closed(不发布空文件),提示手工创建。
     """
     path = Path(path)
     if path.exists():
         return _read_existing(path), False
+    tmp = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         token = secrets.token_urlsafe(32)
@@ -70,22 +71,20 @@ def load_or_create_token(path: Path) -> tuple[str, bool]:
         except FileExistsError:
             return _read_existing(path), False                           # 输了:读赢家的
         except OSError:
-            try:                                                          # 不支持硬链接:退回 O_EXCL
-                fd2 = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                return _read_existing(path), False
-            with os.fdopen(fd2, "w", encoding="utf-8") as fh:
-                fh.write(token + "\n")
-            return token, True
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            # 不支持硬链接:fail-closed。曾经退回 O_EXCL 直接创建目标文件——那会先发布一个空文件,
+            # 写入途中崩溃就让下次启动永久遇到『内容过短』(G8 第 3 轮 #5)。没有原子发布手段就不发布。
+            raise TokenError("令牌文件无法原子创建:该文件系统不支持硬链接。请手工创建令牌文件"
+                             "(至少 24 个随机字符,仅本人可读),再启动服务") from None
     except TokenError:
         raise
     except (OSError, UnicodeError):
         raise TokenError("令牌文件无法创建(权限、磁盘或路径问题)") from None
+    finally:
+        if tmp is not None:                                               # 从创建临时文件起就要清理:fsync 失败时它里面已经有令牌
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def parse_bearer(header: str | None) -> str | None:

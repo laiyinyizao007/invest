@@ -181,7 +181,9 @@ def write_guard(tmp_path, **over):
     """写风控状态文件,mtime 对齐到测试时钟(NOW 是虚构的 2027 年;真实 mtime 会被正确判为落后几个月)。"""
     st = tmp_path / "data" / "state"
     st.mkdir(parents=True, exist_ok=True)
-    data = {"account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d", "day_start_equity": 1.0, "hard_locked": False}
+    from datetime import datetime, timedelta, timezone
+    sampled_at = datetime.fromtimestamp(NOW - 2, timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    data = {"sampled_at": sampled_at, "account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d", "day_start_equity": 1.0, "hard_locked": False}
     data.update(over)
     p = st / "account_guard.json"
     p.write_text(json.dumps(data), encoding="utf-8")
@@ -402,3 +404,41 @@ def test_an_edited_candidate_with_restored_mtime_and_same_size_is_no_longer_show
     p.write_bytes(b"x=2\n")                                          # 同长度
     os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))                 # 恢复 mtime
     assert col.collect_research(S(tmp_path), NOW).section["data"]["pending"][0]["approved"] is False
+
+
+# ---- G8 第 3 轮 #8:运行结果必须符合结构,不能把 {} 显示成正常的 backtest ----
+def _runs_of(tmp_path):
+    r = col.collect_research(S(tmp_path), NOW)
+    return r, r.section["data"]["recent_runs"]
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"kind": "mystery", "strategy_file": "d.py"}, {"kind": "gate"}, {"kind": "gate", "passed": "yes", "strategy_file": "d.py"},
+    {"kind": "evaluate", "strategy_file": "d.py"}, {"kind": "backtest", "strategy_file": "d.py"},
+    {"kind": "gate", "passed": True, "strategy_file": 7}, [], "text", {"kind": "gate", "passed": True, "strategy_file": "d.py", "run_id": "20200101-000000-000000"},
+])
+def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_backtest(tmp_path, body):
+    res(tmp_path, runs=[(RID, body)])
+    r, runs = _runs_of(tmp_path)
+    assert runs == []
+    assert r.level == "warn" and "无法读取" in r.section["message"]
+    assert col.get_run(S(tmp_path), RID) is None
+
+
+def test_valid_runs_of_each_kind_are_accepted(tmp_path):
+    ok = [("20261112-210000-000001", {"kind": "backtest", "strategy_file": "d.py", "stats": {"sharpe": 1.0}}),
+          ("20261112-210000-000002", {"kind": "backtest", "status": "strategy_error", "strategy_file": "d.py", "error": {"type": "X"}}),
+          ("20261112-210000-000003", {"kind": "gate", "passed": False, "strategy_file": "d.py"}),
+          ("20261112-210000-000004", RUN)]
+    res(tmp_path, runs=ok)
+    r, runs = _runs_of(tmp_path)
+    assert len(runs) == 4 and r.level == "ok"
+
+
+def test_invalid_runs_older_than_the_displayed_window_are_still_counted(tmp_path):
+    """曾经只检查最近 N 个文件:更早的损坏文件永远不会被发现。"""
+    good = [(f"20261112-2100{i:02d}-000000", RUN) for i in range(12)]
+    bad = [("20261101-000000-000000", {})]
+    res(tmp_path, runs=good + bad)
+    r, runs = _runs_of(tmp_path)
+    assert len(runs) == 10 and r.level == "warn" and "1 个运行结果" in r.section["message"]

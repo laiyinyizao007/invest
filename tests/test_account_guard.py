@@ -425,3 +425,42 @@ def test_only_stale_open_orders_are_returned():
     orders = [("a", 0.0, True), ("b", 100.0, True), ("c", 0.0, False)]
     assert find_stale_orders(orders, now_ts=130.0, timeout=120.0) == ["a"]     # 平仓单 c 永不因超时被撤
     assert find_stale_orders(orders, now_ts=130.0, timeout=10.0) == ["a", "b"]
+
+
+# ---- G8 第 3 轮 #4:权益『采样时间』与文件写入时间分开 ----
+def test_state_file_records_when_the_equity_was_sampled_with_a_timezone(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    sampled = datetime(2026, 11, 9, 9, 59, 12)
+    g.update(10_000, MON_10AM, sampled_at=sampled)
+    saved = json.loads(path.read_text(encoding="utf-8"))["sampled_at"]
+    parsed = datetime.fromisoformat(saved)
+    assert parsed.tzinfo is not None                                     # 带时区:面板不会把本地时间当 UTC 解析
+    assert parsed.replace(tzinfo=None) == sampled.astimezone().replace(tzinfo=None)
+
+
+def test_sampled_at_defaults_to_now_when_the_caller_gives_none(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    assert datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sampled_at"]).replace(tzinfo=None) == MON_10AM
+
+
+def test_an_invalid_sample_does_not_advance_sampled_at(tmp_path):
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    g.update(float("nan"), datetime(2026, 11, 9, 11, 0))
+    g.update(10_100, datetime(2026, 11, 9, 11, 1), sampled_at=MON_10AM)       # 保存会发生(创新高),采样时间仍是旧的
+    assert datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sampled_at"]).replace(tzinfo=None) == MON_10AM
+
+
+def test_old_state_file_without_sampled_at_still_loads_and_saves_without_inventing_one(tmp_path):
+    path = tmp_path / "guard.json"
+    path.write_text(json.dumps({
+        "peak_equity": 10_000, "day": "2026-11-09", "day_start_equity": 10_000,
+        "daily_locked_day": None, "hard_locked": False, "hard_reason": "",
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(), path)
+    g._save()
+    assert json.loads(path.read_text(encoding="utf-8"))["sampled_at"] is None       # 没有采样就不编造

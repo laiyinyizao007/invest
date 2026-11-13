@@ -26,7 +26,7 @@ from pathlib import Path
 
 from vnpy.event import Event
 from vnpy.trader.constant import Direction, Offset, OrderType, Status
-from vnpy.trader.event import EVENT_LOG
+from vnpy.trader.event import EVENT_ACCOUNT, EVENT_LOG
 from vnpy.trader.logger import ERROR
 from vnpy.trader.object import LogData, OrderData, OrderRequest
 from vnpy.trader.utility import round_to
@@ -150,7 +150,9 @@ class AccountGuardRule(RuleTemplate):
         self.session_active = lambda: True
         self._was_in_session = True
 
+        self._account_event_at: datetime | None = None   # 最近一次『本账户』资金回报到达的时刻(只供状态页判断权益新鲜度)
         self.risk_engine.event_engine.register(EVENT_LOG, self._on_log)
+        self.risk_engine.event_engine.register(EVENT_ACCOUNT, self._on_account_event)
 
     def update_setting(self, rule_setting: dict) -> None:
         super().update_setting(rule_setting)
@@ -282,6 +284,12 @@ class AccountGuardRule(RuleTemplate):
         self._threshold_alerted[metric] = now
         self._alert("WARN", "风控阈值触发", body)
 
+    def _on_account_event(self, event: Event) -> None:
+        """记录账户资金回报的到达时间。**不参与任何熔断判断**:vn.py 在网关断开后仍缓存旧账户对象,
+        只看定时器读到的数据会误以为权益是新的;状态页据此区分『风控进程活着』与『权益还在被刷新』。"""
+        if not self.account_id or getattr(event.data, "accountid", None) == self.account_id:
+            self._account_event_at = self.clock()
+
     def _on_log(self, event: Event) -> None:
         log: LogData = event.data
         if (log.gateway_name == APP_NAME and log.msg.startswith(THRESHOLD_LOG_PREFIX)
@@ -371,7 +379,7 @@ class AccountGuardRule(RuleTemplate):
             note = self.guard.bind_account(account.accountid)
             if note:
                 self._alert("WARN", "账户变更", note)
-            for ev in self.guard.update(account.balance, now_dt):
+            for ev in self.guard.update(account.balance, now_dt, sampled_at=self._account_event_at):
                 self._on_lock_event(ev)
             self.peak_equity, self.day_start_equity = self.guard.peak_equity, self.guard.day_start_equity
         if self.guard.save_error and not self._save_error_alerted:
