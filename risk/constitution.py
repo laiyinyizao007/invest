@@ -283,6 +283,13 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             for name in sorted(_class_body_names(node)):
                 if _is_protected(name, c):
                     findings.append(f"第 {node.lineno} 行: 类 {node.name} 覆盖了受保护成员 {name}")
+                elif name in BUILTIN_FORBIDDEN_DUNDERS:
+                    # `class C: __setattr__ = print` 这种**赋值**形式的定义,
+                    # 与 `def __setattr__` 一样是候选自定义受禁 dunder,静态层也要拦
+                    # (运行时层能抓到,但那时已经在跑候选了)。
+                    findings.append(f"第 {node.lineno} 行: 类 {node.name} 定义了受禁的 {name}(可绕过属性改写检查)")
+                elif name in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
+                    findings.append(f"第 {node.lineno} 行: 类 {node.name} 定义了受禁的按名 setter {name}(可按键名改写实例属性)")
             for stmt in node.body:
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if _is_protected(stmt.name, c):
@@ -347,9 +354,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             if _is_protected(node.arg, c) or node.arg.lower() in _protected_lower(c):
                 findings.append(f"第 {node.lineno} 行: 关键字参数 {node.arg} 属于受保护项,不得由候选指定")
         elif isinstance(node, ast.Dict):
+            # 字典字面量的键:与参数层同一把尺子(大小写不敏感,且受保护**成员**同样算数)。
+            # 早先这里只精确比对 protected_parameters,与 check_params 的口径不一致。
+            protected_lower = _protected_lower(c)
             for key in node.keys:
-                if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in c.protected_parameters:
-                    findings.append(f"第 {node.lineno} 行: 字典字面量含受保护参数 {key.value}")
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if _is_protected(key.value, c):
+                        findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}")
+                    elif key.value.lower() in protected_lower:
+                        findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}(仅大小写不同)")
     return findings
 
 

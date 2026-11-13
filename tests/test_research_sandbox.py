@@ -267,3 +267,28 @@ def test_screen_rejects_the_operator_module():
     """operator.attrgetter('__dict__') 是反射入口:属性名可以是字符串,绕开属性名检查。"""
     findings = rs.screen_source("import operator\noperator.attrgetter('__dict__')(self)\n")
     assert findings and any("operator" in f for f in findings), findings
+
+
+# ---------- 第 6 轮 codex 的 M1:受禁名字的**裸名**与**字符串**形式 ----------
+
+def test_screen_flags_a_bare_builtins_reference():
+    """裸名 `__builtins__` 也必须拦。
+
+    `exec(code, module.__dict__)` 会自动往候选的 globals 里塞一个 `__builtins__`
+    (里面就有 `__import__`),而受禁属性名此前只拦 `x.__builtins__` 这种属性写法——
+    裸名写法完全看不见:静态层 0 findings,候选照样能拿到执行入口。"""
+    findings = rs.screen_source("f = __builtins__['__import__']" + chr(10) + "f('os')" + chr(10))
+    assert findings and any("__builtins__" in f for f in findings), findings
+
+
+def test_screen_flags_a_string_form_of_the_import_entry():
+    """入口藏在字符串里也要拦:`'__import__'` 这种字符串不是属性名,属性检查看不见。"""
+    findings = rs.screen_source("name = '__import__'" + chr(10))
+    assert findings and any("__import__" in f for f in findings), findings
+
+
+def test_screen_does_not_reject_ordinary_words_that_merely_look_like_builtins():
+    """普通词不按字符串拒:`type`/`open` 这类词在候选代码里太常见(字典键、注释都会命中),
+    一律拒绝会把正常候选整片拒掉。真正危险的是 dunder 形状的那些。"""
+    findings = rs.screen_source("KIND = {'type': 'ema', 'open': 3}" + chr(10))
+    assert not findings, findings

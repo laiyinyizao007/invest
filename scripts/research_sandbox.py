@@ -35,6 +35,19 @@ FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "
                    "type"}      # type(self).__base__ 之类的反射入口
 FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
 
+# 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
+# `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,
+# 而调用点完全看不出被调的是谁(第 7 轮实测:静态层与沙盒层当时都返回空列表,
+# 底线由 300 变成 1e12,within_budget 随之放行)。
+# 名单只收两类:dunder 形状的名字(执行入口一定是这类),
+# 以及"按名字改写/反射"的内建名(getattr/setattr/eval/globals 之类)。
+# **不含** `open`/`type`:交易数据里 "status": "open" 这种字段名很常见,
+# 按字符串一律拦会把正常候选整片拒掉——误报面远大于收益。
+FORBIDDEN_STRINGS = FORBIDDEN_ATTRS | {
+    "__import__", "__getattribute__", "__setattr__", "__delattr__",
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "globals", "locals", "vars", "input",
+}
+
 ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
              "LOCALAPPDATA", "PROGRAMDATA", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "PYTHONIOENCODING", "TZ", "VIRTUAL_ENV",
              "INVEST_C15_DATA", "RESEARCH_SANDBOX_CONFIG")      # 数据路径与配置路径(均不含凭据)
@@ -87,14 +100,19 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
         for name in names:
             if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in forbidden_calls:
-            # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
-            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in forbidden_calls:
+                # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
+            elif node.id in FORBIDDEN_ATTRS:
+                # 受禁属性名同样要拦**裸名**:`__builtins__` 是 exec 注入到 globals 里的字典,
+                # 裸名就能拿到(`f = __builtins__['__import__']`),只拦 `x.__builtins__` 是不够的。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过反射检查)")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
         # 属性名当字符串用:operator.attrgetter('__dict__')(self) 能绕开"禁止访问 __dict__"的
         # 属性写法(调用点看不出访问的是什么)。这些名字作为字符串出现时一律拒绝。
-        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_ATTRS:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_STRINGS:
             findings.append(f"第 {node.lineno} 行: 禁止引用 {node.value} 字符串")
     return findings
 

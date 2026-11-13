@@ -55,6 +55,30 @@
 **Medium——隐藏子入口的信任边界(已修)**:`--random-runs` 与 `--prior-trials` 现在由子入口自己复查(`--prior-trials` 为负会放松 DSR 门槛:evaluate 路径先做 `prior + 格子数`,负数让 N 变小,而 DSR 随 N 增大而变严);`--key`/`--segment` 用 parser 的 `choices`;`--on-plateau` 只接受 `0`/`1`;`--file` 必须在 `pending_strategies/` 内;非法 `--segment` 的退出码从 1 改为 2。
 **Low(已改)**:`import_candidate` 改用 `spec_from_file_location` 准备模块元数据(保留 `__spec__`/`__loader__`/`__package__`)但仍不调 `exec_module`,字节码绕过不受影响;BOM 候选改用 `utf-8-sig` 解码(此前会报 `invalid non-printable character U+FEFF`);候选导入期异常改走结构化 `{"error": ...}` 回传(此前带 traceback 退出 1,LLM 拿不到诊断);错误提示语"param_grid 含受保护参数"改为"字典字面量含受保护参数"(这条检查的实际范围是任何字典字面量)。
 **未采纳/未复现(如实记录)**:另一轮提出的"`git log -- <path>` 会把被合并分支吃掉"一条**复现不成立**——实测特性分支新增保护项的提交在默认 `git log` 里仍在(被剪掉的只有与父提交内容完全相同的合并提交,不比也不会漏内容);已按它的建议改用 `--full-history`,但那是可读性改动,不是漏洞修复。另一轮提出的"文档字符串里提到受禁属性名也会被拒"一条**与实现不符**:沙盒层是精确相等匹配,文档字符串里"提到"不会被拒;ADR 已按实现更正口径。
+**第 6 轮复核(MiniMax-M3)**:**32/50,仍不通过**,但阻塞项只剩两条且都很短;它报出了前两轮都没报出的一条活绕过。
+**Critical——`__builtins__['setattr']` 绕过(已修,已独立复现)**:第 5 轮修的是 `self.update_setting(...)`,
+另一条路径能达成**完全相同的后果**:`exec(code, module.__dict__)` 会往候选的 globals 里注入 `__builtins__` **字典**,
+里面就有 `setattr`;此前只拦 `x.__builtins__` 这种**属性写法**,裸名与字符串形式都漏了。
+实测改之前:静态层 `[]`、沙盒层 `[]`,`self.risk_budget` 由 300.0 变成 1e12,`within_budget(100,10,1e12)` 返回 True。
+现改沙盒层:受禁属性名(`__builtins__`/`__dict__`/`__class__` 等)的**裸名**引用一律拒;
+这些名字与 `setattr`/`getattr`/`eval`/`exec`/`globals`/`locals`/`vars`/`__import__`/`compile`/`input`
+作为**字符串常量**出现也拒。**故意不含** `open`/`type`:交易数据里 `"status": "open"` 很常见,按字符串一律拒会整片拒掉正常候选。
+**High——宪法守卫在 CI 上收集即失败(已修)**:守卫此前寄生在 pytest 用例里,CI 跑 `pytest tests/test_constitution.py`,
+而根 `tests/conftest.py` 会 import `segment_ledger` → `bootstrap` → `vnpy.trader.setting`,
+在只装 pytest 的 CI 上**收集阶段就失败(退出码 4)**——守卫在 CI 上一次都没跑过,却看起来"配好了"。
+本地已复现同样的失败(屏蔽 vnpy 导入后 exit 4)。现把守卫抽成独立脚本 `tools/check_constitution_history.py`
+(只用标准库 + git,退出码 0 通过 / 1 有问题 / 2 环境不可用),CI 直接跑它,不装 pytest、更不装 vnpy;
+并加了"注册表完整性"检查(源码里新增字符串集合型的保护常量而没登记进历史比对,守卫会报出来——
+当年 `BUILTIN_PROTECTED_NAMES` 正是这样漏掉的)与"换模板必须同时改内置白名单"检查。
+**本轮还修的(第 6 轮提出)**:BOM 候选在父入口与子入口口径不一致(现在共用 `read_candidate()` 读取器);
+结果里记的 `strategy_sha256` 早先是从换行归一后的文本算的,与批准记录的哈希**必然不同**(工作区 `.py` 都是 CRLF),
+审计链断在换行上——现统一用原始字节的哈希;候选导入期 `raise SystemExit()` 也走结构化回传;
+类体里把按名 setter 写成赋值(`update_setting = 3`)静态层也拦;子入口自己查**审批记录**
+(`--sha256` 只证明"文件没变",不证明"人看过");找不到类改为退出码 2(参数错误)而不是 3;子进程的"拒绝"原样传到父层。
+**如实记录两条本轮复核提出但本轮不做的**:①子入口仍信任调用方给的 `--prior-trials`(少报会让 DSR 的 N 变小,
+放松晋级门槛;且子入口自己不写账本,直接调用可白嫖评估)——根治要么让子入口以账本为准,要么让它自己也记账;
+②本仓库**没有任何工作流跑全量测试**,测试只在本地跑。这两条已登记进 ADR 的"已知残余风险"。
+
 **CI 的实际情况(如实记录)**:本仓库的 GitHub Actions 目前**所有**工作流都在 1–3 秒内失败(`Sync Notion Board`、`Generate Issue Task List`、`Detect Duplicate Issues`、`Constitution Guard` 等一律如此),工作流 YAML 本身解析正常、仓库 Actions 权限是 `enabled`/`all`——不是宪法工作流的写法问题,而是账号/运行器层面的问题(当前 token 缺 `checks:read` 权限,连失败原因都读不到)。因此 `Constitution Guard` 这条工作流**在 CI 上一次都没有真正跑起来过**,PR #17 的 `mergeStateStatus` 一直是 `UNSTABLE` 也是这个原因。ADR 里"由 CI 检查保证"目前只有本地执行支撑(本地全量 2264 passed / 3 skipped,唯一失败的 `test_drill` 是工作树不带被 gitignore 的 `.env` 所致,与本次改动无关)。这条要等 Actions 恢复后确认,不能当作已经跑过。
 **G8 第 2 轮的现状(如实记录)**:codex 连审 5 轮——第 2 轮发现 dunder 绕过与家族根误判、第 4 轮(31/50,未通过)发现 `.pyc` 绕过/别名绕过/`operator` 反射通道/`cfg` 静默回归/子入口未复查参数/ADR 未同步,六项逐条复现后修复并各配了会在修复前失败的测试(对着修复前的提交 `353465e` 跑,8 条新测试会失败)。第 5 轮原先因 codex 账号限流(429)跑不成,额度恢复后于 2026-11-13 03:54 跑完:`gpt-5.6-sol` **40.5/50**、另一轮独立复核(`MiniMax-M3`)**33/50**,两轮都未通过,发现已逐条复现后修复。期间还补过一轮 `gemini-2.5-flash`(**46/50**,无 Critical/High)作参考——它同样不替代 codex 那一轮。修复后已补跑第 6 轮,结果见下方条目。
 - **进化引擎三视图(读取侧 + 前端文档)**(2026-11-13):新增 `dashboard/evolution.py` 与 `docs/web/08-evolution-views.md`。契约新增 6 个阶段④只读接口(战役列表/进化曲线/变异日志/参数热力图/候选源码/候选差异)与 11 个数据模型,12 份示例数据,种子重新生成。读取侧校验台账行(坏行即损坏,不做『尽量显示』)、按代聚合精英/均值/P25/P75 并由服务端判定停滞与过拟合提示、热力图三维切二维(`null` 单元保持为空、不画成 0)、源码按哈希找、统一 diff 由服务端算。**面板只读:不注入变异、不批准、不回滚**;进化回路由毕昇工作流承载。路由按仓库约定由配置开关 `evolution.enabled` 控制(阶段④上线才注册,`capabilities.evolution` 告诉前端),台账损坏返回 503 与 404 可区分。**数据还没有**——引擎侧阶段 3 还没开工,线上取不到是如实状态,前端用示例数据开发。

@@ -140,6 +140,21 @@ class CandidateError(Exception):
         self.detail = detail
 
 
+def _child_reason(stderr: str) -> str:
+    """从子进程的 stderr 里取出拒绝原因(最后一行非空输出)。
+
+    子进程的"拒绝"(退出码 2)必须**原样传到父层**:早先一律压成"回测失败(退出码 3)",
+    于是子入口里那些拒绝(受保护参数、路径越界、审批缺失)的原因只进了本机 stderr,
+    永远进不了返回给调用方/LLM 的结果里——而那条通道正是为"把诊断送回去"设计的。
+
+    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。"""
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return "子进程拒绝执行(原因见本机日志)"
+    reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", lines[-1])
+    return reason[:200]
+
+
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
@@ -154,6 +169,10 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
     if proc.returncode != 0 or line is None:
         # 详细输出只留在本机 stderr;回传给调用方的 message 不含子进程原始输出(可能含本机路径)
         print("失败:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
+        if proc.returncode == EXIT_REFUSED:
+            # 子进程的"拒绝"要**原样传到父层**,不能一律压成"回测失败":
+            # 子入口自己复查的那些项(受保护参数、路径越界、审批缺失)的原因必须能回到调用方。
+            raise JobError(EXIT_REFUSED, "拒绝执行:" + _child_reason(stderr))
         raise JobError(EXIT_FAILED, "回测失败(详情见本机日志)")
     return json.loads(line[len(CHILD_MARK):])
 
@@ -172,8 +191,28 @@ def check_approval(path: Path, paths: dict, confirm: bool) -> None:
         raise JobError(EXIT_REFUSED, str(exc))
 
 
+def read_candidate(path: Path) -> tuple[bytes, str]:
+    """读候选文件:返回(原始字节, 源码文本)。
+
+    **读一次,各处都用同一份**:
+    - 解码统一 `utf-8-sig`:带 BOM 的候选(Windows 编辑器常见)在标准 loader 下能正常导入,
+      若按纯 `utf-8` 解码,BOM 会留在字符串里让 `ast.parse` 报"语法错误"——
+      于是同一份带 BOM 的候选在父入口被拒、在子入口却能过,两处行为不一致(第 6 轮 codex 实测)。
+    - 哈希、筛查、编译、执行都基于这同一份字节,分开打开文件会留下 TOCTOU 窗口。"""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件无法读取: {exc}") from exc
+    try:
+        return raw, raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
+
+
 def screen(path: Path, cfg: dict) -> list[str]:
-    return rs.screen_source(path.read_text(encoding="utf-8"), cfg["screening"]["extra_forbidden_modules"],
+    """静态筛查。与 `import_candidate` 共用同一个读取器,免得两处解码口径不一致。"""
+    _, source = read_candidate(path)
+    return rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
                             cfg["screening"]["extra_forbidden_calls"])
 
 
@@ -238,6 +277,21 @@ def child_file(path: Path) -> Path:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
 
 
+def child_approved(path: Path) -> None:
+    """子进程自己查审批记录。
+
+    `--sha256` 只证明"文件没变",**不证明"人看过"**——哈希谁都能自己算。
+    子入口能被直接调用,不查审批就能跑一份从未被人审阅过的候选,
+    而"运行前由人读过代码"正是这套设计最核心的前提(威胁模型的第一条)。
+    审批记录按**内容哈希**存,所以文件一改就自动失效。"""
+    _, paths = settings()
+    try:
+        if not rs.is_approved(path, paths["approvals_file"]):
+            raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
+    except rs.SandboxError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
 def check_candidate_class(candidate: type) -> None:
     """运行时校验候选类:必须继承模板,且不得重写白名单以外的模板成员(含类创建后打的补丁)。"""
     try:
@@ -260,16 +314,9 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     而用 `spec.loader.exec_module()` 载入时,Python 可能从 `__pycache__` 里取时间戳有效的旧 `.pyc`
     ——那意味着人工批准的、算过哈希的、过了静态筛查的源码,和实际执行的字节码**不是一回事**。
     所以这里只读一次字节,再对同一份内容做完所有事。"""
-    try:
-        raw = Path(path).read_bytes()
-    except OSError as exc:
-        raise JobError(EXIT_REFUSED, f"策略文件无法读取: {exc}") from exc
+    raw, source = read_candidate(path)                      # 读一次,哈希与筛查都用这同一份
     if hashlib.sha256(raw).hexdigest() != sha256:            # 批准之后文件被改动(TOCTOU):拒绝运行
         raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
-    try:
-        source = raw.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise JobError(EXIT_REFUSED, f"策略文件不是合法的 UTF-8: {exc}") from exc
     cfg = rc.load()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
                                 cfg["screening"]["extra_forbidden_calls"])
@@ -295,12 +342,15 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         pass
     try:
         exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
-    except Exception as exc:                                  # noqa: BLE001 - 候选自身的错,按结构化错误回传
+    except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
+        # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
+        # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
         raise CandidateError(describe_error(exc)) from exc
     from vnpy_ctastrategy import CtaTemplate
     candidate = getattr(module, cls_name, None)
     if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
-        raise JobError(EXIT_FAILED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
+        # 找不到类 = 调用方要了一个候选里没有的类,是**参数错误**(拒绝),不是运行失败
+        raise JobError(EXIT_REFUSED, f"{cls_name} 不存在或不是 CtaTemplate 子类")
     check_candidate_class(candidate)                          # 运行时再查一次:挡住批准后被替换的候选
     return candidate
 
@@ -359,10 +409,10 @@ def review_job(strategy: str, input_fn=None, write=print) -> dict:
     静态筛查不过的直接拒绝,不提问。批准只能在本机由人触发,外层没有任何端点能调用它。"""
     cfg, paths = settings()
     path = resolve_strategy(strategy, cfg)
-    source = path.read_text(encoding="utf-8")
+    raw, source = read_candidate(path)           # 字节数按原始字节算:换行转换后的长度不是文件真实大小
     sha = rs.file_sha256(path)
     findings = screen(path, cfg)
-    write(f"文件: {path.name}   大小: {len(source.encode('utf-8'))} 字节   sha256: {sha}")
+    write(f"文件: {path.name}   大小: {len(raw)} 字节   sha256: {sha}")
     write("静态筛查: " + ("通过" if not findings else "未通过"))
     for finding in findings:
         write(f"  - {finding}")
@@ -406,14 +456,17 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     check_params_allowed(params)
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
+    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
+    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
+    strategy_sha = rs.file_sha256(path)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
            "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", rs.file_sha256(path)]
     body = spawn_child(cmd, timeout)
     if "error" in body:                    # 策略自身报错是研究中的正常结果:记录下来供反馈,而不是当作网关故障
         result = {"kind": "backtest", "status": "strategy_error", "strategy_file": path.name,
-                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": key,
+                  "strategy_sha256": strategy_sha, "class": cls, "key": key,
                   "segment": segment, "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"),
                   "error": body["error"]}
         save_with_report(result, paths)
@@ -421,7 +474,7 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
 
     from risk.diagnosis import diagnose
     result = {
-        "kind": "backtest", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "kind": "backtest", "strategy_file": path.name, "strategy_sha256": strategy_sha,
         "class": cls, "key": key, "segment": segment, "params": params,
         "window": [f"{start:%Y-%m-%d}", f"{end:%Y-%m-%d}"], "ran_at": datetime.now().isoformat(timespec="seconds"),
         "stats": body["stats"], "diagnosis": diagnose(body["stats"], body["pnls"]),
@@ -469,7 +522,10 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     on_plateau, plateau_note = plateau
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
+    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
+    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
+    strategy_sha = rs.file_sha256(path)
     trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
@@ -479,12 +535,12 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     body = spawn_child(cmd, timeout)
     if "error" in body:
         result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
-                  "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(), "class": cls, "key": "C15",
+                  "strategy_sha256": strategy_sha, "class": cls, "key": "C15",
                   "params": params, "ran_at": datetime.now().isoformat(timespec="seconds"), "error": body["error"]}
         save_with_report(result, paths)
         return result
     result = {
-        "kind": "gate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "kind": "gate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
         "class": cls, "key": "C15", "params": params, "plateau_note": plateau_note,
         "protocol_notice": PROTOCOL_NOTICE,
         "ran_at": datetime.now().isoformat(timespec="seconds"), **body,
@@ -516,7 +572,10 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
-    source = path.read_text(encoding="utf-8")
+    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
+    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
+    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
+    strategy_sha = rs.file_sha256(path)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
@@ -525,7 +584,7 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     body = spawn_child(cmd, timeout)
     if "error" not in body:
         top_up_grid_trials(paths, body)
-    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
     if "error" in body:
@@ -602,6 +661,7 @@ def run_gate_child(args) -> int:
     from vnpy.trader.constant import Exchange
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
         random_runs, prior_trials = child_int_args(args)
     except JobError as exc:
@@ -641,6 +701,7 @@ def run_evaluate_child(args) -> int:
     from vnpy.trader.constant import Exchange
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
@@ -675,6 +736,7 @@ def run_child(args) -> int:
     from strategies.instruments import INSTRUMENTS
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
+        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
         print(exc.message, file=sys.stderr)
