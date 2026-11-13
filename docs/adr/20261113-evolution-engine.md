@@ -135,15 +135,24 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 三层防线:
 | 层 | 位置 | 拦什么 |
 |---|---|---|
-| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、直接下单/撤单、`param_grid` 含受保护参数 |
-| 运行时(执行前) | `research_api.check_candidate_class` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类 |
-| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数(此前 `backtest`/`gate` 不校验参数键名) |
+| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、直接下单/撤单、`param_grid` 含受保护参数、**受禁 dunder 的调用与自定义**(见下)、自定义 metaclass、类装饰器 |
+| 运行时(执行前) | `research_api.import_candidate` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类;不得定义受禁 dunder;不得自定义 metaclass |
+| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数或成员(此前 `backtest`/`gate` 不校验参数键名),**大小写不敏感**比对 |
 
 要点:
-- **家族而非模板**:要求继承"模板所属家族"(模板往上第一个非 vnpy 祖先),不要求继承 15 分钟模板本身——研究与沙盒也跑日线族。
+- **家族而非模板**:要求继承"模板所属家族"(MRO 里最靠近 object 的**应用层**基类),不要求继承 15 分钟模板本身——研究与沙盒也跑日线族。家族根必须排除 vnpy 框架基类与 `abc.ABC`;早先按"祖先名字/模块"猜测会把 `abc.ABC` 当成家族根,连带把模板自身成员误判为"候选重写",导致**每个真实候选都被拒**。
 - **静态层不判断"是否重写了模板成员"**:模板成员名单要到运行时才知道,那一层由 `check_class` 负责;静态层只管受保护项与下单接口。候选**新增**成员(新指标、新辅助方法)允许。
-- 白名单 `allowed_overrides` 默认只有 `entry_signal`、`param_grid`、`parameters` 与可搜索参数;试图把受保护项加进白名单一律拒绝(不静默过滤,以免掩盖配置错误)。
+- 白名单 `allowed_overrides` 默认只有 `entry_signal`、`param_grid`、`parameters` 与可搜索参数;试图把受保护项加进白名单一律拒绝(不静默过滤,以免掩盖配置错误)。白名单与受保护清单的冲突在**合并后**的集合上校验,冲突即报错。
 - `research_grid.FORBIDDEN_AXES` 改为从清单派生,避免两处各写一份而漂移。
+- **清单的 `template` 只能取内置白名单内的类**:换成任意可导入的类(如 vnpy 的 `CtaTemplate`)会让继承约束形同虚设;要换模板必须改代码、走代码评审。
+- **"只能追加"靠版本控制保证**:`load()` 只与代码里的内置集合合并,察觉不到文件里的删除。清单相对上一次提交只增不减,由 CI 检查(`test_constitution_history_is_append_only`)逐个历史版本比对。
+
+### 受禁 dunder 与元类
+`object.__setattr__(self, "risk_budget", 1e9)` 能在运行时直接改写实例上的风控底线,而属性形式的 `__setattr__` 不在静态筛查原有的赋值检查覆盖范围内,运行时又因"所有 dunder 一律忽略"而漏掉——两层防线同时失效。因此:
+- 静态层拒绝调用 `__setattr__`/`__delattr__`/`__getattribute__`/`__getattr__`/`__init_subclass__`/`__set_name__`,拒绝候选自定义这些 dunder,拒绝自定义 metaclass 与类装饰器;
+- 运行时层拒绝候选定义这些 dunder,拒绝候选的 metaclass 与模板不一致。
+
+**已知残余风险**:候选若在模块导入期用 `import` 副作用改写模板模块的成员,静态层未必拦得住;彻底解决要把风控底线移出候选实例属性、存到候选无法触及的引擎侧对象里。已登记为后续项。
 
 ## 明确不做
 无人值守连续迭代(4c,须单独评审)、仪表盘审批按钮、PBO/CPCV、多品种扩展、新增测试段。

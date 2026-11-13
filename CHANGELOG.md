@@ -23,6 +23,16 @@
 提交时的静态筛查(覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写风控模块函数、直接下单撤单、`param_grid` 含受保护参数)、
 执行前的运行时类校验(必须继承模板家族;不得重写白名单以外的模板成员,含中间基类与类创建后的补丁)、
 请求时的参数校验(`backtest`/`gate` 此前不校验参数键名,`risk_budget` 可被请求方指定)。`research_grid.FORBIDDEN_AXES` 改为从清单派生。
+**G8 双轮复核后加固**(codex 第 2 轮发现,逐条复现后修复):`object`/`type.__setattr__()` 可在运行时直接改写实例上的风控底线,
+而属性形式的 `__setattr__` 不在原有赋值检查覆盖范围内、运行时又因"所有 dunder 一律忽略"而漏掉,两层防线同时失效——现静态层拦截受禁 dunder 的调用与自定义、
+运行时层拒绝候选定义受禁 dunder,另加拒绝自定义 metaclass 与类装饰器;
+`run_gate_child()` 此前**完全没有**运行时类校验(整条 gate 路径只剩静态筛查一层,清单 template 配成不可导入的类时仍会运行),
+现三个子进程入口统一走 `import_candidate()`,哈希/静态筛查/运行时校验一处不漏;
+更严重的是自查发现的 `family_root()` 在真实 MRO 上返回 `abc.ABC`,导致**每个真实候选都因 ABCMeta 自动注入的 `_abc_impl` 被拒**——
+阶段 2 的运行时校验对真实代码从未生效过,现改为按"应用层基类"判定家族根并忽略元类自动生成的成员;
+受保护参数改为大小写不敏感比对(`Risk_Budget` 与 `risk_budget` 是两个属性,精确匹配会让自定义 `__setattr__` 重定向完全绕过参数校验);
+清单的 `template` 改为只能取内置白名单内的类;白名单与受保护清单的冲突改为在合并后的集合上校验(此前 allow 静默胜出,新增的保护形同虚设);
+"只能追加"靠版本控制保证——`load()` 只与代码内置集合合并、察觉不到文件里的删除,现由 CI 检查逐个历史版本比对。
 - **进化引擎阶段 1:试验账本 + DSR 门槛**(Issue [#15](https://github.com/laiyinyizao007/invest/issues/15),ADR `20261113-evolution-engine`):`risk/trial_ledger.py`(只增不减、损坏 fail-closed,每个 param_grid 格子与每次成功提交各计 1 次试验,失败的评估同样消耗试验)、`risk/dsr.py`(Bailey & López de Prado 2014,日收益口径,试验间方差取 1/(T-1))、晋级门槛第 9 条 **DSR ≥ 0.95**(阈值已锁定)。`CandidateMetrics` 新增 `dsr`/`n_trials`:缺失即视为未通过(fail-closed),**旧格式的指标 JSON 不再能过 `record_promotion.py`**。账本由可信的父进程读写(先记账再跑,失败不退:evaluate 预扣最小网格 27 并补差额,gate 记 1 次 `gate_run`)、网关 `_candidates` 记提交试验;子进程只拿到 `--prior-trials` 一个数字。NaN/inf 日收益与非法 `dsr`/`n_trials` 一律 fail-closed(G8 复核发现 NaN 会让 `dsr < 0.95` 恒为 False 而放过候选)。PBO 延后。
 - `tools/build_static_manifest.py`:生成 / 校验前端构建产物清单 `manifest.json`(`{"files": {相对路径: sha256}}`)——**前后端的硬约定**。后端只服务清单内、哈希匹配的文件,每次请求重新校验;改了产物就必须重新生成。拒绝符号链接、空目录、没有 `index.html` 的目录;`--check` 可放进前端 CI;测试断言后端接受本工具写出的一切。
 - 契约:`Guard` 新增 `as_of` / `age_seconds`(风控状态文件自己的年龄);新增示例 `trading-guard-stale`(进程在跑但风控状态陈旧——前端最容易做错的状态);契约文档新增 §10.1 `corrupt` 的完整含义与读取上限、§10.2 `stopped` 录制、`HEAD` 语义。示例共 40 个。
