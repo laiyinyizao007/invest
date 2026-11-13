@@ -135,24 +135,19 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
     return Settings(raw=raw, root=root, paths=paths)
 
 
-# 研究沙盒的目录(来自 config/research_sandbox.json 的默认值);面板会读取这些位置,令牌文件同样不能放进去
-_RESEARCH_DIRS = ("pending_strategies", "data/research", "data/research-control")
-# Docker 部署时状态目录挂载在这里;即使当前配置指向 data/state,令牌也不应落进任何一处交易侧目录树
-_TRADING_SIDE_DIRS = ("data/state", "runtime", ".ops", ".vntrader", ".vntrader_record")
+# 面板专属目录:令牌文件只许放在这里(白名单)。
+# 曾用拒绝名单列出交易侧目录,结果漏掉了 .vntrader_drill / .vntrader_brokertest / .vntrader_probe——拒绝名单永远追不上新增的目录。
+DASHBOARD_DIR = "data/dashboard"
 
 
 def _check_token_location(paths: dict, root: Path) -> None:
-    """令牌文件不能位于交易侧的目录树里。
+    """令牌文件必须位于面板专属目录 data/dashboard/ 之下,其他位置一律拒绝。
 
     G8 第 2 轮审查(Critical):令牌曾默认写在 data/state/——交易系统的状态目录。创建文件会改变目录的 mtime、
     占用同一块磁盘空间,也可能触发交易侧对目录的扫描或备份,违反『面板绝不写入交易系统』。
-    面板自己的文件只许放在专属目录(默认 data/dashboard/)。
     """
+    allowed = (root / DASHBOARD_DIR).resolve()
     token_dir = paths["token_file"].parent
-    guarded = [paths["state_dir"], paths["recording_dir"], paths["research_config"].parent, *paths["log_dirs"],
-               *(root / d for d in _TRADING_SIDE_DIRS), *(root / d for d in _RESEARCH_DIRS)]
-    for d in guarded:
-        d = d.resolve()
-        if token_dir == d or d in token_dir.parents:
-            raise ConfigError(f"令牌文件不能放在交易侧目录 {d.relative_to(root) if root in d.parents else d} 里(创建它就是在写交易系统的目录);"
-                              "请放在面板专属目录,例如 data/dashboard/")
+    if token_dir != allowed and allowed not in token_dir.parents:
+        raise ConfigError(f"令牌文件只能放在面板专属目录 {DASHBOARD_DIR}/ 之下(收到 {paths['token_file'].relative_to(root)});"
+                          "放在别处就是在写交易系统或其他进程的目录")

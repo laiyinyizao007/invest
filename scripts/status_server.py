@@ -15,6 +15,9 @@ import argparse
 import sys
 from pathlib import Path
 
+# 面板『只读』:不能因为 import 就在 risk/、evidence/ 等交易侧包目录里写 __pycache__。必须在任何项目模块被 import 之前设置。
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))

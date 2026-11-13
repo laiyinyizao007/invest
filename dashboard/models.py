@@ -87,11 +87,11 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
             return None, "missing"
         except TooLarge:
             return None, "corrupt"                   # 状态 JSON 都很小;异常增长的文件不读,也不重试
-        except (PermissionError, OSError):
+        except (PermissionError, OSError, BadEncoding):          # 读写撞车可能读到被截断的多字节字符,所以重试一次
             last_error = "corrupt"
         else:
             try:
-                return json.loads(text), None
+                return json.loads(text, parse_constant=_reject_constant), None
             except ValueError:
                 last_error = "corrupt"
         if attempt < retries:
@@ -99,8 +99,21 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
     return None, last_error
 
 
-class TooLarge(Exception):
+class Untrusted(Exception):
+    """文件读到了,但内容不可信(过大、编码非法)。调用方一律按 corrupt 处理,不能『尽量读』后当作正常数据。"""
+
+
+class TooLarge(Untrusted):
     """文件超过读取上限。上限是防止异常增长的文件在单次请求里耗尽内存/CPU(面板与交易系统同机)。"""
+
+
+class BadEncoding(Untrusted):
+    """不是合法 UTF-8。曾用 errors='replace' 把非法字节换成 U+FFFD 继续解析,文件被『修复』后可能仍然合法并被判正常。"""
+
+
+def _reject_constant(name: str):
+    """JSON 标准里没有 NaN / Infinity,Python 默认却接受。它们说明写入方出了问题,不能当作合法数据。"""
+    raise ValueError(f"JSON 不允许常量 {name}")
 
 
 def read_text_limited(path: Path, limit: int) -> str:
@@ -109,7 +122,10 @@ def read_text_limited(path: Path, limit: int) -> str:
         raw = fh.read(limit + 1)
     if len(raw) > limit:
         raise TooLarge(f"{path.name} 超过 {limit} 字节上限")
-    return raw.decode("utf-8", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BadEncoding(f"{path.name} 不是合法 UTF-8") from exc
 
 
 def mtime(path: Path) -> float | None:

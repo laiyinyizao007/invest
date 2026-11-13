@@ -57,7 +57,7 @@ def _read_heartbeat(path: Path) -> tuple[float | None, str | None]:
         text = m.read_text_limited(path, HEARTBEAT_MAX_BYTES).strip()
     except FileNotFoundError:
         return None, "missing"
-    except (OSError, m.TooLarge):
+    except (OSError, m.Untrusted):
         return None, "corrupt"
     try:
         value = float(text)
@@ -432,7 +432,7 @@ def _outbox(settings: Settings, now: float) -> tuple[int, float | None, str]:
         lines = m.read_text_limited(path, MAX_OUTBOX_BYTES).splitlines()
     except FileNotFoundError:
         return 0, None, "missing"
-    except (OSError, m.TooLarge):
+    except (OSError, m.Untrusted):
         return 0, None, "corrupt"                 # 读不了或异常增长 ≠ 不存在;不能把它说成『没有积压』
     pending, oldest = 0, None
     for line in lines:
@@ -708,7 +708,7 @@ def collect_research(settings: Settings, now: float) -> Result:
             if now - at < window:
                 used += 1
                 oldest_in_window = at if oldest_in_window is None else min(oldest_in_window, at)
-    except (ValueError, KeyError, OSError, m.TooLarge):
+    except (ValueError, KeyError, OSError, m.Untrusted):
         sec = m.section("corrupt", None, as_of=m.mtime(ledger_path), now=now, message="提交账本损坏或异常增长:网关会拒绝所有新提交(fail-closed)")
         return Result(sec, "unknown", "提交账本损坏", [_reason("research", "unknown", "提交账本损坏:研究网关将拒绝新提交,需要人工修复")])
 

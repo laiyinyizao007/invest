@@ -213,3 +213,40 @@ def test_a_heartbeat_just_under_the_size_limit_is_still_accepted(tmp_path):
     put(tmp_path, "heartbeat", str(NOW - 2) + " " * 900)
     put(tmp_path, "account_guard.json", guard())
     assert run(tmp_path).section["state"] == "ok"
+
+
+# ---- G8 第 3 轮:严格解码与 JSON 非法常量 ----
+def test_invalid_utf8_inside_a_json_string_is_corrupt_not_silently_repaired(tmp_path):
+    """errors='replace' 会把非法字节变成 U+FFFD,文件被『修复』后仍是合法 JSON、被判 ok;非法编码本身就说明文件不可信。"""
+    healthy(tmp_path)
+    p = tmp_path / "data" / "state" / "account_guard.json"
+    p.write_bytes(json.dumps(guard(hard_reason="XX")).encode("utf-8").replace(b"XX", bytes([0xFF, 0xFE])))
+    os.utime(p, (NOW - 1, NOW - 1))
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level != "ok"
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_json_constants_nan_and_infinity_are_corrupt_even_in_unused_fields(tmp_path, bad):
+    healthy(tmp_path)
+    text = json.dumps(guard(extra="@@")).replace('"@@"', bad)
+    put(tmp_path, "account_guard.json", text)
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level != "ok"
+
+
+def test_heartbeat_with_invalid_utf8_is_corrupt(tmp_path):
+    healthy(tmp_path)
+    p = tmp_path / "data" / "state" / "heartbeat"
+    p.write_bytes(str(NOW - 4).encode() + bytes([0x0A, 0xFF]))
+    os.utime(p, (NOW - 1, NOW - 1))
+    assert run(tmp_path).section["state"] == "corrupt"
+
+
+def test_outbox_with_invalid_utf8_is_not_reported_as_empty(tmp_path):
+    healthy(tmp_path)
+    p = put(tmp_path, "webhook_outbox.jsonl", "")
+    p.write_bytes(b'{"time": "2027-01-15T00:00:00"}\n\xff\xfe\n')
+    os.utime(p, (NOW - 1, NOW - 1))
+    alerts = col.collect_alerts(settings(tmp_path), NOW)
+    assert alerts.section["state"] == "corrupt" or alerts.section["data"]["outbox"]["state"] == "corrupt"

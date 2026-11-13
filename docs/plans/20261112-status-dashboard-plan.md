@@ -216,8 +216,10 @@ graph TD
 
 **Medium**
 5. **令牌发布的无硬链接回退**会先发布 0 字节目标文件(崩溃后永久遇到短令牌);`fsync` 失败时遗留含令牌的临时文件(清理 `finally` 只包围发布阶段)。建议:外层从创建临时文件起就 `finally` 清理;无法原子发布时 fail-closed。
-6. **面板首次导入会在 `risk/` 写 `__pycache__`**(入口在禁用 bytecode 之前就导入本地模块),『只读』承诺没覆盖 Python 自身写盘;令牌拒绝列表遗漏仓库里实际存在的 `.vntrader_drill` / `.vntrader_brokertest` / `.vntrader_probe`(✔ 已核对目录存在)。建议:入口最先 `sys.dont_write_bytecode = True` 并用 `python -B`;令牌改为『只允许在专属目录』的白名单而不是易漏的拒绝列表;新增『全新源码副本启动后交易侧树不变』的测试。
-7. **非法 UTF-8 与 `NaN`/`Infinity` 被当作合法**:`decode(errors="replace")` 把字节损坏变成替换字符;`json.loads` 默认接受非标准常量。建议:严格 UTF-8 + `parse_constant` 抛错,一律 `corrupt`。
+6. ✅ **面板首次导入会在 `risk/` 写 `__pycache__`**(入口在禁用 bytecode 之前就导入本地模块),『只读』承诺没覆盖 Python 自身写盘;令牌拒绝列表遗漏仓库里实际存在的 `.vntrader_drill` / `.vntrader_brokertest` / `.vntrader_probe`(✔ 已核对目录存在)。建议:入口最先 `sys.dont_write_bytecode = True` 并用 `python -B`;令牌改为『只允许在专属目录』的白名单而不是易漏的拒绝列表;新增『全新源码副本启动后交易侧树不变』的测试。
+   **修复**:`scripts/status_server.py` 在导入任何项目模块之前 `sys.dont_write_bytecode = True`;令牌位置改为白名单(只许 `data/dashboard/` 之下,删除交易侧目录拒绝名单);测试在不含 `__pycache__` 的源码副本里跑入口 `--check`,断言整份副本没有任何 `__pycache__` / `.pyc`(修复前该测试失败)。
+7. ✅ **非法 UTF-8 与 `NaN`/`Infinity` 被当作合法**:`decode(errors="replace")` 把字节损坏变成替换字符;`json.loads` 默认接受非标准常量。建议:严格 UTF-8 + `parse_constant` 抛错,一律 `corrupt`。
+   **修复**:`read_text_limited` 严格解码,非法字节抛 `BadEncoding`(与 `TooLarge` 同属 `Untrusted`,调用方一律按 corrupt);`read_json` 用 `parse_constant` 拒绝 `NaN`/`Infinity`。复现测试(JSON 字符串内的非法字节、未使用字段里的 `NaN`、含非法字节的待补发队列)修复前全部失败。**范围说明**:日志按『记录形状』判可信(非法字节让记录行不匹配),文档页只用于展示,二者仍用替换解码。
 8. **研究结果只验证『是 dict』**:`{}` 被显示为正常的 `backtest`(未知 `kind` 也静默改成 `backtest`);只检查最近 N 个文件。建议:对运行结果建立严格 schema。
 9. **净化层仍漏编码 UNC / 双重编码路径**(`%5C%5Cserver%5Cshare`、`%255C...`、`%252Fhome%252F...`)。建议:对检测副本做有界的一到两轮 percent-decode 再检测。
 10. ✅ ✔ **增量解析对『无末尾换行』的最后一行与全量解析不等价**:进程在写入严重事件后崩溃、最后一行没有换行,事件会一直留在 `_pending` 里不显示。建议:`snapshot()` 在解析器副本上临时 `finish()`。我之前的测试把『feed 阶段半行不计』断言成了正确行为,但没考虑崩溃场景。
@@ -225,7 +227,7 @@ graph TD
 
 **轻微**:OpenAPI 只声明 GET,代码还支持 HEAD(契约正文已说明,建议在 OpenAPI 里显式登记)。
 
-**处理顺序建议**:1、2、3、10 已完成;**剩余**:6、7(只读承诺的边界)、5、8、9;4 需要先决定是否改交易侧。
+**处理顺序建议**:1、2、3、10 已完成;6、7 已完成;**剩余**:5、8、9;4 需要先决定是否改交易侧。
 
 ## 修订记录
 
@@ -235,3 +237,4 @@ graph TD
 - 2026-11-12 按用户决定改为 fork `vnpy_webtrader` 后端:更新决策依据、范围、架构图、模块边界,T6 拆为 T6a–T6g,补测试项与风险。
 - 2026-11-13 记录 codex 复核结果(综合 6.0/10),列出 10 条未修问题;G8 验收未满足。
 - 2026-11-13 修复其中 1、2、3、10(提交 `fa7a5cd`);其余 6 项仍未修,**修复后尚未再次交由 codex 复核**,G8 验收仍未满足。
+- 2026-11-13 修复 6、7(只读承诺的边界:不写字节码、令牌白名单、严格解码、拒绝 NaN/Infinity);剩 4、5、8、9,仍未再次复核。

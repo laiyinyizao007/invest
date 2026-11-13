@@ -112,3 +112,17 @@ def test_guard_staleness_threshold_stays_coupled_to_the_runtime_persistence_cade
     assert collectors.GUARD_STALE_AFTER <= 20 * persist_every, "阈值过大会让真正陈旧的风控状态长期显示为新鲜"
     rule_src = (root / "trading" / "guard_rule.py").read_text(encoding="utf-8")
     assert "def on_timer" in rule_src and "self.guard.update(" in rule_src, "update() 不再由 on_timer 驱动——落盘节奏的前提变了"
+
+
+@pytest.mark.parametrize("token_file", [".vntrader_drill/t", ".vntrader_brokertest/t", ".vntrader_probe/t", "risk/t", "data/other/t", "status.token",
+                                        "data/dashboard/../state/t", "data/t"])
+def test_the_token_file_is_allowed_only_inside_the_dashboard_own_directory(tmp_path, token_file):
+    """白名单而非拒绝名单:拒绝名单永远会漏掉新增的交易侧目录(.vntrader_drill 等)。令牌只能在 data/dashboard/ 下。"""
+    cfg = _write(tmp_path, {"token_file": token_file})
+    with pytest.raises(c.ConfigError, match="令牌"):
+        c.load(path=cfg, root=tmp_path)
+
+
+def test_a_token_file_in_a_subdirectory_of_the_dashboard_directory_is_fine(tmp_path):
+    cfg = _write(tmp_path, {"token_file": "data/dashboard/sub/t.token"})
+    assert c.load(path=cfg, root=tmp_path).paths["token_file"].name == "t.token"
