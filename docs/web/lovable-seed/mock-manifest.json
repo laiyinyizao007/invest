@@ -1,0 +1,275 @@
+[
+  {
+    "fixture": "meta-phase1",
+    "method": "GET",
+    "path": "/api/meta",
+    "status": 200,
+    "note": "阶段①的元信息"
+  },
+  {
+    "fixture": "meta-phase3",
+    "method": "GET",
+    "path": "/api/meta",
+    "status": 200,
+    "note": "阶段③已启用实时与控制"
+  },
+  {
+    "fixture": "overview-ok",
+    "method": "GET",
+    "path": "/api/overview",
+    "status": 200,
+    "note": "一切正常"
+  },
+  {
+    "fixture": "overview-warn-unknown",
+    "method": "GET",
+    "path": "/api/overview",
+    "status": 200,
+    "note": "心跳缺失 + 录制停滞:总体 unknown,不是 ok"
+  },
+  {
+    "fixture": "overview-critical",
+    "method": "GET",
+    "path": "/api/overview",
+    "status": 200,
+    "note": "硬锁定"
+  },
+  {
+    "fixture": "trading-ok",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "运行中"
+  },
+  {
+    "fixture": "trading-stale",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "心跳已停 10 小时"
+  },
+  {
+    "fixture": "trading-missing",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "文件缺失"
+  },
+  {
+    "fixture": "trading-corrupt",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "文件损坏"
+  },
+  {
+    "fixture": "trading-hard-locked",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "账户硬锁定"
+  },
+  {
+    "fixture": "trading-paused",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "已手动暂停开仓"
+  },
+  {
+    "fixture": "alerts-empty",
+    "method": "GET",
+    "path": "/api/alerts",
+    "status": 200,
+    "note": "无积压无事件"
+  },
+  {
+    "fixture": "alerts-events",
+    "method": "GET",
+    "path": "/api/alerts",
+    "status": 200,
+    "note": "有待补发与严重事件"
+  },
+  {
+    "fixture": "days-sample",
+    "method": "GET",
+    "path": "/api/days",
+    "status": 200,
+    "note": "两天统计与验收清单"
+  },
+  {
+    "fixture": "recording-running",
+    "method": "GET",
+    "path": "/api/recording",
+    "status": 200,
+    "note": "录制中"
+  },
+  {
+    "fixture": "recording-stalled",
+    "method": "GET",
+    "path": "/api/recording",
+    "status": 200,
+    "note": "已连接却不订阅"
+  },
+  {
+    "fixture": "recording-missing",
+    "method": "GET",
+    "path": "/api/recording",
+    "status": 200,
+    "note": "状态文件缺失"
+  },
+  {
+    "fixture": "research-sample",
+    "method": "GET",
+    "path": "/api/research",
+    "status": 200,
+    "note": "额度与最近运行"
+  },
+  {
+    "fixture": "run-evaluate",
+    "method": "GET",
+    "path": "/api/research/runs/{run_id}",
+    "status": 200,
+    "note": "一次未通过的评估"
+  },
+  {
+    "fixture": "doc-unattended",
+    "method": "GET",
+    "path": "/api/docs/{key}",
+    "status": 200,
+    "note": "无人值守文档"
+  },
+  {
+    "fixture": "error-unauthorized",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 401,
+    "note": "令牌缺失或错误"
+  },
+  {
+    "fixture": "error-not-found",
+    "method": "GET",
+    "path": "/api/docs/{key}",
+    "status": 404,
+    "note": "键不在白名单"
+  },
+  {
+    "fixture": "error-rate-limited",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 429,
+    "note": "限流"
+  },
+  {
+    "fixture": "live-sample",
+    "method": "GET",
+    "path": "/api/live",
+    "status": 200,
+    "note": "阶段② 实时"
+  },
+  {
+    "fixture": "live-stale",
+    "method": "GET",
+    "path": "/api/live",
+    "status": 200,
+    "note": "阶段② 快照过期"
+  },
+  {
+    "fixture": "live-missing",
+    "method": "GET",
+    "path": "/api/live",
+    "status": 200,
+    "note": "阶段② 快照缺失"
+  },
+  {
+    "fixture": "equity-sample",
+    "method": "GET",
+    "path": "/api/equity",
+    "status": 200,
+    "note": "阶段② 权益曲线"
+  },
+  {
+    "fixture": "control-result",
+    "method": "POST",
+    "path": "/api/control/pause",
+    "status": 200,
+    "note": "阶段③ 暂停成功"
+  },
+  {
+    "fixture": "audit-sample",
+    "method": "GET",
+    "path": "/api/audit",
+    "status": 200,
+    "note": "阶段③ 审计"
+  },
+  {
+    "fixture": "error-csrf",
+    "method": "POST",
+    "path": "/api/control/pause",
+    "status": 400,
+    "note": "阶段③ 缺 CSRF"
+  },
+  {
+    "fixture": "error-forbidden",
+    "method": "POST",
+    "path": "/api/control/pause",
+    "status": 403,
+    "note": "阶段③ 角色不足"
+  },
+  {
+    "fixture": "candidate-view",
+    "method": "GET",
+    "path": "/api/research/candidates/{name}",
+    "status": 200,
+    "note": "阶段④ 候选审阅"
+  },
+  {
+    "fixture": "runs-list",
+    "method": "GET",
+    "path": "/api/research/runs",
+    "status": 200,
+    "note": "阶段④ 运行列表"
+  },
+  {
+    "fixture": "data-segments",
+    "method": "GET",
+    "path": "/api/data/segments",
+    "status": 200,
+    "note": "阶段④ 数据段"
+  },
+  {
+    "fixture": "drills-sample",
+    "method": "GET",
+    "path": "/api/drills",
+    "status": 200,
+    "note": "阶段④ 演练"
+  },
+  {
+    "fixture": "recording-quality",
+    "method": "GET",
+    "path": "/api/recording/quality",
+    "status": 200,
+    "note": "阶段④ 录制完整性"
+  },
+  {
+    "fixture": "config-view",
+    "method": "GET",
+    "path": "/api/config",
+    "status": 200,
+    "note": "阶段④ 配置"
+  },
+  {
+    "fixture": "nodes-sample",
+    "method": "GET",
+    "path": "/api/nodes",
+    "status": 200,
+    "note": "阶段⑤ 多节点"
+  },
+  {
+    "fixture": "whoami",
+    "method": "GET",
+    "path": "/api/whoami",
+    "status": 200,
+    "note": "阶段⑤ 当前用户"
+  }
+]
