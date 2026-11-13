@@ -531,3 +531,15 @@ def test_the_log_page_size_comes_from_the_configuration(tmp_path):
     assert page is not None and len(page["records"]) == 3 and page["next_cursor"] == "3"
     bigger = col.get_evolution_log(s, "camp-2026-11", "", 100)
     assert bigger is not None and len(bigger["records"]) == 3
+
+
+def test_a_malformed_parent_hash_is_rejected_not_truncated(tmp_path):
+    """截断出来的哈希是废的:前端拿它请求差异会 404,看起来像『父代源码不在』。"""
+    from dashboard import evolution as ev
+    for bad in ("b" * 63, "b" * 65, "Z" * 64, 123):
+        with pytest.raises(ev.EvolutionError):
+            ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                             "parent_sha256": bad})
+    ok = ev.parse_record({"campaign_id": "c", "generation": 1, "candidate_sha256": "a" * 64,
+                          "parent_sha256": "b" * 64})
+    assert ok.parent_sha256 == "b" * 64

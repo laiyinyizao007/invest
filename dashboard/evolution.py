@@ -95,10 +95,16 @@ def parse_record(row: Any) -> Record:
     if n_trials is not None and (not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials < 0):
         raise EvolutionError("台账记录的 n_trials 非法")
     diagnosis = row.get("diagnosis")
+    parent = row.get("parent_sha256")
+    if parent is not None:
+        # 父代哈希要么没有,要么是合法的 64 位十六进制。**不截断**:截断出来的哈希是废的,
+        # 前端拿它去请求差异会得到 404,看起来像『父代源码不在』。
+        if not isinstance(parent, str) or len(parent) != 64 or any(c not in "0123456789abcdef" for c in parent):
+            raise EvolutionError("台账记录的 parent_sha256 非法")
     return Record(
         generation=generation,
         candidate_sha256=sha,
-        parent_sha256=_text(row.get("parent_sha256"), 64),
+        parent_sha256=parent,
         run_id=_text(row.get("run_id"), 32),
         status=_text(row.get("status"), 64),
         sharpe=_num(row.get("sharpe")),
