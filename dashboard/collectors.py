@@ -1125,7 +1125,9 @@ def get_evolution_log(settings: Settings, campaign_id: str, cursor: str = "", li
         offset = max(int(cursor), 0) if cursor else 0
     except ValueError:
         return None
-    limit = max(1, min(int(limit), 200))
+    # 默认页大小取配置(evolution.log_limit);调用方可以给更小的,不能超过上限
+    default = int(settings.raw["evolution"].get("log_limit", 50))
+    limit = max(1, min(int(limit), default, 200))
     page = records[offset: offset + limit]
     rows = [{**r.brief(), "reflection": r.reflection, "created_at": r.created_at} for r in page]
     next_cursor = str(offset + len(page)) if offset + len(page) < len(records) else None

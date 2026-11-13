@@ -518,3 +518,16 @@ def test_the_curve_counts_candidates_without_a_sharpe_in_the_generation_count():
     ]
     point = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["points"][0]
     assert point["count"] == 2 and point["elite_sharpe"] == 2.0 and point["mean_sharpe"] == 2.0
+
+
+def test_the_log_page_size_comes_from_the_configuration(tmp_path):
+    """evolution.log_limit 是默认页大小,也是上限:调用方不能要更大的页。"""
+    from dashboard import collectors as col
+
+    ledger(tmp_path, [row(gen=1, sha=f"{i:064x}") for i in range(10)])
+    s = settings(tmp_path)
+    s.raw["evolution"]["log_limit"] = 3
+    page = col.get_evolution_log(s, "camp-2026-11")
+    assert page is not None and len(page["records"]) == 3 and page["next_cursor"] == "3"
+    bigger = col.get_evolution_log(s, "camp-2026-11", "", 100)
+    assert bigger is not None and len(bigger["records"]) == 3
