@@ -76,7 +76,10 @@ def test_recording_missing_and_corrupt(tmp_path):
 
 def test_recording_unknown_status_value_is_not_reported_as_healthy(tmp_path):
     rec(tmp_path, status="future_status")
-    assert col.collect_recording(S(tmp_path), NOW).level != "ok"
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.level != "ok"
+    # 契约规定前端『先看 state』:认不出来的状态 = 无法判断,区块状态不能是 ok(否则渲染成绿卡片)
+    assert r.section["state"] != "ok"
 
 
 # ---------------------------------------------------------------- 研究

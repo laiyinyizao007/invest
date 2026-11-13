@@ -668,6 +668,10 @@ def collect_recording(settings: Settings, now: float) -> Result:
     else:
         level, headline = "unknown", f"未知状态 {status}"                 # 不认识的取值绝不当作正常
         reasons.append(_reason("recording", "unknown", f"录制状态取值无法识别:{status}"))
+        if state == "ok":
+            # 状态取值认不出来 = 无法判断录制情况,区块状态不能是 ok(契约规定前端先看 state,ok 会渲染成绿卡片)
+            state = "unknown"
+            message = f"录制状态取值无法识别:{status}"
     return Result(m.section(state, data, as_of=hb, now=now, stale_after=stale_after, message=message), level, headline, reasons)
 
 
