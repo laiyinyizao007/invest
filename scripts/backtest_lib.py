@@ -61,12 +61,14 @@ def run_engine(
         capital=capital,
     )
     engine.add_strategy(strategy_class, setting)
+    _snapshot = _risk_floor_snapshot(engine.strategy)
     engine.load_data()
     if not engine.history_data:
         raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size)
     return engine
 
 
@@ -118,10 +120,37 @@ def run_engine_bars(
         capital=capital,
     )
     engine.add_strategy(strategy_class, setting)
+    _snapshot = _risk_floor_snapshot(engine.strategy)
     engine.history_data = list(bars)
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size)
     return engine
+
+
+def _risk_floor_snapshot(strategy) -> dict:
+    """回测开始前取一份风控状态快照(运行时第三层的比对基准)。"""
+    from risk import constitution as const
+
+    return const.snapshot_instance_state(strategy)
+
+
+def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float) -> None:
+    """回测跑完后核对风控底线还在(不可变宪法的运行时第三层)。
+
+    静态筛查拦的是"写法",类校验拦的是"类字典"——两者都看不见**回测途中**
+    才被改写的实例状态:属性是在 `entry_signal` 里被赋值的,类字典里根本没有它。
+    第 7 轮 codex 实测:`self.cta_engine.size = 0.001` 让止损距离算出来的风险金额
+    接近 0,`promotion_gate` 的两道回撤门槛随之失效,而三层校验全绿。
+    这里在回测结束时核对:熔断阈值、合约乘数、风险预算必须与**回测开始时**一致。
+
+    比的是快照而不是模板常量:研究脚本会用更大的 risk_budget 做敏感性实验
+    (`tests/test_strategy_backtest.py` 里就是),那是合法的;被改写的是"回测途中"。"""
+    from risk import constitution as const
+
+    findings = const.check_instance_state(strategy, expected_size=expected_size, snapshot=snapshot)
+    if findings:
+        raise RuntimeError("风控底线在回测途中被改写(fail-closed):" + "; ".join(findings))
 
 
 def run_backtest_bars(strategy_class, setting: dict, key: str, bars: list[BarData], capital: float = DEFAULT_CAPITAL,

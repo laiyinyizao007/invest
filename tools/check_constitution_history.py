@@ -28,7 +28,15 @@ CONSTITUTION_SOURCE_REL = "risk/constitution.py"
 CONSTITUTION_FIELDS = (
     "allowed_overrides", "protected_names", "protected_parameters",
     "forbidden_order_calls", "protected_module_attrs",
+    "protected_entry_points", "protected_state_objects", "protected_paths",
 )
+
+# **白名单**类字段:语义相反,必须"只减不增"。
+# allowed_overrides 是"候选**可以**重写什么"——多一项就是多放开一点底线,
+# 与保护清单"只能追加"的规则正好相反,不能同规则比(第 7 轮 codex 实测:
+# `BUILTIN_ALLOWED_OVERRIDES` 加一项 "get_size",守卫退出码 0,而候选重写
+# `get_size()` 就能让 300 元单笔预算失效)。
+CONSTITUTION_SHRINK_ONLY_FIELDS = ("allowed_overrides",)
 
 # 代码里的内置保护项(字符串集合)。这些是清单文件之外的保护,删掉一个等于开一个洞,
 # 而清单文件的历史比对看不见它们——它们在代码常量里,只能靠比对历史版本来看住。
@@ -41,7 +49,13 @@ BUILTIN_SETS = (
     "BUILTIN_FORBIDDEN_DUNDERS",
     "BUILTIN_FORBIDDEN_BY_NAME_SETTERS",
     "BUILTIN_ALLOWED_TEMPLATES",
+    "BUILTIN_PROTECTED_ENTRY_POINTS",
+    "BUILTIN_PROTECTED_STATE_OBJECTS",
+    "BUILTIN_PROTECTED_PATHS",
 )
+
+# 同为"白名单"语义的内置常量:只减不增。
+BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES",)
 
 # 沙盒层的内置 deny set 同样是"代码内置的保护",一并纳入比对。
 SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS")
@@ -51,6 +65,11 @@ BUILTIN_REGISTRY = (
     (CONSTITUTION_SOURCE_REL, BUILTIN_SETS),
     ("scripts/research_sandbox.py", SANDBOX_SETS),
 )
+
+# 清单**字段**的执行点也要守:删掉 `if node.attr in c.forbidden_order_calls:` 这个分支,
+# 常量集合没变、清单文件也没变,但下单黑名单不再被执行——只有"字段名被引用的次数"会变。
+# 字段名与常量名分开登记,免得两套语义混在一张表里。
+FIELD_REGISTRY = ((CONSTITUTION_SOURCE_REL, CONSTITUTION_FIELDS),)
 
 # 单值常量:不是集合,没有"只增不减"可言。它只能通过"必须落在白名单里"来约束。
 SINGLE_CONSTANTS = (("risk/constitution.py", "BUILTIN_TEMPLATE", "BUILTIN_ALLOWED_TEMPLATES"),)
@@ -145,6 +164,122 @@ def removed_protections(current_source: str, older_source: str, names) -> dict[s
         if diff:
             removed[name] = diff
     return removed
+
+
+def constant_usage_counts(source: str, names) -> dict[str, int]:
+    """统计每个受保护常量在源码里被**引用**的次数(AST 层面,只数 Load)。
+
+    历史守卫原来只比对常量**集合**:把执行点删掉——例如把
+    `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块删掉、或把它窄化成硬编码元组、
+    或让 `_is_protected` 恒返回 False——常量集合本身没变,守卫照样全绿:
+    常量还在,底线的**执行**没了(第 7 轮 codex 实测:五种改法守卫退出码全是 0)。
+
+    所以这里把"引用次数"也纳入比对:只许增,不许减。少一次引用,就可能少一道闸。"""
+    counts = {name: 0 for name in names}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return counts
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in counts:
+            counts[node.id] += 1
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in counts:
+            counts[node.attr] += 1
+    return counts
+
+
+def usage_regressions(current_source: str, older_source: str, names) -> dict[str, tuple[int, int]]:
+    """引用次数减少的名字:{名字: (历史次数, 当前次数)}。
+
+    单独抽出来是为了能对它自己写测试——历史上这条检查对"常量在、但执行点被删"
+    完全失效,而失效时没有任何测试会报警。"""
+    tracked = list(names)
+    current_counts = constant_usage_counts(current_source, tracked)
+    older_counts = constant_usage_counts(older_source, tracked)
+    regressions = {}
+    for name in tracked:
+        if older_counts.get(name, 0) > current_counts.get(name, 0):
+            regressions[name] = (older_counts[name], current_counts.get(name, 0))
+    return regressions
+
+
+def shrink_only_additions(current: set[str], older: set[str]) -> set[str]:
+    """白名单里"多出来"的项(当前有、历史没有)——白名单只减不增,多一项就是多放开一点底线。"""
+    return set(current) - set(older)
+
+
+def check_protected_usage(root: Path) -> list[str]:
+    """受保护常量与清单字段的**引用次数**相对历史提交不许减少(守的是执行点,不是常量本身)。"""
+    problems: list[str] = []
+    # (文件, 名字列表, 这些名字是不是"源码里的常量")
+    registry = [(rel, names, True) for rel, names in BUILTIN_REGISTRY]
+    registry += [(rel, names, False) for rel, names in FIELD_REGISTRY]
+    for rel, names, is_constant in registry:
+        current_source = (root / rel).read_text(encoding="utf-8")
+        if is_constant:
+            current = const_string_set(current_source, names)
+            # 已经被删掉的常量由集合比对报告(报一次就够);字段名没有集合可比,一律跟踪
+            tracked = [name for name in names if name in current]
+        else:
+            tracked = list(names)
+        if not tracked:
+            continue
+        commits = _commits_touching(root, rel)
+        for rev in commits:
+            older_source = _read_at(root, rev, rel)
+            if older_source is None:
+                continue
+            for name, (older_count, current_count) in usage_regressions(
+                    current_source, older_source, tracked).items():
+                problems.append(
+                    f"{rel} 里的 {name} 的引用次数从 {older_count} 降到 {current_count}"
+                    f"(提交 {rev[:8]}):常量还在但底线的执行点被删了(只能增不能减)")
+    return problems
+
+
+def check_shrink_only(root: Path) -> list[str]:
+    """白名单类清单(`allowed_overrides`)相对历史提交**只减不增**。
+
+    保护清单是"只能追加"(多一项=多一道保护),白名单正好相反:
+    多一项=多放开一点底线。两种语义用同一条规则比,等于给白名单开了后门。"""
+    problems: list[str] = []
+
+    # 清单文件里的白名单字段
+    commits = _commits_touching(root, CONSTITUTION_REL)
+    if len(commits) >= 2:
+        current = json.loads((root / CONSTITUTION_REL).read_text(encoding="utf-8"))
+        for rev in commits[1:]:
+            raw = _read_at(root, rev, CONSTITUTION_REL)
+            if raw is None:
+                continue
+            older = json.loads(raw)
+            for field in CONSTITUTION_SHRINK_ONLY_FIELDS:
+                added = set(current.get(field, [])) - set(older.get(field, []))
+                if added:
+                    problems.append(
+                        f"{CONSTITUTION_REL} 的 {field} 新增了 {sorted(added)}(提交 {rev[:8]} 之后)"
+                        "(白名单只减不增:多一项就多放开一点底线)")
+
+    # 代码里的白名单常量
+    for rel, names in BUILTIN_REGISTRY:
+        current_source = (root / rel).read_text(encoding="utf-8")
+        current = const_string_set(current_source, names)
+        for name in names:
+            if name not in BUILTIN_SHRINK_ONLY_SETS or name not in current:
+                continue
+            for rev in _commits_touching(root, rel):
+                older_source = _read_at(root, rev, rel)
+                if older_source is None:
+                    continue
+                older = const_string_set(older_source, (name,)).get(name)
+                if older is None:
+                    continue
+                added = shrink_only_additions(current[name], older)
+                if added:
+                    problems.append(
+                        f"{rel} 里的 {name} 新增了 {sorted(added)}(提交 {rev[:8]} 之后)"
+                        "(白名单只减不增:多一项就多放开一点底线)")
+    return problems
 
 
 def _read_at(root: Path, rev: str, rel: str) -> str | None:
@@ -298,6 +433,8 @@ def check_all(root: Path) -> list[str]:
     problems += check_builtin_protections(root)
     problems += check_registry_completeness(root)
     problems += check_single_constants(root)
+    problems += check_protected_usage(root)
+    problems += check_shrink_only(root)
     seen: set[str] = set()
     unique = []
     for problem in problems:            # 同一个问题可能对多个历史版本重复出现,报一次就够

@@ -15,10 +15,14 @@
 - 内置清单在代码里(BUILTIN_*),清单文件 `config/immutable_constitution.json` **只能追加**,不能删减内置项;
 - 静态筛查 `screen_source`(看 AST):拒绝覆盖受保护成员、实例上改写受保护属性、改写受保护模块函数、
   **引用**下单接口或受禁 dunder(不只是调用)、引用框架的"按名 setter"、
+  **引用**风控执行点(模板里做风控判定并下单的方法)与受保护的状态对象、
+  写入受保护对象的**内部状态**(`self.guard.max_losses = 999` 这一整条属性路径)、
   受保护参数作为关键字参数或字典键出现。**新增**成员不在静态层管(模板成员名单在运行时才知道);
 - 运行时 `check_class`(对照模板类的真实成员):候选必须继承模板;不得重写白名单以外的**模板成员**
   (含中间基类与类创建后打的补丁)。候选自己新增的成员(新指标、新辅助方法)允许;
-- 运行时 `check_params`:拒绝调用方在设置字典里指定受保护参数;
+- 运行时 `check_instance_state`(回测跑完后核对受保护对象的实例状态):熔断阈值、合约乘数、
+  风险预算必须与回测设置一致——静态层看不见"运行途中才发生的改写";
+- 运行时 `check_params`:拒绝调用方在设置字典里指定受保护参数(顶层与嵌套都查);
 - 一律 fail-closed:清单文件缺失或非法即抛 ConstitutionError,不做"默认放行"。
 
 清单文件的字段:
@@ -65,12 +69,56 @@ BUILTIN_PROTECTED_NAMES = (
     "guard", "trail", "am", "bg", "pending_dist", "pending_entry", "_stop_armed",
     "atr_value", "stop_price", "entry_price", "entry_dist", "prev_pos", "skipped_by_budget",
     "trail_side", "trail_extreme", "trail_stop", "is_live", "state_consistent",
+    # 引擎本体:合约乘数、手续费、订单通道都在它身上。改它等于改掉风控计算的地基
+    # (`self.cta_engine.size = 0.001` 会让止损距离算出来的风险金额接近 0,
+    #  两道回撤门槛随之失效——第 7 轮 codex 实测)。
+    "cta_engine",
     # 下单与持仓管理路径:重写即绕过预算检查与连亏熔断
     "__init__", "on_bar", "on_tick", "on_init", "on_start", "on_stop", "on_trade", "on_order",
     "on_stop_order", "on_account_status", "on_position", "on_cancel_order", "on_disconnect",
     "_process_daily_bar", "_manage_position", "_try_enter", "_send_entry", "_place_protective_stop",
     "_place_pending_entry", "_stop_order_price", "_ensure_protective_stop", "_complete_stale_daily_bar",
 ) + BUILTIN_PROTECTED_PARAMETERS
+
+# 候选不得**引用**的风控执行点:模板里"做风控判定并下单"的那几个方法。
+#
+# 为什么"不得重定义"不够:候选不重写它,直接**调用**它,就把绕在它里面的
+# 预算判定与熔断判定一起绕过去了。`within_budget(dist, self.get_size(), self.risk_budget)`
+# 与 `self.guard.can_open(...)` 都在 `_try_enter` 体内,而 `_send_entry` 是它调用的下单机器:
+#     def entry_signal(self):
+#         signal = super().entry_signal()
+#         if signal:
+#             self._send_entry(signal, self.atr_value * 50.0, self.am.close[-1])   # 预算/熔断全绕开
+#         return 0
+# 第 7 轮 codex 实测:该写法三层校验全绿;真实 15 分钟玉米数据上,atr_mult=50 时
+# 诚实模板成交 0 笔(157 次被预算拦下),候选成交 2 笔、单笔止损距离 508.7
+# (≈17 倍 300 元预算)。**引用**即拦,不只拦调用——`f = self._send_entry` 之后
+# `f(...)` 的调用点看不出是谁。
+BUILTIN_PROTECTED_ENTRY_POINTS = (
+    "_try_enter", "_send_entry", "_manage_position", "_place_protective_stop",
+    "_place_pending_entry", "_process_daily_bar", "_ensure_protective_stop",
+    "_stop_order_price", "_complete_stale_daily_bar",
+)
+
+# 受保护的**状态对象**:模板自己持有的、装着风控判定的那些对象。
+# 候选连"读"都不许——只禁"写"会被别名绕过去:
+#     g = self.guard          # 取别名
+#     g.max_losses = 999      # 这已经不是"对 self.guard 的写入"了,按属性路径查也查不到
+# 干脆连引用一起禁掉,别名这条路就不成立。
+# (`am`/`bg` 不在此列:候选要读行情 `self.am.close[-1]`,那是它的正当用途;
+#  它们只受"不得写入"约束,见 BUILTIN_PROTECTED_NAMES。)
+BUILTIN_PROTECTED_STATE_OBJECTS = (
+    "guard",      # 当日连亏熔断器
+    "trail",      # 移动止损(只收紧不放松)
+    "cta_engine", # 引擎:合约乘数、手续费、订单通道
+)
+
+# 受保护的**属性路径**:整条路径都不许引用(写或取别名)。
+# "am.array" 是行情数组本体——`arr = self.am.array` 之后 `arr[-1] = 999`
+# 就能改写已经走过的价格。numpy 标量(`self.am.close`)是取不出来的副本,不在此列。
+BUILTIN_PROTECTED_PATHS = (
+    "am.array",
+)
 
 # 候选不得调用的下单/撤单接口
 BUILTIN_FORBIDDEN_ORDER_CALLS = (
@@ -90,9 +138,20 @@ BUILTIN_ALLOWED_OVERRIDES = (
 
 # 候选不得定义、也不得调用的 dunder:它们能在运行时改写属性,绕开静态筛查与成员比对。
 # __init__ 例外(它本来就在受保护名单里,单独处理)。
+#
+# 两组:
+# ① 改写属性型:直接改写实例/类的属性查找与设置行为;
+# ② 反射型:能拿到对象的内部字典、类、类层次或代码对象,再从那里绕回来改写状态。
+#    `self.guard.__dict__["max_losses"] = 999` 与 `self.guard.__class__.max_losses = 999`
+#    都是第 2 组要挡的写法——它们不碰受保护的属性名,只碰"装着它的那个容器"。
 BUILTIN_FORBIDDEN_DUNDERS = (
     "__setattr__", "__delattr__", "__getattribute__", "__getattr__",
     "__init_subclass__", "__set_name__",
+    # ② 反射型
+    "__dict__", "__class__", "__mro__", "__bases__", "__subclasses__",
+    "__globals__", "__code__", "__func__", "__self__", "__closure__",
+    "__reduce__", "__reduce_ex__", "__getnewargs__", "__getstate__", "__setstate__",
+    "__del__", "__mro_entries__",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -132,6 +191,9 @@ class Constitution:
     protected_parameters: frozenset[str]
     forbidden_order_calls: frozenset[str]
     protected_module_attrs: frozenset[str]
+    protected_entry_points: frozenset[str] = frozenset()
+    protected_state_objects: frozenset[str] = frozenset()
+    protected_paths: frozenset[str] = frozenset()
 
 
 def default() -> Constitution:
@@ -144,12 +206,25 @@ def default() -> Constitution:
         protected_parameters=frozenset(BUILTIN_PROTECTED_PARAMETERS),
         forbidden_order_calls=frozenset(BUILTIN_FORBIDDEN_ORDER_CALLS),
         protected_module_attrs=frozenset(BUILTIN_PROTECTED_MODULE_ATTRS),
+        protected_entry_points=frozenset(BUILTIN_PROTECTED_ENTRY_POINTS),
+        protected_state_objects=frozenset(BUILTIN_PROTECTED_STATE_OBJECTS),
+        protected_paths=frozenset(BUILTIN_PROTECTED_PATHS),
     )
 
 
 def _require_name_list(value: object, field: str) -> frozenset[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) and v.isidentifier() for v in value):
         raise ConstitutionError(f"清单字段 {field} 必须是标识符字符串列表")
+    return frozenset(value)
+
+
+def _require_path_list(value: object, field: str) -> frozenset[str]:
+    """受保护属性路径:点号分隔的标识符(如 `am.array`)。"""
+    if not isinstance(value, list) or not all(
+        isinstance(v, str) and v and all(part.isidentifier() for part in v.split("."))
+        for v in value
+    ):
+        raise ConstitutionError(f"清单字段 {field} 必须是点号分隔的属性路径列表")
     return frozenset(value)
 
 
@@ -178,7 +253,8 @@ def load(path: Path | None = None) -> Constitution:
             f"不可变宪法清单的 template 不在内置白名单内: {template!r};"
             f"可选: {', '.join(BUILTIN_ALLOWED_TEMPLATES)}")
     for field in ("allowed_overrides", "protected_names", "protected_parameters",
-                  "forbidden_order_calls", "protected_module_attrs"):
+                  "forbidden_order_calls", "protected_module_attrs",
+                  "protected_entry_points", "protected_state_objects", "protected_paths"):
         if field not in data:
             raise ConstitutionError(f"不可变宪法清单缺少字段 {field}")
 
@@ -188,6 +264,9 @@ def load(path: Path | None = None) -> Constitution:
     protected_params = _require_name_list(data["protected_parameters"], "protected_parameters")
     order_calls = _require_name_list(data["forbidden_order_calls"], "forbidden_order_calls")
     module_attrs = _require_name_list(data["protected_module_attrs"], "protected_module_attrs")
+    entry_points = _require_name_list(data["protected_entry_points"], "protected_entry_points")
+    state_objects = _require_name_list(data["protected_state_objects"], "protected_state_objects")
+    protected_paths = _require_path_list(data["protected_paths"], "protected_paths")
 
     if allowed & builtin.protected_names:
         raise ConstitutionError("allowed_overrides 不得包含内置受保护成员(清单只能追加,不能放宽底线)")
@@ -199,7 +278,10 @@ def load(path: Path | None = None) -> Constitution:
     # 白名单在运行时优先生效,新增的保护会静默失效——必须报错而不是让它生效。
     # 冲突要在**合并后**的集合上查:文件新增的 protected_names 也可能撞上内置白名单。
     effective_allowed = allowed | builtin.allowed_overrides
-    effective_protected = (protected_names | builtin.protected_names) | (protected_params | builtin.protected_parameters)
+    effective_protected = ((protected_names | builtin.protected_names)
+                           | (protected_params | builtin.protected_parameters)
+                           | (entry_points | builtin.protected_entry_points)
+                           | (state_objects | builtin.protected_state_objects))
     if effective_allowed & effective_protected:
         clash = ", ".join(sorted(effective_allowed & effective_protected))
         raise ConstitutionError(f"白名单与受保护清单冲突({clash}):白名单会胜出,保护将失效")
@@ -214,6 +296,9 @@ def load(path: Path | None = None) -> Constitution:
         protected_parameters=protected_params | builtin.protected_parameters,
         forbidden_order_calls=order_calls | builtin.forbidden_order_calls,
         protected_module_attrs=module_attrs | builtin.protected_module_attrs,
+        protected_entry_points=entry_points | builtin.protected_entry_points,
+        protected_state_objects=state_objects | builtin.protected_state_objects,
+        protected_paths=protected_paths | builtin.protected_paths,
     )
 
 
@@ -245,6 +330,14 @@ def _class_body_names(node: ast.ClassDef) -> set[str]:
     return names
 
 
+def _string_elements(node: ast.AST) -> list[str]:
+    """元组/列表/集合字面量里的字符串常量(`__slots__` 用)。"""
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [elt.value for elt in node.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+    return []
+
+
 def _is_protected(name: str, c: Constitution) -> bool:
     """名字是否受保护。
 
@@ -261,6 +354,80 @@ def _protected_lower(c: Constitution) -> set[str]:
     `Risk_Budget` 与 `risk_budget` 是两个不同的属性,精确匹配会让这条路径绕过参数校验;
     静态层的关键字参数检查用同一把尺子,免得两处口径不一致。"""
     return {name.lower() for name in c.protected_names} | {name.lower() for name in c.protected_parameters}
+
+
+def protected_lower_all(c: Constitution | None = None) -> set[str]:
+    """受保护项的小写全集(成员 ∪ 参数):**给别的模块用的同一把尺子**。
+
+    `research_grid` 原来自己抄了一份 `protected_parameters` 且大小写敏感,
+    与 `check_params` 的口径不一致——同一把尺子,两处量纲不同(第 7 轮 codex 实测:
+    候选把参数名写成 `Risk_Budget` 并把网格键拼出来,网格层放行、参数层拒绝)。
+    """
+    c = c or default()
+    return {name.lower() for name in c.protected_names} | {name.lower() for name in c.protected_parameters}
+
+
+def _attr_path(node: ast.AST) -> list[str] | None:
+    """把属性表达式解析成路径段列表。
+
+    `self.guard.max_losses` → ["self", "guard", "max_losses"];
+    `self.am.close[0]` → ["self", "am", "close"](下标被跳过——写 `self.am.close[0]`
+    实际改的是 `self.am.close` 指向的那个对象,路径要一路走到它)。
+    不是属性链时返回 None。"""
+    segments: list[str] = []
+    current = node
+    while True:
+        if isinstance(current, ast.Attribute):
+            segments.append(current.attr)
+            current = current.value
+        elif isinstance(current, ast.Subscript):
+            current = current.value
+        elif isinstance(current, ast.Name):
+            segments.append(current.id)
+            segments.reverse()
+            return segments
+        else:
+            return None
+
+
+def _path_after_self(node: ast.AST) -> list[str] | None:
+    """属性路径里 `self.` 之后的部分;根不是 self 时返回 None。
+
+    只认 `self.` 开头的写法:`s = self` 之后的 `s.guard.x = 1` 靠
+    "禁止引用状态对象"那条规则拦(见 BUILTIN_PROTECTED_STATE_OBJECTS),不靠这里。"""
+    path = _attr_path(node)
+    if not path or path[0] != "self":
+        return None
+    return path[1:]
+
+
+def _write_violation(target: ast.AST, c: Constitution) -> str | None:
+    """写入受保护成员(或受保护对象的内部状态)时返回路径说明,否则 None。
+
+    早先只看赋值的**末段**属性名(`target.attr`),于是这两种写法三层全绿:
+        self.guard.max_losses = 999     # 解除当日连亏熔断
+        self.cta_engine.size = 0.001    # 把止损距离算出来的风险金额压到接近 0
+    受保护的对象是**实例属性**,不在类字典里,`check_class` 比不出来(第 7 轮 codex 实测)。
+    这里改成解析整条属性路径:路径落在受保护成员上就是越权。"""
+    rest = _path_after_self(target)
+    if not rest:
+        return None
+    head = rest[0]
+    if head in c.protected_names or head in c.protected_parameters:
+        return ".".join(rest)
+    return None
+
+
+def _path_violation(node: ast.AST, c: Constitution) -> str | None:
+    """整条属性路径命中受保护路径(如 `self.am.array`)时返回该路径,否则 None。"""
+    rest = _path_after_self(node)
+    if not rest:
+        return None
+    for path in c.protected_paths:
+        parts = path.split(".")
+        if rest[:len(parts)] == parts:
+            return path
+    return None
 
 
 def screen_source(source: str, c: Constitution | None = None) -> list[str]:
@@ -305,6 +472,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                         findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 定义了受禁的 {stmt.name}(可绕过属性改写检查)")
                     elif stmt.name in BUILTIN_FORBIDDEN_BY_NAME_SETTERS:
                         findings.append(f"第 {stmt.lineno} 行: 类 {node.name} 定义了受禁的按名 setter {stmt.name}(可按键名改写实例属性)")
+                # __slots__ 里藏受保护名:类体扫描只看赋值目标的名字,
+                # `__slots__ = ("risk_budget",)` 的字符串元组看不见(第 7 轮 codex 实测:
+                # 静态层放行、运行时层兜住)。静态层也扫一遍,少一个漏一个。
+                elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) \
+                        and stmt.targets[0].id == "__slots__":
+                    for element in _string_elements(stmt.value):
+                        if _is_protected(element, c):
+                            findings.append(
+                                f"第 {stmt.lineno} 行: 类 {node.name} 的 __slots__ 含受保护成员 {element}")
             # 自定义元类:元类的 __setattr__ 能在类创建时改写属性,绕开成员比对
             for kw in node.keywords:
                 if kw.arg == "metaclass":
@@ -316,21 +492,28 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             target = node.target
             if isinstance(target, ast.Name) and _is_protected(target.id, c):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
-            elif isinstance(target, ast.Attribute) and _is_protected(target.attr, c):
-                findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {target.attr}")
+            elif isinstance(target, ast.Attribute):
+                violation = _write_violation(target, c)
+                if violation:
+                    findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+                elif target.attr in c.protected_module_attrs:
+                    findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and _is_protected(target.id, c):
                     findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
                 elif isinstance(target, ast.Attribute):
-                    if _is_protected(target.attr, c):
-                        findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {target.attr}")
+                    violation = _write_violation(target, c)
+                    if violation:
+                        findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                     elif target.attr in c.protected_module_attrs:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
         elif isinstance(node, ast.AugAssign):
             target = node.target
-            if isinstance(target, ast.Attribute) and _is_protected(target.attr, c):
-                findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {target.attr}")
+            if isinstance(target, ast.Attribute):
+                violation = _write_violation(target, c)
+                if violation:
+                    findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
             elif isinstance(target, ast.Name) and _is_protected(target.id, c):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
         elif isinstance(node, ast.Attribute):
@@ -344,8 +527,19 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             elif node.attr in c.forbidden_order_calls:
                 # 下单接口同理拦**引用**:`f = self.buy` 之后 `f(1, 1)` 的调用点看不出是下单。
                 findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.attr}")
+            elif node.attr in c.protected_state_objects:
+                # 受保护的状态对象:连读都不许。只禁"写"会被别名绕过去
+                # (`g = self.guard` 之后 `g.max_losses = 999` 不再是对 self.guard 的写入)。
+                findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控状态对象 {node.attr}(改它等于改掉风控底线)")
+            elif node.attr in c.protected_entry_points:
+                # 风控执行点:候选不重写它,直接调用它就把预算判定与熔断判定一起绕过了。
+                findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.attr}(调用它可绕开预算与熔断判定)")
             elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
+            else:
+                hit = _path_violation(node, c)
+                if hit:
+                    findings.append(f"第 {node.lineno} 行: 禁止引用受保护属性路径 {hit}")
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             # 裸名字的引用同样要拦:`__setattr__(self, ...)`、`buy(...)`、以及先取别名再调用。
             if node.id in BUILTIN_FORBIDDEN_DUNDERS:
@@ -354,6 +548,8 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 findings.append(f"第 {node.lineno} 行: 禁止引用按名 setter {node.id}(可按键名改写实例属性)")
             elif node.id in c.forbidden_order_calls:
                 findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.id}")
+            elif node.id in c.protected_entry_points:
+                findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.id}(调用它可绕开预算与熔断判定)")
         elif isinstance(node, ast.keyword) and node.arg:
             # 关键字参数是**按名**传参的另一个入口:`dict(risk_budget=1e12)` 里这个名字
             # 是 ast.keyword.arg,既不是属性赋值也不是字典键,按语法位置筛查看不见。
@@ -381,20 +577,36 @@ def check_params(params: object, c: Constitution | None = None) -> list[str]:
     受保护参数按**大小写不敏感**比对:vn.py 的 `update_setting` 直接 `setattr(self, name, ...)`,
     而 Python 属性名区分大小写,`Risk_Budget` 与 `risk_budget` 是两个不同的属性——
     候选只要自定义 `__setattr__` 就能把 `Risk_Budget` 重定向到真正的 `risk_budget`。
-    精确匹配会让这条路径完全绕过参数校验。"""
+    精确匹配会让这条路径完全绕过参数校验。
+
+    **嵌套结构也查**:早先只查顶层,而静态层对任何位置的字典字面量都查——两处口径不一致,
+    迟早出现"参数层放行、静态层拒绝"的怪事(第 7 轮 codex 实测:嵌套里的受保护键被放行)。
+    嵌套今天还不可利用(`update_setting` 只按顶层名字 setattr,且它本身被禁),
+    但口径必须一致,否则下一个入口接上就变成真漏洞。"""
     c = c or default()
     if not isinstance(params, dict):
         return ["params 必须是 JSON 对象"]
-    findings = []
-    protected_lower = _protected_lower(c)
-    for key in params:
-        if not isinstance(key, str):
-            findings.append(f"参数名非法: {key!r}")
-        elif _is_protected(key, c):
-            findings.append(f"参数 {key} 属于受保护项,不得由调用方指定")
-        elif key.lower() in protected_lower:
-            findings.append(f"参数 {key} 与受保护参数仅大小写不同,不得由调用方指定")
+    findings: list[str] = []
+    _check_param_keys(params, c, "", findings)
     return findings
+
+
+def _check_param_keys(value: object, c: Constitution, path: str, findings: list[str]) -> None:
+    """递归检查参数名(顶层与嵌套)。`path` 只用于说明位置。"""
+    protected_lower = _protected_lower(c)
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            where = f"{path}/{key}" if path else str(key)
+            if not isinstance(key, str):
+                findings.append(f"参数名非法: {key!r}")
+            elif _is_protected(key, c):
+                findings.append(f"参数 {where} 属于受保护项,不得由调用方指定")
+            elif key.lower() in protected_lower:
+                findings.append(f"参数 {where} 与受保护参数仅大小写不同,不得由调用方指定")
+            _check_param_keys(sub, c, where, findings)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _check_param_keys(item, c, f"{path}[{index}]", findings)
 
 
 _DUNDER_OK = {"__init__"}          # 其余 dunder(__doc__、__module__、__qualname__ 等)由解释器自动生成,不算重写
@@ -435,6 +647,108 @@ def family_root(template: type) -> type:
     导致:①家族根算成 ABC;②模板自身的成员被误判为"候选重写",每一个真实候选都被拒。"""
     application = [k for k in template.__mro__ if not _is_framework_class(k)]
     return application[-1] if application else template
+
+
+# 运行时第三层要核对的实例字段:它们既是模板的受保护参数,也是底线值
+# (单笔风险预算、ATR 窗口、当日连亏熔断笔数)。
+INSTANCE_STATE_FIELDS = ("risk_budget", "atr_window", "max_daily_losses")
+
+
+def snapshot_instance_state(strategy: object) -> dict[str, object]:
+    """取一份实例上的风控状态**快照**(回测开始前取一次,跑完再比)。
+
+    为什么要快照而不是"跟模板常量比":底线值不总是模板常量——
+    研究脚本会用更大的 risk_budget 做敏感性实验(`tests/test_strategy_backtest.py` 就是),
+    拿模板常量去比会把**合法**的回测判成"底线被改写"。
+    快照比的是"这次回测开始时的值"与"结束时的值":
+    改写发生在回测途中,快照就抓得住;而设置本身给的值一律放行。"""
+    snap: dict[str, object] = {}
+    for name in INSTANCE_STATE_FIELDS:
+        snap[name] = getattr(strategy, name, None)
+    guard = getattr(strategy, "guard", None)
+    snap["guard.max_losses"] = getattr(guard, "max_losses", None) if guard is not None else None
+    engine = getattr(strategy, "cta_engine", None)
+    snap["cta_engine.size"] = getattr(engine, "size", None) if engine is not None else None
+    return snap
+
+
+def check_instance_state(strategy: object, template: type | None = None, c: Constitution | None = None,
+                         expected_size: float | None = None, snapshot: dict | None = None,
+                         expected: dict | None = None) -> list[str]:
+    """运行时第三层:回测**跑完之后**核对受保护对象的实例状态。
+
+    静态层拦的是"写法",运行时类校验拦的是"类字典"——两者都看不见**运行途中**
+    才发生的改写:属性是在 `entry_signal` 里被赋值的,类字典里根本没有它。
+    第 7 轮 codex 实测的两条绕过正是这一类(`self.guard.max_losses = 999`、
+    `self.cta_engine.size = 0.001`,两层静态校验全绿)。
+
+    这里核对三件在回测结束时**必须**成立的事:
+    1. 熔断器的阈值 == 策略自己用的阈值(候选改了一个没改另一个就露馅);
+    2. 引擎的合约乘数 == 回测设置给它的乘数(改小它,止损距离算出来的风险金额就接近 0,
+       promotion_gate 的两道回撤门槛随之失效);
+    3. 风险预算与 ATR 窗口 == 这**一次**回测开始时的值(`snapshot`),或 == 调用方给的底线(`expected`)。
+
+    检查放在**跑完之后**是有意的:构造完成时这些值都还是对的,改写发生在回测途中。
+
+    `snapshot` 与 `expected` 都可以不给:
+    - 给了 `snapshot`:比对"回测前"与"回测后",抓途中改写(回测脚本走这条);
+    - 给了 `expected`:比对与调用方声明的底线(候选路径走这条);
+    - 两个都不给:退回到"与模板常量比"的底线口径(只用于单元测试与人工排查)。"""
+    c = c or default()
+    if template is None:
+        try:
+            template = load_template(c)
+        except ConstitutionError:
+            return []
+    # 只管模板家族的策略:别的策略(随机入场对照、演示策略)有各自的参数,不该被拿模板的底线比
+    try:
+        if not isinstance(strategy, family_root(template)):
+            return []
+    except Exception:                                       # noqa: BLE001 - 家族判定失败就当不适用
+        return []
+    findings: list[str] = []
+
+    current = snapshot_instance_state(strategy)
+
+    if snapshot is not None:
+        for key, before in snapshot.items():
+            after = current.get(key)
+            if before != after:
+                findings.append(f"{key} 在回测途中被改写: {before!r} -> {after!r}")
+
+    if expected is not None:
+        for key, want in expected.items():
+            after = current.get(key)
+            if want != after:
+                findings.append(f"{key} 与底线不一致: {after!r} != {want!r}")
+
+    if snapshot is None and expected is None:
+        budget = current.get("risk_budget")
+        floor = getattr(template, "risk_budget", None)
+        if isinstance(budget, (int, float)) and isinstance(floor, (int, float)) and budget != floor:
+            findings.append(f"单笔风险预算被改写: {budget!r} != 模板底线 {floor!r}")
+
+        atr_window = current.get("atr_window")
+        atr_floor = getattr(template, "atr_window", None)
+        if isinstance(atr_window, int) and isinstance(atr_floor, int) and atr_window != atr_floor:
+            findings.append(f"ATR 窗口被改写: {atr_window!r} != 模板固定值 {atr_floor!r}")
+
+    guard = getattr(strategy, "guard", None)
+    breaker = getattr(strategy, "max_daily_losses", None)
+    if guard is not None and isinstance(breaker, int):
+        threshold = getattr(guard, "max_losses", None)
+        if threshold != breaker:
+            findings.append(
+                f"当日连亏熔断阈值被改写: 熔断器 {threshold!r} != 策略 {breaker!r}")
+
+    engine = getattr(strategy, "cta_engine", None)
+    if expected_size is not None and engine is not None:
+        size = getattr(engine, "size", None)
+        if size != expected_size:
+            findings.append(
+                f"合约乘数被改写: {size!r} != 回测设置的 {expected_size!r}"
+                "(止损距离算出来的风险金额会随之失真)")
+    return findings
 
 
 def check_class(candidate: type, template: type, c: Constitution | None = None) -> list[str]:

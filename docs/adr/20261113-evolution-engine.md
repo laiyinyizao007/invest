@@ -250,6 +250,98 @@ from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能�
 **这不是安全边界的终点**:容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)
 与"运行前由人读过代码"仍然是真正的边界。能力隔离只是把"静态黑名单挡不住的那部分"又收了一层。
 
+### 第 8 轮补记:风控执行点、整条属性路径、回测后的实例状态
+
+第 8 轮(codex CLI 深度分析,**36/50,未通过**;与第 7 轮并行,审查期间工作区被并发修改)
+报出两条 **Critical**。两条都是**实测复现**过的(真实 15 分钟玉米数据,不是推测),
+而且当时**三层校验全绿**——静态层、沙盒层、运行时类校验全部返回空列表。
+
+#### Critical 1:候选可以**调用**模板的风控执行点
+
+```python
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        signal = super().entry_signal()
+        if signal:
+            self._send_entry(signal, float(self.atr_value) * 50.0, float(self.am.close[-1]))
+        return 0
+```
+
+`BUILTIN_PROTECTED_NAMES` 只防**重定义**(`check_class` 比对类字典),静态层只拦三类**引用**
+(受禁 dunder / 按名 setter / 下单接口)。受保护的**方法名**不在引用黑名单里,
+于是候选借到了模板自己的下单机器——而 `within_budget(dist, self.get_size(), self.risk_budget)`
+与 `self.guard.can_open(...)` **都在被绕过的那个函数体内**(`_try_enter`)。
+实测(`atr_mult=50`,窗口 2022-07-01~2023-06-30,3000 根 15 分钟 K 线):
+
+| | 成交笔数 | 单笔止损距离 | 被预算拦下 |
+|---|---|---|---|
+| 诚实模板 | 0 | — | 157 |
+| 上面这段候选 | 2 | 508.7 | 0 |
+
+508.7 元 ≈ 17 倍的 300 元单笔预算。
+
+**处理**:新增 `BUILTIN_PROTECTED_ENTRY_POINTS`(`_try_enter`/`_send_entry`/`_manage_position`/
+`_place_protective_stop`/`_place_pending_entry`/`_process_daily_bar`/`_ensure_protective_stop`/
+`_stop_order_price`/`_complete_stale_daily_bar`),静态层对这些名字的**引用**一律拒——
+**不只拦调用**:`f = self._send_entry` 之后的 `f(...)` 调用点已经看不出是谁了。
+
+#### Critical 2:静态层只看赋值的**末段属性名**,不看整条属性路径
+
+```python
+self.guard.max_losses = 999      # 当日连亏熔断失效
+self.guard._losses = 0
+self.cta_engine.size = 0.001     # 合约乘数改小 → 风险金额接近 0
+```
+
+`guard`/`trail`/`am`/`cta_engine` 是**实例属性**:既不在 `vars(candidate)` 里(`check_class` 只比类字典),
+也不在受保护名清单里(受保护的是 `guard` 这个**名字**,不是它指向的对象)。
+实测:改 `guard` 后成交 120 → 149 笔(熔断形同虚设);改 `cta_engine.size` 后回撤从
+-4272 元 / -39.97% 缩成 **-0 元 / -0.00%**,`promotion_gate` 的 2000 元与 20% 两道门槛**同时失效**
+(夏普是比值,不受影响,所以门槛看起来"过了")。
+
+**处理**(三条):
+1. 静态层改为解析**整条属性路径**(`self.guard.max_losses` 整条路径入库),命中即拒;
+2. 新增 `BUILTIN_PROTECTED_STATE_OBJECTS`(`guard`/`trail`/`cta_engine`):对这些对象**连引用都禁**
+   ——只禁"写"会被别名绕过去(`g = self.guard` 之后的 `g.max_losses = 999` 按属性路径查也查不到);
+   `am`/`bg` 不在此列(候选要读行情 `self.am.close[-1]`,那是它的正当用途),只受"不得写入"约束;
+   另把 `am.array` 列为受保护路径(整条路径不得出现在源码里);
+3. 新增**运行时第三层** `constitution.check_instance_state()`:回测**跑完之后**核对实例上的
+   `risk_budget`/`atr_window`/`max_daily_losses`/`guard.max_losses`/`cta_engine.size`,
+   不一致即 fail-closed 抛错(`scripts/backtest_lib.py` 的两条入口都接上)。
+   这层**不依赖候选写得老实**——静态层拦写法、类校验拦类字典,这一层拦的是**回测途中**才发生的改写。
+   比对基准是**回测开始前的快照**,不是模板常量:研究脚本会用更大的 `risk_budget` 做敏感性实验
+   (`tests/test_strategy_backtest.py` 里就是),那是合法的;被改写的是"回测途中"。
+
+#### 其余发现(同轮)
+
+- **High 3——历史守卫只守常量,不守常量的执行点**:删掉 `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块、
+  窄化该判断、删掉 `forbidden_order_calls` 分支、`_is_protected` 恒返回 `False`,
+  这四种改法下守卫退出码**都是 0**(全绿)。守卫比对的是**常量集合**,不看常量**被怎么用**;
+  "常量还在、底线的执行没了"正是它挡不住的那条路。
+  **处理**:改为按 AST 统计受保护常量的**引用次数**(Load 语境,定义处不算),引用次数减少即报错;
+  `BUILTIN_ALLOWED_OVERRIDES` 另定为**只减不增**(白名单加一项 = 多放开一点底线,
+  与"清单只能追加"的规则正好相反)。
+- **Medium 4——网格的受保护轴检查与 `check_params` 口径不一**:前者大小写敏感且只覆盖
+  `protected_parameters`,后者大小写不敏感且含 names。现收敛到 `constitution.protected_lower_all()`
+  这一把尺子,两边共用。
+- **Medium 5——`check_params` 只查顶层**:嵌套字典/列表里的受保护键漏检。现改为递归。
+- **Low 6——受禁 dunder 名单漏了反射型的那批**:`__del__`/`__reduce__`/`__reduce_ex__`/`__mro_entries__`/
+  `__dict__`/`__class__`/`__mro__`/`__globals__`/`__code__` 等。现已补齐(见上面的保留字表)。
+- **Low 7——`__slots__` 里藏受保护名能过静态层**(运行时层兜住了)。现静态层也扫 `__slots__` 元素。
+- **Low 8——子入口的 TOCTOU**:子入口先查审批(读一次文件),再由 `import_candidate` **重新读一次**
+  并校验**调用方传入的** `--sha256`,两次读之间文件若被换掉就会跑未审批内容。
+  已改为按**审批命中的哈希**核对(并行的那一路会话完成,提交 `f90807d`)。
+
+#### 本轮之后仍然存在的残余缺口(如实记录)
+
+1. 静态层是**纵深防御,不是安全边界**——真正的边界仍是容器隔离与"运行前由人读过代码";
+2. `am` 的**子对象**只建模到 `am.array` 一条路径,`am` 的其它子对象没有逐个建模;
+3. 晋级门槛缺**逐笔风险预算审计**:能通过门槛的候选,逐笔风险金额仍可能大于 300 元
+   (只是没被改写而已)——这是下一步要补的,不是本轮解决的;
+4. 守卫现在守"引用次数",不是守"语义"——把一次 `if name in BUILTIN_FORBIDDEN_DUNDERS:`
+   改成 `if name in BUILTIN_FORBIDDEN_DUNDERS or True:` 之类的同义改写仍可能躲开计数。
+   语义级的守卫需要把执行点本身登记成受保护常量(下一步)。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -279,7 +371,10 @@ from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能�
 |---|---|---|
 | 受保护参数(不得出现在设置字典、网格、字典键、关键字参数里) | `risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_PARAMETERS` |
 | 受保护成员(不得在类体里重写) | 见 `BUILTIN_PROTECTED_NAMES`(含 `on_trade`/`on_bar`/`_try_enter`/`guard`/`trail` 等) | `risk/constitution.py` |
-| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受保护的**风控执行点**(不得引用,连取别名都不许) | `_try_enter`、`_send_entry`、`_manage_position`、`_place_protective_stop`、`_place_pending_entry`、`_process_daily_bar`、`_ensure_protective_stop`、`_stop_order_price`、`_complete_stale_daily_bar` | `BUILTIN_PROTECTED_ENTRY_POINTS` |
+| 受保护的**风控状态对象**(不得引用,连读都不许) | `guard`、`trail`、`cta_engine` | `BUILTIN_PROTECTED_STATE_OBJECTS` |
+| 受保护的**属性路径**(整条路径不得出现在源码里) | `am.array` | `BUILTIN_PROTECTED_PATHS` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
@@ -384,8 +479,16 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
   `tools/check_constitution_history.py`(不装 pytest、更不装 vnpy,`fetch-depth: 0`)。
 - 外部复核的原始记录:第 5 轮 codex(`gpt-5.6-sol`)**40.5/50,未通过**;第 5 轮另一轮独立复核(`MiniMax-M3`)**33/50,未通过**;
   第 6 轮独立复核(`MiniMax-M3`)**32/50,未通过**(报出第 5 轮两轮都没报出的 `__builtins__['setattr']` 绕过,
-  以及"宪法守卫在 CI 上收集即失败"这一事实)。三轮的发现均已逐条复现后修复并各配了回归测试。
+  以及"宪法守卫在 CI 上收集即失败"这一事实);第 7 轮(codex `gpt-5.6-sol` 与独立复核各一轮,结论不一致,
+  报出的是"静态黑名单封的是已知写法而不是能力");第 8 轮(codex CLI 深度分析)**36/50,未通过**
+  (两条 Critical 都是**实测复现**过的绕过:调用风控执行点、改写受保护对象的内部状态)。
+  各轮的发现均已逐条复现后修复并各配了回归测试。
+- 第 8 轮新增的回归用例:执行点引用、受保护对象写入与别名、`am.array` 路径、
+  运行时第三层(实例状态核对)、`check_params` 嵌套、受禁 dunder、`__slots__`、
+  历史守卫的"引用次数减少"与"白名单只减不增"(`tests/test_constitution.py`),
+  以及运行时第三层的接线用例(`tests/test_baseline_15m.py`:改 `cta_engine.size` / `guard.max_losses`
+  必须抛 `RuntimeError`,不改则正常跑完)。
 
 ## 未完成
-阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,三轮复核的阻塞项已修,第 7 轮复核结果见 `CHANGELOG.md`);
+阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,第 5–8 轮复核的阻塞项已修,第 8 轮结果与残余缺口见 `CHANGELOG.md`);
 阶段 3–4 未实现;阶段 4 另受 Bisheng 模型配额阻塞(见 `PROJECTWIKI.md`)。

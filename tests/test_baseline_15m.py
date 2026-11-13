@@ -256,3 +256,38 @@ def test_strategy_failure_message_carries_the_traceback_that_vnpy_prints_next():
 
     with pytest.raises(RuntimeError, match="too many values to unpack"):
         _raise_if_strategy_failed(messages)
+
+
+# ---------- 不可变宪法的运行时第三层:回测途中被改写要 fail-closed ----------
+
+def test_backtest_fails_closed_when_the_candidate_tamfers_with_the_contract_size():
+    """候选在回测途中改小合约乘数 → 止损距离算出来的风险金额接近 0。
+
+    静态层看不见这种改写(属性是运行期才被赋值的,类字典里根本没有它),
+    所以回测结束时必须核对一次:合约乘数必须还是回测设置给的那个。
+    第 7 轮 codex 实测:不核对的话,回撤从 -4272 元/-39.97% 缩成 -0 元/-0.00%,
+    promotion_gate 的 2000 元与 20% 两道门槛同时失效,而三层校验全绿。"""
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.cta_engine.size = 0.001
+            return super().entry_signal()
+
+    with pytest.raises(RuntimeError, match="风控底线"):
+        run_engine_bars(Evil, SETTING, KEY, synthetic_bars(60, drift=0.6))
+
+
+def test_backtest_fails_closed_when_the_candidate_tampers_with_the_loss_breaker():
+    """熔断器阈值与策略用的阈值不一致 → 当日连亏熔断被架空。"""
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.guard.max_losses = 999
+            return super().entry_signal()
+
+    with pytest.raises(RuntimeError, match="风控底线"):
+        run_engine_bars(Evil, SETTING, KEY, synthetic_bars(60, drift=0.6))
+
+
+def test_an_untouched_strategy_passes_the_runtime_floor_check():
+    """反向用例:没动过底线的策略必须照常跑完(别把正常研究也拦了)。"""
+    engine = run_engine_bars(TrendAtr15mStrategy, SETTING, KEY, synthetic_bars(60, drift=0.6))
+    assert engine.strategy is not None

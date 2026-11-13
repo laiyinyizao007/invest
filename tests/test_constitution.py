@@ -190,7 +190,8 @@ def _write(tmp_path, payload):
 
 BASE = {"version": 1, "template": "strategies.trend_atr_15m_strategy:TrendAtr15mStrategy",
         "allowed_overrides": [], "protected_names": [], "protected_parameters": [],
-        "forbidden_order_calls": [], "protected_module_attrs": []}
+        "forbidden_order_calls": [], "protected_module_attrs": [],
+        "protected_entry_points": [], "protected_state_objects": [], "protected_paths": []}
 
 
 def test_json_can_extend_but_never_shrink_the_builtin_lists(tmp_path):
@@ -760,3 +761,273 @@ def test_assigning_a_by_name_setter_in_a_class_body_is_rejected():
     """`class C: update_setting = print` 同理:按名 setter 的赋值形式也要拦。"""
     findings = const.screen_source("class C:" + chr(10) + "    update_setting = print" + chr(10))
     assert findings and any("update_setting" in f for f in findings), findings
+
+
+# ---------- 第 7 轮 codex 复核:C1/C2 与历史守卫的执行点 ----------
+
+# 这一节的每条用例都对应一条**实测复现**过的绕过(真实 15 分钟玉米数据回测,
+# 不是推测):
+#   C1  候选直接调 self._send_entry(...) → 绕开 _try_enter 里的 within_budget
+#       与 guard.can_open。atr_mult=50 时诚实模板成交 0 笔(157 次被预算拦下),
+#       候选成交 2 笔、单笔止损距离 508.7(≈17 倍 300 元预算)。
+#   C2  候选写 self.guard.max_losses / self.guard._losses / self.cta_engine.size
+#       → 熔断器失效;后者把回撤从 -4272 元/-39.97% 缩成 -0 元/-0.00%,
+#       promotion_gate 的 2000 元与 20% 两道门槛同时失效。
+# 两条在当时都是**三层校验全绿**。
+
+EVIL_CALLS_ENTRY = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            signal = super().entry_signal()
+            if signal:
+                self._send_entry(signal, float(self.atr_value) * 50.0, float(self.am.close[-1]))
+            return 0
+''')
+
+EVIL_TAMPERS_BREAKER = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.guard.max_losses = 999
+            self.guard._losses = 0
+            return super().entry_signal()
+''')
+
+EVIL_TAMPERS_ENGINE = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.cta_engine.size = 0.001
+            return super().entry_signal()
+''')
+
+
+@pytest.mark.parametrize("source", [EVIL_CALLS_ENTRY, EVIL_TAMPERS_BREAKER, EVIL_TAMPERS_ENGINE])
+def test_round7_bypass_candidates_are_rejected_by_the_static_layer(source):
+    """第 7 轮实测的三条绕过:静态层必须全部拦下(原来全是空的)。"""
+    findings = screen(source)
+    assert findings, "第 7 轮的绕过候选没有被静态层拦下:" + source
+
+
+@pytest.mark.parametrize("method", [
+    "_send_entry", "_try_enter", "_manage_position", "_place_protective_stop",
+    "_place_pending_entry", "_process_daily_bar",
+])
+def test_referencing_a_protected_entry_point_is_rejected(method):
+    """风控执行点连"引用"都不许——`f = self._send_entry` 之后 `f(...)` 的调用点看不出是谁。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           f"        f = self.{method}\n        return 0\n")
+    findings = screen(src)
+    assert findings and any("风控执行点" in f for f in findings), findings
+
+
+@pytest.mark.parametrize("statement", [
+    "self.guard.max_losses = 999",
+    "self.guard._losses = 0",
+    "self.cta_engine.size = 0.001",
+    "self.trail.stop = 0.0",
+    "self.am.close = [1.0]",
+    "del self.guard.max_losses",
+])
+def test_writing_into_a_protected_object_is_rejected(statement):
+    """写受保护对象的**内部状态**要拦——早先只看末段属性名,整条属性路径没人看。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement} 未被拦下:{findings}"
+
+
+@pytest.mark.parametrize("statement", [
+    "g = self.guard",
+    "g = self.trail",
+    "g = self.cta_engine",
+    "arr = self.am.array",
+])
+def test_aliasing_a_protected_object_is_rejected(statement):
+    """取别名也要拦:只禁"写"会被 `g = self.guard` 之后的 `g.max_losses = 999` 绕过去。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings, f"{statement} 未被拦下:{findings}"
+
+
+def test_reading_a_protected_state_object_is_rejected():
+    """熔断器与引擎连读都不许:候选读得到它们,就离改写它们只差一步。"""
+    src = "class C:\n    def entry_signal(self):\n        n = self.guard._losses\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("风控状态对象" in f for f in findings), findings
+
+
+def test_a_candidate_may_still_keep_its_own_nested_state():
+    """别把候选自己的状态也一起拦了:风控底线之外的东西必须还能写。
+
+    这条是上面几条的**反面**用例:静态层拦的是"受保护的对象",
+    不是"所有带点号的赋值"。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        self.my_state.counter = self.my_state.counter + 1\n        return 0\n")
+    assert screen(src) == []
+
+
+def test_reading_the_market_data_is_still_allowed():
+    """候选的正当用途不能被误伤:读 `self.am.close[-1]` 是它存在的意义。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        close = self.am.close[-1]\n        return 1 if close > 0 else 0\n")
+    assert screen(src) == []
+
+
+# ---------- 运行时第三层:回测跑完之后核对受保护对象的实例状态 ----------
+
+class _FakeGuard:
+    def __init__(self, max_losses: int) -> None:
+        self.max_losses = max_losses
+        self._losses = 0
+
+
+class _FakeEngine:
+    def __init__(self, size: float) -> None:
+        self.size = size
+
+
+def _fake_strategy(**overrides):
+    """造一个"模板家族的实例"但不跑 __init__:运行时第三层只对模板家族生效。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = TrendAtr15mStrategy.__new__(TrendAtr15mStrategy)
+    strategy.risk_budget = 300.0
+    strategy.atr_window = 14
+    strategy.max_daily_losses = 2
+    strategy.guard = _FakeGuard(2)
+    strategy.cta_engine = _FakeEngine(10.0)
+    for key, value in overrides.items():
+        setattr(strategy, key, value)
+    return strategy
+
+
+def test_instance_state_check_passes_for_an_untouched_strategy():
+    assert const.check_instance_state(_fake_strategy(), expected_size=10.0) == []
+
+
+def test_instance_state_check_ignores_strategies_outside_the_template_family():
+    """别的策略(随机入场对照等)有各自的参数,不该被拿模板的底线比。"""
+
+    class Other:
+        risk_budget = 999.0
+        atr_window = 7
+        max_daily_losses = 9
+        guard = _FakeGuard(1)
+        cta_engine = _FakeEngine(1.0)
+
+    assert const.check_instance_state(Other(), expected_size=10.0) == []
+
+
+def test_instance_state_check_catches_a_tampered_breaker():
+    """熔断器阈值与策略用的阈值不一致 = 候选在回测途中改写了其中一个。"""
+    strategy = _fake_strategy()
+    strategy.guard.max_losses = 999
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("熔断" in f for f in findings), findings
+
+
+def test_instance_state_check_catches_a_tampered_contract_size():
+    """合约乘数被改小 → 止损距离算出来的风险金额接近 0 → 两道回撤门槛同时失效。"""
+    strategy = _fake_strategy()
+    strategy.cta_engine.size = 0.001
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("合约乘数" in f for f in findings), findings
+
+
+def test_instance_state_check_catches_a_tampered_risk_budget():
+    strategy = _fake_strategy()
+    strategy.risk_budget = 1e12
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("风险预算" in f for f in findings), findings
+
+
+# ---------- 参数层:嵌套也要查(Medium 5) ----------
+
+def test_check_params_rejects_a_protected_key_in_a_nested_dict():
+    """嵌套里的受保护键同样要查:静态层对任何位置的字典字面量都查,口径必须一致。"""
+    findings = const.check_params({"outer": {"risk_budget": 1}})
+    assert findings, "嵌套的受保护参数未被拒绝"
+    assert any("risk_budget" in f for f in findings), findings
+
+
+def test_check_params_rejects_a_protected_key_in_a_nested_list():
+    findings = const.check_params({"outer": [{"Risk_Budget": 1}]})
+    assert findings, "嵌套列表里的受保护参数(大小写不同)未被拒绝"
+
+
+def test_check_params_still_accepts_ordinary_nested_settings():
+    assert const.check_params({"fast_window": [10, 20], "nested": {"slow_window": 40}}) == []
+
+
+# ---------- 受禁 dunder 的补齐(Low 6)与 __slots__(Low 7) ----------
+
+@pytest.mark.parametrize("dunder", [
+    "__del__", "__reduce__", "__reduce_ex__", "__mro_entries__",
+    "__dict__", "__class__", "__mro__", "__globals__", "__code__",
+])
+def test_reflecting_dunders_may_not_be_referenced(dunder):
+    """反射型 dunder 能拿到"装着状态的那个容器",从那里绕回来改写状态。"""
+    src = f"class C:\n    def entry_signal(self):\n        x = self.guard.{dunder}\n        return 0\n"
+    findings = screen(src)
+    assert findings and any(dunder in f for f in findings), findings
+
+
+def test_defining_a_forbidden_dunder_is_rejected():
+    for dunder in ("__del__", "__reduce__", "__reduce_ex__", "__mro_entries__"):
+        findings = screen(f"class C:\n    def {dunder}(self):\n        pass\n")
+        assert findings and any(dunder in f for f in findings), findings
+
+
+def test_slots_hiding_a_protected_name_is_rejected():
+    """`__slots__ = ("risk_budget",)` 早先只有运行时层拦得住,静态层也扫一遍。"""
+    findings = screen("class C:\n    __slots__ = ('risk_budget',)\n")
+    assert findings and any("__slots__" in f for f in findings), findings
+
+
+# ---------- 历史守卫:守"执行点",白名单只减不增(High 3) ----------
+
+def test_history_guard_notices_a_deleted_enforcement_site():
+    """把 `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块删掉,常量集合没变,底线不再被执行。
+
+    第 7 轮 codex 实测:这类改法下守卫退出码是 0(全绿)。守卫必须看住**执行点**。"""
+    from tools.check_constitution_history import usage_regressions
+
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    assert "BUILTIN_FORBIDDEN_DUNDERS" in source
+    # 改的是**执行点**(引用),常量定义本身留着——这正是"常量还在、底线不执行"的那种改法
+    mutilated = source.replace("in BUILTIN_FORBIDDEN_DUNDERS", "in SOMETHING_ELSE")
+    assert mutilated != source, "用例本身失效:源码里找不到 BUILTIN_FORBIDDEN_DUNDERS 的引用"
+    regressions = usage_regressions(mutilated, source, ("BUILTIN_FORBIDDEN_DUNDERS",))
+    assert "BUILTIN_FORBIDDEN_DUNDERS" in regressions, regressions
+
+
+def test_history_guard_notices_a_removed_field_branch():
+    """删掉 `c.forbidden_order_calls` 的执行分支:清单与常量都没变,下单黑名单却不再被执行。"""
+    from tools.check_constitution_history import usage_regressions
+
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    mutilated = source.replace("c.forbidden_order_calls", "c.something_else", 1)
+    assert mutilated != source, "用例本身失效:源码里找不到 c.forbidden_order_calls"
+    regressions = usage_regressions(mutilated, source, ("forbidden_order_calls",))
+    assert "forbidden_order_calls" in regressions, regressions
+
+
+def test_history_guard_treats_the_override_whitelist_as_shrink_only():
+    """白名单多一项 = 多放开一点底线,与保护清单"只能追加"的规则正好相反。"""
+    from tools.check_constitution_history import shrink_only_additions
+
+    assert shrink_only_additions({"entry_signal", "get_size"}, {"entry_signal"}) == {"get_size"}
+    assert shrink_only_additions({"entry_signal"}, {"entry_signal", "get_size"}) == set()
+
+
+def test_the_shipped_manifest_has_the_new_fields():
+    """清单文件必须带上新字段:缺字段一律 fail-closed,不能让新规则静默失效。"""
+    constitution = const.load()
+    assert constitution.protected_entry_points
+    assert constitution.protected_state_objects
+    assert "_send_entry" in constitution.protected_entry_points
+    assert "guard" in constitution.protected_state_objects
