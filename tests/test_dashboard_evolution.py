@@ -381,3 +381,24 @@ def test_meta_reports_the_evolution_capability(tmp_path):
     cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
     on = _client(config.load(path=cfg, root=tmp_path))
     assert on.get("/api/meta", headers={"Authorization": "Bearer tok"}).json()["capabilities"]["evolution"] is True
+
+
+def test_the_campaign_list_matches_the_contract_field_by_field(tmp_path):
+    """契约要求的每个字段都要给;少一个字段前端就会读到 undefined。"""
+    import json as _json
+    from pathlib import Path
+    from jsonschema import Draft202012Validator
+
+    web = Path(__file__).resolve().parents[1] / "docs" / "web"
+    spec = _json.loads((web / "status-api.openapi.json").read_text(encoding="utf-8"))
+    components = spec["components"]
+
+    def check(ref, payload):
+        errors = sorted(Draft202012Validator({"$ref": ref, "components": components}).iter_errors(payload), key=str)
+        assert not errors, "; ".join(e.message for e in errors[:3])
+
+    ledger(tmp_path, [row(gen=1, sha="a" * 64)])
+    from dashboard import collectors as col
+    r = col.collect_evolution(settings(tmp_path), NOW)
+    check("#/components/schemas/EvolutionList", r.section["data"])
+    check("#/components/schemas/EvolutionCampaign", r.section["data"]["campaigns"][0])
