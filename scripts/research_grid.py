@@ -106,10 +106,18 @@ def select_params(*, candidate_cls: type, grid: Any, bars: Sequence, runner: Run
 
     scores: dict[tuple[int, int, int], float] = {}
     sharpes: dict[tuple[int, int, int], float] = {}
+    details: dict[tuple[int, int, int], dict] = {}
     for idx, params in cells(axes):
         result = runner(candidate_cls, dict(params), chunk, 1.0)
         sharpe = ce.annualized_sharpe(result["daily_pnls"], capital)
         sharpes[idx] = sharpe
+        # 每个格子的行为/风险摘要(只在选参窗口里算):最佳格子的那份用来分格(MAP-Elites)与做结构化诊断。
+        # 执行器没给的字段留 None——假执行器与旧执行器照常工作,只是分不了格。
+        pnls = result["daily_pnls"]
+        details[idx] = {"round_trips": int(result["round_trips"]), "n_bars": len(chunk),
+                        "hold_bars": result.get("hold_bars"), "trade_pnls": result.get("trade_pnls"),
+                        "maxdd_pct": result.get("maxdd_pct"), "maxdd_yuan": result.get("maxdd_yuan"),
+                        "total_return_pct": (sum(pnls) / capital * 100.0) if capital > 0 and pnls else None}
         scores[idx] = sharpe if int(result["round_trips"]) >= min_round_trips else NEG_INF
 
     valid = sum(1 for v in scores.values() if v != NEG_INF)
@@ -121,6 +129,7 @@ def select_params(*, candidate_cls: type, grid: Any, bars: Sequence, runner: Run
         "plateau": {"cell": None, "scores": [[*idx, "-inf" if v == NEG_INF else v] for idx, v in sorted(scores.items())]},
         # 每个**有效**格子的年化夏普(往返笔数够的那些):供账本记录逐试验夏普。无效格子的夏普没有统计意义,不入样本。
         "cell_sharpes": [sharpes[idx] for idx, v in sorted(scores.items()) if v != NEG_INF],
+        "best_detail": None,
         "note": "",
     }
     if not smooth:
@@ -131,4 +140,5 @@ def select_params(*, candidate_cls: type, grid: Any, bars: Sequence, runner: Run
     out.update({"best_cell": list(best), "best_params": params, "best_smoothed": smooth[best], "best_sharpe": sharpes[best],
                 "on_plateau": parameter_on_plateau(scores, best)})
     out["plateau"]["cell"] = list(best)
+    out["best_detail"] = {**details[best], "sharpe": sharpes[best]}
     return out

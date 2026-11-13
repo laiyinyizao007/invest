@@ -15,7 +15,9 @@ from research_grid import GridError, select_params
 from risk import candidate_eval as ce
 from risk.heatmap import build_heatmap
 from risk.dsr import MAX_TRIAL_SHARPE, merge_stats, sharpe_stats as sharpe_stats_of
+from risk.behavior import describe_behavior
 from risk.diagnosis import diagnose
+from risk.structured_diagnosis import structure
 
 TEST_SEGMENT_START = datetime(2024, 1, 1)   # 与 walk_forward_optimizer.TEST_SEGMENT_START 保持一致(有测试锁定)
 MIN_ENTRY_PROB = 1e-4
@@ -87,6 +89,29 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
     return result
 
 
+def selection_facts(selection: dict) -> dict:
+    """从选参结果里取出**进化回路放开的那一层**的事实:
+
+    - `behavior`:行为描述符(持仓周期/交易频率,程序从回测结果算出);`cell`:MAP-Elites 格子名;
+    - `selection_diagnosis`:选参窗口最佳格子的**结构化诊断**(枚举 + 0–1 数值,不含自由文本与原始数值);
+    - `fitness`:选父代用的适应度(选参窗口的邻域平滑夏普)。DSR 不用于选父代。
+
+    全部来自**选参窗口**(2020-07 ~ 2022-06),不是验证窗口,在这里过拟合不影响闸门。
+    选不出最佳格子、或执行器没给行为信息时对应字段为 None(不猜)。"""
+    detail = selection.get("best_detail")
+    if not isinstance(detail, dict):
+        return {"cell": None, "behavior": None, "selection_diagnosis": None, "fitness": None}
+    hold_bars = detail.get("hold_bars")
+    behavior = describe_behavior(detail["round_trips"], detail["n_bars"],
+                                 hold_bars if isinstance(hold_bars, list) else None)
+    row = {"sharpe": detail.get("sharpe"), "maxdd_pct": detail.get("maxdd_pct"),
+           "maxdd_yuan": detail.get("maxdd_yuan"), "round_trips": detail["round_trips"]}
+    trade_pnls = detail.get("trade_pnls")
+    diagnosis = structure(diagnose(row, trade_pnls if isinstance(trade_pnls, list) and trade_pnls else None))
+    return {"cell": behavior["cell"], "behavior": behavior, "selection_diagnosis": diagnosis,
+            "fitness": selection.get("best_smoothed")}
+
+
 def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,
                    max_cells: int, min_round_trips: int, select_window: tuple[datetime, datetime],
                    validation_windows: Sequence[Window], data_adjusted: bool = True, prior_trials: int | None = None,
@@ -103,7 +128,8 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
         raise GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
     selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
                               max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
-    summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes")}   # 完整得分表留在服务端,不回传给外层
+    summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes", "best_detail")}   # 完整得分表留在服务端,不回传给外层
+    engine_side = selection_facts(selection)           # 选参窗口的行为描述符/结构化诊断/适应度(进化回路放开的那一层)
     # 本次扫过的每个有效格子的**日**夏普(= 年化 / √240,与 DSR 同一口径):入账本,并并入本次 DSR 的经验方差
     # 限幅到 ±MAX_TRIAL_SHARPE:真实网格里偶有极端格子(几笔全盈利之类)夏普极大,不限幅会让整批样本因越界被父进程丢弃;
     # 父进程的校验仍然拒绝越界值——那才是伪造。限幅只会让 V 略小于"不限幅",而 V 有理论值作下限,不会更松。
@@ -117,7 +143,7 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     if selection["best_params"] is None:
         return {"passed": False, "failures": ["无法选参: " + selection["note"]], "params": None,
                 "selection": summary, "kind_detail": "selection-only", "trials": trials,
-                "heatmap": build_heatmap(selection)}
+                "heatmap": build_heatmap(selection), **engine_side}
     result = run_gate(candidate_cls=candidate_cls, params=selection["best_params"], windows=validation_windows, bars=bars,
                       runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
                       on_plateau=selection["on_plateau"], capital=capital,
@@ -127,6 +153,7 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     result["selection"] = summary
     # 完整得分表(选参窗口)交给父进程单独落盘给面板看;父进程在把结果交出去之前把它拿掉,**不并入**外层响应
     result["heatmap"] = build_heatmap(selection)
+    result.update(engine_side)
     result["kind_detail"] = "selection+gate"
     return result
 
@@ -139,10 +166,16 @@ def engine_runner(key: str):
         daily = engine.calculate_result()
         stats = engine.calculate_statistics(daily, output=False) or {}
         pnls = [] if daily is None or len(daily) == 0 else [float(x) for x in daily["net_pnl"].tolist()]
+        from research_sandbox import round_trip_pnls            # 与落盘结果同一份配对口径(FIFO)
+        from risk.behavior import round_trip_holding_bars
+        from strategies.instruments import INSTRUMENTS
+        trades = engine.get_all_trades()
         return {
             "daily_pnls": pnls,
             "round_trips": int(stats.get("total_trade_count", 0)) // 2,
             "maxdd_pct": float(stats.get("max_ddpercent", 0.0)),
             "maxdd_yuan": float(stats.get("max_drawdown", 0.0)),
+            "hold_bars": round_trip_holding_bars(trades, bars),                 # 行为描述符:每个往返持有的 K 线根数
+            "trade_pnls": round_trip_pnls(trades, INSTRUMENTS[key].size),       # 结构化诊断:最长连亏
         }
     return runner

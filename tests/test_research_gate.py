@@ -323,3 +323,65 @@ def test_a_selection_only_failure_still_carries_the_heatmap():
     result = evaluate(runner=make_runner(trips=3), prior_trials=10)
     assert result["kind_detail"] == "selection-only" and result["heatmap"]["on_plateau"] is False
     assert all(row[3] == "-inf" for row in result["heatmap"]["scores"])        # 往返笔数不够:每个格子都无效
+
+
+# ---------- 阶段 3:选参窗口的行为描述符、格子、结构化诊断、适应度 ----------
+
+def _runner_with_behavior(hold=10, **kw):
+    base = make_runner(**kw)
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        out = base(strategy_class, setting, bars, cost_multiplier)
+        out["hold_bars"] = [hold] * out["round_trips"]
+        out["trade_pnls"] = [3.0, -1.0, 2.0, -2.0] * (out["round_trips"] // 4)
+        return out
+    return runner
+
+
+def test_the_evaluation_reports_the_cell_from_the_selection_window_behavior():
+    from risk.behavior import ALL_CELLS
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=10))
+    assert result["cell"] in ALL_CELLS
+    assert result["behavior"]["avg_hold_bars"] == 10.0 and result["behavior"]["round_trips"] == 100
+    assert result["behavior"]["n_bars"] == 3                                     # 选参窗口里的 K 线根数,不是验证窗口的
+    assert result["cell"] == "H0F3"                                              # 平均持仓 10 根 ≤ 16;100 笔/3 根 K 线 ≥ 4/100 根
+
+
+def test_a_different_holding_period_lands_in_a_different_cell():
+    short = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=5))["cell"]
+    long = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=300))["cell"]
+    assert short.startswith("H0") and long.startswith("H3") and short[2:] == long[2:]
+
+
+def test_without_holding_information_the_cell_is_none_rather_than_a_guess():
+    """旧执行器/假执行器不回传持仓根数:不猜格子,但适应度与结构化诊断照常给出。"""
+    result = evaluate(prior_trials=10)
+    assert result["cell"] is None and result["behavior"]["avg_hold_bars"] is None
+    assert isinstance(result["fitness"], float)
+
+
+def test_the_selection_diagnosis_is_structured_and_contains_no_free_text():
+    import json
+
+    from risk.structured_diagnosis import validate
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert validate(result["selection_diagnosis"])
+    text = json.dumps(result["selection_diagnosis"], ensure_ascii=False)
+    assert not any("一" <= ch <= "鿿" for ch in text) and "note" not in text
+
+
+def test_the_fitness_is_the_selection_window_smoothed_sharpe_not_a_validation_number():
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert result["fitness"] == result["selection"]["best_smoothed"]
+
+
+def test_a_selection_failure_has_no_cell_and_no_fitness():
+    result = evaluate(runner=make_runner(trips=3), prior_trials=10)
+    assert result["kind_detail"] == "selection-only"
+    assert result["cell"] is None and result["fitness"] is None and result["selection_diagnosis"] is None
+
+
+def test_the_best_cell_detail_stays_out_of_the_selection_summary():
+    """摘要是给外层看的:最佳格子的逐笔盈亏等明细只在引擎一侧用,不进摘要。"""
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert "best_detail" not in result["selection"]
