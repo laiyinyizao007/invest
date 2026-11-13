@@ -24,7 +24,8 @@ invest 是一套自动交易系统(vn.py + CTP)。交易、风控、录制、研
 | 8 | [`05-lovable-guide.md`](05-lovable-guide.md) | **用 Lovable 构建前端的人** | 风险(真实数据不能进 Lovable、导出物默认带外部依赖)、总流程、项目约束、导出审计、联调 |
 | 9 | [`06-design-system.md`](06-design-system.md) | 前端、设计 | 设计令牌(对比度实测)、玻璃拟态规则与降级、状态的视觉表达、Bento 布局、组件清单 |
 | 10 | [`07-lovable-prompts.md`](07-lovable-prompts.md) | 用 Lovable 的人 | P0–P14 提示词包,每步带验收点;偏离约束时的纠正话术 |
-| 11 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 严格模式编译通过) |
+| 11 | [`08-evolution-views.md`](08-evolution-views.md) | 前端 | **进化引擎三个视图**:进化曲线、参数热力图、代码与变异日志(数据来自毕昇工作流) |
+| 12 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 严格模式编译通过) |
 
 契约由测试守住:`tests/test_web_contract.py` 校验每个示例都符合 OpenAPI 里的模型,并校验 `lovable-seed/` 与契约同步(不同步则失败,重新生成:`python tools/webgen/gen_lovable_seed.py`)。前端导出物入库前必须通过 `tools/audit_frontend_export.py`。**改接口先改 OpenAPI 和示例,测试通过再改实现。**
 
@@ -105,3 +106,6 @@ flowchart LR
 - **后端有已知未修的问题,联调时请不要把它当作完全可信的数据源**:G8 审查的 codex 复核(综合 6.0/10)指出的 10 项均已修改(含风控文件改按『权益采样时间』计年龄);三次复核的评分是 6.0/10 → 36.5/50 → 42.5/50,第三次的发现也已修改,但**修改后尚未第四次复核**,可能造成『看起来正常其实不是』的情形。这些是后端要修的,**不影响前端按契约开发**;但前端的『状态语义』测试(未知取值回退 unknown、过期不显示绿色)不能因为『后端会保证』而省略。
 - 后端任务分解、执行记录与未修问题清单见 `docs/plans/20261112-status-dashboard-plan.md`。
 - 阶段②–⑤ 的后端尚未开始。
+- **进化引擎的读取侧已就绪,数据还没有**(2026-11-13):新增 6 个只读接口(战役列表、进化曲线、变异日志、参数热力图、候选源码、候选差异,`x-phase: 4`),
+  契约、12 份示例数据与种子已同步。**引擎侧(毕昇工作流与研究网关)还没开工产生这些文件**,所以线上取不到数据——前端用示例数据开发即可。
+  三个视图的规格见 [`08-evolution-views.md`](08-evolution-views.md);边界见 ADR `docs/adr/20261113-evolution-dashboard.md`。

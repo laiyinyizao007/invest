@@ -1,0 +1,31 @@
+{
+  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "found": true,
+  "language": "python",
+  "lines": [
+    {
+      "n": 1,
+      "text": "from vnpy_ctastrategy import CtaTemplate"
+    },
+    {
+      "n": 2,
+      "text": ""
+    },
+    {
+      "n": 3,
+      "text": "class Candidate(CtaTemplate):"
+    },
+    {
+      "n": 4,
+      "text": "    fast_window = 24"
+    },
+    {
+      "n": 5,
+      "text": "    slow_window = 192"
+    },
+    {
+      "n": 6,
+      "text": "    atr_mult = 2.0"
+    }
+  ]
+}

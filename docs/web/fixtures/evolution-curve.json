@@ -1,0 +1,68 @@
+{
+  "campaign_id": "camp-2026-11",
+  "generations": 4,
+  "latest_generation": 4,
+  "points": [
+    {
+      "generation": 1,
+      "count": 4,
+      "elite_sharpe": 0.42,
+      "mean_sharpe": -0.11,
+      "p25_sharpe": -0.48,
+      "p75_sharpe": 0.21,
+      "best_total_return": 0.031,
+      "worst_max_drawdown": 0.19,
+      "cells": [
+        "fast-mid",
+        "slow-short"
+      ]
+    },
+    {
+      "generation": 2,
+      "count": 4,
+      "elite_sharpe": 0.78,
+      "mean_sharpe": 0.05,
+      "p25_sharpe": -0.3,
+      "p75_sharpe": 0.44,
+      "best_total_return": 0.068,
+      "worst_max_drawdown": 0.16,
+      "cells": [
+        "fast-mid"
+      ]
+    },
+    {
+      "generation": 3,
+      "count": 5,
+      "elite_sharpe": 1.94,
+      "mean_sharpe": 0.31,
+      "p25_sharpe": -0.12,
+      "p75_sharpe": 0.86,
+      "best_total_return": 0.142,
+      "worst_max_drawdown": 0.22,
+      "cells": [
+        "fast-mid",
+        "slow-short"
+      ]
+    },
+    {
+      "generation": 4,
+      "count": 5,
+      "elite_sharpe": 2.1,
+      "mean_sharpe": 0.44,
+      "p25_sharpe": 0.02,
+      "p75_sharpe": 1.12,
+      "best_total_return": 0.151,
+      "worst_max_drawdown": 0.24,
+      "cells": [
+        "fast-mid"
+      ]
+    }
+  ],
+  "flags": [
+    {
+      "kind": "overfit_suspect",
+      "level": "warn",
+      "text": "第 3 代精英夏普比种群均值高 1.63(≥ 1.0):可能是个别候选的偶然高分,请看热力图判断是否稳健"
+    }
+  ]
+}

@@ -68,12 +68,13 @@ flowchart LR
 | 项 | 内容 |
 |---|---|
 | 目标 | 让研究沙盒、数据资产、演练和录制质量可见 |
-| 页面 | 候选审阅、运行列表、数据与演练、配置 |
-| 接口 | `research/candidates/{name}`、`research/runs`、`data/segments`、`drills`、`recording/quality`、`config` |
+| 页面 | 候选审阅、运行列表、数据与演练、配置、**进化(曲线/热力图/变异日志)** |
+| 接口 | `research/candidates/{name}`、`research/runs`、`data/segments`、`drills`、`recording/quality`、`config`、`research/evolution`(3 个)、`research/candidates/{sha256}/code|diff` |
 | 后端工作 | ① 候选审阅视图(带行号源码 + 静态筛查 + 哈希);② 运行列表游标分页;③ 数据段/测试段消费状态;④ 演练结果**结构化**(现在只在 Markdown 里,需要让演练脚本同时写 JSON);⑤ 录制 K 线完整性统计(新采集器);⑥ 脱敏配置视图 |
 | 对交易系统的改动 | 零(④ 演练 JSON 属于演练脚本,不在交易路径) |
 | 触发条件 | 阶段①稳定;可与②③并行 |
 | 前置/依赖 | 运行结果若要画图表,需沙盒结果补充序列字段(净值/滚动窗口夏普等),属研究侧改动 |
+| 进化三视图的依赖 | **引擎侧**要先产出:谱系台账 `data/research/evolution/<campaign>.jsonl`(每行一代)与热力图 `data/research/heatmaps/<run_id>.json`(三维网格得分)。回路由**毕昇工作流**承载;面板只读,不驱动进化(ADR `20261113-evolution-dashboard.md`) |
 | 需要的 ADR | 候选审阅视图的边界:**网页不提供批准按钮**——批准的价值在于人在本机读过代码(见 `20261112-research-sandbox-config-and-approval.md`) |
 | 风险 | 源码视图泄露策略思路(仅本机访问,风险低);Markdown/源码渲染注入(已在前端约束中规定) |
 

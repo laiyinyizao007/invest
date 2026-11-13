@@ -1081,6 +1081,249 @@
           }
         }
       }
+    },
+    "/api/research/evolution": {
+      "get": {
+        "operationId": "listEvolution",
+        "summary": "进化战役列表",
+        "description": "只读;战役由引擎侧(毕昇工作流)产生,面板不创建也不驱动。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvolutionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/research/evolution/{campaign_id}/curve": {
+      "get": {
+        "operationId": "getEvolutionCurve",
+        "summary": "进化曲线(每代种群统计)",
+        "description": "夏普的精英/均值/P25/P75、收益与回撤。停滞与过拟合提示由服务端判定。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvolutionCurve"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            }
+          }
+        ]
+      }
+    },
+    "/api/research/evolution/{campaign_id}/log": {
+      "get": {
+        "operationId": "getEvolutionLog",
+        "summary": "变异日志(每一代的记录)",
+        "description": "含反思自由文本(仅供审阅)、结构化诊断、父代哈希。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvolutionLog"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        },
+        "parameters": [
+          {
+            "name": "campaign_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ]
+      }
+    },
+    "/api/research/runs/{run_id}/heatmap": {
+      "get": {
+        "operationId": "getRunHeatmap",
+        "summary": "某个评估运行的参数热力图",
+        "description": "三维网格的二维切片;null 单元是无效组合,不是 0。分数来自选参窗口。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Heatmap"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{8}-[0-9]{6}-[0-9]{6}$"
+            }
+          }
+        ]
+      }
+    },
+    "/api/research/candidates/{sha256}/code": {
+      "get": {
+        "operationId": "getCandidateCode",
+        "summary": "候选源码(按哈希)",
+        "description": "纯文本,前端按代码块显示,不得当 HTML 渲染。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateCode"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        ]
+      }
+    },
+    "/api/research/candidates/{sha256}/diff": {
+      "get": {
+        "operationId": "getCandidateDiff",
+        "summary": "两个候选的差异",
+        "description": "统一 diff 文本,由服务端算。",
+        "x-phase": 4,
+        "x-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateDiff"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        },
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -2942,6 +3185,569 @@
         "required": [
           "user",
           "role"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionList": {
+        "type": "object",
+        "description": "战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。",
+        "properties": {
+          "campaigns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvolutionCampaign"
+            }
+          }
+        },
+        "required": [
+          "campaigns"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionCampaign": {
+        "type": "object",
+        "properties": {
+          "campaign_id": {
+            "type": "string"
+          },
+          "generations": {
+            "type": "integer",
+            "description": "已记录的代数"
+          },
+          "latest_generation": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "records": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "最后一条记录的 created_at"
+          },
+          "best_sharpe": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "missing",
+              "corrupt",
+              "stale"
+            ],
+            "description": "该战役的读取状态;corrupt 表示台账损坏或读不了"
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "campaign_id",
+          "generations",
+          "latest_generation",
+          "records",
+          "updated_at",
+          "best_sharpe",
+          "state",
+          "message"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionCurve": {
+        "type": "object",
+        "description": "进化曲线:每代的种群统计。**由服务端算好,前端不要重算**。",
+        "properties": {
+          "campaign_id": {
+            "type": "string"
+          },
+          "generations": {
+            "type": "integer"
+          },
+          "latest_generation": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvolutionPoint"
+            }
+          },
+          "flags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvolutionFlag"
+            }
+          }
+        },
+        "required": [
+          "campaign_id",
+          "generations",
+          "latest_generation",
+          "points",
+          "flags"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionPoint": {
+        "type": "object",
+        "properties": {
+          "generation": {
+            "type": "integer"
+          },
+          "count": {
+            "type": "integer",
+            "description": "该代的候选数"
+          },
+          "elite_sharpe": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "该代最高夏普"
+          },
+          "mean_sharpe": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p25_sharpe": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p75_sharpe": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "best_total_return": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "worst_max_drawdown": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cells": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "该代出现的质量多样性格子"
+          }
+        },
+        "required": [
+          "generation",
+          "count",
+          "elite_sharpe",
+          "mean_sharpe",
+          "p25_sharpe",
+          "p75_sharpe",
+          "best_total_return",
+          "worst_max_drawdown",
+          "cells"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionFlag": {
+        "type": "object",
+        "description": "服务端的提示标志。**是提示,不是结论**;文案已写明依据。",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "stagnant",
+              "overfit_suspect"
+            ]
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "warn",
+              "info"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "level",
+          "text"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionLog": {
+        "type": "object",
+        "description": "变异日志:每一代的记录。reflection 是大模型写的自由文本,**仅供审阅,没有进入模型输入**。",
+        "properties": {
+          "campaign_id": {
+            "type": "string"
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvolutionRecord"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "下一页游标;null 表示到底了"
+          }
+        },
+        "required": [
+          "campaign_id",
+          "records",
+          "next_cursor"
+        ],
+        "additionalProperties": true
+      },
+      "EvolutionRecord": {
+        "type": "object",
+        "properties": {
+          "generation": {
+            "type": "integer"
+          },
+          "candidate_sha256": {
+            "type": "string"
+          },
+          "parent_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sharpe": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "total_return": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_drawdown": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "dsr": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "多重检验校正后的夏普;只展示,不参与选父代"
+          },
+          "n_trials": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "fail_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cell": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "质量多样性格子"
+          },
+          "diagnosis": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "结构化诊断(程序产出)"
+          },
+          "reflection": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "大模型的反思自由文本;仅供审阅"
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "generation",
+          "candidate_sha256",
+          "parent_sha256",
+          "run_id",
+          "status",
+          "sharpe",
+          "total_return",
+          "max_drawdown",
+          "dsr",
+          "n_trials",
+          "fail_reason",
+          "cell",
+          "diagnosis",
+          "reflection",
+          "created_at"
+        ],
+        "additionalProperties": true
+      },
+      "Heatmap": {
+        "type": "object",
+        "description": "参数热力图(三维网格的二维切片)。分数来自**选参窗口**,不是样本外表现。",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "axes": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  }
+                },
+                "required": [
+                  "name",
+                  "values"
+                ],
+                "additionalProperties": true
+              },
+              "y": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  }
+                },
+                "required": [
+                  "name",
+                  "values"
+                ],
+                "additionalProperties": true
+              },
+              "z": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "values": {
+                    "type": "array",
+                    "items": {
+                      "type": "number"
+                    }
+                  },
+                  "selected": {
+                    "type": "integer",
+                    "description": "被切出来的第三轴下标"
+                  }
+                },
+                "required": [
+                  "name",
+                  "values",
+                  "selected"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "additionalProperties": true
+          },
+          "grid": {
+            "type": "array",
+            "description": "二维得分表 grid[y][x];null 表示该组合无效(不足最少往返笔数),**不是 0**",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            }
+          },
+          "best_cell": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer"
+            }
+          },
+          "on_plateau": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "是否在参数高原上(服务端判定)"
+          },
+          "valid_cells": {
+            "type": "integer"
+          },
+          "n_cells": {
+            "type": "integer"
+          },
+          "source_window": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "run_id",
+          "axes",
+          "grid",
+          "best_cell",
+          "on_plateau",
+          "valid_cells",
+          "n_cells",
+          "source_window",
+          "note"
+        ],
+        "additionalProperties": true
+      },
+      "CandidateCode": {
+        "type": "object",
+        "description": "候选源码(只读)。按哈希找,不按名字。",
+        "properties": {
+          "sha256": {
+            "type": "string"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "language": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "n": {
+                  "type": "integer"
+                },
+                "text": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "n",
+                "text"
+              ],
+              "additionalProperties": true
+            }
+          }
+        },
+        "required": [
+          "sha256",
+          "found",
+          "language",
+          "lines"
+        ],
+        "additionalProperties": true
+      },
+      "CandidateDiff": {
+        "type": "object",
+        "description": "两个候选之间的统一 diff(服务端算)。",
+        "properties": {
+          "from_sha256": {
+            "type": "string"
+          },
+          "to_sha256": {
+            "type": "string"
+          },
+          "diff": {
+            "type": "string",
+            "description": "统一 diff 文本;空字符串表示没有差异"
+          },
+          "available": {
+            "type": "boolean",
+            "description": "两份源码是否都找到了"
+          }
+        },
+        "required": [
+          "from_sha256",
+          "to_sha256",
+          "diff",
+          "available"
         ],
         "additionalProperties": true
       }

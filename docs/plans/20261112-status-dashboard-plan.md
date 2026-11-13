@@ -135,10 +135,30 @@ graph TD
   T9 --> T10
 ```
 
+### 进化引擎三视图(2026-11-13;读取侧与前端文档已就绪)
+
+范围:阶段④的只读视图——进化曲线、参数热力图、代码与变异日志。**进化回路由毕昇工作流承载,面板只读**。
+ADR:`docs/adr/20261113-evolution-dashboard.md`。
+
+- [x] **E1 ADR**:分工(毕昇跑 / 面板看)、谱系字段、明确不做(面板不注入变异、不批准)、变异输入方案(结构化诊断、质量多样性、反思不回灌)、PBO 与 DSR 不做的裁决。
+- [x] **E2 契约**:`status-api.openapi.json` 新增 6 个接口(x-phase 4)与 11 个数据模型:
+  `/api/research/evolution`、`.../{campaign_id}/curve`、`.../{campaign_id}/log`、
+  `/api/research/runs/{run_id}/heatmap`、`/api/research/candidates/{sha256}/code`、`.../diff`。
+- [x] **E3 读取侧**:`dashboard/evolution.py`(台账校验、曲线聚合与提示标志、热力图切片、源码与差异)+ `dashboard/collectors.py` 的对应函数;28 个测试;输出与契约示例同形(有对照测试)。
+- [x] **E4 示例数据**:12 份 fixture(空战役、停滞、过拟合嫌疑、无效格、平原、源码缺失、差异不可用)+ manifest;种子重新生成;契约测试通过。
+- [x] **E5 前端文档**:`docs/web/08-evolution-views.md`(三视图规格、"怎么看好坏"、组件、验收清单);
+  `01-product-spec.md` §9.5、`02-api-contract.md`、`04-phases.md`、`06-design-system.md` 组件清单、
+  `07-lovable-prompts.md` 新增 P15–P17、`README.md` 阅读顺序与现状。
+- [ ] **E6 路由注册**:阶段④后端上线时把 6 个接口注册进 `dashboard/app.py`(与既有阶段④接口同一约定:**契约先行、路由随阶段上线**;阶段①的路由严格只注册阶段①接口)。
+- [ ] **E7 引擎侧数据**:台账 `data/research/evolution/<campaign>.jsonl` 与热力图 `data/research/heatmaps/<run_id>.json` 由引擎会话阶段 3 产出(已与其对齐格式)。
+
+**当前状态**:读取侧与前端文档就绪,**数据还没有**——线上取不到是如实状态,前端用示例数据开发。
+
 ## 后续阶段(只登记)
 
 - **阶段② 实时持仓/资金/最新行情**:触发 = ① 稳定使用 ≥1 周且无降级误报。先写 ADR 比较 (a) 运行时周期性原子写状态 JSON、面板只读(交易进程不新增网络监听,仅多一次磁盘写;倾向) 与 (b) 只读 RPC(交易进程内开 ZeroMQ 监听,默认无鉴权加密)。
 - **阶段③ 仅「暂停开仓」**:触发 = ① 稳定 + 用户明确要求。前置 = 独立写令牌、防 CSRF、审计日志、二次确认。**永不提供**发单/撤单/连接/改风控/解锁。
+- **阶段④ 进化三视图**:读取侧与前端文档已就绪(见上);依赖引擎侧产出台账与热力图文件。
 
 ## 风险与缓解
 
