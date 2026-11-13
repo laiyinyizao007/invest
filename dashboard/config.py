@@ -18,6 +18,8 @@ CONFIG_PATH = ROOT / "config" / "status_dashboard.json"
 # 与 trading.guard_rule.PAUSE_FLAG_NAME 必须相等(面板不能 import trading,测试里断言两者一致)
 PAUSE_FLAG_NAME = "pause_trading.flag"
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 ENVIRONMENTS = {
     "simnow": "SimNow 模拟盘",
     "guoxin-test": "国信测试环境",
@@ -101,6 +103,8 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
         if not isinstance(over, dict):
             raise ConfigError("配置文件顶层必须是对象")
         raw = _merge(raw, over)
+    if raw["host"] not in LOOPBACK_HOSTS:
+        raise ConfigError(f"阶段①只允许监听本机回环地址 {sorted(LOOPBACK_HOSTS)},收到 {raw['host']!r}(经局域网访问属于阶段⑤,须另写 ADR)")
     if raw["environment"] not in ENVIRONMENTS:
         raise ConfigError(f"environment 必须是 {sorted(ENVIRONMENTS)} 之一")
     if not isinstance(raw["port"], int) or isinstance(raw["port"], bool) or not 1 <= raw["port"] <= 65535:

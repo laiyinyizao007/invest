@@ -59,3 +59,15 @@ def test_pause_flag_name_matches_the_trading_side_constant():
     from pathlib import Path
     text = (Path(c.ROOT) / "trading" / "guard_rule.py").read_text(encoding="utf-8")
     assert re.search(r'PAUSE_FLAG_NAME\s*=\s*"([^"]+)"', text).group(1) == c.PAUSE_FLAG_NAME
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_loopback_hosts_are_accepted(tmp_path, host):
+    assert c.load(path=_write(tmp_path, {"host": host}), root=tmp_path).raw["host"] == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "10.0.0.5", "example.com", "", "127.0.0.1.evil.com", "localhost.evil.com", 127, None])
+def test_non_loopback_hosts_are_refused_at_config_level(tmp_path, host):
+    """阶段①只监听本机回环;经局域网访问是阶段⑤的事,须另写 ADR。这条承诺在配置层落实,任何入口都绕不过。"""
+    with pytest.raises(c.ConfigError, match="回环"):
+        c.load(path=_write(tmp_path, {"host": host}), root=tmp_path)
