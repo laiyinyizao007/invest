@@ -133,8 +133,39 @@ BUILTIN_PROTECTED_PATHS = (
 # 受保护的**容器**:装着可变对象、拿到别名就能原地改写的那些。
 # `guard`/`trail`/`cta_engine` 连引用都不许(见 BUILTIN_PROTECTED_STATE_OBJECTS);
 # `am` 必须能读(`self.am.close[-1]` 是候选存在的意义),但**不得把它里面的东西取出来另存**。
+#
+# 注意:`am`/`bg` 在这里只保护**属性路径**(`self.am.xxx`),不保护裸局部名——
+# `am` 是 ArrayManager 的常见缩写,LLM 候选写 `am = self.am.sma(5)` 会被误伤(第 11 轮 codex 的 Low 1)。
 BUILTIN_PROTECTED_CONTAINERS = (
     "am",
+)
+
+# 变更型方法规则的**适用范围**:哪些实例属性算"装着行情/风控数据的容器"。
+# `am` 是 ArrayManager(装着 close/open/high/low 数组),`bg` 是 BarGenerator(装着日线/窗口线)。
+# 两者都能被**调用**写入:`self.am.update_bar(fake_bar)`、`self.bg.update_bar(bar)`
+# 会往回测里插一根假 K 线(第 11 轮 codex 实测:端到端四层防线全绿,
+# 而 skipped_by_budget 由 0 变成 3928、成交数由 212 变成 2——回测结果被完全改写)。
+BUILTIN_PROTECTED_CONTAINER_SCOPE = (
+    "am",
+    "bg",
+)
+
+# 受保护容器上的**变更型方法**:对这些方法**调用**就等于原地改写容器里的东西。
+#
+# 为什么必须单列一份名单:容器规则原来只挡"写"(`arr = self.am.close` 后 `arr[0] = 999`)
+# 与"取别名",**挡不住"调用"**——`self.am.close.fill(0.0)`、`self.am.update_bar(fake_bar)`
+# 既不是属性赋值也不是取别名,按语法位置筛查看不见。
+# 名单只收**确实会改状态**的方法;读方法(`sma`/`atr`/`generate`/`size`)不在其中,
+# 候选读行情的正当用途不受影响。
+BUILTIN_PROTECTED_CONTAINER_MUTATORS = (
+    # vnpy 的写入型接口:往容器里塞数据
+    "update_bar", "update_tick",
+    # list/dict/set 的写入型方法
+    "append", "extend", "insert", "remove", "pop", "popitem", "clear",
+    "update", "setdefault", "sort", "reverse", "discard",
+    # numpy 数组的写入型方法(原地改写,对象身份不变)
+    "fill", "itemset", "put", "resize", "copyto", "setfield", "setflags",
+    "byteswap",
 )
 
 # 候选不得调用的下单/撤单接口
@@ -408,6 +439,36 @@ def _string_elements(node: ast.AST) -> list[str]:
     return []
 
 
+def _class_body_target_ids(tree: ast.AST) -> set[int]:
+    """类体里被赋值的**裸名字**目标节点(id 集合)。
+
+    用来区分"类体里定义 `am`"(覆盖受保护成员,拒绝)与
+    "函数体里 `am = self.am.sma(5)`"(普通局部变量,放行)。
+    第 11 轮 codex 的 Low 1:`am`/`bg` 是 ArrayManager/BarGenerator 的常见缩写,
+    LLM 候选写局部变量时会常规踩中——按裸名一刀切会把正常候选整片拒掉。"""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        ids.add(id(target))
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                ids.add(id(stmt.target))
+    return ids
+
+
+def _bare_local_allowed(name: str, node_id: int, class_body_targets: set[int]) -> bool:
+    """裸局部变量用容器名(`am`/`bg`)是否放行。
+
+    容器名只保护**属性路径**(`self.am.xxx`),不保护裸局部名:
+    `am = self.am.sma(5)` 是候选读行情的常规写法,按裸名一刀切会误伤
+    (第 11 轮 codex 的 Low 1)。类体里定义 `am` 仍然拒绝——那是覆盖成员,不是局部变量。"""
+    return name in BUILTIN_PROTECTED_CONTAINER_SCOPE and node_id not in class_body_targets
+
+
 def _is_protected(name: str, c: Constitution) -> bool:
     """名字是否受保护。
 
@@ -471,6 +532,19 @@ def _path_after_self(node: ast.AST) -> list[str] | None:
     return path[1:]
 
 
+def _self_instance_attr(node: ast.AST) -> bool:
+    """`self.<name>` 形状:实例**自己**的属性,不是某个模块的成员。
+
+    第 11 轮 codex 的 Medium 1:`trading_day` 进了受保护的模块级成员名单之后,
+    `_write_violation` 对**任意路径段**命中模块级成员名 → `self.trading_day = bar.datetime.date()`
+    被判成"改写了受保护的风控函数 trading_day",把"每天只开一次仓"这类正常候选整片拒掉
+    (第 10 轮放行、第 11 轮误拒,已用旧源码对照验证)。
+    根因:模块级成员(`risk.risk_guard.trading_day`)与实例属性(`self.trading_day`)是两回事,
+    前者是全局函数,后者改不到它。"""
+    path = _attr_path(node)
+    return bool(path) and len(path) == 2 and path[0] == "self"
+
+
 def _write_violation(target: ast.AST, c: Constitution) -> str | None:
     """写入受保护成员(或受保护对象的内部状态)时返回路径说明,否则 None。
 
@@ -491,10 +565,16 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
     """
     path = _attr_path(target)
     if path:
+        # `self.<name>` 是实例自己的属性:与模块级成员(`risk.risk_guard.<name>`)是两回事。
+        # 模块级成员名只在**路径不止两段**时才算命中(第 11 轮 codex 的 Medium 1:
+        # `self.trading_day = ...` 曾被误判成"改写了受保护的风控函数")。
+        self_attr = len(path) == 2 and path[0] == "self"
         for index, segment in enumerate(path):
             if segment in c.protected_names or segment in c.protected_parameters:
                 return ".".join(path[index:])
             if segment in c.protected_module_attrs and _module_attr_owner_ok(segment, path):
+                if self_attr and index == len(path) - 1:
+                    continue
                 return ".".join(path[index:])
         return None
     # 路径断在调用表达式上:退回按末段属性名判。
@@ -504,6 +584,8 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
         if attr in c.protected_names or attr in c.protected_parameters:
             return attr
         if attr in c.protected_module_attrs and _module_attr_owner_ok(attr, _attr_path(target) or []):
+            if _self_instance_attr(target):
+                return None
             return attr
     return None
 
@@ -533,6 +615,31 @@ def _container_alias(value: ast.AST) -> str | None:
         return None
     for index, segment in enumerate(path):
         if segment in BUILTIN_PROTECTED_CONTAINERS:
+            return ".".join(path[index:])
+    return None
+
+
+def _container_mutator_call(node: ast.Call, c: Constitution) -> str | None:
+    """对受保护容器调用**变更型方法**时返回那条路径,否则 None。
+
+    第 11 轮 codex 的 High 1:容器规则原来只挡"写"与"取别名",**挡不住"调用"**——
+    `self.am.update_bar(fake_bar)` 既不是属性赋值也不是取别名,四层防线全部放行,
+    而回测里被注入了一根假 K 线(实测 skipped_by_budget 由 0 变 3928、成交由 212 变 2)。
+    与"写数组被拦、插数组不拦"自相矛盾:容器规则声明的目的正是"防伪造价格→伪造收益"。
+
+    只拦**变更型**方法:读方法(`sma`/`atr`/`generate`/`size`)不在名单里,
+    候选读行情的正当用途不受影响。"""
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    path = _attr_path(func)
+    if not path or len(path) < 2:
+        return None
+    method = path[-1]
+    if method not in BUILTIN_PROTECTED_CONTAINER_MUTATORS:
+        return None
+    for index, segment in enumerate(path[:-1]):
+        if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
             return ".".join(path[index:])
     return None
 
@@ -571,6 +678,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
         return [f"语法错误: {exc.msg} (第 {exc.lineno} 行)"]
 
     findings: list[str] = []
+    # 类体里的赋值目标:裸局部名豁免(`am`/`bg`)只对**函数体**生效,
+    # 类体里定义 `am = ...` 仍然算"覆盖受保护成员"(见 _class_body_target_ids)。
+    class_body_targets = _class_body_target_ids(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for name in sorted(_class_body_names(node)):
@@ -609,14 +719,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 findings.append(f"第 {node.lineno} 行: 类 {node.name} 不得使用类装饰器")
         elif isinstance(node, ast.AnnAssign):
             target = node.target
-            if isinstance(target, ast.Name) and _is_protected(target.id, c):
+            if isinstance(target, ast.Name) and _is_protected(target.id, c) \
+                    and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
             elif isinstance(target, ast.Attribute):
                 violation = _write_violation(target, c)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                 elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
-                        target.attr, _attr_path(target) or []):
+                        target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
                     findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
             elif isinstance(target, ast.Subscript):
                 # `self.am.close[0] = 999`:改的是被下标取到的那个对象(行情数组本体)
@@ -625,14 +736,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name) and _is_protected(target.id, c):
+                if isinstance(target, ast.Name) and _is_protected(target.id, c) \
+                        and not _bare_local_allowed(target.id, id(target), class_body_targets):
                     findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
                 elif isinstance(target, ast.Attribute):
                     violation = _write_violation(target, c)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                     elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
-                            target.attr, _attr_path(target) or []):
+                            target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
                 elif isinstance(target, ast.Subscript):
                     violation = _write_violation(target.value, c)
@@ -655,8 +767,17 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 violation = _write_violation(target.value, c)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
-            elif isinstance(target, ast.Name) and _is_protected(target.id, c):
+            elif isinstance(target, ast.Name) and _is_protected(target.id, c) \
+                    and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
+        elif isinstance(node, ast.Call):
+            # 对受保护容器调用**变更型方法**:`self.am.update_bar(fake_bar)` 会往回测里
+            # 插一根假 K 线,而它既不是属性赋值也不是取别名(第 11 轮 codex 的 High 1)。
+            violation = _container_mutator_call(node, c)
+            if violation:
+                findings.append(
+                    f"第 {node.lineno} 行: 不得对受保护容器调用变更型方法 {violation}"
+                    "(可原地改写行情数据,伪造回测结果)")
         elif isinstance(node, ast.Attribute):
             # 受禁 dunder 的**任何引用**都要拦,不只调用:`f = object.__setattr__` 之后
             # `f(self, "risk_budget", 1e9)` 同样能改写实例属性,而调用点已经看不出是谁了。
@@ -677,7 +798,10 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.attr}(调用它可绕开预算与熔断判定)")
             elif node.attr in BUILTIN_PROTECTED_READ_ATTRS:
                 # 拿到风控函数的**定义**就多一条改写它的路(改函数对象的状态,连名字都不用碰)。
-                findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.attr}(拿到定义就能架空风控判定)")
+                # 例外:`self.<name>` 是实例自己的属性,改不到模块级函数(第 11 轮 codex 的 Medium 1:
+                # `self.trading_day = ...` 曾被误判成"拿到了受保护对象的定义")。
+                if not _self_instance_attr(node):
+                    findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.attr}(拿到定义就能架空风控判定)")
             elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
             else:
@@ -868,6 +992,77 @@ def _shadowed_template_callables(strategy: object, template: type) -> list[str]:
     return findings
 
 
+# 仓库根目录与候选目录:只有**不在候选目录里**的仓库内代码才享有
+# "可以重写内部方法"的特权(候选受这条规矩约束,仓库内代码不受)。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REPO_PENDING_DIR = _REPO_ROOT / "pending_strategies"
+
+
+def _is_in_repo_strategy_class(klass: type) -> bool:
+    """这个类是不是**仓库自己**的代码(模板、演示策略、测试替身等)。
+
+    第 11 轮 codex 的 Low 3 修复曾把"类字典里出现受保护成员"一律判成越权,
+    结果把仓库自己的代码也拒了:
+    - `strategies/intraday_demo_strategy.py` **合法地**重写了 `_try_enter` /
+      `_process_daily_bar` 这类内部方法;
+    - `tests/` 里的测试替身(`AlwaysLong`、`Chatty`……)也照抄了这些方法。
+    "候选不得重写受保护成员"这条规矩约束的是**候选**,不是人审过的仓库内代码。
+
+    候选一律从 `pending_strategies/` 载入(模块名 `pending_strategy`),
+    仓库内的代码在 `strategies/`、`tests/` 等目录里。这里按**模块文件所在路径**判定,
+    不看类自己声明的 `__module__` 字符串——候选在类体里写 `__module__ = "strategies.x"`
+    骗不过去:sys.modules 里那个模块的 `__file__` 不会落在仓库目录里。"""
+    module = sys.modules.get(getattr(klass, "__module__", "") or "")
+    if module is None:
+        return False
+    filename = getattr(module, "__file__", None)
+    if not filename:
+        return False
+    try:
+        path = Path(filename).resolve()
+    except OSError:                                            # noqa: BLE001 - 路径拿不准就当不可信
+        return False
+    if not path.is_relative_to(_REPO_ROOT):
+        return False
+    return not path.is_relative_to(_REPO_PENDING_DIR)
+
+
+def _runtime_class_dict_violations(strategy: object, template: type, c: Constitution) -> list[str]:
+    """运行期**类字典**里出现了不该出现的成员。
+
+    第 11 轮 codex 的 Low 3:`_shadowed_template_callables` 只查**实例字典**——
+    候选在运行期给自己的类打补丁(`Cand.get_size = lambda: 0.001`)第 3 层看不见,
+    此前只靠静态层按名字兜底。这里在回测结束后再比一次类字典:
+    类字典是"运行期"的事实,静态层只看得见源码。
+
+    自动生成的 dunder(`__dict__`/`__weakref__`/`__module__`/`__doc__` 等)不算越权,
+    它们是解释器塞进去的,不是候选写的。"""
+    findings: list[str] = []
+    try:
+        candidate_type = type(strategy)
+    except Exception:                                           # noqa: BLE001 - 取不到类型就不查
+        return findings
+    if _is_in_repo_strategy_class(candidate_type):
+        return findings                                          # 仓库自己的策略:不受"候选规矩"约束
+    root = family_root(template)
+    stop_at = template if (isinstance(candidate_type, type) and issubclass(candidate_type, template)) else root
+    for klass in candidate_type.__mro__:
+        if klass is stop_at:
+            break
+        if _is_in_repo_strategy_class(klass):
+            continue                                            # 仓库自己的类:可以合法重写内部方法
+        for name in sorted(vars(klass)):
+            if name in _FINGERPRINT_IGNORED_DUNDERS:
+                continue
+            if name in BUILTIN_ALLOWED_OVERRIDES:
+                continue
+            if name in BUILTIN_FORBIDDEN_DUNDERS:
+                findings.append(f"运行期类 {klass.__name__} 的类字典里出现了受禁的 {name}")
+            elif _is_protected(name, c):
+                findings.append(f"运行期类 {klass.__name__} 的类字典里出现了受保护成员 {name}")
+    return findings
+
+
 def check_instance_state(strategy: object, template: type | None = None, c: Constitution | None = None,
                          expected_size: float | None = None, snapshot: dict | None = None,
                          expected: dict | None = None) -> list[str]:
@@ -910,6 +1105,7 @@ def check_instance_state(strategy: object, template: type | None = None, c: Cons
         return []
     findings: list[str] = []
     findings.extend(_shadowed_template_callables(strategy, template))
+    findings.extend(_runtime_class_dict_violations(strategy, template, c))
 
     current = snapshot_instance_state(strategy)
 
@@ -966,7 +1162,53 @@ def check_instance_state(strategy: object, template: type | None = None, c: Cons
 # 结论与第 7 轮一样:**黑名单封的是"已知写法",封不住"能力"**。
 # 与其继续枚举写法(别名、`type(cls)`、`sys.modules`……),不如**事后比对身份**:
 # 不管候选用哪种写法把 `rg.risk_per_trade` 换掉了,指纹就对不上。
-PROTECTED_RUNTIME_PACKAGES = ("risk", "strategies", "vnpy_ctastrategy")
+# 运行期第四层(身份指纹)的覆盖范围。第 11 轮 codex 的 Medium 3 实测:
+# `vnpy.trader.utility.ArrayManager` 之类框架对象**只靠巧合**被覆盖——
+# 模板按名 `from vnpy.trader.utility import ArrayManager` 时,类对象经模板模块共享,
+# 于是指纹里恰好出现了 `strategies.xxx.ArrayManager` 这类键;模板哪天改成
+# `import vnpy.trader.utility as util`,这层保护就**静默消失**,而历史守卫看不出来。
+# 所以这里把模板真正用到的三个框架模块**按路径**显式纳入范围:
+# 覆盖不依赖"模板怎么 import",改写法也不会掉保护。
+#
+# 注意:`vnpy.trader.database` **故意不在范围内**——它的模块级 `database` 全局
+# 在第一次 `get_database()` 时会被合法地替换成数据库实例(离线取数脚本会这么做),
+# 纳入范围会造成运行期虚假 diff;而研究链路的数据来自 CSV(`load_bars_csv`),
+# 数据库根本不在研究数据路径上,篡改它没有意义。
+PROTECTED_RUNTIME_PACKAGES = (
+    "risk",
+    "strategies",
+    "vnpy_ctastrategy",
+    "vnpy.trader.constant",
+    "vnpy.trader.object",
+    "vnpy.trader.utility",
+)
+
+
+def _module_in_scope(name: str, packages: tuple[str, ...]) -> bool:
+    """模块名是否落在受保护范围内。
+
+    支持**点号路径**前缀:`vnpy.trader.utility` 命中 `vnpy.trader.utility` 本身,
+    也命中它的子模块;但不会把 `vnpy.trader.utility_extra` 误算进来
+    (前缀后面必须跟点)。"""
+    for package in packages:
+        if name == package or name.startswith(package + "."):
+            return True
+    return False
+
+
+# 运行期**新加载**的受保护模块要不要报。
+#
+# `strategies` 排除:候选偶尔会 import 别的策略模块(不参与本次回测,改它无害);
+# `risk` 与 `vnpy*` 是风控与框架本体——运行期才加载并改写它们,指纹本来就看不见
+# (第 11 轮 codex 的 Medium 2:候选 import 一个此前没加载过的受保护子模块再改写,
+#  `check_protected_state` 报 [] ),所以这里显式报出来。
+_PROTECTED_NEW_MODULE_PACKAGES = (
+    "risk",
+    "vnpy.trader.constant",
+    "vnpy.trader.object",
+    "vnpy.trader.utility",
+    "vnpy_ctastrategy",
+)
 
 # 候选执行前必须**先**导入的模块:否则模板模块是候选自己 import 的,
 # 快照里根本没有它,候选在导入期把它改写了也拍不到(第 9 轮 codex 实测)。
@@ -1009,6 +1251,15 @@ def _safe_token(value: object) -> object:
         return ("set", frozenset(_safe_token(item) for item in value))
     if isinstance(value, dict):
         return ("map", tuple((_safe_token(k), _safe_token(v)) for k, v in value.items()))
+    # numpy 数组/标量:能按**内容**比就按内容比,否则原地改写看不见
+    # (第 11 轮 codex 的 Medium 4:闭包里装 numpy 数组时 `arr[0] = 5` 检测不到,
+    #  因为对象身份没变而退化成了身份标记)。
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return ("arr", _safe_token(tolist()))
+        except Exception:                                       # noqa: BLE001 - 取不到内容就退回身份
+            return ("id", id(value))
     return ("id", id(value))
 
 
@@ -1042,6 +1293,14 @@ def _protected_fingerprint_value(value: object) -> tuple[str, object]:
         return ("map", _safe_token(dict(value)))
     if isinstance(value, (set, frozenset)):
         return ("set", _safe_token(set(value)))
+    # numpy 数组:比**内容**。对象身份不变、内容变了(原地改写)也算"被改写"
+    # (第 11 轮 codex 的 Medium 4:退化成身份标记时 `arr[0] = 5` 完全看不见)。
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return ("arr", _safe_token(tolist()))
+        except Exception:                                       # noqa: BLE001 - 取不到内容就退回身份
+            return ("id", value)
     return ("id", value)
 
 
@@ -1086,14 +1345,20 @@ def snapshot_protected_state() -> dict[str, tuple[str, object]]:
 
     覆盖:受保护包下**所有已加载模块**的公开属性,以及其中每个**类**的成员
     (dunder 也在内,只放过 `_FINGERPRINT_IGNORED_DUNDERS` 里的纯元数据)。
-    模板类(`TrendAtr15mStrategy.get_size` 等)与风控模块(`risk_per_trade` 等)都在里面。"""
+    模板类(`TrendAtr15mStrategy.get_size` 等)与风控模块(`risk_per_trade` 等)都在里面。
+
+    每个模块本身也留一个标记键(`"risk.risk_guard"` → 该模块对象):
+    没有它就看不出"这个模块是**运行期才加载**的"——第 11 轮 codex 的 Medium 2 实测:
+    候选在自己执行期间 import 一个此前没加载过的受保护子模块再改写它,
+    指纹**完全看不见**(快照里根本没有那个模块)。"""
     _preload_protected_modules()
     snapshot: dict[str, tuple[str, object]] = {}
     for name, module in list(sys.modules.items()):
         if module is None:
             continue
-        if name.split(".")[0] not in PROTECTED_RUNTIME_PACKAGES:
+        if not _module_in_scope(name, PROTECTED_RUNTIME_PACKAGES):
             continue
+        snapshot[name] = ("id", module)
         for attr, value in list(vars(module).items()):
             if _fingerprint_skip(attr):
                 continue
@@ -1124,6 +1389,13 @@ def check_protected_state(before: dict, after: dict) -> list[str]:
             findings.append(f"受保护对象 {key} 被改写")
     for key in sorted(after):
         if key in before:
+            continue
+        value = after[key][1]
+        if isinstance(value, types.ModuleType):
+            # 运行期**新加载**的受保护模块(第 11 轮 codex 的 Medium 2):
+            # 快照里此前根本没有它,改写它指纹就看不见——这里显式报出来。
+            if _module_in_scope(key, _PROTECTED_NEW_MODULE_PACKAGES):
+                findings.append(f"受保护模块 {key} 在运行期被加载(此前不在指纹里,可能被改写)")
             continue
         # 只报"往**已存在**的类上挂新成员"(父键在 before 里)。
         # 候选导入一个新模块/新类不算越权(候选偶尔会 import 别的策略模块),

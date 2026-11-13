@@ -397,6 +397,8 @@ def test_the_reserved_word_table_matches_the_code():
     listed(*const.BUILTIN_PROTECTED_STATE_OBJECTS)
     listed(*const.BUILTIN_PROTECTED_PATHS)
     listed(*const.BUILTIN_PROTECTED_CONTAINERS)
+    listed(*const.BUILTIN_PROTECTED_CONTAINER_SCOPE)
+    listed(*const.BUILTIN_PROTECTED_CONTAINER_MUTATORS)
     listed(*const.BUILTIN_PROTECTED_MODULE_ATTRS)
     listed(*const.BUILTIN_PROTECTED_READ_ATTRS)
     listed(*const.PROTECTED_RUNTIME_PACKAGES)

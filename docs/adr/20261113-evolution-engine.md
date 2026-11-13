@@ -572,6 +572,88 @@ tampered = check_protected_state(before, after)   # 被替换/被删除/被新�
 3. **静态层仍然是纵深防御,不是安全边界**——真正的边界仍是容器隔离与"运行前由人读过代码"。
 4. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
 
+### 第 11 轮补记:容器上的**变更型方法**、执行点的**调用形态**,以及指纹范围的**显式化**
+
+第 11 轮 codex CLI 深度分析(**43.0/50,需改进,不建议发布**)逐条复现了第 9/10 轮的 10 条修复:
+**9 条确认真堵住**(函数对象状态改写、实例遮蔽 `get_size`、`trading_day`、指纹 dunder、
+MRO 家族判定、受保护成员禁读、基准前移、`reset` 带主机制、`_safe_token`),
+**1 条只半堵**(第 10 轮的"执行点注册表"只数名字不看语义)。本轮报出 2 条 High / 3 条 Medium / 2 条 Low,
+逐条处理如下。
+
+#### High 1 —— 受保护容器只挡"写/取别名",不挡"变更型方法调用"
+
+`self.am.update_bar(fake_bar)` 在静态层与沙盒层都返回 `[]`,第 3/4 层也不覆盖活实例:
+codex 端到端实测**四层全绿**而回测结果被完全改写(`skipped_by_budget` 从 0 变成 3928)。
+这与 `BUILTIN_PROTECTED_CONTAINERS` 的立意(防止伪造价格 -> 伪造收益)直接矛盾:
+写数组被拦、插数组不拦。
+
+修法:新增 `BUILTIN_PROTECTED_CONTAINER_SCOPE`(`am`/`bg`)与 `BUILTIN_PROTECTED_CONTAINER_MUTATORS`
+(`update_bar`/`update_tick`/`append`/…/`byteswap`)。凡是"路径经过受保护容器"且"调用了变更型方法"
+的一律拒;容器上的**只读**调用(`self.am.sma(...)`)照常放行。
+配套降误报:裸局部名 `am`/`bg` 降级为**路径保护**(只保护 `self.am.xxx`,不再按裸名一刀切),
+类体里定义 `am` 仍然拒。
+
+#### High 2 —— 第四层执行点守卫只数名字,不看语义
+
+codex 在独立 clone 上实测四种改法,都能让 `tools/check_constitution_history.py` **exit 0** 而第四层已失效:
+(a) 本地同名影子 `def check_protected_state(b, a): return []` + 改为裸名调用;
+(b) `const.check_protected_state(protected_before, protected_before)`——自己比自己,比对必然通过;
+(c) 把调用挪进死分支(`if False:`),名字引用数不变;
+(d) 新增一个执行候选却完全不调第三/四层的脚本——注册表是手工维护的,没有完备性检查。
+
+修法:守卫从"名字出现次数"升级为**调用形态**(`check_call_site_shape`):必须有**活调用**(死分支不算)、
+不得有同名影子、`check_protected_state` 的两个实参必须不同;再加**完备性检查**
+(`check_executor_completeness`):按仓库实际内容找出所有执行候选的模块(裸 `exec(...)` / 沙盒执行入口 /
+候选导入入口),不在"走第四层"的传递闭包里的执行入口一律报出来。
+(裸 `exec(...)` 才算执行候选:`qapp.exec()` 是 Qt 事件循环,按属性名一刀切会误报。)
+
+#### Medium 1 —— `self.trading_day` 的新误报
+
+第 10 轮把 `trading_day` 放进模块级成员名单之后,`self.trading_day = bar.datetime.date()`
+被误判成"改写了受保护的风控函数"——"每天只开一次仓"这类常规候选会被整片拒掉。
+修法:模块级成员名只在**根不是 `self`** 时才算命中(实例属性与同名候选方法一律无害);
+模块级的 `rg.trading_day = ...` 仍然拦。
+
+#### Medium 2 —— 指纹只覆盖"快照时已加载"的受保护模块
+
+候选在运行期 import 一个此前没加载过的受保护子模块再改写它,指纹**完全看不见**
+(此前"新增成员"只在父键已存在时才报)。修法:快照为每个受保护模块留一个**模块标记键**,
+比对时发现"运行期新加载的受保护模块"就报出来。
+
+#### Medium 3 —— vnpy 核心对象只靠"巧合"被覆盖
+
+`vnpy.trader.utility.ArrayManager` 此前只因为模板**按名 import** 它才恰好出现在指纹里;
+模板哪天改成 `import vnpy.trader.utility as util`,这层保护会**静默消失**,而历史守卫看不出来
+(它只守常量集合,不管语义)。修法:`PROTECTED_RUNTIME_PACKAGES` 支持**点号路径前缀**,显式纳入
+`vnpy.trader.constant` / `vnpy.trader.object` / `vnpy.trader.utility`——覆盖不再依赖"模板怎么 import"。
+
+`vnpy.trader.database` **故意不在范围内**:它的模块级 `database` 全局在第一次 `get_database()` 时
+会被**合法**地替换(离线取数脚本会这么做),纳入范围会造成运行期虚假 diff;
+而研究链路的数据来自 CSV(`load_bars_csv`),数据库根本不在研究数据路径上,篡改它没有意义。
+
+#### Medium 4 —— numpy 数组退化成身份标记
+
+`_safe_token` 把 numpy 数组变成 `("id", id(x))`,`arr[0] = 5` 这种原地改写在指纹里看不见。
+修法:numpy 数组按**内容**比(`tolist()` 后逐项取指纹);内容没变就不报(否则每次回测刷出一堆虚假 diff)。
+
+#### Low 1 / Low 3
+
+- **Low 1**:`am`/`bg` 这类容器名降级为路径保护(见 High 1)。
+- **Low 3**:第三层只查**实例字典**,看不见候选在运行期给自己的类打补丁(`Cand.get_size = ...`)。
+  新增 `_runtime_class_dict_violations`:回测结束后再比一次类字典(自动生成的 dunder 除外),
+  白名单里的 `entry_signal` 等仍然允许。
+
+#### 第 11 轮之后仍然存在的残余缺口(如实记录)
+
+1. **第四层仍是"前后差分"**:候选若在回测途中"改 -> 用 -> 还原",差分看不出来(与第 10 轮同)。
+2. **指纹覆盖六个包段、约 4600 个键**:一次快照约 5 毫秒(首张约 490 毫秒,含模块预载);
+   真实回测与候选导入前后均**零虚假 diff**(已实测)。
+3. **`vnpy.trader.database` 不在指纹范围内**:研究链路不用数据库取数,当前没有暴露路径;
+   若将来研究链路改从数据库读数据,这一条必须重新评估。
+4. **候选 import 一个新的 vnpy 子模块并改写它**:静态层按名字看不见(该模块不在受保护名单里),
+   指纹也只在"运行期新加载的受保护模块"这一层报——已登记为后续项。
+5. **PBO/CSCV 仍然延后**,与本轮无关。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -608,7 +690,9 @@ tampered = check_protected_state(before, after)   # 被替换/被删除/被新�
 | 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset`、`trading_day` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
 | 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day` | `BUILTIN_PROTECTED_READ_ATTRS` |
 | 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
-| 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员) | `risk`、`strategies`、`vnpy_ctastrategy` | `PROTECTED_RUNTIME_PACKAGES` |
+| 受保护容器的**范围**(这些名字上的容器受保护) | `am`、`bg` | `BUILTIN_PROTECTED_CONTAINER_SCOPE` |
+| 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |
+| 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员;支持点号路径前缀) | `risk`、`strategies`、`vnpy_ctastrategy`、`vnpy.trader.constant`、`vnpy.trader.object`、`vnpy.trader.utility` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
