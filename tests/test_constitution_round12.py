@@ -300,6 +300,74 @@ def test_the_fifth_layer_notices_bars_forged_during_the_warm_up():
             "C15", bars)
 
 
+def _transient_tamper_class():
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Transient(TrendAtr15mStrategy):
+        """第 13 轮 codex 的 Critical 1:改 -> 用 -> 改回。
+
+        第 30 根 K 线结束时把最后一根的最高价改成 5000,第 31 根 K 线(它的 ATR 计算会用到
+        被改过的值)结束时再还原——回测结束时容器与诚实回测逐值相同。"""
+        _n = 0
+        _saved = 0.0
+
+        def on_bar(self, bar):
+            super().on_bar(bar)
+            self._n += 1
+            if self._n == 30:
+                self._saved = float(self.am.high_array[-1])
+                self.am.high_array[-1] = 5000.0
+            elif self._n == 31:
+                self.am.high_array[-2] = self._saved        # 数组已左移一格
+
+    return Transient
+
+
+_TRANSIENT_SETTING = {"risk_budget": 300.0, "max_daily_losses": 3, "atr_window": 14,
+                      "history_vt_symbol": "C15"}
+
+
+def test_the_fifth_layer_notices_a_transient_tamper_that_is_restored_later():
+    """逐根核对:瞬时改写必须撑过一根 K 线的处理,下一次核对必然露馅。"""
+    import backtest_lib
+
+    with pytest.raises(RuntimeError, match="第 30 根 K 线之后"):
+        backtest_lib.run_engine_bars(_transient_tamper_class(), _TRANSIENT_SETTING, "C15", _synth_bars())
+
+
+def test_the_transient_tamper_test_really_needs_the_per_bar_check(monkeypatch):
+    """证明上一条用例有判别力:关掉逐根核对,只剩结束时的末态比对,这次改写就放过去了。"""
+    import backtest_lib
+
+    monkeypatch.setattr(const.MarketDataWatch, "step", lambda self: [])
+    engine = backtest_lib.run_engine_bars(
+        _transient_tamper_class(), _TRANSIENT_SETTING, "C15", _synth_bars())
+    assert engine.strategy is not None
+
+
+@pytest.mark.parametrize("src", [
+    "def entry_signal(self):\n    x = self.am.close[:, None]\n    return 1\n",
+    "def entry_signal(self):\n    x = self.am.close[...]\n    return 1\n",
+    "def entry_signal(self):\n    x = self.am.close[None]\n    return 1\n",
+    "def entry_signal(self):\n    x = self.am.close.swapaxes(0, 0)\n    return 1\n",
+    "def entry_signal(self):\n    x = self.am.close[slice(None)]\n    return 1\n",
+])
+def test_the_static_layer_refuses_every_basic_index_that_makes_a_view(src):
+    """第 13 轮 Critical 1(静态半边):第 12 轮只认 `ast.Slice`,`[:, None]`/`[...]`/`[None]`/
+    `.swapaxes()`/`slice(...)` 都被放过,拿到的是 numpy 视图。"""
+    assert screen(src), "产生视图的下标没被拦下"
+
+
+@pytest.mark.parametrize("src", [
+    "def entry_signal(self):\n    x = self.am.close[-1]\n    return 1\n",
+    "def entry_signal(self):\n    i = 3\n    x = self.am.close[i]\n    return 1\n",
+    "def entry_signal(self):\n    x = self.am.close[-2] - self.am.close[-1]\n    return 1\n",
+])
+def test_the_static_layer_still_allows_scalar_reads(src):
+    """反向:整数下标取到的是一个数,必须放行,否则正常候选会被整片拒掉。"""
+    assert not screen(src), screen(src)
+
+
 # ---------- High 2:历史守卫的执行点检查 ----------
 
 def _guard_root(tmp_path):
@@ -429,6 +497,86 @@ def test_the_guard_accepts_the_shipped_execution_points_after_the_hardening():
     assert check_constitution_module_is_clean(ROOT) == []
 
 
+# ---------- 第 13 轮 codex:守卫要验"效果"而不只验"形态" ----------
+
+def _two_file_guard_root(tmp_path, body):
+    root = _guard_root(tmp_path)
+    (root / "scripts" / "backtest_lib.py").write_text(body, encoding="utf-8")
+    (root / "scripts" / "research_api.py").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_the_guard_notices_a_discarded_comparison_result(tmp_path):
+    """第 13 轮 High 1:`_ = const.check_protected_state(...)`——调用形态完全对,结论被扔掉。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    _ = const.check_protected_state(before, const.snapshot_protected_state())\n"
+        "    return None\n\n"
+        "run('')\n"))
+    problems = check_call_site_shape(root)
+    assert any("丢弃" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_comparison_whose_result_is_never_read(tmp_path):
+    """结论存进了列表,但这个列表之后从没被读取——和扔掉一样。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    findings = []\n"
+        "    findings.extend(const.check_protected_state(before, const.snapshot_protected_state()))\n"
+        "    return None\n\n"
+        "run('')\n"))
+    problems = check_call_site_shape(root)
+    assert any("丢弃" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_comparison_hidden_in_a_lambda(tmp_path):
+    """第 13 轮 High 2:把比对挪进 `lambda: ...`,它永远不会执行。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    check = lambda: const.check_protected_state(before, const.snapshot_protected_state())\n"
+        "    return None\n\n"
+        "run('')\n"))
+    problems = check_call_site_shape(root)
+    assert any("lambda" in p for p in problems), problems
+
+
+def test_the_guard_notices_an_executor_whose_fourth_layer_hangs_on_another_function(tmp_path):
+    """第 13 轮 High 3:`exec` 在 `run()` 里裸奔,那两个名字只放在一个从不被调用的函数里。
+
+    文件级的"出现过那两个调用"被满足了,执行点本身却没有走第四层。"""
+    from tools.check_constitution_history import check_executor_completeness
+
+    root = _guard_root(tmp_path)
+    (root / "scripts" / "backtest_lib.py").write_text(_COVERED_BODY, encoding="utf-8")
+    (root / "scripts" / "research_api.py").write_text(_COVERED_BODY, encoding="utf-8")
+    (root / "scripts" / "brand_new_runner.py").write_text(
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    exec(code, {})\n"
+        "    return None\n\n"
+        "def _decoy(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    return const.check_protected_state(before, const.snapshot_protected_state())\n",
+        encoding="utf-8")
+    problems = check_executor_completeness(root)
+    assert any("brand_new_runner" in p for p in problems), problems
+
+
 # ---------- Medium 2:__module__ 伪造骗不过"仓库自己的类"豁免 ----------
 
 def test_a_spoofed_module_name_does_not_buy_the_repository_exemption():
@@ -451,6 +599,63 @@ def test_a_spoofed_module_name_does_not_buy_the_repository_exemption():
     strategy = object.__new__(Cand)
     findings = const._runtime_class_dict_violations(strategy, template, const.default())
     assert findings, "伪造 __module__ 骗过了豁免(Medium 2 复发)"
+
+
+def test_a_candidate_cannot_buy_the_exemption_by_planting_itself_in_a_repository_module(monkeypatch):
+    """第 13 轮 Medium 1:`Evil.__module__ = "<仓库模块>"; <仓库模块>.Evil = Evil`。
+
+    第 12 轮的判据之一是"模块字典里有同名对象"——候选自己就能满足它。
+    现在只看类体里自己的代码落在哪个文件:候选的函数不在那个模块文件里,豁免不成立。"""
+    import strategies.trend_atr_15m_strategy as repo_module
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+
+    class Evil(TrendAtrStrategy):
+        def get_size(self) -> float:                      # 越权:重写了受保护的方法
+            return 0.001
+
+    Evil.__module__ = repo_module.__name__
+    monkeypatch.setattr(repo_module, "Evil", Evil, raising=False)
+    assert not const._is_in_repo_strategy_class(Evil)
+    findings = const._runtime_class_dict_violations(
+        object.__new__(Evil), const.load_template(), const.default())
+    assert findings, "伪造模块成员表骗过了豁免(第 13 轮 Medium 1 复发)"
+
+
+def test_a_class_with_only_data_attributes_does_not_get_the_exemption():
+    """没有任何自己的函数的类不豁免:"全部来自仓库"在空集上恒成立,
+    候选写个只有数据属性的类(`risk_budget = 1e9`)就能蒙混过去。"""
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+
+    class OnlyData(TrendAtrStrategy):
+        risk_budget = 1e9
+
+    assert not const._is_in_repo_strategy_class(OnlyData)
+
+
+def test_the_pending_dir_reserved_names_match_the_sandbox_config():
+    """宪法模块不能 import `research_config`(它依赖 bootstrap/vnpy),所以复刻了保留目录集合;
+    两份必须一致,否则宪法与沙盒对"候选目录"的口径就会错位(第 13 轮 Medium 2)。"""
+    import research_config
+
+    assert const._PENDING_DIR_RESERVED == frozenset(research_config.RESERVED_DIRS)
+
+
+@pytest.mark.parametrize("pending, expected_default", [
+    ("strategies", True),            # 沙盒会拒绝加载这份配置;宪法不得比它更宽松
+    ("risk", True),
+    ("../outside", True),            # 越出仓库
+    ("/abs/elsewhere", True),        # 绝对路径
+    ("my_pending", False),           # 合法的自定义候选目录
+])
+def test_the_pending_dir_follows_the_same_validation_as_the_sandbox(tmp_path, monkeypatch, pending, expected_default):
+    import json
+
+    config = tmp_path / "sandbox.json"
+    config.write_text(json.dumps({"paths": {"pending_dir": pending}}), encoding="utf-8")
+    monkeypatch.setenv("RESEARCH_SANDBOX_CONFIG", str(config))
+    resolved = const._repo_pending_dir()
+    default = const._REPO_ROOT / const._DEFAULT_PENDING_DIR
+    assert (resolved == default) is expected_default, resolved
 
 
 def test_the_repository_strategies_keep_their_exemption():

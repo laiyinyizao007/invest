@@ -752,6 +752,83 @@ codex 在独立 clone 上实测五种改法,守卫都能 **exit 0** 而第四层
    (`safe_builtins` 已移除),静态层也把 `getattr` 列为禁用内建。
 5. PBO/CSCV 仍然延后,与本轮无关。
 
+### 第 13 轮补记:第五层从"末态比对"改为"逐根核对",守卫改为验**效果**
+
+第 13 轮 codex CLI 深度分析(**38.0/50,需改进,不建议发布**,与第 12 轮 38.5 基本持平)基于
+`9397821` 复核:第 12 轮的 6 条修复**大部分确已堵住**(持续性行情改写会被第五层当场抓住;
+预热期造假那一条也已被并行提交修掉),但报出 **1 Critical / 3 High / 2 Medium / 3 Low**。
+codex 同时核实了一条重要的**边界**:单笔 ¥300 底线**没有**被突破——`_try_enter` 里参与预算判定的
+`dist` 就是 `_send_entry` 写进 `pending_dist` 的同一个值,`on_trade` 用它建初始止损,而 `pending_dist`
+是受保护名,所以"被判定的金额"与"实际风险金额"结构上同源。损害在**统计口径**(夏普/回撤/往返笔数,
+正是晋级门槛消费的东西),不在风险底线。
+
+#### Critical 1 —— 第五层是末态比对,瞬时改写("改 → 用 → 改回")看不见
+
+codex 的最小复现:候选在第 N 根 K 线结束时把最近 45 根的高/低/收改成同一个值(TR≈0,ATR 塌陷),
+在下一根结束时还原。实测 ATR 从 **40.00 压到 5.07**,诚实模板 0 成交而候选 30 笔往返,
+回测**结束**时三个数组与原始行情逐值相同,五层全绿。静态层恰好也放过了能表达它的写法:
+第 12 轮的 `_container_reference` 只把 `ast.Slice` 当视图,`self.am.close[:, None]` / `[...]` / `[None]`
+/ `.swapaxes()` 全部放行。
+
+修法两半:
+- **静态层**:`_subscript_makes_a_view` 认出 numpy 的全部**基本索引**视图(切片、`...`、`None`、含它们的元组、
+  `slice(...)` 调用);视图方法名单补 `swapaxes`/`diagonal`。整数下标(取到一个数)与高级索引(副本)照常放行——
+  反向用例同样入库。变量里存着的切片对象静态层看不见,交给运行期。
+- **运行期**:新增 `MarketDataWatch`,回测脚本包住 `engine.new_bar`,**每处理完一根 K 线核对一次**容器。
+  瞬时改写要影响下一次 ATR 计算,就必须在这根 K 线**结束时**仍留在容器里,下一次核对必然露馅。
+  只在同一次调用里"改了又改回"、不跨 K 线的写法影响不到受保护的 ATR(ATR 在 `entry_signal` 之前算好),
+  能影响的只有候选本来就能决定的信号。终态比对保留,作为第二道。
+  端到端用例用 monkeypatch 关掉逐根核对来**证明用例有判别力**:关掉之后同一个攻击放行。
+  第五层同时覆盖成交量/成交额/持仓量数组(Low 2)。
+
+#### High 1/2/3 —— 历史守卫"验形态不验效果"
+
+三条都是在独立克隆里改一处、守卫仍 exit 0:
+- **H1**:`_ = const.check_protected_state(...)`——调用形态完全对,结论被扔掉;
+- **H2**:把比对挪进 `lambda: ...`(`_call_scope` 认不出 lambda);
+- **H3**:新执行入口 `exec` 在 `run()` 里裸奔,那两个名字只放在一个从不被调用的函数里,"文件里出现过"就算覆盖。
+
+修法:比对的**结论必须被用掉**(`_result_is_used`:不能是单独一条语句、不能赋给 `_`、存进名字则该名字之后必须被读取,
+只 `extend/append` 不算读取);lambda 是作用域,比对在 lambda 里直接报;执行入口里每个**原语执行调用**
+(裸 `exec/eval/compile`、属性形式的 `import_module/run_path/run_module`)所在的**同一个函数体**里必须自己
+成对取快照并比对,且每个比对调用点都过同一套形态核对(`_check_call_problems`,注册表与执行入口共用)。
+`_result_is_used` 是形态层面的近似,更彻底的"结论必须导致拒绝"由端到端回归用例守。
+
+#### Medium 1 —— "仓库自己的类"豁免可被候选买断
+
+第 12 轮的判据之一是"`vars(module)[name] is klass`"——候选
+`Evil.__module__ = "scripts.research_sandbox"; sb.Evil = Evil` 自己就能满足它,运行期类字典检查就此对候选关闭。
+现在**只看类体里自己的代码落在哪个文件**:类声称的模块文件在仓库里且不在候选目录里;类体里**每一个**自己写的函数
+(解开 staticmethod/classmethod/property)的 `co_filename` 都等于那个模块文件;且**至少有一个**
+(没有自己函数的类不豁免——"全部来自"在空集上恒成立,候选写个只有 `risk_budget = 1e9` 的类就能蒙混)。
+`co_filename` 是编译时写进字节码的,候选没有 `compile`/`exec` 改不了它。
+
+#### Medium 2 —— `pending_dir` 有两个口径
+
+沙盒的 `research_config.load()` 会校验并拒绝 `pending_dir="strategies"`,而宪法的 `_repo_pending_dir()` 自己
+`json.loads` 却照收。现在宪法做**同一套校验**(相对路径、不得越出仓库、首段不得是保留目录),校验不过退回默认目录。
+宪法模块不能 import `research_config`(依赖 bootstrap/vnpy),所以保留目录集合是复刻的,
+`test_the_pending_dir_reserved_names_match_the_sandbox_config` 守两份一致。
+
+#### Low
+
+- **Low 1**:`_container_escape_findings` 只看最外层表达式节点——`x = self.am.close + 0` / `x += self.am.close`
+  不命中。numpy 运算出的是副本,今天无害;**暂不改**,规则的口径是"表达式形状"而不是"数据流形状",如实登记。
+- **Low 2**:第五层只查 4 个价格数组 → 已扩到成交量/成交额/持仓量。
+- **Low 3**:文档对第五层能力的表述过头(写成"防伪造",实际是末态比对)→ 本节已更正为"逐根 + 终态",
+  并写明它**不覆盖**的东西(见下)。
+
+#### 第 13 轮之后仍然存在的残余缺口(如实记录)
+
+1. 逐根核对只能发现**跨 K 线**的改写;同一次调用内改了又改回、且只影响候选自己本来就能决定的信号,看不见(也无需看见)。
+2. 变量里存着的切片对象(`s = slice(None); self.am.close[s]`)静态层看不见,由运行期逐根核对兜底。
+3. 分钟族(一根 K 线不对应一次容器更新)逐根核对只能验"取值必须真实出现过",
+   换成另一个**出现过**的取值发现不了。
+4. `_result_is_used` 是形态近似:恶意改法仍可构造"读取了但不决策"的名字用法;端到端用例是更强的约束。
+5. 豁免判据的残余:候选若 `import` 一个仓库里的函数并挂到类上、且伪造的 `__module__` 指向该函数所在文件时会通过——
+   但那条赋值在类体里,静态层按受保护名拦下,这里只是纵深防御。
+6. 第四层仍是前后差分;PBO/CSCV 仍然延后。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -790,7 +867,7 @@ codex 在独立 clone 上实测五种改法,守卫都能 **exit 0** 而第四层
 | 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
 | 受保护容器的**范围**(这些名字上的容器受保护) | `am`、`bg` | `BUILTIN_PROTECTED_CONTAINER_SCOPE` |
 | 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap`、`__setitem__`、`__delitem__`、`__iadd__`、`__imul__`、`__ior__` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |
-| 受保护容器上的**视图型方法**(返回的还是同一块内存,改它等于改容器) | `view`、`reshape`、`ravel`、`squeeze`、`transpose` | `BUILTIN_PROTECTED_CONTAINER_VIEWS` |
+| 受保护容器上的**视图型方法**(返回的还是同一块内存,改它等于改容器) | `view`、`reshape`、`ravel`、`squeeze`、`transpose`、`swapaxes`、`diagonal` | `BUILTIN_PROTECTED_CONTAINER_VIEWS` |
 | 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员;支持点号路径前缀) | `risk`、`strategies`、`vnpy_ctastrategy`、`vnpy.trader.constant`、`vnpy.trader.object`、`vnpy.trader.utility` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |

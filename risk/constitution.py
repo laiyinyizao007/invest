@@ -37,7 +37,6 @@ from __future__ import annotations
 import ast
 import dataclasses
 import importlib
-import inspect
 import json
 import re
 import sys
@@ -178,6 +177,8 @@ BUILTIN_PROTECTED_CONTAINER_MUTATORS = (
 # `flatten`/`copy` 不在此列:它们返回的是**副本**,拿到也改不到回测数据。
 BUILTIN_PROTECTED_CONTAINER_VIEWS = (
     "view", "reshape", "ravel", "squeeze", "transpose",
+    # 第 13 轮 codex 的 Critical 1:这两个同样返回视图,第 12 轮漏登记
+    "swapaxes", "diagonal",
 )
 
 # 候选不得调用的下单/撤单接口
@@ -611,6 +612,27 @@ def _module_attr_owner_ok(name: str, path: list[str]) -> bool:
     return owner is None or owner in path
 
 
+def _subscript_makes_a_view(index: ast.AST) -> bool:
+    """这个下标会不会让 numpy 返回**视图**(与原数组共享内存)而不是一个数/副本。
+
+    numpy 的**基本索引**返回视图:切片、`...`、`None`/`np.newaxis`,以及包含它们的元组。
+    第 13 轮 codex 的 Critical 1:第 12 轮只认 `ast.Slice`,于是
+    `self.am.close[:, None]` / `[...]` / `[None]` 都被放过,拿到视图写回就改了回测数据。
+    整数下标取到的是一个数(副本),高级索引(列表/数组)返回副本,都不是视图。
+
+    `slice(...)` 构造出来的切片对象同样产生视图,所以调用 `slice(...)` 也按视图算。
+    变量里存着的切片对象静态层看不见——那一条由运行期第五层逐根核对兜底。"""
+    if isinstance(index, ast.Slice):
+        return True
+    if isinstance(index, ast.Constant) and (index.value is None or index.value is Ellipsis):
+        return True
+    if isinstance(index, ast.Call) and isinstance(index.func, ast.Name) and index.func.id == "slice":
+        return True
+    if isinstance(index, ast.Tuple):
+        return any(_subscript_makes_a_view(element) for element in index.elts)
+    return False
+
+
 def _container_reference(node: ast.AST) -> str | None:
     """表达式是否**直接引用**受保护容器(`am`/`bg`)本身或它的某个属性。
 
@@ -643,7 +665,7 @@ def _container_reference(node: ast.AST) -> str | None:
         # 第 12 轮 codex 的 High 1 变体①:视图把 ATR 从 40 压到 2.86,
         # ¥300 单笔预算当场失效(诚实模板 0 成交,候选成交 2 笔),四层防线全绿。
         # `self.am.close[-1]` 取到的是一个数(副本),不是视图,放行。
-        if isinstance(node.slice, ast.Slice):
+        if _subscript_makes_a_view(node.slice):
             return _container_reference(node.value)
         return None
     if isinstance(node, ast.Call):
@@ -1108,23 +1130,39 @@ def _shadowed_template_callables(strategy: object, template: type) -> list[str]:
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# 候选目录不得落在这些仓库目录里。与 `scripts/research_config.py` 的 `RESERVED_DIRS` **必须一致**
+# (宪法模块不能 import 它:它依赖 bootstrap/vnpy;一致性由
+# `tests/test_constitution_round12.py::test_the_pending_dir_reserved_names_match_the_sandbox_config` 守)。
+_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config"})
+_DEFAULT_PENDING_DIR = "pending_strategies"
+
+
 def _repo_pending_dir() -> Path:
     """候选目录的路径(单一事实来源:配置里的 `paths.pending_dir`)。
 
     第 12 轮 codex 的 Medium 2:候选目录此前在宪法里**写死**成 `pending_strategies`,
-    而配置(`config/research_sandbox.json` 的 `paths.pending_dir`)是**可以改**的——
-    两者不一致时,豁免会静默扩大到全部候选(候选放在配置允许的别的目录里,
-    却被当成"仓库自己的代码")。所以这里按配置取,配置读不到才退回默认值。"""
-    import json
+    而配置是**可以改**的,两者不一致时豁免会静默扩大。
+
+    第 13 轮 codex 的 Medium 2:改成读配置之后又出现另一个口径裂缝——沙盒的
+    `research_config.load()` 会校验并拒绝 `pending_dir="strategies"`,而这里自己 `json.loads`
+    却照收,于是宪法认为的"候选目录"与沙盒实际用的路径错位。现在这里做**同一套校验**
+    (相对路径、不得越出仓库、首段不得是保留目录);校验不过就退回默认目录——
+    沙盒对这样的配置是整个拒绝加载的,宪法不应当比它更宽松。"""
     import os
 
-    name = "pending_strategies"
+    name = _DEFAULT_PENDING_DIR
     config_path = os.environ.get("RESEARCH_SANDBOX_CONFIG") or (
         _REPO_ROOT / "config" / "research_sandbox.json")
     try:
         cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
-        name = str(cfg["paths"]["pending_dir"])
-    except Exception:                                           # noqa: BLE001 - 读不到就退回默认值
+        candidate = str(cfg["paths"]["pending_dir"])
+        relative = Path(candidate)
+        resolved = (_REPO_ROOT / relative).resolve()
+        if (candidate and not relative.is_absolute() and ".." not in relative.parts
+                and resolved.is_relative_to(_REPO_ROOT.resolve())
+                and relative.parts and relative.parts[0] not in _PENDING_DIR_RESERVED):
+            name = candidate
+    except Exception:                                           # noqa: BLE001 - 读不到/不合法就退回默认值
         pass
     return _REPO_ROOT / name
 
@@ -1139,21 +1177,21 @@ def _is_in_repo_strategy_class(klass: type) -> bool:
     - `tests/` 里的测试替身(`AlwaysLong`、`Chatty`……)也照抄了这些方法。
     "候选不得重写受保护成员"这条规矩约束的是**候选**,不是人审过的仓库内代码。
 
-    候选一律从候选目录(`paths.pending_dir`,默认 `pending_strategies/`)载入,
-    仓库内的代码在 `strategies/`、`tests/` 等目录里。这里按**模块文件所在路径**判定,
-    不看类自己声明的 `__module__` 字符串。
+    判据只看**类体里自己的代码落在哪个文件**,而且必须同时满足:
+    1. 类声称的模块文件在仓库里、不在候选目录里;
+    2. 类体里**每一个**自己写的函数(`__code__.co_filename`)都来自**那个模块文件,
+       或它的 MRO 父类所在模块的文件**(别的测试给仓库类打补丁再"还原"时,会把**继承来的**
+       函数写进子类自己的字典——那个函数的源文件是父类的文件,不是这个模块自己的);
+    3. 至少有一个——没有任何自己的函数的类不豁免(候选写个只有数据属性的类,
+       `risk_budget = 1e9`,"全部来自"会因为空集而恒成立)。
 
-    第 12 轮 codex 的 Medium 2:光看 `__module__` 指向的模块是不够的——
-    候选可以在类体里写 `__module__ = "strategies.trend_atr_15m_strategy"`,
-    那个模块**确实**在仓库目录里,于是豁免生效。所以还要加一条:
-    这个类必须**确实定义在**它声称的那个模块里。
+    **不认**"模块字典里有没有同名对象"(第 13 轮 codex 的 Medium 1):候选可以
+    `Evil.__module__ = "scripts.research_sandbox"; sb.Evil = Evil` 自己满足它。
+    也不能用 `inspect.getfile(cls)`——它按 `cls.__module__` 查模块文件,是循环的。
+    `__code__.co_filename` 是编译时写进字节码的,候选改不了(它没有 `compile`/`exec`)。
 
-    判据不能是"`vars(module)` 里有没有这个名字"——函数里就地定义的类
-    (测试替身 `Chatty` 就是)本来就不在模块字典里,那样判会把仓库自己的代码也拒掉。
-    真正的判据是**文件**:这个类的源码文件,必须就是那个模块的文件。
-    - 仓库里就地定义的替身:两者都是 `tests/test_xxx.py` → 相同 → 豁免;
-    - 候选伪造 `__module__`:类是候选文件里定义的,模块文件却指向 `strategies/` → 不同 → 不豁免;
-    - 候选没伪造:类与模块都在候选目录 → 候选目录判定直接拒。"""
+    残余:候选若 `import` 一个仓库里的函数并挂到类上,那个函数的文件与伪造的 `__module__`
+    指向的文件相同时会通过——但那条赋值在类体里,静态层按受保护名拦下,这里只是纵深防御。"""
     module = sys.modules.get(getattr(klass, "__module__", "") or "")
     if module is None:
         return False
@@ -1161,49 +1199,60 @@ def _is_in_repo_strategy_class(klass: type) -> bool:
     if not filename:
         return False
     try:
-        path = Path(filename).resolve()
+        module_file = Path(filename).resolve()
     except OSError:                                            # noqa: BLE001 - 路径拿不准就当不可信
         return False
-    if not path.is_relative_to(_REPO_ROOT):
+    if not module_file.is_relative_to(_REPO_ROOT):
         return False
-    if path.is_relative_to(_repo_pending_dir()):
+    if module_file.is_relative_to(_repo_pending_dir()):
         return False
-    return _class_defined_in_module_file(klass, path)
+    return _class_code_comes_only_from(klass, module_file)
 
 
-def _class_defined_in_module_file(klass: type, module_file: Path) -> bool:
-    """这个类是不是**真的**定义在那个模块的文件里。
-
-    两种正当情况都要放行:
-    1. **模块里就有这个类**(`vars(module)[name] is klass`)——仓库自己的策略类是这种。
-       伪造 `__module__` 的候选进不来:那个模块的字典里并没有它。
-       (注意这一条要放在最前面:别的测试往仓库类上打补丁(加了个 lambda)时,
-       类字典里会多出**别的文件**的函数,按"代码文件"判就会误伤仓库自己的类。)
-    2. **就地定义的类**(函数里定义的测试替身 `Chatty`):它本来就不在模块字典里,
-       只能看它自己写的代码落在哪个文件——`__code__.co_filename` 才是定义位置。
-       `inspect.getfile(cls)` 对类是循环的(按 `cls.__module__` 查模块文件),
-       正好被伪造的 `__module__` 骗过,所以不能用它。
-
-    判定取"**至少有一个**自己写的成员来自那个模块文件":别的测试往仓库类上
-    挂过补丁(比如把 `__getattribute__` 挂上去再"还原"成继承来的那个),
-    类字典里会多出**别的文件**的函数——要求"全部来自"会把仓库自己的类误伤。
-    """
-    module = sys.modules.get(getattr(klass, "__module__", "") or "")
-    if module is not None and getattr(module, klass.__name__, None) is klass:
-        return True
-    own_files = set()
-    for value in vars(klass).values():
-        code = getattr(value, "__code__", None)
-        if code is not None:
-            own_files.add(code.co_filename)
-    for filename in own_files:
-        try:
-            source_file = Path(filename).resolve()
-        except OSError:                                        # noqa: BLE001 - 拿不准就当不可信
+def _mro_module_files(klass: type) -> set:
+    """类的 MRO 里各个父类所在模块的文件(解析后的路径)。"""
+    files = set()
+    for base in getattr(klass, "__mro__", ())[1:]:
+        module = sys.modules.get(getattr(base, "__module__", "") or "")
+        filename = getattr(module, "__file__", None) if module is not None else None
+        if not filename:
             continue
-        if source_file == module_file:
-            return True
-    return False
+        try:
+            files.add(Path(filename).resolve())
+        except OSError:                                        # noqa: BLE001 - 拿不准就不算
+            continue
+    return files
+
+
+def _own_code_objects(klass: type) -> list:
+    """类体里自己写的函数的代码对象(解开 staticmethod/classmethod/property)。"""
+    codes = []
+    for value in vars(klass).values():
+        candidates = [value]
+        candidates.append(getattr(value, "__func__", None))
+        for accessor in ("fget", "fset", "fdel"):
+            candidates.append(getattr(value, accessor, None))
+        for item in candidates:
+            code = getattr(item, "__code__", None)
+            if code is not None:
+                codes.append(code)
+    return codes
+
+
+def _class_code_comes_only_from(klass: type, module_file: Path) -> bool:
+    """类体里自己的每一个函数都来自 `module_file` 或其 MRO 父类的模块文件,且至少有一个。"""
+    codes = _own_code_objects(klass)
+    if not codes:
+        return False
+    allowed = {module_file} | _mro_module_files(klass)
+    for code in codes:
+        try:
+            source_file = Path(code.co_filename).resolve()
+        except OSError:                                        # noqa: BLE001 - 拿不准就当不可信
+            return False
+        if source_file not in allowed:
+            return False
+    return True
 
 
 def _runtime_class_dict_violations(strategy: object, template: type, c: Constitution) -> list[str]:
@@ -1636,11 +1685,17 @@ def check_class(candidate: type, template: type, c: Constitution | None = None) 
 # ---------- 运行时第五层:行情数据完整性 ----------
 
 # ArrayManager 的四个价格数组 ↔ BarData 的四个价格字段。
+#
+# 第 13 轮 codex 的 Low 2:成交量/成交额/持仓量数组同样可被改写
+# (将来任何用到成交量的指标都会被带偏),所以一并核对。
 _PRICE_ARRAY_FIELDS = (
     ("open_array", "open_price"),
     ("high_array", "high_price"),
     ("low_array", "low_price"),
     ("close_array", "close_price"),
+    ("volume_array", "volume"),
+    ("turnover_array", "turnover"),
+    ("open_interest_array", "open_interest"),
 )
 
 
@@ -1706,15 +1761,15 @@ def check_market_data_integrity(strategy: object, bars, baseline: dict | None = 
         findings.append(
             f"行情容器里回放阶段累计了 {replayed} 根 K 线,而引擎只喂了 {len(fed)} 根(有 K 线是凭空来的)")
         return findings
-    pool: set[float] = set()
-    for values in base_values.values():
-        pool |= set(values)
-    for bar in fed:
-        for _, field in _PRICE_ARRAY_FIELDS:
+    pools: dict[str, set[float]] = {}
+    for array_name, field in _PRICE_ARRAY_FIELDS:
+        pool = set(base_values.get(array_name) or ())
+        for bar in fed:
             try:
                 pool.add(float(getattr(bar, field, 0.0)))
             except (TypeError, ValueError):
                 continue
+        pools[array_name] = pool
     window = min(size, len(fed))
     exact = replayed == len(fed) and len(fed) > 0
     for array_name, field in _PRICE_ARRAY_FIELDS:
@@ -1725,7 +1780,7 @@ def check_market_data_integrity(strategy: object, bars, baseline: dict | None = 
             actual = [float(value) for value in array]
         except (TypeError, ValueError):
             continue
-        unknown = [value for value in actual if value not in pool]
+        unknown = [value for value in actual if value not in pools[array_name]]
         if unknown:
             findings.append(
                 f"行情容器的 {array_name} 里有 {len(unknown)} 个价格不是引擎喂过的"
@@ -1740,3 +1795,91 @@ def check_market_data_integrity(strategy: object, bars, baseline: dict | None = 
                 f"行情容器的 {array_name} 与引擎喂进来的 {field} 对不上"
                 "(有人在回测途中改写了行情数据)")
     return findings
+
+
+class MarketDataWatch:
+    """运行时第五层的**逐根**核对:每处理完一根 K 线,就核对一次行情容器。
+
+    第 13 轮 codex 的 Critical 1:只在回测结束时核对末态,于是"改 -> 用 -> 改回"的瞬时改写
+    完全看不见——候选把 ATR 从 40.00 压到 5.07、成交 30 笔往返(诚实模板 0 成交),
+    结束时三个数组与原始行情逐值相同,五层全绿。
+
+    逐根核对之后,瞬时改写必须**撑过一根 K 线的处理**(它要影响下一次 ATR 计算,
+    就得在这根 K 线结束时仍然留在容器里),下一次核对必然露馅。
+    (只在**同一次**调用里改了又改回、不跨 K 线的写法,影响不到受保护的 ATR——
+    ATR 是在 `entry_signal` 之前算好的;能影响的只有候选自己本来就能决定的信号。)
+
+    口径同终态核对:基准在 `on_init` 之前拍;`warmup` 是引擎 `load_bar` 实际交出的预热 K 线;
+    `history` 是回放的 K 线。回放根数(累计根数 - 基准)恰等于合法喂入根数时逐值比尾部,
+    否则(分钟族合成日线、日线族丢弃不完整的日线)只核对"每个取值都真实出现过"。
+    首次发现问题之后锁存,不再重复报。"""
+
+    def __init__(self, strategy: object, baseline: dict | None, warmup, history) -> None:
+        import numpy as np
+
+        self._np = np
+        self._strategy = strategy
+        self._am = getattr(strategy, "am", None)
+        warmup = list(warmup)
+        self._k = len(warmup)
+        self._dead = self._am is None
+        if self._dead:
+            return
+        feed = warmup + list(history)
+        baseline = baseline or {}
+        self._base_count = int(baseline.get("count", 0) or 0)
+        base_values = baseline.get("values") or {}
+        size = getattr(self._am, "size", None)
+        self._size = size if isinstance(size, int) else 0
+        self._fields: list[str] = []
+        self._buf: dict = {}
+        self._pool: dict = {}
+        for array_name, field in _PRICE_ARRAY_FIELDS:
+            if getattr(self._am, array_name, None) is None:
+                continue
+            values = np.array([float(getattr(bar, field, 0.0)) for bar in feed], dtype=float)
+            extra = np.array(sorted(base_values.get(array_name) or ()), dtype=float)
+            self._fields.append(array_name)
+            self._buf[array_name] = values
+            self._pool[array_name] = np.unique(np.concatenate([values, extra]))
+
+    def step(self) -> list[str]:
+        """引擎又处理完一根 K 线之后调用;返回这一次的发现(首次之后恒为空)。"""
+        if self._dead:
+            return []
+        self._k += 1
+        try:
+            findings = self._check()
+        except Exception as exc:                                # noqa: BLE001 - 核对自己出错也是失败
+            findings = [f"行情容器的逐根核对自己出错了(fail-closed): {type(exc).__name__}"]
+        if findings:
+            self._dead = True
+        return findings
+
+    def _check(self) -> list[str]:
+        np = self._np
+        am = getattr(self._strategy, "am", None)
+        if am is not self._am:
+            return ["行情容器在回测途中被换成了另一个对象"]
+        count = getattr(am, "count", None)
+        if not isinstance(count, int):
+            return []
+        replayed = count - self._base_count
+        k = self._k
+        if replayed > k:
+            return [f"行情容器里回放阶段累计了 {replayed} 根 K 线,而引擎只喂了 {k} 根(有 K 线是凭空来的)"]
+        window = min(self._size, k)
+        exact = replayed == k and window > 0
+        findings: list[str] = []
+        for array_name in self._fields:
+            array = np.asarray(getattr(am, array_name, None), dtype=float)
+            if exact:
+                if not np.array_equal(array[-window:], self._buf[array_name][k - window:k]):
+                    findings.append(
+                        f"第 {k} 根 K 线之后,行情容器的 {array_name} 与引擎喂进来的对不上"
+                        "(有人在回测途中改写了行情数据)")
+            elif not np.isin(array, self._pool[array_name]).all():
+                findings.append(
+                    f"第 {k} 根 K 线之后,行情容器的 {array_name} 里出现了引擎没喂过的取值"
+                    "(有人在回测途中改写了行情数据)")
+        return findings

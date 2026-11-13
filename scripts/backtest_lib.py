@@ -75,7 +75,8 @@ def run_engine(
     _raise_if_strategy_failed(messages)
     _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
                                bars=_market_feed(_market, engine),
-                               market_baseline=_market.get("market"))
+                               market_baseline=_market.get("market"),
+                               market_findings=_market["findings"])
     return engine
 
 
@@ -135,7 +136,8 @@ def run_engine_bars(
     _raise_if_strategy_failed(messages)
     _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
                                bars=_market_feed(_market, engine),
-                               market_baseline=_market.get("market"))
+                               market_baseline=_market.get("market"),
+                               market_findings=_market["findings"])
     return engine
 
 
@@ -151,7 +153,8 @@ def _install_market_baseline(engine) -> dict:
     把**引擎实际交出去的**预热 K 线记下来,与回放的 K 线一起当作"合法喂入"。"""
     from risk import constitution as const
 
-    holder: dict = {"warmup": [], "market": const.snapshot_market_data(engine.strategy)}
+    holder: dict = {"warmup": [], "market": const.snapshot_market_data(engine.strategy),
+                    "findings": [], "watch": None}
     original = engine.load_bar
 
     def load_bar_recording(*args, **kwargs):
@@ -163,6 +166,20 @@ def _install_market_baseline(engine) -> dict:
         return result
 
     engine.load_bar = load_bar_recording
+
+    # 逐根核对(第 13 轮 codex 的 Critical 1):包住 `new_bar`,每处理完一根 K 线核对一次行情容器。
+    # 只在结束时核对末态,"改 -> 用 -> 改回"的瞬时改写就看不见。
+    # 观察器第一次回放时才建:此时预热已结束、`history_data` 已就绪。
+    original_new_bar = engine.new_bar
+
+    def new_bar_watched(data):
+        if holder["watch"] is None:
+            holder["watch"] = const.MarketDataWatch(
+                engine.strategy, holder["market"], holder["warmup"], engine.history_data)
+        original_new_bar(data)
+        holder["findings"].extend(holder["watch"].step())
+
+    engine.new_bar = new_bar_watched
     return holder
 
 
@@ -187,7 +204,8 @@ def _protected_state_snapshot() -> dict:
 
 def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float,
                                protected_before: dict | None = None,
-                               bars=None, market_baseline: dict | None = None) -> None:
+                               bars=None, market_baseline: dict | None = None,
+                               market_findings: list | None = None) -> None:
     """回测跑完后核对风控底线还在(不可变宪法的运行时第三层)。
 
     静态筛查拦的是"写法",类校验拦的是"类字典"——两者都看不见**回测途中**
@@ -211,6 +229,7 @@ def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float,
         # 静态层按名字封,总有封不到的写法(视图、dunder 写入口、别名);
         # 第 12 轮 codex 的 High 1 实测那三条能把 ¥300 单笔风险预算架空。
         findings.extend(const.check_market_data_integrity(strategy, bars, market_baseline))
+    findings.extend(market_findings or [])           # 逐根核对攒下的发现
     if findings:
         raise RuntimeError("风控底线在回测途中被改写(fail-closed):" + "; ".join(findings))
 

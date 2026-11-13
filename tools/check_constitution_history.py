@@ -600,6 +600,9 @@ def _call_scope(tree: ast.AST, node: ast.Call) -> ast.AST | None:
             self.stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
+        # lambda 也是作用域(第 13 轮 codex 的 High 2):把比对挪进 `lambda: ...` 它就永远不会执行,
+        # 而原先的 _call_scope 认不出 lambda,把它当成外层函数的一部分。
+        visit_Lambda = visit_FunctionDef
 
         def visit_Call(self, node: ast.Call) -> None:
             if node is target:
@@ -665,6 +668,107 @@ def _defined_names(tree: ast.AST) -> set[str]:
     return names
 
 
+# 只"累积"、不"决策"的方法名:`findings.extend(...)` 本身不算用掉了结论。
+_ACCUMULATE_ATTRS = ("extend", "append", "add", "update", "insert")
+
+
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+def _name_is_consumed(scope: ast.AST, name: str, parents: dict) -> bool:
+    """`name` 在 `scope` 里是否被**读取**过(只给它 extend/append 不算读取)。"""
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
+            parent = parents.get(node)
+            if isinstance(parent, ast.Attribute) and parent.value is node                     and parent.attr in _ACCUMULATE_ATTRS:
+                continue
+            return True
+    return False
+
+
+def _result_is_used(tree: ast.AST, call: ast.Call, scope: ast.AST | None) -> bool:
+    """`check_protected_state(...)` 的**结论**有没有流向决策。
+
+    第 13 轮 codex 的 High 1:`_ = const.check_protected_state(before, const.snapshot_protected_state())`
+    调用形态完全对,守卫 exit 0,而比对的结论被扔掉——第四层静默死亡。
+    所以"调用了"不够,结论必须被用掉:作为返回值/条件/实参,或存进一个之后被读取的名字。
+    (这是形态层面的近似——更彻底的"结论必须导致拒绝"靠回归测试里的端到端用例守。)"""
+    parents = _parent_map(tree)
+    parent = parents.get(call)
+    target_scope = scope if scope is not None else tree
+    if isinstance(parent, ast.Expr):
+        return False                                     # 整条语句只为调用,结论被丢弃
+    if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+        targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if names:
+            if all(not name.strip("_") for name in names):
+                return False                             # `_ = ...`:明确丢弃
+            return any(_name_is_consumed(target_scope, name, parents) for name in names)
+        return True
+    if isinstance(parent, ast.Call):
+        func = parent.func
+        if isinstance(func, ast.Attribute) and func.attr in _ACCUMULATE_ATTRS                 and isinstance(func.value, ast.Name):
+            return _name_is_consumed(target_scope, func.value.id, parents)
+        return True
+    return True
+
+
+def _check_call_problems(rel: str, tree: ast.AST, call: ast.Call, snapshot_calls: list,
+                         called_names: set | None) -> list[str]:
+    """对**一个** `check_protected_state(...)` 调用点做形态核对(注册表与执行入口共用)。
+
+    `called_names` 为 None 表示不要求"所在函数在仓库里被调用过"
+    (执行入口自己就是入口,没有调用方)。"""
+    problems: list[str] = []
+    if len(call.args) < 2:
+        problems.append(
+            f"{rel} 里 check_protected_state 只给了 {len(call.args)} 个实参:"
+            "指纹比对需要前后两张快照")
+        return problems
+    if ast.dump(call.args[0]) == ast.dump(call.args[1]):
+        problems.append(
+            f"{rel} 里 check_protected_state 的两个实参是同一个对象"
+            "(自己比自己,比对必然通过)")
+    # 第二个实参必须是一次 snapshot_protected_state() 调用本身:
+    # `dict(snapshot_protected_state())` 语法不同、语义相同,比对必然通过
+    # (第 12 轮 codex 的 High 2 / A2')。
+    if not _is_snapshot_call(call.args[1]):
+        problems.append(
+            f"{rel} 里 check_protected_state 的第二个实参"
+            "不是一次 snapshot_protected_state() 调用"
+            "(指纹必须与**新拍**的快照比对,拿拷贝或旧变量比对必然通过)")
+    scope = _call_scope(tree, call)
+    if isinstance(scope, ast.Lambda):
+        problems.append(
+            f"{rel} 里第四层的比对在 lambda 里(第 {call.lineno} 行):"
+            "lambda 不会被调用,比对永远不会执行")
+        return problems
+    # 结论必须被用掉(第 13 轮 codex 的 High 1)
+    if not _result_is_used(tree, call, scope):
+        problems.append(
+            f"{rel} 第 {call.lineno} 行 check_protected_state 的结论被丢弃了"
+            "(`_ = ...` 或单独一条语句):比对做了也等于没做,第四层静默失效")
+    # 调用点必须在**取快照的同一个函数体**里,且那个函数得有人叫
+    # (第 12 轮 codex 的 High 2 / A3:挪进一个从不被调用的函数)。
+    if scope is not None:
+        same_scope = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
+        if not same_scope:
+            problems.append(
+                f"{rel} 里第四层的比对在 {scope.name} 里,"
+                "而取快照不在同一个函数体里(快照与比对必须成对出现)")
+        if called_names is not None and scope.name not in called_names:
+            problems.append(
+                f"{rel} 里第四层的比对在 {scope.name} 里,"
+                "而这个函数在整个仓库里从没被调用过(第四层实际上不会执行)")
+    return problems
+
+
 def check_call_site_shape(root: Path) -> list[str]:
     """第四层的执行点必须是**真的调用**,而且调用形态对得上。
 
@@ -699,37 +803,7 @@ def check_call_site_shape(root: Path) -> list[str]:
                 snapshot_calls = _live_calls(tree, "snapshot_protected_state")
                 called_names = _called_names_in_repo(root)
                 for call in calls:
-                    if len(call.args) < 2:
-                        problems.append(
-                            f"{rel} 里 check_protected_state 只给了 {len(call.args)} 个实参:"
-                            "指纹比对需要前后两张快照")
-                        continue
-                    if ast.dump(call.args[0]) == ast.dump(call.args[1]):
-                        problems.append(
-                            f"{rel} 里 check_protected_state 的两个实参是同一个对象"
-                            "(自己比自己,比对必然通过)")
-                    # 第二个实参必须是一次 snapshot_protected_state() 调用本身:
-                    # `dict(snapshot_protected_state())` 语法不同、语义相同,比对必然通过
-                    # (第 12 轮 codex 的 High 2 / A2')。
-                    if not _is_snapshot_call(call.args[1]):
-                        problems.append(
-                            f"{rel} 里 check_protected_state 的第二个实参"
-                            "不是一次 snapshot_protected_state() 调用"
-                            "(指纹必须与**新拍**的快照比对,拿拷贝或旧变量比对必然通过)")
-                    # 调用点必须在**取快照的同一个函数体**里,且那个函数得有人叫
-                    # (第 12 轮 codex 的 High 2 / A3:挪进一个从不被调用的函数)。
-                    scope = _call_scope(tree, call)
-                    if scope is None:
-                        continue
-                    same_scope = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
-                    if not same_scope:
-                        problems.append(
-                            f"{rel} 里第四层的比对在 {scope.name} 里,"
-                            "而取快照不在同一个函数体里(快照与比对必须成对出现)")
-                    if scope.name not in called_names:
-                        problems.append(
-                            f"{rel} 里第四层的比对在 {scope.name} 里,"
-                            "而这个函数在整个仓库里从没被调用过(第四层实际上不会执行)")
+                    problems.extend(_check_call_problems(rel, tree, call, snapshot_calls, called_names))
     return problems
 
 
@@ -809,6 +883,26 @@ def _is_candidate_executor(tree: ast.AST) -> bool:
     return False
 
 
+def _primitive_executor_calls(tree: ast.AST) -> list[ast.Call]:
+    """真正**执行代码**的原语调用:裸 `exec/eval/compile` 与属性形式的动态求值/导入/运行脚本。
+
+    `safe_builtins` 与 `import_candidate` 不在此列——它们是"调用已受检的入口",
+    由入口自己(`research_api.import_candidate`)负责第四层。"""
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in ("exec", "eval", "compile"):
+            calls.append(node)
+        elif isinstance(func, ast.Attribute) and func.attr in _EXECUTOR_ATTR_CALLS:
+            receiver = func.value
+            if isinstance(receiver, ast.Name) and receiver.id in _EXECUTOR_ATTR_SAFE_RECEIVERS:
+                continue
+            calls.append(node)
+    return calls
+
+
 def check_executor_completeness(root: Path) -> list[str]:
     """**完备性检查**:谁执行候选,谁就必须走第四层(快照 + 指纹比对)。
 
@@ -837,8 +931,40 @@ def check_executor_completeness(root: Path) -> list[str]:
     # 第 12 轮 codex 的 High 2 / A5:在注释里写上这两个名字就能冒充"已覆盖")。
     covered = set()
     for rel, tree in trees.items():
-        if _live_calls(tree, "snapshot_protected_state") and _live_calls(tree, "check_protected_state"):
+        snapshot_calls = _live_calls(tree, "snapshot_protected_state")
+        check_calls = _live_calls(tree, "check_protected_state")
+        if snapshot_calls and check_calls:
             covered.add(rel)
+
+    # 第 13 轮 codex 的 High 3:光是"文件里出现过那两个调用"不够——
+    # 新执行入口可以只在一个**从不被调用的函数**里放上它们(名义覆盖),而 `exec` 在另一处裸奔。
+    # 所以对每个**原语执行调用**,要求它所在的**同一个函数体**里自己成对取快照并比对,
+    # 且每个比对调用点都过形态核对(结论被用掉、第二个实参是新拍快照、不在 lambda 里)。
+    # 不要求"所在函数被仓库调用过":执行入口自己就是入口,没有调用方。
+    for rel, tree in trees.items():
+        if rel in _EXECUTOR_SKIP_FILES or rel not in covered:
+            continue
+        primitives = _primitive_executor_calls(tree)
+        if not primitives:
+            continue
+        snapshot_calls = _live_calls(tree, "snapshot_protected_state")
+        check_calls = _live_calls(tree, "check_protected_state")
+        for call in check_calls:
+            for problem in _check_call_problems(rel, tree, call, snapshot_calls, None):
+                problems.append(problem)
+        for call in primitives:
+            scope = _call_scope(tree, call)
+            if scope is None or isinstance(scope, ast.Lambda):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行在函数体之外(或 lambda 里)执行代码:"
+                    "执行点必须在一个自己走第四层的函数里")
+                continue
+            in_scope_snapshot = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
+            in_scope_check = [c for c in check_calls if _call_scope(tree, c) is scope]
+            if not in_scope_snapshot or not in_scope_check:
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码的函数 {scope.name} 里"
+                    "没有自己成对取快照并比对(第四层挂在别的函数上,执行点本身裸奔)")
 
     # 模块名 → 文件路径(`scripts.research_api` → `scripts/research_api.py`)
     module_to_rel = {rel[:-3].replace("/", "."): rel for rel in sources}
