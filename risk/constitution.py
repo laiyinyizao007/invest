@@ -39,6 +39,7 @@ import dataclasses
 import importlib
 import json
 import re
+import sys
 from pathlib import Path
 
 CONSTITUTION_FILE = Path(__file__).resolve().parents[1] / "config" / "immutable_constitution.json"
@@ -136,8 +137,19 @@ BUILTIN_FORBIDDEN_ORDER_CALLS = (
 )
 
 # 候选不得改写的模块级风控函数/类(防止绕过预算与熔断)
+#
+# 第 9 轮 codex 实测的 Critical 1:`within_budget` 只是把算术**委托**给 `risk_per_trade`,
+# 而 `risk_per_trade` 此前根本不在名单里——候选三行就能架空 300 元单笔预算:
+#     import risk.risk_guard as rg
+#     rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+# 实测 skipped_by_budget 326 → 0、单笔止损 2901 元(预算的 9.7 倍),而四层防线全部放行。
+# 同样被漏掉的还有熔断器的判定方法(`DailyLossGuard.can_open`)与移动止损的更新方法
+# (`TrailingStop.update`):类名在名单里,方法名不在——所以判定必须**按整条属性路径**,
+# 不能只看末段(末段是 `can_open`/`update` 这种看不出危险的名字)。
 BUILTIN_PROTECTED_MODULE_ATTRS = (
-    "within_budget", "stop_distance", "DailyLossGuard", "TrailingStop", "ceil_to", "floor_to",
+    "within_budget", "stop_distance", "risk_per_trade", "ceil_to", "floor_to",
+    "DailyLossGuard", "TrailingStop",
+    "can_open", "on_trade_closed", "reset",
 )
 
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
@@ -161,6 +173,11 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     "__globals__", "__code__", "__func__", "__self__", "__closure__",
     "__reduce__", "__reduce_ex__", "__getnewargs__", "__getstate__", "__setstate__",
     "__del__", "__mro_entries__",
+    # ③ 构造期(`__new__` 在实例构造时执行,**早于**回测前的快照:
+    #    它里面的改写会被当成"基线",运行期第三层结构性地看不见。
+    #    候选没有正当理由自定义 `__new__`(模板也没有),直接禁掉。
+    #    ——第 9 轮 codex 实测:定义 `__new__` 三层全放行。
+    "__new__",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -423,13 +440,24 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
       而 `guard`/`cta_engine`/`am` 才是"装着风控判定的那些对象"。
     - 不限根:只认 `self.` 开头的话,`s = self` 之后的 `s.risk_budget = 1e12`
       会从静态层溜过去(第 8 轮自查实测)。
+    - 受保护的**模块级**名字也算:第 9 轮 codex 实测 `rg.DailyLossGuard.can_open = ...`
+      这类改写(路径中间的类名才是要害,末段 `can_open` 看不出来)。
+    - 根解析不出来时(`type(cls).risk_budget = 1e12`,路径遇到调用表达式就断了)
+      至少按**末段属性名**判一次,别让"根不是名字"变成免死金牌(第 9 轮实测)。
     """
     path = _attr_path(target)
-    if not path:
+    if path:
+        for index, segment in enumerate(path):
+            if (segment in c.protected_names or segment in c.protected_parameters
+                    or segment in c.protected_module_attrs):
+                return ".".join(path[index:])
         return None
-    for index, segment in enumerate(path):
-        if segment in c.protected_names or segment in c.protected_parameters:
-            return ".".join(path[index:])
+    # 路径断在调用表达式上:退回按末段属性名判
+    if isinstance(target, ast.Attribute):
+        attr = target.attr
+        if (attr in c.protected_names or attr in c.protected_parameters
+                or attr in c.protected_module_attrs):
+            return attr
     return None
 
 
@@ -803,6 +831,124 @@ def check_instance_state(strategy: object, template: type | None = None, c: Cons
             findings.append(
                 f"合约乘数被改写: {size!r} != 回测设置的 {expected_size!r}"
                 "(止损距离算出来的风险金额会随之失真)")
+    return findings
+
+
+# ---------- 运行期第四层:受保护模块与模板类的"身份指纹" ----------
+
+# 这些包里的东西都是候选够得着的改写目标:
+#   risk.*            —— 风控模块(架空预算与熔断)
+#   strategies.*      —— 策略模板(改掉方法、参数表、乘数)
+#   vnpy_ctastrategy  —— CTA 框架本身(改掉回测引擎与按名 setter)
+#
+# 第 9 轮 codex 实测的 Critical 1 正是这一类:候选三行 monkey-patch 就能架空 300 元预算,
+# 而静态层/沙盒层/check_class/check_instance_state **四层全部放行**。
+# 结论与第 7 轮一样:**黑名单封的是"已知写法",封不住"能力"**。
+# 与其继续枚举写法(别名、`type(cls)`、`sys.modules`……),不如**事后比对身份**:
+# 不管候选用哪种写法把 `rg.risk_per_trade` 换掉了,指纹就对不上。
+PROTECTED_RUNTIME_PACKAGES = ("risk", "strategies", "vnpy_ctastrategy")
+
+# 候选执行前必须**先**导入的模块:否则模板模块是候选自己 import 的,
+# 快照里根本没有它,候选在导入期把它改写了也拍不到(第 9 轮 codex 实测)。
+_PROTECTED_PRELOAD_MODULES = (
+    "vnpy_ctastrategy",
+    "vnpy_ctastrategy.template",
+    "vnpy_ctastrategy.backtesting",
+    "vnpy_ctastrategy.engine",
+)
+
+
+def _preload_protected_modules() -> None:
+    """把模板与框架模块先导入进来(导入失败不阻断,指纹里没有它就说明它没被用)。"""
+    modules = list(_PROTECTED_PRELOAD_MODULES)
+    for spec in BUILTIN_ALLOWED_TEMPLATES:
+        modules.append(spec.split(":")[0])
+    for name in modules:
+        try:
+            importlib.import_module(name)
+        except Exception:                                       # noqa: BLE001 - 导不进来就不纳入指纹
+            continue
+
+
+def _protected_fingerprint_value(value: object) -> tuple[str, object]:
+    """把受保护对象的值转成"可比对的指纹"。
+
+    容器(list/dict/set)取**副本**:候选在**原地**改模板的 `parameters` 列表时,
+    对象身份不变,只比身份会漏掉。函数与类比身份(被换掉就是被换掉)。"""
+    if isinstance(value, list):
+        return ("seq", tuple(value))
+    if isinstance(value, tuple):
+        return ("seq", tuple(value))
+    if isinstance(value, dict):
+        return ("map", dict(value))
+    if isinstance(value, (set, frozenset)):
+        return ("set", set(value))
+    return ("id", value)
+
+
+def _protected_values_same(before: tuple[str, object], after: tuple[str, object]) -> bool:
+    if before[0] != after[0]:
+        return False
+    if before[0] == "id":
+        return before[1] is after[1]
+    try:
+        return bool(before[1] == after[1])
+    except Exception:                                           # noqa: BLE001 - 比不了就当被改过(fail-closed)
+        return False
+
+
+def snapshot_protected_state() -> dict[str, tuple[str, object]]:
+    """给受保护的模块与类拍一张**身份指纹**。
+
+    覆盖:受保护包下**所有已加载模块**的公开属性,以及其中每个**类**的成员。
+    模板类(`TrendAtr15mStrategy.get_size` 等)与风控模块(`risk_per_trade` 等)都在里面。"""
+    _preload_protected_modules()
+    snapshot: dict[str, tuple[str, object]] = {}
+    for name, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        if name.split(".")[0] not in PROTECTED_RUNTIME_PACKAGES:
+            continue
+        for attr, value in list(vars(module).items()):
+            if attr.startswith("__") and attr.endswith("__"):
+                continue
+            snapshot[f"{name}.{attr}"] = _protected_fingerprint_value(value)
+            if isinstance(value, type):
+                for member, member_value in list(vars(value).items()):
+                    if member.startswith("__") and member.endswith("__"):
+                        continue
+                    snapshot[f"{name}.{attr}.{member}"] = _protected_fingerprint_value(member_value)
+    return snapshot
+
+
+def check_protected_state(before: dict, after: dict) -> list[str]:
+    """比对两张身份指纹:被替换、被删除或被塞进新成员的受保护对象一律报出来(fail-closed)。
+
+    这是运行期第四层,补的是"候选在导入期/回测途中改写框架对象"这条路——
+    静态层只按名字判断,拦不住别名与"根不是名字"的写法。
+
+    "新增"只对**类成员**报:新导入一个模块不算越权(候选偶尔会 import 别的策略模块),
+    但往受保护的类上挂一个新成员(`TrendAtr15mStrategy.get_size = ...` 之前没有这个键)
+    正是第 9 轮 codex 实测的改写模板类的手法。"""
+    findings: list[str] = []
+    for key, old in sorted(before.items()):
+        if key not in after:
+            findings.append(f"受保护对象 {key} 被删除")
+            continue
+        if not _protected_values_same(old, after[key]):
+            findings.append(f"受保护对象 {key} 被改写")
+    for key in sorted(after):
+        if key in before:
+            continue
+        # 只报"往**已存在**的类上挂新成员"(父键在 before 里)。
+        # 候选导入一个新模块/新类不算越权(候选偶尔会 import 别的策略模块),
+        # 而 `TrendAtr15mStrategy.get_size = ...` 的父键
+        # `...TrendAtr15mStrategy` 在 before 里——正是第 9 轮 codex 实测的改写手法。
+        parent = key.rsplit(".", 1)[0]
+        # parent 还得**本身是类**(before 里它的指纹是 ("id", <class>)):
+        # 否则候选导入一个新模块(`strategies.foo`)会被误判成"往受保护对象上挂东西"。
+        if parent in before and before[parent][0] == "id" and isinstance(before[parent][1], type):
+            findings.append(f"受保护对象 {key} 被新增")
     return findings
 
 

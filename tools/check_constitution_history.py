@@ -53,6 +53,10 @@ BUILTIN_SETS = (
     "BUILTIN_PROTECTED_STATE_OBJECTS",
     "BUILTIN_PROTECTED_PATHS",
     "BUILTIN_PROTECTED_CONTAINERS",
+    # 运行期第四层(身份指纹)的覆盖范围:这三个包里的模块与类成员不许被候选改写。
+    # 少一个包 = 那一个包里的对象不再受指纹保护,所以它同样"只能增不能减"。
+    "PROTECTED_RUNTIME_PACKAGES",
+    "_PROTECTED_PRELOAD_MODULES",
 )
 
 # 同为"白名单"语义的内置常量:只减不增。
@@ -189,6 +193,20 @@ def constant_usage_counts(source: str, names) -> dict[str, int]:
     return counts
 
 
+def usage_regressions_from_counts(current_counts: dict[str, int], older_source: str, names) -> dict[str, tuple[int, int]]:
+    """拿**已经数好的**当前引用次数去比:只解析历史源码那一份。
+
+    第 9 轮 codex 指出这里把同一份当前源码重复解析了很多遍(每个历史版本解析一次)。
+    引用次数的语义没变,只是把重复的解析去掉。"""
+    tracked = list(names)
+    older_counts = constant_usage_counts(older_source, tracked)
+    regressions = {}
+    for name in tracked:
+        if older_counts.get(name, 0) > current_counts.get(name, 0):
+            regressions[name] = (older_counts[name], current_counts.get(name, 0))
+    return regressions
+
+
 def usage_regressions(current_source: str, older_source: str, names) -> dict[str, tuple[int, int]]:
     """引用次数减少的名字:{名字: (历史次数, 当前次数)}。
 
@@ -196,12 +214,7 @@ def usage_regressions(current_source: str, older_source: str, names) -> dict[str
     完全失效,而失效时没有任何测试会报警。"""
     tracked = list(names)
     current_counts = constant_usage_counts(current_source, tracked)
-    older_counts = constant_usage_counts(older_source, tracked)
-    regressions = {}
-    for name in tracked:
-        if older_counts.get(name, 0) > current_counts.get(name, 0):
-            regressions[name] = (older_counts[name], current_counts.get(name, 0))
-    return regressions
+    return usage_regressions_from_counts(current_counts, older_source, tracked)
 
 
 def shrink_only_additions(current: set[str], older: set[str]) -> set[str]:
@@ -225,13 +238,15 @@ def check_protected_usage(root: Path) -> list[str]:
             tracked = list(names)
         if not tracked:
             continue
+        # 当前源码的引用次数只数一遍(第 9 轮 codex:此前每个历史版本都重新解析一次)
+        current_counts = constant_usage_counts(current_source, tracked)
         commits = _commits_touching(root, rel)
         for rev in commits:
             older_source = _read_at(root, rev, rel)
             if older_source is None:
                 continue
-            for name, (older_count, current_count) in usage_regressions(
-                    current_source, older_source, tracked).items():
+            for name, (older_count, current_count) in usage_regressions_from_counts(
+                    current_counts, older_source, tracked).items():
                 problems.append(
                     f"{rel} 里的 {name} 的引用次数从 {older_count} 降到 {current_count}"
                     f"(提交 {rev[:8]}):常量还在但底线的执行点被删了(只能增不能减)")

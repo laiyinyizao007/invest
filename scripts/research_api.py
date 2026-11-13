@@ -364,12 +364,23 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
     # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
     module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"])
+    # 运行期第四层:候选执行**前后**各拍一张"受保护对象身份指纹"。
+    # 静态层按名字判断,拦不住"换个写法"改写框架对象——第 9 轮 codex 实测:
+    # `import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`
+    # 三行就架空 300 元单笔预算,而四层防线全部放行。指纹比对不看写法,只看结果:
+    # 不管候选用哪种写法(rg 直接改、别名改、type(cls) 改),换了对象就对不上。
+    protected_before = const.snapshot_protected_state()
     try:
         exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
         raise CandidateError(describe_error(exc)) from exc
+    protected_after = const.snapshot_protected_state()
+    tampered = const.check_protected_state(protected_before, protected_after)
+    if tampered:
+        raise JobError(EXIT_REFUSED, "候选在导入期改写了受保护的框架对象:"
+                       + chr(10) + "  " + (chr(10) + "  ").join(tampered))
     from vnpy_ctastrategy import CtaTemplate
     candidate = getattr(module, cls_name, None)
     if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):

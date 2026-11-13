@@ -382,6 +382,104 @@ vn.py 的 `ArrayManager` 里 `close` 是 **property**,返回的就是 `close_arr
    改成 `if name in BUILTIN_FORBIDDEN_DUNDERS or True:` 之类的同义改写仍可能躲开计数。
    语义级的守卫需要把执行点本身登记成受保护常量(下一步)。
 
+### 第 9 轮补记:模块级改写、`__new__`、以及运行期第四层(身份指纹)
+
+第 9 轮(codex CLI 深度分析,**34/50,需改进,不建议发布**)报出一条 **Critical** 与若干 High/Medium/Low。
+与前几轮不同的是:这一条**四层防线全部放行**,而且绕开的是"整条属性路径判定"本身——
+
+```python
+import risk.risk_guard as rg
+rg.risk_per_trade = lambda *a, **k: 0.0     # 单笔风险恒为 0 → 300 元预算形同虚设
+```
+
+第 8 轮刚加的"整条属性路径"规则在这里**不起作用**,原因有两个:
+其一,静态层判的是"候选**自己**的源码里出现了受保护成员的路径",
+而这里被改的是**模块对象上的属性**——路径是 `rg.risk_per_trade`,
+`rg` 是候选自己起的别名,静态层无从知道它指向 `risk.risk_guard`;
+其二,`risk_per_trade` 这个名字本身**不在**任何受保护名单里(受保护的是方法与状态对象),
+第 8 轮新增的 `BUILTIN_PROTECTED_MODULE_ATTRS` 正是为这条补上的。
+
+即便补了名单,写法一换就又漏:`rg.risk_per_trade = …`、`import risk.risk_guard as rg` 后赋值、
+`type(cls).risk_budget = …`(路径的根是**调用表达式**,路径解析在那一段断掉)、
+`sys.modules["risk.risk_guard"].risk_per_trade = …`……
+**枚举写法是枚举不完的**。这与第 7 轮的结论一致:**黑名单封的是"已知写法",封不住"能力"**。
+
+#### Critical 1 的处理:运行期第四层——受保护对象的身份指纹
+
+不再枚举写法,改为**事后比对身份**:
+
+```python
+PROTECTED_RUNTIME_PACKAGES = ("risk", "strategies", "vnpy_ctastrategy")
+
+before = snapshot_protected_state()   # 候选执行前
+exec(candidate_code, module.__dict__)
+after  = snapshot_protected_state()   # 候选执行后
+tampered = check_protected_state(before, after)   # 被替换/被删除/被新增 → fail-closed
+```
+
+指纹覆盖**三个受保护包下所有已加载模块的公开属性**,以及其中**每个类的成员**;
+容器(list/dict/set)取**副本**比对,函数与类比**身份**。
+于是不管候选用哪种写法(`rg` 直接改、别名改、`type(cls)` 改、`sys.modules` 改),
+只要换了对象就对不上——**写法不再重要,结果才重要**。
+
+接点有三处:
+- `scripts/research_api.py::import_candidate`:候选**导入期**前后各拍一张;
+- `scripts/backtest_lib.py`:两条回测入口(`run_engine` / `run_engine_bars`)在
+  `engine.add_strategy(...)` **之后**拍基线,回测**结束后**再拍一张——
+  回测途中才发生的改写(第 8 轮第三层看的是实例状态,这一层看的是框架对象)同样能抓住。
+
+**快照必须覆盖到模板模块**:模板是候选自己 import 的,
+若在候选 import 之后才拍快照,快照里根本没有它,候选在导入期把它改写了也拍不到。
+所以 `_preload_protected_modules()` 在拍快照**之前**先导入
+`vnpy_ctastrategy`(`template`/`backtesting`/`engine`)与模板模块本身。
+这一条是 codex 实测出来的:不预加载时,候选改写模板类**完全不被记录**。
+
+#### High 3:`__new__` 早于快照,构造期改写结构性不可见
+
+`__new__` 在**实例构造时**执行,早于回测前的快照——
+它里面的改写会被当成"基线",运行期第三层(比对实例状态)**结构性地看不见**。
+第 9 轮 codex 实测:候选定义 `__new__` 并在里面改 `risk_budget`,三层防线全部放行。
+候选没有任何正当理由自定义 `__new__`(模板也没有),所以直接**禁掉**:
+`__new__` 加入 `BUILTIN_FORBIDDEN_DUNDERS`(不得定义、引用或调用)。
+
+#### 其余发现(同轮)
+
+- **High 3——ADR 保留字表漏项**:表里没列"受保护模块级成员""受保护容器"
+  "运行期受保护包",`__new__` 也漏了,而表是候选作者**唯一的查处**——
+  漏了就等于没有。已补齐,并把 `tests/test_research_sandbox.py` 里的
+  `listed()` 扩展到**全部**宪法名单(`BUILTIN_PROTECTED_NAMES` 整组、
+  `BUILTIN_PROTECTED_MODULE_ATTRS`、`BUILTIN_PROTECTED_CONTAINERS`、
+  `BUILTIN_PROTECTED_PATHS`、`BUILTIN_PROTECTED_ENTRY_POINTS`、
+  `BUILTIN_PROTECTED_STATE_OBJECTS`、`PROTECTED_RUNTIME_PACKAGES`),
+  以后代码里加任何一个名字而表里没写,那条用例会当场红。
+- **Medium 5——候选能 import 风控包**:`risk` 整个包加入 `FORBIDDEN_MODULES`
+  (静态层与受限导入器同时生效)。候选没有正当理由 import 风控模块——
+  风控由基类固定,候选只写信号逻辑。
+  注意**不能**把 `strategies` 一并禁掉:候选本来就要
+  `from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 继承基类。
+- **Low 6——历史守卫重复解析**:守卫此前对**每个**历史版本都重新解析一遍当前源码
+  (引用次数统计),历史一长就是平方级的浪费。改为**当前源码只数一遍**,
+  新增 `usage_regressions_from_counts(current_counts, older_source, names)`,
+  `usage_regressions()` 保留为包装(它有测试在用)。
+- **新增登记**:第四层的覆盖范围(`PROTECTED_RUNTIME_PACKAGES`)与预加载清单
+  (`_PROTECTED_PRELOAD_MODULES`)已登记进 `tools/check_constitution_history.py` 的
+  `BUILTIN_SETS`——少一个包 = 那一个包不再受指纹保护,历史守卫会报出来。
+
+#### 第 9 轮之后仍然存在的残余缺口(如实记录)
+
+1. **指纹不是"内存证明"**:它比对的是**已加载模块**的属性与类成员。
+   候选若通过 `importlib`/`ctypes` 之类手段在别的命名空间里造一个"影子"对象,
+   指纹看不见——但那类模块本来就被禁用清单挡着(`importlib`/`ctypes` 均在 `FORBIDDEN_MODULES` 里),
+   且**它改不到真框架对象**,所以对底线的威胁有限。
+2. **指纹只覆盖三个包**:别的第三方库(数据源、日志、指标)不在范围内。
+   它们不承载风控判定,所以当前不构成底线风险;若将来引入承载风控的新包,
+   必须同时加进 `PROTECTED_RUNTIME_PACKAGES`(历史守卫会强制这一点)。
+3. **静态层仍然是纵深防御,不是安全边界**——真正的边界仍是容器隔离
+   (`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)与"运行前由人读过代码"。
+4. **守卫守的是"引用次数"与"集合内容",不是语义**:把一次检查改写成同义形式仍可能躲开计数;
+   `PROTECTED_RUNTIME_PACKAGES` 这种"多一项更严"的常量已登记,但语义级守卫仍未做。
+5. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -410,11 +508,14 @@ vn.py 的 `ArrayManager` 里 `close` 是 **property**,返回的就是 `close_arr
 | 类别 | 名字 | 出处 |
 |---|---|---|
 | 受保护参数(不得出现在设置字典、网格、字典键、关键字参数里) | `risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_PARAMETERS` |
-| 受保护成员(不得在类体里重写) | 见 `BUILTIN_PROTECTED_NAMES`(含 `on_trade`/`on_bar`/`_try_enter`/`guard`/`trail` 等) | `risk/constitution.py` |
-| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受保护成员(不得在类体里重写) | `guard`、`trail`、`am`、`bg`、`pending_dist`、`pending_entry`、`_stop_armed`、`atr_value`、`stop_price`、`entry_price`、`entry_dist`、`prev_pos`、`skipped_by_budget`、`trail_side`、`trail_extreme`、`trail_stop`、`is_live`、`state_consistent`、`cta_engine`、`__init__`、`on_bar`、`on_tick`、`on_init`、`on_start`、`on_stop`、`on_trade`、`on_order`、`on_stop_order`、`on_account_status`、`on_position`、`on_cancel_order`、`on_disconnect`、`_process_daily_bar`、`_manage_position`、`_try_enter`、`_send_entry`、`_place_protective_stop`、`_place_pending_entry`、`_stop_order_price`、`_ensure_protective_stop`、`_complete_stale_daily_bar`、`risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_NAMES` |
+| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__`、`__new__` | `BUILTIN_FORBIDDEN_DUNDERS` |
 | 受保护的**风控执行点**(不得引用,连取别名都不许) | `_try_enter`、`_send_entry`、`_manage_position`、`_place_protective_stop`、`_place_pending_entry`、`_process_daily_bar`、`_ensure_protective_stop`、`_stop_order_price`、`_complete_stale_daily_bar` | `BUILTIN_PROTECTED_ENTRY_POINTS` |
 | 受保护的**风控状态对象**(不得引用,连读都不许) | `guard`、`trail`、`cta_engine` | `BUILTIN_PROTECTED_STATE_OBJECTS` |
 | 受保护的**属性路径**(整条路径不得出现在源码里) | `am.array` | `BUILTIN_PROTECTED_PATHS` |
+| 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
+| 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
+| 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员) | `risk`、`strategies`、`vnpy_ctastrategy` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
@@ -422,7 +523,7 @@ vn.py 的 `ArrayManager` 里 `close` 是 **property**,返回的就是 `close_arr
 | 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
 | 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |
-| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator` | `research_sandbox.FORBIDDEN_MODULES` |
+| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator`、`risk` | `research_sandbox.FORBIDDEN_MODULES` |
 
 ### 哈希、筛查、编译、执行必须是同一份字节
 早先 `import_candidate` 用 `spec.loader.exec_module()` 载入候选:Python 默认的 `.pyc` 只比对源文件的 mtime 与大小,不确认字节码对应当前内容,于"人工批准的、算过哈希的、过了静态筛查的源码"和"实际执行的字节码"可以不是一回事;分开打开文件还留下 TOCTOU 窗口。现在只读一次字节,对同一份内容做完哈希、筛查、编译、执行(不再走 `SourceFileLoader`),`__pycache__` 里的旧字节码没有机会生效。

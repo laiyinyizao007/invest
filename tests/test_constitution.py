@@ -1079,3 +1079,182 @@ def test_the_shipped_manifest_has_the_new_fields():
     assert constitution.protected_state_objects
     assert "_send_entry" in constitution.protected_entry_points
     assert "guard" in constitution.protected_state_objects
+
+
+# ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)、__new__ 早于快照(High 2) ----------
+
+def test_patching_a_risk_guard_helper_is_rejected():
+    """`rg.risk_per_trade = lambda ...: 0.0` 直接架空单笔风险预算。
+
+    第 9 轮 codex 实测:这一行让 skipped_by_budget 从 326 变成 0、单笔止损算出 2901 元
+    (预算的 9.7 倍),而静态层/沙盒层/check_class/check_instance_state **四层全部放行**。
+    `risk_per_trade` 此前根本不在受保护的模块属性名单里——`within_budget` 只是把算术委托给它。"""
+    findings = screen('''
+import risk.risk_guard as rg
+
+rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+''')
+    assert findings, "模块级 monkey-patch 没被静态层拦下"
+    assert any("risk_per_trade" in f for f in findings)
+
+
+def test_patching_the_loss_breaker_class_is_rejected():
+    """`rg.DailyLossGuard.can_open = lambda self, day: True` 架空当日连亏熔断。
+
+    末段属性名是 `can_open`,不在受保护名单里;**受保护的是路径中间的 `DailyLossGuard`**,
+    所以必须按整条路径判,不能只看末段。"""
+    findings = screen('''
+import risk.risk_guard as rg
+
+rg.DailyLossGuard.can_open = lambda self, day: True
+''')
+    assert findings, "改写熔断器类没被静态层拦下"
+    assert any("DailyLossGuard" in f for f in findings)
+
+
+def test_patching_a_risk_guard_module_is_rejected_however_it_is_spelled():
+    """别名、深层路径都要拦:枚举写法封不住"能力",但能给出清楚的拒绝理由。"""
+    for source in (
+        '''
+import risk.risk_guard as rg
+rg.within_budget = lambda *a, **k: True
+''',
+        '''
+import risk.risk_guard
+risk.risk_guard.risk_per_trade = lambda *a, **k: 0.0
+''',
+        '''
+from risk import risk_guard
+risk_guard.TrailingStop.update = lambda *a, **k: 0.0
+''',
+    ):
+        findings = screen(source)
+        assert findings, source
+
+
+def test_a_write_whose_root_is_a_call_is_rejected():
+    """根不是可解析的名字时(`type(cls).risk_budget = 1e12`)也要按末段属性名判。
+
+    属性路径解析遇到调用表达式就断了,于是整条路径判不到——第 9 轮 codex 与本次自查
+    都实测到这一类放行。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        type(self).risk_budget = 1e12
+        return 0
+''')
+    assert findings, "根是调用表达式的写入没被拦下"
+    assert any("risk_budget" in f for f in findings)
+
+
+def test_defining_new_is_rejected():
+    """`__new__` 在实例构造时执行,**早于**回测前的快照:它里面的改写会被当成"基线"。
+
+    第 9 轮 codex 实测三层全放行。候选没有正当理由自定义 `__new__`,直接禁掉。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+''')
+    assert findings, "自定义 __new__ 没被拦下"
+    assert any("__new__" in f for f in findings)
+
+
+def test_referencing_new_is_rejected():
+    """引用 `__new__` 同样要拦:定义被拦了,拿别名再调用还在。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        obj = super().__new__(type(self))
+        return 0
+''')
+    assert findings and any("__new__" in f for f in findings)
+
+
+# ---------- 运行期第四层:受保护模块与模板类的"身份指纹" ----------
+
+def test_the_protected_state_covers_the_risk_guard_and_the_template():
+    """指纹必须覆盖风控模块**和**模板类:两者都是候选够得着的改写目标。"""
+    snapshot = const.snapshot_protected_state()
+    keys = " ".join(snapshot)
+    assert "risk_per_trade" in keys
+    assert "DailyLossGuard" in keys
+    assert "get_size" in keys, "模板类的方法不在指纹里"
+
+
+def test_an_untouched_protected_state_produces_no_findings():
+    before = const.snapshot_protected_state()
+    after = const.snapshot_protected_state()
+    assert const.check_protected_state(before, after) == []
+
+
+def test_the_protected_state_notices_a_patched_risk_helper():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.risk_per_trade
+    try:
+        rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写风控模块函数没被抓到"
+        assert any("risk_per_trade" in f for f in findings)
+    finally:
+        rg.risk_per_trade = original
+
+
+def test_the_protected_state_notices_a_patched_breaker_method():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.DailyLossGuard.can_open
+    try:
+        rg.DailyLossGuard.can_open = lambda self, day: True
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写熔断方法没被抓到"
+    finally:
+        rg.DailyLossGuard.can_open = original
+
+
+def test_the_protected_state_notices_a_patched_template_method():
+    """模板类被改写同样致命:`get_size` 改一下,风险金额算出来就不一样了。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    before = const.snapshot_protected_state()
+    original = TrendAtr15mStrategy.get_size
+    try:
+        TrendAtr15mStrategy.get_size = lambda self: 100
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写模板类方法没被抓到"
+        assert any("get_size" in f for f in findings)
+    finally:
+        TrendAtr15mStrategy.get_size = original
+
+
+def test_the_protected_state_notices_a_deleted_member():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.within_budget
+    try:
+        del rg.within_budget
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "删掉风控函数没被抓到"
+    finally:
+        rg.within_budget = original
+
+
+def test_the_protected_state_is_taken_before_the_candidate_imports_anything():
+    """子进程里候选执行前就要把模板模块**预先导入**并拍快照。
+
+    否则模板模块是候选自己 import 的,快照里根本没有它,候选在导入期把它改写了也抓不到。"""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys;"
+        "from risk import constitution as const;"
+        "snap = const.snapshot_protected_state();"
+        "print(any('get_size' in k for k in snap))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip().endswith("True"), out.stdout + out.stderr

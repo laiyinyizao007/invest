@@ -28,6 +28,14 @@ FORBIDDEN_MODULES = {
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
     "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
+    # 风控与框架包本身:候选拿到 `risk.risk_guard` 就等于拿到风控函数的**定义**,
+    # 改写它们(`rg.risk_per_trade = lambda ...: 0.0`)可以架空单笔预算,而静态层按
+    # "属性名"判断、只看得到 `rg.risk_per_trade` 这个**结果**,看不到它是谁。
+    # 第 9 轮 codex 实测:三行 monkey-patch 让四层防线全部放行。
+    # 候选没有任何正当理由 import 风控模块——风控由基类固定,候选只写信号逻辑。
+    # 注意**不能**把 `strategies` 一并禁掉:候选本来就要
+    # `from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 继承基类。
+    "risk",
 }
 # 这些名字**任何引用**都拦,不只直接调用:`s = setattr` 之后 `s(self, "risk_budget", 1e9)` 的调用点是裸名字,
 # AST 看不见被调的是谁。只拦调用等于给别名留了门。

@@ -1061,3 +1061,45 @@ def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
                                           "--segment", "train", "--params", "{}", "--sha256", new_sha])
     assert api.run_child(args) == api.EXIT_REFUSED
     assert "批准" in capsys.readouterr().err
+
+
+# ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)—— 运行期第四层 ----------
+
+def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(tree, monkeypatch):
+    """候选在导入期改写框架对象必须被拒。
+
+    第 9 轮 codex 实测:`import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`
+    三行就能架空 300 元单笔预算,而静态层/沙盒层/check_class/check_instance_state
+    **四层全部放行**。静态层现在按整条属性路径拦住了直白的写法,
+    但"换个写法"改不掉的是**身份**——运行期第四层比对导入前后的身份指纹。"""
+    path = tree / "pending_strategies" / "s.py"
+    # 这条写法静态层看不出来:`strategies` 是候选**必须**导入的包(继承基类),
+    # 静态层没有理由禁它;能抓住它的只有身份指纹(第四层)。
+    # 候选改写模板类的方法,与改写风控函数等价——模板方法正是风控判定的入口。
+    path.write_text(
+        "import strategies.trend_atr_15m_strategy as t\n"
+        "t.TrendAtr15mStrategy.get_size = lambda self: 10**9\n"
+        "from vnpy_ctastrategy import CtaTemplate\n"
+        "class S(CtaTemplate):\n"
+        "    pass\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "受保护的框架对象" in str(exc.value)
+
+
+def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monkeypatch):
+    """直白的写法静态层就该拦(整条属性路径判定,不再只看末段)。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(
+        "import risk.risk_guard as rg\n"
+        "rg.DailyLossGuard.can_open = lambda self, day: True\n"
+        "from vnpy_ctastrategy import CtaTemplate\n"
+        "class S(CtaTemplate):\n"
+        "    pass\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "静态筛查未通过" in str(exc.value)

@@ -62,13 +62,14 @@ def run_engine(
     )
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
+    _protected = _protected_state_snapshot()
     engine.load_data()
     if not engine.history_data:
         raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
-    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected)
     return engine
 
 
@@ -121,10 +122,11 @@ def run_engine_bars(
     )
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
+    _protected = _protected_state_snapshot()
     engine.history_data = list(bars)
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
-    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size)
+    _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected)
     return engine
 
 
@@ -135,7 +137,15 @@ def _risk_floor_snapshot(strategy) -> dict:
     return const.snapshot_instance_state(strategy)
 
 
-def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float) -> None:
+def _protected_state_snapshot() -> dict:
+    """回测开始前拍一张"受保护对象身份指纹"(运行时第四层的比对基准)。"""
+    from risk import constitution as const
+
+    return const.snapshot_protected_state()
+
+
+def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float,
+                               protected_before: dict | None = None) -> None:
     """回测跑完后核对风控底线还在(不可变宪法的运行时第三层)。
 
     静态筛查拦的是"写法",类校验拦的是"类字典"——两者都看不见**回测途中**
@@ -145,10 +155,15 @@ def _assert_risk_floor_intact(strategy, snapshot: dict, expected_size: float) ->
     这里在回测结束时核对:熔断阈值、合约乘数、风险预算必须与**回测开始时**一致。
 
     比的是快照而不是模板常量:研究脚本会用更大的 risk_budget 做敏感性实验
-    (`tests/test_strategy_backtest.py` 里就是),那是合法的;被改写的是"回测途中"。"""
+    (`tests/test_strategy_backtest.py` 里就是),那是合法的;被改写的是"回测途中"。
+
+    第四层查的是另一件事:候选在回测途中把**框架对象**换掉了(第 9 轮 codex 实测的
+    模块级 monkey-patch)——那不是实例状态,是整个风控模块被架空。"""
     from risk import constitution as const
 
     findings = const.check_instance_state(strategy, expected_size=expected_size, snapshot=snapshot)
+    if protected_before is not None:
+        findings.extend(const.check_protected_state(protected_before, const.snapshot_protected_state()))
     if findings:
         raise RuntimeError("风控底线在回测途中被改写(fail-closed):" + "; ".join(findings))
 

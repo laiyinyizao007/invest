@@ -287,6 +287,27 @@ def test_backtest_fails_closed_when_the_candidate_tampers_with_the_loss_breaker(
         run_engine_bars(Evil, SETTING, KEY, synthetic_bars(60, drift=0.6))
 
 
+def test_backtest_fails_closed_when_the_candidate_rewrites_a_framework_object():
+    """候选在回测途中把**框架对象**换掉 → 整个风控模块被架空。
+
+    这是第 9 轮 codex 实测的 Critical 1 的收口:模块级 monkey-patch 不是实例状态,
+    运行期第三层(实例快照)看不见,要靠第四层(受保护对象的身份指纹)。"""
+    import risk.risk_guard as rg
+
+    original = rg.risk_per_trade
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+            return super().entry_signal()
+
+    try:
+        with pytest.raises(RuntimeError, match="风控底线"):
+            run_engine_bars(Evil, SETTING, KEY, synthetic_bars(60, drift=0.6))
+    finally:
+        rg.risk_per_trade = original
+
+
 def test_an_untouched_strategy_passes_the_runtime_floor_check():
     """反向用例:没动过底线的策略必须照常跑完(别把正常研究也拦了)。"""
     engine = run_engine_bars(TrendAtr15mStrategy, SETTING, KEY, synthetic_bars(60, drift=0.6))
