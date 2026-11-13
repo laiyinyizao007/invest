@@ -227,7 +227,7 @@ class RevealStore:
                 raise OutwardError("揭示存档超过大小上限")
             view = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise OutwardError(f"揭示存档损坏(fail-closed): {exc}") from exc
+            raise OutwardError(f"揭示存档损坏(fail-closed): {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
         if not validate_view(view):
             raise OutwardError("揭示存档不合法(fail-closed)")
         return view
@@ -248,7 +248,7 @@ class RevealStore:
                 os.fsync(stream.fileno())
             os.replace(tmp, path)
         except (OSError, ValueError) as exc:
-            raise OutwardError(f"揭示存档写入失败: {exc}") from exc
+            raise OutwardError(f"揭示存档写入失败: {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
 
 
 def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: bool = True) -> dict | None:

@@ -77,7 +77,7 @@ class Ladder:
         try:
             state = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise LadderError(f"梯子状态损坏或无法读取(fail-closed): {exc}") from exc
+            raise LadderError(f"梯子状态损坏或无法读取(fail-closed): {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
         self._validate(state)
         return state
 
@@ -115,7 +115,7 @@ class Ladder:
                 os.fsync(stream.fileno())
             os.replace(tmp, self.path)
         except OSError as exc:
-            raise LadderError(f"梯子状态写入失败(fail-closed,不放出汇报值): {exc}") from exc
+            raise LadderError(f"梯子状态写入失败(fail-closed,不放出汇报值): {type(exc).__name__}") from exc
 
     # ---------- 对外接口 ----------
 

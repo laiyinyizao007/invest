@@ -53,6 +53,11 @@ class LineageError(Exception):
     """台账损坏、记录不合法或写入失败。"""
 
 
+def _why(exc: BaseException) -> str:
+    """错误的可外传说明:`OSError` 的原文里有本机绝对路径(G7:不得泄露),只给异常类型。"""
+    return type(exc).__name__ if isinstance(exc, OSError) else str(exc)
+
+
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -186,7 +191,7 @@ def read_records(directory: Path, campaign_id: str) -> list[dict]:
             raise LineageError("台账超过大小上限")
         text = path.read_bytes().decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        raise LineageError(f"台账无法读取(fail-closed): {exc}") from exc
+        raise LineageError(f"台账无法读取(fail-closed): {_why(exc)}") from exc
     rows: list[dict] = []
     seen: dict[str, int] = {}
     for number, line in enumerate(text.splitlines(), 1):
@@ -244,5 +249,5 @@ def append_record(directory: Path, campaign_id: str, record: dict, *, now: datet
                 stream.flush()
                 os.fsync(stream.fileno())
         except OSError as exc:
-            raise LineageError(f"台账写入失败(fail-closed): {exc}") from exc
+            raise LineageError(f"台账写入失败(fail-closed): {_why(exc)}") from exc
     return clean

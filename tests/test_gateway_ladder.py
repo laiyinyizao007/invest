@@ -13,7 +13,7 @@ from test_research_gateway import call, make_app, seed_result
 
 
 def ladder_of(app):
-    return Ladder(app.paths["results_dir"] / "ladder.json")
+    return Ladder(app.paths["results_dir"] / "ladder" / "ladder.json")
 
 
 def jobs_returning(result, **more):
@@ -94,8 +94,8 @@ def test_a_strategy_error_costs_no_query(tmp_path):
 # ---------- 预算用尽:不放出任何验证窗口信息,也不白跑作业 ----------
 
 def exhaust(app):
-    app.paths["results_dir"].mkdir(parents=True, exist_ok=True)
-    (app.paths["results_dir"] / "ladder.json").write_text(
+    (app.paths["results_dir"] / "ladder").mkdir(parents=True, exist_ok=True)
+    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text(
         json.dumps({"version": 1, "eta": 1.1, "budget": 1, "queries": 1, "best": 0.0}), encoding="utf-8")
 
 
@@ -116,7 +116,7 @@ def test_an_exhausted_ladder_still_replays_runs_that_were_already_revealed(tmp_p
     seed(app, full_result())
     first = call(app, "GET", "/research/results/run42")[1]
     exhaust(app)
-    (app.paths["results_dir"] / "ladder.json").write_text(
+    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text(
         json.dumps({"version": 1, "eta": 1.1, "budget": 1, "queries": 1, "best": 3.3}), encoding="utf-8")
     status, again = call(app, "GET", "/research/results/run42")
     assert status == 200 and again == first
@@ -133,8 +133,8 @@ def test_a_corrupted_ladder_refuses_everything_and_runs_nothing(tmp_path, bad):
 
     app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=must_not_run, gate_job=must_not_run,
                                                   plateau_from_data=lambda d: (True, "x")))
-    app.paths["results_dir"].mkdir(parents=True, exist_ok=True)
-    (app.paths["results_dir"] / "ladder.json").write_text(bad, encoding="utf-8")
+    (app.paths["results_dir"] / "ladder").mkdir(parents=True, exist_ok=True)
+    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text(bad, encoding="utf-8")
     assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 500
     assert call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "C"})[0] == 500
     seed(app, full_result())
@@ -142,13 +142,13 @@ def test_a_corrupted_ladder_refuses_everything_and_runs_nothing(tmp_path, bad):
     assert status == 500 and "不可用" in out["error"]
     for sentinel in SENTINELS:
         assert sentinel not in dumped(out)
-    assert (app.paths["results_dir"] / "ladder.json").read_text(encoding="utf-8") == bad     # 不被"修复"成全新状态
+    assert (app.paths["results_dir"] / "ladder" / "ladder.json").read_text(encoding="utf-8") == bad     # 不被"修复"成全新状态
 
 
 def test_the_error_message_for_a_broken_ladder_contains_no_paths(tmp_path):
     app = make_app(tmp_path)
-    app.paths["results_dir"].mkdir(parents=True, exist_ok=True)
-    (app.paths["results_dir"] / "ladder.json").write_text("garbage", encoding="utf-8")
+    (app.paths["results_dir"] / "ladder").mkdir(parents=True, exist_ok=True)
+    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text("garbage", encoding="utf-8")
     seed(app, full_result())
     out = call(app, "GET", "/research/results/run42")[1]
     assert "ladder.json" not in dumped(out) and str(tmp_path) not in dumped(out)
@@ -224,3 +224,28 @@ def test_a_tampered_reveal_archive_makes_feedback_fail_closed(tmp_path):
 def test_the_gateway_still_has_exactly_the_whitelisted_routes():
     import research_gateway as gw
     assert len(gw.ROUTES) == 7 and ("GET", "/research/elite") not in gw.ROUTES        # ADR:GET /elite 不做
+
+
+# ---------- 自查发现:results 目录里不是运行结果的 *.json 不得被当成结果 ----------
+
+def test_the_ladder_state_is_not_listed_as_a_result_and_cannot_be_read_as_one(tmp_path):
+    """`list_results` 按 *.json 列 run;梯子状态曾与结果混放,`/research/results/ladder` 会把它当成一个结果读出来。"""
+    import research_sandbox as rs
+    app = make_app(tmp_path, jobs=jobs_returning(full_result()))
+    call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+    assert (app.paths["results_dir"] / "ladder" / "ladder.json").exists()
+    assert "ladder" not in rs.list_results(app.paths["results_dir"])
+    assert call(app, "GET", "/research/results/ladder")[0] == 404
+
+
+def test_other_json_files_in_the_results_directory_are_not_results_either(tmp_path):
+    app = make_app(tmp_path)
+    app.paths["results_dir"].mkdir(parents=True, exist_ok=True)
+    (app.paths["results_dir"] / "approvals.json").write_text(json.dumps({"s.py": "a" * 64}), encoding="utf-8")
+    (app.paths["results_dir"] / "list.json").write_text("[1, 2, 3]", encoding="utf-8")
+    seed_result(app, "norun", note="no kind field")
+    for name in ("approvals", "list", "norun"):
+        status, out = call(app, "GET", f"/research/results/{name}")
+        assert status == 404 and "a" * 64 not in dumped(out), name
+    status, out = call(app, "GET", "/research/feedback")
+    assert status == 200 and out["traces"] == []

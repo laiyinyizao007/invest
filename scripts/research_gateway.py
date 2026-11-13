@@ -50,6 +50,7 @@ MAX_TRACE_TEXT = 300
 LADDER_EXHAUSTED = ("验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,需要人工续期"
                     "(选参窗口的信息、/research/feedback 里已揭示过的结果不受影响)")
 LADDER_UNAVAILABLE = "梯子状态或揭示存档不可用(fail-closed):拒绝给出任何验证窗口的信息,请人工检查"
+RESULT_KINDS = ("evaluate", "gate", "backtest")      # 只有这几种 JSON 是"运行结果";results 目录里别的 *.json 不是
 VALID_SEGMENT_REFUSED = ("验证段的回测不能经网关直接读取:它会绕过梯子直接给出验证窗口的完整统计。"
                          "验证窗口的成绩只经 /research/evaluate(或 /research/gate)按梯子量化后给出")
 
@@ -337,7 +338,8 @@ class GatewayApp:
 
     # ---- 对外揭示(risk/outward.py):外层看到的一切都从这里过 ----
     def _ladder(self) -> Ladder:
-        return Ladder(Path(self.paths["results_dir"]) / "ladder.json")
+        # 放进子目录:`list_results` 按 `*.json` 列 run,梯子状态与结果混放会被当成一个"结果"(自查发现)
+        return Ladder(Path(self.paths["results_dir"]) / "ladder" / "ladder.json")
 
     def _reveal_store(self) -> RevealStore:
         return RevealStore(Path(self.paths["results_dir"]) / "outward")
@@ -444,6 +446,8 @@ class GatewayApp:
             result = rs.load_result(run_id, self.paths["results_dir"])
         except rs.SandboxError:
             return 404, {"error": "没有这条结果"}
+        if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
+            return 404, {"error": "没有这条结果"}            # results 目录里不是运行结果的 *.json(审批记录等)不外露
         # 落盘的是给人看的完整记录;外层只看净化视图。第一次读到带验证窗口数字的 run 才消耗一次梯子查询,之后回放
         return self._reveal(result)
 
@@ -459,6 +463,8 @@ class GatewayApp:
             try:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
+                continue
+            if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
                 continue
             status, view = self._reveal(result, allow_query=False)
             if status != 200:

@@ -37,6 +37,11 @@ class TrialLedgerError(Exception):
     """试验账本损坏、不可读或写入参数非法。"""
 
 
+def _why(exc: BaseException) -> str:
+    """错误的可外传说明:`OSError` 的原文里有本机绝对路径(G7:不得泄露),只给异常类型;别的异常原文照给。"""
+    return type(exc).__name__ if isinstance(exc, OSError) else str(exc)
+
+
 def _check_sharpes_entry(data: dict) -> None:
     values = data.get("values")
     if data.get("source") not in SHARPE_SOURCES:
@@ -74,7 +79,7 @@ def _entries(path: Path) -> list[dict]:
         if sum(len(e["values"]) for e in entries if e["kind"] == SHARPES_KIND) > MAX_TOTAL_SHARPES:
             raise ValueError(f"累计夏普样本超过上限 {MAX_TOTAL_SHARPES}")
     except (OSError, ValueError) as exc:          # JSONDecodeError 是 ValueError 的子类
-        raise TrialLedgerError(f"试验账本损坏或无法读取(fail-closed): {exc}") from exc
+        raise TrialLedgerError(f"试验账本损坏或无法读取(fail-closed): {_why(exc)}") from exc
     return entries
 
 
@@ -98,14 +103,14 @@ def record_trials(path: Path, kind: str, count: int, *, at: float) -> int:
         existing = _count_of(_entries(path))      # 先校验,损坏则不追加
         if existing + count > MAX_TOTAL:
             raise TrialLedgerError(f"累计试验次数将超过上限 {MAX_TOTAL}")
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"kind": kind, "count": count, "at": at}, ensure_ascii=False) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
         except OSError as exc:
-            raise TrialLedgerError(f"试验账本写入失败(fail-closed): {exc}") from exc
+            raise TrialLedgerError(f"试验账本写入失败(fail-closed): {_why(exc)}") from exc
     return existing + count
 
 
@@ -133,15 +138,15 @@ def record_sharpes(path: Path, source: str, values, *, at: float) -> int:
         existing = sum(len(e["values"]) for e in entries if e["kind"] == SHARPES_KIND)
         if existing + len(clean) > MAX_TOTAL_SHARPES:
             raise TrialLedgerError(f"累计夏普样本将超过上限 {MAX_TOTAL_SHARPES}")
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"kind": SHARPES_KIND, "source": source, "values": clean, "at": at},
                                         ensure_ascii=False, allow_nan=False) + chr(10))
                 stream.flush()
                 os.fsync(stream.fileno())
         except OSError as exc:
-            raise TrialLedgerError(f"试验账本写入失败(fail-closed): {exc}") from exc
+            raise TrialLedgerError(f"试验账本写入失败(fail-closed): {_why(exc)}") from exc
     return existing + len(clean)
 
 

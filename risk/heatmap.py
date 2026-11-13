@@ -32,6 +32,11 @@ class HeatmapError(Exception):
     """热力图形状不合法或无法写入。"""
 
 
+def _why(exc: BaseException) -> str:
+    """错误的可外传说明:`OSError` 的原文里有本机绝对路径(G7:不得泄露),只给异常类型。"""
+    return type(exc).__name__ if isinstance(exc, OSError) else str(exc)
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -145,5 +150,5 @@ def save_heatmap(directory: Path, run_id: str, body: dict) -> Path:
             os.fsync(stream.fileno())
         os.replace(tmp, target)
     except OSError as exc:
-        raise HeatmapError(f"热力图写入失败: {exc}") from exc
+        raise HeatmapError(f"热力图写入失败: {_why(exc)}") from exc
     return target
