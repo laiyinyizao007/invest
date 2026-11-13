@@ -1097,11 +1097,20 @@ def get_heatmap(settings: Settings, run_id: str) -> dict | None:
         raise EvolutionUnavailable("热力图文件损坏或读不了") from exc
 
 
+def _pending_dir(settings: Settings) -> Path:
+    """待审候选目录。**用沙盒配置里的路径**,不要写死:写死会出现两份真相
+    (沙盒把目录改到别处时,面板会去找错地方,于是显示『源码已不在』)。"""
+    cfg, err = _research_cfg(settings)
+    rel = cfg["paths"]["pending_dir"] if err is None else "pending_strategies"
+    inside = _inside(settings.root, rel)
+    return inside if inside is not None else settings.root / "pending_strategies"
+
+
 def get_candidate_code(settings: Settings, sha256: str) -> dict | None:
     """候选源码(按哈希找)。找不到不是错误:found=False,前端显示『源码已不在』而不是报错。"""
     if not _matches(sha256, ev.SHA256):
         return None
-    source = ev.candidate_source(settings.root / "pending_strategies", sha256)
+    source = ev.candidate_source(_pending_dir(settings), sha256)
     lines = [] if source is None else [{"n": i, "text": line} for i, line in enumerate(source.splitlines(), start=1)]
     return {"sha256": sha256, "found": source is not None, "language": "python", "lines": lines}
 
@@ -1110,7 +1119,7 @@ def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> d
     """两个候选的差异。父代源码不在(被清理了)时 available=False,不是错误。"""
     if not _matches(sha256, ev.SHA256) or not _matches(parent_sha256, ev.SHA256):
         return None
-    directory = settings.root / "pending_strategies"
+    directory = _pending_dir(settings)
     before = ev.candidate_source(directory, parent_sha256)
     after = ev.candidate_source(directory, sha256)
     if before is None or after is None:

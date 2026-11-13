@@ -443,3 +443,24 @@ def test_the_reflection_text_is_sanitized_before_it_leaves_the_process(tmp_path)
     body = r.text
     assert "Alice" not in body and "secret.env" not in body
     assert "<path>" in body
+
+
+def test_the_candidate_directory_comes_from_the_sandbox_config_not_a_hardcoded_path(tmp_path):
+    """沙盒把待审目录改到别处时,面板必须跟着改:写死路径会显示『源码已不在』。"""
+    import hashlib
+    from dashboard import collectors as col
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "research_sandbox.json").write_text(json.dumps({
+        "iteration": {"max_iterations": 5, "window_hours": 24},
+        "paths": {"pending_dir": "other_pending", "results_dir": "data/research",
+                  "approvals_file": "data/research-control/approvals.json"}}), encoding="utf-8")
+    other = tmp_path / "other_pending"
+    other.mkdir()
+    src = "class C: pass\n"
+    sha = hashlib.sha256(src.encode()).hexdigest()
+    (other / "x.py").write_bytes(src.encode())
+    s = settings(tmp_path)
+    out = col.get_candidate_code(s, sha)
+    assert out is not None and out["found"] is True
