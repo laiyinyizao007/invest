@@ -26,11 +26,6 @@ MAX_HEATMAP_CELLS = 200_000
 CAMPAIGN_ID = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
 SHA256 = r"[0-9a-f]{64}"
 
-RECORD_FIELDS = ("campaign_id", "generation", "candidate_sha256", "parent_sha256", "run_id", "status",
-                 "sharpe", "total_return", "max_drawdown", "dsr", "n_trials", "fail_reason", "reflection",
-                 "created_at", "cell", "diagnosis")
-
-
 class EvolutionError(Exception):
     """读取失败。消息里不含本机路径。"""
 
@@ -54,7 +49,6 @@ class Record:
     created_at: str | None
     cell: str | None
     diagnosis: dict | None
-    raw: dict
 
     def brief(self) -> dict:
         """给前端的精简视图。**不含**反思原文以外的自由文本;reflection 单独字段、限长。"""
@@ -117,7 +111,6 @@ def parse_record(row: Any) -> Record:
         created_at=_text(row.get("created_at"), 40),
         cell=_text(row.get("cell"), 64),
         diagnosis=diagnosis if isinstance(diagnosis, dict) else None,
-        raw=row,
     )
 
 

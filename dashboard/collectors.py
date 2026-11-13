@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
 import threading
@@ -15,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from dashboard import evolution as ev
 from dashboard import models as m
 from dashboard.config import PAUSE_FLAG_NAME, Settings
 from dashboard.safe import mask_account
@@ -975,9 +975,6 @@ def collect_overview(settings: Settings, now: float) -> dict:
 
 # ---------------------------------------------------------------- 进化引擎(只读)
 # 引擎侧(毕昇工作流与研究网关)写台账与热力图,面板只读。详见 docs/adr/20261113-evolution-dashboard.md。
-from dashboard import evolution as ev                                     # noqa: E402
-
-
 class EvolutionUnavailable(Exception):
     """台账损坏或读不了:与『战役不存在』不同,调用方要能区分(404 vs 数据不可信)。"""
 
@@ -1123,7 +1120,7 @@ def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> d
 
 
 def _matches(value: str, pattern: str) -> bool:
-    import re as _re
-    return isinstance(value, str) and _re.fullmatch(pattern, value) is not None
+    """完整匹配一个格式(战役号、哈希、run_id)。不匹配就返回 False——不猜、不裁剪。"""
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
 # MARKER_TEST
