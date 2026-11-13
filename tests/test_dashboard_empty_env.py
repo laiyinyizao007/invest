@@ -34,3 +34,19 @@ def test_the_overview_is_not_ok_when_nothing_can_be_read(tmp_path):
     assert overview["level"] != "ok", overview["level"]
     for name, section in overview["sections"].items():
         assert not (section["state"] == "ok" and section["level"] == "ok"), (name, section)
+
+
+def test_a_collector_failure_is_logged_with_its_traceback_and_not_leaked(tmp_path, caplog):
+    """提示语写着『详见服务端日志』——必须真的记了,否则那句话是假的;但堆栈不能进响应。"""
+    import logging
+
+    settings = _empty_settings(tmp_path)
+
+    def boom(_settings, _now):
+        raise RuntimeError("secret " + chr(67) + ":" + chr(92) + "Users" + chr(92) + "Alice" + chr(92) + "token.txt")
+
+    with caplog.at_level(logging.ERROR):
+        result = col._collect_safely("trading", boom, settings, NOW)
+    assert result.section["state"] == "unknown"
+    assert "Alice" not in json.dumps(result.section, ensure_ascii=False)       # 不外泄
+    assert any("trading" in r.getMessage() and r.exc_info for r in caplog.records), caplog.text   # 但留了堆栈

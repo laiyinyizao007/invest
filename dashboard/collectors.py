@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import re
 import threading
@@ -1055,10 +1056,15 @@ _ORDER = {"critical": 0, "unknown": 1, "warn": 2, "ok": 3}
 
 
 def _collect_safely(name: str, func, settings: Settings, now: float) -> Result:
-    """单个来源出任何异常都只影响它自己的区块,且异常细节不外泄。"""
+    """单个来源出任何异常都只影响它自己的区块,且异常细节不外泄。
+
+    **但要记日志**:提示语说的是『详见服务端日志』——不记日志的话那句话就是假的,
+    半夜出问题无从查起。堆栈只进服务端日志,不进响应。
+    """
     try:
         return func(settings, now)
     except Exception:  # noqa: BLE001
+        logging.exception("面板采集器 %s 失败(该区块按『无法判断』显示)", name)
         sec = m.section("unknown", None, now=now, message=f"{name} 采集失败(详见服务端日志)")
         return Result(sec, "unknown", "采集失败", [_reason(name, "unknown", f"{name} 采集失败,无法判断")])
 
