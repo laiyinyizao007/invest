@@ -49,8 +49,12 @@ def test_a_strategy_error_backtest_still_needs_no_statistics():
 
 
 # ---------------------------------------------------------------- codex 第八次复核的发现
-def test_unscanned_research_results_make_the_block_unknown(tmp_path):
-    """超出扫描上限的旧结果从未被校验:里面若有坏文件就彻底不可见。这属于『有数据没显示』,state 不能是 ok。"""
+def test_unscanned_research_results_are_surfaced_not_silently_dropped(tmp_path):
+    """超出扫描上限的旧结果从未被校验:里面若有损坏文件就彻底不可见——所以必须明确说出来。
+
+    内容是好的(只是更旧的结果没检查)→ state=ok + level=warn,前端加警示徽标即可;
+    真正读坏了的文件 → state=unknown。
+    """
     from dashboard import collectors as col
     from dashboard import config as appconfig
 
@@ -69,10 +73,8 @@ def test_unscanned_research_results_make_the_block_unknown(tmp_path):
             "ran_at": "2026-11-12T21:00:00", "run_id": rid, "passed": True, "failures": []}), encoding="utf-8")
     settings = appconfig.load(path=root / "none.json", root=root)
     r = col.collect_research(settings, 1_800_000_000.0)
-    assert r.section["state"] == "unknown", "有结果文件没被检查,区块不能显示正常"
+    assert r.section["level"] == "warn", "有结果文件没被检查,必须给出警示"
     assert "未检查" in (r.section["message"] or "")
-
-
 def test_a_severe_event_is_still_reported_when_the_latest_day_is_untrustworthy(tmp_path):
     """最新那天不可信(正在写)时,最新的**可信天**上的硬锁定不能被降级成『有日志无法识别』。"""
     from dashboard import collectors as col
@@ -112,3 +114,29 @@ def test_a_historical_severe_event_does_not_pin_the_overview_at_critical(tmp_pat
     # 但它仍然在表里可见
     days = {row["day"]: row for row in r.section["data"]["days"]}
     assert days["2026-10-01"]["has_severe"] is True
+
+
+def test_the_research_scan_limit_is_a_warning_not_a_broken_block(tmp_path):
+    """超出扫描上限的是**更旧的**结果(本来也不在『最近 N 个』里),不是读不出来:
+    内容是好的 → state=ok + level=warn,前端加一个警示徽标即可。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    res = root / "data" / "research"
+    res.mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "config" / "research_sandbox.json").write_text(json.dumps({
+        "iteration": {"max_iterations": 5, "window_hours": 24},
+        "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
+                  "approvals_file": "data/research-control/approvals.json"}}), encoding="utf-8")
+    for i in range(col.MAX_RUNS_SCANNED + 5):
+        rid = f"20261112-210000-{i:06d}"
+        (res / f"{rid}.json").write_text(json.dumps({
+            "kind": "gate", "strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r",
+            "ran_at": "2026-11-12T21:00:00", "run_id": rid, "passed": True, "failures": []}), encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    r = col.collect_research(settings, 1_800_000_000.0)
+    assert r.section["state"] == "ok" and r.section["level"] == "warn"
+    assert "未检查" in (r.section["message"] or "")
+    assert (r.section["message"] or "").count("未检查") == 1, "同一句话不该出现两遍"

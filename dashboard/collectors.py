@@ -915,12 +915,11 @@ def collect_research(settings: Settings, now: float) -> Result:
     problems, notes = [], []
     if unscanned:
         # 超出扫描上限的旧结果**从未被校验**:里面若有损坏文件就彻底不可见。
-        # 所以要明确说明(不是静默),但它与『读出来是坏的』不同:前者只是没检查,后者是坏了。
+        # 要明确说明(不是静默),但它与『读出来是坏的』不同:前者只是没检查,后者是坏了——
+        # 所以进 notes(notes 只影响 level=warn,state 仍是 ok),真正读坏的才进 problems(state=unknown)。
         notes.append(f"更早的 {unscanned} 个运行结果未检查(它们的状态未知,不能当作正常)")
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
-    if unscanned:
-        notes.append(f"更早的 {unscanned} 个运行结果未检查")
     if unreadable_pending:
         problems.append(f"有 {unreadable_pending} 个待审候选未列出(只显示最近 {MAX_PENDING_LISTED} 个)"
                         if unreadable_pending > MAX_PENDING_LISTED else
@@ -928,6 +927,9 @@ def collect_research(settings: Settings, now: float) -> Result:
     reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
     if problems:
         level, headline = "warn", "有数据无法显示"
+    elif notes:
+        # 只是『有些内容没列出/没检查』:内容是好的,给 warn 徽标即可(state 仍是 ok)
+        level, headline = "warn", "部分内容未列出"
     elif used >= limit:
         level, headline = "warn", f"额度已用尽 {used}/{limit}"
         reasons = [_reason("research", "warn", f"迭代额度已用尽({used}/{limit}),新候选会被网关拒绝")]
@@ -936,7 +938,7 @@ def collect_research(settings: Settings, now: float) -> Result:
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
     # 有数据没显示 → 状态不是 ok(契约:前端先看 state,ok 会渲染成绿卡片)
-    section_state = "unknown" if (problems or unscanned) else "ok"
+    section_state = "unknown" if problems else "ok"
     return Result(m.section(section_state, data, as_of=max(activity) if activity else None, now=now,
                             message=";".join(problems + notes) or None),
                   level, headline, reasons)
@@ -1126,6 +1128,9 @@ def collect_evolution(settings: Settings, now: float) -> Result:
     reasons: list[dict] = []
     if unscanned:
         # **没检查 ≠ 没问题**:剩下的战役可能有坏台账,区块不能显示正常。
+        # (与 research 的区别是实质的:research 的 recent_runs 本来就只显示最近 N 个,
+        #  超上限的是**更旧的**结果,没列出来不算少显示了内容 → state=ok + level=warn;
+        #  evolution 的 campaigns 是**全部**战役,少列了就是少了内容 → state=unknown。)
         message = ";".join(filter(None, [message, f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,"
                                                  f"还有 {unscanned} 个未检查(它们的状态未知)"]))   # 未检查的是字典序靠后的那些
         state = "unknown"
