@@ -880,3 +880,21 @@ def test_evaluate_child_really_runs_the_evaluation(tmp_path, monkeypatch, capsys
     assert "error" not in payload, payload
     assert payload["passed"] is True
     assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]
+
+
+def test_the_saved_backtest_stats_are_exactly_what_the_dashboard_validates():
+    """落盘的 stats 与面板校验的键集必须同源。
+
+    曾经面板另写一份键集(写成 vnpy 原始的 `total_trade_count`),而落盘的是投影后的 `round_trips`,
+    结果每一个真实回测都被判成损坏、从列表消失、详情 404——而测试夹具照着那份错的写,套件全绿也证明不了。
+    """
+    from risk.report import BACKTEST_STATS_KEYS, backtest_stats_row
+
+    stats = {"total_return": 0.1, "max_ddpercent": -5.0, "max_drawdown": -500.0, "sharpe_ratio": 1.2,
+             "total_trade_count": 156, "end_balance": 20000.0, "total_net_pnl": 200.0,
+             "total_commission": 100.0, "total_slippage": 50.0}
+    row = backtest_stats_row(stats)
+    assert row["round_trips"] == 78                     # total_trade_count 被折半
+    assert "total_trade_count" not in row               # 落盘的形状里没有它
+    for key in BACKTEST_STATS_KEYS:
+        assert key in row and isinstance(row[key], (int, float))
