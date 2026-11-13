@@ -58,7 +58,10 @@ def is_account_key(key: str) -> bool:
 
 # ---- 文本里的泄露形态 ----
 # 敏感词 = / : 值。值取到空白、分号或逗号为止;Authorization 要连 scheme 带凭据一起吞(Basic xxx / Bearer xxx)。
-_ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|auth[_-]?code|app[_-]?id)\b(\s*[=:]\s*)[^\s;,&]+")
+# 赋值形态:`password=x`、`password: x`,以及**带引号的 JSON 键**(`"password": "x"`)。
+# 引号形态曾被漏掉:日志或候选代码里的 JSON 字面量会把秘密原样带出去。
+_ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|auth[_-]?code|app[_-]?id)\b"
+                     r"(\s*[\"']?\s*[=:]\s*[\"']?)[^\s;,\"'&]+")
 _AUTH_HEADER = re.compile(r"(?i)\b(authorization|proxy-authorization)\b(\s*[=:]\s*)(?:(?:basic|bearer|digest|token)\s+)?[^\s;,]+")
 _COOKIE = re.compile(r"(?i)\b(set-cookie|cookie)\b(\s*[=:]\s*)[^\r\n]+")
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}")

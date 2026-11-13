@@ -982,29 +982,63 @@ class EvolutionUnavailable(Exception):
     """台账损坏或读不了:与『战役不存在』不同,调用方要能区分(404 vs 数据不可信)。"""
 
 
+# 战役摘要的缓存:台账是**引擎侧追加写**的,列表接口每次都要读完所有台账(实测 8 个战役 × 2 万条 = 2.9 秒),
+# 而前端每 30 秒轮询一次。缓存键是 (路径, 大小, mtime):追加写会让后两者都变,缓存自然失效。
+# **前提**:台账由我们自己的引擎写(只追加);对项目目录有写权限的本地攻击者本来就在威胁模型之外
+# (见 ADR 20261112-status-dashboard.md 的令牌创建竞态一节)。曲线与日志接口**不读缓存**,每次现读。
+_EVOLUTION_SUMMARY_CACHE: dict[tuple[str, int, float], dict] = {}
+_EVOLUTION_CACHE_MAX = 64
+MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
+MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
+MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
+
+
+def _campaign_summary(settings: Settings, name: str) -> dict:
+    """一个战役的摘要(代数、最新代、最好夏普、最后时间)。"""
+    directory = settings.paths["evolution_dir"]
+    path = directory / f"{name}.jsonl"
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise ev.EvolutionError("台账无法读取") from exc
+    key = (str(path), stat.st_size, stat.st_mtime)
+    cached = _EVOLUTION_SUMMARY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    records = ev.read_campaign(directory, name)
+    sharpes = [r.sharpe for r in records if r.sharpe is not None]
+    summary = {
+        "campaign_id": name,
+        "generations": len({r.generation for r in records}),
+        "latest_generation": max((r.generation for r in records), default=None),
+        "records": len(records),
+        "updated_at": records[-1].created_at if records else None,
+        "best_sharpe": round(max(sharpes), 4) if sharpes else None,
+        "state": "ok" if records else "missing",
+        "message": None,
+    }
+    if len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
+        _EVOLUTION_SUMMARY_CACHE.clear()
+    _EVOLUTION_SUMMARY_CACHE[key] = summary
+    return summary
+
+
 def collect_evolution(settings: Settings, now: float) -> Result:
     """进化战役列表。可选子系统:没有战役时是 missing,不计入总体级别(不因为还没跑进化就显示整体异常)。"""
     directory = settings.paths["evolution_dir"]
     names = ev.campaigns(directory)
     campaigns = []
-    for name in names:
+    unscanned = max(len(names) - MAX_CAMPAIGNS_SUMMARIZED, 0)
+    for name in names[:MAX_CAMPAIGNS_SUMMARIZED]:
         try:
-            records = ev.read_campaign(directory, name)
+            campaigns.append(_campaign_summary(settings, name))
         except ev.EvolutionError as exc:
             campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
                               "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
-            continue
-        sharpes = [r.sharpe for r in records if r.sharpe is not None]
-        campaigns.append({
-            "campaign_id": name,
-            "generations": len({r.generation for r in records}),
-            "latest_generation": max((r.generation for r in records), default=None),
-            "records": len(records),
-            "updated_at": records[-1].created_at if records else None,
-            "best_sharpe": round(max(sharpes), 4) if sharpes else None,
-            "state": "ok" if records else "missing",
-            "message": None,
-        })
+    if unscanned:
+        campaigns.append({"campaign_id": f"(还有 {unscanned} 个战役未统计)", "generations": 0, "latest_generation": None,
+                          "records": 0, "updated_at": None, "best_sharpe": None, "state": "unknown",
+                          "message": f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,更早的 {unscanned} 个未检查"})
     data = {"campaigns": campaigns}
     state = "ok" if campaigns else "missing"
     message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
@@ -1091,3 +1125,5 @@ def get_candidate_diff(settings: Settings, sha256: str, parent_sha256: str) -> d
 def _matches(value: str, pattern: str) -> bool:
     import re as _re
     return isinstance(value, str) and _re.fullmatch(pattern, value) is not None
+
+# MARKER_TEST
