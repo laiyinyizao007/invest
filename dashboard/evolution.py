@@ -242,11 +242,21 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
             "latest_generation": points[-1]["generation"] if points else None}
 
 
+def _really_inside(path: Path, directory: Path) -> bool:
+    """文件解析后的真实位置必须直接位于 directory 内。符号链接/junction 指向目录外的一律不算。"""
+    try:
+        return path.resolve(strict=True).parent == directory.resolve()
+    except OSError:
+        return False
+
+
 def read_heatmap(directory: Path, run_id: str) -> dict | None:
     """读某个运行的参数网格得分表,并切成二维(第三轴取 best_cell)。文件不存在返回 None。"""
     path = directory / f"{run_id}.json"
     if not path.exists():
         return None
+    if not _really_inside(path, directory):
+        raise EvolutionError("热力图文件是链接,指向目录之外")     # 与研究结果文件同一口径:不读目录外的文件
     try:
         if path.stat().st_size > MAX_HEATMAP_BYTES:
             raise EvolutionError("热力图文件超过大小上限")

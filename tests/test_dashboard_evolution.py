@@ -464,3 +464,21 @@ def test_the_candidate_directory_comes_from_the_sandbox_config_not_a_hardcoded_p
     s = settings(tmp_path)
     out = col.get_candidate_code(s, sha)
     assert out is not None and out["found"] is True
+
+
+def test_a_heatmap_file_that_is_a_symlink_out_of_the_directory_is_refused(tmp_path):
+    """与研究结果文件同一口径:符号链接/junction 指向目录外的一律不读。"""
+    import os
+
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"axes": {"a": [1.0], "b": [2.0], "c": [3.0]}, "scores": [[0, 0, 0, 1.0]]}),
+                        encoding="utf-8")
+    d = tmp_path / "heatmaps"
+    d.mkdir()
+    link = d / "20261112-210000-000000.json"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        pytest.skip("无法创建符号链接")
+    with pytest.raises(ev.EvolutionError):
+        ev.read_heatmap(d, "20261112-210000-000000")
