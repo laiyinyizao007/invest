@@ -15,7 +15,7 @@
 
 | 需要的数据 | 现状 |
 |---|---|
-| 参数热力图 | **已有**。`evaluate` 结果含 `plateau.scores`(三维网格得分 `[i,j,k,夏普\|"-inf"]`)、`axes`、`best_cell`、`on_plateau`(`scripts/research_grid.py`) |
+| 参数热力图 | **目前没有落盘**。`select_params` 的返回里有 `plateau.scores`(三维网格得分),但 `run_evaluation` 保存结果时只留摘要(`n_cells / valid_cells / on_plateau / plateau_cell`),完整得分表被有意留在服务端、不回传给外层(`scripts/research_gate.py`)。(2026-11-13 更正:本 ADR 初稿曾误写『已有』。) |
 | 进化曲线(代、种群统计) | **没有**。没有「代」「父代」的记录,网关只记 `submissions.jsonl`(额度账本) |
 | 反思意见、代码差异 | **没有**。反思文本只存在于毕昇工作流的运行上下文里;候选代码在 `pending_strategies/`,但无父子关系 |
 | 自动进化回路 | **没有**。毕昇 v3 是单轮「想法→候选→评估」,`--rounds` 只用于联调 |
@@ -39,6 +39,9 @@
 - `reflection` 是**不可信的 LLM 文本**:限长(2KB)、仅存储与展示、展示前过 `dashboard/safe.py`、**绝不回灌进任何 LLM 上下文**。
   这与既有「硬记忆预算」一致:外层反馈仍只携带最近 3 次失败的结构化 Trace,谱系台账**只用于人看**,不是 LLM 的记忆。
 - 面板对 `data/research/evolution/` 与 `pending_strategies/` 只读;代码与差异在服务端按哈希读取、`difflib` 生成,大小有上限,按纯文本返回。
+
+### 2b. 热力图数据需要落盘(待引擎侧实现)
+评估时把完整得分表另存为 `data/research/heatmaps/<run_id>.json`(`axes`、`scores`、`best_cell`、`on_plateau`),**不并入网关返回给外层的响应**——『得分表不给 LLM 看』这条保持;面板只读该文件给人看。写入属引擎侧(`research_api` / `research_gate`)改动,已转告引擎会话,本会话不修改。
 
 ### 3. 服务端算好,前端只渲染
 - 曲线:每代 `elite / mean / p25 / p75`(夏普)与收益、回撤;提示标志 `stagnant`(连续 N 代精英无提升,默认 5)与 `overfit_suspect`(精英与种群均值差距超阈值)。
