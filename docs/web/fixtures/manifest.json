@@ -49,6 +49,13 @@
     "note": "心跳已停 10 小时"
   },
   {
+    "fixture": "trading-guard-stale",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "心跳新鲜(进程在跑)但风控状态文件已落后一天:权益数字不是当前值,区块 stale,前端不得显示『运行中』绿灯"
+  },
+  {
     "fixture": "trading-missing",
     "method": "GET",
     "path": "/api/trading",

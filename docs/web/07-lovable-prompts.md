@@ -202,8 +202,9 @@
 8. 本页没有任何写操作按钮。
 ```
 
-**验收点**(依次选 `trading-ok`、`trading-stale`、`trading-missing`、`trading-corrupt`、`trading-hard-locked`、`trading-paused`)
+**验收点**(依次选 `trading-ok`、`trading-stale`、`trading-guard-stale`、`trading-missing`、`trading-corrupt`、`trading-hard-locked`、`trading-paused`)
 - [ ] `trading-stale`:数字置灰并带"数据已过期",**没有"运行中"**
+- [ ] `trading-guard-stale`(**最容易做错的一个**):进程在跑(`heartbeat.process` 是 `running`),但风控状态文件落后了一天,区块 `state` 是 `stale`。权益、盈亏、锁定状态那一块必须置灰并显示『风控状态已过期 N 分钟』;**不得只看 `heartbeat.process` 就显示绿色『运行中』**——先看区块 `state`,再看各块自己的年龄(`guard.age_seconds`)
 - [ ] `trading-missing` / `trading-corrupt`:不渲染数字,显示对应说明
 - [ ] `trading-hard-locked`:顶部整幅硬锁定横条,进度条接近满
 - [ ] 页面上找不到任何"下单/撤单/平仓"字样

@@ -18,7 +18,7 @@ invest 是一套自动交易系统(vn.py + CTP)。交易、风控、录制、研
 | 2 | [`01-product-spec.md`](01-product-spec.md) | 前端、产品 | 信息架构、每个页面的内容、状态与交互、文案、视觉约束 |
 | 3 | [`02-api-contract.md`](02-api-contract.md) | 前端、后端 | 通用约定:鉴权、区块模型、错误、时间、轮询、写操作规则 |
 | 4 | [`status-api.openapi.json`](status-api.openapi.json) | 前端、后端 | **机器可读的契约**,22 个接口、37 个数据模型,每个接口标注阶段与角色 |
-| 5 | [`fixtures/`](fixtures/) | 前端 | 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)+ `manifest.json` |
+| 5 | [`fixtures/`](fixtures/) | 前端 | 40 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)+ `manifest.json` |
 | 6 | [`03-frontend-handoff.md`](03-frontend-handoff.md) | 前端 | 技术约束、安全清单、目录与构建、联调流程、验收清单 |
 | 7 | [`04-phases.md`](04-phases.md) | 所有人 | 五个阶段各自的范围、前置条件、后端工作、风险 |
 | 8 | [`05-lovable-guide.md`](05-lovable-guide.md) | **用 Lovable 构建前端的人** | 风险(真实数据不能进 Lovable、导出物默认带外部依赖)、总流程、项目约束、导出审计、联调 |

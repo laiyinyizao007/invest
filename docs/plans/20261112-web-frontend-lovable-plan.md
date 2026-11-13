@@ -59,7 +59,7 @@ graph TD
 ## 任务
 
 ### 阶段 1:准备(已完成)
-- [x] **F1** OpenAPI 契约(阶段①–⑤)、39 个示例、契约测试
+- [x] **F1** OpenAPI 契约(阶段①–⑤)、40 个示例、契约测试
 - [x] **F2** `api-types.ts` / `mock-data.*.ts` / `mock-manifest.json` 由契约生成,TypeScript 严格模式编译通过
 - [x] **F3** 设计系统(令牌对比度实测达标)
 - [x] **F4** `tools/audit_frontend_export.py` 与测试
