@@ -182,13 +182,27 @@ REQUIRED_STREAK = 5
 
 
 def _log_files(settings: Settings) -> list[Path]:
-    """有内容的每日日志。**空文件不算**:别的进程新建的 0 字节日志既不是活动证据(曾让交易进程停了几十小时的页面显示『刚更新』),
-    也不能代表『这一天无异常』。"""
+    """可信的每日日志:非空,且至少含一行能解析出时间戳的内容。
+
+    **空文件不算**:别的进程新建的 0 字节日志既不是活动证据(曾让交易进程停了几十小时的页面显示『刚更新』),也不能代表『这一天无异常』。
+    **垃圾内容也不算**(G8 第 2 轮审查):任何新鲜的非空文件都被解释成『干净的一天』并给 alerts 提供『数据仍新鲜』的证据。
+    可信度看内容,新鲜度看文件 mtime(日志时间戳是机器本地时间,容器与宿主时区不同,不能直接当北京时间)。
+    解析结果有缓存,这里的判断几乎没有额外开销。
+    """
     files: list[Path] = []
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
-            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f)]
+            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f) and _parse_cached(f).first_ts]
     return files
+
+
+def _unreadable_logs(settings: Settings) -> int:
+    """非空、但没有任何可识别时间戳的日志文件数(格式变了或被写坏)。与『一个日志都没找到』是两回事。"""
+    n = 0
+    for d in settings.paths["log_dirs"]:
+        if d.is_dir():
+            n += sum(1 for f in d.glob("vt_*.log") if _nonempty(f) and not _parse_cached(f).first_ts)
+    return n
 
 
 def _nonempty(path: Path) -> bool:
@@ -318,6 +332,11 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     stale_after = settings.stale_after("days")
     days = _days(settings)
     if not days:
+        bad = _unreadable_logs(settings)
+        if bad:
+            msg = f"有 {bad} 个日志文件,但内容无法识别(格式变了或被写坏),不能据此判断无人值守情况"
+            return Result(m.section("corrupt", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志无法识别",
+                          [_reason("days", "unknown", msg)])
         sec = m.section("missing", None, now=now, stale_after=stale_after, message="未找到每日日志(交易进程未运行过,或日志目录配置不对)")
         return Result(sec, "unknown", "无日志", [_reason("days", "unknown", "未找到每日日志:无法判断无人值守情况")])
 
@@ -361,11 +380,11 @@ def _outbox(settings: Settings, now: float) -> tuple[int, float | None, str]:
     """(待补发条数, 最老一条的年龄, 状态)。状态:ok / missing。无法解析的非空行也计入条数(宁可多报,不能漏报)。"""
     path = settings.paths["state_dir"] / "webhook_outbox.jsonl"
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = m.read_text_limited(path, MAX_OUTBOX_BYTES).splitlines()
     except FileNotFoundError:
         return 0, None, "missing"
-    except OSError:
-        return 0, None, "missing"
+    except (OSError, m.TooLarge):
+        return 0, None, "corrupt"                 # 读不了或异常增长 ≠ 不存在;不能把它说成『没有积压』
     pending, oldest = 0, None
     for line in lines:
         if not line.strip():
@@ -389,6 +408,16 @@ def collect_alerts(settings: Settings, now: float) -> Result:
     stale_after = settings.stale_after("alerts")
     pending, oldest, outbox_state = _outbox(settings, now)
     days = _days(settings)
+    if outbox_state == "corrupt":
+        # 待补发队列是『有告警没送到手机』的唯一证据;读不了或异常增长时,不能说没有积压
+        msg = "待补发告警队列无法读取或异常增长:无法确认有没有告警尚未送达手机"
+        return Result(m.section("corrupt", None, as_of=m.mtime(settings.paths["state_dir"] / "webhook_outbox.jsonl"), now=now,
+                                stale_after=stale_after, message=msg), "unknown", "告警队列异常", [_reason("alerts", "unknown", msg)])
+    bad_logs = 0 if days else _unreadable_logs(settings)
+    if bad_logs:
+        msg = f"有 {bad_logs} 个日志文件,但内容无法识别(格式变了或被写坏),不能据此确认没有新告警"
+        return Result(m.section("corrupt", None, now=now, stale_after=stale_after, message=msg), "unknown", "日志无法识别",
+                      [_reason("alerts", "unknown", msg)])
     if not days and outbox_state == "missing":
         sec = m.section("missing", None, now=now, stale_after=stale_after, message="未找到告警队列和每日日志")
         return Result(sec, "unknown", "无数据来源", [_reason("alerts", "unknown", "未找到告警队列和日志:无法判断告警情况")])
@@ -447,6 +476,12 @@ def collect_recording(settings: Settings, now: float) -> Result:
 
     status = raw.get("status") if isinstance(raw.get("status"), str) else "unknown"
     hb = m.parse_iso(raw.get("heartbeat_at"))
+    started = m.parse_iso(raw.get("started_at"))
+    # 时间关系必须自洽:心跳不能在未来(超出容忍的时钟误差),开始时间不能晚于心跳。矛盾 = 文件不可信,而不是『新鲜』
+    if hb is not None and (hb - now > CLOCK_SKEW_TOLERANCE or (started is not None and started - hb > CLOCK_SKEW_TOLERANCE)):
+        msg = "录制状态里的时间自相矛盾或在未来(时钟回拨或文件异常),不能据此判断录制情况"
+        return Result(m.section("corrupt", None, as_of=m.mtime(path), now=now, stale_after=stale_after, message=msg), "unknown",
+                      "状态文件时间异常", [_reason("recording", "unknown", msg)])
     age = None if hb is None else max(now - hb, 0.0)
     fresh = age is not None and age <= stale_after
     stopped = status == "stopped"
@@ -465,10 +500,12 @@ def collect_recording(settings: Settings, now: float) -> Result:
         "last_error": text("last_error"), "data_warning": text("data_warning"),
     }
     reasons: list[dict] = []
-    if stopped:
+    if hb is None:
+        # 包括 status=stopped:正常停止应当留下终态时间;没有它就无法证明这是一次正常停止(G8 第 2 轮审查:
+        # 曾经 {"status": "stopped"} 单独一行就返回 ok、as_of 为空)
+        state, message = "unknown", "录制状态里没有心跳时间:无法判断录制进程是否存活或是否正常停止"
+    elif stopped:
         state, message = "ok", None
-    elif hb is None:
-        state, message = "unknown", "录制状态里没有心跳时间:无法判断录制进程是否存活"
     elif not fresh:
         state, message = "stale", f"录制进程心跳已停 {age / 60:.0f} 分钟:进程可能已退出"
     else:
@@ -498,10 +535,11 @@ def collect_recording(settings: Settings, now: float) -> Result:
 # ---------------------------------------------------------------- 研究沙盒
 
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{6}$")
-MAX_JSON_BYTES = 2_000_000
-MAX_SOURCE_BYTES = 1_000_000
-SHA_CACHE_MAX = 256
-_SHA_CACHE: dict[tuple[str, float, int], str] = {}
+MAX_JSON_BYTES = 2_000_000           # 单个运行结果
+MAX_SOURCE_BYTES = 256_000           # 候选策略源码(沙盒配置里的提交上限是 64 KB,留余量)
+MAX_LEDGER_BYTES = 2_000_000         # 提交账本:每天最多几十条
+MAX_OUTBOX_BYTES = 5_000_000         # 待补发队列:最多 200 条,每条几 KB
+MAX_PENDING_LISTED = 50              # 待审候选最多列出多少个
 
 
 def _research_cfg(settings: Settings) -> tuple[dict, str | None]:
@@ -526,18 +564,19 @@ def _inside(root: Path, rel: Any) -> Path | None:
 
 
 def _sha256(path: Path) -> str | None:
+    """文件内容的 SHA-256;读不了或超过上限返回 None(调用方要把它计为『不可读』,不能静默丢弃)。
+
+    **不缓存**(G8 第 2 轮审查):曾按 (路径, mtime, size) 缓存,同长度改动并恢复 mtime 后,已修改的候选会继续显示『已批准』。
+    『已批准』是安全相关的状态,宁可每次请求重新哈希——候选最多 50 个、每个 ≤256 KB,开销可以忽略。
+    """
     try:
-        st = path.stat()
-        key = (str(path), st.st_mtime, st.st_size)
-        if key not in _SHA_CACHE:
-            if st.st_size > MAX_SOURCE_BYTES:
-                return None
-            if len(_SHA_CACHE) >= SHA_CACHE_MAX:
-                _SHA_CACHE.clear()                       # 简单的有界缓存:满了就整体清空(条目很便宜,命中率不重要)
-            _SHA_CACHE[key] = hashlib.sha256(path.read_bytes()).hexdigest()
-        return _SHA_CACHE[key]
+        with path.open("rb") as fh:
+            raw = fh.read(MAX_SOURCE_BYTES + 1)
     except OSError:
         return None
+    if len(raw) > MAX_SOURCE_BYTES:
+        return None
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _headline_of(result: dict) -> str:
@@ -601,8 +640,8 @@ def collect_research(settings: Settings, now: float) -> Result:
         return Result(sec, "unknown", "配置损坏", [_reason("research", "unknown", "研究沙盒配置里的额度取值非法")])
     used, oldest_in_window = 0, None
     try:
-        lines = ledger_path.read_text(encoding="utf-8").splitlines() if ledger_path.exists() else []
-        for line in lines:
+        text = m.read_text_limited(ledger_path, MAX_LEDGER_BYTES) if ledger_path.exists() else ""
+        for line in text.splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -612,33 +651,55 @@ def collect_research(settings: Settings, now: float) -> Result:
             if now - at < window:
                 used += 1
                 oldest_in_window = at if oldest_in_window is None else min(oldest_in_window, at)
-    except (ValueError, KeyError, OSError):
-        sec = m.section("corrupt", None, as_of=m.mtime(ledger_path), now=now, message="提交账本损坏:网关会拒绝所有新提交(fail-closed)")
+    except (ValueError, KeyError, OSError, m.TooLarge):
+        sec = m.section("corrupt", None, as_of=m.mtime(ledger_path), now=now, message="提交账本损坏或异常增长:网关会拒绝所有新提交(fail-closed)")
         return Result(sec, "unknown", "提交账本损坏", [_reason("research", "unknown", "提交账本损坏:研究网关将拒绝新提交,需要人工修复")])
 
-    approvals, _ = m.read_json(approvals_file)
+    # 批准记录:文件不存在 = 没有任何批准(合法);文件存在却读不了 = 『已批准』标记不可信,整个区块判损坏
+    # (G8 第 2 轮审查:曾把损坏当成『0 个批准』,用户无法区分『确实没批准』与『批准文件坏了』)
+    approvals, approvals_err = m.read_json(approvals_file)
+    if approvals_err == "corrupt" or (approvals_err is None and not isinstance(approvals, dict)):
+        sec = m.section("corrupt", None, as_of=m.mtime(approvals_file), now=now, message="批准记录文件损坏或格式不符:无法判断哪些候选已批准")
+        return Result(sec, "unknown", "批准记录损坏", [_reason("research", "unknown", "批准记录损坏:无法判断哪些候选已批准,请人工检查")])
     approved_hashes = set(approvals) if isinstance(approvals, dict) else set()
-    pending = []
-    for p in pending_files[:50]:
+
+    pending, unreadable_pending = [], 0
+    for p in pending_files[:MAX_PENDING_LISTED]:
         sha = _sha256(p)
-        if sha:
-            pending.append({"name": p.name, "sha256": sha, "approved": sha in approved_hashes})
-    recent = []
+        if sha is None:
+            unreadable_pending += 1                        # 读不了或超过上限:计数并暴露,不静默消失
+            continue
+        pending.append({"name": p.name, "sha256": sha, "approved": sha in approved_hashes})
+    unreadable_pending += max(len(pending_files) - MAX_PENDING_LISTED, 0)
+
+    recent, unreadable_runs = [], 0
     for p in runs[: settings.raw["recent_runs"]]:
         body, e = m.read_json(p, retries=0)
         if e is None and isinstance(body, dict):
             recent.append(_brief_run(p.stem, body))
+        else:
+            unreadable_runs += 1
     data = {"quota": {"used": used, "limit": limit, "window_hours": int(cfg["iteration"]["window_hours"]),
                       "next_release_in_seconds": None if oldest_in_window is None else int(round(oldest_in_window + window - now))},
             "approvals_count": len(approved_hashes), "pending": pending, "recent_runs": recent}
-    if used >= limit:
+
+    problems = []
+    if unreadable_runs:
+        problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
+    if unreadable_pending:
+        problems.append(f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
+    reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
+    if problems:
+        level, headline = "warn", "有数据无法显示"
+    elif used >= limit:
         level, headline = "warn", f"额度已用尽 {used}/{limit}"
         reasons = [_reason("research", "warn", f"迭代额度已用尽({used}/{limit}),新候选会被网关拒绝")]
     else:
-        level, headline, reasons = "ok", f"额度 {used}/{limit}", []
+        level, headline = "ok", f"额度 {used}/{limit}"
     # 研究数据是每次请求现读的快照,不依赖周期性写入的进程,不判过期;as_of 取最近一次活动
     activity = [t for t in (m.mtime(ledger_path), m.mtime(runs[0]) if runs else None) if t is not None]
-    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now), level, headline, reasons)
+    return Result(m.section("ok", data, as_of=max(activity) if activity else None, now=now, message=";".join(problems) or None),
+                  level, headline, reasons)
 
 
 def get_run(settings: Settings, run_id: str) -> dict | None:

@@ -14,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+MAX_JSON_FILE_BYTES = 2_000_000          # 状态 JSON(风控状态、录制状态、批准记录、运行结果)的读取上限
 LEVELS = ("ok", "warn", "critical", "unknown")
 _RANK = {"ok": 0, "warn": 1, "unknown": 2, "critical": 3}     # unknown 比 warn 更糟:不知道比知道有点问题更危险
 
@@ -68,9 +69,11 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
     last_error = "corrupt"
     for attempt in range(retries + 1):
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_text_limited(path, MAX_JSON_FILE_BYTES)
         except FileNotFoundError:
             return None, "missing"
+        except TooLarge:
+            return None, "corrupt"                   # 状态 JSON 都很小;异常增长的文件不读,也不重试
         except (PermissionError, OSError):
             last_error = "corrupt"
         else:

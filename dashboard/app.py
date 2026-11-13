@@ -21,7 +21,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from dashboard import auth, collectors as col, models as m
@@ -72,29 +72,65 @@ def error_response(status: int, message: str, code: str | None = None, headers: 
 
 # ---------------------------------------------------------------- 静态托管:只服务构建清单内、哈希匹配的文件
 
+MAX_STATIC_BYTES = 20_000_000
+
+
 class StaticSite:
+    """只服务构建清单内的文件,而且**每次请求都重新校验哈希**。
+
+    G8 第 2 轮审查:曾经哈希只在创建应用时校验一次,之后文件被替换仍会未经鉴权公开返回,还带一年 immutable 缓存。
+    现在 read() 每次把文件读入内存、对这份字节算哈希、对上清单才返回——响应体就是被校验过的这份字节,
+    不存在『校验之后又被替换』的 check-then-use 竞态。不用 mtime/size 判断变化:『同长度改动并恢复 mtime』可以绕过它。
+    前端构建产物是几十到几百 KB 且被浏览器缓存,每次重算哈希的开销可以忽略。
+    """
+
     def __init__(self, static_dir: Path) -> None:
-        self.files: dict[str, Path] = {}
-        self.rejected: list[str] = []
-        manifest = static_dir / "manifest.json"
+        self.expected: dict[str, str] = {}              # 相对路径 -> 清单里的 SHA-256
+        self._paths: dict[str, Path] = {}
+        self.rejected: list[str] = []                   # 启动时就缺失/对不上的(用于启动告警)
+        self.root = static_dir.resolve()
         try:
-            listing = json.loads(manifest.read_text(encoding="utf-8")).get("files", {})
+            listing = json.loads((static_dir / "manifest.json").read_text(encoding="utf-8")).get("files", {})
         except (OSError, ValueError, AttributeError):
             listing = {}
-        root = static_dir.resolve()
+        if not isinstance(listing, dict):
+            listing = {}
         for rel, digest in listing.items():
-            path = (root / rel).resolve()
-            if path.is_file() and root in path.parents and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
-                self.files[rel.replace("\\", "/")] = path
+            key = str(rel).replace("\\", "/")
+            path = (self.root / key).resolve()
+            if isinstance(digest, str) and self.root in path.parents:
+                self.expected[key], self._paths[key] = digest.lower(), path
             else:
-                self.rejected.append(rel)            # 缺失或哈希对不上:不服务
+                self.rejected.append(str(rel))           # 路径越界或哈希格式不对:永不服务
+        for key in list(self.expected):
+            if self.read(key) is None:
+                self.rejected.append(key)
+
+    def read(self, rel: str) -> tuple[bytes, str] | None:
+        """返回 (已校验的字节, content-type);不在清单、读不了、哈希对不上都返回 None。"""
+        path = self._paths.get(rel)
+        if path is None:
+            return None
+        try:
+            if path.resolve().parent.joinpath(path.name) != path or self.root not in path.resolve().parents:
+                return None                              # 符号链接/junction 指向静态目录之外
+            with path.open("rb") as fh:
+                raw = fh.read(MAX_STATIC_BYTES + 1)
+        except OSError:
+            return None
+        if len(raw) > MAX_STATIC_BYTES or hashlib.sha256(raw).hexdigest() != self.expected[rel]:
+            return None
+        return raw, mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
     @property
     def has_index(self) -> bool:
-        return "index.html" in self.files
+        """index.html 当前是否可用(每次现查:被篡改或删除后回退到占位页)。"""
+        return self.read("index.html") is not None
 
-    def lookup(self, rel: str) -> Path | None:
-        return self.files.get(rel)
+    @property
+    def files(self) -> dict[str, Path]:
+        """启动时通过校验的文件(兼容旧属性,供测试断言)。"""
+        return {k: v for k, v in self._paths.items() if k not in self.rejected}
 
 
 # ---------------------------------------------------------------- 应用
@@ -153,9 +189,19 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
 
     app.state.require_token = require_token
 
+    def head_ok() -> Response:
+        return Response(status_code=200, headers={"Cache-Control": "no-store"})
+
     def get(path: str):
-        """API 路由:一律 GET/HEAD,且一律带鉴权依赖。"""
-        return app.api_route(path, methods=list(ALLOWED_METHODS), dependencies=[Depends(require_token)])
+        """API 路由:GET 执行处理函数;HEAD 只验证令牌与路由、不执行采集、没有 body。两者都带鉴权依赖。
+
+        G8 第 2 轮审查:曾让 HEAD 也走完整处理函数——/api/overview 的 HEAD 会跑全部文件采集,并在 ASGI 层发出完整 JSON body
+        (真实 uvicorn 会丢弃 body,但应用本身语义不对,HEAD 也不该是廉价探活之外的昂贵操作)。
+        HEAD 恒为 200(只表示『令牌有效且路由存在』),不反映数据是否存在;要看数据请用 GET。"""
+        def decorate(func):
+            app.api_route(path, methods=["HEAD"], dependencies=[Depends(require_token)], include_in_schema=False)(head_ok)
+            return app.api_route(path, methods=["GET"], dependencies=[Depends(require_token)])(func)
+        return decorate
 
     def get_public(path: str):
         """静态页与 SPA 回退:无数据,不需要令牌。"""
@@ -212,8 +258,9 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
 
     # ---- 静态页:不需要令牌;SPA 回退只对不含扩展名的路径生效,且永不接管 /api ----
     def index_response() -> Response:
-        if site.has_index:
-            return FileResponse(site.lookup("index.html"), media_type="text/html", headers={"Cache-Control": "no-cache"})
+        served = site.read("index.html")                      # 每次现读并校验;被篡改/删除就回退占位页,而不是发出被改过的页面
+        if served is not None:
+            return Response(content=served[0], media_type="text/html", headers={"Cache-Control": "no-cache"})
         return HTMLResponse(PLACEHOLDER, headers={"Cache-Control": "no-cache"})
 
     @get_public("/")
@@ -224,10 +271,10 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     def static_or_spa(rel_path: str):
         if rel_path == "api" or rel_path.startswith("api/") or rel_path.startswith("/") or "//" in rel_path:
             return error_response(404, "不存在")                                   # /api 一律不进前端;含双斜杠的歧义路径不进前端
-        path = site.lookup(rel_path)
-        if path is not None:
+        served = site.read(rel_path)
+        if served is not None:
             headers = {"Cache-Control": "public, max-age=31536000, immutable" if rel_path.startswith("assets/") else "no-cache"}
-            return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream", headers=headers)
+            return Response(content=served[0], media_type=served[1], headers=headers)
         if any(r.match(rel_path) for r in FRONTEND_ROUTES):                       # 前端路由(/trading 等)
             return index_response()
         return error_response(404, "不存在")

@@ -418,3 +418,88 @@ def test_every_api_route_declares_the_auth_dependency(env):
     for r in api_routes:
         deps = [d.call for d in r.dependant.dependencies]
         assert app.state.require_token in deps, r.path
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex #9 #11)
+
+def test_a_static_file_replaced_after_startup_is_no_longer_served(env):
+    """曾经:清单哈希只在创建应用时校验一次,之后文件被替换仍会未经鉴权公开返回(还带一年 immutable 缓存)。"""
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"console.log('SAFE')"})
+    c = client(settings)
+    assert c.get("/assets/app.js").status_code == 200
+    (d / "assets" / "app.js").write_bytes(b"SECRET C:\Users\alice\.env TOKEN=abc")             # 启动之后被替换
+    r = c.get("/assets/app.js")
+    assert r.status_code == 404 and "SECRET" not in r.text
+
+
+def test_a_static_file_replaced_by_same_size_content_with_restored_mtime_is_still_rejected(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"AAAA"})
+    c = client(settings)
+    st = (d / "assets" / "app.js").stat()
+    (d / "assets" / "app.js").write_bytes(b"BBBB")
+    import os
+    os.utime(d / "assets" / "app.js", ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert c.get("/assets/app.js").status_code == 404
+
+
+def test_a_deleted_static_file_is_a_404_not_a_500(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"1"})
+    c = client(settings)
+    (d / "assets" / "app.js").unlink()
+    assert c.get("/assets/app.js").status_code == 404
+
+
+def test_index_html_replaced_after_startup_falls_back_to_the_placeholder_not_the_tampered_page(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>"})
+    c = client(settings)
+    (d / "index.html").write_bytes(b"<script>steal()</script>")
+    assert "steal()" not in c.get("/").text and "steal()" not in c.get("/trading").text
+
+
+def test_head_on_an_api_route_requires_auth_and_sends_no_body_at_the_asgi_level(env):
+    """曾经:HEAD 会执行完整采集,并在 ASGI 层发出完整 JSON body(真实 uvicorn 会丢弃,但应用本身语义不对)。"""
+    _, settings = env
+    app = appmodapp(settings)
+    status, _ = raw_method(app, "HEAD", "/api/overview")
+    assert status == 401                                                 # 无令牌:HEAD 同样要鉴权(错误响应可以带说明正文)
+    status, body = raw_method(app, "HEAD", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert status == 200 and body == ""                                  # 有令牌:成功的 HEAD 没有 body
+
+
+def test_head_does_not_run_the_expensive_collectors(env, monkeypatch):
+    _, settings = env
+    calls = []
+    monkeypatch.setattr(appmod.col, "collect_overview", lambda *a, **k: (calls.append(1), {})[1])
+    app = appmodapp(settings)
+    raw_method(app, "HEAD", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert calls == []
+    raw_method(app, "GET", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert calls == [1]
+
+
+def appmodapp(settings):
+    return appmod.create_app(settings, TOKEN, clock=lambda: NOW)
+
+
+def raw_method(app, method, path, headers=()):
+    import asyncio
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method, "scheme": "http", "path": path,
+             "raw_path": path.encode(), "query_string": b"", "headers": [(b"host", b"127.0.0.1")] + list(headers),
+             "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8770)}
+    out = {"status": None, "body": b""}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+
+    asyncio.run(app(scope, receive, send))
+    return out["status"], out["body"].decode("utf-8", "replace")

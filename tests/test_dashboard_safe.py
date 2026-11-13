@@ -113,3 +113,67 @@ def test_every_contract_fixture_survives_sanitize_unchanged():
             continue
         data = json.loads(p.read_text(encoding="utf-8"))
         assert safe.sanitize(data) == data, p.stem
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex #8):净化层的具体泄露输入
+
+def test_a_numeric_account_id_is_masked_too_not_only_strings():
+    """曾经:ACCOUNT_KEYS 命中后仍要求值是 str,{"account_id": 66170099} 原样返回。"""
+    assert safe.sanitize({"account_id": 66170099})["account_id"] == "66****99"
+    assert safe.sanitize({"account_id": 66170099.0})["account_id"] != 66170099.0
+
+
+@pytest.mark.parametrize("key", ["account_no", "accountNo", "account_number", "AccountNumber", "broker_account", "login_id", "loginId",
+                                 "investor_id", "InvestorID", "user_name", "UserName", "user-id", "client_account"])
+def test_account_like_keys_are_masked_regardless_of_spelling(key):
+    out = safe.sanitize({key: "66170099"})[key]
+    assert "66170099" not in str(out) and out != "66170099"
+
+
+@pytest.mark.parametrize("key", ["pwd", "PWD", "passwd", "authorization", "Authorization", "cookie", "Set-Cookie", "session", "session_id", "sessionid",
+                                 "x-api-key", "access_token", "refresh_token", "client_secret", "credentials", "private-key"])
+def test_credential_like_keys_are_hidden_regardless_of_spelling(key):
+    assert safe.sanitize({key: "s3cr3t-value"})[key] == "***"
+
+
+@pytest.mark.parametrize("text,leak", [
+    ("PASSWORD=hunter2", "hunter2"), ("password: hunter2 ok", "hunter2"), ("pwd=hunter2", "hunter2"), ("passwd = hunter2", "hunter2"),
+    ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"), ("authorization=Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+    ("Cookie: sid=abc123def456; theme=dark", "abc123def456"), ("api_key=AKIA1234567890", "AKIA1234567890"), ("token=abcdef123456", "abcdef123456"),
+    ("secret: s3cr3tvalue", "s3cr3tvalue"), ("AUTH_CODE=ABCDEF0123456789", "ABCDEF0123456789"),
+    (r"UNC=\\server\share\secret\file.txt", "server"), (r"见 \\?\C:\Users\me\.env", "Users"), (r"\\fileserver\finance\2026.xlsx", "fileserver"),
+    (r"\\.\pipe\trading-secret", "trading-secret"), (r"路径 \\nas01\backup\accounts.csv 不可读", "nas01"),
+    ("读取 C%3A%5CUsers%5Cme%5C.env 失败", "Users%5Cme"), ("path=%2Fhome%2Favery%2Finvest%2F.env", "avery"), ("see c%3a%5cdev%5cprojects", "dev%5cprojects"),
+    ("打开 /private/var/folders/xx/secret.txt", "/private/var"), ("in /workspace/invest/data/state/x.json", "/workspace/invest"),
+    ("x /Volumes/Backup/accounts.csv", "/Volumes/Backup"), ("/usr/local/lib/python3.13/site-packages/x.py", "/usr/local"),
+])
+def test_text_leaks_found_by_the_second_reviewer_are_scrubbed(text, leak):
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+@pytest.mark.parametrize("text", [
+    "候选评估(类 Candidate)\n结论: 未通过\n夏普 -1.84,往返 156 笔", "passed 3 of 5 checks", "bypass flag is off", "pass rate 0.5",
+    "token bucket 容量 8", "2026/11/12 09:00:01", "比例 1/2/3", "sha256 9f2c5a1d0b7e4c33a1f0e8d6b2c4a7f1", "c2701.DCE 多开 1@2400",
+    "请求 /api/trading 返回 401", "文档在 docs/web/README.md", "key=value 但不是敏感词: name=demo", "version 1.0.0",
+])
+def test_ordinary_text_with_similar_words_is_left_alone(text):
+    assert safe.scrub_text(text) == text
+
+
+def test_scrub_cannot_be_defeated_by_unicode_lookalikes_of_the_key_names():
+    """全角/变体写法:先做 NFKC 规范化再判断键名。"""
+    assert safe.sanitize({"ｐａｓｓｗｏｒｄ": "x", "ＰＷＤ": "y"}) == {"ｐａｓｓｗｏｒｄ": "***", "ＰＷＤ": "***"}
+
+
+def test_an_account_key_holding_an_object_is_recursed_into_not_stringified():
+    """回归(契约示例暴露):live.data.account 是资金对象 {balance, ...},键名恰好叫 account。
+    账号掩码只对标量(字符串/数字)生效;容器必须继续递归,其中真正的账号键仍会被各自掩码。"""
+    out = safe.sanitize({"account": {"balance": 9870.5, "available": 8900.0, "account_id": "66170099"}})
+    assert out["account"]["balance"] == 9870.5 and out["account"]["available"] == 8900.0
+    assert out["account"]["account_id"] == "66****99"
+    assert safe.sanitize({"account": ["a", "b"]})["account"] == ["a", "b"]
+
+
+def test_a_secret_key_holding_an_object_is_hidden_entirely():
+    assert safe.sanitize({"credentials": {"user": "x", "pass": "y"}}) == {"credentials": "***"}

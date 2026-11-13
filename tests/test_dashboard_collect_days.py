@@ -345,3 +345,87 @@ def test_warm_up_primes_the_cache_so_the_first_request_does_not_pay_the_cold_par
 def test_warm_up_never_raises_even_when_everything_is_broken(tmp_path, monkeypatch):
     monkeypatch.setattr(col, "_days", lambda s: (_ for _ in ()).throw(RuntimeError("boom")))
     col.warm_up(settings(tmp_path))                             # 预热只是优化,失败不能阻止服务启动
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex):垃圾日志不是证据
+
+def _garbage_log(tmp_path, day="20261112", body=b"garbage only\nnothing recognisable here\n"):
+    d = tmp_path / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"vt_{day}.log"
+    p.write_bytes(body)
+    os.utime(p, (NOW - 5, NOW - 5))
+    return p
+
+
+def test_a_fresh_garbage_log_is_not_a_clean_day_and_not_evidence_of_activity(tmp_path):
+    """曾经:只排除了空文件;任何新鲜的非空垃圾文件都被解释成『干净的一天』,并给 alerts 提供『数据仍新鲜』的证据。"""
+    _garbage_log(tmp_path)
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.section["state"] in ("corrupt", "missing"), collect.__name__
+        assert r.level == "unknown" and r.section["data"] is None, collect.__name__
+
+
+def test_garbage_does_not_hide_behind_a_valid_log_but_also_does_not_poison_it(tmp_path):
+    log(tmp_path, "20261111", CLEAN)
+    _garbage_log(tmp_path)                                                   # 另一天是垃圾
+    d = col.collect_days(settings(tmp_path), NOW).section["data"]
+    assert [x["day"] for x in d["days"]] == ["2026-11-11"]                    # 垃圾那天不出现,更不会显示成『无异常』
+
+
+def test_a_log_with_one_recognisable_line_among_noise_counts(tmp_path):
+    p = _garbage_log(tmp_path, body=b"junk\n2026-11-12 09:00:01.000 | INFO | r | \xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\njunk\n")
+    d = col.collect_days(settings(tmp_path), NOW).section["data"]
+    assert d["days"][0]["started"] == 1
+
+
+def test_touching_an_old_garbage_file_cannot_make_alerts_look_fresh(tmp_path):
+    old = log(tmp_path, "20261110", CLEAN)
+    os.utime(old, (NOW - 100 * 3600, NOW - 100 * 3600))
+    _garbage_log(tmp_path)                                                   # mtime 很新
+    r = col.collect_alerts(settings(tmp_path), NOW)
+    assert r.section["state"] == "stale" and r.section["age_seconds"] >= 99 * 3600
+
+
+def test_logs_that_exist_but_are_all_unreadable_are_corrupt_with_an_honest_message_not_missing(tmp_path):
+    """『没找到日志』(进程可能没跑过)与『日志在但读不懂』(格式变了/被写坏)对排查方向完全不同。"""
+    _garbage_log(tmp_path)
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.section["state"] == "corrupt", collect.__name__
+        assert "无法识别" in r.section["message"], collect.__name__
+    assert col.collect_days(settings(tmp_path), NOW).level == "unknown"
+
+
+def test_no_log_files_at_all_is_still_missing(tmp_path):
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "missing"
+    (tmp_path / "runtime" / "vntrader" / "log").mkdir(parents=True)
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "missing"
+
+
+# ---------------------------------------------------------------- 读取上限(codex #10):异常增长的文件不能在单次请求里耗尽内存
+
+def test_an_oversized_outbox_is_reported_not_read_into_memory(tmp_path):
+    ob = tmp_path / "data" / "state" / "webhook_outbox.jsonl"
+    ob.parent.mkdir(parents=True)
+    ob.write_bytes(b'{"time": "2026-11-12T09:00:00"}\n' * 400_000)           # ~12 MB,远超上限
+    log(tmp_path, "20261112", CLEAN)
+    r = col.collect_alerts(settings(tmp_path), NOW)
+    assert r.section["state"] == "corrupt" and r.level == "unknown" and "异常增长" in (r.section["message"] or "")
+
+
+def test_an_outbox_just_under_the_limit_is_still_read(tmp_path):
+    ob = tmp_path / "data" / "state" / "webhook_outbox.jsonl"
+    ob.parent.mkdir(parents=True)
+    ob.write_bytes(entry(10)["time"].encode() and (json.dumps(entry(10)) + "\n").encode() * 50)
+    log(tmp_path, "20261112", CLEAN)
+    assert col.collect_alerts(settings(tmp_path), NOW).section["data"]["outbox"]["pending"] == 50
+
+
+def test_read_json_refuses_huge_state_files(tmp_path):
+    from dashboard import models
+    p = tmp_path / "big.json"
+    p.write_text('{"a": "' + "x" * 3_000_000 + '"}', encoding="utf-8")
+    data, err = models.read_json(p, retries=0)
+    assert data is None and err == "corrupt"

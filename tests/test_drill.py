@@ -560,6 +560,21 @@ def test_a_failed_cancel_does_not_break_the_drill():
     d._cancel_order(_Boom(), "VT.1", "c2701", Exchange.DCE)     # 不抛异常即通过
 
 
+def test_cancel_strips_the_gateway_prefix_from_the_vt_orderid():
+    """send_order 返回 vt_orderid;撤单请求必须用不带网关前缀的 orderid,否则 vnpy_ctp 解析失败、单子没撤掉。"""
+    seen = []
+
+    class _Main:
+        def cancel_order(self, req, gateway_name):
+            seen.append((req.orderid, gateway_name))
+
+    class _RT:
+        main = _Main()
+
+    d._cancel_order(_RT(), "CTP.1_2090429828_1", "c2701", Exchange.DCE)
+    assert seen == [("1_2090429828_1", "CTP")]
+
+
 def test_the_drill_lists_its_scenarios():
     assert d.main(["--list"]) == 0
     assert "tick-stale" in d.SCENARIOS
