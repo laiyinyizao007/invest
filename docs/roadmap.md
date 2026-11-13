@@ -20,7 +20,7 @@
 |---|---|---|
 | `/research/backtest` | 提交沙盒回测(策略文件须位于 pending 目录) | `scripts/backtest_lib.py::run_engine_bars` |
 | `/research/optimize` | 触发 walk-forward 滚动寻优(日期断言照常生效) | `scripts/walk_forward_optimizer.py` 公开函数 |
-| `/research/gate` | 查询候选的晋级 8 条结果 | `risk/promotion_gate.py::check_gate` |
+| `/research/gate` | 查询候选的晋级 9 条结果 | `risk/promotion_gate.py::check_gate` |
 | `/research/results` | 查询结果摘要与 Trace 式诊断书 | 结果文件读取 + 确定性诊断逻辑 |
 | `/research/data` | 列出可用数据段及其「测试段已消费」状态 | 数据清单 |
 
@@ -71,7 +71,7 @@ flowchart TB
     BL --> O15[scripts/optimize_15m.py 15m 三段基准]
     BL --> WFO[scripts/walk_forward_optimizer.py 滚动窗口+三层隔离]
     ST0[strategies/random_entry_strategy.py 随机对照] --> BL
-    PG[risk/promotion_gate.py 晋级 8 条·唯一闸门] -. 门槛检查 .-> OPT
+    PG[risk/promotion_gate.py 晋级 9 条·唯一闸门] -. 门槛检查 .-> OPT
     PG -.- O15
     PG -.- WFO
     PP[参数平原 已实现 risk/plateau.py;PBO/DSR 规划位→阶段三]

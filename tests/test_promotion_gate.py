@@ -17,7 +17,7 @@ from risk.promotion_gate import (  # noqa: E402
 GOOD = CandidateMetrics(
     oos_sharpe=2.0, oos_years=5.0, max_drawdown_pct=-12.0, max_drawdown_yuan=-1200,
     round_trips=200, random_entry_percentile=98.0, stress_sharpe=1.4,
-    data_adjusted=True, parameter_on_plateau=True,
+    data_adjusted=True, parameter_on_plateau=True, dsr=0.99, n_trials=50,
 )
 
 
@@ -61,6 +61,7 @@ def test_good_candidate_passes():
         ({"stress_sharpe": 0.4}, "成本翻倍"),
         ({"data_adjusted": False}, "未复权"),
         ({"parameter_on_plateau": False}, "参数高原"),
+        ({"dsr": 0.80}, "DSR"),
     ],
 )
 def test_each_criterion_fails_independently(change, keyword):
@@ -90,6 +91,32 @@ def test_non_positive_years_is_reported():
 def test_thresholds_are_configurable():
     loose = GateThresholds(min_round_trips=50)
     assert check_gate(replace(GOOD, round_trips=80), loose) == []
+
+
+def test_dsr_threshold_is_locked_at_0_95():
+    assert GateThresholds().min_dsr == 0.95
+
+
+def test_dsr_boundary_is_inclusive():
+    assert check_gate(replace(GOOD, dsr=0.95)) == []
+    assert any("DSR" in f for f in check_gate(replace(GOOD, dsr=0.9499)))
+
+
+def test_missing_dsr_fails_closed():
+    """没有算 DSR(例如旧格式的指标文件)不能放行。"""
+    fails = check_gate(replace(GOOD, dsr=None))
+    assert any("DSR" in f and "未计算" in f for f in fails)
+
+
+def test_dsr_without_trial_count_fails_closed():
+    """DSR 必须带着试验次数:n_trials 缺失(0)意味着无法核对去通胀是否到位。"""
+    fails = check_gate(replace(GOOD, n_trials=0))
+    assert any("试验次数" in f for f in fails)
+
+
+def test_dsr_failure_message_names_trials():
+    fails = check_gate(replace(GOOD, dsr=0.4, n_trials=300))
+    assert any("300" in f for f in fails)
 
 
 def test_all_failures_are_reported_together():

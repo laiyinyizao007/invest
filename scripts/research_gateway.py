@@ -30,6 +30,7 @@ from typing import Callable
 import bootstrap
 import research_config as rc
 import research_sandbox as rs
+from risk.trial_ledger import TrialLedgerError, record_trials
 
 ROUTES = {
     ("GET", "/research/data"),
@@ -295,6 +296,10 @@ class GatewayApp:
             sha = hashlib.sha256(raw).hexdigest()
             window = self.cfg["iteration"]["window_hours"] * 3600.0
             kept = [e for e in entries if now - e["at"] < window]
+            try:                                                    # 试验账本最先写:损坏则整个提交失败、什么都没占用;
+                record_trials(self.paths["results_dir"] / "trials.jsonl", "submission", 1, at=now)   # 之后任何一步失败,多记的试验也保留(只增不减)
+            except TrialLedgerError as exc:
+                return 500, {"error": str(exc)}
             try:                                                    # 先记账再落文件:崩溃只会多扣一个额度,不会多放一个
                 self._write_ledger(kept + [{"at": now, "name": name, "sha256": sha}])
             except OSError as exc:

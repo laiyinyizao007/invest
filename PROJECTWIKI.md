@@ -97,7 +97,7 @@ flowchart LR
   - [`20261109-china-timezone.md`](docs/adr/20261109-china-timezone.md):进程统一为中国时区
   - [`20261109-account-risk-budget.md`](docs/adr/20261109-account-risk-budget.md):1 万元 / 300 元预算,超预算则不交易,主测玉米
   - [`20261109-negative-backtest-result.md`](docs/adr/20261109-negative-backtest-result.md):如实记录"未发现优势"与方法学纪律
-  - [`20261109-promotion-gate.md`](docs/adr/20261109-promotion-gate.md):策略晋级门槛(8 条)
+  - [`20261109-promotion-gate.md`](docs/adr/20261109-promotion-gate.md):策略晋级门槛(9 条;第 9 条 DSR 见 [`20261113-evolution-engine.md`](docs/adr/20261113-evolution-engine.md))
   - [`20261109-account-risk-lock.md`](docs/adr/20261109-account-risk-lock.md):账户级双层熔断、平仓永远放行、紧急平仓防重复下单
   - [`20261109-deployment-and-live-mode.md`](docs/adr/20261109-deployment-and-live-mode.md):实盘模式策略、运行时对账、通知、容器化
   - [`20261110-baseline-15m.md`](docs/adr/20261110-baseline-15m.md):15 分钟基准的事前方案、成绩单与"测试段已被使用"的约束
@@ -167,7 +167,7 @@ flowchart LR
 
 **风控(纯逻辑在 `risk/`,vn.py 集成在 `trading/`)**
 - `risk/risk_guard.py`:单笔预算闸、只收紧的移动止损、策略层连亏熔断。
-- `risk/promotion_gate.py`:策略晋级门槛(8 条),纯函数。
+- `risk/promotion_gate.py`:策略晋级门槛(9 条,含 DSR ≥ 0.95),纯函数;`risk/dsr.py`、`risk/trial_ledger.py`:DSR 与试验次数账本(Issue #15)。
 - `risk/account_guard.py`:账户级双层熔断(当日 600 / 累计 2000)、原子落盘、解锁冷却与历史、非策略委托计数。
 - `risk/order_policy.py`:CTP 错误码优先的废单三级分类与有限重试策略。
 - `risk/live_admission.py`:生产 API 的实盘准入检查(需晋级门槛批准文件)。

@@ -538,3 +538,100 @@ def test_review_refuses_when_file_changes_while_user_is_reading(tree):
     with pytest.raises(api.JobError):
         api.review_job("s.py", input_fn=swap_then_say_yes, write=lambda _: None)
     assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+# ---------- 试验记账:账本在可信的父进程读写,子进程只拿到一个数字 ----------
+
+def _trials(tree):
+    from risk.trial_ledger import total_trials
+    return total_trials(tree / "data" / "research" / "trials.jsonl")
+
+
+def _seed_trials(tree, n):
+    from risk.trial_ledger import record_trials
+    record_trials(tree / "data" / "research" / "trials.jsonl", "submission", n, at=1.0)
+
+
+def _arg(cmd, name):
+    return cmd[cmd.index(name) + 1]
+
+
+def test_evaluate_job_hands_the_child_the_prior_trial_count(tree, monkeypatch):
+    make_strategy(tree)
+    _seed_trials(tree, 5)
+    seen = {}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: seen.update(cmd=cmd) or
+                        {"passed": False, "failures": [], "params": None, "selection": {"n_cells": 27}, "metrics": {},
+                         "trials": {"prior": 5, "grid_cells": 27, "total": 32}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _arg(seen["cmd"], "--prior-trials") == "5"
+
+
+def test_evaluate_job_records_the_grid_cells_the_child_consumed(tree, monkeypatch):
+    make_strategy(tree)
+    _seed_trials(tree, 5)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout:
+                        {"passed": False, "failures": [], "params": None, "selection": {"n_cells": 27}, "metrics": {},
+                         "trials": {"prior": 5, "grid_cells": 27, "total": 32}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 32
+
+
+def test_failed_evaluations_still_consume_trials(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout:
+                        {"passed": False, "failures": ["无法选参: x"], "params": None, "selection": {"n_cells": 27},
+                         "kind_detail": "selection-only", "trials": {"prior": 0, "grid_cells": 27, "total": 27}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 54
+
+
+def test_strategy_errors_do_not_write_trials(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "GridError", "message": "x"}})
+
+    api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    assert _trials(tree) == 0
+
+
+def test_corrupt_trial_ledger_refuses_before_spawning(tree, monkeypatch):
+    make_strategy(tree)
+    (tree / "data" / "research").mkdir(parents=True)
+    (tree / "data" / "research" / "trials.jsonl").write_text("garbage\n", encoding="utf-8")
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("账本损坏不得启动子进程"))
+
+    with pytest.raises(api.JobError) as exc:
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+    assert exc.value.code == api.EXIT_REFUSED and "试验账本" in exc.value.message
+
+    with pytest.raises(api.JobError):
+        api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+
+
+def test_gate_job_counts_itself_as_at_least_one_trial(tree, monkeypatch):
+    make_strategy(tree)
+    seen = {}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: seen.update(cmd=cmd) or {"passed": False, "failures": [], "metrics": {}})
+
+    api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+    assert _arg(seen["cmd"], "--prior-trials") == "1"                 # 账本为空也不能给 0
+
+    _seed_trials(tree, 40)
+    api.gate_job(strategy="s.py", cls="S", params={}, plateau=(False, "n"), confirm=True)
+    assert _arg(seen["cmd"], "--prior-trials") == "40"
+
+
+def test_child_parsers_accept_prior_trials():
+    parser = api.build_parser()
+    e = parser.parse_args(["_evaluate_child", "--file", "f", "--cls", "S", "--random-runs", "5", "--sha256", "a", "--prior-trials", "9"])
+    g = parser.parse_args(["_gate_child", "--file", "f", "--cls", "S", "--params", "{}", "--on-plateau", "0", "--sha256", "a",
+                           "--random-runs", "5", "--prior-trials", "9"])
+    assert e.prior_trials == 9 and g.prior_trials == 9

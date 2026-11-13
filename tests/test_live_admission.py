@@ -20,7 +20,7 @@ NOW = datetime(2026, 11, 11, 10, 0)
 
 PASSING = CandidateMetrics(oos_sharpe=2.0, oos_years=6.0, max_drawdown_pct=10.0, max_drawdown_yuan=1200.0,
                            round_trips=200, random_entry_percentile=99.0, stress_sharpe=1.5,
-                           data_adjusted=True, parameter_on_plateau=True)
+                           data_adjusted=True, parameter_on_plateau=True, dsr=0.99, n_trials=50)
 FAILING = CandidateMetrics(oos_sharpe=-1.08, oos_years=2.5, max_drawdown_pct=22.0, max_drawdown_yuan=2200.0,
                            round_trips=70, random_entry_percentile=40.0, stress_sharpe=-2.0,
                            data_adjusted=True, parameter_on_plateau=False)

@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,7 @@ import bootstrap
 import research_config as rc
 import research_sandbox as rs
 from risk.report import render_report
+from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
 
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
@@ -78,6 +80,31 @@ def describe_error(exc: BaseException) -> dict:
     msg = _PATH_LIKE.sub("<path>", msg)
     msg = "".join(ch for ch in msg if ch.isprintable())[:200]
     return {"type": name.split(".")[-1], "message": msg}
+
+
+def trials_path(paths: dict) -> Path:
+    return Path(paths["results_dir"]) / "trials.jsonl"
+
+
+def prior_trials(paths: dict) -> int:
+    """累计试验次数,供子进程计算 DSR。账本损坏则拒绝作业(fail-closed):少记试验等于放水。"""
+    try:
+        return total_trials(trials_path(paths))
+    except TrialLedgerError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
+def record_grid_trials(paths: dict, body: dict) -> None:
+    """按子进程回报的 trials.grid_cells 记账;失败的评估同样消耗试验。子进程报错(无结果)时不记。"""
+    trials = body.get("trials")
+    if not isinstance(trials, dict):
+        return
+    cells = trials.get("grid_cells")
+    if isinstance(cells, int) and not isinstance(cells, bool) and cells > 0:
+        try:
+            record_trials(trials_path(paths), "grid_cell", cells, at=time.time())
+        except TrialLedgerError as exc:
+            raise JobError(EXIT_REFUSED, str(exc)) from exc
 
 
 class JobError(Exception):
@@ -289,10 +316,12 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
+    trials = max(prior_trials(paths), 1)          # 这次门槛评估本身至少算一次试验,账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
-           "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path)]
+           "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path),
+           "--prior-trials", str(trials)]
     body = spawn_child(cmd, timeout)
     if "error" in body:
         result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
@@ -334,10 +363,13 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     require_clean(path, cfg)
     check_approval(path, paths, confirm)
     source = path.read_text(encoding="utf-8")
+    prior = prior_trials(paths)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path)]
+           "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path), "--prior-trials", str(prior)]
     body = spawn_child(cmd, timeout)
+    if "error" not in body:
+        record_grid_trials(paths, body)
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
@@ -433,7 +465,8 @@ def run_gate_child(args) -> int:
     try:
         result = run_gate(candidate_cls=cls, params=json.loads(args.params), windows=windows, bars=bars,
                           runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=args.random_runs,
-                          data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL)
+                          data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
+                          prior_trials=args.prior_trials)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -471,7 +504,7 @@ def run_evaluate_child(args) -> int:
             candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
             random_runs=args.random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
             min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows])
+            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=args.prior_trials)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -573,11 +606,13 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("file", "cls", "params", "on-plateau", "sha256"):
         gchild.add_argument(f"--{name}", required=True)
     gchild.add_argument("--random-runs", type=int, required=True)
+    gchild.add_argument("--prior-trials", type=int, default=None)
     gchild.set_defaults(func=run_gate_child)
     echild = sub.add_parser("_evaluate_child")  # 内部使用
     for name in ("file", "cls", "sha256"):
         echild.add_argument(f"--{name}", required=True)
     echild.add_argument("--random-runs", type=int, required=True)
+    echild.add_argument("--prior-trials", type=int, default=None)
     echild.set_defaults(func=run_evaluate_child)
     return parser
 

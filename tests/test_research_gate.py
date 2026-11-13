@@ -181,3 +181,48 @@ def test_evaluation_result_trims_the_score_table_but_keeps_the_verdict():
     assert "scores" not in result["selection"].get("plateau", {})
     assert result["selection"]["n_cells"] == 27
     json.dumps(result, ensure_ascii=False)
+
+
+# ---------- 试验记账 / DSR ----------
+
+def test_gate_without_prior_trials_fails_closed_on_dsr():
+    result = run()
+
+    assert result["metrics"]["dsr"] is None and result["metrics"]["n_trials"] == 0
+    assert any("DSR" in f for f in result["failures"])
+    assert result["passed"] is False
+
+
+def test_gate_uses_prior_trials_as_the_deflation_count():
+    result = run(prior_trials=40)
+
+    assert result["metrics"]["n_trials"] == 40
+    assert result["metrics"]["dsr"] is not None
+
+
+def test_gate_more_prior_trials_never_raise_dsr():
+    low = run(prior_trials=2)["metrics"]["dsr"]
+    high = run(prior_trials=2000)["metrics"]["dsr"]
+    assert high <= low
+
+
+def test_evaluation_counts_this_runs_grid_cells_on_top_of_prior_trials():
+    result = evaluate(prior_trials=10)
+
+    assert result["metrics"]["n_trials"] == 10 + 27                       # 3x3x3 = 27 个格子
+    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}
+
+
+def test_evaluation_without_prior_trials_fails_closed():
+    result = evaluate()
+
+    assert result["metrics"]["dsr"] is None
+    assert any("DSR" in f for f in result["failures"])
+
+
+def test_selection_only_failure_still_reports_the_cells_it_consumed():
+    """选不出参数也消耗了试验:调用方必须据此记账,否则失败的进化轮次会被免费送出。"""
+    result = evaluate(runner=make_runner(trips=3), prior_trials=10)
+
+    assert result["passed"] is False
+    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}

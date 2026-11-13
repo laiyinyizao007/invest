@@ -33,6 +33,7 @@ class GateThresholds:
     min_sharpe_ci_lower: float = 0.0     # 夏普 95% 置信区间下界必须大于此值
     min_random_percentile: float = 95.0  # 相对随机入场对照的分位数(%)
     min_stress_sharpe: float = 1.0       # 成本(滑点+手续费)翻倍后夏普下限
+    min_dsr: float = 0.95                # Deflated Sharpe Ratio 下限;ADR 20261113 锁定,不得为让候选通过而放宽
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class CandidateMetrics:
     stress_sharpe: float             # 成本翻倍后的样本外夏普
     data_adjusted: bool              # 回测使用的是复权后的连续合约
     parameter_on_plateau: bool       # 最优参数位于参数高原(邻域平均得分同样为正)
+    dsr: float | None = None         # Deflated Sharpe Ratio(0~1);None = 未计算,按未通过处理(fail-closed)
+    n_trials: int = 0                # 计算 DSR 所用的累计试验次数;0 = 未记账,按未通过处理
 
 
 def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> list[str]:
@@ -85,5 +88,13 @@ def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> lis
 
     if not m.parameter_on_plateau:
         fails.append("最优参数不在参数高原:邻域表现不稳定,疑似过拟合")
+
+    if m.dsr is None:
+        fails.append("DSR 未计算:缺少去通胀检验,不予通过")
+    else:
+        if m.n_trials < 1:
+            fails.append("DSR 缺少试验次数:无法核对多重检验的去通胀是否到位,不予通过")
+        if m.dsr < t.min_dsr:
+            fails.append(f"DSR {m.dsr:.3f} < {t.min_dsr}(累计试验 {m.n_trials} 次):扣除多重检验后不能排除是运气")
 
     return fails
