@@ -332,6 +332,27 @@ def test_safe_builtins_still_allow_ordinary_imports():
     assert module.dumps({"a": 1}) == '{"a": 1}'
 
 
+def test_safe_builtins_block_the_risk_package():
+    """风控包必须导不进来:拿到 `risk.risk_guard` 就等于拿到风控函数的定义。
+
+    候选改写 `rg.risk_per_trade` 就能架空 300 元单笔预算,而静态层只看得到
+    "属性名"、看不到它是谁(第 9 轮 codex 实测:三行 monkey-patch,四层防线全放行)。
+    候选不需要 import 风控模块——风控由基类固定,候选只写信号逻辑。"""
+    safe = rs.safe_builtins()
+    try:
+        safe["__import__"]("risk.risk_guard")
+    except ImportError as exc:
+        assert "risk" in str(exc)
+    else:
+        pytest.fail("risk 包竟然能导入")
+
+
+def test_screen_rejects_importing_the_risk_package():
+    """静态层同样要拦:候选源码里出现 `import risk...` 一律拒绝。"""
+    findings = rs.screen_source("import risk.risk_guard as rg\n")
+    assert any("risk" in f for f in findings), findings
+
+
 def test_safe_builtins_honour_the_configured_extra_blocklist():
     """配置里追加的禁用模块,在受限导入器里同样生效。"""
     safe = rs.safe_builtins(forbidden_modules=("json",))
@@ -368,6 +389,16 @@ def test_the_reserved_word_table_matches_the_code():
     # 宪法层的名单
     from risk import constitution as const
     listed(*const.BUILTIN_PROTECTED_PARAMETERS)
+    listed(*const.BUILTIN_PROTECTED_NAMES)
     listed(*const.BUILTIN_FORBIDDEN_DUNDERS)
     listed(*const.BUILTIN_FORBIDDEN_BY_NAME_SETTERS)
     listed(*const.BUILTIN_FORBIDDEN_ORDER_CALLS)
+    listed(*const.BUILTIN_PROTECTED_ENTRY_POINTS)
+    listed(*const.BUILTIN_PROTECTED_STATE_OBJECTS)
+    listed(*const.BUILTIN_PROTECTED_PATHS)
+    listed(*const.BUILTIN_PROTECTED_CONTAINERS)
+    listed(*const.BUILTIN_PROTECTED_CONTAINER_SCOPE)
+    listed(*const.BUILTIN_PROTECTED_CONTAINER_MUTATORS)
+    listed(*const.BUILTIN_PROTECTED_MODULE_ATTRS)
+    listed(*const.BUILTIN_PROTECTED_READ_ATTRS)
+    listed(*const.PROTECTED_RUNTIME_PACKAGES)

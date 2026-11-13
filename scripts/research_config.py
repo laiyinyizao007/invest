@@ -108,7 +108,8 @@ def _validate(cfg: dict) -> None:
 
     for key in ("pending_dir", "results_dir", "approvals_file"):
         path = _relative_inside(cfg["paths"][key], f"paths.{key}")
-        if key == "pending_dir" and path.parts[0] in RESERVED_DIRS:
+        # 大小写不敏感:`Strategies` 在不分大小写的文件系统上就是真正的 `strategies/`
+        if key == "pending_dir" and path.parts[0].lower() in {d.lower() for d in RESERVED_DIRS}:
             raise ConfigError(f"paths.pending_dir 不得指向受保护目录 {path.parts[0]!r}")
     token = _relative_inside(cfg["gateway"]["token_file"], "gateway.token_file")
     if token.name in RESERVED_FILES or token.parts[0] in RESERVED_DIRS:

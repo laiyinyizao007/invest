@@ -270,6 +270,679 @@ from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能�
 **这不是安全边界的终点**:容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)
 与"运行前由人读过代码"仍然是真正的边界。能力隔离只是把"静态黑名单挡不住的那部分"又收了一层。
 
+### 第 8 轮补记:风控执行点、整条属性路径、回测后的实例状态
+
+第 8 轮(codex CLI 深度分析,**36/50,未通过**;与第 7 轮并行,审查期间工作区被并发修改)
+报出两条 **Critical**。两条都是**实测复现**过的(真实 15 分钟玉米数据,不是推测),
+而且当时**三层校验全绿**——静态层、沙盒层、运行时类校验全部返回空列表。
+
+#### Critical 1:候选可以**调用**模板的风控执行点
+
+```python
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        signal = super().entry_signal()
+        if signal:
+            self._send_entry(signal, float(self.atr_value) * 50.0, float(self.am.close[-1]))
+        return 0
+```
+
+`BUILTIN_PROTECTED_NAMES` 只防**重定义**(`check_class` 比对类字典),静态层只拦三类**引用**
+(受禁 dunder / 按名 setter / 下单接口)。受保护的**方法名**不在引用黑名单里,
+于是候选借到了模板自己的下单机器——而 `within_budget(dist, self.get_size(), self.risk_budget)`
+与 `self.guard.can_open(...)` **都在被绕过的那个函数体内**(`_try_enter`)。
+实测(`atr_mult=50`,窗口 2022-07-01~2023-06-30,3000 根 15 分钟 K 线):
+
+| | 成交笔数 | 单笔止损距离 | 被预算拦下 |
+|---|---|---|---|
+| 诚实模板 | 0 | — | 157 |
+| 上面这段候选 | 2 | 508.7 | 0 |
+
+508.7 元 ≈ 17 倍的 300 元单笔预算。
+
+**处理**:新增 `BUILTIN_PROTECTED_ENTRY_POINTS`(`_try_enter`/`_send_entry`/`_manage_position`/
+`_place_protective_stop`/`_place_pending_entry`/`_process_daily_bar`/`_ensure_protective_stop`/
+`_stop_order_price`/`_complete_stale_daily_bar`),静态层对这些名字的**引用**一律拒——
+**不只拦调用**:`f = self._send_entry` 之后的 `f(...)` 调用点已经看不出是谁了。
+
+#### Critical 2:静态层只看赋值的**末段属性名**,不看整条属性路径
+
+```python
+self.guard.max_losses = 999      # 当日连亏熔断失效
+self.guard._losses = 0
+self.cta_engine.size = 0.001     # 合约乘数改小 → 风险金额接近 0
+```
+
+`guard`/`trail`/`am`/`cta_engine` 是**实例属性**:既不在 `vars(candidate)` 里(`check_class` 只比类字典),
+也不在受保护名清单里(受保护的是 `guard` 这个**名字**,不是它指向的对象)。
+实测:改 `guard` 后成交 120 → 149 笔(熔断形同虚设);改 `cta_engine.size` 后回撤从
+-4272 元 / -39.97% 缩成 **-0 元 / -0.00%**,`promotion_gate` 的 2000 元与 20% 两道门槛**同时失效**
+(夏普是比值,不受影响,所以门槛看起来"过了")。
+
+**处理**(三条):
+1. 静态层改为解析**整条属性路径**(`self.guard.max_losses` 整条路径入库),命中即拒;
+2. 新增 `BUILTIN_PROTECTED_STATE_OBJECTS`(`guard`/`trail`/`cta_engine`):对这些对象**连引用都禁**
+   ——只禁"写"会被别名绕过去(`g = self.guard` 之后的 `g.max_losses = 999` 按属性路径查也查不到);
+   `am`/`bg` 不在此列(候选要读行情 `self.am.close[-1]`,那是它的正当用途),只受"不得写入"约束;
+   另把 `am.array` 列为受保护路径(整条路径不得出现在源码里);
+3. 新增**运行时第三层** `constitution.check_instance_state()`:回测**跑完之后**核对实例上的
+   `risk_budget`/`atr_window`/`max_daily_losses`/`guard.max_losses`/`cta_engine.size`,
+   不一致即 fail-closed 抛错(`scripts/backtest_lib.py` 的两条入口都接上)。
+   这层**不依赖候选写得老实**——静态层拦写法、类校验拦类字典,这一层拦的是**回测途中**才发生的改写。
+   比对基准是**回测开始前的快照**,不是模板常量:研究脚本会用更大的 `risk_budget` 做敏感性实验
+   (`tests/test_strategy_backtest.py` 里就是),那是合法的;被改写的是"回测途中"。
+
+#### 第 8 轮之后自查又发现的两个缺口(自己写的新规则自己复查时抓到的)
+
+**缺口 1:写受保护成员只看 `self.` 开头的路径,`s = self` 之后绕过去。**
+上面那条"按整条属性路径判定"最初只认 `self.` 根,于是这三种写法静态层**全返回空列表**:
+
+```python
+s = self;  s.risk_budget = 1e12      # 给 self 取别名之后改底线
+o = object();  o.risk_budget = 1e12  # 根不是 self
+s = self;  s.am.close = [1.0]
+```
+
+第三条还算**回归**:早先的规则是按赋值的**末段**属性名判定的(`target.attr`),
+`o.risk_budget = ...` 那种写法本来就被拒;换成"只看 self 根的整条路径"之后反而放行了。
+现改成:**属性路径里任何一段命中受保护成员就算越权**(不限根)。
+
+**缺口 2:行情数组可以被原地改写——那等于伪造回测数据。**
+
+```python
+self.am.close[0] = 999.0        # 下标赋值:改的是被取到的那个对象
+arr = self.am.close;  arr[0] = 999.0   # 取别名之后原地改
+```
+
+vn.py 的 `ArrayManager` 里 `close` 是 **property**,返回的就是 `close_array` 本身(不是副本),
+所以"取出来再改"与"直接改"是一回事。候选改掉已经走过的价格,就能凭空造出一段行情。
+现补三条:**下标赋值**也按整条路径判定(`self.am.close[0] = …` 命中 `am`);
+新增"**受保护容器不得取别名**"(`arr = self.am.close` 拒——带下标的读 `x = self.am.close[-1]`
+与带调用的读 `x = self.am.atr(14)` 放行,别把正常用法一起误伤)。
+
+**顺带更正本 ADR 早先的一句过头话**:原先写"`numpy 标量(self.am.close)`是取不出来的副本,不在此列"——
+**不成立**,`self.am.close` 就是那个数组本体。另外 `BUILTIN_PROTECTED_PATHS` 里的 `am.array`
+在 vn.py 的 ArrayManager 里**根本没有这个属性**(真实的是 `close_array`/`open_array`/…),
+这一条几乎匹配不到东西;真正护住行情数组的是上面的"容器不得取别名"。该条目留着是因为
+历史守卫对内置清单只查"只增不减",删条目会被判违规——这一点也写在这里,免得以后有人以为它有用。
+
+**新守卫第一次实战生效**:改写 `_write_violation` 时顺手把 `c.protected_names` 的直接引用
+换成了 `_is_protected(...)`,引用次数从 10 降到 9,**守卫当场报了出来**
+("常量还在但底线的执行点被删了")。这条规则不是摆设。
+
+#### 其余发现(同轮)
+
+- **High 3——历史守卫只守常量,不守常量的执行点**:删掉 `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块、
+  窄化该判断、删掉 `forbidden_order_calls` 分支、`_is_protected` 恒返回 `False`,
+  这四种改法下守卫退出码**都是 0**(全绿)。守卫比对的是**常量集合**,不看常量**被怎么用**;
+  "常量还在、底线的执行没了"正是它挡不住的那条路。
+  **处理**:改为按 AST 统计受保护常量的**引用次数**(Load 语境,定义处不算),引用次数减少即报错;
+  `BUILTIN_ALLOWED_OVERRIDES` 另定为**只减不增**(白名单加一项 = 多放开一点底线,
+  与"清单只能追加"的规则正好相反)。
+- **Medium 4——网格的受保护轴检查与 `check_params` 口径不一**:前者大小写敏感且只覆盖
+  `protected_parameters`,后者大小写不敏感且含 names。现收敛到 `constitution.protected_lower_all()`
+  这一把尺子,两边共用。
+- **Medium 5——`check_params` 只查顶层**:嵌套字典/列表里的受保护键漏检。现改为递归。
+- **Low 6——受禁 dunder 名单漏了反射型的那批**:`__del__`/`__reduce__`/`__reduce_ex__`/`__mro_entries__`/
+  `__dict__`/`__class__`/`__mro__`/`__globals__`/`__code__` 等。现已补齐(见上面的保留字表)。
+- **Low 7——`__slots__` 里藏受保护名能过静态层**(运行时层兜住了)。现静态层也扫 `__slots__` 元素。
+- **Low 8——子入口的 TOCTOU**:子入口先查审批(读一次文件),再由 `import_candidate` **重新读一次**
+  并校验**调用方传入的** `--sha256`,两次读之间文件若被换掉就会跑未审批内容。
+  已改为按**审批命中的哈希**核对(并行的那一路会话完成,提交 `f90807d`)。
+
+#### 本轮之后仍然存在的残余缺口(如实记录)
+
+1. 静态层是**纵深防御,不是安全边界**——真正的边界仍是容器隔离与"运行前由人读过代码";
+2. `am` 的**子对象**按"容器"整体保护(取别名即拒),没有逐个字段建模;
+   静态层不做作用域解析,`self` 的别名之外的路径靠"路径里任何一段命中受保护成员"这条规则兜着,
+   但它挡不住**同名但无关**的对象(比如候选自己造一个叫 `guard` 的字段——那种写法会被误伤,属 fail-closed 的有意取舍);
+3. 晋级门槛缺**逐笔风险预算审计**:能通过门槛的候选,逐笔风险金额仍可能大于 300 元
+   (只是没被改写而已)——这是下一步要补的,不是本轮解决的;
+4. 守卫现在守"引用次数",不是守"语义"——把一次 `if name in BUILTIN_FORBIDDEN_DUNDERS:`
+   改成 `if name in BUILTIN_FORBIDDEN_DUNDERS or True:` 之类的同义改写仍可能躲开计数。
+   语义级的守卫需要把执行点本身登记成受保护常量(下一步)。
+
+### 第 9 轮补记:模块级改写、`__new__`、以及运行期第四层(身份指纹)
+
+第 9 轮(codex CLI 深度分析,**34/50,需改进,不建议发布**)报出一条 **Critical** 与若干 High/Medium/Low。
+与前几轮不同的是:这一条**四层防线全部放行**,而且绕开的是"整条属性路径判定"本身——
+
+```python
+import risk.risk_guard as rg
+rg.risk_per_trade = lambda *a, **k: 0.0     # 单笔风险恒为 0 → 300 元预算形同虚设
+```
+
+第 8 轮刚加的"整条属性路径"规则在这里**不起作用**,原因有两个:
+其一,静态层判的是"候选**自己**的源码里出现了受保护成员的路径",
+而这里被改的是**模块对象上的属性**——路径是 `rg.risk_per_trade`,
+`rg` 是候选自己起的别名,静态层无从知道它指向 `risk.risk_guard`;
+其二,`risk_per_trade` 这个名字本身**不在**任何受保护名单里(受保护的是方法与状态对象),
+第 8 轮新增的 `BUILTIN_PROTECTED_MODULE_ATTRS` 正是为这条补上的。
+
+即便补了名单,写法一换就又漏:`rg.risk_per_trade = …`、`import risk.risk_guard as rg` 后赋值、
+`type(cls).risk_budget = …`(路径的根是**调用表达式**,路径解析在那一段断掉)、
+`sys.modules["risk.risk_guard"].risk_per_trade = …`……
+**枚举写法是枚举不完的**。这与第 7 轮的结论一致:**黑名单封的是"已知写法",封不住"能力"**。
+
+#### Critical 1 的处理:运行期第四层——受保护对象的身份指纹
+
+不再枚举写法,改为**事后比对身份**:
+
+```python
+PROTECTED_RUNTIME_PACKAGES = ("risk", "strategies", "vnpy_ctastrategy")
+
+before = snapshot_protected_state()   # 候选执行前
+exec(candidate_code, module.__dict__)
+after  = snapshot_protected_state()   # 候选执行后
+tampered = check_protected_state(before, after)   # 被替换/被删除/被新增 → fail-closed
+```
+
+指纹覆盖**三个受保护包下所有已加载模块的公开属性**,以及其中**每个类的成员**;
+容器(list/dict/set)取**副本**比对,函数与类比**身份**。
+于是不管候选用哪种写法(`rg` 直接改、别名改、`type(cls)` 改、`sys.modules` 改),
+只要换了对象就对不上——**写法不再重要,结果才重要**。
+
+接点有三处:
+- `scripts/research_api.py::import_candidate`:候选**导入期**前后各拍一张;
+- `scripts/backtest_lib.py`:两条回测入口(`run_engine` / `run_engine_bars`)在
+  `engine.add_strategy(...)` **之后**拍基线,回测**结束后**再拍一张——
+  回测途中才发生的改写(第 8 轮第三层看的是实例状态,这一层看的是框架对象)同样能抓住。
+
+**快照必须覆盖到模板模块**:模板是候选自己 import 的,
+若在候选 import 之后才拍快照,快照里根本没有它,候选在导入期把它改写了也拍不到。
+所以 `_preload_protected_modules()` 在拍快照**之前**先导入
+`vnpy_ctastrategy`(`template`/`backtesting`/`engine`)与模板模块本身。
+这一条是 codex 实测出来的:不预加载时,候选改写模板类**完全不被记录**。
+
+#### High 3:`__new__` 早于快照,构造期改写结构性不可见
+
+`__new__` 在**实例构造时**执行,早于回测前的快照——
+它里面的改写会被当成"基线",运行期第三层(比对实例状态)**结构性地看不见**。
+第 9 轮 codex 实测:候选定义 `__new__` 并在里面改 `risk_budget`,三层防线全部放行。
+候选没有任何正当理由自定义 `__new__`(模板也没有),所以直接**禁掉**:
+`__new__` 加入 `BUILTIN_FORBIDDEN_DUNDERS`(不得定义、引用或调用)。
+
+#### 其余发现(同轮)
+
+- **High 3——ADR 保留字表漏项**:表里没列"受保护模块级成员""受保护容器"
+  "运行期受保护包",`__new__` 也漏了,而表是候选作者**唯一的查处**——
+  漏了就等于没有。已补齐,并把 `tests/test_research_sandbox.py` 里的
+  `listed()` 扩展到**全部**宪法名单(`BUILTIN_PROTECTED_NAMES` 整组、
+  `BUILTIN_PROTECTED_MODULE_ATTRS`、`BUILTIN_PROTECTED_CONTAINERS`、
+  `BUILTIN_PROTECTED_PATHS`、`BUILTIN_PROTECTED_ENTRY_POINTS`、
+  `BUILTIN_PROTECTED_STATE_OBJECTS`、`PROTECTED_RUNTIME_PACKAGES`),
+  以后代码里加任何一个名字而表里没写,那条用例会当场红。
+- **Medium 5——候选能 import 风控包**:`risk` 整个包加入 `FORBIDDEN_MODULES`
+  (静态层与受限导入器同时生效)。候选没有正当理由 import 风控模块——
+  风控由基类固定,候选只写信号逻辑。
+  注意**不能**把 `strategies` 一并禁掉:候选本来就要
+  `from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 继承基类。
+- **Low 6——历史守卫重复解析**:守卫此前对**每个**历史版本都重新解析一遍当前源码
+  (引用次数统计),历史一长就是平方级的浪费。改为**当前源码只数一遍**,
+  新增 `usage_regressions_from_counts(current_counts, older_source, names)`,
+  `usage_regressions()` 保留为包装(它有测试在用)。
+- **新增登记**:第四层的覆盖范围(`PROTECTED_RUNTIME_PACKAGES`)与预加载清单
+  (`_PROTECTED_PRELOAD_MODULES`)已登记进 `tools/check_constitution_history.py` 的
+  `BUILTIN_SETS`——少一个包 = 那一个包不再受指纹保护,历史守卫会报出来。
+
+#### 第 9 轮之后仍然存在的残余缺口(如实记录)
+
+1. **指纹不是"内存证明"**:它比对的是**已加载模块**的属性与类成员。
+   候选若通过 `importlib`/`ctypes` 之类手段在别的命名空间里造一个"影子"对象,
+   指纹看不见——但那类模块本来就被禁用清单挡着(`importlib`/`ctypes` 均在 `FORBIDDEN_MODULES` 里),
+   且**它改不到真框架对象**,所以对底线的威胁有限。
+2. **指纹只覆盖三个包**:别的第三方库(数据源、日志、指标)不在范围内。
+   它们不承载风控判定,所以当前不构成底线风险;若将来引入承载风控的新包,
+   必须同时加进 `PROTECTED_RUNTIME_PACKAGES`(历史守卫会强制这一点)。
+3. **静态层仍然是纵深防御,不是安全边界**——真正的边界仍是容器隔离
+   (`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)与"运行前由人读过代码"。
+4. **守卫守的是"引用次数"与"集合内容",不是语义**:把一次检查改写成同义形式仍可能躲开计数;
+   `PROTECTED_RUNTIME_PACKAGES` 这种"多一项更严"的常量已登记,但语义级守卫仍未做。
+5. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
+
+### 第 10 轮补记:函数对象的**状态**、实例上的**遮蔽**,以及"判定逻辑本身"可被改写
+
+第 9 轮引入的运行期第四层(受保护对象的**身份指纹**)把"换个写法改写框架对象"堵住了,
+但它比的是**身份**(`("id", value)`)。第 10 轮 codex 复核与本地自查各抓到一条 Critical,
+两条都**四层防线全部放行**,且都不是"写法"的问题:
+
+#### Critical 1(codex):改的是函数**对象的状态**,不是它的名字
+
+    from strategies.trend_atr_strategy import within_budget
+    within_budget.__defaults__ = (0.0,)        # volume 的默认值变成 0
+
+`within_budget` 还是**那个函数对象**,身份没变,只比身份完全看不见;
+而改完之后单笔风险金额恒为 0,300 元预算形同虚设。
+实测:`within_budget(500, 10, 300)` 由 `False` 变成 `True`。
+
+处理(纵深,三处各自独立):
+
+- **静态层**:把 `__defaults__`/`__kwdefaults__`/`__annotations__`/`__wrapped__`
+  加进 `BUILTIN_FORBIDDEN_DUNDERS`,沙盒的 `FORBIDDEN_ATTRS`/`FORBIDDEN_STRINGS` 同步;
+  候选没有任何正当理由碰这些 dunder。
+- **静态层(读)**:新增 `BUILTIN_PROTECTED_READ_ATTRS`
+  (`within_budget`/`stop_distance`/`risk_per_trade`/`DailyLossGuard`/`TrailingStop`/`trading_day`)——
+  候选**不得读**风控对象。风控由基类固定,候选只写信号逻辑;
+  拿到定义就多一条改写它的路。只收**不会误伤**的名字:泛用词
+  (`reset`/`can_open`/`on_trade_closed`/`ceil_to`/`floor_to`)不在其中。
+- **第四层**:指纹对函数不再只比身份,而是比
+  `(函数对象, __code__ 的 id, __defaults__, __kwdefaults__, 闭包单元格内容)`。
+  就地改写默认参数、换掉代码对象、改闭包里捕获的变量,都会被报出来。
+
+#### Critical 2(自查):在**实例**上遮蔽模板方法
+
+    def entry_signal(self):
+        self.get_size = lambda: 0.001        # 真实合约乘数 10
+        return 1
+
+`within_budget(dist, self.get_size(), self.risk_budget)` 读到的是 0.001,
+300 元预算算成 0.003 元,任何止损距离都"在预算内"。
+类字典里没有这个赋值(`check_class` 比不出来),实例字段快照只盯三个底线值,
+指纹只覆盖模块属性与类成员——所以四层全放行。
+
+处理:
+
+- **静态层**:`get_size` 进 `BUILTIN_PROTECTED_NAMES`(它是"决定风险金额"的框架方法),
+  `self.get_size = ...` 按名字被拦。
+- **第三层**:新增"实例上不许遮蔽模板方法"的核对——模板 MRO 里的**可调用**成员,
+  实例字典里不许出现这些名字(白名单里的 `entry_signal` 等除外)。
+  这里只查"实例上有没有遮蔽",不比"实现是不是同一个":同一个家族里日线模板与
+  15 分钟模板本来就有各自的实现,按"必须等于某个模板的实现"去比会误伤合法的日线策略。
+
+#### 其余发现(同轮)
+
+- **High 1——`trading_day` 没被保护**:熔断器按它分日("今天亏了几笔"),
+  改掉它就能把昨天的亏损算到今天,当日连亏熔断随之失效。
+  已进 `BUILTIN_PROTECTED_MODULE_ATTRS` 与 `BUILTIN_PROTECTED_READ_ATTRS`。
+- **High 2——指纹"跳过所有 dunder"**:于是改写类的 `__getattribute__`
+  (让 `self.get_size()` 返回假的)或 `__instancecheck__`(把 isinstance 判定废掉)都拍不到。
+  改成**显式忽略清单**(`_FINGERPRINT_IGNORED_DUNDERS`,只放过纯元数据),
+  其余 dunder 一律进指纹;`__instancecheck__`/`__subclasscheck__`/`__subclasshook__`/`__prepare__`
+  同时进受禁 dunder 名单。
+- **High 2 的另一半——家族判定本身可被改写**:第三层原来用
+  `isinstance(strategy, family_root(template))` 判"这是不是模板家族的策略",
+  而 `isinstance` 的判定逻辑正是 `ABCMeta.__instancecheck__`——把它换掉,
+  第三层直接判成"不适用"而放行。改成按 **MRO** 判定(结构判定,没有可改写的入口)。
+- **Medium 1——受保护模块成员"只禁写不禁读"**:读一次就多一条改写的路,
+  由上面 `BUILTIN_PROTECTED_READ_ATTRS` 补上(只收不会误伤的名字)。
+- **Medium 3——第四层的"回测前"基准拍晚了**:`backtest_lib` 里基准是在
+  `engine.add_strategy()` **之后**拍的,构造期的改写会被当成"基线"。
+  基准前移到构造之前(`run_engine` 与 `run_engine_bars` 两处)。
+- **Medium 4——第四层的**执行点**没人守**:删掉 `check_protected_state(...)` 那一行,
+  常量集合没变、清单文件也没变,第四层就此失效。
+  `tools/check_constitution_history.py` 新增 `CALL_SITE_REGISTRY`,
+  按"引用次数只许增不许减"守 `snapshot_protected_state`/`check_protected_state`
+  在 `backtest_lib` 与 `research_api` 两处的引用次数(实测:删掉调用后守卫退出码 1)。
+- **Low 1——泛用名按名字一刀切**:`self.indicator.reset = 1` 这种普通写法会被
+  `reset`(TrailingStop 的方法名)误拒。带主的名字改成**主人也在路径里**才算命中
+  (`BUILTIN_MODULE_ATTR_OWNERS`),路径断在调用表达式上时只认底线成员。
+- **Low 3——比对可能抛异常**:numpy 数组的 `==` 返回数组,放进 `bool()` 会抛 ValueError,
+  原实现会把它当成"被改写"(误报)。指纹改用 `_safe_token`:能按值比的按值比
+  (浮点用 `repr` 解决 nan),不能的一律退化成身份标记,**比对永不抛异常**。
+
+#### 第 10 轮之后仍然存在的残余缺口(如实记录)
+
+1. **第四层仍是"前后差分"**:候选若在回测途中"改→用→还原",差分看不出来。
+   这一类要靠**能力收走**来堵(见"执行时的能力隔离":候选的内建里没有
+   `setattr`/`getattr`/`type`,`sys`/`importlib`/`ctypes` 等模块导不进来),
+   静态层则保证**源码里可见的**改写一律按名字被拦。
+   两层叠加之后,"纯动态取得受保护对象再改"的路已经堵死,但差分本身的盲区仍在。
+2. **指纹覆盖三个包、约 3400 个键**:一次快照约 6 毫秒(第 9 轮是 2.5 毫秒,
+   多出来的是 dunder 覆盖与函数状态)。每次回测拍两张,代价可接受。
+3. **静态层仍然是纵深防御,不是安全边界**——真正的边界仍是容器隔离与"运行前由人读过代码"。
+4. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
+
+### 第 11 轮补记:容器上的**变更型方法**、执行点的**调用形态**,以及指纹范围的**显式化**
+
+第 11 轮 codex CLI 深度分析(**43.0/50,需改进,不建议发布**)逐条复现了第 9/10 轮的 10 条修复:
+**9 条确认真堵住**(函数对象状态改写、实例遮蔽 `get_size`、`trading_day`、指纹 dunder、
+MRO 家族判定、受保护成员禁读、基准前移、`reset` 带主机制、`_safe_token`),
+**1 条只半堵**(第 10 轮的"执行点注册表"只数名字不看语义)。本轮报出 2 条 High / 3 条 Medium / 2 条 Low,
+逐条处理如下。
+
+#### High 1 —— 受保护容器只挡"写/取别名",不挡"变更型方法调用"
+
+`self.am.update_bar(fake_bar)` 在静态层与沙盒层都返回 `[]`,第 3/4 层也不覆盖活实例:
+codex 端到端实测**四层全绿**而回测结果被完全改写(`skipped_by_budget` 从 0 变成 3928)。
+这与 `BUILTIN_PROTECTED_CONTAINERS` 的立意(防止伪造价格 -> 伪造收益)直接矛盾:
+写数组被拦、插数组不拦。
+
+修法:新增 `BUILTIN_PROTECTED_CONTAINER_SCOPE`(`am`/`bg`)与 `BUILTIN_PROTECTED_CONTAINER_MUTATORS`
+(`update_bar`/`update_tick`/`append`/…/`byteswap`)。凡是"路径经过受保护容器"且"调用了变更型方法"
+的一律拒;容器上的**只读**调用(`self.am.sma(...)`)照常放行。
+配套降误报:裸局部名 `am`/`bg` 降级为**路径保护**(只保护 `self.am.xxx`,不再按裸名一刀切),
+类体里定义 `am` 仍然拒。
+
+#### High 2 —— 第四层执行点守卫只数名字,不看语义
+
+codex 在独立 clone 上实测四种改法,都能让 `tools/check_constitution_history.py` **exit 0** 而第四层已失效:
+(a) 本地同名影子 `def check_protected_state(b, a): return []` + 改为裸名调用;
+(b) `const.check_protected_state(protected_before, protected_before)`——自己比自己,比对必然通过;
+(c) 把调用挪进死分支(`if False:`),名字引用数不变;
+(d) 新增一个执行候选却完全不调第三/四层的脚本——注册表是手工维护的,没有完备性检查。
+
+修法:守卫从"名字出现次数"升级为**调用形态**(`check_call_site_shape`):必须有**活调用**(死分支不算)、
+不得有同名影子、`check_protected_state` 的两个实参必须不同;再加**完备性检查**
+(`check_executor_completeness`):按仓库实际内容找出所有执行候选的模块(裸 `exec(...)` / 沙盒执行入口 /
+候选导入入口),不在"走第四层"的传递闭包里的执行入口一律报出来。
+(裸 `exec(...)` 才算执行候选:`qapp.exec()` 是 Qt 事件循环,按属性名一刀切会误报。)
+
+#### Medium 1 —— `self.trading_day` 的新误报
+
+第 10 轮把 `trading_day` 放进模块级成员名单之后,`self.trading_day = bar.datetime.date()`
+被误判成"改写了受保护的风控函数"——"每天只开一次仓"这类常规候选会被整片拒掉。
+修法:模块级成员名只在**根不是 `self`** 时才算命中(实例属性与同名候选方法一律无害);
+模块级的 `rg.trading_day = ...` 仍然拦。
+
+#### Medium 2 —— 指纹只覆盖"快照时已加载"的受保护模块
+
+候选在运行期 import 一个此前没加载过的受保护子模块再改写它,指纹**完全看不见**
+(此前"新增成员"只在父键已存在时才报)。修法:快照为每个受保护模块留一个**模块标记键**,
+比对时发现"运行期新加载的受保护模块"就报出来。
+
+#### Medium 3 —— vnpy 核心对象只靠"巧合"被覆盖
+
+`vnpy.trader.utility.ArrayManager` 此前只因为模板**按名 import** 它才恰好出现在指纹里;
+模板哪天改成 `import vnpy.trader.utility as util`,这层保护会**静默消失**,而历史守卫看不出来
+(它只守常量集合,不管语义)。修法:`PROTECTED_RUNTIME_PACKAGES` 支持**点号路径前缀**,显式纳入
+`vnpy.trader.constant` / `vnpy.trader.object` / `vnpy.trader.utility`——覆盖不再依赖"模板怎么 import"。
+
+`vnpy.trader.database` **故意不在范围内**:它的模块级 `database` 全局在第一次 `get_database()` 时
+会被**合法**地替换(离线取数脚本会这么做),纳入范围会造成运行期虚假 diff;
+而研究链路的数据来自 CSV(`load_bars_csv`),数据库根本不在研究数据路径上,篡改它没有意义。
+
+#### Medium 4 —— numpy 数组退化成身份标记
+
+`_safe_token` 把 numpy 数组变成 `("id", id(x))`,`arr[0] = 5` 这种原地改写在指纹里看不见。
+修法:numpy 数组按**内容**比(`tolist()` 后逐项取指纹);内容没变就不报(否则每次回测刷出一堆虚假 diff)。
+
+#### Low 1 / Low 3
+
+- **Low 1**:`am`/`bg` 这类容器名降级为路径保护(见 High 1)。
+- **Low 3**:第三层只查**实例字典**,看不见候选在运行期给自己的类打补丁(`Cand.get_size = ...`)。
+  新增 `_runtime_class_dict_violations`:回测结束后再比一次类字典(自动生成的 dunder 除外),
+  白名单里的 `entry_signal` 等仍然允许。
+
+#### 第 11 轮之后仍然存在的残余缺口(如实记录)
+
+1. **第四层仍是"前后差分"**:候选若在回测途中"改 -> 用 -> 还原",差分看不出来(与第 10 轮同)。
+2. **指纹覆盖六个包段、约 4600 个键**:一次快照约 8 毫秒(实测 7.3-10.1 毫秒,中位 8.2;首张约 490 毫秒,含模块预载);
+   真实回测与候选导入前后均**零虚假 diff**(已实测)。
+3. **`vnpy.trader.database` 不在指纹范围内**:研究链路不用数据库取数,当前没有暴露路径;
+   若将来研究链路改从数据库读数据,这一条必须重新评估。
+4. **候选 import 一个新的 vnpy 子模块并改写它**:静态层按名字看不见(该模块不在受保护名单里),
+   指纹也只在"运行期新加载的受保护模块"这一层报——已登记为后续项。
+5. **PBO/CSCV 仍然延后**,与本轮无关。
+
+### 第 12 轮补记:容器的**视图与别名**、执行点守卫的**数据流**,以及运行期第五层(行情数据完整性)
+
+第 12 轮 codex CLI 深度分析(**38.5/50,需改进,不建议发布**)端到端实测复现了第 11 轮的修复,
+并报出 2 条 High / 2 条 Medium / 2 条 Low,逐条处理如下。
+
+#### High 1 —— 容器规则只挡"写/取别名",不挡"视图 / dunder 写入口 / bg 别名"
+
+codex 在 120 根合成 15 分钟 K 线上端到端实测:`self.am.close[:]`(numpy 视图)、
+`self.am.close.__setitem__(...)`(dunder 写入口)、`x = self.bg` 再 `x.update_bar(fake)`
+(别名),静态层与沙盒层都返回 `[]`,第 3/4 层也不覆盖活实例——**四层防线全绿**,
+而 ATR 被从 40 压到 2.86、`skipped_by_budget` 由 1 变 0,诚实模板 0 成交而候选成交 2 笔:
+**¥300 单笔风险预算被架空**。
+
+根因:"按名字禁止变更型方法"只覆盖了**直接调用**。numpy 的**视图**与 dunder 写入口可以在
+不改写容器本身的前提下改写它的内容;而别名一旦被取走,调用点已经看不出被调的是谁。
+
+修法分两层:
+- **静态层**:新增 `BUILTIN_PROTECTED_CONTAINER_VIEWS`(`view`/`reshape`/`ravel`/`squeeze`/`transpose`),
+  这些方法返回的还是同一块内存;变更型方法名单补上 dunder 写入口
+  (`__setitem__`/`__delitem__`/`__iadd__`/`__imul__`/`__ior__`);
+  并新增"**交出引用**"检查(`_container_escape_findings`):把容器存进名字(赋值 / 带注解 / 海象 / 元组解包)、
+  传给出调用、返回出去、装进容器、作为默认参数——凡是让引用**流出去**的动作一律拒。
+  容器只许**就地**使用(读 `self.am.close[-1]`、读调用 `self.am.sma(5)`)。
+- **运行期第五层**(`check_market_data_integrity`):回测结束后把行情容器与引擎**真正喂过的** K 线
+  逐值比对——回放根数不得多于喂入根数(凭空多出来的 K 线),容器里的每个价格都必须**真实出现过**
+  (基准里已有的 + 引擎喂过的),回放根数与喂入根数一致时再逐值比一遍尾部(被改写的行情)。
+  这一层**不依赖静态分析的枚举**,所以尚未被枚举出来的写路径也能兜住——**但有前提**:
+  它核对的是容器里的**数据**,而判断"这一根 K 线容器该怎么变"要靠**家族的更新契约**(第 14 轮补记)。
+  契约一旦被改写(如 `am.count`),强核对会降级;所以它与静态层**并不完全独立**,见第 14 轮补记。
+
+  **基准拍在 `on_init` 之前,预热的合法根数只认引擎交出的那些**:日线族的 `on_init` 会先经
+  `engine.load_bar` 加载一段历史日线做预热,那些根数同样记在 `am.count` 里——把"累计根数"直接当成
+  "回放根数",就会把**预热**误判成"凭空多出来的 K 线",整个日线研究链路都会在回测结束时
+  fail-closed(本轮修复时真的踩到了:14 条既有测试同时变红)。第一版的补法是把基准拍在预热之后,
+  但**这又开了一个洞**(第 13 轮自查实测):候选在 `on_init` 里往容器塞 40 根假 K 线,它们成了
+  "基线",`am.count=160` 而引擎只喂了 120,第五层照样放行。现在的口径:基准拍在构造完成时
+  (`on_init` 之前,容器为空),回测脚本包住 `engine.load_bar` 记下**引擎实际交出的**预热 K 线,
+  与回放 K 线一起算"合法喂入"。
+
+#### High 2 —— 第四层执行点守卫仍能被"形态"绕过
+
+codex 在独立 clone 上实测五种改法,守卫都能 **exit 0** 而第四层已经失效:
+把比对挪进**永不被调用的函数**;第二个实参写成语义相同但语法不同的
+`dict(const.snapshot_protected_state())`;新执行入口只在**注释**里写上那两个名字;
+新执行入口用 `eval(compile(...))` 跑候选;新执行入口只 `import` 一个已覆盖的模块。
+
+修法:守卫从"名字与计数"升级为**数据流 + 作用域 + 可达性 + AST 覆盖**:
+- 第二个实参必须**就是**一次 `snapshot_protected_state()` 调用(不能是变量,不能包一层);
+- 快照调用与比对调用必须在**同一个函数作用域**内;
+- 所在函数必须在仓库里**被调用过**(死函数不算);
+- 执行入口的识别改为 **AST 为准**(注释里的名字不算数),并覆盖裸 `exec`/`eval`/`compile`
+  与属性形式的 `import_module`/`run_path`/`run_module`;
+- 新增 `check_constitution_module_is_clean`:宪法模块自身不得出现裸 `exec`/`eval`/`compile`。
+
+#### Medium 1 —— 裸局部名 `am.append(...)` 被误拒
+
+第 11 轮承诺"裸局部名 `am`/`bg` 不再按裸名一刀切",但只放宽了**赋值**路径,变更型方法的
+**调用**路径照旧按裸名拒——`am = []` 再 `am.append(x)` 会被整片拒掉,常规候选会被误伤。
+修法:受保护容器的判定改为**路径级**——只有作用域段出现在接收者路径的第 2 段及以后
+(`self.am.update_bar` ✓、`s.am.update_bar` ✓)才算命中;裸名 `am.append` 放行。
+
+#### Medium 2 —— 伪造 `__module__` 能买"仓库自己的类"豁免
+
+运行期类字典检查给"仓库自己的策略类"开了豁免(它们合法地重写内部方法)。候选只要在类体里写
+`__module__ = "strategies.trend_atr_15m_strategy"`,字符串就与仓库里的模块名对上了,豁免生效——
+越权的 `get_size` 改写被放过。
+修法:豁免的判定必须是"这个类**确实定义在**它声称的模块里"。
+
+判据不能是"`vars(module)` 里有没有这个名字"——**函数里就地定义的类**本来就不在模块字典里
+(`tests/test_x.py` 里的 `Chatty` 就是),那样判会把仓库自己的代码也拒掉(实测 14 条既有测试变红)。
+也不能是 `inspect.getfile(cls)`——它对类是循环的(按 `cls.__module__` 查模块文件),正好被伪造的
+`__module__` 骗过。真正的判据是**类体里自己的代码落在哪个文件**:自己写的函数/lambda 的
+`__code__.co_filename` 才是定义位置。于是:
+- 仓库里就地定义的替身:代码文件 == 模块文件 → 豁免;
+- 候选伪造 `__module__ = "strategies.xxx"`:代码文件是候选文件,模块文件在 `strategies/` → 不同 → 不豁免;
+- 类体里没有自己的函数(只继承)时,退回"模块字典里就有这个类"来判断。
+
+顺带修正:待审目录不再写死,而是从 `RESEARCH_SANDBOX_CONFIG` 指向的配置文件里读 `pending_dir`
+(默认 `pending_strategies`)。
+
+#### Low 1 / Low 2 —— 文档与实测不符
+
+- **Low 1**:保留字表少了两组名字(容器视图型方法、dunder 写入口),已补到上表
+  (该表仍是单一事实来源,由 `tests/test_research_sandbox.py::test_the_reserved_word_table_matches_the_code` 逐个核对)。
+- **Low 2**:三处与实测不符的断言——①"伪造 `__module__` 能骗过豁免"那是**漏洞**不是保证(已在 Medium 2 修掉);
+  ②"裸局部名 `am.append` 一律拒"是第 11 轮的半成品(已在 Medium 1 修掉);
+  ③"一次快照约 5 毫秒"实测为 7.3-10.1 毫秒(中位 8.2),已改。
+
+#### 第 12 轮之后仍然存在的残余缺口(如实记录)
+
+1. 第五层只覆盖**行情容器**(价格数组与 K 线根数);候选若改写的是别的引擎状态(例如持仓或委托的内部字段),
+   第五层看不见——但那些字段落在第三层(受保护成员)与第四层(身份指纹)范围内。
+1b. 第五层的"逐值比尾部"只在**一根 K 线对应一次容器更新**时成立(当前的日线族与 15 分钟族都是);
+   若将来出现"一根 K 线不更新容器"的家族,那一段只能靠"价格必须真实出现过"这条兜底。
+2. 第五层比对的是"喂入的 K 线 vs 容器里的价格";若引擎本身喂错(不是候选造成的),它也会报出来——**故意的**:宁可多报。
+3. 第四层仍是"前后差分":候选若在回测途中"改 -> 用 -> 还原",差分看不出来(与第 9/10/11 轮同)。
+4. 容器静态规则是**语法级**的:候选若用反射拿到容器——但 `getattr` 在执行期根本不提供
+   (`safe_builtins` 已移除),静态层也把 `getattr` 列为禁用内建。
+5. PBO/CSCV 仍然延后,与本轮无关。
+
+### 第 13 轮补记:第五层从"末态比对"改为"逐根核对",守卫改为验**效果**
+
+第 13 轮 codex CLI 深度分析(**38.0/50,需改进,不建议发布**,与第 12 轮 38.5 基本持平)基于
+`9397821` 复核:第 12 轮的 6 条修复**大部分确已堵住**(持续性行情改写会被第五层当场抓住;
+预热期造假那一条也已被并行提交修掉),但报出 **1 Critical / 3 High / 2 Medium / 3 Low**。
+codex 同时核实了一条重要的**边界**:单笔 ¥300 底线**没有**被突破——`_try_enter` 里参与预算判定的
+`dist` 就是 `_send_entry` 写进 `pending_dist` 的同一个值,`on_trade` 用它建初始止损,而 `pending_dist`
+是受保护名,所以"被判定的金额"与"实际风险金额"结构上同源。损害在**统计口径**(夏普/回撤/往返笔数,
+正是晋级门槛消费的东西),不在风险底线。
+
+#### Critical 1 —— 第五层是末态比对,瞬时改写("改 → 用 → 改回")看不见
+
+codex 的最小复现:候选在第 N 根 K 线结束时把最近 45 根的高/低/收改成同一个值(TR≈0,ATR 塌陷),
+在下一根结束时还原。实测 ATR 从 **40.00 压到 5.07**,诚实模板 0 成交而候选 30 笔往返,
+回测**结束**时三个数组与原始行情逐值相同,五层全绿。静态层恰好也放过了能表达它的写法:
+第 12 轮的 `_container_reference` 只把 `ast.Slice` 当视图,`self.am.close[:, None]` / `[...]` / `[None]`
+/ `.swapaxes()` 全部放行。
+
+修法两半:
+- **静态层**:`_subscript_makes_a_view` 认出 numpy 的全部**基本索引**视图(切片、`...`、`None`、含它们的元组、
+  `slice(...)` 调用);视图方法名单补 `swapaxes`/`diagonal`。整数下标(取到一个数)与高级索引(副本)照常放行——
+  反向用例同样入库。变量里存着的切片对象静态层看不见,交给运行期。
+- **运行期**:新增 `MarketDataWatch`,回测脚本包住 `engine.new_bar`,**每处理完一根 K 线核对一次**容器。
+  瞬时改写要影响下一次 ATR 计算,就必须在这根 K 线**结束时**仍留在容器里,下一次核对必然露馅。
+  只在同一次调用里"改了又改回"、不跨 K 线的写法影响不到受保护的 ATR(ATR 在 `entry_signal` 之前算好),
+  能影响的只有候选本来就能决定的信号。终态比对保留,作为第二道。
+  端到端用例用 monkeypatch 关掉逐根核对来**证明用例有判别力**:关掉之后同一个攻击放行。
+  第五层同时覆盖成交量/成交额/持仓量数组(Low 2)。
+
+#### High 1/2/3 —— 历史守卫"验形态不验效果"
+
+三条都是在独立克隆里改一处、守卫仍 exit 0:
+- **H1**:`_ = const.check_protected_state(...)`——调用形态完全对,结论被扔掉;
+- **H2**:把比对挪进 `lambda: ...`(`_call_scope` 认不出 lambda);
+- **H3**:新执行入口 `exec` 在 `run()` 里裸奔,那两个名字只放在一个从不被调用的函数里,"文件里出现过"就算覆盖。
+
+修法:比对的**结论必须被用掉**(`_result_is_used`:不能是单独一条语句、不能赋给 `_`、存进名字则该名字之后必须被读取,
+只 `extend/append` 不算读取);lambda 是作用域,比对在 lambda 里直接报;执行入口里每个**原语执行调用**
+(裸 `exec/eval/compile`、属性形式的 `import_module/run_path/run_module`)所在的**同一个函数体**里必须自己
+成对取快照并比对,且每个比对调用点都过同一套形态核对(`_check_call_problems`,注册表与执行入口共用)。
+`_result_is_used` 是形态层面的近似,更彻底的"结论必须导致拒绝"由端到端回归用例守。
+
+#### Medium 1 —— "仓库自己的类"豁免可被候选买断
+
+第 12 轮的判据之一是"`vars(module)[name] is klass`"——候选
+`Evil.__module__ = "scripts.research_sandbox"; sb.Evil = Evil` 自己就能满足它,运行期类字典检查就此对候选关闭。
+现在**只看类体里自己的代码落在哪个文件**:类声称的模块文件在仓库里且不在候选目录里;类体里**每一个**自己写的函数
+(解开 staticmethod/classmethod/property)的 `co_filename` 都等于那个模块文件;且**至少有一个**
+(没有自己函数的类不豁免——"全部来自"在空集上恒成立,候选写个只有 `risk_budget = 1e9` 的类就能蒙混)。
+`co_filename` 是编译时写进字节码的,候选没有 `compile`/`exec` 改不了它。
+
+#### Medium 2 —— `pending_dir` 有两个口径
+
+沙盒的 `research_config.load()` 会校验并拒绝 `pending_dir="strategies"`,而宪法的 `_repo_pending_dir()` 自己
+`json.loads` 却照收。现在宪法做**同一套校验**(相对路径、不得越出仓库、首段不得是保留目录),校验不过退回默认目录。
+宪法模块不能 import `research_config`(依赖 bootstrap/vnpy),所以保留目录集合是复刻的,
+`test_the_pending_dir_reserved_names_match_the_sandbox_config` 守两份一致。
+
+#### Low
+
+- **Low 1**:`_container_escape_findings` 只看最外层表达式节点——`x = self.am.close + 0` / `x += self.am.close`
+  不命中。numpy 运算出的是副本,今天无害;**暂不改**,规则的口径是"表达式形状"而不是"数据流形状",如实登记。
+- **Low 2**:第五层只查 4 个价格数组 → 已扩到成交量/成交额/持仓量。
+- **Low 3**:文档对第五层能力的表述过头(写成"防伪造",实际是末态比对)→ 本节已更正为"逐根 + 终态",
+  并写明它**不覆盖**的东西(见下)。
+
+#### 第 13 轮之后仍然存在的残余缺口(如实记录)
+
+1. 逐根核对只能发现**跨 K 线**的改写;同一次调用内改了又改回、且只影响候选自己本来就能决定的信号,看不见(也无需看见)。
+2. 变量里存着的切片对象(`s = slice(None); self.am.close[s]`)静态层看不见,由运行期逐根核对兜底。
+3. 分钟族(一根 K 线不对应一次容器更新)逐根核对只能验"取值必须真实出现过",
+   换成另一个**出现过**的取值发现不了。
+4. `_result_is_used` 是形态近似:恶意改法仍可构造"读取了但不决策"的名字用法;端到端用例是更强的约束。
+5. 豁免判据的残余:候选若 `import` 一个仓库里的函数并挂到类上、且伪造的 `__module__` 指向该函数所在文件时会通过——
+   但那条赋值在类体里,静态层按受保护名拦下,这里只是纵深防御。
+6. 第四层仍是前后差分;PBO/CSCV 仍然延后。
+
+### 第 14 轮补记:第五层的"更新契约"、守卫的时序与结论流向
+
+第 14 轮 codex CLI 深度分析(**38.5/50,需改进,不建议发布**)基于 `3ca7b11`:第 13 轮的 Critical **真堵住了**
+(跨 K 线瞬时改写被逐根核对当场抓住,对正常候选零误报;numpy 视图覆盖完整;`co_filename` 判据挡住了 `__module__`
+伪造;日线预热记账正确),**无 Critical**,新报 2 High / 3 Medium / 4 Low。三轮分数(38.5 → 38.0 → 38.5)基本持平:
+每轮关掉旧的、冒出新的,见本节末的"趋势"。
+
+#### High 1 —— `am.count` 被当成**模式开关**,第五层与静态层并不独立
+
+第五层原先用 `replayed == k`(累计根数是否等于喂入根数)决定走"逐值比尾部"还是"只验取值出现过"。
+候选让 `am.count` 落后一根,强模式**永久关闭**,再用"引擎喂过的取值"调包:实测 ATR 31.54 → 14.51、
+被预算拦下 10 → 3、成交 0 → 12 笔,运行期各层全绿。已实现的风险仍在 ¥300 以内(止损也用假 ATR),
+被突破的是"行情完整性"这层的保证。这意味着第五层的强模式**依赖静态层**去拦 `am.count` 的写入——
+第 12 轮补记里"不依赖静态分析"这句话**说过头了**(已更正)。
+
+修法:把"每喂一根 K 线容器恰好更新一次"当成**被核对的契约**,而不是从 count 里猜。契约由模板自己的两个
+受保护方法决定——`on_bar` 与 `_process_daily_bar`(真正调 `am.update_bar` 的地方):候选覆盖不了它们,
+所以对候选而言它们就是模板那份;日线族(喂入日线)同理。满足契约的家族,每根 K 线 `count` 增量必须恰为 1,
+累计根数与喂入根数的偏移必须恒定,否则就是 finding;不满足的(分钟族合成日线、重写了
+`_process_daily_bar` 的 `IntradayDemoStrategy`)只能验"取值出现过"。
+`MarketDataWatch` 同时在构造时捕获 `am.size`,运行期被改写即 finding(Medium 2:终态核对原先读活的 size,
+改小它会缩小比对窗口)。
+
+**修复过程中的两次打脸(如实记录)**:第一版用"开头连续 3 根增量都是 1 就判为逐根更新族"来**猜**,被
+`IntradayDemoStrategy` 当场打脸(它前几根都是 +1,第 60 根却是 0)——更新节奏是**家族的属性**,不能从前几根推断。
+第二版只看 `on_bar` 是不是模板的,又被同一个演示策略打脸(它继承 15 分钟模板、没覆盖 `on_bar`,
+却重写了 `_process_daily_bar`)。现在两个方法都要是模板的。
+
+#### High 2 —— 守卫仍只验形态:五种一行改法全部 exit 0
+
+在独立克隆里逐一改一处:G6 把"回测前"基准挪到回测之后、G6b 把导入前快照挪到 `exec` 之后、
+G1 结论只被 `print`、G2 比对挪进同名嵌套死函数、G3 条件表达式吞掉结论。G6 最危险:看起来只是无害重排,
+而守卫只校验**第二个实参**是新鲜快照,从不问**第一个实参**什么时候拍的。
+
+修法:
+- **时序**:执行候选的原语(`exec`/`eval`/动态导入)之前,同一函数体里必须已有基准快照,之后必须有比对
+  (`compile` 只生成字节码不执行,不在此列——守卫对真实代码的第一次报错就是把 `compile` 算进去了);
+  `backtest_lib` 没有裸 `exec`,执行候选的是 `engine.run_backtesting()`,新增 `check_run_call_order`:
+  基准快照必须在它之前(按行号)。
+- **结论流向决策**:读取必须发生在决策位置(`if`/`while`/`return`/`raise`/`assert`),途中经过 `print`/日志不算;
+  未知的父节点形态一律按"未使用";条件表达式的静态为假分支不算活调用。
+- **嵌套函数**必须在本文件内被调用(`_called_names_in_repo` 是全仓按名字匹配,一个叫 `run` 的嵌套死函数就能冒充)。
+
+**如实说明守卫的边界**:这仍是**形态层面**的近似。守卫防不住"有人用别的写法悄悄关掉某一层"的全部变种——
+真正的约束是**端到端回归用例**:把任一层关掉,对应的端到端用例必须变红(第 13 轮起,瞬时改写用例就带着
+"关掉逐根核对后同一攻击放行"的反证)。守卫是第二道,不是唯一一道。
+
+#### Medium 1/3 与 Low
+
+- **M1 嵌套类买断豁免**:候选把自己的代码藏进嵌套类,顶层只剩一个仓库函数,判据看不见。`_own_code_objects`
+  现在递归进**真正嵌套**的类(`__qualname__` 以外层类名开头)。
+- **M3 `pending_dir` 大小写**:`Strategies` 在不分大小写的文件系统上就是真正的 `strategies/`,宪法与沙盒配置
+  **两边**都精确比对、都放行。现在两边都按小写比对,并拒绝带盘符的路径。
+- **L1 `variables` 不在受保护名单**:vnpy 实盘引擎会按名把 `variables` 里的值写回实例,但研究/回测走
+  `BacktestingEngine`,且恢复的值来自候选自己持久化的数据,**当前不可利用**;**暂不加入**(会让大量
+  合法的 vnpy 写法被拒),如实登记为残余。
+- **L2 conftest 全局 fixture**:codex 指出它依赖导入顺序、不还原模块级属性,**掩盖而不是修复**
+  `test_research_api.py` 里那个直接改共享类的用例。同意——已删除全局 fixture,改成在那个用例里按用例回滚。
+- **L4 守卫硬编码 `_probe_r11`**:改为按 `_probe` 前缀跳过。
+
+#### 第 14 轮之后仍然存在的残余缺口(如实记录)
+
+1. **运行期三层(第 3/4/5)与静态层并不完全独立**:第五层的强核对依赖家族契约与 `am.count` 等受保护属性不被改写;
+   契约被改写时降级,仍由静态层兜住。要真正独立,需要把容器换成**候选写不进的对象**(见下)。
+2. 守卫是形态近似(见上),真正的约束是端到端用例。
+3. `variables` 运行期可写(当前不可利用)。
+4. 同第 13 轮残余 1–3、5、6。
+
+#### 趋势与判断(给评审者)
+
+第 12/13/14 轮分数 38.5 / 38.0 / 38.5。每一轮修的都是**写法**(把能想到的绕过逐个堵上),而每一轮 codex
+都能找到下一个——这与第 7/9 轮"黑名单封不住能力"的结论一致,**继续按这条路修,没有理由认为能收敛到 ≥45**。
+真正有可能改变趋势的是**收能力**:让候选拿到的 `self.am` 是一个**只读视图/副本**
+(例如 `entry_signal` 期间换成冻结的数组副本),把"改写行情容器"这一整类从"检测"变成"做不到"。
+这会改动模板与 ADR 的既有决策(G6 要求变更须经用户确认),所以**没有擅自做**,留给决策。
+
+#### 合并决定(用户授权,2026-11-13)
+
+G8 要求双轮都 ≥45 才算发布档;第 12/13/14 轮 codex 为 **38.5 / 38.0 / 38.5**(需改进档,35–44),
+**G8 第一轮的外部专家验证没有完成**(`gemini-2.5-pro` 免费档配额耗尽,只有自查记录)。
+用户在被告知上述事实、以及"继续逐条堵没有理由认为能收敛"的判断后,**明确选择接受现状合并 PR #17**
+(备选是"收能力:候选只拿只读视图"与"继续逐条堵再跑第 15 轮")。这是**风险取舍,不是分数达标**:
+
+- **接受的残余风险**即上面"第 14 轮之后仍然存在的残余缺口"与各轮残余清单——核心一条是运行期三层与静态层
+  **并不完全独立**,候选若找到静态层的新缺口,可能影响**统计口径**(夏普/回撤/往返笔数),
+  而**不会**突破单笔 ¥300 底线(被预算判定的距离与写进 `pending_dist` 的是同一个值,codex 第 13/14 轮均实测确认);
+- **这个合并不改变任何上线约束**:晋级仍须人工批准 → SimNow → **单独的**实盘授权;进化回路不得写 `approved/`、
+  `promotion_approval.json` 与实盘配置;DSR ≥ 0.95 门槛已锁定;PBO 仍延后。合并宪法只是把**研究侧**的防线并入主干,
+  不会让任何东西接近实盘;
+- **后续项(未做,留待决策)**:收能力方案(让候选拿到的 `self.am` 是只读视图/副本);补做 G8 第一轮外部验证;
+  任何新的外部复核分数应当重新评估这条取舍。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -298,16 +971,26 @@ from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能�
 | 类别 | 名字 | 出处 |
 |---|---|---|
 | 受保护参数(不得出现在设置字典、网格、字典键、关键字参数里) | `risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_PARAMETERS` |
-| 受保护成员(不得在类体里重写) | 见 `BUILTIN_PROTECTED_NAMES`(含 `on_trade`/`on_bar`/`_try_enter`/`guard`/`trail` 等) | `risk/constitution.py` |
-| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受保护成员(不得在类体里重写) | `guard`、`trail`、`am`、`bg`、`pending_dist`、`pending_entry`、`_stop_armed`、`atr_value`、`stop_price`、`entry_price`、`entry_dist`、`prev_pos`、`skipped_by_budget`、`trail_side`、`trail_extreme`、`trail_stop`、`is_live`、`state_consistent`、`cta_engine`、`get_size`、`__init__`、`on_bar`、`on_tick`、`on_init`、`on_start`、`on_stop`、`on_trade`、`on_order`、`on_stop_order`、`on_account_status`、`on_position`、`on_cancel_order`、`on_disconnect`、`_process_daily_bar`、`_manage_position`、`_try_enter`、`_send_entry`、`_place_protective_stop`、`_place_pending_entry`、`_stop_order_price`、`_ensure_protective_stop`、`_complete_stale_daily_bar`、`risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_NAMES` |
+| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__`、`__new__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受保护的**风控执行点**(不得引用,连取别名都不许) | `_try_enter`、`_send_entry`、`_manage_position`、`_place_protective_stop`、`_place_pending_entry`、`_process_daily_bar`、`_ensure_protective_stop`、`_stop_order_price`、`_complete_stale_daily_bar` | `BUILTIN_PROTECTED_ENTRY_POINTS` |
+| 受保护的**风控状态对象**(不得引用,连读都不许) | `guard`、`trail`、`cta_engine` | `BUILTIN_PROTECTED_STATE_OBJECTS` |
+| 受保护的**属性路径**(整条路径不得出现在源码里) | `am.array` | `BUILTIN_PROTECTED_PATHS` |
+| 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset`、`trading_day` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
+| 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day` | `BUILTIN_PROTECTED_READ_ATTRS` |
+| 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
+| 受保护容器的**范围**(这些名字上的容器受保护) | `am`、`bg` | `BUILTIN_PROTECTED_CONTAINER_SCOPE` |
+| 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap`、`__setitem__`、`__delitem__`、`__iadd__`、`__imul__`、`__ior__` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |
+| 受保护容器上的**视图型方法**(返回的还是同一块内存,改它等于改容器) | `view`、`reshape`、`ravel`、`squeeze`、`transpose`、`swapaxes`、`diagonal` | `BUILTIN_PROTECTED_CONTAINER_VIEWS` |
+| 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员;支持点号路径前缀) | `risk`、`strategies`、`vnpy_ctastrategy`、`vnpy.trader.constant`、`vnpy.trader.object`、`vnpy.trader.utility` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
-| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__` | `research_sandbox.FORBIDDEN_ATTRS` |
 | 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
 | 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |
-| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator` | `research_sandbox.FORBIDDEN_MODULES` |
+| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator`、`risk` | `research_sandbox.FORBIDDEN_MODULES` |
 
 ### 哈希、筛查、编译、执行必须是同一份字节
 早先 `import_candidate` 用 `spec.loader.exec_module()` 载入候选:Python 默认的 `.pyc` 只比对源文件的 mtime 与大小,不确认字节码对应当前内容,于"人工批准的、算过哈希的、过了静态筛查的源码"和"实际执行的字节码"可以不是一回事;分开打开文件还留下 TOCTOU 窗口。现在只读一次字节,对同一份内容做完哈希、筛查、编译、执行(不再走 `SourceFileLoader`),`__pycache__` 里的旧字节码没有机会生效。
@@ -404,8 +1087,16 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
   `tools/check_constitution_history.py`(不装 pytest、更不装 vnpy,`fetch-depth: 0`)。
 - 外部复核的原始记录:第 5 轮 codex(`gpt-5.6-sol`)**40.5/50,未通过**;第 5 轮另一轮独立复核(`MiniMax-M3`)**33/50,未通过**;
   第 6 轮独立复核(`MiniMax-M3`)**32/50,未通过**(报出第 5 轮两轮都没报出的 `__builtins__['setattr']` 绕过,
-  以及"宪法守卫在 CI 上收集即失败"这一事实)。三轮的发现均已逐条复现后修复并各配了回归测试。
+  以及"宪法守卫在 CI 上收集即失败"这一事实);第 7 轮(codex `gpt-5.6-sol` 与独立复核各一轮,结论不一致,
+  报出的是"静态黑名单封的是已知写法而不是能力");第 8 轮(codex CLI 深度分析)**36/50,未通过**
+  (两条 Critical 都是**实测复现**过的绕过:调用风控执行点、改写受保护对象的内部状态)。
+  各轮的发现均已逐条复现后修复并各配了回归测试。
+- 第 8 轮新增的回归用例:执行点引用、受保护对象写入与别名、`am.array` 路径、
+  运行时第三层(实例状态核对)、`check_params` 嵌套、受禁 dunder、`__slots__`、
+  历史守卫的"引用次数减少"与"白名单只减不增"(`tests/test_constitution.py`),
+  以及运行时第三层的接线用例(`tests/test_baseline_15m.py`:改 `cta_engine.size` / `guard.max_losses`
+  必须抛 `RuntimeError`,不改则正常跑完)。
 
 ## 未完成
-阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,三轮复核的阻塞项已修,第 7 轮复核结果见 `CHANGELOG.md`);
+阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,第 5–8 轮复核的阻塞项已修,第 8 轮结果与残余缺口见 `CHANGELOG.md`);
 阶段 3–4 未实现;阶段 4 另受 Bisheng 模型配额阻塞(见 `PROJECTWIKI.md`)。

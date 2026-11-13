@@ -1077,3 +1077,83 @@ def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
                                           "--segment", "train", "--params", "{}", "--sha256", new_sha])
     assert api.run_child(args) == api.EXIT_REFUSED
     assert "批准" in capsys.readouterr().err
+
+
+# ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)—— 运行期第四层 ----------
+
+def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(tree, monkeypatch, request):
+    """候选在导入期改写框架对象必须被拒。
+
+    第 9 轮 codex 实测:`import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`
+    三行就能架空 300 元单笔预算,而静态层/沙盒层/check_class/check_instance_state
+    **四层全部放行**。静态层现在按整条属性路径拦住了直白的写法,
+    但"换个写法"改不掉的是**身份**——运行期第四层比对导入前后的身份指纹。"""
+    path = tree / "pending_strategies" / "s.py"
+    # 候选会在**共享的类对象**上永久挂一个 `get_pricetick`——用例结束必须还原,
+    # 否则同一进程里之后的测试看到的是被篡改的模板(`test_real_spawn_*` 里串行结果与新进程结果对不上,
+    # 这条失败在基线上就存在)。按用例回滚:用 monkeypatch 先记下"类字典里原来有没有这个名字"。
+    import strategies.trend_atr_15m_strategy as template_module
+
+    template_class = template_module.TrendAtr15mStrategy
+    had_in_dict = "get_pricetick" in vars(template_class)
+    saved = vars(template_class).get("get_pricetick")
+
+    def restore_template_class():
+        if had_in_dict:
+            template_class.get_pricetick = saved
+        elif "get_pricetick" in vars(template_class):
+            del template_class.get_pricetick
+
+    request.addfinalizer(restore_template_class)
+    # 这条写法静态层看不出来:`strategies` 是候选**必须**导入的包(继承基类),
+    # 静态层没有理由禁它;能抓住它的只有身份指纹(第四层)。
+    # 候选改写模板类的方法,与改写风控函数等价——模板方法正是风控判定的入口。
+    # (第 10 轮:`get_size` 已经进了受保护名单,静态层就能拦;这里用一个静态层
+    #  按名字看不见的成员,专门盯住"第四层还在工作"这件事。)
+    path.write_text(
+        "import strategies.trend_atr_15m_strategy as t\n"
+        "t.TrendAtr15mStrategy.get_pricetick = lambda self: 10**9\n"
+        "from vnpy_ctastrategy import CtaTemplate\n"
+        "class S(CtaTemplate):\n"
+        "    pass\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "受保护的框架对象" in str(exc.value)
+
+
+def test_a_candidate_that_shadows_get_size_on_the_instance_is_refused(tree, monkeypatch):
+    """候选在**实例**上遮蔽 `get_size` 也要被拒(第 10 轮自查发现的 Critical)。
+
+    `self.get_size = lambda: 0.001` 把合约乘数 10 换成 0.001:
+    300 元单笔预算算成 0.003 元,任何止损距离都"在预算内"。
+    类字典里没有这个赋值,四层防线原本全都放行——现在静态层按名字拦住了。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(
+        "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy\n"
+        "class S(TrendAtr15mStrategy):\n"
+        "    def entry_signal(self):\n"
+        "        self.get_size = lambda: 0.001\n"
+        "        return 1\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "get_size" in str(exc.value)
+
+
+def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monkeypatch):
+    """直白的写法静态层就该拦(整条属性路径判定,不再只看末段)。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(
+        "import risk.risk_guard as rg\n"
+        "rg.DailyLossGuard.can_open = lambda self, day: True\n"
+        "from vnpy_ctastrategy import CtaTemplate\n"
+        "class S(CtaTemplate):\n"
+        "    pass\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "静态筛查未通过" in str(exc.value)

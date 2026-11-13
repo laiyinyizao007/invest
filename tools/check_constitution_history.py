@@ -28,7 +28,15 @@ CONSTITUTION_SOURCE_REL = "risk/constitution.py"
 CONSTITUTION_FIELDS = (
     "allowed_overrides", "protected_names", "protected_parameters",
     "forbidden_order_calls", "protected_module_attrs",
+    "protected_entry_points", "protected_state_objects", "protected_paths",
 )
+
+# **白名单**类字段:语义相反,必须"只减不增"。
+# allowed_overrides 是"候选**可以**重写什么"——多一项就是多放开一点底线,
+# 与保护清单"只能追加"的规则正好相反,不能同规则比(第 7 轮 codex 实测:
+# `BUILTIN_ALLOWED_OVERRIDES` 加一项 "get_size",守卫退出码 0,而候选重写
+# `get_size()` 就能让 300 元单笔预算失效)。
+CONSTITUTION_SHRINK_ONLY_FIELDS = ("allowed_overrides",)
 
 # 代码里的内置保护项(字符串集合)。这些是清单文件之外的保护,删掉一个等于开一个洞,
 # 而清单文件的历史比对看不见它们——它们在代码常量里,只能靠比对历史版本来看住。
@@ -38,10 +46,29 @@ BUILTIN_SETS = (
     "BUILTIN_PROTECTED_PARAMETERS",
     "BUILTIN_FORBIDDEN_ORDER_CALLS",
     "BUILTIN_PROTECTED_MODULE_ATTRS",
+    "BUILTIN_PROTECTED_READ_ATTRS",
     "BUILTIN_FORBIDDEN_DUNDERS",
     "BUILTIN_FORBIDDEN_BY_NAME_SETTERS",
     "BUILTIN_ALLOWED_TEMPLATES",
+    "BUILTIN_PROTECTED_ENTRY_POINTS",
+    "BUILTIN_PROTECTED_STATE_OBJECTS",
+    "BUILTIN_PROTECTED_PATHS",
+    "BUILTIN_PROTECTED_CONTAINERS",
+    # 容器上的变更型方法:第 11 轮 codex 的 High 1(`self.am.update_bar(fake_bar)`
+    # 注入假 K 线,四层防线全绿)——这份名单是"容器只挡写、不挡调用"的补丁。
+    "BUILTIN_PROTECTED_CONTAINER_SCOPE",
+    "BUILTIN_PROTECTED_CONTAINER_MUTATORS",
+    # 容器上的**视图型方法**:返回的是原数组的视图(共享内存),拿到就能原地改写
+    # (第 12 轮 codex 的 High 1 变体①:`self.am.close[:]` / `reshape` 把 ATR 压塌)。
+    "BUILTIN_PROTECTED_CONTAINER_VIEWS",
+    # 运行期第四层(身份指纹)的覆盖范围:这三个包里的模块与类成员不许被候选改写。
+    # 少一个包 = 那一个包里的对象不再受指纹保护,所以它同样"只能增不能减"。
+    "PROTECTED_RUNTIME_PACKAGES",
+    "_PROTECTED_PRELOAD_MODULES",
 )
+
+# 同为"白名单"语义的内置常量:只减不增。
+BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES",)
 
 # 沙盒层的内置 deny set 同样是"代码内置的保护",一并纳入比对。
 SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS")
@@ -50,6 +77,28 @@ SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORB
 BUILTIN_REGISTRY = (
     (CONSTITUTION_SOURCE_REL, BUILTIN_SETS),
     ("scripts/research_sandbox.py", SANDBOX_SETS),
+)
+
+# 清单**字段**的执行点也要守:删掉 `if node.attr in c.forbidden_order_calls:` 这个分支,
+# 常量集合没变、清单文件也没变,但下单黑名单不再被执行——只有"字段名被引用的次数"会变。
+# 字段名与常量名分开登记,免得两套语义混在一张表里。
+FIELD_REGISTRY = ((CONSTITUTION_SOURCE_REL, CONSTITUTION_FIELDS),)
+
+# 运行期第四层的**执行点**(第 10 轮 codex 的 Medium 4):
+# 把 `check_protected_state(...)` 那一行删掉,常量集合没变、清单文件也没变,
+# 但"指纹比对"就此不再发生——受保护对象被改写也照样放行。
+# 这两个名字是**函数名**而不是常量,所以按"引用次数只许增不许减"来守。
+CALL_SITE_REGISTRY = (
+    ("scripts/backtest_lib.py", ("snapshot_protected_state", "check_protected_state")),
+    ("scripts/research_api.py", ("snapshot_protected_state", "check_protected_state")),
+)
+
+# 回测入口的**时序**(第 14 轮 codex 的 G6):`backtest_lib` 没有裸 exec,执行候选的是
+# `engine.run_backtesting()`。基准快照必须在它**之前**拍——把
+# `_protected = _protected_state_snapshot()` 挪到回测之后,第四层就成了"自己跟自己比",
+# 而守卫只验第二个实参,从不问第一个实参是什么时候拍的。
+RUN_CALL_ORDER = (
+    ("scripts/backtest_lib.py", "run_backtesting", ("_protected_state_snapshot", "snapshot_protected_state")),
 )
 
 # 单值常量:不是集合,没有"只增不减"可言。它只能通过"必须落在白名单里"来约束。
@@ -145,6 +194,213 @@ def removed_protections(current_source: str, older_source: str, names) -> dict[s
         if diff:
             removed[name] = diff
     return removed
+
+
+def _statically_false(node: ast.AST) -> bool:
+    """条件在语法上就恒为假(`if False:`、`if 0:`、`if False and x:`、`if []:`)。
+
+    死分支里的引用**不算数**:第 11 轮 codex 实测
+    `if False and name in BUILTIN_FORBIDDEN_DUNDERS:` 能让守卫全绿——
+    常量集合没变、引用次数也没变,但那圈检查**永远不执行**。
+
+    只在**能证明**的时候才返回 True:`not X` 不是"恒假"(除非 X 恒真),
+    早先的写法把 `not X` 当成恒假,于是每个 `if not ...:` 的分支体都不计数——
+    计数被凭空压低,守卫会误报"引用次数减少"。"""
+    if isinstance(node, ast.Constant):
+        value = node.value
+        return value is False or value is None or value == 0 or value == ""
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return any(_statically_false(value) for value in node.values)
+        return all(_statically_false(value) for value in node.values)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return not node.elts
+    if isinstance(node, ast.Dict):
+        return not node.keys
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _statically_true(node.operand)
+    return False
+
+
+def _statically_true(node: ast.AST) -> bool:
+    """条件在语法上就恒为真(`if True:`、`if 1:`、`if [] or x:`…)。"""
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if value is True:
+            return True
+        if value is False or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return bool(value)
+        return False
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            return all(_statically_true(value) for value in node.values)
+        return any(_statically_true(value) for value in node.values)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return bool(node.elts)
+    if isinstance(node, ast.Dict):
+        return bool(node.keys)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _statically_false(node.operand)
+    return False
+
+
+class _LiveReferenceCounter(ast.NodeVisitor):
+    """统计**活代码**里对受保护常量的引用次数(AST 层面,只数 Load)。
+
+    历史守卫原来只比对常量**集合**:把执行点删掉——例如把
+    `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块删掉、或把它窄化成硬编码元组、
+    或让 `_is_protected` 恒返回 False——常量集合本身没变,守卫照样全绿:
+    常量还在,底线的**执行**没了(第 7 轮 codex 实测:五种改法守卫退出码全是 0)。
+
+    所以这里把"引用次数"也纳入比对:只许增,不许减。少一次引用,就可能少一道闸。
+
+    第 11 轮再补一条:**死分支里的引用不算引用**。`if False and name in ...:`
+    让引用次数保持不变,却把那圈检查永远停掉——所以死分支不计数。"""
+
+    def __init__(self, names):
+        self.counts = {name: 0 for name in names}
+
+    def visit_If(self, node: ast.If) -> None:
+        if _statically_false(node.test):
+            for stmt in node.orelse:
+                self.visit(stmt)
+            return
+        self.generic_visit(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        if _statically_false(node.test):
+            return
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id in self.counts:
+            self.counts[node.id] += 1
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.ctx, ast.Load) and node.attr in self.counts:
+            self.counts[node.attr] += 1
+
+
+def constant_usage_counts(source: str, names) -> dict[str, int]:
+    """每个受保护常量在**活代码**里被引用的次数。"""
+    counts = {name: 0 for name in names}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return counts
+    counter = _LiveReferenceCounter(names)
+    counter.visit(tree)
+    return counter.counts
+
+
+def usage_regressions_from_counts(current_counts: dict[str, int], older_source: str, names) -> dict[str, tuple[int, int]]:
+    """拿**已经数好的**当前引用次数去比:只解析历史源码那一份。
+
+    第 9 轮 codex 指出这里把同一份当前源码重复解析了很多遍(每个历史版本解析一次)。
+    引用次数的语义没变,只是把重复的解析去掉。"""
+    tracked = list(names)
+    older_counts = constant_usage_counts(older_source, tracked)
+    regressions = {}
+    for name in tracked:
+        if older_counts.get(name, 0) > current_counts.get(name, 0):
+            regressions[name] = (older_counts[name], current_counts.get(name, 0))
+    return regressions
+
+
+def usage_regressions(current_source: str, older_source: str, names) -> dict[str, tuple[int, int]]:
+    """引用次数减少的名字:{名字: (历史次数, 当前次数)}。
+
+    单独抽出来是为了能对它自己写测试——历史上这条检查对"常量在、但执行点被删"
+    完全失效,而失效时没有任何测试会报警。"""
+    tracked = list(names)
+    current_counts = constant_usage_counts(current_source, tracked)
+    return usage_regressions_from_counts(current_counts, older_source, tracked)
+
+
+def shrink_only_additions(current: set[str], older: set[str]) -> set[str]:
+    """白名单里"多出来"的项(当前有、历史没有)——白名单只减不增,多一项就是多放开一点底线。"""
+    return set(current) - set(older)
+
+
+def check_protected_usage(root: Path) -> list[str]:
+    """受保护常量与清单字段的**引用次数**相对历史提交不许减少(守的是执行点,不是常量本身)。"""
+    problems: list[str] = []
+    # (文件, 名字列表, 这些名字是不是"源码里的常量")
+    registry = [(rel, names, True) for rel, names in BUILTIN_REGISTRY]
+    registry += [(rel, names, False) for rel, names in FIELD_REGISTRY]
+    registry += [(rel, names, False) for rel, names in CALL_SITE_REGISTRY]
+    for rel, names, is_constant in registry:
+        current_source = (root / rel).read_text(encoding="utf-8")
+        if is_constant:
+            current = const_string_set(current_source, names)
+            # 已经被删掉的常量由集合比对报告(报一次就够);字段名没有集合可比,一律跟踪
+            tracked = [name for name in names if name in current]
+        else:
+            tracked = list(names)
+        if not tracked:
+            continue
+        # 当前源码的引用次数只数一遍(第 9 轮 codex:此前每个历史版本都重新解析一次)
+        current_counts = constant_usage_counts(current_source, tracked)
+        commits = _commits_touching(root, rel)
+        for rev in commits:
+            older_source = _read_at(root, rev, rel)
+            if older_source is None:
+                continue
+            for name, (older_count, current_count) in usage_regressions_from_counts(
+                    current_counts, older_source, tracked).items():
+                problems.append(
+                    f"{rel} 里的 {name} 的引用次数从 {older_count} 降到 {current_count}"
+                    f"(提交 {rev[:8]}):常量还在但底线的执行点被删了(只能增不能减)")
+    return problems
+
+
+def check_shrink_only(root: Path) -> list[str]:
+    """白名单类清单(`allowed_overrides`)相对历史提交**只减不增**。
+
+    保护清单是"只能追加"(多一项=多一道保护),白名单正好相反:
+    多一项=多放开一点底线。两种语义用同一条规则比,等于给白名单开了后门。"""
+    problems: list[str] = []
+
+    # 清单文件里的白名单字段
+    commits = _commits_touching(root, CONSTITUTION_REL)
+    if len(commits) >= 2:
+        current = json.loads((root / CONSTITUTION_REL).read_text(encoding="utf-8"))
+        for rev in commits[1:]:
+            raw = _read_at(root, rev, CONSTITUTION_REL)
+            if raw is None:
+                continue
+            older = json.loads(raw)
+            for field in CONSTITUTION_SHRINK_ONLY_FIELDS:
+                added = set(current.get(field, [])) - set(older.get(field, []))
+                if added:
+                    problems.append(
+                        f"{CONSTITUTION_REL} 的 {field} 新增了 {sorted(added)}(提交 {rev[:8]} 之后)"
+                        "(白名单只减不增:多一项就多放开一点底线)")
+
+    # 代码里的白名单常量
+    for rel, names in BUILTIN_REGISTRY:
+        current_source = (root / rel).read_text(encoding="utf-8")
+        current = const_string_set(current_source, names)
+        for name in names:
+            if name not in BUILTIN_SHRINK_ONLY_SETS or name not in current:
+                continue
+            for rev in _commits_touching(root, rel):
+                older_source = _read_at(root, rev, rel)
+                if older_source is None:
+                    continue
+                older = const_string_set(older_source, (name,)).get(name)
+                if older is None:
+                    continue
+                added = shrink_only_additions(current[name], older)
+                if added:
+                    problems.append(
+                        f"{rel} 里的 {name} 新增了 {sorted(added)}(提交 {rev[:8]} 之后)"
+                        "(白名单只减不增:多一项就多放开一点底线)")
+    return problems
 
 
 def _read_at(root: Path, rev: str, rel: str) -> str | None:
@@ -290,6 +546,581 @@ def _single_string(source: str, name: str) -> str | None:
     return None
 
 
+def _live_calls(tree: ast.AST, name: str) -> list[ast.Call]:
+    """源码里对 `name` 的**活调用**(死分支里的不算)。
+
+    第 11 轮 codex 的 High 2:守卫原来只数"名字出现次数",于是
+    `def check_protected_state(b, a): return []` + 改为裸名调用,
+    或 `if False and name in BUILTIN_FORBIDDEN_DUNDERS:` 都能让守卫全绿
+    而第四层已经失效。这里要的是**调用**,不是引用。"""
+
+    class Finder(ast.NodeVisitor):
+        def __init__(self):
+            self.calls: list[ast.Call] = []
+            self.scopes: list[ast.AST] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.scopes.append(node)
+            self.generic_visit(node)
+            self.scopes.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_If(self, node: ast.If) -> None:
+            if _statically_false(node.test):
+                for stmt in node.orelse:
+                    self.visit(stmt)
+                return
+            self.generic_visit(node)
+
+        def visit_While(self, node: ast.While) -> None:
+            if _statically_false(node.test):
+                return
+            self.generic_visit(node)
+
+        def visit_IfExp(self, node: ast.IfExp) -> None:
+            # `(check(...) if False else [])`(第 14 轮 codex 的 G3):条件表达式把结论吞掉
+            if _statically_false(node.test):
+                self.visit(node.orelse)
+                return
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if ((isinstance(func, ast.Name) and func.id == name)
+                    or (isinstance(func, ast.Attribute) and func.attr == name)):
+                self.calls.append(node)
+            self.generic_visit(node)
+
+    finder = Finder()
+    finder.visit(tree)
+    return finder.calls
+
+
+def _call_scope(tree: ast.AST, node: ast.Call) -> ast.AST | None:
+    """调用点**所在的最内层函数体**(不在任何函数里则返回 None)。
+
+    第 12 轮 codex 的 High 2(A3):把第四层的比对挪进一个**永不被调用**的函数,
+    守卫 exit 0 而第四层就此消失——所以光看"有没有活调用"不够,
+    还要看这个调用**在哪**、那个函数**有没有人叫**。"""
+    found: list[ast.AST] = []
+
+    class ScopeFinder(ast.NodeVisitor):
+        def __init__(self):
+            self.stack: list[ast.AST] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+        # lambda 也是作用域(第 13 轮 codex 的 High 2):把比对挪进 `lambda: ...` 它就永远不会执行,
+        # 而原先的 _call_scope 认不出 lambda,把它当成外层函数的一部分。
+        visit_Lambda = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if node is target:
+                found.append(self.stack[-1] if self.stack else None)
+                return
+            self.generic_visit(node)
+
+    target = node
+    ScopeFinder().visit(tree)
+    return found[0] if found else None
+
+
+def _is_snapshot_call(node: ast.AST) -> bool:
+    """这个表达式是不是**一次** `snapshot_protected_state()` 调用。
+
+    第 12 轮 codex 的 High 2(A2'):`check_protected_state(before, dict(snapshot_protected_state()))`
+    的两个实参语法不同、语义相同,比对必然通过——所以第二个实参必须是**调用本身**,
+    不能是它的拷贝、也不能是提前存好的变量。"""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "snapshot_protected_state"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "snapshot_protected_state"
+    return False
+
+
+def _called_names_in_repo(root: Path) -> set[str]:
+    """仓库里**被调用过**的函数名(按名字调用)。
+
+    用来判"第四层所在的那个函数有没有人叫"——
+    第 12 轮 codex 的 High 2(A3)实测:调用挪进一个从不被调用的函数,
+    守卫的引用次数与名字都没变,于是 exit 0,而第四层已经死了。
+    测试目录不算:只在测试里被调用的函数,在生产路径上同样不会执行。"""
+    called: set[str] = set()
+    for path in _repo_python_files(root):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                called.add(func.attr)
+    return called
+
+
+def _defined_names(tree: ast.AST) -> set[str]:
+    """模块里自己定义的名字(函数/类/赋值)——用来抓"同名影子"。"""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+    return names
+
+
+# 只"累积"、不"决策"的方法名:`findings.extend(...)` 本身不算用掉了结论。
+_ACCUMULATE_ATTRS = ("extend", "append", "add", "update", "insert")
+
+
+def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+_LOGGING_CALLS = frozenset({"print", "debug", "info", "warning", "error", "log", "write_log", "pprint"})
+
+
+def _is_logging_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _LOGGING_CALLS
+    if isinstance(func, ast.Attribute):
+        return func.attr in _LOGGING_CALLS
+    return False
+
+
+def _flows_to_decision(node: ast.AST, parents: dict) -> bool:
+    """这个表达式的值有没有流向**决策**:条件、返回值、`raise`、`assert`。
+
+    第 14 轮 codex 的 G1:结论存进一个**只被 `print` 的名字**——名字确实被读了,
+    但从不导致拒绝。所以"被读取过"不够,读取必须发生在决策位置:
+    `if findings:` / `return findings` / `raise ...(findings)` / `assert not findings`。
+    途中经过日志/打印调用则不算(那是旁路)。"""
+    current = node
+    while current in parents:
+        parent = parents[current]
+        if _is_logging_call(parent):
+            return False
+        if isinstance(parent, (ast.Return, ast.Raise, ast.Assert)):
+            return True
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp)) and parent.test is current:
+            return True
+        if isinstance(parent, ast.IfExp):
+            # 值落在条件表达式的某个分支里:要看**这个条件表达式**自己的值有没有流向决策
+            current = parent
+            continue
+        if isinstance(parent, ast.stmt):
+            return False                                  # 走到语句边界还没碰到决策
+        current = parent
+    return False
+
+
+def _name_is_consumed(scope: ast.AST, name: str, parents: dict) -> bool:
+    """`name` 在 `scope` 里是否在**决策位置**被读取过(只给它 extend/append 不算读取)。"""
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
+            parent = parents.get(node)
+            if isinstance(parent, ast.Attribute) and parent.value is node \
+                    and parent.attr in _ACCUMULATE_ATTRS:
+                continue
+            if _flows_to_decision(node, parents):
+                return True
+    return False
+
+
+def _result_is_used(tree: ast.AST, call: ast.Call, scope: ast.AST | None) -> bool:
+    """`check_protected_state(...)` 的**结论**有没有流向决策。
+
+    第 13 轮 codex 的 High 1:`_ = const.check_protected_state(...)` 调用形态完全对,
+    守卫 exit 0,而比对的结论被扔掉——第四层静默死亡。
+    第 14 轮 codex 的 G1/G3:存进"只被 print 的名字"、被条件表达式吞掉,同样让结论不导致拒绝。
+    所以结论必须**流向决策**(见 `_flows_to_decision`)。未知的父节点形态一律按"未使用"处理。
+    (这仍是形态层面的近似;"结论必须导致拒绝"的**效果**由端到端回归用例守——
+    把任一层关掉,对应的端到端用例必须变红。)"""
+    parents = _parent_map(tree)
+    target_scope = scope if scope is not None else tree
+    node: ast.AST = call
+    parent = parents.get(node)
+    # 条件表达式的分支:取这个条件表达式自己的值继续判
+    while isinstance(parent, ast.IfExp) and parent.test is not node:
+        node = parent
+        parent = parents.get(node)
+    if isinstance(parent, ast.Expr):
+        return False                                     # 整条语句只为调用,结论被丢弃
+    if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+        targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+        names = [t.id for t in targets if isinstance(t, ast.Name)]
+        if not names:
+            return False
+        if all(not name.strip("_") for name in names):
+            return False                                 # `_ = ...`:明确丢弃
+        return any(_name_is_consumed(target_scope, name, parents) for name in names)
+    if isinstance(parent, ast.Call):
+        if _is_logging_call(parent):
+            return False
+        func = parent.func
+        if isinstance(func, ast.Attribute) and func.attr in _ACCUMULATE_ATTRS \
+                and isinstance(func.value, ast.Name):
+            return _name_is_consumed(target_scope, func.value.id, parents)
+        return _flows_to_decision(parent, parents)
+    return _flows_to_decision(node, parents)
+
+
+def _check_call_problems(rel: str, tree: ast.AST, call: ast.Call, snapshot_calls: list,
+                         called_names: set | None) -> list[str]:
+    """对**一个** `check_protected_state(...)` 调用点做形态核对(注册表与执行入口共用)。
+
+    `called_names` 为 None 表示不要求"所在函数在仓库里被调用过"
+    (执行入口自己就是入口,没有调用方)。"""
+    problems: list[str] = []
+    if len(call.args) < 2:
+        problems.append(
+            f"{rel} 里 check_protected_state 只给了 {len(call.args)} 个实参:"
+            "指纹比对需要前后两张快照")
+        return problems
+    if ast.dump(call.args[0]) == ast.dump(call.args[1]):
+        problems.append(
+            f"{rel} 里 check_protected_state 的两个实参是同一个对象"
+            "(自己比自己,比对必然通过)")
+    # 第二个实参必须是一次 snapshot_protected_state() 调用本身:
+    # `dict(snapshot_protected_state())` 语法不同、语义相同,比对必然通过
+    # (第 12 轮 codex 的 High 2 / A2')。
+    if not _is_snapshot_call(call.args[1]):
+        problems.append(
+            f"{rel} 里 check_protected_state 的第二个实参"
+            "不是一次 snapshot_protected_state() 调用"
+            "(指纹必须与**新拍**的快照比对,拿拷贝或旧变量比对必然通过)")
+    scope = _call_scope(tree, call)
+    if isinstance(scope, ast.Lambda):
+        problems.append(
+            f"{rel} 里第四层的比对在 lambda 里(第 {call.lineno} 行):"
+            "lambda 不会被调用,比对永远不会执行")
+        return problems
+    # 结论必须被用掉(第 13 轮 codex 的 High 1)
+    if not _result_is_used(tree, call, scope):
+        problems.append(
+            f"{rel} 第 {call.lineno} 行 check_protected_state 的结论被丢弃了"
+            "(`_ = ...` 或单独一条语句):比对做了也等于没做,第四层静默失效")
+    # 调用点必须在**取快照的同一个函数体**里,且那个函数得有人叫
+    # (第 12 轮 codex 的 High 2 / A3:挪进一个从不被调用的函数)。
+    if scope is not None:
+        # 嵌套函数(第 14 轮 codex 的 G2):`_called_names_in_repo` 是全仓**按名字**匹配,
+        # 一个嵌套的死函数只要取了个仓库里别处被调用过的名字(`run`/`main`/`load`)就能冒充"被调用过"。
+        # 嵌套的函数/方法必须在**本文件内**被调用。
+        parent = _parent_map(tree).get(scope)
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local_calls = {
+                (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))}
+            if scope.name not in local_calls:
+                problems.append(
+                    f"{rel} 里第四层的比对在嵌套的 {scope.name} 里,而它在本文件里从没被调用过")
+        same_scope = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
+        if not same_scope:
+            problems.append(
+                f"{rel} 里第四层的比对在 {scope.name} 里,"
+                "而取快照不在同一个函数体里(快照与比对必须成对出现)")
+        if called_names is not None and scope.name not in called_names:
+            problems.append(
+                f"{rel} 里第四层的比对在 {scope.name} 里,"
+                "而这个函数在整个仓库里从没被调用过(第四层实际上不会执行)")
+    return problems
+
+
+def check_run_call_order(root: Path) -> list[str]:
+    """每个跑回测的函数里,基准快照必须在 `run_backtesting()` 之前(按行号)。"""
+    problems: list[str] = []
+    for rel, run_name, snapshot_names in RUN_CALL_ORDER:
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            problems.append(f"{rel} 读取/解析失败,无法核对回测的时序: {exc}")
+            continue
+        run_calls = _live_calls(tree, run_name)
+        if not run_calls:
+            problems.append(f"{rel} 里没有对 {run_name} 的活调用:回测入口已经不在了,时序检查失去对象")
+            continue
+        for call in run_calls:
+            scope = _call_scope(tree, call)
+            if scope is None or isinstance(scope, ast.Lambda):
+                problems.append(f"{rel} 第 {call.lineno} 行在函数体之外(或 lambda 里)跑回测")
+                continue
+            snapshots = [c for name in snapshot_names for c in _live_calls(tree, name)
+                         if _call_scope(tree, c) is scope]
+            if not any(c.lineno < call.lineno for c in snapshots):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行 {run_name}() 之前,{scope.name} 里没有取基准快照"
+                    "(基准拍在回测之后,第四层的指纹比对必然通过)")
+    return problems
+
+
+def check_call_site_shape(root: Path) -> list[str]:
+    """第四层的执行点必须是**真的调用**,而且调用形态对得上。
+
+    第 11 轮 codex 的 High 2:注册表只按"名字出现次数"守,于是三种改法都能让守卫 exit 0
+    而第四层已失效:
+    - 同名影子函数(`def check_protected_state(b, a): return []`)后改为裸名调用;
+    - `check_protected_state(before, before)`——自己比自己,比对必然通过;
+    - 把调用挪进死分支(`if False: ...`)。
+
+    这里逐条按**调用形态**核对:必须有活调用、没有同名影子、比对的两个实参必须不同。"""
+    problems: list[str] = []
+    for rel, names in CALL_SITE_REGISTRY:
+        source = (root / rel).read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source)
+        except SyntaxError as exc:
+            problems.append(f"{rel} 解析失败,无法核对第四层的执行点: {exc}")
+            continue
+        defined = _defined_names(tree)
+        for name in names:
+            if name in defined:
+                problems.append(
+                    f"{rel} 里定义了与第四层执行点同名的 {name}"
+                    "(调用会落到影子函数上,第四层形同虚设)")
+            calls = _live_calls(tree, name)
+            if not calls:
+                problems.append(
+                    f"{rel} 里没有对 {name} 的**活调用**(只有引用、或者调用在死分支里):"
+                    "第四层的执行点已经不在了")
+                continue
+            if name == "check_protected_state":
+                snapshot_calls = _live_calls(tree, "snapshot_protected_state")
+                called_names = _called_names_in_repo(root)
+                for call in calls:
+                    problems.extend(_check_call_problems(rel, tree, call, snapshot_calls, called_names))
+    return problems
+
+
+# 会执行候选代码的特征:**裸名调用** `exec(...)` / `eval(...)` / `compile(...)`,
+# 沙盒的执行入口(`safe_builtins`)、候选导入入口。
+#
+# 裸名与属性名要分开:`re.compile(...)` 与 `qapp.exec()` 都不是执行候选代码
+# (前者是编译正则,后者是 Qt 事件循环),按属性名一刀切会误判成执行入口。
+_EXECUTOR_CALLS = ("exec", "eval", "compile", "safe_builtins", "import_candidate")
+
+# 属性形式的执行入口:动态求值、动态导入与运行脚本。
+# (`importlib.import_module` 能把任意模块拉进来执行,`runpy.run_path` 能跑任意脚本。)
+#
+# 例外:`re.compile(...)` 是编译正则,不是执行代码——按属性名一刀切会把它误判成执行入口
+# (宪法模块自己就用它校验模板名)。
+_EXECUTOR_ATTR_CALLS = ("eval", "compile", "import_module", "run_path", "run_module")
+_EXECUTOR_ATTR_SAFE_RECEIVERS = ("re",)
+
+# 守卫自身不参与"执行候选"的判定。
+_EXECUTOR_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv",
+                                 ".pytest_tmp"})
+
+# 宪法模块自己**不执行候选**:它只用 importlib 载入模板与框架模块(为身份指纹),
+# 那是导入不是执行。它是"谁执行候选"这件事的裁判,自己却能执行代码就名存实亡——
+# 所以它被排除在"执行入口"判定之外的同时,另有一条专门检查盯着它
+# (见 check_constitution_module_is_clean)。
+_EXECUTOR_SKIP_FILES = ("risk/constitution.py",)
+
+
+def _repo_python_files(root: Path) -> list[Path]:
+    """仓库里的 Python 文件(排除测试与临时目录)。"""
+    files: list[Path] = []
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root)
+        if any(part in _EXECUTOR_SKIP_DIRS or part.startswith("_probe") for part in rel.parts):
+            continue
+        if rel.parts and rel.parts[0] == "tests":
+            continue
+        files.append(path)
+    return files
+
+
+def _imported_modules(tree: ast.AST) -> set[str]:
+    """这个模块 import 到的**仓库内**模块名。
+
+    `import scripts.research_api` → "scripts.research_api";
+    `from scripts import research_api` → "scripts.research_api";
+    `from scripts.research_api import import_candidate` → "scripts.research_api"。"""
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+            for alias in node.names:
+                modules.add(f"{node.module}.{alias.name}")
+    return modules
+
+
+def _is_candidate_executor(tree: ast.AST) -> bool:
+    """这个模块会不会**执行候选代码**。
+
+    `exec` 只认**裸名调用**(`exec(code, ...)`):`qapp.exec()` 是 Qt 的事件循环,
+    不是执行代码——按属性名一刀切会把 GUI 脚本误判成执行入口(实测误报过一次)。"""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in _EXECUTOR_CALLS:
+            return True
+        if isinstance(func, ast.Attribute) and func.attr in _EXECUTOR_ATTR_CALLS:
+            receiver = func.value
+            if isinstance(receiver, ast.Name) and receiver.id in _EXECUTOR_ATTR_SAFE_RECEIVERS:
+                continue
+            return True
+    return False
+
+
+def _primitive_executor_calls(tree: ast.AST) -> list[ast.Call]:
+    """真正**执行代码**的原语调用:裸 `exec/eval/compile` 与属性形式的动态求值/导入/运行脚本。
+
+    `safe_builtins` 与 `import_candidate` 不在此列——它们是"调用已受检的入口",
+    由入口自己(`research_api.import_candidate`)负责第四层。"""
+    calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # `compile` 只生成字节码、不执行,不在此列(`exec(compile(...))` 的 exec 照样被抓)
+        if isinstance(func, ast.Name) and func.id in ("exec", "eval"):
+            calls.append(node)
+        elif isinstance(func, ast.Attribute) and func.attr in _EXECUTOR_ATTR_CALLS and func.attr != "compile":
+            receiver = func.value
+            if isinstance(receiver, ast.Name) and receiver.id in _EXECUTOR_ATTR_SAFE_RECEIVERS:
+                continue
+            calls.append(node)
+    return calls
+
+
+def check_executor_completeness(root: Path) -> list[str]:
+    """**完备性检查**:谁执行候选,谁就必须走第四层(快照 + 指纹比对)。
+
+    第 11 轮 codex 的 High 2:注册表是手工维护的,新增一个执行入口
+    (`scripts/brand_new_runner.py` 跑候选却完全不调第三/四层)守卫照样 exit 0——
+    "执行点有人守"这句话当时是**言过其实**的。
+
+    这里按仓库实际内容自动判定:
+    1. 找出所有执行候选的模块(裸 `exec(...)` / 沙盒执行入口 / 候选导入入口);
+    2. 算出哪些模块**走**第四层:自己调用了 `snapshot_protected_state` 与
+       `check_protected_state`,或者 import 了走第四层的模块(传递闭包);
+    3. 执行候选却不在闭包里的模块 → 报出来。"""
+    problems: list[str] = []
+    sources: dict[str, str] = {}
+    trees: dict[str, ast.AST] = {}
+    for path in _repo_python_files(root):
+        rel = path.relative_to(root).as_posix()
+        try:
+            source = path.read_text(encoding="utf-8")
+            trees[rel] = ast.parse(source)
+        except (UnicodeDecodeError, SyntaxError):
+            continue
+        sources[rel] = source
+
+    # 走第四层的模块:自己**调用**了那两个名字(按 AST 判定,不是全文子串——
+    # 第 12 轮 codex 的 High 2 / A5:在注释里写上这两个名字就能冒充"已覆盖")。
+    covered = set()
+    for rel, tree in trees.items():
+        snapshot_calls = _live_calls(tree, "snapshot_protected_state")
+        check_calls = _live_calls(tree, "check_protected_state")
+        if snapshot_calls and check_calls:
+            covered.add(rel)
+
+    # 第 13 轮 codex 的 High 3:光是"文件里出现过那两个调用"不够——
+    # 新执行入口可以只在一个**从不被调用的函数**里放上它们(名义覆盖),而 `exec` 在另一处裸奔。
+    # 所以对每个**原语执行调用**,要求它所在的**同一个函数体**里自己成对取快照并比对,
+    # 且每个比对调用点都过形态核对(结论被用掉、第二个实参是新拍快照、不在 lambda 里)。
+    # 不要求"所在函数被仓库调用过":执行入口自己就是入口,没有调用方。
+    for rel, tree in trees.items():
+        if rel in _EXECUTOR_SKIP_FILES or rel not in covered:
+            continue
+        primitives = _primitive_executor_calls(tree)
+        if not primitives:
+            continue
+        snapshot_calls = _live_calls(tree, "snapshot_protected_state")
+        check_calls = _live_calls(tree, "check_protected_state")
+        for call in check_calls:
+            for problem in _check_call_problems(rel, tree, call, snapshot_calls, None):
+                problems.append(problem)
+        for call in primitives:
+            scope = _call_scope(tree, call)
+            if scope is None or isinstance(scope, ast.Lambda):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行在函数体之外(或 lambda 里)执行代码:"
+                    "执行点必须在一个自己走第四层的函数里")
+                continue
+            in_scope_snapshot = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
+            in_scope_check = [c for c in check_calls if _call_scope(tree, c) is scope]
+            if not in_scope_snapshot or not in_scope_check:
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码的函数 {scope.name} 里"
+                    "没有自己成对取快照并比对(第四层挂在别的函数上,执行点本身裸奔)")
+                continue
+            # 时序(第 14 轮 codex 的 G6b):基准必须在执行**之前**拍,比对在执行**之后**。
+            # 把 `before = snapshot_protected_state()` 挪到 exec 之后,第四层就成了"自己跟自己比"。
+            if not any(c.lineno < call.lineno for c in in_scope_snapshot):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码之前,{scope.name} 里没有取基准快照"
+                    "(快照拍在执行之后,指纹比对必然通过)")
+            if not any(c.lineno > call.lineno for c in in_scope_check):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码之后,{scope.name} 里没有指纹比对")
+
+    # 模块名 → 文件路径(`scripts.research_api` → `scripts/research_api.py`)
+    module_to_rel = {rel[:-3].replace("/", "."): rel for rel in sources}
+
+    # **不**做跨模块的传递闭包:执行入口必须自己走第四层。
+    # `import scripts.backtest_lib` 只是把模块拉进来,不代表这个入口自己比对了指纹
+    # (第 12 轮 codex 的 High 2 / A8:靠 import 传递闭包就能让守卫全绿)。
+
+    for rel, tree in trees.items():
+        if rel in _EXECUTOR_SKIP_FILES:
+            continue
+        if not _is_candidate_executor(tree):
+            continue
+        if rel not in covered:
+            problems.append(
+                f"{rel} 会执行候选代码,却没有走第四层(受保护对象的快照与指纹比对):"
+                "新执行入口不得裸奔")
+    return problems
+
+
+def check_constitution_module_is_clean(root: Path) -> list[str]:
+    """宪法模块自己不得有**执行入口**(裸 `exec` / `eval` / `compile` 调用)。
+
+    它是"谁执行候选、谁必须走第四层"这件事的裁判,自己却能执行代码,
+    那这道防线就名存实亡。它需要 importlib 来载入模板与框架模块(那是导入,不是执行),
+    所以只禁这三个执行入口。"""
+    problems: list[str] = []
+    rel = CONSTITUTION_SOURCE_REL
+    tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+    for name in ("exec", "eval", "compile"):
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == name):
+                problems.append(
+                    f"{rel} 第 {node.lineno} 行调用了 {name}:"
+                    "宪法模块是裁判,自己不得有执行入口")
+    return problems
+
+
 def check_all(root: Path) -> list[str]:
     """跑完全部检查,返回问题清单(空列表表示通过)。"""
     require_full_history(root)
@@ -298,6 +1129,12 @@ def check_all(root: Path) -> list[str]:
     problems += check_builtin_protections(root)
     problems += check_registry_completeness(root)
     problems += check_single_constants(root)
+    problems += check_protected_usage(root)
+    problems += check_call_site_shape(root)
+    problems += check_run_call_order(root)
+    problems += check_executor_completeness(root)
+    problems += check_constitution_module_is_clean(root)
+    problems += check_shrink_only(root)
     seen: set[str] = set()
     unique = []
     for problem in problems:            # 同一个问题可能对多个历史版本重复出现,报一次就够

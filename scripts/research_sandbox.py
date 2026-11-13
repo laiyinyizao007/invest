@@ -28,12 +28,27 @@ FORBIDDEN_MODULES = {
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
     "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
+    # 风控与框架包本身:候选拿到 `risk.risk_guard` 就等于拿到风控函数的**定义**,
+    # 改写它们(`rg.risk_per_trade = lambda ...: 0.0`)可以架空单笔预算,而静态层按
+    # "属性名"判断、只看得到 `rg.risk_per_trade` 这个**结果**,看不到它是谁。
+    # 第 9 轮 codex 实测:三行 monkey-patch 让四层防线全部放行。
+    # 候选没有任何正当理由 import 风控模块——风控由基类固定,候选只写信号逻辑。
+    # 注意**不能**把 `strategies` 一并禁掉:候选本来就要
+    # `from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 继承基类。
+    "risk",
 }
 # 这些名字**任何引用**都拦,不只直接调用:`s = setattr` 之后 `s(self, "risk_budget", 1e9)` 的调用点是裸名字,
 # AST 看不见被调的是谁。只拦调用等于给别名留了门。
 FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input",
                    "type"}      # type(self).__base__ 之类的反射入口
-FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
+FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__",
+                   # 函数对象的**状态**(第 10 轮 codex 实测的 Critical):
+                   # `within_budget.__defaults__ = (0.0,)` 把 volume 默认值改成 0,
+                   # 单笔风险金额恒为 0,300 元预算形同虚设——改的不是名字,是对象的状态。
+                   "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
+                   # 类型判定入口:改掉 `__instancecheck__` 之后 isinstance 一律返回 False,
+                   # 运行时第三层的家族判定直接失效。
+                   "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__"}
 
 # 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
 # `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,
