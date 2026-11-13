@@ -240,3 +240,21 @@ def test_a_rooted_windows_path_without_a_drive_letter_is_scrubbed(text, leak):
     """没有盘符的根路径曾被漏掉:盘符路径有规则,这个形态没有。"""
     out = safe.scrub_text(text)
     assert leak not in out, out
+
+
+@pytest.mark.parametrize("text,leak", [
+    ("C" + chr(0x200B) + ":" + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "x", "alice"),
+    ("C:" + chr(0x200B) + chr(92) + "Users" + chr(92) + "alice" + chr(92) + "x", "alice"),
+    ("C:" + chr(92) + "Users" + chr(92) + "al" + chr(0x200B) + "ice" + chr(92) + "x", "alice"),
+])
+def test_zero_width_characters_inside_a_path_are_still_scrubbed(text, leak):
+    """零宽字符能拆开路径结构。**不靠删除这些字符**(那会改动服务器原文),
+    而是让路径规则容忍它们——路径本身被整段替换,路径之外的文本一个字节都不动。"""
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+def test_zero_width_characters_outside_a_path_are_left_byte_identical():
+    """净化不应改动与路径无关的原文。"""
+    text = "文本" + chr(0x200B) + "中间" + chr(0x200E) + "结束"
+    assert safe.scrub_text(text) == text

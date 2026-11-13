@@ -68,8 +68,9 @@ _UNC = re.compile(r"\\\\[?.]?\\?[^\s\"'<>|*?]+")                                
 # 盘符后接反斜杠,或接**单个**正斜杠:`https://x` 里的 `s:/` 后面还有一个 `/`,所以不会被当成盘符;而 `fooC:\Users` 这种紧贴字母的写法仍会命中
 # 反斜杠写法:目录名里允许单个空格(`C:\Users\Alice Smith\x.txt`——空格后面必须还有反斜杠才算目录的一部分,所以普通句子不会被吞掉);
 # 正斜杠写法:盘符前不能是字母数字/斜杠/点(挡住 URL 路径里的 `a:/b`),而反斜杠写法不加这个限制(`fooC:\Users` 仍要命中)。
-_WIN_PATH = re.compile(r"[A-Za-z]:\\(?:[^\\\s\"'<>|*?]+(?: [^\\\s\"'<>|*?]+)*\\)*[^\s\"'<>|*?]*|(?:(?<![\w/.%-])|(?<=file:///))[A-Za-z]:/(?!/)[^\s\"'<>|*?]*")
-_ZERO_WIDTH = re.compile("[\u200b-\u200f\u2060\ufeff\u202a-\u202e]")             # 零宽/方向控制字符:能拆开路径结构,先去掉再匹配
+# 零宽/方向控制字符:能拆开路径结构(C:\u200bUsers)。**不删除它们**(那会改动与路径无关的原文),
+# 而是让路径规则容忍它们——路径被整段替换时这些字符随之消失,路径之外的原文一个字节不动。
+_WIN_PATH = re.compile(r"[A-Za-z](?:[\u200b-\u200f\u2060\ufeff\u202a-\u202e]*)?:(?:[\u200b-\u200f\u2060\ufeff\u202a-\u202e]*)?\\(?:[^\\\s\"'<>|*?]+(?: [^\\\s\"'<>|*?]+)*\\)*[^\s\"'<>|*?]*|(?:(?<![\w/.%-])|(?<=file:///))[A-Za-z]:/(?!/)[^\s\"'<>|*?]*")
 # 引号包围的路径可以含空格(C:\Users\Alice Smith\...):整段替换,否则只遮住空格之前的部分
 _QUOTED_PATH = re.compile(r"(?P<q>[\"'])(?:[A-Za-z]:[\\/]|\\\\|/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library)/)[^\"'<>|*?\r\n]*(?P=q)")
 # 全角冒号/斜杠写成的盘符路径(C：＼Users＼x):只在确实含全角路径字符时才替换,半角版本由 _WIN_PATH 处理
@@ -124,7 +125,7 @@ def _scrub_encoded_token(match: re.Match) -> str:
 
 def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) -> str:
     """文本净化。保留换行与普通内容,只替换已知的泄露形态。"""
-    out = redact(_ZERO_WIDTH.sub("", text), secrets)
+    out = redact(text, secrets)
     out = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _COOKIE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
