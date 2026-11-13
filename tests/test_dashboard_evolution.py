@@ -426,3 +426,20 @@ def test_the_diff_endpoint_refuses_a_parent_that_is_not_a_hash(tmp_path):
     from dashboard import collectors as col
     s = settings(tmp_path)
     assert col.get_candidate_diff(s, "a" * 64, "../../secret") is None
+
+
+def test_the_reflection_text_is_sanitized_before_it_leaves_the_process(tmp_path):
+    """反思是**不可信的大模型文本**:它可能带路径、账号、令牌。出口必须净化(唯一的出口是 dashboard/safe.py)。"""
+    from fastapi.testclient import TestClient
+
+    from dashboard import app as appmod
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    s = config.load(path=cfg, root=tmp_path)
+    ledger(tmp_path, [row(gen=1, sha="a" * 64, reflection="读取 " + chr(92) + "Users" + chr(92) + "Alice" + chr(92) + "secret.env 失败")])
+    c = TestClient(appmod.create_app(s, "tok"))
+    r = c.get("/api/research/evolution/camp-2026-11/log", headers={"Authorization": "Bearer tok"})
+    assert r.status_code == 200
+    body = r.text
+    assert "Alice" not in body and "secret.env" not in body
+    assert "<path>" in body

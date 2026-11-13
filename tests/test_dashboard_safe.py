@@ -228,3 +228,15 @@ def test_remaining_path_forms_found_by_the_second_review_are_scrubbed(text, leak
 ])
 def test_the_wider_path_rules_do_not_damage_ordinary_text(text):
     assert safe.scrub_text(text) == text
+
+
+@pytest.mark.parametrize("text,leak", [
+    (r"读取 \Users\Alice\secret.env 失败", "Alice"),
+    (r"路径 \Windows\Temp\x.tmp", "Temp"),
+    (r"\ProgramData\some\file.db", "ProgramData"),
+    (r"\home\avery\invest\.env", "avery"),
+])
+def test_a_rooted_windows_path_without_a_drive_letter_is_scrubbed(text, leak):
+    """没有盘符的根路径曾被漏掉:盘符路径有规则,这个形态没有。"""
+    out = safe.scrub_text(text)
+    assert leak not in out, out

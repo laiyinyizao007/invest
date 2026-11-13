@@ -81,6 +81,8 @@ _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|e
 _PCT_TOKEN = re.compile(r"[^\s\"'<>]*%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})[^\s\"'<>]*")                                   # 含百分号编码的片段
 _DECODE_ROUNDS = 8                                                                                 # 解码到稳定为止,最多 8 轮(%5C、%255C、%25255C…);更深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
+# 没有盘符的 Windows 根路径(`\Users\Alice\...`):盘符路径有规则,这个形态曾被漏掉
+_WIN_ROOTED_PATH = re.compile(r"(?<![\w.:/\\])\\(?:Users|Windows|ProgramData|Program Files|Applications|home|tmp|opt|srv|usr|var|etc|Volumes|Library|private)\\?[^\s\"'<>|*?]*")
 
 
 def mask_account(value: object) -> str:
@@ -135,6 +137,7 @@ def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) 
     out = _ENC_WIN_PATH.sub("<path>", out)
     out = _ENC_POSIX_PATH.sub("<path>", out)
     out = _POSIX_PATH.sub("<path>", out)
+    out = _WIN_ROOTED_PATH.sub("<path>", out)
     out = _PCT_TOKEN.sub(_scrub_encoded_token, out)
     return clip(out, limit)
 
