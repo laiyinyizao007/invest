@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from dashboard import app as appmod
 from dashboard import config, evolution as ev
 
 NOW = 1_800_000_000.0
@@ -324,3 +325,59 @@ def test_heatmap_cells_outside_the_declared_axis_ranges_are_rejected(tmp_path):
     })
     with pytest.raises(ev.EvolutionError):
         ev.read_heatmap(d, "20261112-210000-000002")
+
+
+# ---------------------------------------------------------------- 路由(阶段④上线时)
+def _client(settings, token="tok"):
+    from fastapi.testclient import TestClient
+    return TestClient(appmod.create_app(settings, token))
+
+
+def test_the_evolution_routes_are_only_registered_when_the_phase_is_enabled(tmp_path):
+    """与阶段②–⑤ 的既有约定一致:接口在契约里先存在,路由随阶段上线才注册。默认关闭时连路由都不存在。"""
+    from dashboard import app as appmod
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"environment": "simnow"}), encoding="utf-8")
+    off = config.load(path=cfg, root=tmp_path)
+    paths = {r.path for r in appmod.create_app(off, "tok").routes if hasattr(r, "path")}
+    assert "/api/research/evolution" not in paths
+
+    cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    on = config.load(path=cfg, root=tmp_path)
+    paths = {r.path for r in appmod.create_app(on, "tok").routes if hasattr(r, "path")}
+    assert "/api/research/evolution" in paths and "/api/research/evolution/{campaign_id}/curve" in paths
+
+
+def test_the_evolution_endpoints_need_the_token(tmp_path):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    s = config.load(path=cfg, root=tmp_path)
+    c = _client(s)
+    for path in ("/api/research/evolution", "/api/research/evolution/camp/curve",
+                 "/api/research/evolution/camp/log", "/api/research/runs/20261112-210000-000000/heatmap"):
+        assert c.get(path).status_code == 401, path
+        assert c.get(path, headers={"Authorization": "Bearer tok"}).status_code in (200, 404), path
+
+
+def test_a_corrupt_campaign_returns_a_distinct_error_not_a_404(tmp_path):
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    s = config.load(path=cfg, root=tmp_path)
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / "camp-bad.jsonl").write_text("{broken\n", encoding="utf-8")
+    c = _client(s)
+    r = c.get("/api/research/evolution/camp-bad/curve", headers={"Authorization": "Bearer tok"})
+    assert r.status_code == 503 and r.json()["code"] == "unavailable"
+    assert c.get("/api/research/evolution/nope/curve", headers={"Authorization": "Bearer tok"}).status_code == 404
+
+
+def test_meta_reports_the_evolution_capability(tmp_path):
+    """前端按 capabilities 决定是否显示进化视图的入口。"""
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(json.dumps({"environment": "simnow"}), encoding="utf-8")
+    off = _client(config.load(path=cfg, root=tmp_path))
+    assert off.get("/api/meta", headers={"Authorization": "Bearer tok"}).json()["capabilities"]["evolution"] is False
+    cfg.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    on = _client(config.load(path=cfg, root=tmp_path))
+    assert on.get("/api/meta", headers={"Authorization": "Bearer tok"}).json()["capabilities"]["evolution"] is True

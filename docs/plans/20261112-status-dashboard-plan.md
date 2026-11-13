@@ -149,7 +149,7 @@ ADR:`docs/adr/20261113-evolution-dashboard.md`。
 - [x] **E5 前端文档**:`docs/web/08-evolution-views.md`(三视图规格、"怎么看好坏"、组件、验收清单);
   `01-product-spec.md` §9.5、`02-api-contract.md`、`04-phases.md`、`06-design-system.md` 组件清单、
   `07-lovable-prompts.md` 新增 P15–P17、`README.md` 阅读顺序与现状。
-- [ ] **E6 路由注册**:阶段④后端上线时把 6 个接口注册进 `dashboard/app.py`(与既有阶段④接口同一约定:**契约先行、路由随阶段上线**;阶段①的路由严格只注册阶段①接口)。
+- [x] **E6 路由注册**:6 个接口按『契约先行、路由随阶段上线』的约定,用配置开关 `evolution.enabled` 实现:为真时才注册进 `dashboard/app.py`,默认关闭(阶段①的路由严格只注册阶段①接口,这条不变);`GET /api/meta` 的 `capabilities.evolution` 随之告诉前端是否显示入口。台账损坏返回 503(数据不可信)而不是 404(没有数据),两者可区分。
 - [ ] **E7 引擎侧数据**:台账 `data/research/evolution/<campaign>.jsonl` 与热力图 `data/research/heatmaps/<run_id>.json` 由引擎会话阶段 3 产出(已与其对齐格式)。
 
 **当前状态**:读取侧与前端文档就绪,**数据还没有**——线上取不到是如实状态,前端用示例数据开发。

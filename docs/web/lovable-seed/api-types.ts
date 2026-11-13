@@ -44,6 +44,7 @@ export interface Meta {
     research_detail: boolean;
     data_views: boolean;
     nodes: boolean;
+    evolution: boolean;
   };
 }
 

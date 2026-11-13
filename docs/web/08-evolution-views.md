@@ -34,8 +34,11 @@
 
 全部是 `GET`、全部需要令牌、全部只读。
 
+**可见性**:`GET /api/meta` 的 `capabilities.evolution` 为真时,这几个接口才存在(路由随阶段④上线才注册),
+前端才显示进化视图的入口。为假时调用会得到 404 —— 这不是故障,是"该阶段还没上线"。
+
 ### 当前状态:数据还没有
-引擎侧(毕昇工作流与研究网关)还没开工产生这些文件,所以现在这三个接口会返回**空**或**缺失**。
+引擎侧(毕昇工作流与研究网关)还没开工产生这些文件,所以现在这几个接口会返回**空**或**缺失**。
 **这是如实状态,不是故障**。前端用 `docs/web/fixtures/` 里的 12 个示例数据开发:`evolution-list`、`evolution-list-empty`、
 `evolution-curve`、`evolution-curve-stagnant`、`evolution-log`、`evolution-log-page`、`evolution-heatmap`、
 `evolution-heatmap-plateau`、`candidate-code`、`candidate-code-missing`、`candidate-diff`、`candidate-diff-missing`。
@@ -156,7 +159,8 @@
 | 情况 | 显示 |
 |---|---|
 | 还没有任何战役(`campaigns: []`) | "还没有进化战役(引擎侧还没开始产生记录)"。**不要**显示成一个空图表或错误页 |
-| 战役存在但某战役 `state: "corrupt"` | 该行显示"台账损坏或读不了",其余战役照常显示 |
+| 战役存在但某战役 `state: "corrupt"` | 该行显示"台账损坏或读不了",其余战役照常显示;整块级别为 `warn` |
+| 某个战役的曲线/日志返回 503 | 台账损坏或读不了(**不是 404**)。显示"该战役的记录不可用",不要当成"没有这个战役" |
 | 某次运行没有热力图 | "这次运行没有保存参数网格" |
 | 源码找不到 | "该哈希的候选源码已不在" |
 | 差异不可用 | "父代源码已不在,无法比较" |

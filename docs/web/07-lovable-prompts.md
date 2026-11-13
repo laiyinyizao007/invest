@@ -328,21 +328,21 @@
 
 ### P15 阶段④:进化曲线
 ```
-实现 /research/evolution 的曲线视图(capabilities.data_views 为真时出现;数据来自示例文件 evolution-curve.json 与 evolution-curve-stagnant.json)。规格:
+实现 /research/evolution 的曲线视图(capabilities.evolution 为真时出现;数据来自示例文件 evolution-curve.json 与 evolution-curve-stagnant.json)。规格:
 〔粘贴 08-evolution-views.md §3〕
 重点:双 Y 轴(左夏普、右收益),两轴都标单位;画 P25-P75 半透明带;精英线实线、均值线虚线;flags 用横幅原样显示服务端文案,不要自己判定过拟合;纵轴不要截断到误导。
 ```
 
 ### P16 阶段④:参数热力图
 ```
-实现参数热力图(数据来自示例文件 evolution-heatmap.json 与 evolution-heatmap-plateau.json)。规格:
+实现参数热力图(同样在 capabilities.evolution 为真时出现;数据来自示例文件 evolution-heatmap.json 与 evolution-heatmap-plateau.json)。规格:
 〔粘贴 08-evolution-views.md §4〕
 重点:每格颜色+数值双编码;null 格显示"无效"图案,绝不画成 0;单一色相渐变,禁止红绿渐变;on_plateau 为假时也要显示"不在参数高原上";必须显示 note("选参窗口")。
 ```
 
 ### P17 阶段④:代码与变异日志
 ```
-实现变异日志与代码/差异视图(数据来自示例文件 evolution-log.json、candidate-code.json、candidate-diff.json)。规格:
+实现变异日志与代码/差异视图(同样在 capabilities.evolution 为真时出现;数据来自示例文件 evolution-log.json、candidate-code.json、candidate-diff.json)。规格:
 〔粘贴 08-evolution-views.md §5〕
 重点:源码与 diff 一律纯文本渲染,禁止 dangerouslySetInnerHTML;反思文本标注"仅供审阅,未进入模型输入";dsr/n_trials 只展示,不参与排序或高亮;页面上不得出现任何写操作按钮。
 ```

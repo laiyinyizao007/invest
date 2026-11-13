@@ -1574,6 +1574,10 @@
               },
               "nodes": {
                 "type": "boolean"
+              },
+              "evolution": {
+                "type": "boolean",
+                "description": "阶段④的进化引擎视图是否已启用"
               }
             },
             "required": [
@@ -1583,7 +1587,8 @@
               "stream",
               "research_detail",
               "data_views",
-              "nodes"
+              "nodes",
+              "evolution"
             ],
             "additionalProperties": true
           }
