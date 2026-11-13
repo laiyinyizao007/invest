@@ -5,6 +5,7 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+- `docs/broker-filing.md` §5c/§5d:写清可跑的交易时段(周末与周日夜盘休市)、「预演/正式都是一条命令、清场仅在闸门报有持仓时才需要」、以及 2026-11-13 的 SimNow 预演与国信前置尝试记录(含「遗留持仓很可能是 OMS 旧缓存、尚未在柜台核实」的说明)(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14))。
 - 退出码判定抽成 `broker_test.exit_code_for`(登录失败 3 / 步骤崩溃 4 / 有失败项 1 / 全过 0)并补测试;`normalize_address` 主机名转小写,与白名单比较同一套归一化(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14))。
 - G8 第三次复核(codex,38/50,无 Critical/High)的整改(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):复制档案到 `.env` 中途失败时还原原 `.env` 并以配置错退出;一键流程 `effective_env` 的白名单键按集合比较(与 `load_profile` 一致);穿透演练收尾持仓检查保留可信度;`failed_steps` 声明为 `Ctx` 字段;`sys.exit()` 非整数码映成崩溃码 4。**未处理的 Low**:主机名大小写归一化、探针限流间隔、`main()`→4 与「一键不出报告」的端到端测试、未知 BrokerID 的提示文案。
 - G8 整改后复核(codex,36/50)再补的整改(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):穿透演练的空仓闸门保留 `check_positions` 的可信度信号(柜台没应答 → 不发单、「查询持仓」记 FAIL);`restore_env` 在运行前没有 `.env` 时删除本次写入的档案(上一批这处改动其实没有写进去);取证运行器有步骤抛异常时退出码 4,一键流程不出报告;白名单比较与地址闸门同用 `normalize_address`;进程环境里独有的白名单键降级为提示;`test_guoxin_oneclick` 里两个依赖真实时钟的用例改为固定时钟。
