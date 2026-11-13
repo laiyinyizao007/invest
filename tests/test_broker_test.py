@@ -727,3 +727,14 @@ def test_a_crashed_step_makes_the_run_exit_with_the_crash_code(tmp_path, monkeyp
         assert e.ctx.failed_steps == ["<lambda>"]
     finally:
         e.main.close()
+
+
+def test_exit_code_separates_incomplete_evidence_from_failed_items():
+    """一键流程只对 0/1 出报告:登录失败 3、步骤崩溃 4(证据不完整)、跑完有失败 1、全过 0。"""
+    ok = be.Evidence("T1", be.PASS, "", "t")
+    bad = be.Evidence("T2", be.FAIL, "x", "t")
+    assert bt.exit_code_for(False, [], [], [ok]) == bt.EXIT_LOGIN
+    assert bt.exit_code_for(True, ["step_x"], [], [ok]) == bt.EXIT_CRASH      # 即使其余项全过
+    assert bt.exit_code_for(True, [], ["⚠⚠ 留有持仓"], [ok]) == bt.EXIT_FAILED
+    assert bt.exit_code_for(True, [], [], [ok, bad]) == bt.EXIT_FAILED
+    assert bt.exit_code_for(True, [], [], [ok]) == bt.EXIT_OK

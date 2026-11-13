@@ -1086,11 +1086,16 @@ def main(argv: list[str] | None = None) -> int:
         print("⚠ 引擎关闭超时,进程将被强制结束:国信「退出后是否正常注销」可能受影响,请观察。", file=sys.stderr)
     print(f"证据已写入 {out_dir}")
     print_summary(evidences)
+    return exit_code_for(logged_in, ctx.failed_steps, notes, evidences)
+
+
+def exit_code_for(logged_in: bool, failed_steps: list[str], notes: list[str], evidences: list[Evidence]) -> int:
+    """取证运行的退出码。一键流程只对 0/1 出报告,所以「证据不完整」必须与 1 分开。"""
     if not logged_in:
         return EXIT_LOGIN
-    if ctx.failed_steps:
+    if failed_steps:
         # 有步骤抛了异常:证据不完整,不能当报告用 —— 与「跑完但有失败项(1)」分开
-        print(f"⚠ 步骤抛出异常 {ctx.failed_steps},证据不完整。", file=sys.stderr)
+        print(f"⚠ 步骤抛出异常 {failed_steps},证据不完整。", file=sys.stderr)
         return EXIT_CRASH
     if any("⚠⚠" in n for n in notes):
         return EXIT_FAILED

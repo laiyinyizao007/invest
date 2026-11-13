@@ -162,3 +162,9 @@ def test_the_same_address_in_two_spellings_is_not_a_conflict(tmp_path, monkeypat
     _write(tmp_path / ".env", "BROKER_TEST_ALLOWED_TD=121.13.218.19:41285\n")
     monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "tcp://121.13.218.19:41285")
     assert load_profile("", root=tmp_path).hard_conflicts == []
+
+
+def test_hostname_case_is_not_a_conflict(tmp_path, monkeypatch):
+    _write(tmp_path / ".env", "BROKER_TEST_ALLOWED_TD=Front.Example.com:41285\n")
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "front.example.COM:41285")
+    assert load_profile("", root=tmp_path).hard_conflicts == []

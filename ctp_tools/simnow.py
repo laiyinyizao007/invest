@@ -49,7 +49,7 @@ def normalize_address(td_address: str) -> str:
         address = urlparse(address).netloc or address.split("://", 1)[1]
     # 去掉路径部分(/ctp 之类),只留 host:port
     address = address.split("/", 1)[0]
-    return address.strip()
+    return address.strip().lower()   # 主机名大小写无关;与 profile 的白名单比较同一套归一化
 
 
 def check_simnow_address(td_address: str, allow_any: bool = False) -> tuple[bool, str]:
