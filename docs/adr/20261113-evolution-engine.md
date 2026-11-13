@@ -237,7 +237,9 @@ PBO 重启(第二个品种)仍须单独立项和 ADR,但数据这一侧不再是
 4. **经验方差的样本口径不一致**:网格格子的夏普来自**选参窗口**(更长),门槛评估的夏普来自**验证窗口**(更短),而公式里的 V 是"同一 OOS 窗口下各试验夏普的方差"。混用只会让 V 偏小(窗口越长分散越小),而 V 有理论值作下限、取 max,所以**不会比阶段 1 更松**,但也不是原文的严格口径。
 5. 梯子与试验账本同一口径:同进程内用锁串行,**跨进程不加锁**——网关用 `_busy` 串行作业,CLI 与网关并发才可能漏记查询(偏向少记)。
 6. 揭示存档按 run 一份、写入后不改写;损坏就 fail-closed 而不是重新查询(重新查询会掩盖篡改)。**人工续期梯子(重置 `queries`)没有专门的命令**,目前是手工编辑 `ladder.json`,这一步没有审计钩子。
-7. **阶段 4 未做**:`tools/bisheng/build_v4.py`(父代选择 → 变异 → 评估 → 归档的毕昇流程)、`scripts/make_promotion_metrics.py`。`risk/map_elites.select_parent` 与 `describe_candidate` 已就绪,但还没有谁调用它们。
+7. **梯子防的是"自适应泄漏",不是"恶意外传"**(自查时清点出来,必须写下来):候选代码就在验证窗口的行情上运行。一份恶意的候选可以经它能控制的任何输出通道把验证窗口的数字送出去——异常消息(`error.message`,外层最多读到 300 字符)、伪造子进程的结果 JSON(子进程的输出本来就由候选所在的进程打印)。揭示层的白名单约束的是**程序自己产出**的字段,拦不住这种通道;梯子、白名单、检查项 ID 对"诚实但会自适应的 LLM"有效,对"主动外传的代码"无效。**真正的边界是**:只运行**已被人读过并批准**的代码(`research_api.py approve`)、容器隔离、以及"外传代码对人是可见的"这一点——它是纵深防御而不是沙盒(与 `research_sandbox.py` 文件头一致)。
+8. **梯子状态与揭示存档的位置**:`<results_dir>/ladder/ladder.json` 与 `<results_dir>/outward/<run_id>.json`,都在子目录里——自查时发现梯子状态原先与运行结果混放在 `results_dir`,`rs.list_results` 按 `*.json` 列 run,`/research/results/ladder` 会把它当成一个结果读出(`approvals.json` 同类,是已有问题)。现在网关只承认 `kind` 属于 evaluate/gate/backtest 的 JSON 是结果。
+9. **阶段 4 未做**:`tools/bisheng/build_v4.py`(父代选择 → 变异 → 评估 → 归档的毕昇流程)、`scripts/make_promotion_metrics.py`。`risk/map_elites.select_parent` 与 `describe_candidate` 已就绪,但还没有谁调用它们。
 
 ## 阶段 2:不可变宪法(Issue #16)
 
