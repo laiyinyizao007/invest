@@ -27,6 +27,12 @@ FORBIDDEN_MODULES = {
     "os", "sys", "subprocess", "socket", "ctypes", "shutil", "pathlib", "importlib", "pickle", "marshal",
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
+    # 栈帧与回溯的内省(第 14 轮之后自查实测):`traceback.walk_stack(None)` 不需要写任何被禁的属性名,
+    # 就能拿到调用栈上每个栈帧的 `f_locals`——沿它走得到回测引擎(`history_data`、`cta_engine`)、
+    # `run_evaluation` 的局部变量(含**整份**行情,包括验证窗口)。这与 `self.cta_engine`(引用即拦)是同一个能力。
+    # `linecache` 还能读任意文件;`code`/`pdb`/`dis`/`runpy`/`faulthandler`/`tracemalloc` 同属解释器内省与动态执行。
+    "traceback", "linecache", "code", "codeop", "pdb", "bdb", "dis", "faulthandler", "tracemalloc", "runpy", "pkgutil",
+    "zipimport",
     "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
     # 风控与框架包本身:候选拿到 `risk.risk_guard` 就等于拿到风控函数的**定义**,
     # 改写它们(`rg.risk_per_trade = lambda ...: 0.0`)可以架空单笔预算,而静态层按
@@ -48,7 +54,14 @@ FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__",
                    "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
                    # 类型判定入口:改掉 `__instancecheck__` 之后 isinstance 一律返回 False,
                    # 运行时第三层的家族判定直接失效。
-                   "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__"}
+                   "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__",
+                   # 栈帧与回溯(第 7 轮就写过这条路径 `e.__traceback__.tb_frame.f_builtins`,当时只把 `setattr`
+                   # 从候选的内建里拿掉,**没有**拿掉"沿栈帧走到可信代码"这个能力本身):
+                   # 异常 → `__traceback__` → `tb_frame` → `f_back` → `f_locals`,一路走到模板、引擎、研究编排的局部变量;
+                   # 生成器/协程同理(`gi_frame`/`cr_frame`/`ag_frame`)。属性名都不在原来的禁用名单里。
+                   "__traceback__", "tb_frame", "tb_next", "f_back", "f_locals", "f_globals", "f_builtins", "f_code",
+                   "f_trace", "gi_frame", "gi_code", "gi_yieldfrom", "cr_frame", "cr_code", "cr_await",
+                   "ag_frame", "ag_code", "ag_await", "with_traceback"}
 
 # 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
 # `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,

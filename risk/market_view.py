@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import numpy as np
@@ -106,3 +107,19 @@ class _NoAccess:
 
 
 NO_ACCESS = _NoAccess()
+
+# 换入期间真实容器的存放处。**不放在 `_call_entry_signal` 的局部变量里**:候选若沿栈帧走到调用者
+# (`e.__traceback__.tb_frame.f_back.f_locals`),局部变量里放着真容器就等于白给。静态层封了栈帧内省的名字与模块,
+# 这里再做一层:即使有人走到那个栈帧,里面只有 `self`(`self.am` 此刻已是视图)。
+_REAL: "weakref.WeakKeyDictionary[Any, tuple[Any, Any]]" = weakref.WeakKeyDictionary()
+
+
+def swap_in(strategy: Any) -> None:
+    """记下真实的 am/bg,换入只读视图与禁止访问的哨兵。"""
+    _REAL[strategy] = (strategy.am, strategy.bg)
+    strategy.am, strategy.bg = strategy._am_view, NO_ACCESS
+
+
+def swap_out(strategy: Any) -> None:
+    """还原真实的 am/bg(配合 try/finally:异常时也要还原)。"""
+    strategy.am, strategy.bg = _REAL.pop(strategy)

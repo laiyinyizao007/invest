@@ -252,6 +252,8 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     "__globals__", "__code__", "__func__", "__self__", "__closure__",
     "__reduce__", "__reduce_ex__", "__getnewargs__", "__getstate__", "__setstate__",
     "__del__", "__mro_entries__",
+    # 回溯对象入口(见 research_sandbox.FORBIDDEN_ATTRS 里同一条的说明):经它走得到栈帧、再走到可信代码的局部变量
+    "__traceback__",
     # ③ 构造期(`__new__` 在实例构造时执行,**早于**回测前的快照:
     #    它里面的改写会被当成"基线",运行期第三层结构性地看不见。
     #    候选没有正当理由自定义 `__new__`(模板也没有),直接禁掉。

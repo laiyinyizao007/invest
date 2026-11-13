@@ -32,7 +32,7 @@ from vnpy_ctastrategy import CtaTemplate
 from vnpy_ctastrategy.base import EngineType
 
 from risk.account_guard import trading_day
-from risk.market_view import NO_ACCESS, read_only_view
+from risk.market_view import read_only_view, swap_in, swap_out
 from risk.risk_guard import DailyLossGuard, TrailingStop, stop_distance, within_budget
 
 
@@ -240,12 +240,11 @@ class TrendAtrStrategy(CtaTemplate):
         这一刻 `self.am` 换成只读视图(数组与指标结果都是拷贝,没有变更入口),`self.bg` 换成禁止访问的哨兵;
         调用结束(含异常)立刻还原。候选因此拿不到真实容器:视图写回、`[:, None]`、`__setitem__`、
         改 `count`/`size` 这一整类"改写行情容器"的攻击没有可改的对象,不用再逐条枚举写法。"""
-        real_am, real_bg = self.am, self.bg
-        self.am, self.bg = self._am_view, NO_ACCESS
+        swap_in(self)                    # 真容器存在 market_view 的模块级表里,**不放局部变量**(栈帧内省也拿不到)
         try:
             return self.entry_signal()
         finally:
-            self.am, self.bg = real_am, real_bg
+            swap_out(self)
 
     def _try_enter(self, bar: BarData) -> None:
         signal = self._call_entry_signal()
