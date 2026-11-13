@@ -62,7 +62,8 @@
 | drill.py 六场景 | IMPL | 2026-11-12 夜盘全部通过,`docs/simnow-drills.md`;`disconnect` 要求 `--external-cut`(宿主机真实切网),没给则跳过;`--trace` 诊断埋点(`scripts/drill_trace.py`)。`latency` 对行情活跃度敏感 |
 | notify 落盘待补发队列 | IMPL | `notify/webhook.py`(`WEBHOOK_OUTBOX`);单测 + 真实 HTTP 断网恢复测试 + 真实 Telegram 补发验证;真实切网复测待做 |
 | simnow_guard | IMPL | `scripts/simnow_guard.py` |
-| unattended_report | PART | `scripts/unattended_report.py`;连续 5 天证据未攒齐 |
+| unattended_report | PART | `scripts/unattended_report.py`;连续 5 天证据未攒齐。纯逻辑已抽到 `evidence/logstats.py`(与状态页共用) |
+| 状态页(只读 Web 监控面板)阶段① | IMPL | `dashboard/`(派生自 vnpy_webtrader 1.1.0,MIT)+ `scripts/status_server.py`;独立进程、仅回环、全 GET;ADR `20261112-status-dashboard.md`,契约 `docs/web/`。**前端尚未构建**(`dashboard/static/` 为空,显示占位页);阶段②-⑤ 为 PLAN |
 | CAL 交易日历 | PLAN | 无节假日逻辑 |
 | RM 主力换月自动化 | PLAN | rolls 数据离线生成,运行时无人校验 `LIVE_VT_SYMBOL` |
 | 统一时段表 `risk/sessions.py` | PLAN | 时段定义散在 4 处,语义各异(见 §1 已知违例) |
@@ -104,8 +105,10 @@ flowchart TB
     STRAT[strategies/<br/>策略与品种表]
     TRADING[trading/<br/>运行时、守卫规则、优雅登出]
     NOTIFY[notify/<br/>Webhook 通知与脱敏]
+    EVID[evidence/<br/>日志统计纯逻辑 仅标准库]
   end
   SCRIPTS[scripts/<br/>入口与工具:运行、演练、取证、研究、数据]
+  DASH[dashboard/<br/>只读状态页 独立进程 不依赖 trading 与 vnpy]
   STRAT --> RISK
   TRADING --> RISK
   TRADING --> STRAT
@@ -113,7 +116,14 @@ flowchart TB
   SCRIPTS --> RISK
   SCRIPTS --> STRAT
   SCRIPTS --> NOTIFY
+  SCRIPTS --> EVID
+  SCRIPTS --> DASH
+  DASH --> EVID
+  DASH --> NOTIFY
+  DASH --> RISK
 ```
+
+`dashboard/` 只依赖 `evidence/`、`notify/`(脱敏)、`risk/account_guard`(阈值默认值)——都是纯标准库路径;**绝不 import `trading` / `vnpy` / `bootstrap`**(`tests/test_dashboard_boundaries.py` 用 AST 与新进程加载检查强制)。交易路径对面板零依赖:杀掉面板不影响交易。
 
 规则:**只向下依赖**——`risk` 不依赖任何同级以上的包;`trading` 可用 `risk`、`strategies`;`scripts` 可用全部;核心包**不得** import `scripts/`。
 现状(2026-11-11 核对):核心包符合,无循环、无反向依赖。

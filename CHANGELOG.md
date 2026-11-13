@@ -18,6 +18,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- **状态页后端阶段①**(只读 Web 监控面板,ADR `20261112-status-dashboard.md`):`dashboard/`(派生自 vnpy_webtrader 1.1.0,MIT,保留版权与许可证,见 `dashboard/NOTICE-vnpy_webtrader.md`)+ `scripts/status_server.py` + `requirements-dashboard.txt`。接口 `meta` `overview` `trading` `alerts` `days` `recording` `research` `research/runs/{id}` `docs/{key}`,全部 GET/HEAD;令牌文件 + 常量时间比较 + 滚动窗口限流;统一错误形状且不回显输入;CSP 等安全头;关闭 FastAPI 自动文档与斜杠重定向;静态托管只服务清单内且哈希匹配的文件,SPA 回退限定在前端路由白名单;仅监听回环(配置层强制)。**缺失、过期、损坏永远不是 ok**,总体取最差(unknown 比 warn 更糟);录制与研究是可选子系统,未部署只显示缺失、不拖低总体级别。响应一律经唯一净化出口 `dashboard/safe.py`(账号掩码、令牌/路径/环境变量清理、敏感键名、非有限数)。**前端尚未构建**(显示占位页)。新增 `evidence/logstats.py`:从 `unattended_report.py` 抽出的纯逻辑(302 行原样移动,脚本重新导出,既有 46 个测试不变),因为该脚本经 `bootstrap` 会间接加载 vnpy。边界测试(`tests/test_dashboard_boundaries.py`)把 ADR 承诺变成自动检查:不 import vnpy/trading、不读 `.env`、Web 依赖不进交易环境、上游危险代码不在(基于 AST)、真实进程冒烟(含『杀掉面板不改变状态文件』)。
 - 状态页前端(React + Lovable)的计划与文档:`docs/plans/20261112-web-frontend-lovable-plan.md`;`docs/web/05-lovable-guide.md`(真实数据不得进入 Lovable、导出物默认带外部依赖的对策、总流程、可粘贴的项目约束、导出审计闸门)、`06-design-system.md`(深色冷调 Bento + 克制的玻璃拟态;设计令牌对比度经脚本实测深浅两套均达 WCAG AA;玻璃降级规则;状态视觉表达;盈亏色与状态色分离;不用新拟态)、`07-lovable-prompts.md`(P0–P14 提示词,每步带验收点与纠正话术);`docs/web/lovable-seed/`(由 OpenAPI 生成的 `api-types.ts` 与示例数据,经 `tsc --strict` 编译通过,由 `tools/webgen/gen_lovable_seed.py` 重新生成,契约测试断言与契约同步)。`tools/audit_frontend_export.py`:拦截外部脚本(含 Lovable 风格的在线编辑脚本)、内联脚本、Supabase 与统计依赖、`innerHTML`、令牌写入 `localStorage`、API 客户端之外的请求、交易类文案,有 10 条测试。
 - 状态页完整 Web 规划(`docs/web/`,供前端同事接手):产品规格(页面、状态语义、无障碍)、API 通用约定、前端交接说明(硬性约束与验收清单)、五阶段规划;机器可读契约 `status-api.openapi.json`(OpenAPI 3.1,22 个接口、37 个模型,每个接口标注阶段与角色)与 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)。`tests/test_web_contract.py` 校验示例符合模型,并把边界写成断言:阶段①全部 GET、写操作恰好是暂停/解除、任何阶段都没有下单撤单连接改风控解锁批准类路径。新增测试依赖 `jsonschema`。仅文档与测试,无运行时代码。
 - 设计:只读状态页(Web 监控面板)的 ADR `docs/adr/20261112-status-dashboard.md`(待确认)与阶段①计划 `docs/plans/20261112-status-dashboard-plan.md`。结论:独立只读进程、只读文件、仅监听本机回环、前端零外链;**不使用 `vnpy_webtrader`**(核对 1.1.0 安装包:JWT 密钥写死为 `test`、带 `POST /order` 下单与撤单接口、需把 RPC 监听嵌进交易进程、前端仅 104 行 CDN 演示页、也没有我们的熔断/看门狗/录制/研究状态)。实时持仓资金与「暂停开仓」控制分别登记为阶段②③,不在本次范围。仅文档,无代码改动。
@@ -240,6 +241,8 @@
 - 明确记录:**15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次**,新候选策略不能再用它做最终确认。
 
 ### Fixed（修复）
+- 状态页:`dashboard/safe.py` 的敏感键名正则曾把 `passed` / `bypass` / `pass_rate` 当成密码键整个替换成 `***`(研究页的通过状态会永远显示星号);改为 `password`/`passwd`/`passphrase` 任何位置都算,单独的 `pass` 只在整个键或键末尾才算。新增『所有契约示例经净化后原样不变』的回归测试。
+- 状态页:每日日志只统计有内容的文件。真实数据验证发现——交易进程停了 71 小时,别的进程新建了 0 字节的当天日志,曾让『日志』与『告警』区块显示『刚更新、ok』。
 - `drill.py latency` 开仓限价改为「卖一 + N 跳」(新参数 `--aggress-ticks`,默认 3,0 = 贴卖一):夜盘后段清淡行情里贴着卖一挂的限价买单 30 秒没成交;限价买单按对手价成交,上限只封顶滑点。单测断言挂价。**尚未在真实行情下重测**。
 - 研究网关提交改为「先记账、再落文件」(审查发现):进程在两步之间崩溃时,最坏是多扣一个额度,而不是留下未记账的候选而多放额度;重名在记账前判定、不占额度;文件写入失败会把刚记的账退回。各有回归测试。
 - 代码审查(2026-11-12)对研究沙盒的两处修复:`research_api.py review` 在批准前重新校验文件哈希,阅读期间文件被换则拒绝(批准必须绑定到用户读过的内容);`risk/report.py` 的随机入场门槛改取 `GateThresholds` 默认值而非写死 95%,`selection.window` 含非字符串元素时不再让整份报告变成「生成失败」。各有回归测试。

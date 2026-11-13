@@ -78,7 +78,8 @@ flowchart LR
 | CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | **部分**:主机端与容器内均跑通完整启动管道(2026-11-10);废单文本、撤单失败、断线重连、夜盘跨日**未在真实 CTP 验证** |
 | GUI | `scripts/run_gui.py` | 完成(人工观察用,非无人值守) |
 | SG / DR | `scripts/simnow_guard.py`、`scripts/drill.py` | 代码完成,**演练从未实跑**(`docs/simnow-drills.md` 尚不存在,首次实跑时由脚本生成);阶段一,见 §2.4 |
-| UR | `scripts/unattended_report.py` | 完成(离线自检通过,真实 webhook 待配,probe 未通过;连续 5 天证据未攒齐) |
+| UR | `scripts/unattended_report.py` | 完成(离线自检通过,真实 webhook 待配,probe 未通过;连续 5 天证据未攒齐);纯逻辑在 `evidence/logstats.py` |
+| 状态页 | `dashboard/`、`scripts/status_server.py`、`requirements-dashboard.txt` | **后端阶段①完成**(2026-11-12):只读、仅回环、令牌鉴权、全 GET;**前端未构建**(占位页)。启动:`python scripts/status_server.py`;规划与契约见 `docs/web/README.md` |
 
 
 ### 2.2 目标架构与演进路线(已迁出)

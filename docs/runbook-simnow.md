@@ -78,6 +78,19 @@ docker compose run --rm --entrypoint python trader scripts/drill.py latency --co
 
 **排查工具**：`drill.py --trace FILE`（默认关闭）逐行 fsync 记录退出钩子、致命信号转储、释放后 API 调用探针、周期快照与登录间隔；`--trace-skip-close` 为控制运行。
 
+#### `scripts/status_server.py` —— 只读状态页(Web 监控面板)后端
+```bash
+pip install -r requirements-dashboard.txt     # Web 依赖,与交易环境隔离;交易机不需要装
+python scripts/status_server.py --check       # 只校验配置
+python scripts/status_server.py               # 启动,默认 127.0.0.1:8770
+```
+- **只读、仅回环**:全部接口是 GET;监听 `0.0.0.0` 或局域网地址会被配置层拒绝启动(经局域网访问属于阶段⑤,须另写 ADR)。
+- **令牌**:首次启动在 `data/state/status.token` 自动生成(不入库,内容不会被打印);浏览器里粘贴它。令牌放 `Authorization: Bearer` 头,不要放 URL。
+- **环境标签**:在 `config/status_dashboard.json` 里设 `environment`(`simnow` / `guoxin-test` / `live`)。不设则页面横幅显示『环境未知』——面板不读 `.env`,不会猜。
+- **状态目录**:默认 `data/state`(直接用 Python 运行的机器);Docker 运行则在配置里把 `state_dir` 指向挂载出来的 `runtime/data/state`,`log_dirs` 默认 `runtime/vntrader/log`。**不要把 `.vntrader/log` 加进去**——单元测试会污染它。
+- **面板必须与交易运行时在同一台机器**(它读同一批文件)。杀掉面板不影响交易;它不写任何被读取的文件(测试强制)。
+- 前端未构建时 `/` 显示占位页;API 可直接用(带令牌)。前端构建与入库见 `docs/web/05-lovable-guide.md`。
+
 #### `scripts/unattended_report.py` —— 无人值守验收的证据
 ```bash
 python scripts/unattended_report.py --report          # 生成每日证据表 → docs/unattended-log.md
