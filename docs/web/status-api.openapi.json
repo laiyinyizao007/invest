@@ -3439,7 +3439,8 @@
             "type": [
               "number",
               "null"
-            ]
+            ],
+            "description": "该代最好的一条的收益"
           },
           "worst_max_drawdown": {
             "type": [
@@ -3453,6 +3454,20 @@
               "type": "string"
             },
             "description": "该代出现的质量多样性格子"
+          },
+          "mean_total_return": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "该代所有候选的平均收益(画收益曲线用这个;只用最好的一条会高估种群)"
+          },
+          "mean_max_drawdown": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "该代所有候选的平均最大回撤"
           }
         },
         "required": [

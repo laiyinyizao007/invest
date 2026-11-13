@@ -63,7 +63,9 @@
 | `elite_sharpe` | 这一代的**最高**夏普 | 折线的主线 |
 | `mean_sharpe` | 这一代的**平均**夏普 | 折线的第二条线 |
 | `p25_sharpe` / `p75_sharpe` | 种群中间 50% 的区间 | 画成**带**(band) |
-| `best_total_return` | 最好收益 | 副轴折线 |
+| `best_total_return` | 最好收益 | 副轴折线(参考)
+| `mean_total_return` | **平均收益** | 副轴的主线——只画『最好』的一条会高估种群 |
+| `mean_max_drawdown` | 平均最大回撤 | 副轴 |
 | `worst_max_drawdown` | 最差回撤 | 副轴折线 |
 | `cells` | 这一代出现的格子(质量多样性) | 作为分组或 tooltip 补充 |
 

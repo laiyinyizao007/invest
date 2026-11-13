@@ -433,6 +433,8 @@ export interface EvolutionPoint {
   best_total_return: number | null;
   worst_max_drawdown: number | null;
   cells: Array<string>;
+  mean_total_return?: number | null;
+  mean_max_drawdown?: number | null;
 }
 
 /** 服务端的提示标志。**是提示,不是结论**;文案已写明依据。 */

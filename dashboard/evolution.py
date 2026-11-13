@@ -233,6 +233,9 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
             "p25_sharpe": _percentile(sharpes, 0.25),
             "p75_sharpe": _percentile(sharpes, 0.75),
             "best_total_return": None if not returns else round(max(returns), 4),
+            # 均值也要给:只给『最好』的那条会高估整个种群,画出来的收益曲线会偏乐观。
+            "mean_total_return": round(sum(returns) / len(returns), 4) if returns else None,
+            "mean_max_drawdown": round(sum(drawdowns) / len(drawdowns), 4) if drawdowns else None,
             "worst_max_drawdown": None if not drawdowns else round(max(drawdowns), 4),
             "cells": sorted({r.cell for r in group if r.cell}),
         })

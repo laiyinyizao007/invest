@@ -15,7 +15,9 @@
       "cells": [
         "fast-mid",
         "slow-short"
-      ]
+      ],
+      "mean_total_return": 0.0177,
+      "mean_max_drawdown": 0.1368
     },
     {
       "generation": 2,
@@ -28,7 +30,9 @@
       "worst_max_drawdown": 0.16,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0388,
+      "mean_max_drawdown": 0.1152
     },
     {
       "generation": 3,
@@ -42,7 +46,9 @@
       "cells": [
         "fast-mid",
         "slow-short"
-      ]
+      ],
+      "mean_total_return": 0.0809,
+      "mean_max_drawdown": 0.1584
     },
     {
       "generation": 4,
@@ -55,7 +61,9 @@
       "worst_max_drawdown": 0.24,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0861,
+      "mean_max_drawdown": 0.1728
     }
   ],
   "flags": [

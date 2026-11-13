@@ -14,7 +14,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     },
     {
       "generation": 2,
@@ -27,7 +29,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     },
     {
       "generation": 3,
@@ -40,7 +44,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     },
     {
       "generation": 4,
@@ -53,7 +59,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     },
     {
       "generation": 5,
@@ -66,7 +74,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     },
     {
       "generation": 6,
@@ -79,7 +89,9 @@
       "worst_max_drawdown": 0.2,
       "cells": [
         "fast-mid"
-      ]
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
     }
   ],
   "flags": [
