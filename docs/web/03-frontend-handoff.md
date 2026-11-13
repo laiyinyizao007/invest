@@ -62,6 +62,7 @@
 2. **未知取值按 unknown。** `state`/`level` 出现不认识的值 → 灰色『无法判断』。禁止 `default` 分支落到 ok。
 3. **年龄用 `age_seconds`。** 不用浏览器时钟减时间戳。两个例外:『距上次刷新』这种前端自己的计时。
 4. **`unknown` ≠ `ok`。** 总状态条、徽标都要有独立外观。
+   **`state` 与 `level` 各管一件事**:`state` 决定**内容能不能渲染**(missing/corrupt 时 data 为 null),`level` 决定**徽标长什么样**。所以 `state=ok` + `level=warn` 是常态(内容是好的,只是有些内容没列出/没检查),这时要正常渲染内容并加一个警示徽标,而不是当成异常。
 5. **空态 ≠ 缺失。** `state=ok` 且列表为空 → 『无』;`state=missing` → 『未找到数据来源』。
 6. **`null` 显示 `—`,不是 0。** 尤其是 `daily_pnl`、`peak_equity` 这类金额。
 7. **不重算服务器算好的值**:`level`、`reasons`、`daily_pnl`、`drawdown_from_peak`。
