@@ -30,7 +30,7 @@
 | `GET /api/research/evolution/{campaign_id}/log` | 变异日志 | `cursor`、`limit`(1–200,默认 50) |
 | `GET /api/research/runs/{run_id}/heatmap` | 参数热力图 | 路径参数 |
 | `GET /api/research/candidates/{sha256}/code` | 候选源码(按哈希) | 路径参数 |
-| `GET /api/research/candidates/{sha256}/diff` | 两个候选的差异 | 路径参数 |
+| `GET /api/research/candidates/{sha256}/diff` | 两个候选的差异 | 路径参数 `sha256`、查询参数 `parent`(父代哈希,必填) |
 
 全部是 `GET`、全部需要令牌、全部只读。
 

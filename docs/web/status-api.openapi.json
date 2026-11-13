@@ -1321,6 +1321,16 @@
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
             }
+          },
+          {
+            "name": "parent",
+            "in": "query",
+            "required": true,
+            "description": "父代候选的哈希(与父代比对)",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
           }
         ]
       }
