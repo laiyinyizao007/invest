@@ -32,6 +32,7 @@ from vnpy_ctastrategy import CtaTemplate
 from vnpy_ctastrategy.base import EngineType
 
 from risk.account_guard import trading_day
+from risk.market_view import NO_ACCESS, read_only_view
 from risk.risk_guard import DailyLossGuard, TrailingStop, stop_distance, within_budget
 
 
@@ -89,6 +90,8 @@ class TrendAtrStrategy(CtaTemplate):
         self.bg = BarGenerator(self.on_bar, window=1, on_window_bar=self.on_daily_bar,
                                interval=Interval.DAILY, daily_end=self.daily_end)
         self._daily_open_dt = None
+        # 候选在 entry_signal 里拿到的只读行情视图(收能力,见 docs/adr/20261113-read-only-market-view.md)
+        self._am_view = read_only_view(self.am)
 
     # ---- TrailingStop 内部状态的变量映射(供 sync_data 保存 / 引擎恢复) ----
     @property
@@ -231,8 +234,21 @@ class TrendAtrStrategy(CtaTemplate):
         if ids:
             self._stop_armed = True
 
+    def _call_entry_signal(self) -> int:
+        """调用 `entry_signal()`——候选碰得到行情容器的**唯一**时机。
+
+        这一刻 `self.am` 换成只读视图(数组与指标结果都是拷贝,没有变更入口),`self.bg` 换成禁止访问的哨兵;
+        调用结束(含异常)立刻还原。候选因此拿不到真实容器:视图写回、`[:, None]`、`__setitem__`、
+        改 `count`/`size` 这一整类"改写行情容器"的攻击没有可改的对象,不用再逐条枚举写法。"""
+        real_am, real_bg = self.am, self.bg
+        self.am, self.bg = self._am_view, NO_ACCESS
+        try:
+            return self.entry_signal()
+        finally:
+            self.am, self.bg = real_am, real_bg
+
     def _try_enter(self, bar: BarData) -> None:
-        signal = self.entry_signal()
+        signal = self._call_entry_signal()
         if signal == 0:
             return
         if not self.guard.can_open(trading_day(bar.datetime)):

@@ -379,11 +379,12 @@ def test_the_fifth_layer_notices_a_container_whose_count_is_made_to_lag():
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 
     class Lagging(TrendAtr15mStrategy):
-        def entry_signal(self):
-            # 候选只能在 entry_signal 里动手(on_bar/_process_daily_bar 是受保护成员):
-            # 每根 K 线让计数落后一根
-            self.am.count -= 1
-            return super().entry_signal()
+        def _call_entry_signal(self):
+            # 候选只能在 entry_signal 里动手,而那里现在拿到的是只读视图(docs/adr/20261113-read-only-market-view.md),
+            # 改 count 的攻击已经没有可改的对象。这里用覆盖换入点的类**模拟"视图被绕过"**,
+            # 验证第五层作为纵深防御仍然有效(静态层与 check_class 会拦这种类;此处直接绕过它们来测运行期)。
+            self.am.count -= 1                              # 每根 K 线让真实容器的计数落后一根
+            return super()._call_entry_signal()
 
     with pytest.raises(RuntimeError, match="累计根数"):
         backtest_lib.run_engine_bars(Lagging, _TRANSIENT_SETTING, "C15", _synth_bars())

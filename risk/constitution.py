@@ -84,7 +84,7 @@ BUILTIN_PROTECTED_NAMES = (
     # 下单与持仓管理路径:重写即绕过预算检查与连亏熔断
     "__init__", "on_bar", "on_tick", "on_init", "on_start", "on_stop", "on_trade", "on_order",
     "on_stop_order", "on_account_status", "on_position", "on_cancel_order", "on_disconnect",
-    "_process_daily_bar", "_manage_position", "_try_enter", "_send_entry", "_place_protective_stop",
+    "_process_daily_bar", "_manage_position", "_try_enter", "_call_entry_signal", "_am_view", "_send_entry", "_place_protective_stop",
     "_place_pending_entry", "_stop_order_price", "_ensure_protective_stop", "_complete_stale_daily_bar",
 ) + BUILTIN_PROTECTED_PARAMETERS
 
@@ -106,6 +106,8 @@ BUILTIN_PROTECTED_ENTRY_POINTS = (
     "_try_enter", "_send_entry", "_manage_position", "_place_protective_stop",
     "_place_pending_entry", "_process_daily_bar", "_ensure_protective_stop",
     "_stop_order_price", "_complete_stale_daily_bar",
+    # 只读行情视图的换入点(收能力):候选碰得到行情容器的唯一时机。覆盖它或引用它,就能绕开视图。
+    "_call_entry_signal",
 )
 
 # 受保护的**状态对象**:模板自己持有的、装着风控判定的那些对象。
