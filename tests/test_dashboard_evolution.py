@@ -299,3 +299,28 @@ def test_a_corrupt_ledger_is_distinguishable_from_a_missing_campaign(tmp_path):
         col.get_evolution_log(s, "camp-bad")
     assert col.get_evolution_curve(s, "camp-missing") is None      # 不存在 → None(404)
     assert col.get_evolution_log(s, "camp-missing") is None
+
+
+def test_a_heatmap_whose_cells_do_not_match_the_axis_lengths_is_rejected(tmp_path):
+    """格子数与坐标轴长度对不上:网格会有空洞,前端画出来的热力图是错的(缺格显示成无效或错位)。"""
+    d = heatmap(tmp_path, body={
+        "axes": {"a": [1.0, 2.0], "b": [10, 20], "c": [0.5]},
+        "scores": [[0, 0, 0, 1.2], [1, 0, 0, 0.9], [0, 1, 0, "-inf"], [1, 1, 0, 0.4]],
+        "best_cell": [0, 0, 0],
+    })
+    # 故意把 b 轴写成三格而得分表只有两行
+    d2 = heatmap(tmp_path, "20261112-210000-000001", body={
+        "axes": {"a": [1.0, 2.0], "b": [10, 20, 30], "c": [0.5]},
+        "scores": [[0, 0, 0, 1.2], [1, 0, 0, 0.9], [0, 1, 0, "-inf"], [1, 1, 0, 0.4]],
+    })
+    with pytest.raises(ev.EvolutionError):
+        ev.read_heatmap(d2, "20261112-210000-000001")
+
+
+def test_heatmap_cells_outside_the_declared_axis_ranges_are_rejected(tmp_path):
+    d = heatmap(tmp_path, "20261112-210000-000002", body={
+        "axes": {"a": [1.0, 2.0], "b": [10, 20], "c": [0.5]},
+        "scores": [[0, 0, 0, 1.2], [5, 0, 0, 0.9]],
+    })
+    with pytest.raises(ev.EvolutionError):
+        ev.read_heatmap(d, "20261112-210000-000002")

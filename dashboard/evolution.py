@@ -277,6 +277,7 @@ def read_heatmap(directory: Path, run_id: str) -> dict | None:
         values = axes[name]
         if not isinstance(values, list) or not values or any(not isinstance(v, (int, float)) or isinstance(v, bool) for v in values):
             raise EvolutionError("热力图的坐标轴取值非法")
+    limits = [len(axes[name]) for name in names]        # 每个轴的下标范围
     cells: dict[tuple[int, ...], float | None] = {}
     for item in scores:
         if not isinstance(item, list) or len(item) != 4:
@@ -284,6 +285,8 @@ def read_heatmap(directory: Path, run_id: str) -> dict | None:
         index = item[:3]
         if any(not isinstance(i, int) or isinstance(i, bool) for i in index):
             raise EvolutionError("热力图的得分表下标非法")
+        if any(i < 0 or i >= limit for i, limit in zip(index, limits)):
+            raise EvolutionError("热力图的得分表下标越界(与坐标轴长度不符)")
         value = item[3]
         if isinstance(value, str) and value == "-inf":
             cells[tuple(index)] = None               # 无效格子:显式为空,不画成 0
@@ -294,8 +297,12 @@ def read_heatmap(directory: Path, run_id: str) -> dict | None:
     best_cell = body.get("best_cell")
     if not (isinstance(best_cell, list) and len(best_cell) == 3):
         best_cell = None
+    elif any(not isinstance(i, int) or isinstance(i, bool) or i < 0 or i >= limit for i, limit in zip(best_cell, limits)):
+        raise EvolutionError("热力图的 best_cell 越界")
     # 三维 → 二维:第三轴固定在 best_cell 的取值上(没有 best_cell 时取第一格)
     third = 0 if best_cell is None else int(best_cell[2])
+    if len(axes[names[0]]) * len(axes[names[1]]) * len(axes[names[2]]) != len(cells):
+        raise EvolutionError("热力图的格子数与坐标轴长度对不上")
     x_name, y_name = names[0], names[1]
     x_values, y_values = axes[x_name], axes[y_name]
     grid = []
