@@ -147,3 +147,30 @@ def test_corrupt_outbox_lines_are_skipped_but_counted_conservatively(tmp_path):
 def test_alerts_with_no_logs_and_no_outbox_is_missing(tmp_path):
     r = col.collect_alerts(settings(tmp_path), NOW)
     assert r.section["state"] == "missing" and r.level == "unknown"
+
+
+def test_an_empty_log_file_created_just_now_is_not_evidence_of_activity(tmp_path):
+    """回归(真实数据发现):交易进程停了几十小时,别的进程却新建了一个 0 字节的当天日志,
+    曾让『日志』和『告警』区块显示『刚更新、ok』。空文件不是活动证据。"""
+    old = log(tmp_path, "20261111", CLEAN)
+    os.utime(old, (NOW - 100 * 3600, NOW - 100 * 3600))
+    empty = tmp_path / "runtime" / "vntrader" / "log" / "vt_20261113.log"
+    empty.write_bytes(b"")
+    os.utime(empty, (NOW, NOW))
+    for collect in (col.collect_days, col.collect_alerts):
+        r = collect(settings(tmp_path), NOW)
+        assert r.section["state"] == "stale", collect.__name__
+        assert r.section["age_seconds"] >= 99 * 3600
+
+
+def test_the_age_comes_from_the_last_logged_line_when_the_file_has_content(tmp_path):
+    p = log(tmp_path, "20261111", CLEAN)
+    os.utime(p, (NOW - 2 * 3600, NOW - 2 * 3600))
+    assert abs(col.collect_days(settings(tmp_path), NOW).section["age_seconds"] - 2 * 3600) < 2
+
+
+def test_only_empty_logs_means_missing_not_a_clean_week(tmp_path):
+    d = tmp_path / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True)
+    (d / "vt_20261111.log").write_bytes(b"")
+    assert col.collect_days(settings(tmp_path), NOW).section["state"] == "missing"

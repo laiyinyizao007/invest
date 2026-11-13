@@ -147,15 +147,36 @@ REQUIRED_STREAK = 5
 
 
 def _log_files(settings: Settings) -> list[Path]:
+    """有内容的每日日志。**空文件不算**:别的进程新建的 0 字节日志既不是活动证据(曾让交易进程停了几十小时的页面显示『刚更新』),
+    也不能代表『这一天无异常』。"""
     files: list[Path] = []
     for d in settings.paths["log_dirs"]:
         if d.is_dir():
-            files += sorted(d.glob("vt_*.log"))
+            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f)]
     return files
 
 
+def _nonempty(path: Path) -> bool:
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def _days(settings: Settings) -> list[ls.DayStats]:
-    return ls.collect_days([d for d in settings.paths["log_dirs"] if d.is_dir()])
+    """按天汇总,只统计有内容的日志(与 _log_files 同一口径)。"""
+    merged: dict[str, ls.DayStats] = {}
+    for f in _log_files(settings):
+        stats = ls.parse_day_log(f)
+        target = merged.setdefault(stats.day, ls.DayStats(day=stats.day))
+        target.started += stats.started
+        target.trades += stats.trades
+        target.events.update(stats.events)
+        target.first_ts = target.first_ts or stats.first_ts
+        if stats.last_ts:
+            target.last_ts = stats.last_ts
+        target.log_path = stats.log_path
+    return [merged[d] for d in sorted(merged)]
 
 
 def _events(stats: ls.DayStats) -> list[dict]:
