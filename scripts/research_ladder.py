@@ -1,0 +1,48 @@
+"""梯子的人工入口:`status`(只读)与 `renew`(显式续期,留痕)。
+
+用法:
+    python scripts/research_ladder.py status
+    python scripts/research_ladder.py renew --reason "第 1 批候选已复核,续 60 次"
+
+为什么需要它(第 15 轮 codex 的 High):梯子的总查询预算用尽后,续期原先只能手工编辑状态文件——
+续期与回滚无法区分,而且没有审计钩子。现在状态是带哈希链的日志(risk/ladder.py),手工编辑会被当成篡改而 fail-closed;
+续期只能走这里,每次追加一条 `renew` 事件:`queries` 归零、**`best` 保留**(已经泄漏的信息收不回来)、必须给出非空原因。
+
+这是**给人用**的命令:进化回路与网关没有任何路径可以调用它(网关只有 /research/* 白名单路由)。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import bootstrap  # noqa: F401  (必须先于 vnpy;这里不用 vnpy,但与同目录脚本保持同一入口约定)
+import research_api as api
+from risk.ladder import Ladder, LadderError
+
+
+def ladder_for(paths: dict) -> Ladder:
+    return Ladder(Path(paths["results_dir"]) / "ladder" / "ladder.json")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="梯子的人工入口(只读 status;显式 renew,留痕)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="当前汇报值与剩余查询数(不消耗查询)")
+    renew = sub.add_parser("renew", help="续期:queries 归零、保留 best,留审计记录")
+    renew.add_argument("--reason", required=True, help="续期原因(必填,写进审计日志,至多 200 字符)")
+    args = parser.parse_args(argv)
+    _, paths = api.settings()
+    ladder = ladder_for(paths)
+    try:
+        out = ladder.status() if args.command == "status" else ladder.renew(args.reason)
+    except LadderError as exc:
+        print(f"拒绝: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

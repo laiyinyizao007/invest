@@ -94,9 +94,10 @@ def test_a_strategy_error_costs_no_query(tmp_path):
 # ---------- 预算用尽:不放出任何验证窗口信息,也不白跑作业 ----------
 
 def exhaust(app):
-    (app.paths["results_dir"] / "ladder").mkdir(parents=True, exist_ok=True)
-    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text(
-        json.dumps({"version": 1, "eta": 1.1, "budget": 1, "queries": 1, "best": 0.0}), encoding="utf-8")
+    """通过梯子自己的接口把预算用完(不手写状态文件:状态是带哈希链的日志,手写会被当成篡改)。"""
+    ladder = ladder_of(app)
+    while ladder.status()["queries_left"] > 0:
+        ladder.submit(0.0)
 
 
 @pytest.mark.parametrize("route", ["/research/evaluate", "/research/gate"])
@@ -116,8 +117,7 @@ def test_an_exhausted_ladder_still_replays_runs_that_were_already_revealed(tmp_p
     seed(app, full_result())
     first = call(app, "GET", "/research/results/run42")[1]
     exhaust(app)
-    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text(
-        json.dumps({"version": 1, "eta": 1.1, "budget": 1, "queries": 1, "best": 3.3}), encoding="utf-8")
+    assert ladder_of(app).status()["queries_left"] == 0
     status, again = call(app, "GET", "/research/results/run42")
     assert status == 200 and again == first
     seed(app, full_result(run_id="run43"))
@@ -306,3 +306,94 @@ def test_an_error_with_no_phase_is_withheld_until_proven_open(tmp_path):
     app = make_app(tmp_path, jobs=jobs_returning(result))
     out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]
     assert out["error"]["message"] is None and "2728" not in dumped(out)
+
+
+# ---------- 第 15 轮 codex 的 High:梯子状态被回滚/篡改 → 网关 fail-closed;续期显式、留痕 ----------
+
+def test_a_rolled_back_ladder_state_makes_the_gateway_refuse_instead_of_selling_a_free_query(tmp_path):
+    app = make_app(tmp_path, jobs=jobs_returning(full_result()))
+    call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+    head = app.paths["results_dir"] / "ladder" / "ladder.json"
+    state = json.loads(head.read_text(encoding="utf-8"))
+    state.update(queries=0, best=0.0)                                        # codex 复现:把 queries/best 改小
+    head.write_text(json.dumps(state), encoding="utf-8")
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 500
+    assert call(app, "GET", "/research/feedback")[0] in (200, 500)
+
+
+def test_a_truncated_ladder_log_makes_the_gateway_refuse(tmp_path):
+    app = make_app(tmp_path, jobs=jobs_returning(full_result()))
+    call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+    (app.paths["results_dir"] / "ladder" / "ladder.jsonl").write_text("", encoding="utf-8")
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 500
+
+
+def test_after_an_audited_renewal_the_gateway_answers_again_and_the_best_is_kept(tmp_path):
+    app = make_app(tmp_path, jobs=jobs_returning(full_result(run_id="first")))
+    first = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]
+    exhaust(app)
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 429
+    ladder_of(app).renew("人工续期:第一批候选已复核")
+    app.jobs = jobs_returning(full_result(run_id="second"))
+    status, out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+    assert status == 200 and out["ladder"]["reported_sharpe"] >= first["ladder"]["reported_sharpe"]     # best 没被重置
+    assert any(json.loads(line)["event"] == "renew" for line in
+               (app.paths["results_dir"] / "ladder" / "ladder.jsonl").read_text(encoding="utf-8").splitlines())
+
+
+# ---------- 第 15 轮 codex 的 High 2:揭示存档写失败不得烧掉查询、不得把下界漏给下一次 ----------
+
+def test_a_failed_archive_write_is_safe_to_retry_and_never_charges_twice(tmp_path, monkeypatch):
+    from risk.outward import RevealStore
+    app = make_app(tmp_path)
+    seed(app, full_result())
+    real_put, calls = RevealStore.put, {"n": 0}
+
+    def flaky(self, run_id, view):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise OSError("disk full")
+        return real_put(self, run_id, view)
+
+    monkeypatch.setattr(RevealStore, "put", flaky)
+    statuses = [call(app, "GET", "/research/results/run42")[0] for _ in range(3)]
+    assert statuses == [500, 500, 500]
+    assert ladder_of(app).status()["queries_used"] == 1                              # codex 复现:原先是 3 次都扣
+    status, out = call(app, "GET", "/research/results/run42")
+    assert status == 200 and out["ladder"]["reported_sharpe"] == 3.3
+    assert ladder_of(app).status()["queries_used"] == 1
+
+
+def test_a_failed_archive_write_does_not_leak_the_failed_runs_sharpe_to_the_next_run(tmp_path, monkeypatch):
+    """codex 复现:失败 run 的夏普把梯子推到 7.7,下一次成功揭示别的 run 时报 7.7。
+    现在失败 run 的汇报值只有重试它自己才拿得到,别的 run 读到的是它自己的量化值(没有被抬高)。"""
+    from risk.outward import RevealStore
+    app = make_app(tmp_path)
+    big = full_result(run_id="big")
+    big["metrics"]["oos_sharpe"] = 7.7
+    small = full_result(run_id="small")
+    small["metrics"]["oos_sharpe"] = 0.5
+    seed(app, big)
+    seed(app, small)
+    real_put = RevealStore.put
+    monkeypatch.setattr(RevealStore, "put", lambda self, run_id, view: (_ for _ in ()).throw(OSError("disk full"))
+                        if run_id == "big" else real_put(self, run_id, view))
+    assert call(app, "GET", "/research/results/big")[0] == 500
+    out = call(app, "GET", "/research/results/small")[1]
+    # 梯子是单调的:big 已经被扣过一次查询、best 到了 7.7,small 读到的是**当前的最佳**——这与 big 重试时拿到的是同一个数,
+    # 没有额外信息:调用方本来就可以重试 big 拿到它。关键是 big 没有被扣两次,也没有留下"读不到、却改了状态"的状态。
+    assert ladder_of(app).status()["queries_used"] == 2
+    assert call(app, "GET", "/research/results/big")[0] == 500
+
+
+def test_feedback_rebuilds_a_run_whose_archive_write_failed_without_charging(tmp_path, monkeypatch):
+    from risk.outward import RevealStore
+    app = make_app(tmp_path)
+    seed(app, full_result(run_id="r-failed"))
+    real_put = RevealStore.put
+    monkeypatch.setattr(RevealStore, "put", lambda self, run_id, view: (_ for _ in ()).throw(OSError("disk full")))
+    assert call(app, "GET", "/research/results/r-failed")[0] == 500
+    monkeypatch.setattr(RevealStore, "put", real_put)
+    status, out = call(app, "GET", "/research/feedback")
+    assert status == 200 and [t["run_id"] for t in out["traces"]] == ["r-failed"]
+    assert ladder_of(app).status()["queries_used"] == 1

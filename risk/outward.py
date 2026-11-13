@@ -15,8 +15,10 @@ DSR、成本翻倍夏普……);外层看到的是它的**净化视图**,由本�
   (`<results_dir>/outward/<run_id>.json`);**之后重复读取只回放当时的视图**,不再查询、也不会读到更新的值——
   否则反复读同一个 run 就是在白嫖查询,或者在梯子上升之后读到不一致的值;
 - 没有验证窗口数字的 run(选参失败、策略报错、训练段回测)不消耗查询;
-- **从未揭示过的 run 不会被偷偷揭示**:`allow_query=False` 时(给 `/feedback` 用)没有存档就返回 None,
+- **从未揭示过的 run 不会被偷偷揭示**:`allow_query=False` 时(给 `/feedback` 用)既没有存档、梯子里也没有这个 run 就返回 None,
   因为 `/feedback` 一次要扫很多 run,不能让一次读取悄悄烧掉一批查询;
+- **存档写失败后重试是安全的**(第 15 轮 codex 的 High):梯子的提交按 `run_id` 幂等,"扣了查询、存档没写成"的 run 重试时
+  只回放当时的汇报值,不重复扣查询;
 - 存档损坏就 fail-closed(抛 OutwardError),不重新查询——重新查询会掩盖篡改。
 
 被拒绝的路径同样重要:验证段的回测(`/backtest` 的 `segment=valid`)由网关直接拒绝(见 research_gateway.py),
@@ -292,9 +294,13 @@ def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: boo
         stored = store.get(run_id)
         if stored is not None:
             return stored
-        if not allow_query:
+        # 没有存档,但梯子日志里有这个 run:上一次揭示在"扣了查询、存档没写成"处失败了(第 15 轮 codex 的 High)。
+        # 它已经被扣过一次查询,重建视图只是回放当时的汇报值——不是"偷偷揭示",也不会再扣。
+        if not allow_query and not ladder.has(run_id):
             return None
-        reported = ladder.submit(sharpe)                       # 先扣查询、先落盘梯子状态
+        # 梯子的提交按 run_id **幂等**:同一个 run 重复提交只回放当时的汇报值、不再扣查询。
+        # 所以存档写失败之后重试是安全的:不会重复扣、也没有新的信息泄漏(重试本来就拿得到同样的值)。
+        reported = ladder.submit(sharpe, run_id=run_id)
         view["ladder"] = {"reported_sharpe": reported["reported"], "step": reported["step"],
                           "queries_left": reported["queries_left"]}
         view["report"] = outward_report(view)
