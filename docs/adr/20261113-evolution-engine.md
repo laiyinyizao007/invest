@@ -135,9 +135,9 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 三层防线:
 | 层 | 位置 | 拦什么 |
 |---|---|---|
-| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、直接下单/撤单、`param_grid` 含受保护参数、**受禁 dunder 的调用与自定义**(见下)、自定义 metaclass、类装饰器 |
+| 静态(提交时) | `research_sandbox.screen_source` → `constitution.screen_source` | 类体覆盖受保护成员、重写受保护方法、实例上改写受保护属性、改写受保护的风控模块函数、下单/撤单接口、禁用内建函数的**引用**、`param_grid` 含受保护参数、**受禁 dunder 的定义与引用**(见下)、自定义 metaclass、类装饰器 |
 | 运行时(执行前) | `research_api.import_candidate` → `constitution.check_class` | 候选必须继承模板家族;不得重写白名单以外的**模板成员**——覆盖候选类体、中间基类、类创建后动态打的补丁三类;不得定义受禁 dunder;不得自定义 metaclass |
-| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数或成员(此前 `backtest`/`gate` 不校验参数键名),**大小写不敏感**比对 |
+| 参数(请求时) | `research_api.check_params_allowed` → `constitution.check_params` | 调用方不得在设置字典里指定受保护参数或成员(此前 `backtest`/`gate` 不校验参数键名),**大小写不敏感**比对;子进程入口(`_child`/`_gate_child`)自己再查一遍——子入口是独立的信任边界 |
 
 要点:
 - **家族而非模板**:要求继承"模板所属家族"(MRO 里最靠近 object 的**应用层**基类),不要求继承 15 分钟模板本身——研究与沙盒也跑日线族。家族根必须排除 vnpy 框架基类与 `abc.ABC`;早先按"祖先名字/模块"猜测会把 `abc.ABC` 当成家族根,连带把模板自身成员误判为"候选重写",导致**每个真实候选都被拒**。
@@ -145,12 +145,26 @@ N=100 时括号项约 2.53,与实现一致。核对对象是二手资料,未读 
 - 白名单 `allowed_overrides` 默认只有 `entry_signal`、`param_grid`、`parameters` 与可搜索参数;试图把受保护项加进白名单一律拒绝(不静默过滤,以免掩盖配置错误)。白名单与受保护清单的冲突在**合并后**的集合上校验,冲突即报错。
 - `research_grid.FORBIDDEN_AXES` 改为从清单派生,避免两处各写一份而漂移。
 - **清单的 `template` 只能取内置白名单内的类**:换成任意可导入的类(如 vnpy 的 `CtaTemplate`)会让继承约束形同虚设;要换模板必须改代码、走代码评审。
-- **"只能追加"靠版本控制保证**:`load()` 只与代码里的内置集合合并,察觉不到文件里的删除。清单相对上一次提交只增不减,由 CI 检查(`test_constitution_history_is_append_only`)逐个历史版本比对。
+- **"只能追加"靠版本控制保证**:`load()` 只与代码里的内置集合合并,察觉不到文件里的删除。清单相对上一次提交只增不减,由 CI 检查(`test_constitution_history_is_append_only`)逐个历史版本比对;**内置**保护项写在代码常量里,那个比对看不见,另由 `test_builtin_protections_are_never_shrunk` 从历史版本里把常量读出来比对(否则把 `BUILTIN_PROTECTED_PARAMETERS` 里的 `risk_budget` 删掉,其它检查一样全绿)。两个检查都需要**完整历史**:CI 必须 `fetch-depth: 0`,浅克隆下检查直接失败而不是跳过——查不了等于没查,不能让它冒充通过。
+
+### 拦"引用"而不是拦"调用"
+`f = object.__setattr__` 之后 `f(self, "risk_budget", 1e9)` 的调用点是裸名字,AST 看不见被调的是谁;实测这个写法**真的能击穿风控底线**(`within_budget(100.0, 10.0, inst.risk_budget)` 在改写后返回 True)。因此静态层一律拦**引用**:
+- 受禁 dunder(`__setattr__`/`__delattr__`/`__getattribute__`/`__getattr__`/`__init_subclass__`/`__set_name__`)的任何 `ast.Attribute` 引用与裸名字引用;
+- 下单/撤单接口(`buy`/`sell`/`send_order`/`cancel_all` …)的任何 `ast.Attribute` 引用与裸名字引用;
+- 禁用内建函数(`getattr`/`setattr`/`delattr`/`vars`/`globals`/`locals`/`eval`/`exec`/`compile`/`open`/`__import__`/`input`/`type`)的任何名字引用。
+
+同样地,`operator.attrgetter('__dict__')(self)` 把属性名当字符串用,绕开了"禁止访问 `__dict__`"的属性写法检查——`operator` 模块整体禁用,受禁属性名作为**字符串常量**出现也一律拒绝(这些 token 在候选源码里按保留字处理,文档字符串里提到也会被拒,这是有意的保守取舍)。
+
+### 哈希、筛查、编译、执行必须是同一份字节
+早先 `import_candidate` 用 `spec.loader.exec_module()` 载入候选:Python 默认的 `.pyc` 只比对源文件的 mtime 与大小,不确认字节码对应当前内容,于"人工批准的、算过哈希的、过了静态筛查的源码"和"实际执行的字节码"可以不是一回事;分开打开文件还留下 TOCTOU 窗口。现在只读一次字节,对同一份内容做完哈希、筛查、编译、执行(不再走 `SourceFileLoader`),`__pycache__` 里的旧字节码没有机会生效。
 
 ### 受禁 dunder 与元类
 `object.__setattr__(self, "risk_budget", 1e9)` 能在运行时直接改写实例上的风控底线,而属性形式的 `__setattr__` 不在静态筛查原有的赋值检查覆盖范围内,运行时又因"所有 dunder 一律忽略"而漏掉——两层防线同时失效。因此:
-- 静态层拒绝调用 `__setattr__`/`__delattr__`/`__getattribute__`/`__getattr__`/`__init_subclass__`/`__set_name__`,拒绝候选自定义这些 dunder,拒绝自定义 metaclass 与类装饰器;
+- 静态层拒绝**定义、引用或调用** `__setattr__`/`__delattr__`/`__getattribute__`/`__getattr__`/`__init_subclass__`/`__set_name__`,拒绝候选自定义这些 dunder,拒绝自定义 metaclass 与类装饰器;
 - 运行时层拒绝候选定义这些 dunder,拒绝候选的 metaclass 与模板不一致。
+- `super().__init__()` 不在受禁之列(`__init__` 在受保护成员名单里,单独处理)。
+
+**静态层不是安全边界**:AST 黑名单无法封闭 Python 的动态能力(运行时构造的属性名、字节码、导入期副作用都绕得开)。它的定位是纵深防御的一层,真正的边界是容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)与"运行前由人读过代码"这两条前提。
 
 **已知残余风险**:候选若在模块导入期用 `import` 副作用改写模板模块的成员,静态层未必拦得住;彻底解决要把风控底线移出候选实例属性、存到候选无法触及的引擎侧对象里。已登记为后续项。
 

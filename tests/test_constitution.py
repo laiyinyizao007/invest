@@ -532,3 +532,83 @@ def test_constitution_history_is_append_only():
                       "forbidden_order_calls", "protected_module_attrs"):
             removed = set(older.get(field, [])) - set(current.get(field, []))
             assert not removed, f"{field} 里的 {sorted(removed)} 在后续提交中被删除了(清单只能追加)"
+
+
+BUILTIN_SETS = (
+    "BUILTIN_ALLOWED_OVERRIDES",
+    "BUILTIN_PROTECTED_NAMES",
+    "BUILTIN_PROTECTED_PARAMETERS",
+    "BUILTIN_FORBIDDEN_ORDER_CALLS",
+    "BUILTIN_PROTECTED_MODULE_ATTRS",
+    "BUILTIN_FORBIDDEN_DUNDERS",
+)
+
+
+def test_builtin_protections_are_never_shrunk():
+    """代码里的内置保护项也不许被删掉。
+
+    清单文件只能追加,靠的是上面那个历史比对;但**内置**的保护项写在
+    `risk/constitution.py` 的常量里,那个比对看不见它们——把
+    `BUILTIN_PROTECTED_PARAMETERS` 里的 `risk_budget` 删掉,其它检查一样全绿,
+    而候选已经可以改写风控底线了。这条检查把历史版本里的常量也读出来比对。"""
+    import ast
+    import subprocess
+
+    root = str(const.CONSTITUTION_FILE.parent.parent)
+
+    def git(*args):
+        # 显式按 utf-8 解码:系统默认编码在中文 Windows 上是 cp1252,会解不出仓库里的中文注释。
+        return subprocess.run(["git", *args], capture_output=True, cwd=root, encoding="utf-8",
+                              errors="replace")
+
+    shallow = git("rev-parse", "--is-shallow-repository")
+    if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+        pytest.fail("仓库是浅克隆,无法比对内置保护项的历史(fail-closed)")
+
+    out = git("log", "--format=%H", "--", "risk/constitution.py")
+    if out.returncode != 0:
+        pytest.fail(f"git 不可用,无法检查内置保护项(fail-closed): {out.stderr.strip()}")
+    commits = [h.strip() for h in out.stdout.split() if h.strip()]
+    if len(commits) < 2:
+        pytest.skip("宪法模块自建立起只提交过一次,暂无可比对的历史版本")
+
+    def sets_of(source):
+        """从源码里取出各内置常量定义的字符串集合;常量不存在则返回空 dict。"""
+        found = {}
+        for node in ast.parse(source).body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name) or target.id not in BUILTIN_SETS:
+                continue
+            if not isinstance(node.value, (ast.Tuple, ast.List)):
+                continue
+            values = [e.value for e in node.value.elts
+                      if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            found[target.id] = set(values)
+        return found
+
+    current = sets_of(open(str(const.CONSTITUTION_FILE.parent.parent / "risk" / "constitution.py"),
+                           encoding="utf-8").read())
+    for rev in commits:
+        raw = git("show", f"{rev}:risk/constitution.py")
+        if raw.returncode != 0:
+            continue
+        older = sets_of(raw.stdout)
+        for name, values in older.items():
+            removed = values - current.get(name, set())
+            assert not removed, f"{name} 里的 {sorted(removed)} 在后续提交中被删除了(内置保护只能增不能减)"
+
+
+# ---------- 别名绕过:下单接口与 dunder 同样拦引用 ----------
+
+@pytest.mark.parametrize("snippet", [
+    "f = self.buy\nf(1, 1)",
+    "f = self.cancel_all\nf()",
+    "g = buy\ng(1, 1)",
+])
+def test_aliasing_an_order_call_is_rejected(snippet):
+    """下单接口的引用也要拦:`f = self.buy` 之后 `f(1, 1)` 的调用点看不出是下单。"""
+    src = f"class C:\n    def entry_signal(self):\n        {snippet}\n        return 0\n"
+    findings = screen(src)
+    assert findings, f"未拦下: {snippet}"

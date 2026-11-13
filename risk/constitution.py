@@ -281,18 +281,17 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             # `f(self, "risk_budget", 1e9)` 同样能改写实例属性,而调用点已经看不出是谁了。
             if node.attr in BUILTIN_FORBIDDEN_DUNDERS:
                 findings.append(f"第 {node.lineno} 行: 禁止引用 {node.attr}(可绕过属性改写检查)")
+            elif node.attr in c.forbidden_order_calls:
+                # 下单接口同理拦**引用**:`f = self.buy` 之后 `f(1, 1)` 的调用点看不出是下单。
+                findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.attr}")
             elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
-        elif isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute):
-                if func.attr in c.forbidden_order_calls:
-                    findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.attr})")
-            elif isinstance(func, ast.Name):
-                if func.id in c.forbidden_order_calls:
-                    findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.id})")
-                elif func.id in BUILTIN_FORBIDDEN_DUNDERS:
-                    findings.append(f"第 {node.lineno} 行: 禁止调用 {func.id}()")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            # 裸名字的引用同样要拦:`__setattr__(self, ...)`、`buy(...)`、以及先取别名再调用。
+            if node.id in BUILTIN_FORBIDDEN_DUNDERS:
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写检查)")
+            elif node.id in c.forbidden_order_calls:
+                findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.id}")
         elif isinstance(node, ast.Dict):
             for key in node.keys:
                 if isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value in c.protected_parameters:

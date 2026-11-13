@@ -775,3 +775,108 @@ def test_all_three_child_entrypoints_go_through_the_same_validation_function(tre
         source = inspect.getsource(getattr(api, name))
         assert "import_candidate(" in source, f"{name} 没走统一入口"
         assert "check_candidate_class(" not in source, f"{name} 仍在自己做校验,会漏"
+
+
+# ---------- codex 第 4 轮:pyc 绕过、参数绕过、evaluate 回归 ----------
+
+def test_a_stale_pyc_cannot_replace_the_hashed_source(tmp_path, monkeypatch):
+    """预置一个"时间戳有效"的旧 .pyc:执行的必须是被哈希、被筛查的那份源码。
+
+    Python 默认的 .pyc 只比对源文件的 mtime 与大小,不确认字节码对应当前内容。
+    如果载入走 `spec.loader.exec_module()`,攻击者可以让"人工批准的干净源码"与
+    "实际执行的字节码"不是一回事——所以哈希、筛查、编译、执行必须基于同一份字节。"""
+    import importlib.util
+    import os
+    import py_compile
+
+    good = "from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    VALUE = 'GOOD'\n"
+    bad = good.replace("'GOOD'", "'BAD!'")          # 等长:pyc 的大小校验同样过得去
+    assert len(good) == len(bad)
+    f = tmp_path / "s.py"
+    f.write_text(bad, encoding="utf-8")
+    py_compile.compile(str(f), doraise=True)        # 生成与 bad 对应的 .pyc
+    stat = os.stat(f)
+    f.write_text(good, encoding="utf-8")
+    os.utime(f, (stat.st_atime, stat.st_mtime))      # 把 mtime 调回去:pyc 的时间戳校验因此通过
+
+    # 先证明这套"攻击"确实成立:走 importlib 的老路子会执行旧字节码
+    spec = importlib.util.spec_from_file_location("stale_demo", f)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.S.VALUE == "BAD!", "这个攻击没复现,测试无效"
+
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    cls = api.import_candidate(f, "S", api.rs.file_sha256(f))
+    assert cls.VALUE == "GOOD", "执行的不是被哈希的那份源码"
+
+
+def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tmp_path):
+    """子入口是独立的信任边界:绕过父入口直接传受保护参数,必须一样被拒。"""
+    f = tmp_path / "s.py"
+    f.write_text("class S: pass\n", encoding="utf-8")
+    sha = api.rs.file_sha256(f)
+    bad = '{"risk_budget": 1000000000}'
+
+    args = api.build_parser().parse_args(["_child", "--file", str(f), "--cls", "S", "--key", "CADJ",
+                                          "--segment", "train", "--params", bad, "--sha256", sha])
+    assert api.run_child(args) == api.EXIT_REFUSED
+
+    args = api.build_parser().parse_args(["_gate_child", "--file", str(f), "--cls", "S", "--params", bad,
+                                          "--on-plateau", "0", "--sha256", sha, "--random-runs", "1"])
+    assert api.run_gate_child(args) == api.EXIT_REFUSED
+
+
+def test_evaluate_child_really_runs_the_evaluation(tmp_path, monkeypatch, capsys):
+    """evaluate 子进程必须真的走到评估那一步。
+
+    早先统一入口的重构漏掉了 `cfg = rc.load()`,而 `cfg` 的使用点包在宽泛的
+    `except Exception` 里——结果每个通过导入的 evaluate 作业都静默变成一条
+    "NameError" 的错误结果。这个用例跑真实的子进程路径,断言拿到的是评估结果。"""
+    import sys
+    import types as pytypes
+
+    body = "from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    VALUE = 'GOOD'\n"
+    path = tmp_path / "s.py"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+
+    class Win:
+        name = "W1"
+        train_start = 1
+        train_end = 2
+        valid_start = 3
+        valid_end = 4
+
+    seen = {}
+
+    def fake_run_evaluation(**kw):
+        seen.update(kw)
+        return {"passed": True, "sharpe": 1.0}
+
+    wf = pytypes.ModuleType("walk_forward_optimizer")
+    wf.DATA_FILE = "x.csv"
+    wf.SYMBOL = "c2701.DCE"
+    wf.KEY = "CADJ"
+    wf.build_windows = lambda: [Win()]
+    bl = pytypes.ModuleType("backtest_lib")
+    bl.DEFAULT_CAPITAL = 100000.0
+    bl.load_bars_csv = lambda *a, **k: []
+    rg = pytypes.ModuleType("research_gate")
+    rg.engine_runner = lambda key: (lambda *a, **k: None)
+    rg.run_evaluation = fake_run_evaluation
+    rnd = pytypes.ModuleType("strategies.random_entry_15m_strategy")
+    rnd.RandomEntry15mStrategy = object
+    for name, mod in (("walk_forward_optimizer", wf), ("backtest_lib", bl), ("research_gate", rg),
+                      ("strategies.random_entry_15m_strategy", rnd)):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "1", "--sha256", api.rs.file_sha256(path)])
+    code = api.run_evaluate_child(args)
+    out = capsys.readouterr().out
+
+    assert code == api.EXIT_OK
+    payload = json.loads(out.split(api.CHILD_MARK)[-1])
+    assert "error" not in payload, payload
+    assert payload["passed"] is True
+    assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]

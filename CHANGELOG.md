@@ -37,8 +37,16 @@
 (`within_budget(100.0, 10.0, inst.risk_budget)` 在改写后返回 True),现改为受禁 dunder 的任何引用一律拦下;
 `operator.attrgetter('__dict__')(self)` 把属性名当字符串用,绕开了"禁止访问 `__dict__`"的属性写法检查,现把受禁属性名作为字符串常量出现时也拦下;
 `screen_source` 遇到语法错误时返回空列表(fail-**open**:解析不过就等于没筛查,而空列表看起来跟"查过没问题"一模一样),现改为返回"语法错误"结论(fail-closed);
+**codex 第 4 轮复核(31/50,未通过)的发现,逐条复现后修复**:
+(1) **Critical——`.pyc` 绕过**:`import_candidate` 走 `spec.loader.exec_module()`,而 Python 默认的 `.pyc` 只比对源文件的 mtime 与大小、不确认字节码对应当前内容,于是"人工批准的、算过哈希的、过了静态筛查的源码"与"实际执行的字节码"可以不是一回事(已实测复现);分开打开文件还留下 TOCTOU 窗口。现只读一次字节,对同一份内容做完哈希、筛查、编译、执行,不再走 `SourceFileLoader`;
+(2) **High——别名绕过**:静态层此前只拦"调用",于是"先取别名再调用"(如把 `setattr`/`vars`/`getattr` 存进变量再调)照样能改写风控底线或取到实例字典;下单接口(`self.buy`)同理。现一律拦**引用**;
+(3) **High——`operator` 反射通道**:`operator.attrgetter` 能把属性名当字符串传入,绕开属性名检查;`operator` 模块整体禁用,受禁属性名作为字符串常量出现也拒绝(这些 token 按保留字处理,含文档字符串里的提及);
+(4) **High——`run_evaluate_child` 的 `cfg` 未定义**:统一入口的重构漏掉了 `cfg = rc.load()`,而使用点包在宽泛的 `except Exception` 里,结果是**每个通过导入的 evaluate 作业都静默变成一条 NameError 的错误结果**;现补回并补了真正跑通子进程路径的行为测试(此前只有"源码里含某个字符串"式的检查,发现不了这种回归);
+(5) **Medium——子入口未复查参数**:`_child`/`_gate_child` 能被直接调用,绕过父入口直接传受保护参数就能改写底线;子入口现在自己解析并校验参数(子入口是独立的信任边界);
+(6) **Low——ADR 未同步**"受禁 dunder 的任何引用均拒绝"的新语义,并补记静态层不是安全边界、真正的边界是容器隔离。
 "只能追加"靠版本控制保证——`load()` 只与代码内置集合合并、察觉不到文件里的删除,现由 CI 检查逐个历史版本比对。
 **该检查此前在 CI 里形同虚设**:CI 用 `actions/checkout@v4` + `fetch-depth: 1`(浅克隆)时 `git log` 只看得到一个提交,检查会**静默跳过**、看起来是绿的;现改为对浅克隆 fail-closed(直接失败而不是跳过),并新增 `.github/workflows/constitution-guard.yml`(`fetch-depth: 0`)专门跑这个检查——否则"只能追加"只是一句没人执行的承诺。
+**内置保护项也是同样的漏洞**:内置清单写在 `risk/constitution.py` 的常量里,上面那个历史比对看不见它——把 `BUILTIN_PROTECTED_PARAMETERS` 里的 `risk_budget` 删掉,其它检查一样全绿,而候选已经可以改写风控底线了;新增 `test_builtin_protections_are_never_shrunk`,从历史版本里把常量读出来比对(内置保护只能增不能减)。
 - **进化引擎阶段 1:试验账本 + DSR 门槛**(Issue [#15](https://github.com/laiyinyizao007/invest/issues/15),ADR `20261113-evolution-engine`):`risk/trial_ledger.py`(只增不减、损坏 fail-closed,每个 param_grid 格子与每次成功提交各计 1 次试验,失败的评估同样消耗试验)、`risk/dsr.py`(Bailey & López de Prado 2014,日收益口径,试验间方差取 1/(T-1))、晋级门槛第 9 条 **DSR ≥ 0.95**(阈值已锁定)。`CandidateMetrics` 新增 `dsr`/`n_trials`:缺失即视为未通过(fail-closed),**旧格式的指标 JSON 不再能过 `record_promotion.py`**。账本由可信的父进程读写(先记账再跑,失败不退:evaluate 预扣最小网格 27 并补差额,gate 记 1 次 `gate_run`)、网关 `_candidates` 记提交试验;子进程只拿到 `--prior-trials` 一个数字。NaN/inf 日收益与非法 `dsr`/`n_trials` 一律 fail-closed(G8 复核发现 NaN 会让 `dsr < 0.95` 恒为 False 而放过候选)。PBO 延后。
 - `tools/build_static_manifest.py`:生成 / 校验前端构建产物清单 `manifest.json`(`{"files": {相对路径: sha256}}`)——**前后端的硬约定**。后端只服务清单内、哈希匹配的文件,每次请求重新校验;改了产物就必须重新生成。拒绝符号链接、空目录、没有 `index.html` 的目录;`--check` 可放进前端 CI;测试断言后端接受本工具写出的一切。
 - 契约:`Guard` 新增 `as_of` / `age_seconds`(风控状态文件自己的年龄);新增示例 `trading-guard-stale`(进程在跑但风控状态陈旧——前端最容易做错的状态);契约文档新增 §10.1 `corrupt` 的完整含义与读取上限、§10.2 `stopped` 录制、`HEAD` 语义。示例共 40 个。
