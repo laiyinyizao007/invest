@@ -71,5 +71,5 @@
     "required_streak": 5,
     "missing_weekdays": []
   },
-  "level": "ok"
+  "level": "critical"
 }

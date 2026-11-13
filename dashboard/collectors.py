@@ -147,8 +147,9 @@ def collect_trading(settings: Settings, now: float) -> Result:
     sampled_ts = guard.pop("_sampled_ts") if guard is not None else None
     guard_future = (guard_mtime is not None and guard_mtime - now > CLOCK_SKEW_TOLERANCE) or (sampled_ts is not None and sampled_ts - now > CLOCK_SKEW_TOLERANCE)
     guard_unverifiable = guard is not None and sampled_ts is None
-    basis = [t for t in (sampled_ts, guard_mtime) if t is not None]
-    guard_age = None if guard is None or sampled_ts is None else round(max(now - min(basis), 0.0), 1)
+    # 年龄只看**采样时刻**:文件写入时间不是权益新鲜度的证据(风控进程每分钟重写文件,网关断开时它照样是新的)。
+    # (原来取 sampled_ts 与文件 mtime 的较小者,把两个不同时钟混在一起,测试里用假时钟就会失真。)
+    guard_age = None if guard is None or sampled_ts is None else round(max(now - sampled_ts, 0.0), 1)
     if guard is not None:
         guard["as_of"] = None if sampled_ts is None else m.iso(sampled_ts)
         guard["age_seconds"] = guard_age

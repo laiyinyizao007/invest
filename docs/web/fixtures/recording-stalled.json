@@ -19,5 +19,5 @@
     "last_error": "已连接但 90 秒内未订阅到任何合约",
     "data_warning": null
   },
-  "level": "ok"
+  "level": "warn"
 }
