@@ -1158,9 +1158,14 @@ def _repo_pending_dir() -> Path:
         candidate = str(cfg["paths"]["pending_dir"])
         relative = Path(candidate)
         resolved = (_REPO_ROOT / relative).resolve()
-        if (candidate and not relative.is_absolute() and ".." not in relative.parts
+        # 大小写不敏感:Windows/macOS 的文件系统不分大小写,`Strategies` 就是真正的 `strategies/`
+        # (第 14 轮 codex 的 Medium 3);带盘符的路径(`C:foo`)也拒。
+        resolved_first = resolved.relative_to(_REPO_ROOT.resolve()).parts[0] if resolved != _REPO_ROOT.resolve() else ""
+        reserved = {item.lower() for item in _PENDING_DIR_RESERVED}
+        if (candidate and not relative.is_absolute() and not relative.drive and ".." not in relative.parts
                 and resolved.is_relative_to(_REPO_ROOT.resolve())
-                and relative.parts and relative.parts[0] not in _PENDING_DIR_RESERVED):
+                and relative.parts and relative.parts[0].lower() not in reserved
+                and resolved_first.lower() not in reserved):
             name = candidate
     except Exception:                                           # noqa: BLE001 - 读不到/不合法就退回默认值
         pass
@@ -1224,10 +1229,18 @@ def _mro_module_files(klass: type) -> set:
     return files
 
 
-def _own_code_objects(klass: type) -> list:
-    """类体里自己写的函数的代码对象(解开 staticmethod/classmethod/property)。"""
+def _own_code_objects(klass: type, _depth: int = 0) -> list:
+    """类体里自己写的函数的代码对象(解开 staticmethod/classmethod/property,并**递归进嵌套类**)。
+
+    第 14 轮 codex 的 Medium 1:只遍历顶层成员时,候选把自己的代码藏进嵌套类里,
+    豁免判据完全看不见它——顶层只剩一个仓库函数,判据就放行了。
+    只递归**真正嵌套**的类(`__qualname__` 以外层类名开头),类体里引用的外部类不算。"""
     codes = []
     for value in vars(klass).values():
+        if (isinstance(value, type) and _depth < 4 and value is not klass
+                and getattr(value, "__qualname__", "").startswith(klass.__qualname__ + ".")):
+            codes.extend(_own_code_objects(value, _depth + 1))
+            continue
         candidates = [value]
         candidates.append(getattr(value, "__func__", None))
         for accessor in ("fget", "fset", "fdel"):
@@ -1756,6 +1769,11 @@ def check_market_data_integrity(strategy: object, bars, baseline: dict | None = 
     if baseline:
         base_count = int(baseline.get("count", 0) or 0)
         base_values = baseline.get("values") or {}
+        base_size = baseline.get("size")
+        if isinstance(base_size, int):
+            if size != base_size:
+                findings.append(f"行情容器的容量在回测途中被改写了(原来 {base_size},现在 {size})")
+            size = base_size                               # 比对窗口用拍下来的容量,不读活的
     replayed = count - base_count
     if replayed > len(fed):
         findings.append(
@@ -1829,8 +1847,22 @@ class MarketDataWatch:
         baseline = baseline or {}
         self._base_count = int(baseline.get("count", 0) or 0)
         base_values = baseline.get("values") or {}
-        size = getattr(self._am, "size", None)
+        # `size` 在构造时捕获,之后任何改动本身就是 finding(第 14 轮 codex 的 Medium 2:
+        # 终态核对读的是活的 am.size,改小它会缩小比对窗口)
+        size = baseline.get("size") if baseline.get("size") is not None else getattr(self._am, "size", None)
         self._size = size if isinstance(size, int) else 0
+        # 族判定(第 14 轮 codex 的 High 1):
+        # 旧口径拿 `replayed == k` 当强/弱模式的**开关**——候选让 `am.count` 落后一根,
+        # 强模式永久关闭,而"count 与喂入根数不同步"这件事没有任何一层报告。
+        # 现在把"每根 K 线容器恰好更新一次"当成**被核对的契约**,而不是从 count 里猜:
+        # - 模板的 `on_bar`(候选不能覆盖它,它受保护)每喂一根就更新一次容器;
+        # - 日线族(喂入的是日线)同样每根更新一次。
+        # 其余(分钟族合成日线、逐分钟喂入的演示策略)更新节奏不规则,只能核对"取值出现过"。
+        # (第一版用"开头连续 3 根增量都是 1"来猜,被 `intraday_demo` 打脸:它前几根都是 +1,
+        #  第 60 根却是 0——节奏是**家族的属性**,不能从前几根里推断。)
+        self._prev_count = getattr(self._am, "count", None)
+        self._family = self._updates_every_bar(strategy, history)
+        self._offset: int | None = None
         self._fields: list[str] = []
         self._buf: dict = {}
         self._pool: dict = {}
@@ -1842,6 +1874,33 @@ class MarketDataWatch:
             self._fields.append(array_name)
             self._buf[array_name] = values
             self._pool[array_name] = np.unique(np.concatenate([values, extra]))
+
+    @staticmethod
+    def _updates_every_bar(strategy: object, history) -> bool:
+        """这个策略是不是"每喂一根 K 线就更新一次行情容器"的家族。
+
+        契约由**模板自己的两个方法**决定:`on_bar`(把 K 线交给谁)与 `_process_daily_bar`
+        (真正调用 `am.update_bar` 的地方)。两者都是受保护成员,候选不能覆盖,所以对候选来说
+        这两个方法就是模板的那份;而仓库里的演示策略(`IntradayDemoStrategy` 重写了
+        `_process_daily_bar`,有些 K 线不更新容器)节奏不同,只能走宽松口径。"""
+        try:
+            template = load_template()
+            root = family_root(template)
+            cls = type(strategy)
+            if getattr(cls, "_process_daily_bar", None) is not getattr(root, "_process_daily_bar", object()):
+                return False
+            on_bar = getattr(cls, "on_bar", None)
+            if on_bar is not None and on_bar is getattr(template, "on_bar", object()):
+                return True
+        except Exception:                                       # noqa: BLE001 - 判不出就当不是
+            return False
+        try:
+            from vnpy.trader.constant import Interval
+
+            history = list(history)
+            return bool(history) and getattr(history[0], "interval", None) == Interval.DAILY
+        except Exception:                                       # noqa: BLE001
+            return False
 
     def step(self) -> list[str]:
         """引擎又处理完一根 K 线之后调用;返回这一次的发现(首次之后恒为空)。"""
@@ -1861,6 +1920,9 @@ class MarketDataWatch:
         am = getattr(self._strategy, "am", None)
         if am is not self._am:
             return ["行情容器在回测途中被换成了另一个对象"]
+        size = getattr(am, "size", None)
+        if self._size and size != self._size:
+            return [f"行情容器的容量在回测途中被改写了(原来 {self._size},现在 {size})"]
         count = getattr(am, "count", None)
         if not isinstance(count, int):
             return []
@@ -1868,8 +1930,19 @@ class MarketDataWatch:
         k = self._k
         if replayed > k:
             return [f"行情容器里回放阶段累计了 {replayed} 根 K 线,而引擎只喂了 {k} 根(有 K 线是凭空来的)"]
+        delta = count - self._prev_count if isinstance(self._prev_count, int) else None
+        self._prev_count = count
+        if self._family and delta is not None:
+            if delta != 1:
+                return [f"第 {k} 根 K 线之后,行情容器的累计根数这一根变化了 {delta}"
+                        "(逐根更新的家族每根 K 线应恰好 +1;有人在回测途中改写了容器的计数)"]
+            if self._offset is None:
+                self._offset = replayed - k                    # 预热丢弃了不完整日线时不为 0,之后要求恒定
+            elif replayed - k != self._offset:
+                return [f"第 {k} 根 K 线之后,行情容器的累计根数与引擎喂入根数的偏移变了"
+                        "(有人在回测途中改写了容器的计数)"]
         window = min(self._size, k)
-        exact = replayed == k and window > 0
+        exact = bool(self._family) and self._offset == 0 and replayed == k and window > 0
         findings: list[str] = []
         for array_name in self._fields:
             array = np.asarray(getattr(am, array_name, None), dtype=float)

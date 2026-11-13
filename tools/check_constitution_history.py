@@ -93,6 +93,14 @@ CALL_SITE_REGISTRY = (
     ("scripts/research_api.py", ("snapshot_protected_state", "check_protected_state")),
 )
 
+# 回测入口的**时序**(第 14 轮 codex 的 G6):`backtest_lib` 没有裸 exec,执行候选的是
+# `engine.run_backtesting()`。基准快照必须在它**之前**拍——把
+# `_protected = _protected_state_snapshot()` 挪到回测之后,第四层就成了"自己跟自己比",
+# 而守卫只验第二个实参,从不问第一个实参是什么时候拍的。
+RUN_CALL_ORDER = (
+    ("scripts/backtest_lib.py", "run_backtesting", ("_protected_state_snapshot", "snapshot_protected_state")),
+)
+
 # 单值常量:不是集合,没有"只增不减"可言。它只能通过"必须落在白名单里"来约束。
 SINGLE_CONSTANTS = (("risk/constitution.py", "BUILTIN_TEMPLATE", "BUILTIN_ALLOWED_TEMPLATES"),)
 
@@ -570,6 +578,13 @@ def _live_calls(tree: ast.AST, name: str) -> list[ast.Call]:
                 return
             self.generic_visit(node)
 
+        def visit_IfExp(self, node: ast.IfExp) -> None:
+            # `(check(...) if False else [])`(第 14 轮 codex 的 G3):条件表达式把结论吞掉
+            if _statically_false(node.test):
+                self.visit(node.orelse)
+                return
+            self.generic_visit(node)
+
         def visit_Call(self, node: ast.Call) -> None:
             func = node.func
             if ((isinstance(func, ast.Name) and func.id == name)
@@ -680,43 +695,95 @@ def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
     return parents
 
 
+_LOGGING_CALLS = frozenset({"print", "debug", "info", "warning", "error", "log", "write_log", "pprint"})
+
+
+def _is_logging_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _LOGGING_CALLS
+    if isinstance(func, ast.Attribute):
+        return func.attr in _LOGGING_CALLS
+    return False
+
+
+def _flows_to_decision(node: ast.AST, parents: dict) -> bool:
+    """这个表达式的值有没有流向**决策**:条件、返回值、`raise`、`assert`。
+
+    第 14 轮 codex 的 G1:结论存进一个**只被 `print` 的名字**——名字确实被读了,
+    但从不导致拒绝。所以"被读取过"不够,读取必须发生在决策位置:
+    `if findings:` / `return findings` / `raise ...(findings)` / `assert not findings`。
+    途中经过日志/打印调用则不算(那是旁路)。"""
+    current = node
+    while current in parents:
+        parent = parents[current]
+        if _is_logging_call(parent):
+            return False
+        if isinstance(parent, (ast.Return, ast.Raise, ast.Assert)):
+            return True
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp)) and parent.test is current:
+            return True
+        if isinstance(parent, ast.IfExp):
+            # 值落在条件表达式的某个分支里:要看**这个条件表达式**自己的值有没有流向决策
+            current = parent
+            continue
+        if isinstance(parent, ast.stmt):
+            return False                                  # 走到语句边界还没碰到决策
+        current = parent
+    return False
+
+
 def _name_is_consumed(scope: ast.AST, name: str, parents: dict) -> bool:
-    """`name` 在 `scope` 里是否被**读取**过(只给它 extend/append 不算读取)。"""
+    """`name` 在 `scope` 里是否在**决策位置**被读取过(只给它 extend/append 不算读取)。"""
     for node in ast.walk(scope):
         if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
             parent = parents.get(node)
-            if isinstance(parent, ast.Attribute) and parent.value is node                     and parent.attr in _ACCUMULATE_ATTRS:
+            if isinstance(parent, ast.Attribute) and parent.value is node \
+                    and parent.attr in _ACCUMULATE_ATTRS:
                 continue
-            return True
+            if _flows_to_decision(node, parents):
+                return True
     return False
 
 
 def _result_is_used(tree: ast.AST, call: ast.Call, scope: ast.AST | None) -> bool:
     """`check_protected_state(...)` 的**结论**有没有流向决策。
 
-    第 13 轮 codex 的 High 1:`_ = const.check_protected_state(before, const.snapshot_protected_state())`
-    调用形态完全对,守卫 exit 0,而比对的结论被扔掉——第四层静默死亡。
-    所以"调用了"不够,结论必须被用掉:作为返回值/条件/实参,或存进一个之后被读取的名字。
-    (这是形态层面的近似——更彻底的"结论必须导致拒绝"靠回归测试里的端到端用例守。)"""
+    第 13 轮 codex 的 High 1:`_ = const.check_protected_state(...)` 调用形态完全对,
+    守卫 exit 0,而比对的结论被扔掉——第四层静默死亡。
+    第 14 轮 codex 的 G1/G3:存进"只被 print 的名字"、被条件表达式吞掉,同样让结论不导致拒绝。
+    所以结论必须**流向决策**(见 `_flows_to_decision`)。未知的父节点形态一律按"未使用"处理。
+    (这仍是形态层面的近似;"结论必须导致拒绝"的**效果**由端到端回归用例守——
+    把任一层关掉,对应的端到端用例必须变红。)"""
     parents = _parent_map(tree)
-    parent = parents.get(call)
     target_scope = scope if scope is not None else tree
+    node: ast.AST = call
+    parent = parents.get(node)
+    # 条件表达式的分支:取这个条件表达式自己的值继续判
+    while isinstance(parent, ast.IfExp) and parent.test is not node:
+        node = parent
+        parent = parents.get(node)
     if isinstance(parent, ast.Expr):
         return False                                     # 整条语句只为调用,结论被丢弃
     if isinstance(parent, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
         targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
         names = [t.id for t in targets if isinstance(t, ast.Name)]
-        if names:
-            if all(not name.strip("_") for name in names):
-                return False                             # `_ = ...`:明确丢弃
-            return any(_name_is_consumed(target_scope, name, parents) for name in names)
-        return True
+        if not names:
+            return False
+        if all(not name.strip("_") for name in names):
+            return False                                 # `_ = ...`:明确丢弃
+        return any(_name_is_consumed(target_scope, name, parents) for name in names)
     if isinstance(parent, ast.Call):
+        if _is_logging_call(parent):
+            return False
         func = parent.func
-        if isinstance(func, ast.Attribute) and func.attr in _ACCUMULATE_ATTRS                 and isinstance(func.value, ast.Name):
+        if isinstance(func, ast.Attribute) and func.attr in _ACCUMULATE_ATTRS \
+                and isinstance(func.value, ast.Name):
             return _name_is_consumed(target_scope, func.value.id, parents)
-        return True
-    return True
+        return _flows_to_decision(parent, parents)
+    return _flows_to_decision(node, parents)
 
 
 def _check_call_problems(rel: str, tree: ast.AST, call: ast.Call, snapshot_calls: list,
@@ -757,6 +824,18 @@ def _check_call_problems(rel: str, tree: ast.AST, call: ast.Call, snapshot_calls
     # 调用点必须在**取快照的同一个函数体**里,且那个函数得有人叫
     # (第 12 轮 codex 的 High 2 / A3:挪进一个从不被调用的函数)。
     if scope is not None:
+        # 嵌套函数(第 14 轮 codex 的 G2):`_called_names_in_repo` 是全仓**按名字**匹配,
+        # 一个嵌套的死函数只要取了个仓库里别处被调用过的名字(`run`/`main`/`load`)就能冒充"被调用过"。
+        # 嵌套的函数/方法必须在**本文件内**被调用。
+        parent = _parent_map(tree).get(scope)
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local_calls = {
+                (n.func.id if isinstance(n.func, ast.Name) else n.func.attr)
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call) and isinstance(n.func, (ast.Name, ast.Attribute))}
+            if scope.name not in local_calls:
+                problems.append(
+                    f"{rel} 里第四层的比对在嵌套的 {scope.name} 里,而它在本文件里从没被调用过")
         same_scope = [c for c in snapshot_calls if _call_scope(tree, c) is scope]
         if not same_scope:
             problems.append(
@@ -766,6 +845,33 @@ def _check_call_problems(rel: str, tree: ast.AST, call: ast.Call, snapshot_calls
             problems.append(
                 f"{rel} 里第四层的比对在 {scope.name} 里,"
                 "而这个函数在整个仓库里从没被调用过(第四层实际上不会执行)")
+    return problems
+
+
+def check_run_call_order(root: Path) -> list[str]:
+    """每个跑回测的函数里,基准快照必须在 `run_backtesting()` 之前(按行号)。"""
+    problems: list[str] = []
+    for rel, run_name, snapshot_names in RUN_CALL_ORDER:
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError) as exc:
+            problems.append(f"{rel} 读取/解析失败,无法核对回测的时序: {exc}")
+            continue
+        run_calls = _live_calls(tree, run_name)
+        if not run_calls:
+            problems.append(f"{rel} 里没有对 {run_name} 的活调用:回测入口已经不在了,时序检查失去对象")
+            continue
+        for call in run_calls:
+            scope = _call_scope(tree, call)
+            if scope is None or isinstance(scope, ast.Lambda):
+                problems.append(f"{rel} 第 {call.lineno} 行在函数体之外(或 lambda 里)跑回测")
+                continue
+            snapshots = [c for name in snapshot_names for c in _live_calls(tree, name)
+                         if _call_scope(tree, c) is scope]
+            if not any(c.lineno < call.lineno for c in snapshots):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行 {run_name}() 之前,{scope.name} 里没有取基准快照"
+                    "(基准拍在回测之后,第四层的指纹比对必然通过)")
     return problems
 
 
@@ -824,7 +930,7 @@ _EXECUTOR_ATTR_SAFE_RECEIVERS = ("re",)
 
 # 守卫自身不参与"执行候选"的判定。
 _EXECUTOR_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv",
-                                 ".pytest_tmp", "_probe_r11"})
+                                 ".pytest_tmp"})
 
 # 宪法模块自己**不执行候选**:它只用 importlib 载入模板与框架模块(为身份指纹),
 # 那是导入不是执行。它是"谁执行候选"这件事的裁判,自己却能执行代码就名存实亡——
@@ -838,7 +944,7 @@ def _repo_python_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root)
-        if any(part in _EXECUTOR_SKIP_DIRS for part in rel.parts):
+        if any(part in _EXECUTOR_SKIP_DIRS or part.startswith("_probe") for part in rel.parts):
             continue
         if rel.parts and rel.parts[0] == "tests":
             continue
@@ -893,9 +999,10 @@ def _primitive_executor_calls(tree: ast.AST) -> list[ast.Call]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id in ("exec", "eval", "compile"):
+        # `compile` 只生成字节码、不执行,不在此列(`exec(compile(...))` 的 exec 照样被抓)
+        if isinstance(func, ast.Name) and func.id in ("exec", "eval"):
             calls.append(node)
-        elif isinstance(func, ast.Attribute) and func.attr in _EXECUTOR_ATTR_CALLS:
+        elif isinstance(func, ast.Attribute) and func.attr in _EXECUTOR_ATTR_CALLS and func.attr != "compile":
             receiver = func.value
             if isinstance(receiver, ast.Name) and receiver.id in _EXECUTOR_ATTR_SAFE_RECEIVERS:
                 continue
@@ -965,6 +1072,16 @@ def check_executor_completeness(root: Path) -> list[str]:
                 problems.append(
                     f"{rel} 第 {call.lineno} 行执行代码的函数 {scope.name} 里"
                     "没有自己成对取快照并比对(第四层挂在别的函数上,执行点本身裸奔)")
+                continue
+            # 时序(第 14 轮 codex 的 G6b):基准必须在执行**之前**拍,比对在执行**之后**。
+            # 把 `before = snapshot_protected_state()` 挪到 exec 之后,第四层就成了"自己跟自己比"。
+            if not any(c.lineno < call.lineno for c in in_scope_snapshot):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码之前,{scope.name} 里没有取基准快照"
+                    "(快照拍在执行之后,指纹比对必然通过)")
+            if not any(c.lineno > call.lineno for c in in_scope_check):
+                problems.append(
+                    f"{rel} 第 {call.lineno} 行执行代码之后,{scope.name} 里没有指纹比对")
 
     # 模块名 → 文件路径(`scripts.research_api` → `scripts/research_api.py`)
     module_to_rel = {rel[:-3].replace("/", "."): rel for rel in sources}
@@ -1014,6 +1131,7 @@ def check_all(root: Path) -> list[str]:
     problems += check_single_constants(root)
     problems += check_protected_usage(root)
     problems += check_call_site_shape(root)
+    problems += check_run_call_order(root)
     problems += check_executor_completeness(root)
     problems += check_constitution_module_is_clean(root)
     problems += check_shrink_only(root)

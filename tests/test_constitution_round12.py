@@ -368,6 +368,79 @@ def test_the_static_layer_still_allows_scalar_reads(src):
     assert not screen(src), screen(src)
 
 
+# ---------- 第 14 轮 codex:第五层不能拿 count 当"模式开关" ----------
+
+def test_the_fifth_layer_notices_a_container_whose_count_is_made_to_lag():
+    """第 14 轮 High 1:候选让 `am.count` 每根 K 线落后一根,强模式(逐值比尾部)就此永久关闭,
+    再用"引擎喂过的取值"调包,运行期各层全绿(实测 ATR 31.54 -> 14.51、0 笔 -> 12 笔成交)。
+
+    现在看的是**每根 K 线 count 的增量**:逐根更新的家族增量恒为 1,不是 1 就是 finding。"""
+    import backtest_lib
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Lagging(TrendAtr15mStrategy):
+        def entry_signal(self):
+            # 候选只能在 entry_signal 里动手(on_bar/_process_daily_bar 是受保护成员):
+            # 每根 K 线让计数落后一根
+            self.am.count -= 1
+            return super().entry_signal()
+
+    with pytest.raises(RuntimeError, match="累计根数"):
+        backtest_lib.run_engine_bars(Lagging, _TRANSIENT_SETTING, "C15", _synth_bars())
+
+
+def test_the_fifth_layer_notices_a_shrunk_container_size():
+    """第 14 轮 Medium 2:终态核对读活的 `am.size`,改小它会缩小比对窗口;容量必须用拍下来的。"""
+    import backtest_lib
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Shrinking(TrendAtr15mStrategy):
+        def on_bar(self, bar):
+            super().on_bar(bar)
+            if self.am.inited:
+                self.am.size = 5
+
+    with pytest.raises(RuntimeError, match="容量"):
+        backtest_lib.run_engine_bars(Shrinking, _TRANSIENT_SETTING, "C15", _synth_bars())
+
+
+def test_the_exemption_sees_code_hidden_in_a_nested_class():
+    """第 14 轮 Medium 1:候选把自己的代码藏进嵌套类,顶层只剩一个仓库函数,豁免判据看不见它。"""
+    import strategies.trend_atr_strategy as repo_module
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+
+    class Evil(TrendAtrStrategy):
+        class _Hidden:
+            @staticmethod
+            def arm():
+                return 1
+
+        entry_signal = repo_module.TrendAtrStrategy.entry_signal    # 仓库里的函数
+
+    Evil.__module__ = repo_module.__name__
+    assert not const._is_in_repo_strategy_class(Evil)
+
+
+@pytest.mark.parametrize("pending", ["Strategies", "STRATEGIES", "Risk", "C:foo"])
+def test_the_pending_dir_reserved_check_is_case_insensitive(tmp_path, monkeypatch, pending):
+    """第 14 轮 Medium 3:`Strategies` 在不分大小写的文件系统上就是真正的 `strategies/`。
+    宪法与沙盒配置**两边**都必须拒。"""
+    import json
+
+    import research_config
+
+    config = tmp_path / "sandbox.json"
+    config.write_text(json.dumps({"paths": {"pending_dir": pending}}), encoding="utf-8")
+    monkeypatch.setenv("RESEARCH_SANDBOX_CONFIG", str(config))
+    assert const._repo_pending_dir() == const._REPO_ROOT / const._DEFAULT_PENDING_DIR
+    import copy
+
+    cfg = copy.deepcopy(research_config.DEFAULTS)
+    cfg["paths"]["pending_dir"] = pending
+    with pytest.raises(research_config.ConfigError):
+        research_config._validate(cfg)
+
+
 # ---------- High 2:历史守卫的执行点检查 ----------
 
 def _guard_root(tmp_path):
@@ -575,6 +648,117 @@ def test_the_guard_notices_an_executor_whose_fourth_layer_hangs_on_another_funct
         encoding="utf-8")
     problems = check_executor_completeness(root)
     assert any("brand_new_runner" in p for p in problems), problems
+
+
+# ---------- 第 14 轮 codex:守卫要验"时序"与"结论流向决策" ----------
+
+def test_the_guard_notices_a_result_that_is_only_printed(tmp_path):
+    """第 14 轮 G1:结论存进一个**只被 print 的名字**——名字确实被读了,但从不导致拒绝。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    _audit = const.check_protected_state(before, const.snapshot_protected_state())\n"
+        "    print(_audit)\n"
+        "    return None\n\n"
+        "run('')\n"))
+    problems = check_call_site_shape(root)
+    assert any("丢弃" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_result_swallowed_by_a_conditional_expression(tmp_path):
+    """第 14 轮 G3:`(check(...) if False else [])`——条件表达式把结论吞掉。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    findings = (const.check_protected_state(before, const.snapshot_protected_state())"
+        " if False else [])\n"
+        "    if findings:\n"
+        "        raise RuntimeError('x')\n\n"
+        "run('')\n"))
+    problems = check_call_site_shape(root)
+    assert any("活调用" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_nested_dead_function_that_borrows_a_called_name(tmp_path):
+    """第 14 轮 G2:比对挪进一个嵌套函数,取个仓库里别处被调用过的名字(`run`)冒充"被调用过"。"""
+    from tools.check_constitution_history import check_call_site_shape
+
+    root = _two_file_guard_root(tmp_path, (
+        "import risk.constitution as const\n\n"
+        "def outer(code):\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    exec(code, {})\n"
+        "    def run():\n"
+        "        findings = const.check_protected_state(before, const.snapshot_protected_state())\n"
+        "        if findings:\n"
+        "            raise RuntimeError('x')\n"
+        "    return None\n\n"
+        "outer('')\n"))
+    (root / "scripts" / "other.py").write_text("def main(x):\n    return run(x)\n", encoding="utf-8")
+    problems = check_call_site_shape(root)
+    assert any("嵌套" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_baseline_taken_after_the_executor(tmp_path):
+    """第 14 轮 G6b:把 `before = snapshot_protected_state()` 挪到 exec 之后——
+    第四层成了"自己跟自己比",形态全对,守卫只验第二个实参。"""
+    from tools.check_constitution_history import check_executor_completeness
+
+    root = _guard_root(tmp_path)
+    (root / "scripts" / "backtest_lib.py").write_text(_COVERED_BODY, encoding="utf-8")
+    (root / "scripts" / "research_api.py").write_text(
+        "import risk.constitution as const\n\n"
+        "def run(code):\n"
+        "    exec(code, {})\n"
+        "    before = const.snapshot_protected_state()\n"
+        "    findings = const.check_protected_state(before, const.snapshot_protected_state())\n"
+        "    if findings:\n"
+        "        raise RuntimeError('x')\n",
+        encoding="utf-8")
+    problems = check_executor_completeness(root)
+    assert any("取基准快照" in p for p in problems), problems
+
+
+def test_the_guard_notices_a_baseline_taken_after_the_backtest(tmp_path):
+    """第 14 轮 G6:`backtest_lib` 没有裸 exec,执行候选的是 `engine.run_backtesting()`;
+    基准快照挪到它之后,第四层就恒通过。"""
+    from tools.check_constitution_history import check_run_call_order
+
+    root = _guard_root(tmp_path)
+    (root / "scripts" / "backtest_lib.py").write_text(
+        "def _protected_state_snapshot():\n"
+        "    return 1\n\n"
+        "def run_engine(engine):\n"
+        "    engine.run_backtesting()\n"
+        "    _protected = _protected_state_snapshot()\n"
+        "    return _protected\n",
+        encoding="utf-8")
+    problems = check_run_call_order(root)
+    assert any("基准快照" in p for p in problems), problems
+
+    (root / "scripts" / "backtest_lib.py").write_text(
+        "def _protected_state_snapshot():\n"
+        "    return 1\n\n"
+        "def run_engine(engine):\n"
+        "    _protected = _protected_state_snapshot()\n"
+        "    engine.run_backtesting()\n"
+        "    return _protected\n",
+        encoding="utf-8")
+    assert check_run_call_order(root) == []
+
+
+def test_the_guard_accepts_the_shipped_run_call_order():
+    from tools.check_constitution_history import check_run_call_order
+
+    assert check_run_call_order(ROOT) == []
 
 
 # ---------- Medium 2:__module__ 伪造骗不过"仓库自己的类"豁免 ----------

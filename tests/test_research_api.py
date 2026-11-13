@@ -1065,7 +1065,7 @@ def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
 
 # ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)—— 运行期第四层 ----------
 
-def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(tree, monkeypatch):
+def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(tree, monkeypatch, request):
     """候选在导入期改写框架对象必须被拒。
 
     第 9 轮 codex 实测:`import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`
@@ -1073,6 +1073,22 @@ def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(
     **四层全部放行**。静态层现在按整条属性路径拦住了直白的写法,
     但"换个写法"改不掉的是**身份**——运行期第四层比对导入前后的身份指纹。"""
     path = tree / "pending_strategies" / "s.py"
+    # 候选会在**共享的类对象**上永久挂一个 `get_pricetick`——用例结束必须还原,
+    # 否则同一进程里之后的测试看到的是被篡改的模板(`test_real_spawn_*` 里串行结果与新进程结果对不上,
+    # 这条失败在基线上就存在)。按用例回滚:用 monkeypatch 先记下"类字典里原来有没有这个名字"。
+    import strategies.trend_atr_15m_strategy as template_module
+
+    template_class = template_module.TrendAtr15mStrategy
+    had_in_dict = "get_pricetick" in vars(template_class)
+    saved = vars(template_class).get("get_pricetick")
+
+    def restore_template_class():
+        if had_in_dict:
+            template_class.get_pricetick = saved
+        elif "get_pricetick" in vars(template_class):
+            del template_class.get_pricetick
+
+    request.addfinalizer(restore_template_class)
     # 这条写法静态层看不出来:`strategies` 是候选**必须**导入的包(继承基类),
     # 静态层没有理由禁它;能抓住它的只有身份指纹(第四层)。
     # 候选改写模板类的方法,与改写风控函数等价——模板方法正是风控判定的入口。
