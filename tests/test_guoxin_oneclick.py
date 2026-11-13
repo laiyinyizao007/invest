@@ -291,6 +291,7 @@ def test_check_only_stops_after_the_environment_check(monkeypatch, tmp_path, cap
 
 
 def test_a_missing_profile_stops_the_flow(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(g, "in_session", lambda now: True)      # 不依赖真实时钟
     monkeypatch.setattr(g, "find_file", lambda *a: None)
     assert g.main(["--yes"]) == g.EXIT_CONFIG
     assert "找不到" in capsys.readouterr().err
@@ -306,6 +307,7 @@ def test_a_failing_environment_check_stops_the_flow(monkeypatch, tmp_path, capsy
 
 def test_a_missing_template_stops_the_flow(monkeypatch, tmp_path, capsys):
     profile = _profile_file(tmp_path)
+    monkeypatch.setattr(g, "in_session", lambda now: True)      # 不依赖真实时钟
     monkeypatch.setattr(g, "find_file", lambda *a: profile if a[-1] == ".env.guoxin" else None)
     assert g.main(["--yes"]) == g.EXIT_CONFIG
     assert "找不到报告模板" in capsys.readouterr().err
@@ -423,3 +425,12 @@ def test_the_pushed_whitelist_never_contradicts_the_profile_the_child_reads(tmp_
     for key, value in child.items():
         monkeypatch.setenv(key, value) if key in profile_env else None
     assert load_profile("", root=tmp_path).hard_conflicts == []
+
+
+def test_a_dotenv_that_did_not_exist_before_the_run_is_removed_afterwards(monkeypatch, tmp_path):
+    """运行前没有 .env:跑完要把我们写进去的国信档案删掉,否则别的脚本会静默停在国信账号上。"""
+    _install_flow(monkeypatch, tmp_path)
+    target = tmp_path / ".env"
+    assert not target.exists()
+    assert g.main(["--yes"]) == g.EXIT_OK
+    assert not target.exists()

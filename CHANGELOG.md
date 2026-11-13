@@ -5,6 +5,7 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+- G8 整改后复核(codex,36/50)再补的整改(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):穿透演练的空仓闸门保留 `check_positions` 的可信度信号(柜台没应答 → 不发单、「查询持仓」记 FAIL);`restore_env` 在运行前没有 `.env` 时删除本次写入的档案(上一批这处改动其实没有写进去);取证运行器有步骤抛异常时退出码 4,一键流程不出报告;白名单比较与地址闸门同用 `normalize_address`;进程环境里独有的白名单键降级为提示;`test_guoxin_oneclick` 里两个依赖真实时钟的用例改为固定时钟。
 - G8 第二轮**复审**(codex CLI 两次独立复核,35/50)的整改落地(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
   - **一键取证流程会被自己拦死(Critical)**:父进程把排序后的白名单下推给子进程,而 `.env` 里是手写顺序;`load_profile` 按字符串比 → 判硬冲突 → 子进程退出码 2。现在 `BROKER_TEST_ALLOWED_TD/MD` 按**归一化集合**比较。
   - **柜台静默拒掉持仓查询会被判「空仓」(Critical)**:vnpy_ctp 的 TD 侧没有 `onRspError`,又丢弃 `reqQryInvestorPosition` 的返回码,被流控拒掉时零行零日志,与空仓无法区分。现在「没有行」必须有一次**账户资金回报**作证(`_probe_counter_replies`),拿不到就判不可信;各脚本补注册 `EVENT_ACCOUNT`。

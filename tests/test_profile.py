@@ -155,3 +155,10 @@ def test_a_gated_key_only_in_the_process_environment_is_a_hard_conflict(tmp_path
     loaded = load_profile("", root=tmp_path)
     assert any("CTP_USERNAME" in c and "只在进程环境里" in c for c in loaded.hard_conflicts)
     assert "stale_user_0001" not in "\n".join(loaded.hard_conflicts)
+
+
+def test_the_same_address_in_two_spellings_is_not_a_conflict(tmp_path, monkeypatch):
+    """tcp:// 前缀不同的同一地址:地址闸门会放行,这里也不能判硬冲突(归一化与 resolve_allowed 一致)。"""
+    _write(tmp_path / ".env", "BROKER_TEST_ALLOWED_TD=121.13.218.19:41285\n")
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "tcp://121.13.218.19:41285")
+    assert load_profile("", root=tmp_path).hard_conflicts == []

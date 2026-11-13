@@ -292,7 +292,7 @@ python scripts/unlock_account.py --yes
 pytest tests -q --cov=risk --cov=strategies --cov=trading --cov=notify --cov=scripts --cov=ctp_tools
 ```
 
-- 覆盖率目标 **85%**，最低 70%；当前全仓库 **1806 个用例通过 / 1 个跳过**，覆盖率 **86%**。
+- 覆盖率目标 **85%**，最低 70%；当前全仓库 **1811 个用例通过 / 1 个跳过**，覆盖率 **86%**。
 - `ctp_tools/`（CTP 取证与穿透测试的共用实现：可信前置地址表、档案解析、行情采集、穿透检查）已纳入统计口径——它现在是一等公民代码，不统计就等于把风险最大的那部分排除在门禁之外。
 - 用例里有假网关（`tests/fakes.py`），**不需要**连网或连 CTP。
 - 改完代码请先跑测试再提交。

@@ -31,6 +31,8 @@ import os
 from pathlib import Path
 from typing import NamedTuple
 
+from ctp_tools.simnow import normalize_address
+
 # 参与冲突检查的键:这些键决定「连到哪台机器、用哪个账号」。
 GATED_PREFIXES = ("CTP_",)
 GATED_KEYS = ("LIVE_VT_SYMBOL", "BROKER_TEST_ALLOWED_TD", "BROKER_TEST_ALLOWED_MD")
@@ -86,7 +88,8 @@ SET_KEYS = ("BROKER_TEST_ALLOWED_TD", "BROKER_TEST_ALLOWED_MD")
 def _same_value(key: str, a: str, b: str) -> bool:
     if key in SET_KEYS:
         def norm(raw: str) -> frozenset[str]:
-            return frozenset(x.strip() for x in raw.replace(";", ",").split(",") if x.strip())
+            # 与 resolve_allowed 同一套归一化:tcp:// 前缀/路径不同的同一地址不算冲突
+            return frozenset(normalize_address(x) for x in raw.replace(";", ",").split(",") if x.strip())
         return norm(a) == norm(b)
     return a == b
 
@@ -120,7 +123,9 @@ def load_profile(profile: str = "", root: Path | None = None) -> Profile:
         if _p.exists():
             profile_keys = set(_read(_p))
     for key, value in os.environ.items():
-        if _is_gated(key) and key not in base_keys and key not in profile_keys and key not in SET_KEYS:
+        if key in SET_KEYS and key not in base_keys and key not in profile_keys:
+            notes.append(f"{key}:只在进程环境里(={describe_env_value(key, value)}),会作为白名单生效(仍与可信地址表求交集)")
+        elif _is_gated(key) and key not in base_keys and key not in profile_keys:
             hard.append(f"{key}:只在进程环境里(={describe_env_value(key, value)}),"
                         "档案和 .env 里都没有——它会静默生效")
 

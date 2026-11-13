@@ -826,6 +826,7 @@ def final_safety(ctx: Ctx) -> list[str]:
 
 
 def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
+    ctx.failed_steps = []
     """按序执行全部步骤。登录失败则后续依赖连接的步骤不再执行。返回是否登录成功。"""
     def want(*items: str) -> bool:
         return only is None or any(i in only for i in items)
@@ -839,7 +840,7 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         return True
     ctx.contract = c
     ctx.in_session = in_trading_session(beijing_now())
-    failed_steps: list[str] = []
+    failed_steps = ctx.failed_steps
 
     def guarded(items: tuple[str, ...], fn, *fn_args):
         """单步抛异常不能带走整次取证:已采到的证据要保住,这一步记 FAIL,继续往下。
@@ -1086,6 +1087,10 @@ def main(argv: list[str] | None = None) -> int:
     print_summary(evidences)
     if not logged_in:
         return EXIT_LOGIN
+    if getattr(ctx, "failed_steps", None):
+        # 有步骤抛了异常:证据不完整,不能当报告用 —— 与「跑完但有失败项(1)」分开
+        print(f"⚠ 步骤抛出异常 {ctx.failed_steps},证据不完整。", file=sys.stderr)
+        return EXIT_CRASH
     if any("⚠⚠" in n for n in notes):
         return EXIT_FAILED
     return EXIT_FAILED if any(e.status == FAIL for e in evidences) else EXIT_OK

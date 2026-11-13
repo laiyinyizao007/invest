@@ -291,11 +291,12 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
             "已收到账户资金回报" if accounts else "10 秒内没有收到账户资金回报", time.monotonic() - t2)
 
     t3 = time.monotonic()
-    positions, _ = check_positions(main_engine, wait=args.position_wait, early_exit=False,
-                                  collector=collector)
-    connected = trade_connected(main_engine)
+    positions, trusted = check_positions(main_engine, wait=args.position_wait, early_exit=False,
+                                         collector=collector)
+    # 可信度以 check_positions 的第二个返回值为准(含「柜台没应答」),不能只看通道在线
+    connected = trusted and trade_connected(main_engine)
     if not connected:
-        run.add("查询持仓", "FAIL", "交易连接已断开,查询结果不可信", time.monotonic() - t3)
+        run.add("查询持仓", "FAIL", "交易连接已断开或柜台没有应答,查询结果不可信", time.monotonic() - t3)
     else:
         run.add("查询持仓", "PASS", f"当前持仓 {len(positions)} 项", time.monotonic() - t3)
 

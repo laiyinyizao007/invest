@@ -406,3 +406,16 @@ def test_order_is_not_sent_when_the_account_already_holds_a_position(monkeypatch
     run, code = pc.run_checks(args(with_order=True), "c2701.DCE", engine, collector)
     names = {s.name: s.status for s in run.steps}
     assert not engine.sent and names["报单/撤单"] == "FAIL" and code == pc.EXIT_STEP_FAILED
+
+
+def test_order_is_not_sent_when_the_position_query_is_untrusted(monkeypatch):
+    """通道在线但柜台没有应答(查询被流控拒):check_positions 判不可信 → 一笔不发,里程碑记 FAIL。"""
+    monkeypatch.setattr(pc, "in_trading_session", lambda dt: True)
+    import ctp_tools.penetration as pen
+
+    monkeypatch.setattr(pen, "check_positions", lambda *a, **k: ([], False))
+    collector = make_collector(ALL_LOGS)
+    engine = StubEngine(collector)
+    run, code = pc.run_checks(args(with_order=True), "c2701.DCE", engine, collector)
+    names = {s.name: s.status for s in run.steps}
+    assert not engine.sent and names["查询持仓"] == "FAIL" and names["报单/撤单"] == "FAIL"

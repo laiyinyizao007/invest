@@ -403,7 +403,14 @@ def main(argv: list[str] | None = None) -> int:
     def restore_env() -> None:
         """把 .env 还原成运行前的版本(幂等,多处调用都安全)。"""
         try:
-            if original_env is not None and target.exists() and target.read_bytes() != original_env:
+            if original_env is None:
+                # 运行前根本没有 .env:把本次写入的档案删掉,否则这台机器上所有
+                # 走 bootstrap.load_env() 的脚本都会静默停在国信测试账号上。
+                if wrote_env["done"] and target.exists():
+                    target.unlink()
+                    wrote_env["done"] = False
+                    print("\n运行前没有 .env,已删除本次写入的档案。")
+            elif target.exists() and target.read_bytes() != original_env:
                 target.write_bytes(original_env)
                 print("\n已把 .env 还原成运行前的版本。")
         except OSError as exc:      # 还原失败要吵,否则这台机器会静默停在国信账号上

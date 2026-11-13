@@ -714,3 +714,16 @@ def test_a_step_that_raises_does_not_discard_the_evidence_already_collected(tmp_
         assert "P4.1" in e.book.items                                         # 不发单的步骤照常出证据
     finally:
         e.main.close()
+
+
+def test_a_crashed_step_makes_the_run_exit_with_the_crash_code(tmp_path, monkeypatch):
+    """步骤抛异常 = 证据不完整:run_steps 记下失败步骤,main 据此返回崩溃码(一键流程不出报告)。"""
+    e = Env(tmp_path)
+    try:
+        e.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
+        monkeypatch.setattr(bt, "in_trading_session", lambda dt: True)
+        monkeypatch.setattr(bt, "step_validity", lambda ctx, book: (_ for _ in ()).throw(RuntimeError("x")))
+        assert bt.run_steps(e.ctx, e.book, only={"P4.1"}) is True
+        assert e.ctx.failed_steps == ["<lambda>"]
+    finally:
+        e.main.close()
