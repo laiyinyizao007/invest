@@ -66,17 +66,20 @@ _CTP_ENV = re.compile(r"(?i)\bCTP_[A-Z0-9_]+\s*[=:]\s*\S+")
 
 _UNC = re.compile(r"\\\\[?.]?\\?[^\s\"'<>|*?]+")                                                    # \\server\share  \\?\C:\...  \\.\pipe\x
 # 盘符后接反斜杠,或接**单个**正斜杠:`https://x` 里的 `s:/` 后面还有一个 `/`,所以不会被当成盘符;而 `fooC:\Users` 这种紧贴字母的写法仍会命中
-_WIN_PATH = re.compile(r"[A-Za-z]:(?:\\|/(?!/))[^\s\"'<>|*?]*")
+# 反斜杠写法:目录名里允许单个空格(`C:\Users\Alice Smith\x.txt`——空格后面必须还有反斜杠才算目录的一部分,所以普通句子不会被吞掉);
+# 正斜杠写法:盘符前不能是字母数字/斜杠/点(挡住 URL 路径里的 `a:/b`),而反斜杠写法不加这个限制(`fooC:\Users` 仍要命中)。
+_WIN_PATH = re.compile(r"[A-Za-z]:\\(?:[^\\\s\"'<>|*?]+(?: [^\\\s\"'<>|*?]+)*\\)*[^\s\"'<>|*?]*|(?:(?<![\w/.%-])|(?<=file:///))[A-Za-z]:/(?!/)[^\s\"'<>|*?]*")
+_ZERO_WIDTH = re.compile("[\u200b-\u200f\u2060\ufeff\u202a-\u202e]")             # 零宽/方向控制字符:能拆开路径结构,先去掉再匹配
 # 引号包围的路径可以含空格(C:\Users\Alice Smith\...):整段替换,否则只遮住空格之前的部分
 _QUOTED_PATH = re.compile(r"(?P<q>[\"'])(?:[A-Za-z]:[\\/]|\\\\|/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library)/)[^\"'<>|*?\r\n]*(?P=q)")
 # 全角冒号/斜杠写成的盘符路径(C：＼Users＼x):只在确实含全角路径字符时才替换,半角版本由 _WIN_PATH 处理
-_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ][:：][\\/＼／][^\s\"'<>|*?]*|[A-Za-zＡ-Ｚａ-ｚ]：[\\/＼／][^\s\"'<>|*?]*")
+_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ][:：][\\/＼／][^\s\"'<>|*?]*")
 _FULLWIDTH_MARKS = "：＼／"
 _PCT_U = re.compile(r"(?i)%u([0-9a-f]{4})")                                                       # 非标准的 %uXXXX 写法,只用于检测副本
 _ENC_WIN_PATH = re.compile(r"(?i)\b[a-z]%3a(?:%5c|%2f)[^\s\"'<>]*")                                  # C%3A%5CUsers%5C...
 _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|etc|tmp|mnt|srv|app|private|workspace|volumes)%2f[^\s\"'<>]*")
 _PCT_TOKEN = re.compile(r"[^\s\"'<>]*%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})[^\s\"'<>]*")                                   # 含百分号编码的片段
-_DECODE_ROUNDS = 4                                                                                 # 解码到稳定为止,最多 4 轮(%5C、%255C、%25255C…);再深的嵌套不在威胁模型内
+_DECODE_ROUNDS = 8                                                                                 # 解码到稳定为止,最多 8 轮(%5C、%255C、%25255C…);更深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
 
 
@@ -109,7 +112,8 @@ def _decoded_has_path(token: str) -> bool:
 
 def _scrub_fullwidth(match: re.Match) -> str:
     text = match.group(0)
-    return "<path>" if any(ch in text for ch in _FULLWIDTH_MARKS) or text[0] in "Ａ-Ｚａ-ｚ" else text
+    # 盘符字母本身是全角(Ｃ)也算——必须按字符判断,不能写成 `in "Ａ-Ｚ"`(那只是字符串成员测试,不是范围)
+    return "<path>" if any(ch in text for ch in _FULLWIDTH_MARKS) or not text[0].isascii() else text
 
 
 def _scrub_encoded_token(match: re.Match) -> str:
@@ -118,7 +122,7 @@ def _scrub_encoded_token(match: re.Match) -> str:
 
 def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) -> str:
     """文本净化。保留换行与普通内容,只替换已知的泄露形态。"""
-    out = redact(text, secrets)
+    out = redact(_ZERO_WIDTH.sub("", text), secrets)
     out = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _COOKIE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)

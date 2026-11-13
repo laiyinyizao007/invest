@@ -143,6 +143,7 @@ class DayLogParser:
         self._lines = 0               # 非空行数
         self._records = 0             # 其中形如『时间 | 级别 | 来源 | 内容』的真实日志记录数
         self._first_record_day = ""   # 第一条记录的日期(应与文件名日期一致)
+        self._truncated_tail = False  # 文件末尾停在多字节字符中间(只在 finish() 处理尾行时才可能为真;追加后字符补全则不会再出现)
         self._bad_encoding = False    # 出现过非法 UTF-8:日志不可信(曾用替换字符『修复』,坏字节落在关键字中间时严重事件会被藏起来)
 
     def feed(self, data: bytes) -> None:
@@ -167,6 +168,9 @@ class DayLogParser:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             if tail and exc.reason == "unexpected end of data" and exc.end == len(raw):
+                # 崩溃时写到一半的最后一行。被截掉的字符可能正是『硬锁定』的最后一个字——无法证明它不是关键字的一部分,
+                # 所以这一天不能被算作『无异常』:标记不可信(不是永久坏编码,字符补全后重新解析即恢复)。
+                self._truncated_tail = True
                 return raw[: exc.start].decode("utf-8", errors="replace")
             self._bad_encoding = True
             return raw.decode("utf-8", errors="replace")
@@ -202,7 +206,7 @@ class DayLogParser:
         c.first_ts, c.last_ts = self.first_ts, self.last_ts
         c._started_ok, c._start_attempts, c._pending = self._started_ok, self._start_attempts, self._pending
         c._lines, c._records, c._first_record_day = self._lines, self._records, self._first_record_day
-        c._bad_encoding = self._bad_encoding
+        c._bad_encoding, c._truncated_tail = self._bad_encoding, self._truncated_tail
         return c
 
     def trusted(self) -> bool:
@@ -214,7 +218,7 @@ class DayLogParser:
         0. 没有出现过非法 UTF-8(codex 第 3 轮复核:坏字节落在『当日熔断』中间时,替换后关键字不匹配,日志却仍被判为干净)。
         3. 记录占非空行的比例不低于 20%(容忍 traceback 续行,挡住『一行合规 + 大量垃圾』)。
         不可信的日志不能被解读成『这一天无异常』(G8 复核:一行合规加任意垃圾曾被判为干净的一天)。"""
-        return (not self._bad_encoding and self._records >= 1 and self._first_record_day == self.day
+        return (not self._bad_encoding and not self._truncated_tail and self._records >= 1 and self._first_record_day == self.day
                 and self._records >= MIN_RECORD_RATIO * self._lines)
 
     def snapshot(self, log_path: str = "") -> DayStats:

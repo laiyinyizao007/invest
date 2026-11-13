@@ -144,7 +144,15 @@ DASHBOARD_DIR = "data/dashboard"
 def _is_link(path: Path) -> bool:
     """符号链接或 Windows junction(reparse point)。不存在的路径不算链接。"""
     try:
-        return path.is_symlink() or path.is_junction()
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)         # Path.is_junction 是 Python 3.12 才有的
+        if is_junction is not None:
+            return bool(is_junction())
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)  # 旧版本 Windows:直接看 reparse point 属性
+        return bool(attrs & 0x400)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True                           # 无法判断就按有风险处理(fail-closed)
 

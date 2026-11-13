@@ -101,7 +101,7 @@ def res(tmp_path, runs=(), ledger=(), pending=None, approvals=None):
         (ctl / "approvals.json").write_text(json.dumps(approvals), encoding="utf-8")
 
 
-RUN = {"kind": "evaluate", "status": "ok", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64, "ran_at": "2026-11-12T21:00:00",
+RUN = {"kind": "evaluate", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64, "ran_at": "2026-11-12T21:00:00",
        "report": "候选评估\n结论: 未通过(3 项未过)\n样本外夏普 -1.84", "failures": ["f1", "f2"], "params": {"n": 72},
        "metrics": {"oos_sharpe": -1.84}, "diagnosis": {"weakest": "drawdown"}, "selection": None, "windows": None}
 RID = "20261112-210000-000000"
@@ -431,9 +431,9 @@ def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_
 def test_valid_runs_of_each_kind_are_accepted(tmp_path):
     base = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00", "report": "结论: x"}
     ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": {"sharpe": 1.0}}),
-          ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X"}}),
+          ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}}),
           ("20261112-210000-000003", {**base, "kind": "gate", "passed": False, "failures": ["f"]}),
-          ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X"}}),
+          ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X", "message": "m"}}),
           ("20261112-210000-000004", RUN)]
     res(tmp_path, runs=ok)
     r, runs = _runs_of(tmp_path)

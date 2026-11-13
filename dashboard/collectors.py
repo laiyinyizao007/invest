@@ -694,17 +694,25 @@ def _valid_run(run_id: str, body: Any) -> bool:
     sha = body.get("strategy_sha256")
     if not isinstance(sha, str) or not _SHA256.fullmatch(sha):
         return False
-    if not isinstance(body.get("report"), str) or not body["report"].strip() or not isinstance(body.get("ran_at"), str):
+    if not isinstance(body.get("report"), str) or not body["report"].strip() or m.parse_iso(body.get("ran_at")) is None:
         return False
-    if body.get("status") is not None and not isinstance(body["status"], str):
+    status = body.get("status")
+    if status not in (None, "strategy_error"):                          # 真实产出里只有这两种;其他取值(含 "ok"/"complete")是手写或损坏的
         return False
-    errored = body.get("status") == "strategy_error"
-    if errored and not isinstance(body.get("error"), dict):
-        return False
-    if body["kind"] in ("gate", "evaluate"):
-        if not isinstance(body.get("passed"), bool):
+    errored = status == "strategy_error"
+    if errored:
+        err = body.get("error")
+        if not (isinstance(err, dict) and isinstance(err.get("type"), str) and isinstance(err.get("message"), str)):
             return False
-        return errored or (isinstance(body.get("failures"), list) and all(isinstance(x, str) for x in body["failures"]))
+    if body["kind"] in ("gate", "evaluate"):
+        passed, failures = body.get("passed"), body.get("failures")
+        if not isinstance(passed, bool):
+            return False
+        if errored:
+            return passed is False                                      # 策略报错不可能同时『通过』
+        if not (isinstance(failures, list) and all(isinstance(x, str) for x in failures)):
+            return False
+        return (not failures) if passed else bool(failures)             # 通过 ⇔ 没有失败项(risk/candidate_eval.py:passed = not failures)
     return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
 
 
