@@ -232,50 +232,53 @@ def test_selection_only_failure_still_reports_the_cells_it_consumed():
 
 # ---------- 阶段 3:DSR 的经验方差(V = max(V_经验, 1/(T-1)),只能更严) ----------
 
-def _wide_stats(seed=5, n=60, sd=0.2):
-    import random
-
-    from risk.dsr import sharpe_stats
-    rng = random.Random(seed)
-    return sharpe_stats([rng.gauss(0.0, sd) for _ in range(n)])
+def _wide_variances(n=6, level=0.006):
+    """偏大的各次评估格子夏普方差(明显大于这套假数据的理论值 1/(T-1) ≈ 0.0042,但又不至于让 DSR 下溢成 0)。"""
+    return [level * (1 + 0.1 * i) for i in range(n)]
 
 
-def test_gate_without_prior_sharpes_reports_insufficient_samples():
+def test_gate_without_prior_history_reports_insufficient_samples():
     """没有账本样本时 DSR 退回理论值——这件事要写进结果,不得静默。"""
     result = run(prior_trials=300)
     assert result["dsr_variance"]["basis"] == "insufficient_samples"
-    assert result["dsr_variance"]["n_sharpes"] == 0
+    assert result["dsr_variance"]["n_evaluations"] == 0
 
 
-def test_gate_with_dispersed_prior_sharpes_is_stricter_and_says_so():
+def test_gate_with_a_dispersed_history_is_stricter_and_says_so():
     # 温和的候选(日夏普约 0.12):DSR 不会被饱和在 1.0,才看得出 V 变大之后的差别
     mild = make_runner(candidate_pnl=-0.9)
     loose = run(prior_trials=300, runner=mild)["metrics"]["dsr"]
-    result = run(prior_trials=300, runner=mild, sharpe_stats=_wide_stats())
+    result = run(prior_trials=300, runner=mild, run_variances=_wide_variances())
     assert result["dsr_variance"]["basis"] == "empirical"
     assert 0.0 < result["metrics"]["dsr"] < loose < 1.0
 
 
-def test_gate_with_few_prior_sharpes_falls_back_to_theory_and_equals_the_old_dsr():
-    few = _wide_stats(n=10)
-    result = run(prior_trials=300, sharpe_stats=few)
+def test_gate_with_too_few_prior_evaluations_falls_back_to_theory_and_equals_the_old_dsr():
+    result = run(prior_trials=300, run_variances=_wide_variances(n=2))
     assert result["dsr_variance"]["basis"] == "insufficient_samples"
     assert result["metrics"]["dsr"] == run(prior_trials=300)["metrics"]["dsr"]
 
 
-def test_evaluation_folds_this_runs_cell_sharpes_into_the_variance():
-    """本次扫过的格子夏普也是试验样本:并入先验之后再算 DSR 的 V。"""
-    prior = _wide_stats(n=15)                                              # 先验 15 条 < 20:单靠它不够
-    result = evaluate(prior_trials=10, sharpe_stats=prior)
-    cells = len(result["trials"]["cell_sharpes"])
-    assert result["dsr_variance"]["n_sharpes"] == prior[0] + cells
-    assert cells > 0
+def test_evaluation_folds_this_runs_own_variance_into_the_history():
+    """本次评估自己扫过的格子也是一次评估:它的方差并入先验之后再取中位数。"""
+    result = evaluate(prior_trials=10, run_variances=_wide_variances(n=2))           # 先验 2 次 + 本次 = 3 次
+    assert result["dsr_variance"]["n_evaluations"] == 3
+    assert result["dsr_variance"]["basis"] in ("empirical", "theory")
 
 
-def test_evaluation_with_prior_sharpes_never_has_a_higher_dsr_than_without():
+def test_evaluation_with_a_history_never_has_a_higher_dsr_than_without():
     base = evaluate(prior_trials=10)["metrics"]["dsr"]
-    with_stats = evaluate(prior_trials=10, sharpe_stats=_wide_stats())["metrics"]["dsr"]
-    assert with_stats <= base + 1e-12
+    with_history = evaluate(prior_trials=10, run_variances=_wide_variances())["metrics"]["dsr"]
+    assert with_history <= base + 1e-12
+
+
+def test_one_poisoned_evaluation_in_the_history_does_not_zero_the_dsr():
+    """第 15 轮 codex 的 Critical:一次网格极端分裂的评估(方差 0.279)混进历史,不得让此后每个候选的 DSR 恒为 0。"""
+    mild = make_runner(candidate_pnl=-0.9)
+    honest = [0.0004, 0.0005, 0.0003, 0.0006, 0.0004]
+    clean = run(prior_trials=300, runner=mild, run_variances=honest)["metrics"]["dsr"]
+    poisoned = run(prior_trials=300, runner=mild, run_variances=honest + [0.279])["metrics"]["dsr"]
+    assert clean > 0.0 and poisoned == pytest.approx(clean, rel=0.2)
 
 
 def test_cell_sharpes_are_daily_not_annualized():

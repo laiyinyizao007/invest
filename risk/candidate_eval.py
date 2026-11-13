@@ -62,12 +62,12 @@ def random_seeds(n: int = DEFAULT_RANDOM_RUNS) -> range:
 
 def build_metrics(pooled: dict, stress_sharpe: float, random_sharpes: Sequence[float],
                   data_adjusted: bool, on_plateau: bool, n_trials: int | None = None,
-                  sharpe_stats: tuple[int, float, float] | None = None) -> CandidateMetrics:
+                  run_variances: Sequence[float] | None = None) -> CandidateMetrics:
     """n_trials 为累计试验次数(含被淘汰者,见 risk/trial_ledger.py)。缺省或缺日收益序列时 DSR 记为 None,门槛按未通过处理。"""
     if n_trials is not None and (isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1):
         raise ValueError("n_trials 必须是 ≥ 1 的整数")
     returns = pooled.get("daily_returns")
-    dsr = deflated_sharpe(returns, n_trials, sharpe_stats) if n_trials is not None and returns else None
+    dsr = deflated_sharpe(returns, n_trials, run_variances) if n_trials is not None and returns else None
     return CandidateMetrics(
         oos_sharpe=pooled["sharpe"],
         oos_years=pooled["years"],
@@ -85,14 +85,14 @@ def build_metrics(pooled: dict, stress_sharpe: float, random_sharpes: Sequence[f
 
 def evaluate(pooled: dict, stress_sharpe: float, random_sharpes: Sequence[float],
              data_adjusted: bool, on_plateau: bool, thresholds: GateThresholds = GateThresholds(),
-             n_trials: int | None = None, sharpe_stats: tuple[int, float, float] | None = None) -> dict:
-    """`sharpe_stats` 是历次试验日夏普的 (n, mean, M2),供 DSR 用经验方差(V = max(V_经验, 1/(T-1)),只能更严)。
+             n_trials: int | None = None, run_variances: Sequence[float] | None = None) -> dict:
+    """`run_variances` 是历次评估各自的格子日夏普方差,供 DSR 用经验方差(V = max(中位数, 1/(T-1)),只能更严)。
     结果里的 `dsr_variance` 记录了 V 用的是什么、依据是什么(含"样本不足"退回理论值这件事)。"""
-    metrics = build_metrics(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials, sharpe_stats)
+    metrics = build_metrics(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials, run_variances)
     failures = check_gate(metrics, thresholds)
     failed_check_ids = check_gate_ids(metrics, thresholds)
     returns = pooled.get("daily_returns")
-    variance = (deflated_sharpe_detail(returns, n_trials, sharpe_stats)["variance"]
+    variance = (deflated_sharpe_detail(returns, n_trials, run_variances)["variance"]
                 if n_trials is not None and returns else None)
     return {"passed": not failures, "failures": failures, "failed_check_ids": failed_check_ids,
             "metrics": metrics.__dict__ | {"random_runs": len(random_sharpes)}, "dsr_variance": variance}

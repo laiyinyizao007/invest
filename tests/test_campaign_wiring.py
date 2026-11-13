@@ -9,7 +9,7 @@ from dashboard.evolution import read_campaign, read_heatmap
 from risk import lineage
 from risk.heatmap import build_heatmap
 from risk.lineage import LineageError, read_records, record_from_result
-from risk.trial_ledger import total_trials, trial_sharpe_stats
+from risk.trial_ledger import grid_run_variances, total_trials
 from test_heatmap import selection as heat_selection
 from test_research_api import make_strategy, tree  # noqa: F401  (tree 是 fixture)
 from test_research_gateway import call, make_app
@@ -25,7 +25,7 @@ def spawn_body(passed=False):
         "selection": {"window": ["2020-07-22", "2022-06-30"], "n_cells": 27, "valid_cells": 20, "best_sharpe": 0.9,
                       "best_smoothed": 0.8, "best_params": {"fast_window": 20}, "on_plateau": True, "note": ""},
         "metrics": {"oos_sharpe": 1.0, "dsr": 0.4, "n_trials": 37},
-        "trials": {"prior": 10, "grid_cells": 27, "total": 37, "cell_sharpes": [0.01, -0.02, 0.03]},
+        "trials": {"prior": 10, "grid_cells": 27, "total": 37, "cell_sharpes": [0.01, -0.02, 0.03, 0.0, 0.02, -0.01]},
         "cell": "H1F1", "behavior": {"round_trips": 80, "n_bars": 9000, "avg_hold_bars": 40.0, "trips_per_100_bars": 0.9,
                                      "cell": "H1F1"},
         "selection_diagnosis": {"weakest": "sharpe", "levels": {"drawdown": "ok", "trades": "ok", "losing_streak": "unknown",
@@ -164,13 +164,12 @@ def test_the_trial_sharpes_are_recorded_without_changing_the_trial_count(tree, m
     make_strategy(tree)
     result = run_job(tree, monkeypatch)
     ledger = api.trials_path({"results_dir": tree / "data" / "research"})
-    n, mean, _ = trial_sharpe_stats(ledger)
-    assert n == 4                                                      # 3 个格子 + 1 个门槛评估
+    assert len(grid_run_variances(ledger)) == 1                        # 这次评估的 6 个有效格子 → 一个方差
     assert "cell_sharpes" not in result["trials"]                      # 样本不留在保存的结果里
     assert total_trials(ledger) == api.MIN_GRID_CELLS                  # 次数仍只由计数记录决定(夏普记录不算)
 
 
-def test_a_second_evaluation_is_told_about_the_first_ones_sharpes(tree, monkeypatch):
+def test_a_second_evaluation_is_told_about_the_first_ones_history(tmp_path_factory, tree, monkeypatch):
     make_strategy(tree)
     run_job(tree, monkeypatch)
     seen = {}
@@ -182,7 +181,8 @@ def test_a_second_evaluation_is_told_about_the_first_ones_sharpes(tree, monkeypa
     monkeypatch.setattr(api, "spawn_child", spawn)
     api.evaluate_job(strategy="s.py", cls="S", confirm=True)
     cmd = seen["cmd"]
-    assert cmd[cmd.index("--prior-sharpe-n") + 1] == "4"
+    history = json.loads(cmd[cmd.index("--prior-run-variances") + 1])
+    assert len(history) == 1 and history[0] > 0
 
 
 # ---------- 网关转发 ----------

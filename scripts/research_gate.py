@@ -15,7 +15,7 @@ from typing import Callable, Sequence
 from research_grid import GridError, select_params
 from risk import candidate_eval as ce
 from risk.heatmap import build_heatmap
-from risk.dsr import MAX_TRIAL_SHARPE, merge_stats, sharpe_stats as sharpe_stats_of
+from risk.dsr import MAX_TRIAL_SHARPE, run_variance
 from risk.behavior import describe_behavior
 from risk.diagnosis import diagnose
 from risk.structured_diagnosis import structure
@@ -78,7 +78,7 @@ def _random_params(random_cls: type, params: dict) -> dict:
 def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], bars: Sequence, runner: Runner,
              random_cls: type, random_runs: int = ce.DEFAULT_RANDOM_RUNS, data_adjusted: bool, on_plateau: bool,
              capital: float, prior_trials: int | None = None,
-             sharpe_stats: tuple[int, float, float] | None = None) -> dict:
+             run_variances: Sequence[float] | None = None) -> dict:
     """prior_trials = 已累计的试验次数(含被淘汰者,由调用方从 risk/trial_ledger.py 读取),作为 DSR 的去通胀次数。
     不提供时 DSR 记为未计算,门槛按未通过处理(fail-closed)。"""
     slices = [(name, slice_bars(bars, start, end)) for name, start, end in windows]
@@ -99,7 +99,7 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
         random_sharpes.append(ce.pool_oos(runs, capital)["sharpe"])
 
     result = ce.evaluate(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials=prior_trials,
-                         sharpe_stats=sharpe_stats)
+                         run_variances=run_variances)
     result["windows"] = [
         {"name": name, "bars": len(chunk), "round_trips": res["round_trips"], "maxdd_pct": res["maxdd_pct"],
          "maxdd_yuan": res["maxdd_yuan"], "sharpe": ce.annualized_sharpe(res["daily_pnls"], capital)}
@@ -148,7 +148,7 @@ def selection_facts(selection: dict) -> dict:
 def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,
                    max_cells: int, min_round_trips: int, select_window: tuple[datetime, datetime],
                    validation_windows: Sequence[Window], data_adjusted: bool = True, prior_trials: int | None = None,
-                   sharpe_stats: tuple[int, float, float] | None = None) -> dict:
+                   run_variances: Sequence[float] | None = None) -> dict:
     """选参 + 门槛评估:候选在类上声明 `param_grid`,先在**选参窗口**(止于第一个验证窗口之前)扫网格选参并判定参数高原,
     再用选出的参数在**滚动验证窗口**上做完整门槛评估。选参数据与评估数据不重叠,样本外因此成立。
 
@@ -182,7 +182,8 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     cells_run = int(selection["n_cells"])
     trials = None if prior_trials is None else {"prior": prior_trials, "grid_cells": cells_run, "total": prior_trials + cells_run,
                                                 "cell_sharpes": cell_sharpes}
-    merged_stats = merge_stats(sharpe_stats or (0, 0.0, 0.0), sharpe_stats_of(cell_sharpes))
+    own = run_variance(cell_sharpes)                  # 本次评估自己的格子夏普方差(有效格子 < 5 个则不入样本)
+    merged_variances = list(run_variances or ()) + ([own] if own is not None else [])
     if selection["best_params"] is None:
         return {"passed": False, "failures": ["无法选参: " + selection["note"]], "params": None,
                 "selection": summary, "kind_detail": "selection-only", "trials": trials,
@@ -190,7 +191,7 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     result = run_gate(candidate_cls=candidate_cls, params=selection["best_params"], windows=validation_windows, bars=bars,
                       runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
                       on_plateau=selection["on_plateau"], capital=capital,
-                      prior_trials=None if trials is None else trials["total"], sharpe_stats=merged_stats)
+                      prior_trials=None if trials is None else trials["total"], run_variances=merged_variances)
     result["trials"] = trials
     result["params"] = selection["best_params"]
     result["selection"] = summary

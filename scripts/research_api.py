@@ -34,11 +34,11 @@ from research_grid import MIN_AXIS_VALUES
 from risk import constitution as const
 from risk.report import backtest_stats_row, render_report
 from risk.candidate_eval import TRADING_DAYS_PER_YEAR
-from risk.dsr import MAX_TRIAL_SHARPE
+from risk.dsr import MAX_RUNS_USED, MAX_TRIAL_SHARPE
 from risk import lineage
 from risk.heatmap import HeatmapError, save_heatmap, validate_heatmap
-from risk.trial_ledger import (MAX_TOTAL_SHARPES, TrialLedgerError, record_sharpes, record_trials, total_trials,
-                               trial_sharpe_stats, valid_trial_sharpes)
+from risk.trial_ledger import (TrialLedgerError, grid_run_variances, record_sharpes, record_trials, total_trials,
+                               valid_trial_sharpes)
 
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
@@ -127,18 +127,17 @@ def save_job_heatmap(paths: dict, run_id: str, heatmap: dict) -> None:
         raise JobError(EXIT_FAILED, f"结果已保存(run_id={run_id}),但热力图写入失败: {exc}") from exc
 
 
-def prior_sharpe_stats(paths: dict) -> tuple[int, float, float]:
-    """账本里历次试验日夏普的 (n, mean, M2),供子进程算 DSR 的经验方差。账本损坏则拒绝作业(fail-closed)。"""
+def prior_run_variances(paths: dict) -> list[float]:
+    """账本里最近各次评估的格子夏普方差,供子进程算 DSR 的经验方差(取中位数)。账本损坏则拒绝作业(fail-closed)。"""
     try:
-        return trial_sharpe_stats(trials_path(paths))
+        return grid_run_variances(trials_path(paths))
     except TrialLedgerError as exc:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
 
 
-def sharpe_stats_argv(stats: tuple[int, float, float]) -> list[str]:
-    """把先验统计量变成子进程命令行参数(repr 保证浮点数无损往返)。"""
-    n, mean, m2 = stats
-    return ["--prior-sharpe-n", str(n), "--prior-sharpe-mean", repr(float(mean)), "--prior-sharpe-m2", repr(float(m2))]
+def run_variances_argv(variances: list[float]) -> list[str]:
+    """把先验方差列表变成子进程命令行参数(JSON,repr 保证浮点数无损往返;至多 MAX_RUNS_USED 个)。"""
+    return ["--prior-run-variances", json.dumps([float(v) for v in variances[-MAX_RUNS_USED:]])]
 
 
 def record_job_sharpes(paths: dict, body: dict) -> None:
@@ -350,31 +349,27 @@ def child_int_args(args) -> tuple[int, int]:
     return random_runs, prior
 
 
-def child_sharpe_stats(args) -> tuple[int, float, float] | None:
-    """子进程自己校验先验夏普统计量 `--prior-sharpe-n/-mean/-m2`(三个要么都给、要么都不给)。
+def child_run_variances(args) -> list[float] | None:
+    """子进程自己校验先验方差列表 `--prior-run-variances`(JSON 数组)。
 
-    它们也是调用方给的值,不能假设父进程查过。这三个数进的是 DSR 的 V,而 V 只能更大不能更小(取 max),
-    所以伪造也只可能让门槛更严;但仍要卡住范围:巨大的 M2 会让 V 离谱、把后续所有候选一并卡死。
+    它也是调用方给的值,不能假设父进程查过。这些数进的是 DSR 的 V,而 V 取 max(中位数, 理论值),只能更严;
+    但仍要卡住范围:个数 ≤ MAX_RUNS_USED,每个是 [0, 1] 内的有限数(格子日夏普限幅在 ±1 以内,方差不可能更大)。
     返回 None 表示没给(DSR 按"样本不足"退回理论值,并在结果里写明)。"""
-    names = ("prior_sharpe_n", "prior_sharpe_mean", "prior_sharpe_m2")
-    given = [getattr(args, name, None) for name in names]
-    if all(value is None for value in given):
+    raw = getattr(args, "prior_run_variances", None)
+    if raw is None:
         return None
-    if any(value is None for value in given):
-        raise JobError(EXIT_REFUSED, "--prior-sharpe-n/-mean/-m2 要么都给、要么都不给")
-    n, mean, m2 = given
-    if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= MAX_TOTAL_SHARPES:
-        raise JobError(EXIT_REFUSED, "--prior-sharpe-n 必须是账本上限内的非负整数")
-    for name, value in (("mean", mean), ("m2", m2)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            raise JobError(EXIT_REFUSED, f"--prior-sharpe-{name} 必须是有限数")
-    if abs(mean) > MAX_TRIAL_SHARPE:
-        raise JobError(EXIT_REFUSED, "--prior-sharpe-mean 超出单条试验夏普的上限")
-    if m2 < 0 or m2 > n * (2 * MAX_TRIAL_SHARPE) ** 2:
-        raise JobError(EXIT_REFUSED, "--prior-sharpe-m2 越界(离差平方和不可能为负或超过上限)")
-    if n == 0 and (mean != 0 or m2 != 0):
-        raise JobError(EXIT_REFUSED, "n = 0 时 mean 与 m2 必须为 0")
-    return n, float(mean), float(m2)
+    if not isinstance(raw, str):                       # 命令行参数一定是 str;bytes/数字之类一律拒
+        raise JobError(EXIT_REFUSED, "--prior-run-variances 必须是 JSON 数组字符串")
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise JobError(EXIT_REFUSED, "--prior-run-variances 必须是 JSON 数组") from exc
+    if not isinstance(values, list) or len(values) > MAX_RUNS_USED:
+        raise JobError(EXIT_REFUSED, f"--prior-run-variances 必须是个数 ≤ {MAX_RUNS_USED} 的数组")
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise JobError(EXIT_REFUSED, "--prior-run-variances 里每个数必须是 [0, 1] 内的有限数")
+    return [float(v) for v in values]
 
 
 def child_file(path: Path) -> Path:
@@ -664,13 +659,13 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
-    stats = prior_sharpe_stats(paths)
+    variances = prior_run_variances(paths)
     trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
            "--on-plateau", "1" if on_plateau else "0", "--sha256", strategy_sha,
-           "--prior-trials", str(trials), *sharpe_stats_argv(stats)]
+           "--prior-trials", str(trials), *run_variances_argv(variances)]
     body = spawn_child(cmd, timeout)
     if "error" not in body:
         record_job_sharpes(paths, body)
@@ -746,12 +741,12 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
-    stats = prior_sharpe_stats(paths)             # 同样先读:本次的夏普是作业跑完才有的,不能进自己的先验
+    variances = prior_run_variances(paths)        # 同样先读:本次的夏普是作业跑完才有的,不能进自己的先验
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
            "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior),
-           *sharpe_stats_argv(stats)]
+           *run_variances_argv(variances)]
     body = spawn_child(cmd, timeout)
     heatmap, heatmap_note = None, None
     if "error" not in body:
@@ -844,7 +839,7 @@ def run_gate_child(args) -> int:
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
         random_runs, prior_trials = child_int_args(args)
-        sharpe_stats = child_sharpe_stats(args)
+        run_variances = child_run_variances(args)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
@@ -865,7 +860,7 @@ def run_gate_child(args) -> int:
         result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
                           runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=prior_trials, sharpe_stats=sharpe_stats)
+                          prior_trials=prior_trials, run_variances=run_variances)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -884,7 +879,7 @@ def run_evaluate_child(args) -> int:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
-        sharpe_stats = child_sharpe_stats(args)
+        run_variances = child_run_variances(args)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
@@ -905,7 +900,7 @@ def run_evaluate_child(args) -> int:
             random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
             min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
             validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials,
-            sharpe_stats=sharpe_stats)
+            run_variances=run_variances)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -960,11 +955,9 @@ def cmd_results(args) -> int:
     return EXIT_OK
 
 
-def _add_sharpe_stats_args(parser: argparse.ArgumentParser) -> None:
-    """内部子命令的先验夏普统计量(见 child_sharpe_stats):三个要么都给要么都不给。"""
-    parser.add_argument("--prior-sharpe-n", type=int, default=None)
-    parser.add_argument("--prior-sharpe-mean", type=float, default=None)
-    parser.add_argument("--prior-sharpe-m2", type=float, default=None)
+def _add_run_variance_args(parser: argparse.ArgumentParser) -> None:
+    """内部子命令的先验方差列表(见 child_run_variances):JSON 数组字符串。"""
+    parser.add_argument("--prior-run-variances", default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1018,14 +1011,14 @@ def build_parser() -> argparse.ArgumentParser:
     gchild.add_argument("--on-plateau", required=True, choices=("0", "1"))
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.add_argument("--prior-trials", type=int, default=None)
-    _add_sharpe_stats_args(gchild)
+    _add_run_variance_args(gchild)
     gchild.set_defaults(func=run_gate_child)
     echild = sub.add_parser("_evaluate_child")  # 内部使用
     for name in ("file", "cls", "sha256"):
         echild.add_argument(f"--{name}", required=True)
     echild.add_argument("--random-runs", type=int, required=True)
     echild.add_argument("--prior-trials", type=int, default=None)
-    _add_sharpe_stats_args(echild)
+    _add_run_variance_args(echild)
     echild.set_defaults(func=run_evaluate_child)
     return parser
 

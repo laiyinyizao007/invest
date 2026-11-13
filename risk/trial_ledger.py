@@ -17,7 +17,7 @@ import os
 import threading
 from pathlib import Path
 
-from risk.dsr import MAX_TRIAL_SHARPE, merge_stats, sharpe_stats as _stats_of
+from risk.dsr import MAX_RUNS_USED, MAX_TRIAL_SHARPE, run_variance
 
 KINDS = ("submission", "grid_cell", "gate_run")
 # 阶段 3:账本在记次数之外同时记录每次试验的夏普,供 DSR 用**经验方差**(见 risk/dsr.py)。
@@ -150,10 +150,15 @@ def record_sharpes(path: Path, source: str, values, *, at: float) -> int:
     return existing + len(clean)
 
 
-def trial_sharpe_stats(path: Path) -> tuple[int, float, float]:
-    """账本里全部试验夏普的 (n, mean, M2),供 DSR 的经验方差用。账本不存在视为 (0, 0, 0);损坏抛 TrialLedgerError。"""
-    stats = (0, 0.0, 0.0)
+def grid_run_variances(path: Path, limit: int = MAX_RUNS_USED) -> list[float]:
+    """最近 `limit` 次评估各自的格子日夏普方差,供 DSR 的经验方差(取中位数)用。
+
+    只看 source = "grid" 的夏普记录(门槛评估的单个池化夏普不入——一次评估只有一个数,没有"内部分散度");
+    有效格子少于 `MIN_CELLS_PER_RUN` 的评估不入样本。账本不存在视为空列表;损坏抛 TrialLedgerError。"""
+    out: list[float] = []
     for entry in _entries(Path(path)):
-        if entry["kind"] == SHARPES_KIND:
-            stats = merge_stats(stats, _stats_of(entry["values"]))
-    return stats
+        if entry["kind"] == SHARPES_KIND and entry["source"] == "grid":
+            value = run_variance(entry["values"])
+            if value is not None:
+                out.append(value)
+    return out[-limit:]
