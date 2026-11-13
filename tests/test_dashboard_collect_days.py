@@ -429,3 +429,35 @@ def test_read_json_refuses_huge_state_files(tmp_path):
     p.write_text('{"a": "' + "x" * 3_000_000 + '"}', encoding="utf-8")
     data, err = models.read_json(p, retries=0)
     assert data is None and err == "corrupt"
+
+
+
+def test_a_replaced_log_whose_tail_bytes_happen_to_match_is_still_fully_reparsed(tmp_path):
+    """(d) 复核:增量解析的前缀指纹若只看已读部分的末尾 64 字节,会被『旧长度处的末尾相同、更早内容不同、文件更长』
+    的替换文件骗过,导致新文件的计数混进旧解析器的累计值。指纹还要包含文件开头的字节。
+
+    构造要点(上一版测试没真正构造出碰撞,所以在弱实现下也会通过):新文件的前 len(old) 个字节里,最后 64 字节必须与
+    旧文件的最后 64 字节逐字节相同,而更早的内容不同;然后再追加内容使文件更长,旧偏移落在新文件内部。"""
+    tail = "2026-11-12 09:59:59.000 | INFO | runtime | 公共尾部 用来让末尾六十四个字节完全相同 ................\n"
+    old = "2026-11-12 09:00:01.000 | ERROR | x | [ERROR] 对账失败\n" * 3 + tail
+    old_b = old.encode("utf-8")
+    tail_b = tail.encode("utf-8")
+    pad_len = len(old_b) - len(tail_b)
+    filler_line = "2026-11-12 08:00:00.000 | INFO | y | 完全不同的开头\n".encode("utf-8")
+    filler = (filler_line * (pad_len // len(filler_line) + 1))[:pad_len]
+    new_b = filler + tail_b + "2026-11-12 10:00:00.000 | WARNING | z | 连接断开\n".encode("utf-8")
+    assert new_b[: len(old_b)][-64:] == old_b[-64:], "构造失败:旧长度处的末尾 64 字节应当相同"
+    assert new_b[:64] != old_b[:64] and len(new_b) > len(old_b)
+    p = tmp_path / "runtime" / "vntrader" / "log" / "vt_20261112.log"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(old_b)
+    s = settings(tmp_path)
+    col._PARSE_CACHE.clear()
+    first = col.collect_days(s, NOW).section["data"]["days"][0]
+    assert any(e["name"] == "对账失败" and e["count"] == 3 for e in first["events"])
+    p.write_bytes(new_b)
+    got = col.collect_days(s, NOW).section["data"]["days"][0]
+    col._PARSE_CACHE.clear()
+    cold = col.collect_days(s, NOW).section["data"]["days"][0]
+    assert got == cold
+    assert not any(e["name"] == "对账失败" for e in got["events"]), "旧文件的计数不应混进新文件"

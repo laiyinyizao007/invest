@@ -112,8 +112,8 @@ class StaticSite:
         if path is None:
             return None
         try:
-            if path.resolve().parent.joinpath(path.name) != path or self.root not in path.resolve().parents:
-                return None                              # 符号链接/junction 指向静态目录之外
+            if self.root not in path.resolve(strict=True).parents:
+                return None                              # 启动后被换成指向静态目录之外的符号链接/junction:不服务(目标内容可能被别人改)
             with path.open("rb") as fh:
                 raw = fh.read(MAX_STATIC_BYTES + 1)
         except OSError:

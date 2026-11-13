@@ -95,3 +95,20 @@ def test_a_token_file_inside_a_directory_the_dashboard_reads_is_refused(tmp_path
 def test_the_default_token_file_is_in_its_own_directory(tmp_path):
     s = c.load(path=tmp_path / "none.json", root=tmp_path)
     assert s.paths["token_file"] == (tmp_path / "data" / "dashboard" / "status.token").resolve()
+
+
+def test_guard_staleness_threshold_stays_coupled_to_the_runtime_persistence_cadence():
+    """面板把『风控状态文件落后 >180 秒』判为陈旧,依据是运行时至少每 60 秒落盘一次。
+    面板不能 import trading/risk 之外的运行时代码,所以这里读源码文本守住这个耦合:
+    运行时改了落盘节奏(间隔变大、不再每秒调用 update)而面板阈值没跟着改,这条测试会提醒。"""
+    import re
+    from dashboard import collectors
+    root = c.ROOT
+    guard_src = (root / "risk" / "account_guard.py").read_text(encoding="utf-8")
+    m = re.search(r"_last_saved_at\)\.total_seconds\(\)\s*>=\s*(\d+)", guard_src)
+    assert m, "account_guard.update() 的『至少每 N 秒落盘』条件找不到了——请复核 GUARD_STALE_AFTER 的依据"
+    persist_every = float(m.group(1))
+    assert collectors.GUARD_STALE_AFTER >= 2 * persist_every, "面板的陈旧阈值应至少是运行时落盘间隔的 2 倍,否则会误报"
+    assert collectors.GUARD_STALE_AFTER <= 20 * persist_every, "阈值过大会让真正陈旧的风控状态长期显示为新鲜"
+    rule_src = (root / "trading" / "guard_rule.py").read_text(encoding="utf-8")
+    assert "def on_timer" in rule_src and "self.guard.update(" in rule_src, "update() 不再由 on_timer 驱动——落盘节奏的前提变了"

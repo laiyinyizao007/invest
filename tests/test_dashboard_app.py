@@ -503,3 +503,23 @@ def raw_method(app, method, path, headers=()):
 
     asyncio.run(app(scope, receive, send))
     return out["status"], out["body"].decode("utf-8", "replace")
+
+
+def test_a_static_file_replaced_by_a_symlink_to_the_outside_after_startup_is_not_served(env):
+    """(c) 复核:启动时文件在静态目录里、哈希对得上;之后被换成指向目录外文件的符号链接——即使目标内容的哈希恰好相同,
+    也不能服务(符号链接的目标可能被别人改)。"""
+    import os
+    tmp, settings = env
+    body = b"console.log('same bytes')"
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": body})
+    outside = tmp / "outside.js"
+    outside.write_bytes(body)                                          # 内容与清单里的哈希完全相同
+    c = client(settings)
+    assert c.get("/assets/app.js").status_code == 200
+    (d / "assets" / "app.js").unlink()
+    try:
+        os.symlink(outside, d / "assets" / "app.js")
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("本机不允许创建符号链接")
+    assert c.get("/assets/app.js").status_code == 404

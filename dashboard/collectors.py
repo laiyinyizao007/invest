@@ -41,7 +41,11 @@ def _reason(section: str, level: str, text: str) -> dict:
 
 HEARTBEAT_MAX_BYTES = 1024           # 心跳文件就是一个数字;更大的一定是异常
 CLOCK_SKEW_TOLERANCE = 60.0          # 允许文件时间戳比本机时钟超前这么多秒(两台机器/NTP 校时的正常误差)
-GUARD_STALE_AFTER = 180.0            # 风控状态运行时至少每 60 秒落盘一次(risk/account_guard.py),留 3 倍余量
+# 风控状态落后多久算陈旧。依据(已核对源码):trading/guard_rule.py::on_timer 每秒调用 guard.update(),
+# risk/account_guard.py::update 在『状态变化』或『距上次落盘 >=60 秒』时 _save();留 3 倍余量。
+# 前提:账户对象已到位(on_timer 里 `if account is not None`)。账户资金还没回报或断线时文件确实不再更新——
+# 此时判 stale 是对的(当前权益确实不是最新的)。改动上述两处的人请同步这个阈值;tests/test_dashboard_config.py 里有断言守着这个耦合。
+GUARD_STALE_AFTER = 180.0
 
 
 def _read_heartbeat(path: Path) -> tuple[float | None, str | None]:
@@ -221,7 +225,7 @@ _PARSE_LOCK = threading.Lock()
 class _ParseState:
     parser: ls.DayLogParser
     offset: int                 # 已喂给解析器的字节数
-    fingerprint: bytes          # 已读部分末尾的若干字节:用来确认文件只是被追加,没有被替换
+    fingerprint: bytes          # 文件开头 + 已读部分末尾的若干字节:用来确认文件只是被追加,没有被替换
     mtime_ns: int
     size: int
 
@@ -235,11 +239,18 @@ def _read_range(path: Path, start: int, end: int | None = None) -> bytes:
         return fh.read() if end is None else fh.read(max(end - start, 0))
 
 
-def _tail_fingerprint(path: Path, offset: int) -> bytes:
-    """文件 [offset-N, offset) 这段的内容。固定很小(64 字节),单独实现——_read_range 只表示『喂给解析器的数据读取』,便于测试断言读了多少。"""
+def _fingerprint(path: Path, offset: int) -> bytes:
+    """文件指纹 = 开头 N 字节 + [offset-N, offset) 这段。用来确认文件自上次读取以来只是被追加。
+
+    只看末尾不够(G8 复核实测):『旧长度处的末尾相同、更早内容不同、文件更长』的替换文件能骗过它,
+    结果是旧文件的计数混进新文件(对一个干净的新日志报『严重事件』,或反过来漏报)。
+    加上文件开头的字节:追加不会改变开头;不同的日志文件以不同的时间戳开头。
+    固定很小(共 ≤128 字节),单独实现——_read_range 只表示『喂给解析器的数据读取』,便于测试断言读了多少。"""
     with path.open("rb") as fh:
+        head = fh.read(min(offset, FINGERPRINT_BYTES))
         fh.seek(max(offset - FINGERPRINT_BYTES, 0))
-        return fh.read(min(offset, FINGERPRINT_BYTES))
+        tail = fh.read(min(offset, FINGERPRINT_BYTES))
+    return head + b"|" + tail
 
 
 def _parse_cached(path: Path) -> ls.DayStats:
@@ -264,14 +275,14 @@ def _parse_cached(path: Path) -> ls.DayStats:
         try:
             if state is not None and (st.st_mtime_ns, st.st_size) == (state.mtime_ns, state.size):
                 pass                                                          # 没变:直接用
-            elif state is not None and st.st_size >= state.offset and _tail_fingerprint(path, state.offset) == state.fingerprint:
+            elif state is not None and st.st_size >= state.offset and _fingerprint(path, state.offset) == state.fingerprint:
                 state.parser.feed(_read_range(path, state.offset, st.st_size))   # 只追加:读新增部分
                 state.offset, state.size, state.mtime_ns = st.st_size, st.st_size, st.st_mtime_ns
-                state.fingerprint = _tail_fingerprint(path, state.offset)
+                state.fingerprint = _fingerprint(path, state.offset)
             else:                                                             # 首次 / 被截断 / 被替换:全量
                 parser = ls.DayLogParser(ls._day_from_filename(path))
                 parser.feed(_read_range(path, 0, st.st_size))
-                state = _ParseState(parser, st.st_size, _tail_fingerprint(path, st.st_size), st.st_mtime_ns, st.st_size)
+                state = _ParseState(parser, st.st_size, _fingerprint(path, st.st_size), st.st_mtime_ns, st.st_size)
                 if len(_PARSE_CACHE) >= PARSE_CACHE_MAX and key not in _PARSE_CACHE:
                     _PARSE_CACHE.clear()
                 _PARSE_CACHE[key] = state
