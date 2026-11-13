@@ -261,3 +261,26 @@ def test_a_ledger_of_millions_of_empty_lines_is_rejected_without_building_a_huge
     finally:
         tracemalloc.stop()
     assert peak < 32 * 1024 * 1024, f"峰值内存 {peak // 1024 // 1024} MB"
+
+
+# ---------------------------------------------------------------- 区块级别:损坏不能说成正常
+def test_a_campaign_with_a_corrupt_ledger_is_not_reported_as_a_healthy_evolution_section(tmp_path):
+    """台账损坏 = 无法判断这个战役的状态。整体级别不能是 ok(『不制造虚假安心』)。"""
+    from dashboard import collectors as col
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / "camp-bad.jsonl").write_text("{broken\n", encoding="utf-8")
+    s = settings(tmp_path)
+    r = col.collect_evolution(s, NOW)
+    assert r.level != "ok" and r.reasons
+    assert r.section["data"]["campaigns"][0]["state"] == "corrupt"
+    assert "损坏" in r.reasons[0]["text"]
+
+
+def test_an_empty_ledger_file_is_a_campaign_with_no_data_not_a_broken_one(tmp_path):
+    from dashboard import collectors as col
+    d = tmp_path / "data" / "research" / "evolution"
+    d.mkdir(parents=True)
+    (d / "camp-empty.jsonl").write_text("", encoding="utf-8")
+    r = col.collect_evolution(settings(tmp_path), NOW)
+    assert r.section["data"]["campaigns"][0]["state"] == "missing"

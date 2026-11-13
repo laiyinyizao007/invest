@@ -956,8 +956,16 @@ def collect_evolution(settings: Settings, now: float) -> Result:
     data = {"campaigns": campaigns}
     state = "ok" if campaigns else "missing"
     message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
-    return Result(m.section(state, data, now=now, message=message), "ok" if campaigns else "unknown",
-                  f"{len(campaigns)} 个战役" if campaigns else "暂无战役", [])
+    # 台账损坏 = 无法判断这个战役的状态,整体不能显示正常(『不制造虚假安心』)
+    broken = [c["campaign_id"] for c in campaigns if c["state"] == "corrupt"]
+    reasons = [_reason("evolution", "warn", f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断")] if broken else []
+    if broken:
+        message = ";".join(filter(None, [message, f"{len(broken)} 个战役的台账损坏或读不了"]))
+        state = "ok"                       # 区块数据仍然可用(其它战役正常),但级别与横幅要说清楚
+        level, headline = "warn", f"{len(campaigns)} 个战役({len(broken)} 个台账损坏)"
+    else:
+        level, headline = ("ok", f"{len(campaigns)} 个战役") if campaigns else ("unknown", "暂无战役")
+    return Result(m.section(state, data, now=now, message=message), level, headline, reasons)
 
 
 def get_evolution_curve(settings: Settings, campaign_id: str) -> dict | None:
