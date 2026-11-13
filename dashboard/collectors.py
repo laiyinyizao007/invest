@@ -365,10 +365,19 @@ def _parse_cached(path: Path) -> ls.DayStats:
 
 
 def warm_up(settings: Settings) -> None:
-    """启动时预热日志解析缓存,让用户第一次打开页面时已经是热的(60 MB 日志冷解析约 11 秒)。
+    """启动时预热解析缓存,让用户第一次打开页面时已经是热的
+    (60 MB 日志冷解析约 11 秒;进化台账同理,50 个战役 ≈ 300 MB)。
+
     预热只是优化:任何异常都吞掉,绝不能阻止服务启动。"""
     try:
         _days(settings)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # 进化台账也要预热:总览每 8 秒轮询一次,冷启动后第一个请求要 11 秒就足够拖慢页面。
+        # 只在开关打开时预热(阶段①默认关着,没理由去读那些文件)。
+        if settings.raw.get("evolution", {}).get("enabled"):
+            collect_evolution(settings, time.time())
     except Exception:  # noqa: BLE001
         pass
 
@@ -1079,9 +1088,14 @@ class EvolutionUnavailable(Exception):
 # 而前端每 30 秒轮询一次。缓存键是 (路径, **内容哈希**):用元数据(大小/mtime)会被『同长度改写并恢复 mtime』骗过,
 # 返回旧摘要——那会让面板显示一个已经不存在的最好夏普。
 # 曲线与日志接口**不读缓存**,每次现读。
-_EVOLUTION_SUMMARY_CACHE: dict = {}          # 内容哈希键 → 摘要;路径键 → {at, summary}(带 TTL)
+# **两类键必须分开计数**:混在一个 dict 里时,每个战役占两个条目,有效容量只剩一半
+# (上限 64 → 只能缓存 32 个战役),而淘汰方式是 clear() —— 越过 32 个战役后每次写入都清空缓存,
+# TTL 永远不命中,总览每 8 秒轮询就重读一次全部台账(实测 50 个战役 = 300 MB ≈ 9 秒/请求)。
+_EVOLUTION_SUMMARY_CACHE: dict = {}      # (路径, 内容哈希) → 摘要      上限 _EVOLUTION_CACHE_MAX
+_EVOLUTION_TTL_CACHE: dict = {}          # 路径 → {at, summary}         上限 _EVOLUTION_TTL_CACHE_MAX
 EVOLUTION_SUMMARY_TTL = 30.0              # 摘要缓存的存活秒数:总览每 8 秒轮询一次,不能每次都重读全部台账
-_EVOLUTION_CACHE_MAX = 64
+_EVOLUTION_CACHE_MAX = 128
+_EVOLUTION_TTL_CACHE_MAX = 128
 MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
 
 
@@ -1098,15 +1112,23 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
     # 过期后强制重算(这样『同长度改写』最多藏一个 TTL 的时间)。
     now = time.time()
     ttl = float(settings.raw.get("evolution", {}).get("summary_ttl", EVOLUTION_SUMMARY_TTL))
-    cached = _EVOLUTION_SUMMARY_CACHE.get(str(path))
+    cached = _EVOLUTION_TTL_CACHE.get(str(path))
     if cached is not None and now - cached["at"] < ttl:
         return cached["summary"]
-    key = (str(path), _file_digest(path))
-    summary = _EVOLUTION_SUMMARY_CACHE.get(key)
-    if summary is not None:
-        _EVOLUTION_SUMMARY_CACHE[str(path)] = {"at": now, "summary": summary}
-        return summary
-    records = ev.read_campaign(directory, name)
+    try:
+        key = (str(path), _file_digest(path))
+        summary = _EVOLUTION_SUMMARY_CACHE.get(key)
+        if summary is not None:
+            _remember_summary(str(path), key, summary, now)
+            return summary
+        records = ev.read_campaign(directory, name)
+    except ev.EvolutionError:
+        # **失败路径也要缓存**:损坏/超限的台账不进缓存的话,每个请求都会重读并重新哈希整个文件
+        # (一个 929 MB 的超限台账 = 每请求约 1 秒)。这里缓存一条『损坏』摘要。
+        summary = {"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
+                   "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": "台账损坏或读不了"}
+        _remember_summary(str(path), None, summary, now)
+        raise
     sharpes = [r.sharpe for r in records if r.sharpe is not None]
     summary = {
         "campaign_id": name,
@@ -1118,11 +1140,21 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
         "state": "ok" if records else "missing",
         "message": None,
     }
-    if len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
-        _EVOLUTION_SUMMARY_CACHE.clear()
-    _EVOLUTION_SUMMARY_CACHE[key] = summary
-    _EVOLUTION_SUMMARY_CACHE[str(path)] = {"at": now, "summary": summary}
+    _remember_summary(str(path), key, summary, now)
     return summary
+
+
+def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> None:
+    """把摘要写进两个缓存。**淘汰按上限逐出最旧的**,不是 clear() 全部清空。"""
+    if hash_key is not None:
+        if len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:
+            for k in list(_EVOLUTION_SUMMARY_CACHE)[: len(_EVOLUTION_SUMMARY_CACHE) - _EVOLUTION_CACHE_MAX + 1]:
+                del _EVOLUTION_SUMMARY_CACHE[k]
+        _EVOLUTION_SUMMARY_CACHE[hash_key] = summary
+    if len(_EVOLUTION_TTL_CACHE) >= _EVOLUTION_TTL_CACHE_MAX:
+        for k in sorted(_EVOLUTION_TTL_CACHE, key=lambda x: _EVOLUTION_TTL_CACHE[x]["at"])[: len(_EVOLUTION_TTL_CACHE) - _EVOLUTION_TTL_CACHE_MAX + 1]:
+            del _EVOLUTION_TTL_CACHE[k]
+    _EVOLUTION_TTL_CACHE[path_key] = {"at": now, "summary": summary}
 
 
 def _file_digest(path: Path) -> str:

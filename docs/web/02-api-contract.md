@@ -44,7 +44,7 @@
 | `state` | `ok` / `stale` / `missing` / `corrupt` / `unknown`,见产品规格 §5 |
 | `as_of` | **数据自身**的时间(文件修改时间或内容里的时间),不是服务器当前时间。缺失时为 `null` |
 | `level` | 严重程度(`ok` / `warn` / `critical` / `unknown`),决定徽标。**与 `state` 分开**:`state` 说『内容能不能看』,`level` 说『有多严重』。例如『有些内容没列出来/没检查』是 `state=ok` + `level=warn`(内容照常显示,加警示徽标),而『有数据读不出来』是 `state=unknown`(内容仍给得出读得出来的部分,但要提示) |
-| `age_seconds` | 服务器计算的 `now - as_of`。前端直接显示,**不要用浏览器时钟重算**(两台机器时钟可能不同) |
+| `age_seconds` | 服务器计算的 `now - as_of`。前端直接显示,**不要用浏览器时钟重算**(两台机器时钟可能不同)。**注意**:区块级的 `age_seconds` 描述的是**最新的那个信号**,不一定是被判过期的那一项(例如风控状态有自己的 `guard.age_seconds`);`state=stale` 与 `age_seconds` 很小可以同时成立 |
 | `stale_after_seconds` | 超过它 `state` 变 `stale` |
 | `message` | 给人看的说明,非 `ok` 时通常有值 |
 | `data` | 内容;`missing` / `corrupt` 时为 `null`,`stale` 时通常仍有值 |
