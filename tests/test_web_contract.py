@@ -95,3 +95,24 @@ def test_manifest_paths_exist_in_the_spec():
     for entry in MANIFEST:
         assert entry["path"] in SPEC["paths"], entry
         assert entry["method"].lower() in SPEC["paths"][entry["path"]], entry
+
+
+def test_lovable_seed_files_are_in_sync_with_the_contract(tmp_path):
+    """契约或示例改了而没重新生成种子文件(api-types.ts / mock-data)时失败。重新生成:python tools/webgen/gen_lovable_seed.py"""
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[1] / "tools" / "webgen" / "gen_lovable_seed.py"
+    spec = importlib.util.spec_from_file_location("gen_lovable_seed", path)
+    gen = importlib.util.module_from_spec(spec)
+    sys.modules["gen_lovable_seed"] = gen
+    spec.loader.exec_module(gen)
+    seed = WEB / "lovable-seed"
+    assert (seed / "api-types.ts").read_text(encoding="utf-8") == gen.types_file()
+    manifest = json.loads((WEB / "fixtures" / "manifest.json").read_text(encoding="utf-8"))
+    on_disk = {p.name for p in seed.glob("mock-data.*.ts")}
+    assert on_disk == {"mock-data.phase1.ts", "mock-data.later.ts"}
+    names = [m["fixture"] for m in manifest]
+    covered = "".join((seed / n).read_text(encoding="utf-8") for n in on_disk)
+    for n in names:
+        assert f'"{n}":' in covered, f"{n} 没有出现在种子数据里"

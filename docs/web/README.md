@@ -21,8 +21,12 @@ invest 是一套自动交易系统(vn.py + CTP)。交易、风控、录制、研
 | 5 | [`fixtures/`](fixtures/) | 前端 | 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)+ `manifest.json` |
 | 6 | [`03-frontend-handoff.md`](03-frontend-handoff.md) | 前端 | 技术约束、安全清单、目录与构建、联调流程、验收清单 |
 | 7 | [`04-phases.md`](04-phases.md) | 所有人 | 五个阶段各自的范围、前置条件、后端工作、风险 |
+| 8 | [`05-lovable-guide.md`](05-lovable-guide.md) | **用 Lovable 构建前端的人** | 风险(真实数据不能进 Lovable、导出物默认带外部依赖)、总流程、项目约束、导出审计、联调 |
+| 9 | [`06-design-system.md`](06-design-system.md) | 前端、设计 | 设计令牌(对比度实测)、玻璃拟态规则与降级、状态的视觉表达、Bento 布局、组件清单 |
+| 10 | [`07-lovable-prompts.md`](07-lovable-prompts.md) | 用 Lovable 的人 | P0–P14 提示词包,每步带验收点;偏离约束时的纠正话术 |
+| 11 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 严格模式编译通过) |
 
-契约由测试守住:`tests/test_web_contract.py` 校验每个示例都符合 OpenAPI 里的模型。**改接口先改 OpenAPI 和示例,测试通过再改实现。**
+契约由测试守住:`tests/test_web_contract.py` 校验每个示例都符合 OpenAPI 里的模型,并校验 `lovable-seed/` 与契约同步(不同步则失败,重新生成:`python tools/webgen/gen_lovable_seed.py`)。前端导出物入库前必须通过 `tools/audit_frontend_export.py`。**改接口先改 OpenAPI 和示例,测试通过再改实现。**
 
 ## 全貌
 

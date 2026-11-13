@@ -12,7 +12,7 @@
 | 契约测试 | 用 `fixtures/` 校验前端对每种状态的渲染(见 §6) |
 | 一页说明 | 如何开发、构建、更新示例数据 |
 
-技术栈**自由选择**(React / Vue / Svelte / 原生均可),前提是满足 §2 的全部约束。选型请在开工前告知,我们只关心约束是否满足。
+技术栈**已确定为 React + TypeScript + Tailwind CSS**,用 Lovable 作为开发环境:做法与风险见 [`05-lovable-guide.md`](05-lovable-guide.md),提示词见 [`07-lovable-prompts.md`](07-lovable-prompts.md)。无论用什么工具,都必须满足 §2 的全部约束;导出物入库前必须通过 `tools/audit_frontend_export.py`。
 
 ## 2. 硬性约束(验收时逐条检查)
 

@@ -29,8 +29,9 @@
 4. **监控页的首要风险是假安心**:每个区块有 `ok / stale / missing / corrupt / unknown` 多态;缺失、过期、损坏一律显示为"未知/过期",不显示成正常;总状态灯取最差;每块显示数据年龄。
 5. **唯一的出口净化点** `dashboard/safe.py`:账号只留头尾各 2 位,文本过 `notify.webhook.redact`,路径转相对路径,字符串与列表截断。所有响应序列化前必须经过它。不读取 `.env`。
 6. **鉴权与网络**:Bearer 令牌文件(`data/state/status.token`,不入库,常量时间比较),每分钟限流,不开 CORS,**阶段①只允许监听 127.0.0.1**,拒绝非回环地址。经局域网或内网访问须另写 ADR(VPN 或限定局域网,不做公网穿透)。
-7. **前端零外部依赖**:无 CDN、无外链字体,离线可用;日志与告警文本一律 `textContent`(日志里有对端返回的文本,存在注入面);令牌放 `sessionStorage`,走 Authorization 头,不进 URL;响应带 `Content-Security-Policy: default-src 'self'`。
-8. **时区并列显示**:本机时区与北京时间(开发机是太平洋时间,交易按北京时间,已经混淆过)。
+7. **前端技术栈与开发环境**:React + TypeScript + Tailwind CSS,用 Lovable 作开发环境(仅示例数据,真实数据与令牌不进入 Lovable);导出物经 `tools/audit_frontend_export.py` 审计后才能入库,产物为静态文件由本机状态服务托管。详见 `docs/web/05-lovable-guide.md`。
+8. **前端零外部依赖**:无 CDN、无外链字体,离线可用;日志与告警文本一律 `textContent`(日志里有对端返回的文本,存在注入面);令牌放 `sessionStorage`,走 Authorization 头,不进 URL;响应带 `Content-Security-Policy: default-src 'self'`。
+9. **时区并列显示**:本机时区与北京时间(开发机是太平洋时间,交易按北京时间,已经混淆过)。
 
 ## fork 范围
 
