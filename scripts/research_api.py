@@ -35,6 +35,7 @@ from risk import constitution as const
 from risk.report import backtest_stats_row, render_report
 from risk.candidate_eval import TRADING_DAYS_PER_YEAR
 from risk.dsr import MAX_TRIAL_SHARPE
+from risk import lineage
 from risk.heatmap import HeatmapError, save_heatmap, validate_heatmap
 from risk.trial_ledger import (MAX_TOTAL_SHARPES, TrialLedgerError, record_sharpes, record_trials, total_trials,
                                trial_sharpe_stats, valid_trial_sharpes)
@@ -697,11 +698,38 @@ def save_with_report(result: dict, paths: dict) -> None:
     result["run_id"] = rs.save_result(result, paths["results_dir"])
 
 
+def check_campaign(campaign) -> dict | None:
+    """校验战役信息 {campaign_id, parent_sha256, generation}(都是调用方给的,不可信)。没有则返回 None。"""
+    if campaign is None:
+        return None
+    if not isinstance(campaign, dict) or set(campaign) - {"campaign_id", "parent_sha256", "generation"}:
+        raise JobError(EXIT_REFUSED, "campaign 只接受 campaign_id / parent_sha256 / generation 三个字段")
+    campaign_id, parent, generation = campaign.get("campaign_id"), campaign.get("parent_sha256"), campaign.get("generation")
+    if not isinstance(campaign_id, str) or not lineage.CAMPAIGN_ID.fullmatch(campaign_id):
+        raise JobError(EXIT_REFUSED, "campaign_id 不合法(字母数字开头,可含 . _ -,至多 64 个字符)")
+    if parent is not None and (not isinstance(parent, str) or not lineage.SHA256.fullmatch(parent)):
+        raise JobError(EXIT_REFUSED, "parent_sha256 必须是 64 位小写十六进制或不填")
+    if isinstance(generation, bool) or not isinstance(generation, int) or not 0 <= generation <= lineage.MAX_GENERATION:
+        raise JobError(EXIT_REFUSED, "generation 必须是非负整数")
+    return {"campaign_id": campaign_id, "parent_sha256": parent, "generation": generation}
+
+
+def record_lineage(paths: dict, campaign: dict, result: dict, source: str) -> None:
+    """结果已落盘之后把它记进谱系台账。写不进去就大声失败:缺失的台账记录不能让进化曲线显示成正常。"""
+    try:
+        record = lineage.record_from_result(result, source, parent_sha256=campaign["parent_sha256"],
+                                            generation=campaign["generation"])
+        lineage.append_record(Path(paths["results_dir"]) / "evolution", campaign["campaign_id"], record)
+    except lineage.LineageError as exc:
+        raise JobError(EXIT_FAILED, f"结果已保存(run_id={result.get('run_id')}),但谱系台账写入失败: {exc}") from exc
+
+
 def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
-                 confirm: bool = False) -> dict:
+                 confirm: bool = False, campaign: dict | None = None) -> dict:
     """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
     再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。"""
     cfg, paths = settings()
+    campaign = check_campaign(campaign)                  # 先查:战役信息不合法就不必白跑一次
     timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
     random_runs = random_runs if random_runs is not None else cfg["gate"]["random_runs"]
     path = resolve_strategy(strategy, cfg)
@@ -740,6 +768,8 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     save_with_report(result, paths)
     if heatmap is not None:
         save_job_heatmap(paths, result["run_id"], heatmap)
+    if campaign is not None:
+        record_lineage(paths, campaign, result, source)
     return result
 
 

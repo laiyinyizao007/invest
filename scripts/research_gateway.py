@@ -420,11 +420,21 @@ class GatewayApp:
         random_runs = _lenient_int(data.get("random_runs"), "random_runs")
         # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
         view = _view(data)
+        extra = {}
+        if data.get("campaign") not in (None, ""):
+            # 战役信息(谱系台账用):{campaign_id, parent_sha256, generation}。形状与取值由作业层严格校验;
+            # 这里只负责把"JSON 字符串形式的对象"(毕昇工具节点把所有参数当字符串传)还原成对象
+            campaign = _lenient_object(data.get("campaign"), "campaign")
+            if campaign is None:
+                return 400, {"error": "campaign 必须是对象或其 JSON 字符串"}
+            if isinstance(campaign.get("generation"), str):
+                campaign["generation"] = _lenient_int(campaign["generation"], "campaign.generation")
+            extra["campaign"] = campaign
         refused = self._ladder_precheck()
         if refused:
             return refused
         return self._shape(self._reveal_outcome(self._run_job(
-            self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False)), view)
+            self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False, **extra)), view)
 
     def _results(self, _data, params):
         run_id = params["run_id"]

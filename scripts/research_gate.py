@@ -100,7 +100,8 @@ def selection_facts(selection: dict) -> dict:
     选不出最佳格子、或执行器没给行为信息时对应字段为 None(不猜)。"""
     detail = selection.get("best_detail")
     if not isinstance(detail, dict):
-        return {"cell": None, "behavior": None, "selection_diagnosis": None, "fitness": None}
+        return {"cell": None, "behavior": None, "selection_diagnosis": None, "fitness": None,
+                "selection_metrics": None}
     hold_bars = detail.get("hold_bars")
     behavior = describe_behavior(detail["round_trips"], detail["n_bars"],
                                  hold_bars if isinstance(hold_bars, list) else None)
@@ -108,8 +109,12 @@ def selection_facts(selection: dict) -> dict:
            "maxdd_yuan": detail.get("maxdd_yuan"), "round_trips": detail["round_trips"]}
     trade_pnls = detail.get("trade_pnls")
     diagnosis = structure(diagnose(row, trade_pnls if isinstance(trade_pnls, list) and trade_pnls else None))
+    drawdown = detail.get("maxdd_pct")
     return {"cell": behavior["cell"], "behavior": behavior, "selection_diagnosis": diagnosis,
-            "fitness": selection.get("best_smoothed")}
+            "fitness": selection.get("best_smoothed"),
+            # 选参窗口最佳格子的收益(%)与最大回撤(%,取绝对值):谱系台账里的 total_return / max_drawdown
+            "selection_metrics": {"total_return": detail.get("total_return_pct"),
+                                  "max_drawdown": abs(drawdown) if isinstance(drawdown, (int, float)) else None}}
 
 
 def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,

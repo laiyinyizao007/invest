@@ -128,6 +128,48 @@ def validate_record(record: Any) -> dict:
     }
 
 
+def _short_reason(result: dict) -> str | None:
+    """程序给出的失败原因短字符串(不含验证窗口数字):门槛检查项 ID,或固定短语。"""
+    if result.get("status") == "strategy_error":
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        etype = error.get("type")
+        return ("策略运行报错:" + etype[:60])[:MAX_FAIL_REASON] if isinstance(etype, str) and etype.isidentifier() else "策略运行报错"
+    if result.get("kind_detail") == "selection-only":
+        return "无法选参"
+    ids = result.get("failed_check_ids")
+    if isinstance(ids, list) and ids:
+        return ",".join(i for i in ids if isinstance(i, str) and re.fullmatch(r"[a-z_]+", i))[:MAX_FAIL_REASON] or None
+    return None
+
+
+def record_from_result(result: dict, source: str, *, parent_sha256: str | None, generation: int) -> dict:
+    """由一个 evaluate 落盘结果生成台账记录。**只取进化回路放开的那一层**:
+
+    - `sharpe` / `total_return` / `max_drawdown` / `fitness` / `cell` / `diagnosis`:选参窗口的成绩与行为;
+    - `dsr` / `n_trials`:验证窗口派生的数,**只记录给人看**(面板展示),进化回路从不读(见 risk/map_elites.py);
+    - `description`:程序从候选源码抽取的可验证描述。
+    返回的记录还要过 `validate_record`(append_record 会做)。"""
+    selection = result.get("selection") if isinstance(result.get("selection"), dict) else {}
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+    chosen = result.get("selection_metrics") if isinstance(result.get("selection_metrics"), dict) else {}
+    if result.get("status") == "strategy_error":
+        status = "strategy_error"
+    elif result.get("kind_detail") == "selection-only":
+        status = "selection_failed"
+    else:
+        status = "gate_passed" if result.get("passed") is True else "gate_failed"
+    n_trials = metrics.get("n_trials")
+    return {
+        "generation": generation, "candidate_sha256": result.get("strategy_sha256"), "parent_sha256": parent_sha256,
+        "run_id": result.get("run_id"), "status": status, "sharpe": selection.get("best_sharpe"),
+        "total_return": chosen.get("total_return"), "max_drawdown": chosen.get("max_drawdown"),
+        "dsr": metrics.get("dsr"), "n_trials": n_trials if isinstance(n_trials, int) and not isinstance(n_trials, bool) and n_trials >= 0 else None,
+        "fail_reason": _short_reason(result), "cell": result.get("cell"),
+        "diagnosis": result.get("selection_diagnosis"), "fitness": result.get("fitness"),
+        "description": describe_mod.describe_candidate(source),
+    }
+
+
 def ledger_path(directory: Path, campaign_id: str) -> Path:
     if not isinstance(campaign_id, str) or not CAMPAIGN_ID.fullmatch(campaign_id):
         raise LineageError("campaign_id 不合法")
