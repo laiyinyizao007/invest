@@ -137,7 +137,7 @@
 | `fail_reason` | 失败原因 |
 | `reflection` | **反思自由文本**——用 `PlainText` 组件原样显示 |
 | `parent_sha256` / `candidate_sha256` | 哈希,等宽字体,点击"看代码"或"看差异"时传给代码接口 |
-| `created_at` | 时间 |
+| `created_at` | 时间。**无时区字符串**,按北京时间解释(见接口约定 §1 的第三族例外) |
 
 ### 5.3 源码与差异
 - 源码:接口 `GET /api/research/candidates/{sha256}/code` 返回 `lines[]`(`{n, text}`)。
