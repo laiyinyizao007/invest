@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import time
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +64,14 @@ from trading.events import EVENT_GUARD_ALERT  # noqa: E402
 from trading.guard_rule import ACCOUNT_RULE_NAME  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
 from trading.safe_risk import SafeRiskManagerApp  # noqa: E402
+
+BEIJING = ZoneInfo("Asia/Shanghai")
+
+
+def beijing_now() -> datetime:
+    """北京时间(无时区信息)。交易时段按交易所所在时区判断,不能用运行机的本地时间(宿主机可能是 UTC-8)。"""
+    return datetime.now(BEIJING).replace(tzinfo=None)
+
 
 OUT_ROOT = bootstrap.ROOT / "data" / "broker_test"
 DAILY_RULE, SIZE_RULE, DUP_RULE = "每日上限检查", "委托规模检查", "重复报单检查"
@@ -111,7 +120,7 @@ class Ctx:
         return self.risk_engine.rules.get(name)
 
     def now(self) -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return beijing_now().strftime("%Y-%m-%d %H:%M:%S")
 
     def clean(self, text: str) -> str:
         return redact(str(text), list(self.secrets))
@@ -772,7 +781,7 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         book.add("T2", FAIL, f"合约表里没有 {ctx.symbol}", [Shot("", ["合约不存在"])], ctx.now())
         return True
     ctx.contract = c
-    ctx.in_session = in_trading_session(datetime.now())
+    ctx.in_session = in_trading_session(beijing_now())
     if want("T2", "T3", "T4", "T5"):
         step_market(ctx, book)
     order_items = ORDER_ITEMS if only is None else (only & ORDER_ITEMS)

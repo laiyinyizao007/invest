@@ -482,3 +482,19 @@ def test_save_connection_info_appends_one_entry_per_run(tmp_path):
 
     import json
     assert [r["at"] for r in json.loads((tmp_path / "connection.json").read_text(encoding="utf-8"))] == ["a", "b"]
+
+
+def test_session_and_evidence_timestamps_use_beijing_time_not_host_local_time(monkeypatch):
+    """宿主机可能是 UTC-8:北京周五 10:00 在本机是周四 18:00,按本地时间会把交易时段误判为休市。"""
+    from datetime import datetime as real_datetime, timezone
+    real_now = real_datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)          # = 北京 2026-11-13 10:00 周五
+
+    class Fake(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_now.astimezone(tz) if tz else real_now.astimezone(timezone.utc).replace(tzinfo=None) - __import__("datetime").timedelta(hours=8)
+
+    monkeypatch.setattr(bt, "datetime", Fake)
+    now = bt.beijing_now()
+    assert (now.hour, now.weekday()) == (10, 4)
+    assert bt.in_trading_session(now) is True
