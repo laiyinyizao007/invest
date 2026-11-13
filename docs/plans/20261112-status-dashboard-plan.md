@@ -398,6 +398,19 @@ days/alerts/research 在有内容读不出来时 `state=unknown`(data 仍保留;
 (b) 与周末一致(只有严重事件打断)——标准宽,但要写清楚『警告不打断』;
 (c) 折中:连接抖动这类**已知的、发生在非交易时段**的警告不打断,其它警告打断。
 
+## 已知问题:测试套件偶发失败(与本轮改动无关)
+
+全量跑下来,偶发(同一提交、单独跑通过、重跑全量也通过)失败的有这么几个:
+`tests/test_recording_tools.py::test_wrapper_lock_is_released_by_os_when_holder_process_dies`、
+`tests/test_drill.py::test_hard_lock_triggers_on_a_drawdown_and_stops_with_exit_code_zero`、
+`tests/test_drill_trace.py::test_periodic_snapshot_runs_until_stopped_and_survives_errors`、
+`tests/test_research_api.py::test_all_three_child_entrypoints_go_through_the_same_validation_function`、
+`tests/test_runtime.py::test_run_returns_refusal_code_and_always_shuts_down`。
+
+共同点:**都涉及子进程或时序**(杀进程等操作系统释放文件锁、等待定时器、读源码)。
+机器负载高时(比如同时在跑 codex 复核)更容易触发。**不是这几轮改动引入的**,但会让『全量绿』这个信号变得不可靠——
+需要的话可以给它们加标记(例如 `pytest.mark.flaky`)并在 CI 里重跑。
+
 ## 修订记录
 
 - 2026-11-13 补充『执行记录』:勾选 T1–T6、T8;T7 / T9 / T10 保持未勾选并注明原因;如实记录 G8 审查的真实状态。
