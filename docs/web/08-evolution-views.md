@@ -43,8 +43,8 @@
 前端不要把列表显示成"一切正常"。列表里**不会**出现代表"未统计"的假战役行。
 (契约规定前端『先看 state』,所以这个信号落在 `state` 上,而不是另设一个级别字段。)
 
-### 当前状态:数据还没有
-引擎侧(毕昇工作流与研究网关)还没开工产生这些文件,所以现在这几个接口会返回**空**或**缺失**。
+### 当前状态:引擎侧已就绪,尚无真实数据
+引擎侧的写入端已实现(阶段 3,2026-11-13):`evaluate` 作业带战役信息时写谱系台账,评估时另存热力图,格式与本读取侧同口径并有契约测试;但**还没有真实战役跑过**(毕昇模型配额仍卡着),所以线上这几个接口目前仍会返回**空**或**缺失**。
 **这是如实状态,不是故障**。前端用 `docs/web/fixtures/` 里的 12 个示例数据开发:`evolution-list`、`evolution-list-empty`、
 `evolution-curve`、`evolution-curve-stagnant`、`evolution-log`、`evolution-log-page`、`evolution-heatmap`、
 `evolution-heatmap-plateau`、`candidate-code`、`candidate-code-missing`、`candidate-diff`、`candidate-diff-missing`。
