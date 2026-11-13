@@ -114,6 +114,8 @@ def const_string_set(source: str, names) -> dict[str, set[str]]:
     for node in ast.parse(source).body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             assignments[node.targets[0].id] = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments[node.target.id] = node.value      # 带注解的常量定义(`X: frozenset[str] = {...}`)
 
     # 按依赖顺序反复求解:常量之间可能互相引用(如 PROTECTED_NAMES 引用 PARAMETERS)
     pending = {name: assignments[name] for name in names if name in assignments}
@@ -190,16 +192,26 @@ def check_constitution_file(root: Path) -> list[str]:
             removed = set(older.get(field, [])) - set(current.get(field, []))
             if removed:
                 problems.append(f"{CONSTITUTION_REL} 的 {field} 里的 {sorted(removed)} 在后续提交中被删除了(清单只能追加)")
-        # template 不在"只能增不减"之列(换模板是合法需求),但换模板必须**同时**改内置白名单:
-        # 只改清单里的 template 就等于绕开了白名单——白名单才是真正限制"能换成哪个模板"的东西。
-        if older.get("template") != current.get("template"):
-            older_source = _read_at(root, rev, CONSTITUTION_SOURCE_REL) or ""
-            older_templates = const_string_set(older_source, ("BUILTIN_ALLOWED_TEMPLATES",)).get(
-                "BUILTIN_ALLOWED_TEMPLATES", set())
-            if older_templates == current_templates:
-                problems.append(
-                    f"{CONSTITUTION_REL} 的 template 从 {older.get('template')!r} 改成了 {current.get('template')!r},"
-                    "但内置白名单 BUILTIN_ALLOWED_TEMPLATES 没有同时变化(换模板必须同时改白名单)")
+    # template 不在"只能增不减"之列(换模板是合法需求),但**每个版本的清单**都必须指向
+    # "那个版本的内置白名单"允许的模板:只改清单里的 template 就等于绕开了白名单。
+    # 早先的写法是"当前白名单 vs 旧白名单不相等才报",那只在白名单从未增长过时才成立——
+    # 白名单一旦在历史上涨过,这条检查就永远不报(第 7 轮独立复核实测:隔离克隆里
+    # 先给白名单加一项、再改清单的 template,守卫退出码 0)。
+    # 现在按"逐个版本"检查:该版本清单里的 template 必须在**该版本**的白名单里。
+    for rev in commits:
+        manifest = read(rev)
+        template = manifest.get("template")
+        if not template:
+            continue
+        source = _read_at(root, rev, CONSTITUTION_SOURCE_REL)
+        if source is None:
+            continue                      # 那个版本里还没有宪法模块:无从判断,跳过
+        templates = const_string_set(source, ("BUILTIN_ALLOWED_TEMPLATES",)).get(
+            "BUILTIN_ALLOWED_TEMPLATES", set())
+        if templates and template not in templates:
+            problems.append(
+                f"{CONSTITUTION_REL} 在提交 {rev[:8]} 里的 template={template!r} "
+                f"不在那一版内置白名单 BUILTIN_ALLOWED_TEMPLATES 里(清单不得指向白名单之外的模板)")
     return problems
 
 
@@ -239,10 +251,13 @@ def check_registry_completeness(root: Path) -> list[str]:
         source = (root / rel).read_text(encoding="utf-8")
         registered = set(names)
         for node in ast.parse(source).body:
-            if not (isinstance(node, ast.Assign) and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                # 带注解的写法(`FORBIDDEN_X: frozenset[str] = {...}`)同样是常量定义
+                name = node.target.id
+            else:
                 continue
-            name = node.targets[0].id
             if not name.startswith(GUARDED_PREFIXES) or name in registered:
                 continue
             if const_string_set(source, (name,)).get(name) is not None:

@@ -650,11 +650,13 @@ def test_adding_an_unregistered_protection_constant_is_noticed():
     assert "BUILTIN_MADE_UP_PROTECTION" in parsed, "提取器认不出新常量,用例本身失效了"
 
 
-def test_changing_the_template_requires_changing_the_whitelist(tmp_path):
-    """换模板必须同时改内置白名单,否则等于绕开白名单——清单的 template 也得有人看着。
+def test_a_manifest_may_not_point_at_a_template_outside_the_whitelist(tmp_path):
+    """清单的 template 必须落在**那一版**的内置白名单里。
 
-    第 6 轮 codex 实测:把清单里的 template 换成别的内置模板,历史守卫全绿。
-    这里在临时仓库里造两个提交,验证守卫能报出来。"""
+    只改清单里的 template 就等于绕开了白名单——白名单才是真正限制"能换成哪个模板"的东西。
+    第 7 轮独立复核指出早先的写法("当前白名单 vs 旧白名单不相等才报")只在白名单从未增长过时成立:
+    白名单一旦在历史上涨过,那条检查就永远不报(隔离克隆里先给白名单加一项、再改清单的 template,
+    守卫退出码 0)。现在按逐个版本检查,不再依赖历史的形状。"""
     import json
     import subprocess
 
@@ -668,7 +670,7 @@ def test_changing_the_template_requires_changing_the_whitelist(tmp_path):
         return subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
                                *args], cwd=str(repo), capture_output=True, encoding="utf-8", errors="replace")
 
-    def commit(template: str, allowed: tuple[str, ...]):
+    def commit(template: str, allowed: tuple[str, ...], message: str = "manifest"):
         manifest.write_text(json.dumps({
             "version": 1, "template": template, "allowed_overrides": [], "protected_names": [],
             "protected_parameters": [], "forbidden_order_calls": [], "protected_module_attrs": [],
@@ -676,16 +678,18 @@ def test_changing_the_template_requires_changing_the_whitelist(tmp_path):
         source.write_text("BUILTIN_ALLOWED_TEMPLATES = " + repr(allowed) + chr(10), encoding="utf-8")
         git("init", "-q")
         git("add", "-A")
-        git("commit", "-q", "-m", "manifest")
+        git("commit", "-q", "-m", message)
 
     commit("pkg:A", ("pkg:A", "pkg:B"))
-    commit("pkg:B", ("pkg:A", "pkg:B"))            # 换了模板,白名单没动 → 必须报出来
-    problems = check_constitution_file(repo)
-    assert problems, "清单换模板而白名单没变,守卫却没有报出来"
-    assert any("template" in p for p in problems), problems
+    commit("pkg:B", ("pkg:A", "pkg:B"))            # 换成白名单里的另一个模板 → 合法
+    assert not check_constitution_file(repo), "白名单内的模板切换被误报了"
 
-    commit("pkg:B", ("pkg:A", "pkg:B", "pkg:C"))    # 白名单同步变了 → 不该再报
-    assert not check_constitution_file(repo), "白名单同步变化后仍在报错"
+    # 白名单先涨过一次(历史上真实存在过的形状),再把清单指向白名单之外的模板
+    commit("pkg:B", ("pkg:A", "pkg:B", "pkg:C"), "widen the whitelist")
+    commit("pkg:X", ("pkg:A", "pkg:B", "pkg:C"), "point outside the whitelist")
+    problems = check_constitution_file(repo)
+    assert problems, "清单指向白名单之外的模板,守卫却没有报出来"
+    assert any("template" in p for p in problems), problems
 
 
 def test_the_ci_workflow_runs_the_guard_without_installing_the_trading_stack():

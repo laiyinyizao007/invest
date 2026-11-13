@@ -151,7 +151,12 @@ def _child_reason(stderr: str) -> str:
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
     if not lines:
         return "子进程拒绝执行(原因见本机日志)"
-    reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", lines[-1])
+    reason = lines[-1]
+    # Windows 盘符路径(含带空格的目录)、POSIX 绝对路径、引号里的整段路径都要盖住:
+    # 早先只处理"不含空格的盘符路径",`C:\Program Files\...` 这类只替换掉前半段。
+    reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", reason)
+    reason = re.sub(r"(?<![\w.])/(?:[^\s\"']*/)*[^\s\"']*", "<路径>", reason)
+    reason = re.sub(r"\"[^\"]*\"|'[^']*'", "<路径>", reason)
     return reason[:200]
 
 
@@ -180,11 +185,18 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
 NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
 
 
-def check_approval(path: Path, paths: dict, confirm: bool) -> None:
-    """人工批准检查,未通过抛 JobError。confirm=True(仅本机 CLI 可传)等价于「我现在读过并批准」,会记录哈希。"""
+def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = None) -> None:
+    """人工批准检查,未通过抛 JobError。confirm=True(仅本机 CLI 可传)等价于「我现在读过并批准」,会记录哈希。
+
+    `sha256` 是**已经读出来的那份字节**的哈希:父进程只读一次候选文件,
+    审批检查、静态筛查、传给子进程的哈希、结果里记的哈希全部用这同一个值——
+    否则"审批时看到的""筛查时看到的""执行时校验的""结果里记的"可能是四份不同的内容。"""
     try:
         if confirm:
             rs.record_approval(path, paths["approvals_file"])
+        elif sha256 is not None:
+            if sha256 not in rs._load_approvals(paths["approvals_file"]):
+                raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
         elif not rs.is_approved(path, paths["approvals_file"]):
             raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
     except rs.SandboxError as exc:
@@ -201,8 +213,9 @@ def read_candidate(path: Path) -> tuple[bytes, str]:
     - 哈希、筛查、编译、执行都基于这同一份字节,分开打开文件会留下 TOCTOU 窗口。"""
     try:
         raw = Path(path).read_bytes()
-    except OSError as exc:
-        raise JobError(EXIT_REFUSED, f"策略文件无法读取: {exc}") from exc
+    except OSError:
+        # 同样不带路径(exc 里通常带文件名);细节留在本机日志里
+        raise JobError(EXIT_REFUSED, "策略文件无法读取或不可读") from None
     try:
         return raw, raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -273,8 +286,9 @@ def child_file(path: Path) -> Path:
     cfg = rc.load()
     try:
         return rs.resolve_pending(str(path), bootstrap.ROOT, cfg["paths"]["pending_dir"])
-    except rs.SandboxError as exc:
-        raise JobError(EXIT_REFUSED, str(exc)) from exc
+    except rs.SandboxError:
+        # 消息里不带路径:拒绝原因会回传给调用方,而回传的约定是不含本机路径
+        raise JobError(EXIT_REFUSED, "策略文件不在 pending_strategies/ 目录内") from None
 
 
 def child_approved(path: Path) -> None:
@@ -340,6 +354,12 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
             module.__name__ = spec.name
     except Exception:                                        # noqa: BLE001 - 元数据拿不到不该拦住执行
         pass
+    # 候选执行时用**最小内建集合**:静态层能封住已知的写法,封不住能力本身——
+    # `e.__traceback__.tb_frame.f_builtins.setattr(...)` 这类路径上的名字都不在禁用名单里,
+    # 而 `unittest.mock.patch.object` 只要能 import 就能改写实例属性。
+    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
+    # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
+    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"])
     try:
         exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
@@ -454,15 +474,17 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     if not isinstance(params, dict):
         raise JobError(EXIT_REFUSED, "params 必须是 JSON 对象")
     check_params_allowed(params)
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
-    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
-    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
-    strategy_sha = rs.file_sha256(path)
+    # 只读一次:哈希、筛查、审批、子进程参数、结果记录全部用这同一份字节。
+    raw, source = read_candidate(path)
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_child", "--file", str(path), "--cls", cls,
-           "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", rs.file_sha256(path)]
+           "--key", key, "--segment", segment, "--params", json.dumps(params), "--sha256", strategy_sha]
     body = spawn_child(cmd, timeout)
     if "error" in body:                    # 策略自身报错是研究中的正常结果:记录下来供反馈,而不是当作网关故障
         result = {"kind": "backtest", "status": "strategy_error", "strategy_file": path.name,
@@ -520,17 +542,18 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
     check_params_allowed(params)
     on_plateau, plateau_note = plateau
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
-    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
-    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
-    strategy_sha = rs.file_sha256(path)
+    raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
     trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
-           "--on-plateau", "1" if on_plateau else "0", "--sha256", rs.file_sha256(path),
+           "--on-plateau", "1" if on_plateau else "0", "--sha256", strategy_sha,
            "--prior-trials", str(trials)]
     body = spawn_child(cmd, timeout)
     if "error" in body:
@@ -570,17 +593,18 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     low, high = rc.INT_BOUNDS[("gate", "random_runs")]
     if isinstance(random_runs, bool) or not isinstance(random_runs, int) or not low <= random_runs <= high:
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
-    require_clean(path, cfg)
-    check_approval(path, paths, confirm)
-    # 审计锚点用**原始字节**的哈希,与批准记录同源(rs.file_sha256)。
-    # 早先这里取的是 read_text 之后的文本再哈希,而 read_text 会做通用换行转换:
-    # CRLF 文件于是算出一个与批准哈希**必然不同**的值,审计链断在换行上(第 7 轮 codex 实测)。
-    strategy_sha = rs.file_sha256(path)
+    raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
+    strategy_sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"])
+    if findings:
+        raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", rs.file_sha256(path), "--prior-trials", str(prior)]
+           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior)]
     body = spawn_child(cmd, timeout)
     if "error" not in body:
         top_up_grid_trials(paths, body)
