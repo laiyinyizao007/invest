@@ -18,10 +18,10 @@ def write_log(directory: Path, name: str, lines: list[str]) -> Path:
 
 def test_a_normal_day_has_no_events(tmp_path):
     path = write_log(tmp_path, "vt_20261110.log", [
-        "2026-11-10 09:01:02.000 启动耗时(自发起连接): 行情登录=0.5s",
-        "2026-11-10 09:01:03.000 [INFO] 已启动: trend_atr 运行于 c2701.DCE,权益 20000000",
-        "2026-11-10 09:05:00.000 [INFO] 成交: c2701.DCE 多开 1@2400",
-        "2026-11-10 15:00:00.000 [INFO] 停止: 正常停止",
+        "2026-11-10 09:01:02.000 | INFO | Runtime | 启动耗时(自发起连接): 行情登录=0.5s",
+        "2026-11-10 09:01:03.000 | INFO | Runtime | [INFO] 已启动: trend_atr 运行于 c2701.DCE,权益 20000000",
+        "2026-11-10 09:05:00.000 | INFO | Runtime | [INFO] 成交: c2701.DCE 多开 1@2400",
+        "2026-11-10 15:00:00.000 | INFO | Runtime | [INFO] 停止: 正常停止",
     ])
     stats = u.parse_day_log(path)
     assert stats.day == "2026-11-10"

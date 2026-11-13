@@ -368,6 +368,8 @@ def _days(settings: Settings) -> list[ls.DayStats]:
     for f in _log_files(settings):
         stats = _parse_cached(f)
         target = merged.setdefault(stats.day, ls.DayStats(day=stats.day))
+        target.trusted = target.trusted and stats.trusted        # 任一文件不可信 → 那天不可信
+        target.tail_uncertain = target.tail_uncertain or stats.tail_uncertain
         target.started += stats.started
         target.trades += stats.trades
         target.events.update(stats.events)

@@ -76,7 +76,12 @@ class DayStats:
 
     @property
     def clean(self) -> bool:
-        return not self.events
+        """这一天能不能算作『无异常』。
+
+        **必须同时可信**:日志内容不可信(损坏、日期对不上、尾部被截断而可能藏着严重事件)时,
+        『没看到事件』不等于『没有事件』。无人值守验收表与状态页都靠这个判断。
+        """
+        return not self.events and self.trusted
 
     @property
     def has_severe(self) -> bool:
@@ -90,6 +95,8 @@ class DayStats:
     def as_row(self, heartbeat: str = "") -> str:
         if self.events:
             detail = "、".join(f"{name}×{count}" for (_, name), count in sorted(self.events.items()))
+        elif not self.trusted:
+            detail = "无法确认(日志不可信)"        # 不能写『无异常』:没看到事件 ≠ 没有事件
         else:
             detail = "无异常"
         trades = str(self.trades) if self.trades else "-"
@@ -282,6 +289,8 @@ def collect_days(log_dirs: list[Path], day_filter: str = "") -> list[DayStats]:
             if day_filter and stats.day != day_filter:
                 continue
             target = merged.setdefault(stats.day, DayStats(day=stats.day))
+            target.trusted = target.trusted and stats.trusted        # 任一文件不可信 → 那天不可信
+            target.tail_uncertain = target.tail_uncertain or stats.tail_uncertain
             target.started += stats.started
             target.trades += stats.trades
             target.events.update(stats.events)
