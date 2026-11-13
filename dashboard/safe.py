@@ -88,8 +88,21 @@ _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|e
 _PCT_TOKEN = re.compile(r"[^\s\"'<>]*%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})[^\s\"'<>]*")                                   # 含百分号编码的片段
 _DECODE_ROUNDS = 8                                                                                 # 解码到稳定为止,最多 8 轮(%5C、%255C、%25255C…);更深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
-# 没有盘符的 Windows 根路径(`\Users\Alice\...`):盘符路径有规则,这个形态曾被漏掉
-_WIN_ROOTED_PATH = re.compile(r"(?<![\w.:/\\])\\" + _ZW_CLASS + r"*(?:Users|Windows|ProgramData|Program Files|Applications|home|tmp|opt|srv|usr|var|etc|Volumes|Library|private)\\?[^\s\"'<>|*?]*")
+# 没有盘符的 Windows 根路径(`\Users\Alice\...`):盘符路径有规则,这个形态曾被漏掉。
+# 目录名里也可以夹零宽字符(`\Us\u200bers\Alice\...`),所以名字本身按『每个字符之间都允许零宽』来写。
+_ROOT_NAMES = ("Users", "Windows", "ProgramData", "Program Files", "Applications",
+                "home", "tmp", "opt", "srv", "usr", "var", "etc", "Volumes", "Library", "private")
+
+
+def _zw_tolerant(literal: str) -> str:
+    """让一个固定字符串容忍零宽字符插在字符之间(Us<ZW>ers)。"""
+    zw = _ZW_CLASS + "*"
+    return "".join(part + zw for part in literal)
+
+
+_WIN_ROOTED_PATH = re.compile(r"(?<![\w.:/\\])\\" + _ZW_CLASS + "*"
+                              + "(?:" + "|".join(_zw_tolerant(name) for name in _ROOT_NAMES) + ")"
+                              + r"\\?[^\s\"'<>|*?]*")
 
 
 def mask_account(value: object) -> str:

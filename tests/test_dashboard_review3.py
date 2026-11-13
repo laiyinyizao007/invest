@@ -4,6 +4,7 @@ import json
 import pytest
 
 from dashboard import collectors as col
+from risk.report import backtest_stats_row
 from dashboard import safe
 from evidence import logstats as ls
 
@@ -72,7 +73,7 @@ def test_contradictory_or_unknown_result_shapes_are_rejected(body):
     {"kind": "evaluate", "passed": False, "failures": ["无法选参: x"], "kind_detail": "selection-only", "params": None},
     {"kind": "gate", "status": "strategy_error", "passed": False, "error": {"type": "ValueError", "message": "m"}},
     {"kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}},
-    {"kind": "backtest", "stats": {"total_trade_count": 156, "end_balance": 20000.0}},
+    {"kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})},
 ])
 def test_every_real_result_shape_is_still_accepted(body):
     assert _ok(body)

@@ -30,7 +30,7 @@ import research_config as rc
 import research_sandbox as rs
 from research_grid import MIN_AXIS_VALUES
 from risk import constitution as const
-from risk.report import render_report
+from risk.report import backtest_stats_row, render_report
 from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
 
 CHILD_MARK = "RESEARCH_RESULT_JSON:"
@@ -611,14 +611,7 @@ def run_child(args) -> int:
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
-    stats = stats or {}
-    row = {
-        "return_pct": stats.get("total_return", 0.0), "maxdd_pct": stats.get("max_ddpercent", 0.0),
-        "maxdd_yuan": stats.get("max_drawdown", 0.0), "sharpe": stats.get("sharpe_ratio", 0.0),
-        "round_trips": int(stats.get("total_trade_count", 0)) // 2, "end_balance": stats.get("end_balance", 0.0),
-        "net_pnl": stats.get("total_net_pnl", 0.0),
-        "total_cost": stats.get("total_commission", 0.0) + stats.get("total_slippage", 0.0),
-    }
+    row = backtest_stats_row(stats)          # 投影规则见 risk/report.py:面板校验用的是同一份
     pnls = rs.round_trip_pnls(trades, INSTRUMENTS[args.key].size)
     print(CHILD_MARK + json.dumps({"stats": row, "pnls": pnls}))
     return EXIT_OK

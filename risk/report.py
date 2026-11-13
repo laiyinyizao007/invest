@@ -12,6 +12,23 @@ from risk.promotion_gate import GateThresholds
 MAX_FAILURES = 10
 MAX_LINE = 240
 
+# 落盘的回测统计是**投影后的 row**,不是 vnpy calculate_statistics 的原始字典:
+# total_trade_count 在投影里被折半成 round_trips。**面板的校验与测试都用这里**,
+# 免得两边各写一份键集、其中一份写错(曾把 total_trade_count 当成落盘字段,结果所有真实回测都被判成损坏)。
+BACKTEST_STATS_KEYS = ("round_trips", "end_balance")
+
+
+def backtest_stats_row(stats: dict) -> dict:
+    """把 vnpy 的统计字典投影成落盘的 row。沙盒写结果、面板校验结果都用这一个函数。"""
+    stats = stats or {}
+    return {
+        "return_pct": stats.get("total_return", 0.0), "maxdd_pct": stats.get("max_ddpercent", 0.0),
+        "maxdd_yuan": stats.get("max_drawdown", 0.0), "sharpe": stats.get("sharpe_ratio", 0.0),
+        "round_trips": int(stats.get("total_trade_count", 0)) // 2, "end_balance": stats.get("end_balance", 0.0),
+        "net_pnl": stats.get("total_net_pnl", 0.0),
+        "total_cost": stats.get("total_commission", 0.0) + stats.get("total_slippage", 0.0),
+    }
+
 
 def _clip(text: Any, limit: int = MAX_LINE) -> str:
     text = " ".join(str(text).split())

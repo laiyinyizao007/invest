@@ -107,3 +107,98 @@ def test_the_candidate_source_cache_notices_a_same_size_rewrite(tmp_path):
 def test_the_campaign_limit_constant_is_defined_exactly_once():
     src = open(col.__file__, encoding="utf-8").read()
     assert src.count("MAX_CAMPAIGNS_SUMMARIZED = ") == 1, "常量重复定义了"
+
+
+def test_the_wire_level_of_the_evolution_section_is_not_ok_when_something_is_unknown(tmp_path, monkeypatch):
+    """端点只返回 Section(没有 level 字段),契约说前端『先看 state』——所以『部分未检查』必须落到 state。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    _make_campaigns(root, 5)
+    settings = appconfig.load(path=root / "none.json", root=root)
+    monkeypatch.setattr(col, "MAX_CAMPAIGNS_SUMMARIZED", 2)
+    section = col.collect_evolution(settings, 1_800_000_000.0).section
+    assert section["state"] == "unknown", "state 必须是 unknown,否则卡片还是绿的"
+    assert section["data"] is not None, "已统计的部分仍然要显示"
+    assert "未检查" in (section["message"] or "")
+
+
+def test_the_evolution_section_is_ok_when_everything_was_checked(tmp_path):
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    _make_campaigns(root, 2)
+    settings = appconfig.load(path=root / "none.json", root=root)
+    section = col.collect_evolution(settings, 1_800_000_000.0).section
+    assert section["state"] == "ok" and section["data"]["unscanned"] == 0
+
+
+def test_a_corrupt_ledger_also_makes_the_state_unknown(tmp_path):
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    _make_campaigns(root, 1, broken_last=True)
+    settings = appconfig.load(path=root / "none.json", root=root)
+    section = col.collect_evolution(settings, 1_800_000_000.0).section
+    assert section["state"] == "unknown"
+
+
+def test_a_continuously_improving_campaign_is_not_reported_as_stagnant():
+    """曾经拿**全局最好**当基准,窗口内的最好值等于全局最好时判定恒成立 → 正在进步的战役也被说成停滞。"""
+    from dashboard import evolution as ev
+    records = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                                "sharpe": 1.0 + g * 0.1}) for g in range(1, 21)]
+    flags = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["flags"]
+    assert not [f for f in flags if f["kind"] == "stagnant"], flags
+
+
+def test_a_genuinely_flat_tail_is_reported_as_stagnant():
+    from dashboard import evolution as ev
+    records = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                                "sharpe": 2.0}) for g in range(1, 11)]
+    flags = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["flags"]
+    assert [f for f in flags if f["kind"] == "stagnant"]
+
+
+def test_a_campaign_that_improves_then_flats_is_reported_as_stagnant():
+    from dashboard import evolution as ev
+    sharpes = [1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    records = [ev.parse_record({"campaign_id": "c", "generation": g, "candidate_sha256": f"{g:064x}",
+                                "sharpe": v}) for g, v in enumerate(sharpes, start=1)]
+    flags = ev.curve(records, stagnant_generations=5, stagnant_epsilon=0.05, overfit_mean_gap=1.0)["flags"]
+    assert [f for f in flags if f["kind"] == "stagnant"]
+
+
+def test_the_log_page_limit_is_not_capped_by_a_hardcoded_number(tmp_path):
+    """配置成 500 时就该给 500:写死的上限会让配置项有一半是摆设。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    _make_campaigns(root, 1)
+    ledger_dir = root / "data" / "research" / "evolution"
+    path = ledger_dir / "camp0.jsonl"
+    path.write_text("".join(json.dumps(_record("camp0", generation=g)) + "\n" for g in range(1, 300)), encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    settings.raw["evolution"]["log_limit"] = 250
+    page = col.get_evolution_log(settings, "camp0", "", 1000)
+    assert page is not None and len(page["records"]) == 250
+
+
+# ---------------------------------------------------------------- 净化层的两个尾巴
+def test_a_zero_width_character_inside_a_root_directory_name_is_still_scrubbed():
+    """零宽字符夹在目录名中间时曾原样保留。"""
+    zw = chr(0x200B)
+    text = chr(92) + "Us" + zw + "ers" + chr(92) + "Alice" + chr(92) + "secret.txt"
+    out = safe.scrub_text(text)
+    assert "Alice" not in out and "secret.txt" not in out, out
+
+
+def test_an_ordinary_rooted_path_is_still_scrubbed_after_the_name_tolerance_change():
+    """改了目录名的容忍写法,不能把正常的根路径漏掉。"""
+    text = chr(92) + "Users" + chr(92) + "Alice" + chr(92) + "x"
+    out = safe.scrub_text(text)
+    assert "Alice" not in out, out

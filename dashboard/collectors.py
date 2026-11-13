@@ -16,6 +16,7 @@ from typing import Any
 
 from dashboard import evolution as ev
 from dashboard import models as m
+from risk.report import BACKTEST_STATS_KEYS
 from dashboard.config import PAUSE_FLAG_NAME, Settings
 from dashboard.safe import mask_account
 from evidence import logstats as ls
@@ -768,13 +769,14 @@ def _valid_run(run_id: str, body: Any) -> bool:
     return _stats_look_like_backtest(stats)
 
 
-# 真实回测统计里一定有这几个字段(vnpy 的 calculate_statistics 产出;研究代码也正是读它们)
-_BACKTEST_STATS_KEYS = ("total_trade_count", "end_balance")
-
-
 def _stats_look_like_backtest(stats: dict) -> bool:
-    """回测统计是不是像真的:至少含那几个核心字段,且是有限数。"""
-    for key in _BACKTEST_STATS_KEYS:
+    """回测统计是不是像真的:含那几个核心字段,且是有限数。
+
+    键集来自 `risk.report.backtest_stats_row`——**与沙盒落盘用的是同一个函数**。
+    (曾在这里另写一份键集,写成了 vnpy 原始字段 `total_trade_count`,而落盘的是投影后的 `round_trips`,
+    结果每一个真实回测结果都被判成损坏、从列表里消失。)
+    """
+    for key in BACKTEST_STATS_KEYS:
         value = stats.get(key)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
             return False
@@ -1072,19 +1074,23 @@ def collect_evolution(settings: Settings, now: float) -> Result:
             campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
                               "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
     data = {"campaigns": campaigns, "total": len(names), "checked": len(names) - unscanned, "unscanned": unscanned}
+    # **状态用 state 表达**:端点只返回 Section(没有 level 字段),而契约规定前端『先看 state』。
+    # 『部分未检查』或『有损坏台账』= 无法判断全部 → state=unknown(不是 ok,卡片不能是绿的)。
     state = "ok" if campaigns else "missing"
     message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
     reasons: list[dict] = []
     if unscanned:
         # **没检查 ≠ 没问题**:剩下的战役可能有坏台账,区块不能显示正常。
         message = ";".join(filter(None, [message, f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,"
-                                                 f"更早的 {unscanned} 个未检查(它们的状态未知)"]))
+                                                 f"还有 {unscanned} 个未检查(它们的状态未知)"]))   # 未检查的是字典序靠后的那些
+        state = "unknown"
         reasons.append(_reason("evolution", "warn",
                                 f"还有 {unscanned} 个战役未检查:它们的状态未知,不能当作正常"))
     # 台账损坏 = 无法判断这个战役的状态,整体不能显示正常(『不制造虚假安心』)
     broken = [c["campaign_id"] for c in campaigns if c["state"] == "corrupt"]
     if broken:
         message = ";".join(filter(None, [message, f"{len(broken)} 个战役的台账损坏或读不了"]))
+        state = "unknown"
         reasons.append(_reason("evolution", "warn",
                                 f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断"))
         level, headline = "warn", f"已检查 {data['checked']}/{data['total']} 个战役({len(broken)} 个台账损坏)"
@@ -1125,9 +1131,10 @@ def get_evolution_log(settings: Settings, campaign_id: str, cursor: str = "", li
         offset = max(int(cursor), 0) if cursor else 0
     except ValueError:
         return None
-    # 默认页大小取配置(evolution.log_limit);调用方可以给更小的,不能超过上限
-    default = int(settings.raw["evolution"].get("log_limit", 50))
-    limit = max(1, min(int(limit), default, 200))
+    # 默认页大小与上限都取配置(evolution.log_limit):调用方可以给更小的,不能超过配置的上限。
+    # (曾在这里还写死一个 200,配置成 500 会被静默截到 200——配置项有一半是摆设。)
+    default = max(1, int(settings.raw["evolution"].get("log_limit", 50)))
+    limit = max(1, min(int(limit), default))
     page = records[offset: offset + limit]
     rows = [{**r.brief(), "reflection": r.reflection, "created_at": r.created_at} for r in page]
     next_cursor = str(offset + len(page)) if offset + len(page) < len(records) else None

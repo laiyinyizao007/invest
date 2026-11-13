@@ -4,6 +4,7 @@ import json
 import pytest
 
 from dashboard import collectors as col
+from risk.report import backtest_stats_row
 from dashboard import safe
 from evidence import logstats as ls
 
@@ -79,7 +80,7 @@ def test_contradictory_result_shapes_are_rejected(body):
     {"kind": "gate", "passed": False, "failures": ["f"]},
     {"kind": "evaluate", "passed": False, "failures": ["无法选参: x"], "kind_detail": "selection-only"},
     {"kind": "gate", "status": "strategy_error", "passed": False, "error": {"type": "ValueError", "message": "m"}},
-    {"kind": "backtest", "stats": {"total_trade_count": 156, "end_balance": 20000.0, "max_ddpercent": -12.5}},
+    {"kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})},
     {"kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}},
 ])
 def test_real_result_shapes_are_still_accepted(body):
@@ -89,7 +90,7 @@ def test_real_result_shapes_are_still_accepted(body):
 def test_passed_is_not_exposed_for_a_backtest():
     """backtest 没有『通过』这个概念,展示层也不该给出这个字段。"""
     brief = col._brief_run("20261112-210000-000000",
-                           {**BASE, "kind": "backtest", "stats": {"total_trade_count": 156, "end_balance": 20000.0}})
+                           {**BASE, "kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})})
     assert brief["passed"] is None
 
 

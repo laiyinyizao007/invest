@@ -231,14 +231,23 @@ def curve(records: list[Record], *, stagnant_generations: int, stagnant_epsilon:
             "cells": sorted({r.cell for r in group if r.cell}),
         })
     flags: list[dict] = []
-    best = max((p["elite_sharpe"] for p in points if p["elite_sharpe"] is not None), default=None)
-    if best is not None and len(points) >= stagnant_generations:
+    if len(points) >= stagnant_generations:
         tail = points[-stagnant_generations:]
+        # 基准取**窗口之前**的历史最好。拿全局最好当基准是错的:窗口内的最好值恰好等于全局最好时,
+        # 『窗口内每代都没超过全局最好』恒成立 —— 一个正在进步的战役也会被判成停滞(文案与事实相反)。
+        before = points[:-stagnant_generations]
+        baseline = max((p["elite_sharpe"] for p in before if p["elite_sharpe"] is not None), default=None)
+        window_best = max((p["elite_sharpe"] for p in tail if p["elite_sharpe"] is not None), default=None)
+        if baseline is None:
+            # 战役开头就没有更早的代可比较:用窗口第一代当基准(从头到尾一样平,也是停滞)
+            baseline = tail[0]["elite_sharpe"]
         # 『连续 N 代』要求代号是**连续的**:代号跳号(1、7、30)说明中间有代没跑,
         # 那不是连续 N 代停滞,只是记录稀疏。稀疏时不给停滞提示(宁可不说,不说错)。
         contiguous = all(tail[i]["generation"] == tail[i - 1]["generation"] + 1 for i in range(1, len(tail)))
-        if contiguous and all(p["elite_sharpe"] is not None and p["elite_sharpe"] <= best + stagnant_epsilon for p in tail):
-            flags.append({"kind": "stagnant", "text": f"连续 {stagnant_generations} 代精英夏普没有提升(最高 {best})",
+        if (baseline is not None and window_best is not None and contiguous
+                and window_best <= baseline + stagnant_epsilon
+                and all(p["elite_sharpe"] is not None for p in tail)):
+            flags.append({"kind": "stagnant", "text": f"连续 {stagnant_generations} 代精英夏普没有提升(窗口前最高 {baseline})",
                           "level": "warn"})
     for point in points:
         if point["elite_sharpe"] is not None and point["mean_sharpe"] is not None:

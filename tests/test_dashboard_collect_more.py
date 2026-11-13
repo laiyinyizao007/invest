@@ -6,6 +6,7 @@ import os
 import pytest
 
 from dashboard import collectors as col, config
+from risk.report import backtest_stats_row
 
 NOW = 1_800_000_000.0
 
@@ -430,7 +431,7 @@ def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_
 
 def test_valid_runs_of_each_kind_are_accepted(tmp_path):
     base = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00", "report": "结论: x"}
-    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": {"total_trade_count": 156, "end_balance": 20000.0, "max_ddpercent": -12.5}}),
+    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})}),
           ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}}),
           ("20261112-210000-000003", {**base, "kind": "gate", "passed": False, "failures": ["f"]}),
           ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X", "message": "m"}}),
