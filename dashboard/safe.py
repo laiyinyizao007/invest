@@ -129,9 +129,11 @@ def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) 
     **输入先截断**:否则净化在输出末尾才截断,输入多大就要处理多大——一个几百 KB 的百分号串
     会让 8 轮解码做很久(实测 600 KB 要 300 毫秒)。被截掉的部分本来也不会显示,不会泄露。
     """
-    if len(text) > limit + 1:                # 多留一个字符:末尾的 clip 仍能加上省略号
-        text = text[: limit + 1]
+    # **先脱敏再截断**:反过来会让跨过截断点的秘密只露出前缀(实测泄露 9 个字符)。
+    # redact 是线性替换,开销可忽略;真正贵的是下面的多轮解码,那才是需要先截断的原因。
     out = redact(text, secrets)
+    if len(out) > limit + 1:                 # 多留一个字符:末尾的 clip 仍能加上省略号
+        out = out[: limit + 1]
     out = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _COOKIE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)

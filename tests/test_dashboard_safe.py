@@ -270,3 +270,11 @@ def test_a_huge_percent_encoded_blob_does_not_cost_unbounded_work():
     out = safe.scrub_text("x " + blob + " y")
     assert time.perf_counter() - t0 < 0.2, "净化耗时过长"
     assert len(out) <= safe.MAX_STR
+
+
+def test_a_secret_straddling_the_truncation_point_does_not_leak_its_prefix():
+    """净化先脱敏再截断。反过来的话,跨过截断点的秘密会只露出前缀(实测泄露 9 个字符)。"""
+    token = "abcdefghij0123456789ABCDEFGHIJ012345"
+    for pad in (1985, 1990, 1995, 1999, 2001, 2005):
+        out = safe.scrub_text("x" * pad + token + " 后缀", secrets=[token])
+        assert not any(token[:n] in out for n in range(8, len(token))), pad
