@@ -249,7 +249,7 @@ flowchart TB
 |---|---|---|---|
 | 月度滚动重估引擎 | `scripts/walk_forward_optimizer.py` 提升为 `optimizer/` 包 + 调度入口 + 新 ADR | 三条件同时满足:①≥2 品种复权连续数据;②实盘月度换参需求;③数据厚度支持新窗口 | 2026-11-10 共识 |
 | Optuna TPE 寻优 | 并入 `walk_forward_optimizer.py` 或其旁新脚本(不改 `optimize.py` 已定案口径) | 参数维度 >2 或组合空间 > 数百,网格不再可行 | 要点梳理 §3.5 |
-| 参数平原卷积 / PBO / DSR — **参数平原(3×3×3 邻域)已落地于 `risk/plateau.py` 与选参;PBO/DSR 仍规划位** | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
+| 参数平原卷积 / PBO / DSR — **参数平原(3×3×3 邻域)已落地于 `risk/plateau.py` 与选参;DSR 已采纳随进化引擎分期落地(ADR `20261113-evolution-engine`),PBO 延后** | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
 | 研究沙盒 API(CLI→HTTP) — **已落地(2026-11-12)** | `scripts/research_api.py`、`research_gateway.py`、`research_sandbox.py`、`research_gate.py`、`research_grid.py`、`research_config.py`;容器 `docker-compose.research.yml`;契约 `docs/research-gateway.openapi.json` | — | ADR bisheng-ai-researcher、`20261112-research-sandbox-*` |
 | 策略骨架模板 + pending/approved 沙盒 — **pending 已落地,approved/ 与骨架模板未做** | `strategies/` 内模板文件 + `pending_strategies/`/`approved/` 目录约定 + 新 ADR | 阶段四 4a 启动前 | 要点梳理 §6.3-① |
 | Bisheng 外层 — **已本机部署(2026-11-12),工作流 v3 已建,LLM 联调待额度** | 独立 compose 文件(与交易 compose 完全分离,不共享网络与 `.env`) | 阶段四 4b(前置 = 阶段三 API 固化);版本 ≥2.6.0、仅内网、禁用 Code 节点 | ADR bisheng-ai-researcher |
