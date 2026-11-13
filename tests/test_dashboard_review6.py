@@ -113,3 +113,9 @@ def test_encoded_forms_of_every_path_shape_are_scrubbed(text, leak):
 ])
 def test_urls_and_ordinary_percent_text_are_still_left_alone(text):
     assert safe.scrub_text(text) == text
+
+
+def test_a_message_containing_a_pipe_still_hides_a_truncated_marker():
+    """消息里带竖线时,只取最后一段会丢掉前半段——整行也要检查。"""
+    line = "2026-11-13 09:00:00 | ERROR | Runtime | 见 a | 硬锁".encode("utf-8")
+    assert _parse(PREFIX + line).trusted is False

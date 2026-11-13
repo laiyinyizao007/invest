@@ -254,15 +254,15 @@ class DayLogParser:
         """
         if not self._tail_partial:
             return False
-        message = _message_part(self._tail_partial)
+        # 消息部分与整行都看:消息里带竖线时(『见 a | b』),只取最后一段会丢掉前半段。
+        # 两处都用 **endswith**:截断只能发生在行尾,所以只看结尾就够;
+        # 而『整行任意位置搜索』会把普通消息(如『当前权益 10000』里的『当』)误判成不可信。
+        candidates = (_message_part(self._tail_partial), self._tail_partial)
         for marker in EVENT_MARKERS:
-            if marker in message:
+            if any(marker in text for text in candidates):
                 continue                      # 事件已完整出现并被计入,不是『被藏起来』
             for cut in range(1, len(marker)):
-                # **只看结尾**:截断只能发生在行尾。整行任意位置搜索会把普通消息
-                # (如『当前权益 10000』里的『当』是『当日熔断』的前缀)误判成不可信,
-                # 还会让已经完整识别出的严重事件整份日志被排除(严重级别降成未知)。
-                if message.endswith(marker[:cut]):
+                if any(text.endswith(marker[:cut]) for text in candidates):
                     return True
         return False
 
