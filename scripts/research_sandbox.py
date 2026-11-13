@@ -52,6 +52,50 @@ ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", 
              "LOCALAPPDATA", "PROGRAMDATA", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "PYTHONIOENCODING", "TZ", "VIRTUAL_ENV",
              "INVEST_C15_DATA", "RESEARCH_SANDBOX_CONFIG")      # 数据路径与配置路径(均不含凭据)
 
+# 执行候选时**不给**的内建:属性改写、反射、动态执行、文件访问、类型系统入口。
+#
+# 为什么是"不给"而不是"再禁一批名字"(第 7 轮复核实测):
+# 静态层能封住**已知的写法**,封不住**能力**——
+#   e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)
+# 这条路径上的每个名字(回溯、帧、内建字典)都不在禁用名单里,静态层与沙盒层都返回空列表;
+# 而 `unittest.mock.patch.object(self, 'risk_budget', 1e12)` 只要能 import 就能改写实例属性。
+# 与其继续枚举反射路径(枚举不完,而且每加一批都要配测试),不如把能力本身收走:
+# 候选执行时的内建字典里**没有 setattr**,那么无论它怎么拿到内建字典都没用——
+# 连 `frame.f_builtins` 也只会拿到这份受限字典。
+#
+# 代价:候选用到这些名字会得到 NameError(而不是静默放行),由人在批准前看出来。
+UNSAFE_BUILTINS = frozenset({
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "open",
+    "globals", "locals", "vars", "breakpoint", "input",
+    "type", "object",                       # 类型系统入口:__mro__/__subclasses__ 是万能钥匙
+    "help", "exit", "quit", "license", "credits",
+})
+
+# 这些模块能改写任意对象的属性(`unittest.mock.patch.object`)或拿到内建本身,同样禁掉。
+EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
+
+
+def safe_builtins(forbidden_modules: Sequence[str] = ()) -> dict:
+    """候选执行时用的**最小内建集合**:去掉 `UNSAFE_BUILTINS`,并把 `__import__` 换成受限版。
+
+    受限导入器只放行不在禁用名单里的模块——候选必须能 import(模板与策略基类就是这么来的),
+    但 `import builtins` / `import unittest.mock` 这类"拿到内建或改写属性能力"的入口必须关上。
+    """
+    import builtins as _builtins
+
+    blocked = set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES) | set(forbidden_modules)
+    real_import = _builtins.__import__
+
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.split(".")[0]
+        if root in blocked:
+            raise ImportError(f"禁止导入 {name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
+    safe["__import__"] = restricted_import
+    return safe
+
 
 class SandboxError(ValueError):
     pass

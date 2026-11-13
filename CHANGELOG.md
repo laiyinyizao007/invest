@@ -79,7 +79,27 @@
 放松晋级门槛;且子入口自己不写账本,直接调用可白嫖评估)——根治要么让子入口以账本为准,要么让它自己也记账;
 ②本仓库**没有任何工作流跑全量测试**,测试只在本地跑。这两条已登记进 ADR 的"已知残余风险"。
 
-**CI 的实际情况(如实记录)**:本仓库的 GitHub Actions 目前**所有**工作流都在 1–3 秒内失败(`Sync Notion Board`、`Generate Issue Task List`、`Detect Duplicate Issues`、`Constitution Guard` 等一律如此),工作流 YAML 本身解析正常、仓库 Actions 权限是 `enabled`/`all`——不是宪法工作流的写法问题,而是账号/运行器层面的问题(当前 token 缺 `checks:read` 权限,连失败原因都读不到)。因此 `Constitution Guard` 这条工作流**在 CI 上一次都没有真正跑起来过**,PR #17 的 `mergeStateStatus` 一直是 `UNSTABLE` 也是这个原因。ADR 里"由 CI 检查保证"目前只有本地执行支撑(本地全量 2264 passed / 3 skipped,唯一失败的 `test_drill` 是工作树不带被 gitignore 的 `.env` 所致,与本次改动无关)。这条要等 Actions 恢复后确认,不能当作已经跑过。
+**第 7 轮复核(codex `gpt-5.6-sol` 与独立复核 `MiniMax-M3` 各跑一轮)**:两轮结论**不一致**,都未通过,分歧本身有价值:
+gpt-5.6-sol 说"上一轮的 Critical 只封住了具体写法、没封住能力"(32/50),MiniMax 说"约 30 条取内建/反射路径逐条探针全部被拦"(达成)。
+我按 gpt 说的路径实测:**gpt 是对的**——`e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)`
+与 `from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)` 两条都让静态层与沙盒层返回空列表。
+**这说明静态黑名单封的是"已知写法",封不住"能力"**——继续枚举反射路径是枚举不完的。
+**改为把能力收走(执行时隔离)**:候选执行时(`exec(code, module.__dict__)`)显式给一份**最小内建集合**
+(`scripts/research_sandbox.py::safe_builtins`):`setattr`/`delattr`/`getattr`/`eval`/`exec`/`compile`/`open`/
+`globals`/`locals`/`vars`/`type`/`object`/`breakpoint`/`input` 一律不给,`__import__` 换成受限导入器
+(`builtins`、`unittest.mock` 等已进禁用名单),其余内建照常给。这样无论候选怎么绕,
+**它能拿到的内建字典里就没有 `setattr`**——连 `frame.f_builtins` 也只会拿到这份受限字典。
+实测:同一份绕过代码现在抛 `AttributeError`,底线保持 300,`within_budget` 仍为 False。
+代价:候选用到这些名字会得到 `NameError`/`AttributeError`(fail-closed,由人在批准前看出来),`type(...)` 这类常见写法也会失效。
+**这不是安全边界的终点**:容器隔离与"运行前由人读过代码"仍是真正的边界,能力隔离只是又收了一层。
+**同轮修掉的**:守卫的"换模板必须同时改内置白名单"检查在真实历史形状下**静默失效**(白名单一旦在历史上涨过就永远不报——
+隔离克隆里先给白名单加一项、再改清单的 template,守卫退出码 0),改为**逐个版本**检查"该版本清单里的 template 必须在该版本的白名单里";
+守卫的注册表完整性检查补上 `AnnAssign` 写法;父进程把候选文件收敛为**只读一次**(哈希、筛查、审批、子进程参数、结果记录全部用同一份字节);
+回传给调用方的拒绝原因脱敏补上带空格的路径、引号路径与 POSIX 路径;子入口的拒绝消息不再带本机路径;
+源码与 ADR 里"vnpy 全家只有 update_setting 一处按名 setter"这句**说过头**的话已更正;
+ADR 的保留字清单补齐 `FORBIDDEN_STRINGS`/`UNSAFE_BUILTINS`/`EXTRA_FORBIDDEN_MODULES`,并新增"清单与代码一致"的用例钉住它。
+
+**CI 的实际情况(如实记录)**:本仓库的 GitHub Actions 目前**所有**工作流都在 1–3 秒内失败(`Sync Notion Board`、`Generate Issue Task List`、`Detect Duplicate Issues`、`Constitution Guard` 等一律如此),工作流 YAML 本身解析正常、仓库 Actions 权限是 `enabled`/`all`——不是宪法工作流的写法问题,而是账号/运行器层面的问题(当前 token 缺 `checks:read` 权限,连失败原因都读不到)。**旁证**:该作业的 job 记录里**一个 step 都没有执行**(不是某个 step 失败),这正是运行器/队列/计费层面失败的特征——脚本失败会留下一个 failed step。所以在 Actions 恢复前,守卫在 CI 上的执行仍未被真正验证过;本地已验证:仓库上退出码 0,删掉一个受保护成员后退出码 1。因此 `Constitution Guard` 这条工作流**在 CI 上一次都没有真正跑起来过**,PR #17 的 `mergeStateStatus` 一直是 `UNSTABLE` 也是这个原因。ADR 里"由 CI 检查保证"目前只有本地执行支撑(本地全量 2264 passed / 3 skipped,唯一失败的 `test_drill` 是工作树不带被 gitignore 的 `.env` 所致,与本次改动无关)。这条要等 Actions 恢复后确认,不能当作已经跑过。
 **G8 第 2 轮的现状(如实记录)**:codex 连审 5 轮——第 2 轮发现 dunder 绕过与家族根误判、第 4 轮(31/50,未通过)发现 `.pyc` 绕过/别名绕过/`operator` 反射通道/`cfg` 静默回归/子入口未复查参数/ADR 未同步,六项逐条复现后修复并各配了会在修复前失败的测试(对着修复前的提交 `353465e` 跑,8 条新测试会失败)。第 5 轮原先因 codex 账号限流(429)跑不成,额度恢复后于 2026-11-13 03:54 跑完:`gpt-5.6-sol` **40.5/50**、另一轮独立复核(`MiniMax-M3`)**33/50**,两轮都未通过,发现已逐条复现后修复。期间还补过一轮 `gemini-2.5-flash`(**46/50**,无 Critical/High)作参考——它同样不替代 codex 那一轮。修复后已补跑第 6 轮,结果见下方条目。
 - **进化引擎三视图(读取侧 + 前端文档)**(2026-11-13):新增 `dashboard/evolution.py` 与 `docs/web/08-evolution-views.md`。契约新增 6 个阶段④只读接口(战役列表/进化曲线/变异日志/参数热力图/候选源码/候选差异)与 11 个数据模型,12 份示例数据,种子重新生成。读取侧校验台账行(坏行即损坏,不做『尽量显示』)、按代聚合精英/均值/P25/P75 并由服务端判定停滞与过拟合提示、热力图三维切二维(`null` 单元保持为空、不画成 0)、源码按哈希找、统一 diff 由服务端算。**面板只读:不注入变异、不批准、不回滚**;进化回路由毕昇工作流承载。路由按仓库约定由配置开关 `evolution.enabled` 控制(阶段④上线才注册,`capabilities.evolution` 告诉前端),台账损坏返回 503 与 404 可区分。**数据还没有**——引擎侧阶段 3 还没开工,线上取不到是如实状态,前端用示例数据开发。
 - **进化引擎阶段 1:试验账本 + DSR 门槛**(Issue [#15](https://github.com/laiyinyizao007/invest/issues/15),ADR `20261113-evolution-engine`):`risk/trial_ledger.py`(只增不减、损坏 fail-closed,每个 param_grid 格子与每次成功提交各计 1 次试验,失败的评估同样消耗试验)、`risk/dsr.py`(Bailey & López de Prado 2014,日收益口径,试验间方差取 1/(T-1))、晋级门槛第 9 条 **DSR ≥ 0.95**(阈值已锁定)。`CandidateMetrics` 新增 `dsr`/`n_trials`:缺失即视为未通过(fail-closed),**旧格式的指标 JSON 不再能过 `record_promotion.py`**。账本由可信的父进程读写(先记账再跑,失败不退:evaluate 预扣最小网格 27 并补差额,gate 记 1 次 `gate_run`)、网关 `_candidates` 记提交试验;子进程只拿到 `--prior-trials` 一个数字。NaN/inf 日收益与非法 `dsr`/`n_trials` 一律 fail-closed(G8 复核发现 NaN 会让 `dsr < 0.95` 恒为 False 而放过候选)。PBO 延后。

@@ -96,14 +96,21 @@ BUILTIN_FORBIDDEN_DUNDERS = (
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
-# vnpy 全家只有 CtaTemplate.update_setting 一处(已核过 vnpy_ctastrategy 与 vnpy.trader):
+# 候选能**直接调用**的只有 CtaTemplate.update_setting 一处:
 #   for name in self.parameters: if name in setting: setattr(self, name, setting[name])
+# (另有两处按名恢复的路径——CTA 引擎按 strategy.variables 恢复变量、spreadtrading 的对应实现——
+#  它们由框架自己调用,当前无害是因为 variables 是模板成员、候选改不了,不是这里的名单保证的。)
 # 而模板的 parameters 列表里正好有四个受保护参数(risk_budget / max_daily_losses /
 # atr_window / history_vt_symbol),于是候选只要写
 #     self.update_setting(dict(risk_budget=1e12))
 # 就能把风控底线改掉——而这个名字在源码里既不是属性赋值也不是字典键,
 # 按语法位置筛查看不见它(第 5 轮外部复核实测:静态层与运行时层全绿,底线从 300 被改成 1e12)。
 # 所以这一类入口**整体禁用**:不是逐个补 API,而是不给"按名改写"留任何入口。
+#
+# 但要说清楚:静态层封的是**已知写法**,不是能力本身——同一条后果还能从别的路径拿到
+# (第 7 轮实测:经异常回溯拿到 frame.f_builtins 里的 setattr;以及 unittest.mock.patch.object)。
+# 真正把能力收走的是**执行时不给这些内建**(scripts/research_sandbox.py::safe_builtins):
+# 候选的内建字典里没有 setattr,那些路径就都不成立。
 BUILTIN_FORBIDDEN_BY_NAME_SETTERS = ("update_setting",)
 
 # 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。

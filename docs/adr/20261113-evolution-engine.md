@@ -222,6 +222,34 @@ __builtins__['setattr'](self, 'risk_budget', 1e12)     # 底线 300 → 1e12,wit
 **为什么不把 `open`/`type` 也按字符串拒**:交易数据里 `"status": "open"` 这种字段值很常见,
 按字符串一律拒会把正常候选整片拒掉——误报面远大于收益。真正危险的是"按名字改写/反射"这一类。
 
+### 执行时的能力隔离:不给,而不是再禁一批名字
+
+第 7 轮复核(`gpt-5.6-sol`)指出:前面这些**静态**规则封住的是**已知写法**,不是能力本身。
+实测两条等价后果的路径,静态层与沙盒层都返回空列表:
+
+```python
+e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)   # 经异常回溯拿到内建字典
+from unittest import mock; mock.patch.object(self, 'risk_budget', 1e12)  # 能改写任意对象属性的模块
+```
+
+继续枚举反射路径是枚举不完的(每加一批名字都要配测试,而且总有下一个)。所以改成**把能力收走**:
+候选执行时(`exec(code, module.__dict__)`)显式给一份**最小内建集合**
+(`scripts/research_sandbox.py::safe_builtins`):
+
+- `setattr`/`delattr`/`getattr`/`eval`/`exec`/`compile`/`open`/`globals`/`locals`/`vars`/`type`/`object` 等一律**不给**;
+- `__import__` 换成**受限导入器**:只放行不在禁用名单里的模块(`builtins`、`unittest.mock` 等已加进名单);
+- 其余内建(`len`/`range`/`min`/`max`/`sum`/`sorted`/`isinstance`/`hasattr`/`Exception` 等)照常给。
+
+这样一来:无论候选怎么绕,**它能拿到的内建字典里就没有 `setattr`**——
+连 `frame.f_builtins` 也只会拿到这份受限字典(帧的 `f_builtins` 取自模块 globals 的 `__builtins__`)。
+`unittest.mock` 那条路则由受限导入器直接关上。
+
+代价:候选用到这些名字会得到 `NameError`/`AttributeError`(而不是静默放行),由人在批准前看出来;
+`type(...)` 这种常见写法也会失效。这是本项目一贯的 fail-closed 取舍。
+
+**这不是安全边界的终点**:容器隔离(`docker-compose.research.yml`:无网络、只读挂载、`cap_drop ALL`)
+与"运行前由人读过代码"仍然是真正的边界。能力隔离只是把"静态黑名单挡不住的那部分"又收了一层。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -244,7 +272,8 @@ __builtins__['setattr'](self, 'risk_budget', 1e12)     # 底线 300 → 1e12,wit
 
 **保留字清单(候选作者一侧要查的就是这份)**:清单的单一事实来源是代码里的常量,
 下面这份是从代码抄出来的快照;改动常量时要同步改这里,并跑
-`tests/test_research_sandbox.py` 里"清单与代码一致"的用例。
+`tests/test_research_sandbox.py::test_the_reserved_word_table_matches_the_code`
+(它逐个核对本表里的名字与代码常量是否一致)。
 
 | 类别 | 名字 | 出处 |
 |---|---|---|
@@ -255,6 +284,9 @@ __builtins__['setattr'](self, 'risk_budget', 1e12)     # 底线 300 → 1e12,wit
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
 | 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
+| 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
+| 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |
 | 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator` | `research_sandbox.FORBIDDEN_MODULES` |
 
 ### 哈希、筛查、编译、执行必须是同一份字节
@@ -287,8 +319,10 @@ __builtins__['setattr'](self, 'risk_budget', 1e12)     # 底线 300 → 1e12,wit
 
 **已知残余风险**:
 1. 候选若在模块导入期用 `import` 副作用改写模板模块的成员,静态层未必拦得住。
-2. 第 5 轮实测的 `update_setting` 绕过、第 7 轮实测的 `__builtins__['setattr']` 绕过都已被静态层堵住(见上),
-   但它们暴露的是一类更一般的问题:**按名字改写实例属性的入口**。彻底解决要把风控底线移出候选实例属性、
+2. 第 5 轮实测的 `update_setting` 绕过、第 7 轮实测的 `__builtins__['setattr']` 绕过、第 7 轮实测的
+   `frame.f_builtins.setattr` 与 `unittest.mock.patch.object` 绕过,静态层已**拦截已知写法**,
+   执行时也**不再给候选改写属性的能力**(见"执行时的能力隔离")——但它们暴露的是一类更一般的问题:
+   **按名字改写实例属性的入口**。彻底解决要把风控底线移出候选实例属性、
    存到候选够不着的引擎侧对象里(模板的 `parameters` 列表里之所以有 `risk_budget`,就是因为底线现在是实例属性)。
    已登记为后续项,不在阶段 2 范围内。
 3. 静态层按名字拦,不做作用域解析,保留标识符误伤普通写法(见"保留标识符与误报")。这是有意的取舍。
