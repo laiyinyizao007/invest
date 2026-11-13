@@ -1060,3 +1060,20 @@ def test_a_missing_class_is_a_refusal_not_a_failure(tree, monkeypatch):
     with pytest.raises(api.JobError) as excinfo:
         api.import_candidate(path, "NoSuchClass", api.rs.file_sha256(path))
     assert excinfo.value.code == api.EXIT_REFUSED
+
+
+def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
+    """子入口查审批记录要按**传进来的那个哈希**查,不是按文件当前内容。
+
+    场景:文件被改过(内容 B),调用方把 B 的哈希传进来——哈希是自洽的,但 **B 从未被批准过**
+    (批准记录里是旧内容 A 的哈希)。子入口若按文件当前内容去查就等于"文件没变所以批准过",
+    恰恰把"人看过的是 A"这件事丢了。所以查的必须是传进来的哈希。"""
+    path = make_strategy(tree, "class S: pass\n")
+    approve(path)                                   # 批准的是内容 A
+    path.write_text("class S:\n    x = 1\n", encoding="utf-8")     # 现在文件是内容 B
+    new_sha = api.rs.file_sha256(path)              # B 的哈希(自洽,但没被批准过)
+
+    args = api.build_parser().parse_args(["_child", "--file", str(path), "--cls", "S", "--key", "CADJ",
+                                          "--segment", "train", "--params", "{}", "--sha256", new_sha])
+    assert api.run_child(args) == api.EXIT_REFUSED
+    assert "批准" in capsys.readouterr().err
