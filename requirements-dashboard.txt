@@ -1,0 +1,6 @@
+# 状态页(dashboard/)的依赖,与交易环境隔离:交易机的 venv 与交易镜像不装这些。
+# 开发/测试环境需要同时安装 requirements.txt 与本文件。
+# 许可证(2026-11-12 核对):fastapi MIT;uvicorn / starlette / httpx BSD-3-Clause;pydantic MIT。
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+httpx>=0.28,<1        # 仅测试用(starlette TestClient)
