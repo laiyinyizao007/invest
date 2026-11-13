@@ -143,6 +143,7 @@ class DayLogParser:
         self._lines = 0               # 非空行数
         self._records = 0             # 其中形如『时间 | 级别 | 来源 | 内容』的真实日志记录数
         self._first_record_day = ""   # 第一条记录的日期(应与文件名日期一致)
+        self._bad_encoding = False    # 出现过非法 UTF-8:日志不可信(曾用替换字符『修复』,坏字节落在关键字中间时严重事件会被藏起来)
 
     def feed(self, data: bytes) -> None:
         buf = self._pending + data
@@ -151,13 +152,24 @@ class DayLogParser:
             self._pending = buf
             return
         self._pending = buf[cut + 1:]
-        self._consume(buf[: cut + 1].decode("utf-8", errors="replace"))
+        self._consume(self._decode(buf[: cut + 1], tail=False))
 
     def finish(self) -> None:
         """文件到此为止:把没有换行结尾的最后一行也算进去(全量解析就是这个语义)。"""
         if self._pending:
-            text, self._pending = self._pending.decode("utf-8", errors="replace"), b""
+            text, self._pending = self._decode(self._pending, tail=True), b""
             self._consume(text)
+
+    def _decode(self, raw: bytes, *, tail: bool) -> str:
+        """严格解码。非法字节 → 标记不可信(仍用替换字符继续计数,供展示;可信度由 trusted() 否决)。
+        例外:没有换行的**最后一行**以『不完整的多字节字符』结尾——进程崩溃时写到一半,不是编码损坏。"""
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if tail and exc.reason == "unexpected end of data" and exc.end == len(raw):
+                return raw[: exc.start].decode("utf-8", errors="replace")
+            self._bad_encoding = True
+            return raw.decode("utf-8", errors="replace")
 
     def _consume(self, text: str) -> None:
         for line in text.splitlines():
@@ -190,6 +202,7 @@ class DayLogParser:
         c.first_ts, c.last_ts = self.first_ts, self.last_ts
         c._started_ok, c._start_attempts, c._pending = self._started_ok, self._start_attempts, self._pending
         c._lines, c._records, c._first_record_day = self._lines, self._records, self._first_record_day
+        c._bad_encoding = self._bad_encoding
         return c
 
     def trusted(self) -> bool:
@@ -198,9 +211,10 @@ class DayLogParser:
            (逻辑上被第 2 条隐含——没有记录时首条记录日期为空,必然不等于文件名日期。有意保留,把『必须有记录』这个意图写在代码里;
            变异检查去掉它不会让测试失败,原因就在这里。)
         2. 第一条记录的日期与文件名日期一致(被移植/重命名的日志不能当这一天的证据);
+        0. 没有出现过非法 UTF-8(codex 第 3 轮复核:坏字节落在『当日熔断』中间时,替换后关键字不匹配,日志却仍被判为干净)。
         3. 记录占非空行的比例不低于 20%(容忍 traceback 续行,挡住『一行合规 + 大量垃圾』)。
         不可信的日志不能被解读成『这一天无异常』(G8 复核:一行合规加任意垃圾曾被判为干净的一天)。"""
-        return (self._records >= 1 and self._first_record_day == self.day
+        return (not self._bad_encoding and self._records >= 1 and self._first_record_day == self.day
                 and self._records >= MIN_RECORD_RATIO * self._lines)
 
     def snapshot(self, log_path: str = "") -> DayStats:

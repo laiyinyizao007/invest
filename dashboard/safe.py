@@ -65,11 +65,18 @@ _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}")
 _CTP_ENV = re.compile(r"(?i)\bCTP_[A-Z0-9_]+\s*[=:]\s*\S+")
 
 _UNC = re.compile(r"\\\\[?.]?\\?[^\s\"'<>|*?]+")                                                    # \\server\share  \\?\C:\...  \\.\pipe\x
-_WIN_PATH = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s\"'<>|*?]*")            # 盘符前不能是字母数字,否则 https://x 里的 s:// 会被当成盘符
+# 盘符后接反斜杠,或接**单个**正斜杠:`https://x` 里的 `s:/` 后面还有一个 `/`,所以不会被当成盘符;而 `fooC:\Users` 这种紧贴字母的写法仍会命中
+_WIN_PATH = re.compile(r"[A-Za-z]:(?:\\|/(?!/))[^\s\"'<>|*?]*")
+# 引号包围的路径可以含空格(C:\Users\Alice Smith\...):整段替换,否则只遮住空格之前的部分
+_QUOTED_PATH = re.compile(r"(?P<q>[\"'])(?:[A-Za-z]:[\\/]|\\\\|/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library)/)[^\"'<>|*?\r\n]*(?P=q)")
+# 全角冒号/斜杠写成的盘符路径(C：＼Users＼x):只在确实含全角路径字符时才替换,半角版本由 _WIN_PATH 处理
+_FULLWIDTH_PATH = re.compile(r"[A-Za-zＡ-Ｚａ-ｚ][:：][\\/＼／][^\s\"'<>|*?]*|[A-Za-zＡ-Ｚａ-ｚ]：[\\/＼／][^\s\"'<>|*?]*")
+_FULLWIDTH_MARKS = "：＼／"
+_PCT_U = re.compile(r"(?i)%u([0-9a-f]{4})")                                                       # 非标准的 %uXXXX 写法,只用于检测副本
 _ENC_WIN_PATH = re.compile(r"(?i)\b[a-z]%3a(?:%5c|%2f)[^\s\"'<>]*")                                  # C%3A%5CUsers%5C...
 _ENC_POSIX_PATH = re.compile(r"(?i)(?<![\w.:/%-])%2f(?:home|users|root|var|opt|etc|tmp|mnt|srv|app|private|workspace|volumes)%2f[^\s\"'<>]*")
-_PCT_TOKEN = re.compile(r"[^\s\"'<>]*%[0-9A-Fa-f]{2}[^\s\"'<>]*")                                   # 含百分号编码的片段
-_DECODE_ROUNDS = 2                                                                                 # 单层与双层编码(%5C、%255C);更深的嵌套不在威胁模型内
+_PCT_TOKEN = re.compile(r"[^\s\"'<>]*%(?:[0-9A-Fa-f]{2}|[uU][0-9A-Fa-f]{4})[^\s\"'<>]*")                                   # 含百分号编码的片段
+_DECODE_ROUNDS = 4                                                                                 # 解码到稳定为止,最多 4 轮(%5C、%255C、%25255C…);再深的嵌套不在威胁模型内
 _POSIX_PATH = re.compile(r"(?<![\w.:/%-])/(?:home|Users|root|var|opt|etc|tmp|mnt|srv|app|usr|private|workspace|Volumes|Library|proc|media|snap)/[^\s\"'<>]*")
 
 
@@ -89,7 +96,7 @@ def clip(text: str, limit: int) -> str:
 
 def _decoded_has_path(token: str) -> bool:
     """对**检测副本**做有界的百分号解码,看解码后是否出现路径。替换作用于原文,所以没有路径的编码文本(%E4%B8%AD、%20)不受影响。"""
-    current = token
+    current = _PCT_U.sub(lambda m: chr(int(m.group(1), 16)), token)
     for _ in range(_DECODE_ROUNDS):
         decoded = unquote(current)
         if decoded == current:
@@ -97,7 +104,12 @@ def _decoded_has_path(token: str) -> bool:
         current = decoded
         if _UNC.search(current) or _WIN_PATH.search(current) or _POSIX_PATH.search(current):
             return True
-    return False
+    return _UNC.search(current) is not None or _WIN_PATH.search(current) is not None or _POSIX_PATH.search(current) is not None
+
+
+def _scrub_fullwidth(match: re.Match) -> str:
+    text = match.group(0)
+    return "<path>" if any(ch in text for ch in _FULLWIDTH_MARKS) or text[0] in "Ａ-Ｚａ-ｚ" else text
 
 
 def _scrub_encoded_token(match: re.Match) -> str:
@@ -112,6 +124,8 @@ def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) 
     out = _ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _BEARER.sub("Bearer ***", out)
     out = _CTP_ENV.sub("<env>", out)
+    out = _QUOTED_PATH.sub("<path>", out)
+    out = _FULLWIDTH_PATH.sub(_scrub_fullwidth, out)
     out = _UNC.sub("<path>", out)
     out = _WIN_PATH.sub("<path>", out)
     out = _ENC_WIN_PATH.sub("<path>", out)

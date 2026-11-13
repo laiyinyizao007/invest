@@ -126,3 +126,66 @@ def test_the_token_file_is_allowed_only_inside_the_dashboard_own_directory(tmp_p
 def test_a_token_file_in_a_subdirectory_of_the_dashboard_directory_is_fine(tmp_path):
     cfg = _write(tmp_path, {"token_file": "data/dashboard/sub/t.token"})
     assert c.load(path=cfg, root=tmp_path).paths["token_file"].name == "t.token"
+
+
+# ---- codex 第 3 轮复核 #6:白名单目录本身是 junction / 符号链接 ----
+def _make_dir_link(link, target):
+    """尽力创建目录链接(Windows junction 无需特权;POSIX 用符号链接)。创建不了就跳过。"""
+    import os
+    import subprocess
+    import sys
+    if sys.platform == "win32":
+        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if proc.returncode != 0:
+            pytest.skip("无法创建 junction")
+    else:
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("无法创建符号链接")
+
+
+def _remove_dir_link(link):
+    import os
+    try:
+        os.rmdir(link)                    # junction 用 rmdir 只删链接本身;符号链接用 unlink
+    except OSError:
+        os.unlink(link)
+
+
+def test_a_dashboard_directory_that_links_into_the_trading_state_dir_is_refused(tmp_path):
+    """data/dashboard 若是指向 data/state 的 junction,解析后白名单与令牌都落在 data/state——白名单校验反而通过,令牌被写进交易状态目录。"""
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.load(path=tmp_path / "none.json", root=tmp_path)
+    finally:
+        _remove_dir_link(link)
+
+
+def test_a_linked_subdirectory_under_the_dashboard_directory_is_refused_too(tmp_path):
+    (tmp_path / "data" / "dashboard").mkdir(parents=True)
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard" / "sub"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        cfg = _write(tmp_path, {"token_file": "data/dashboard/sub/t.token"})
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.load(path=cfg, root=tmp_path)
+    finally:
+        _remove_dir_link(link)
+
+
+def test_the_token_location_is_verified_again_right_before_the_token_is_created(tmp_path):
+    """配置加载与创建令牌之间目录可能被换成链接(TOCTOU 窗口):创建前必须再验一次。"""
+    s = c.load(path=tmp_path / "none.json", root=tmp_path)
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.verify_token_location(s)
+    finally:
+        _remove_dir_link(link)

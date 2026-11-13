@@ -60,8 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        config.verify_token_location(settings)           # 配置加载之后目录可能被换成链接:创建令牌前再验一次
         token, created = auth.load_or_create_token(settings.paths["token_file"])
-    except auth.TokenError as exc:
+    except (auth.TokenError, config.ConfigError) as exc:
         print(f"令牌错误: {exc}", file=sys.stderr)
         return 2
     rel = settings.paths["token_file"].relative_to(settings.root)

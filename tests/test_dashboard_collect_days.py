@@ -96,7 +96,7 @@ def test_binary_garbage_in_a_log_does_not_crash_or_leak(tmp_path):
     d.mkdir(parents=True)
     (d / "vt_20261111.log").write_bytes(b"\xff\xfe\x00garbage\n" + "2026-11-11 09:00:01.000 | INFO | r | 已启动\n".encode())
     r = col.collect_days(settings(tmp_path), NOW)
-    assert r.section["state"] in ("ok", "stale")
+    assert r.section["state"] != "ok" and r.level != "ok"      # 含非法字节的日志不可信:不能被『修复』成正常的一天
     json.dumps(r.section, allow_nan=False)
 
 

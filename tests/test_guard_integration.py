@@ -768,3 +768,28 @@ def test_account_events_for_other_accounts_do_not_count_as_a_sample(env):
     env.gw.on_account(AccountData(accountid="OTHER", balance=5.0, frozen=0.0, gateway_name="FAKE"))
     env.tick(seconds=61)
     assert _saved_sampled_at(env) == t0
+
+
+def test_another_accounts_events_never_refresh_the_displayed_accounts_sample_time(env):
+    """account_id 留空时规则取账户列表里第一个账户;别的账户的回报不能让它显得新鲜。"""
+    from vnpy.trader.object import AccountData
+    t0 = env.clock.dt
+    env.clock.dt = t0.replace(minute=45)
+    env.gw.on_account(AccountData(accountid="OTHER", balance=5.0, frozen=0.0, gateway_name="FAKE"))
+    env.tick(seconds=61)
+    assert _saved_sampled_at(env) == t0
+
+
+def test_cached_account_without_any_event_since_start_is_not_stamped_as_fresh(tmp_path):
+    """重启后没有收到任何账户回报,但 get_all_accounts 里已有缓存对象:采样时间不能是『现在』。"""
+    import json
+    e = Env(tmp_path)
+    try:
+        e.state_file.unlink(missing_ok=True)
+        e.rule._account_events.clear()
+        e.clock.dt = e.clock.dt.replace(minute=50)
+        e.tick(seconds=61)
+        saved = json.loads(e.state_file.read_text(encoding="utf-8")).get("sampled_at")
+        assert saved is None or datetime.fromisoformat(saved).replace(tzinfo=None) != e.clock.dt
+    finally:
+        e.main.close()

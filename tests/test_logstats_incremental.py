@@ -167,3 +167,45 @@ def test_a_severe_event_on_the_unterminated_last_line_is_reported(tmp_path):
     data = ("2026-11-12 09:00:01.000 | INFO | r | 已启动\n" * 3 + "2026-11-12 09:05:00.000 | ERROR | g | [FATAL] 紧急平仓: 触发").encode("utf-8")
     snap = incremental(tmp_path, data, [10, 77])
     assert ("严重", "触发紧急平仓") in dict(snap[3])
+
+
+# ---- codex 第 3 轮复核 #7:日志不能用替换字符『修复』非法字节 ----
+HARD_LOCK_LINE = "2026-11-12 10:00:00.000 | ERROR | g | [ERROR] 当日熔断: 权益下降 650"
+
+
+def _with_bad_byte_inside(line: str, word: str) -> bytes:
+    raw = line.encode("utf-8")
+    pos = raw.index(word.encode("utf-8"))
+    return raw[: pos + 3] + bytes([0xFF]) + raw[pos + 3:]               # 在『当日熔断』的 UTF-8 字节中间插入 0xFF
+
+
+def test_invalid_utf8_inside_a_severe_keyword_makes_the_log_untrusted_not_clean():
+    """替换成 U+FFFD 后『当日熔断』匹配失败,但时间戳格式仍对:曾被判为可信且干净,严重事件被隐藏。"""
+    data = (LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n"
+    parser = ls.DayLogParser("2026-11-12")
+    parser.feed(data)
+    snap = parser.snapshot("x")
+    assert snap.trusted is False
+
+
+def test_invalid_utf8_makes_the_log_untrusted_whatever_the_chunking():
+    data = (LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n"
+    for cut in range(len(data) + 1):
+        parser = ls.DayLogParser("2026-11-12")
+        parser.feed(data[:cut])
+        parser.feed(data[cut:])
+        assert parser.snapshot("x").trusted is False, cut
+
+
+def test_a_crash_that_cuts_the_last_line_in_the_middle_of_a_character_does_not_make_the_log_untrusted(tmp_path):
+    """进程崩溃时最后一行可能停在多字节字符中间:这是『写到一半』,不是『编码损坏』。"""
+    data = (LINES[0] + "\n").encode("utf-8") + "2026-11-12 10:00:00.000 | ERROR | g | [ERROR] 当日熔断".encode("utf-8")[:-2]
+    p = tmp_path / "vt_20261112.log"
+    p.write_bytes(data)
+    assert ls.parse_day_log(p).trusted is True
+
+
+def test_full_parse_of_a_file_with_invalid_utf8_is_untrusted(tmp_path):
+    p = tmp_path / "vt_20261112.log"
+    p.write_bytes((LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n")
+    assert ls.parse_day_log(p).trusted is False

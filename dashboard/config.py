@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -131,7 +132,7 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
     }
     if set(raw["docs"]) != set(raw["docs_titles"]):
         raise ConfigError("docs 与 docs_titles 的键必须一致")
-    _check_token_location(paths, root)
+    _check_token_location(paths, root, raw["token_file"])
     return Settings(raw=raw, root=root, paths=paths)
 
 
@@ -140,14 +141,42 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
 DASHBOARD_DIR = "data/dashboard"
 
 
-def _check_token_location(paths: dict, root: Path) -> None:
+def _is_link(path: Path) -> bool:
+    """符号链接或 Windows junction(reparse point)。不存在的路径不算链接。"""
+    try:
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        return True                           # 无法判断就按有风险处理(fail-closed)
+
+
+def _check_token_location(paths: dict, root: Path, rel: str | None = None) -> None:
     """令牌文件必须位于面板专属目录 data/dashboard/ 之下,其他位置一律拒绝。
 
     G8 第 2 轮审查(Critical):令牌曾默认写在 data/state/——交易系统的状态目录。创建文件会改变目录的 mtime、
     占用同一块磁盘空间,也可能触发交易侧对目录的扫描或备份,违反『面板绝不写入交易系统』。
+    G8 第 3 轮(High):白名单根目录自己被 resolve() 之后再比较,若 data/dashboard 是指向 data/state 的 junction,
+    白名单与令牌会一起落到 data/state,校验反而通过。现在:① 按**字面路径**比较(不跟随链接);
+    ② 从 data/ 往下到令牌所在目录的每一级都不得是符号链接/junction;③ 解析后的位置仍须在专属目录内。
     """
-    allowed = (root / DASHBOARD_DIR).resolve()
     token_dir = paths["token_file"].parent
-    if token_dir != allowed and allowed not in token_dir.parents:
-        raise ConfigError(f"令牌文件只能放在面板专属目录 {DASHBOARD_DIR}/ 之下(收到 {paths['token_file'].relative_to(root)});"
+    lexical = Path(os.path.abspath(root / rel)) if rel is not None else paths["token_file"]
+    lexical_allowed = Path(os.path.abspath(root / DASHBOARD_DIR))
+    lexical_dir = lexical.parent
+    if lexical_dir != lexical_allowed and lexical_allowed not in lexical_dir.parents:
+        raise ConfigError(f"令牌文件只能放在面板专属目录 {DASHBOARD_DIR}/ 之下(收到 {lexical.relative_to(root) if root in lexical.parents else lexical});"
                           "放在别处就是在写交易系统或其他进程的目录")
+    node = lexical_dir
+    while node != root and root in node.parents:               # 从令牌目录一路检查到项目根之下第一级
+        if _is_link(node):
+            raise ConfigError(f"令牌文件所在路径里有符号链接或 junction({node.relative_to(root)}):它可能把令牌写进交易侧目录;请改用真实目录")
+        node = node.parent
+    resolved_allowed = (root / DASHBOARD_DIR).resolve()
+    if token_dir != resolved_allowed and resolved_allowed not in token_dir.parents:
+        raise ConfigError(f"令牌文件解析后不在面板专属目录 {DASHBOARD_DIR}/ 之内")
+    if resolved_allowed != lexical_allowed:                    # 白名单根自己被重定向
+        raise ConfigError(f"面板专属目录 {DASHBOARD_DIR}/ 被链接到别处,令牌可能写进交易侧目录")
+
+
+def verify_token_location(settings: "Settings") -> None:
+    """创建令牌前再验一次:配置加载与实际创建之间,目录可能被换成链接。"""
+    _check_token_location(settings.paths, settings.root, settings.raw["token_file"])

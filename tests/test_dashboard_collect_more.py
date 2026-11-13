@@ -84,6 +84,9 @@ def res(tmp_path, runs=(), ledger=(), pending=None, approvals=None):
     base = tmp_path / "data" / "research"
     base.mkdir(parents=True, exist_ok=True)
     for rid, body in runs:
+        if isinstance(body, dict) and "run_id" not in body and not body.get("_no_run_id"):
+            body = {**body, "run_id": rid}                       # 真实产出里 save_result 一定写入 run_id
+        body = {k: v for k, v in body.items() if k != "_no_run_id"} if isinstance(body, dict) else body
         (base / f"{rid}.json").write_text(json.dumps(body), encoding="utf-8")
     if ledger:
         (base / "submissions.jsonl").write_text("\n".join(json.dumps(x) if isinstance(x, dict) else x for x in ledger) + "\n", encoding="utf-8")
@@ -98,7 +101,7 @@ def res(tmp_path, runs=(), ledger=(), pending=None, approvals=None):
         (ctl / "approvals.json").write_text(json.dumps(approvals), encoding="utf-8")
 
 
-RUN = {"kind": "evaluate", "status": "ok", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64,
+RUN = {"kind": "evaluate", "status": "ok", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64, "ran_at": "2026-11-12T21:00:00",
        "report": "候选评估\n结论: 未通过(3 项未过)\n样本外夏普 -1.84", "failures": ["f1", "f2"], "params": {"n": 72},
        "metrics": {"oos_sharpe": -1.84}, "diagnosis": {"weakest": "drawdown"}, "selection": None, "windows": None}
 RID = "20261112-210000-000000"
@@ -426,13 +429,38 @@ def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_
 
 
 def test_valid_runs_of_each_kind_are_accepted(tmp_path):
-    ok = [("20261112-210000-000001", {"kind": "backtest", "strategy_file": "d.py", "stats": {"sharpe": 1.0}}),
-          ("20261112-210000-000002", {"kind": "backtest", "status": "strategy_error", "strategy_file": "d.py", "error": {"type": "X"}}),
-          ("20261112-210000-000003", {"kind": "gate", "passed": False, "strategy_file": "d.py"}),
+    base = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00", "report": "结论: x"}
+    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": {"sharpe": 1.0}}),
+          ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X"}}),
+          ("20261112-210000-000003", {**base, "kind": "gate", "passed": False, "failures": ["f"]}),
+          ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X"}}),
           ("20261112-210000-000004", RUN)]
     res(tmp_path, runs=ok)
     r, runs = _runs_of(tmp_path)
-    assert len(runs) == 4 and r.level == "ok"
+    assert len(runs) == 5 and r.level == "ok"
+
+
+@pytest.mark.parametrize("patch", [
+    {"_no_run_id": True}, {"run_id": "20200101-000000-000000"}, {"strategy_file": ""}, {"strategy_file": "a/b.py"}, {"strategy_file": "x.txt"},
+    {"strategy_sha256": "xyz"}, {"strategy_sha256": None}, {"report": None}, {"report": ""}, {"failures": None}, {"failures": "f"},
+])
+def test_a_minimal_gate_result_missing_required_fields_is_not_accepted_as_a_pass(tmp_path, patch):
+    """codex 第 3 轮复核 #8:只有 kind/strategy_file/passed 的残缺文件曾显示成『通过』。"""
+    body = {"kind": "gate", "passed": True, "strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r", "failures": [], "ran_at": "x"}
+    body.update(patch)
+    res(tmp_path, runs=[(RID, body)])
+    r, runs = _runs_of(tmp_path)
+    assert runs == [] and r.level == "warn"
+
+
+@pytest.mark.parametrize("body", [
+    {"kind": "backtest", "stats": {}}, {"kind": "backtest", "stats": []}, {"kind": "backtest", "status": "strategy_error"},
+    {"kind": "evaluate", "status": "strategy_error", "passed": False},
+])
+def test_empty_stats_or_a_strategy_error_without_error_detail_is_not_accepted(tmp_path, body):
+    full = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r", "ran_at": "x", **body}
+    res(tmp_path, runs=[(RID, full)])
+    assert _runs_of(tmp_path)[1] == []
 
 
 def test_invalid_runs_older_than_the_displayed_window_are_still_counted(tmp_path):

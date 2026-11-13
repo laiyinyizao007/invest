@@ -306,3 +306,17 @@ def test_a_sample_time_in_the_future_is_not_fresh(tmp_path):
     put(tmp_path, "heartbeat", str(NOW - 2))
     put(tmp_path, "account_guard.json", guard(sampled_at=sampled(-9999)))
     assert run(tmp_path).section["state"] == "stale"
+
+
+# ---- codex 第 3 轮复核 #7:JSON 浮点溢出与深层嵌套 ----
+def test_json_numbers_that_overflow_to_infinity_are_corrupt(tmp_path):
+    healthy(tmp_path)
+    put(tmp_path, "account_guard.json", json.dumps(guard(extra="@@")).replace('"@@"', "1e999"))
+    assert run(tmp_path).section["state"] == "corrupt"
+
+
+def test_deeply_nested_json_is_corrupt_not_a_500(tmp_path):
+    from dashboard import models
+    p = tmp_path / "deep.json"
+    p.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    assert models.read_json(p, retries=0) == (None, "corrupt")

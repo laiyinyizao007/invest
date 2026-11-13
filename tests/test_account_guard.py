@@ -439,11 +439,12 @@ def test_state_file_records_when_the_equity_was_sampled_with_a_timezone(tmp_path
     assert parsed.replace(tzinfo=None) == sampled.astimezone().replace(tzinfo=None)
 
 
-def test_sampled_at_defaults_to_now_when_the_caller_gives_none(tmp_path):
+def test_sampled_at_is_none_when_the_caller_never_supplies_one(tmp_path):
+    """调用方没有采样时间就不记录——绝不用 now 顶替(见重启场景的测试)。需要『现在』的调用方自己传 now。"""
     path = tmp_path / "guard.json"
     g = AccountGuard(AccountLimits(600, 2000), path)
     g.update(10_000, MON_10AM)
-    assert datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sampled_at"]).replace(tzinfo=None) == MON_10AM
+    assert json.loads(path.read_text(encoding="utf-8"))["sampled_at"] is None
 
 
 def test_an_invalid_sample_does_not_advance_sampled_at(tmp_path):
@@ -464,3 +465,29 @@ def test_old_state_file_without_sampled_at_still_loads_and_saves_without_inventi
     g = AccountGuard(AccountLimits(), path)
     g._save()
     assert json.loads(path.read_text(encoding="utf-8"))["sampled_at"] is None       # 没有采样就不编造
+
+
+# ---- codex 第 3 轮复核 #4:重启与缓存账户不能被写成『刚采样』 ----
+def test_sampled_at_is_restored_on_load_and_not_replaced_by_now_when_the_caller_has_no_sample_time(tmp_path):
+    """重启后 vn.py 若仍能给出缓存的旧账户对象,定时器会调用 update(..., sampled_at=None)。
+    此时绝不能把 now 当成采样时间——那会把旧权益写成刚采样。"""
+    path = tmp_path / "guard.json"
+    old = datetime(2026, 11, 8, 15, 0)
+    first = AccountGuard(AccountLimits(600, 2000), path)
+    first.update(10_000, old, sampled_at=old)
+    restarted = AccountGuard(AccountLimits(600, 2000), path)
+    assert restarted.last_sampled_at is not None and restarted.last_sampled_at.replace(tzinfo=None) == old
+    restarted.update(10_000, MON_10AM, sampled_at=None)
+    restarted._save()
+    saved = datetime.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["sampled_at"])
+    assert saved.replace(tzinfo=None) == old
+
+
+def test_a_corrupt_sampled_at_in_the_state_file_is_dropped_not_invented(tmp_path):
+    path = tmp_path / "guard.json"
+    AccountGuard(AccountLimits(600, 2000), path).update(10_000, MON_10AM, sampled_at=MON_10AM)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["sampled_at"] = "not-a-time"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at is None and g.peak_equity == 10_000          # 其余状态照常加载

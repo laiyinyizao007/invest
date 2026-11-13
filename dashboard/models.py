@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -91,8 +92,8 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
             last_error = "corrupt"
         else:
             try:
-                return json.loads(text, parse_constant=_reject_constant), None
-            except ValueError:
+                return loads(text), None
+            except (ValueError, RecursionError):                 # 深层嵌套会触发 RecursionError(不是 ValueError)
                 last_error = "corrupt"
         if attempt < retries:
             time.sleep(pause)
@@ -109,6 +110,19 @@ class TooLarge(Untrusted):
 
 class BadEncoding(Untrusted):
     """不是合法 UTF-8。曾用 errors='replace' 把非法字节换成 U+FFFD 继续解析,文件被『修复』后可能仍然合法并被判正常。"""
+
+
+def loads(text: str) -> Any:
+    """面板里所有 JSON 解析的唯一入口:拒绝 NaN/Infinity 常量与溢出为 inf 的数字。深层嵌套抛 RecursionError,由调用方按损坏处理。"""
+    return json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float)
+
+
+def _finite_float(text: str) -> float:
+    """`1e999` 是合法数字语法,Python 把它解析成 inf,不经过 parse_constant。"""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"数值溢出: {text[:20]}")
+    return value
 
 
 def _reject_constant(name: str):

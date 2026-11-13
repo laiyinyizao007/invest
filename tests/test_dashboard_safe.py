@@ -205,3 +205,26 @@ def test_urls_are_not_mistaken_for_drive_letter_paths():
     """曾经 `s://` 被当成盘符 `s:/`,https://example.com 会变成 http<path>。"""
     assert safe.scrub_text("见 https://example.com/docs 与 ftp://host/x") == "见 https://example.com/docs 与 ftp://host/x"
     assert "Users" not in safe.scrub_text("file:///C:/Users/me/.env")
+
+
+# ---- codex 第 3 轮复核 #9:带空格的引号路径、紧贴字母的盘符、%u、三层编码、全角字符 ----
+@pytest.mark.parametrize("text,leak", [
+    (r'"C:\Users\Alice Smith\secret.txt"', "Smith"),
+    (r"'C:\Program Files\Vendor Tool\x.ini'", "Vendor"),
+    ('打开 "/home/alice smith/invest/.env" 失败', "smith"),
+    (r"fooC:\Users\alice\x", "alice"),
+    ("C:%u005cUsers%u005calice%u005cx", "alice"),
+    ("C%25253A%25255CUsers%25255Calice", "alice"),
+    ("C：＼Users＼alice＼x", "alice"),
+    ("路径 Ｃ：／Users／alice", "alice"),
+])
+def test_remaining_path_forms_found_by_the_second_review_are_scrubbed(text, leak):
+    out = safe.scrub_text(text)
+    assert leak not in out, out
+
+
+@pytest.mark.parametrize("text", [
+    "见 https://example.com/docs 与 ftp://host/x", "时间：10:30，价格：2400", "比例：3：4（全角标点保持原样）", "http://127.0.0.1:8770/api/meta", "ratio a:b",
+])
+def test_the_wider_path_rules_do_not_damage_ordinary_text(text):
+    assert safe.scrub_text(text) == text

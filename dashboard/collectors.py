@@ -463,8 +463,8 @@ def _outbox(settings: Settings, now: float) -> tuple[int, float | None, str]:
             continue
         pending += 1
         try:
-            row = json.loads(line)
-        except ValueError:
+            row = m.loads(line)
+        except (ValueError, RecursionError):
             continue
         if isinstance(row, dict) and isinstance(row.get("time"), str):
             try:
@@ -675,22 +675,37 @@ RUN_KINDS = ("backtest", "gate", "evaluate")
 MAX_RUNS_SCANNED = 200               # 最多校验多少个运行结果文件(防止结果目录无限增长拖慢请求);超出的在提示里说明
 
 
-def _valid_run(run_id: str, body: Any) -> bool:
-    """运行结果的最小结构(按 scripts/research_api.py 的真实产出定):不符合就当作无法读取,而不是『尽量显示』。
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
-    G8 第 3 轮 #8:曾经 `{}` 被显示成正常的 backtest,未知 kind 被静默改成 backtest。
+
+def _valid_run(run_id: str, body: Any) -> bool:
+    """运行结果的结构(按 scripts/research_api.py 的真实产出定):不符合就当作无法读取,而不是『尽量显示』。
+
+    G8 第 3 轮 #8:曾经 `{}` 被显示成正常的 backtest;第二次复核时只有 kind/strategy_file/passed 的残缺文件仍能显示成『通过』。
+    网关保存结果时一定写入 run_id、strategy_sha256、report、ran_at;策略报错时写 error,否则 gate/evaluate 写 failures、backtest 写 stats。
     """
     if not isinstance(body, dict) or body.get("kind") not in RUN_KINDS:
         return False
-    if not isinstance(body.get("strategy_file"), str):
+    if body.get("run_id") != run_id:                                     # 必须存在且等于文件名(文件被改名、复制或手写都会不符)
         return False
-    if "run_id" in body and body["run_id"] != run_id:                   # 文件被改名或复制
+    name = body.get("strategy_file")
+    if not isinstance(name, str) or not name.endswith(".py") or "/" in name or "\\" in name or name in (".py", "..py"):
+        return False
+    sha = body.get("strategy_sha256")
+    if not isinstance(sha, str) or not _SHA256.fullmatch(sha):
+        return False
+    if not isinstance(body.get("report"), str) or not body["report"].strip() or not isinstance(body.get("ran_at"), str):
         return False
     if body.get("status") is not None and not isinstance(body["status"], str):
         return False
+    errored = body.get("status") == "strategy_error"
+    if errored and not isinstance(body.get("error"), dict):
+        return False
     if body["kind"] in ("gate", "evaluate"):
-        return isinstance(body.get("passed"), bool)
-    return body.get("status") == "strategy_error" or isinstance(body.get("stats"), dict)
+        if not isinstance(body.get("passed"), bool):
+            return False
+        return errored or (isinstance(body.get("failures"), list) and all(isinstance(x, str) for x in body["failures"]))
+    return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
 
 
 def _brief_run(run_id: str, result: dict) -> dict:
@@ -746,14 +761,14 @@ def collect_research(settings: Settings, now: float) -> Result:
         for line in text.splitlines():
             if not line.strip():
                 continue
-            row = json.loads(line)
+            row = m.loads(line)
             at = row["at"] if isinstance(row, dict) else None
             if not _num(at):
                 raise ValueError("记录缺少时间戳")
             if now - at < window:
                 used += 1
                 oldest_in_window = at if oldest_in_window is None else min(oldest_in_window, at)
-    except (ValueError, KeyError, OSError, m.Untrusted):
+    except (ValueError, KeyError, OSError, RecursionError, m.Untrusted):
         sec = m.section("corrupt", None, as_of=m.mtime(ledger_path), now=now, message="提交账本损坏或异常增长:网关会拒绝所有新提交(fail-closed)")
         return Result(sec, "unknown", "提交账本损坏", [_reason("research", "unknown", "提交账本损坏:研究网关将拒绝新提交,需要人工修复")])
 
