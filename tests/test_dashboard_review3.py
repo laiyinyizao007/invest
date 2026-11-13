@@ -72,7 +72,7 @@ def test_contradictory_or_unknown_result_shapes_are_rejected(body):
     {"kind": "evaluate", "passed": False, "failures": ["无法选参: x"], "kind_detail": "selection-only", "params": None},
     {"kind": "gate", "status": "strategy_error", "passed": False, "error": {"type": "ValueError", "message": "m"}},
     {"kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}},
-    {"kind": "backtest", "stats": {"sharpe_ratio": 1.2}},
+    {"kind": "backtest", "stats": {"total_trade_count": 156, "end_balance": 20000.0}},
 ])
 def test_every_real_result_shape_is_still_accepted(body):
     assert _ok(body)

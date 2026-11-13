@@ -760,7 +760,25 @@ def _valid_run(run_id: str, body: Any) -> bool:
         return (not failures) if passed else bool(failures)             # 通过 ⇔ 没有失败项(risk/candidate_eval.py:passed = not failures)
     if "passed" in body:
         return False                        # backtest 没有『通过』这个概念,带了就矛盾
-    return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
+    if errored:
+        return True                         # 策略报错没有统计数字
+    stats = body.get("stats")
+    if not isinstance(stats, dict):
+        return False
+    return _stats_look_like_backtest(stats)
+
+
+# 真实回测统计里一定有这几个字段(vnpy 的 calculate_statistics 产出;研究代码也正是读它们)
+_BACKTEST_STATS_KEYS = ("total_trade_count", "end_balance")
+
+
+def _stats_look_like_backtest(stats: dict) -> bool:
+    """回测统计是不是像真的:至少含那几个核心字段,且是有限数。"""
+    for key in _BACKTEST_STATS_KEYS:
+        value = stats.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+            return False
+    return True
 
 
 def _brief_run(run_id: str, result: dict) -> dict:
