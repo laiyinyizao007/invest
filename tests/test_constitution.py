@@ -492,24 +492,37 @@ def test_constitution_history_is_append_only():
     """清单的历史追加项不得被删除:load() 只与代码里的内置集合合并,察觉不到文件里的删除。
 
     "只能追加"必须靠版本控制来保证——每次提交后的清单,相对上一次提交只能增不能减。
-    这个检查在 CI 里跑,防止有人改配置时顺手删掉一条保护。"""
+    这个检查在 CI 里跑,防止有人改配置时顺手删掉一条保护。
+
+    浅克隆(git clone --depth=1 / actions/checkout 的 fetch-depth: 1)下 `git log` 只能看到
+    一个提交,检查会"看起来通过"实则根本没比对——那种情况必须报错而不是跳过:
+    查不了等于没查,不能让它冒充通过。CI 需要完整历史(fetch-depth: 0)。"""
     import json
     import subprocess
 
-    def committed(path):
-        out = subprocess.run(["git", "log", "--format=%H", "--", path],
-                             capture_output=True, text=True, cwd=str(const.CONSTITUTION_FILE.parent.parent))
-        if out.returncode != 0:
-            pytest.skip("git 不可用,跳过清单历史检查")
-        return [h.strip() for h in out.stdout.split() if h.strip()]
+    root = str(const.CONSTITUTION_FILE.parent.parent)
 
-    commits = committed("config/immutable_constitution.json")
+    def git(*args):
+        return subprocess.run(["git", *args], capture_output=True, text=True, cwd=root)
+
+    shallow = git("rev-parse", "--is-shallow-repository")
+    if shallow.returncode == 0 and shallow.stdout.strip() == "true":
+        pytest.fail("仓库是浅克隆,无法比对清单历史(清单只能追加的检查需要完整历史;"
+                    "CI 请用 fetch-depth: 0)")
+
+    out = git("log", "--format=%H", "--", "config/immutable_constitution.json")
+    if out.returncode != 0:
+        pytest.fail(f"git 不可用,无法检查清单历史(fail-closed): {out.stderr.strip()}")
+    commits = [h.strip() for h in out.stdout.split() if h.strip()]
     if len(commits) < 2:
-        pytest.skip("清单文件只有一个版本,无需检查历史")
+        # 仓库历史是完整的(上面已排除浅克隆),清单确实只有一个版本:还没有"上一次"可比,
+        # 不存在被删的可能,这不是检查没生效。
+        pytest.skip("清单文件自建立起只提交过一次,暂无可比对的历史版本")
 
     def read(rev):
-        raw = subprocess.run(["git", "show", f"{rev}:config/immutable_constitution.json"],
-                             capture_output=True, text=True, cwd=str(const.CONSTITUTION_FILE.parent.parent))
+        raw = git("show", f"{rev}:config/immutable_constitution.json")
+        if raw.returncode != 0:
+            pytest.fail(f"无法读取历史版本 {rev}: {raw.stderr.strip()}")
         return json.loads(raw.stdout)
 
     current = read(commits[0])

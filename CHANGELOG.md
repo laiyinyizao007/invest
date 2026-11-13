@@ -32,7 +32,13 @@
 阶段 2 的运行时校验对真实代码从未生效过,现改为按"应用层基类"判定家族根并忽略元类自动生成的成员;
 受保护参数改为大小写不敏感比对(`Risk_Budget` 与 `risk_budget` 是两个属性,精确匹配会让自定义 `__setattr__` 重定向完全绕过参数校验);
 清单的 `template` 改为只能取内置白名单内的类;白名单与受保护清单的冲突改为在合并后的集合上校验(此前 allow 静默胜出,新增的保护形同虚设);
+**第 3 轮自查发现的绕过**(codex 连续两轮未报出,系复现绕过代码时自行发现):静态层此前只拦受禁 dunder 的**调用**、不拦**引用**,
+于是 `f = object.__setattr__` 之后 `f(self, "risk_budget", 10**12)` 的调用点是裸名字、AST 看不见被调的是谁——实测该写法**真的能击穿风控底线**
+(`within_budget(100.0, 10.0, inst.risk_budget)` 在改写后返回 True),现改为受禁 dunder 的任何引用一律拦下;
+`operator.attrgetter('__dict__')(self)` 把属性名当字符串用,绕开了"禁止访问 `__dict__`"的属性写法检查,现把受禁属性名作为字符串常量出现时也拦下;
+`screen_source` 遇到语法错误时返回空列表(fail-**open**:解析不过就等于没筛查,而空列表看起来跟"查过没问题"一模一样),现改为返回"语法错误"结论(fail-closed);
 "只能追加"靠版本控制保证——`load()` 只与代码内置集合合并、察觉不到文件里的删除,现由 CI 检查逐个历史版本比对。
+**该检查此前在 CI 里形同虚设**:CI 用 `actions/checkout@v4` + `fetch-depth: 1`(浅克隆)时 `git log` 只看得到一个提交,检查会**静默跳过**、看起来是绿的;现改为对浅克隆 fail-closed(直接失败而不是跳过),并新增 `.github/workflows/constitution-guard.yml`(`fetch-depth: 0`)专门跑这个检查——否则"只能追加"只是一句没人执行的承诺。
 - **进化引擎阶段 1:试验账本 + DSR 门槛**(Issue [#15](https://github.com/laiyinyizao007/invest/issues/15),ADR `20261113-evolution-engine`):`risk/trial_ledger.py`(只增不减、损坏 fail-closed,每个 param_grid 格子与每次成功提交各计 1 次试验,失败的评估同样消耗试验)、`risk/dsr.py`(Bailey & López de Prado 2014,日收益口径,试验间方差取 1/(T-1))、晋级门槛第 9 条 **DSR ≥ 0.95**(阈值已锁定)。`CandidateMetrics` 新增 `dsr`/`n_trials`:缺失即视为未通过(fail-closed),**旧格式的指标 JSON 不再能过 `record_promotion.py`**。账本由可信的父进程读写(先记账再跑,失败不退:evaluate 预扣最小网格 27 并补差额,gate 记 1 次 `gate_run`)、网关 `_candidates` 记提交试验;子进程只拿到 `--prior-trials` 一个数字。NaN/inf 日收益与非法 `dsr`/`n_trials` 一律 fail-closed(G8 复核发现 NaN 会让 `dsr < 0.95` 恒为 False 而放过候选)。PBO 延后。
 - `tools/build_static_manifest.py`:生成 / 校验前端构建产物清单 `manifest.json`(`{"files": {相对路径: sha256}}`)——**前后端的硬约定**。后端只服务清单内、哈希匹配的文件,每次请求重新校验;改了产物就必须重新生成。拒绝符号链接、空目录、没有 `index.html` 的目录;`--check` 可放进前端 CI;测试断言后端接受本工具写出的一切。
 - 契约:`Guard` 新增 `as_of` / `age_seconds`(风控状态文件自己的年龄);新增示例 `trading-guard-stale`(进程在跑但风控状态陈旧——前端最容易做错的状态);契约文档新增 §10.1 `corrupt` 的完整含义与读取上限、§10.2 `stopped` 录制、`HEAD` 语义。示例共 40 个。
