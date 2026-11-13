@@ -434,3 +434,26 @@ def test_a_dotenv_that_did_not_exist_before_the_run_is_removed_afterwards(monkey
     assert not target.exists()
     assert g.main(["--yes"]) == g.EXIT_OK
     assert not target.exists()
+
+
+def test_a_failed_profile_copy_restores_the_original_dotenv(monkeypatch, tmp_path, capsys):
+    """复制档案到 .env 中途失败(杀软占用/磁盘满):必须还原原来的 .env,并以配置错退出。"""
+    _install_flow(monkeypatch, tmp_path)
+    target = tmp_path / ".env"
+    target.write_text("CTP_ENVIRONMENT=实盘\n", encoding="utf-8")
+
+    def broken_copy(src, dst, *a, **k):
+        if str(dst).endswith(".env") and not str(dst).endswith(".env.prev"):
+            Path(dst).write_text("半截", encoding="utf-8")
+            raise OSError("占用")
+
+    monkeypatch.setattr(g.shutil, "copy2", broken_copy)
+    assert g.main(["--yes"]) == g.EXIT_CONFIG
+    assert target.read_text(encoding="utf-8") == "CTP_ENVIRONMENT=实盘\n"
+
+
+def test_an_equivalent_whitelist_in_the_process_environment_is_not_a_conflict(monkeypatch):
+    """一键流程与 load_profile 同一语义:白名单按集合比,顺序/tcp:// 不同不算冲突。"""
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "tcp://120.86.114.57:41285,121.13.218.19:41285")
+    _eff, conflicts = g.effective_env({"BROKER_TEST_ALLOWED_TD": "121.13.218.19:41285,120.86.114.57:41285"})
+    assert not any("BROKER_TEST_ALLOWED_TD" in c for c in conflicts)

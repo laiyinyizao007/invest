@@ -55,7 +55,7 @@ from ctp_tools.broker_targets import (  # noqa: E402
     SIMNOW_TD,
 )
 from ctp_tools.collector import in_trading_session  # noqa: E402
-from ctp_tools.profile import describe_env_value  # noqa: E402  (打印配置值的唯一脱敏出处)
+from ctp_tools.profile import _same_value, describe_env_value  # noqa: E402  (打印配置值的唯一脱敏出处)
 from ctp_tools.simnow import normalize_address  # noqa: E402
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -104,7 +104,7 @@ def effective_env(file_env: dict[str, str]) -> tuple[dict[str, str], list[str]]:
         if key not in file_env:
             conflicts.append(f"{key} 只在进程环境里(={describe_env_value(key, value)}),"
                              "档案里没有——运行时它会盖住档案")
-        elif file_env[key] != value:
+        elif not _same_value(key, file_env[key], value):
             conflicts.append(f"{key} 进程环境变量(={describe_env_value(key, value)})与档案"
                              f"(={describe_env_value(key, file_env[key])})不一致,运行时用进程里的")
         eff[key] = value
@@ -437,8 +437,15 @@ def main(argv: list[str] | None = None) -> int:
         backup = ROOT / f".env.prev.{now.strftime('%Y%m%d-%H%M%S')}"
         shutil.copy2(target, backup)
         print(f"当前 .env 与{label}不同,已另存为 {backup.name}")
-    shutil.copy2(source, target)
-    wrote_env["done"] = True
+    wrote_env["done"] = True          # 先置位:复制到一半失败,也要把半截文件清理/还原掉
+    if original_env is None:
+        print("提示:本次运行前没有 .env;若进程被强杀,请手工删除项目根目录的 .env(它是国信档案的副本)。")
+    try:
+        shutil.copy2(source, target)
+    except OSError as exc:
+        print(f"写入 {target} 失败({exc!r}),已退出(没有连接任何环境)。", file=sys.stderr)
+        restore_env()
+        return EXIT_CONFIG
     print(f"已写入 {target}(.env 被 gitignore,不会提交)")
 
     try:

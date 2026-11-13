@@ -108,6 +108,7 @@ class Ctx:
     flat_reason: str = ""                # 空仓闸门失败的具体原因(有持仓 / 连接断开)
     started_wall: datetime = field(default_factory=datetime.now)   # 本次运行开始时刻,日志归因用
     alerts: list[dict] = field(default_factory=list)
+    failed_steps: list[str] = field(default_factory=list)      # 抛了异常的步骤:证据不完整,main 据此返回崩溃码
     trades: list = field(default_factory=list)
     notifier: object | None = None
     state_dir: Path = BT_ROOT / "state"
@@ -826,8 +827,8 @@ def final_safety(ctx: Ctx) -> list[str]:
 
 
 def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
-    ctx.failed_steps = []
     """按序执行全部步骤。登录失败则后续依赖连接的步骤不再执行。返回是否登录成功。"""
+    ctx.failed_steps = []
     def want(*items: str) -> bool:
         return only is None or any(i in only for i in items)
 
@@ -1087,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
     print_summary(evidences)
     if not logged_in:
         return EXIT_LOGIN
-    if getattr(ctx, "failed_steps", None):
+    if ctx.failed_steps:
         # 有步骤抛了异常:证据不完整,不能当报告用 —— 与「跑完但有失败项(1)」分开
         print(f"⚠ 步骤抛出异常 {ctx.failed_steps},证据不完整。", file=sys.stderr)
         return EXIT_CRASH
@@ -1101,7 +1102,8 @@ if __name__ == "__main__":
     try:
         code = main()
     except SystemExit as exc:
-        code = exc.code if isinstance(exc.code, int) else 1
+        # sys.exit() / sys.exit("msg") 不能映成 1(=跑完有失败项,一键流程会拿半份证据出报告)
+        code = exc.code if isinstance(exc.code, int) else EXIT_CRASH
     except BaseException:      # noqa: BLE001  崩溃/被中断:必须与「有失败项(1)」区分,
         import traceback       # 一键流程只对 0/1 出报告,半份证据不能当报告用
         traceback.print_exc()

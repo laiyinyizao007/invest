@@ -80,7 +80,7 @@ def _is_gated(key: str) -> bool:
     return key in GATED_KEYS or key.startswith(GATED_PREFIXES)
 
 
-# 值是「地址集合」的键:顺序/空白/大小写不同不算冲突(一键流程会把排序后的全集
+# 值是「地址集合」的键:顺序/空白/tcp:// 前缀不同不算冲突(一键流程会把排序后的全集
 # 下推给子进程,而 .env 里是手写顺序 —— 按字符串比就会把它误判成硬冲突)。
 SET_KEYS = ("BROKER_TEST_ALLOWED_TD", "BROKER_TEST_ALLOWED_MD")
 

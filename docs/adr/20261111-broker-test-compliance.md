@@ -96,7 +96,7 @@
 `tests/test_broker_test.py`(取证步骤,假网关 + 同步事件引擎 + **真实**风控规则)与 `tests/test_broker_report.py`(填写器,现场构造同结构迷你模板):
 §5 的硬约束逐条有用例——`--only` 仍过空仓闸门(有持仓一笔不发)、撤单后跑重复报单不互相污染、演示委托价格唯一、暂停步骤中途抛异常仍清场、证据落盘即脱敏;报告侧覆盖选测 FAIL 不勾结论、证据图缺失显式报出、预勾选一律重置、国信填写区逐字节未改。
 
-全量 **1811 个用例通过 / 1 个跳过**,覆盖率 **86%**(门禁 ≥85%)。口径:`pytest tests -q --cov=risk --cov=strategies --cov=trading --cov=notify --cov=scripts --cov=ctp_tools`;本批改动的 `ctp_tools/` 也纳入统计(README 里的旧命令不含它,单算为 81%)。
+全量 **1813 个用例通过 / 1 个跳过**,覆盖率 **86%**(门禁 ≥85%)。口径:`pytest tests -q --cov=risk --cov=strategies --cov=trading --cov=notify --cov=scripts --cov=ctp_tools`;本批改动的 `ctp_tools/` 也纳入统计(README 里的旧命令不含它,单算为 81%)。
 
 ## 修订(2026-11-12,Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):适配 20260717 版模板
 客户经理重发资料后,新模板与本 ADR 依据的 20251203 版结构不同:

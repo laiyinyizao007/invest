@@ -309,19 +309,19 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
         elif positions or not connected:
             # 空仓闸门:与取证运行器/采集工具同一口径。账户上有持仓、或查不准时,
             # 一笔不发 —— 报单步骤在有持仓的账户上多一笔委托就多一分误伤的可能。
-            why = f"账户已有持仓 {positions}" if positions else "交易连接不在线,无法确认账户空仓"
+            why = f"账户已有持仓 {positions}" if positions else "交易连接不在线或柜台没有应答,无法确认账户空仓"
             run.add("报单/撤单", "FAIL", f"已中止:{why}(穿透演练的报单只在确认空仓后进行)")
             code = EXIT_STEP_FAILED
         else:
             code = do_order_cancel(run, main_engine, collector, contract, tick)
-            after, _ = check_positions(main_engine, wait=args.position_wait, early_exit=False,
-                             collector=collector)
-            ok = trade_connected(main_engine)
+            after, after_trusted = check_positions(main_engine, wait=args.position_wait, early_exit=False,
+                                                   collector=collector)
+            ok = after_trusted and trade_connected(main_engine)
             if after:
                 run.add("收尾持仓检查", "FAIL", f"发现持仓 {len(after)} 项,请立即人工核对并平仓")
                 code = EXIT_POSITION
             elif not ok:
-                run.add("收尾持仓检查", "WARN", "连接已断开,无法确认是否留下持仓,请人工核对")
+                run.add("收尾持仓检查", "WARN", "连接已断开或柜台没有应答,无法确认是否留下持仓,请人工核对")
     else:
         run.add("报单/撤单", "SKIP", "未加 --with-order")
     return run, code
