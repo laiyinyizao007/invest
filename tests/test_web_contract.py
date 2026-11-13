@@ -7,7 +7,9 @@ import re
 from pathlib import Path
 
 import pytest
-from jsonschema import Draft202012Validator
+
+pytest.importorskip("jsonschema", reason="契约测试需要 jsonschema(见 requirements.txt)")
+from jsonschema import Draft202012Validator  # noqa: E402
 
 WEB = Path(__file__).resolve().parents[1] / "docs" / "web"
 SPEC = json.loads((WEB / "status-api.openapi.json").read_text(encoding="utf-8"))

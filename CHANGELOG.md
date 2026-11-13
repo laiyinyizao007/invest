@@ -16,6 +16,7 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- 状态页完整 Web 规划(`docs/web/`,供前端同事接手):产品规格(页面、状态语义、无障碍)、API 通用约定、前端交接说明(硬性约束与验收清单)、五阶段规划;机器可读契约 `status-api.openapi.json`(OpenAPI 3.1,22 个接口、37 个模型,每个接口标注阶段与角色)与 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)。`tests/test_web_contract.py` 校验示例符合模型,并把边界写成断言:阶段①全部 GET、写操作恰好是暂停/解除、任何阶段都没有下单撤单连接改风控解锁批准类路径。新增测试依赖 `jsonschema`。仅文档与测试,无运行时代码。
 - 设计:只读状态页(Web 监控面板)的 ADR `docs/adr/20261112-status-dashboard.md`(待确认)与阶段①计划 `docs/plans/20261112-status-dashboard-plan.md`。结论:独立只读进程、只读文件、仅监听本机回环、前端零外链;**不使用 `vnpy_webtrader`**(核对 1.1.0 安装包:JWT 密钥写死为 `test`、带 `POST /order` 下单与撤单接口、需把 RPC 监听嵌进交易进程、前端仅 104 行 CDN 演示页、也没有我们的熔断/看门狗/录制/研究状态)。实时持仓资金与「暂停开仓」控制分别登记为阶段②③,不在本次范围。仅文档,无代码改动。
 - `tools/repro_logout_crash.py`:复现「重连后退出登出段错误(139)」的宿主机循环脚本——每轮在容器里跑 `drill.py disconnect|all --trace`,宿主机真实切断/恢复容器网络(恢复放在 finally),记录退出码与恢复后到退出的秒数,汇总写 `runtime/data/repro/summary.jsonl`。凭据只以 `-e KEY`(不带值)传入、运行时读 `.env.simnow.bak`,不改 `.env`;参数下限防止触发不了断线(切网 ≥130 秒)或被登录限流(轮间隔 ≥300 秒)。有 `--dry-run`。**尚未对真实 SimNow 运行**,待日盘。
 - 毕昇研究工作流收尾（不依赖 LLM 的部分；LLM 联调待模型有额度）：

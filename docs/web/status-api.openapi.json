@@ -1104,7 +1104,7 @@
         "schema": {
           "type": "string"
         },
-        "description": "阶段③写操作必带。值由 GET /api/meta 之外的专用握手下发(见契约文档 §写操作)。"
+        "description": "阶段③写操作必带。值由 GET /api/meta 的响应头 X-CSRF-Token 下发(仅写能力开启且请求带有效写令牌时存在),前端保存在内存中。见 02-api-contract.md 第 9 节。"
       }
     },
     "responses": {

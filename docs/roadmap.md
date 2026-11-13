@@ -256,7 +256,7 @@ flowchart TB
 | MetaRouter 状态路由 | `strategies/` 内新策略类(路由器本身就是一个 CtaTemplate 策略,不建 router/ 目录) | ≥2 个通过晋级门槛且风格相反的策略并存 | 要点梳理 §6.5 |
 | Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
 | 增量调度器 | DSH `@goodandready/dsh-cron` 短任务 `ensure`/`watchdog`，不写 Python 常驻调度器；生命周期边界见 `docs/adr/20261111-market-recording-and-dsh-orchestration.md` | 阶段一并行副线立即建设；先完成 dummy worker Windows 生命周期实测 | §4「缺自动化调度」/Issue #13 |
-| 只读状态页(Web 监控面板) | `dashboard/` 纯逻辑包 + `scripts/status_server.py` + 静态单页;只读文件、独立进程、仅监听 127.0.0.1;实时持仓/资金(阶段②)与「暂停开仓」(阶段③)另立 ADR | 阶段一并行副线;ADR 确认后开工,计划见 `docs/plans/20261112-status-dashboard-plan.md` | `docs/adr/20261112-status-dashboard.md` |
+| 只读状态页(Web 监控面板) | `dashboard/` 纯逻辑包 + `scripts/status_server.py` + 静态单页;只读文件、独立进程、仅监听 127.0.0.1;实时持仓/资金(阶段②)与「暂停开仓」(阶段③)另立 ADR | 阶段一并行副线;ADR 确认后开工,阶段①计划见 `docs/plans/20261112-status-dashboard-plan.md`;完整 Web 规划(五阶段、契约、前端交接)见 `docs/web/README.md` | `docs/adr/20261112-status-dashboard.md` |
 | 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
 | 主力换月自动化 | 扩展 `scripts/build_continuous.py` 的 rolls 派生逻辑(换月数据实际在这里生成,不在 `import_minute.py`)→ runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
 | CTP 行情自录 | 官方 `vnpy_datarecorder` 独立无头进程，数据写 `.vntrader_record/database.db`；由 wrapper + DSH 短任务 `ensure`/`watchdog` 管理，不挂交易 runtime | 阶段一并行副线；先完成生命周期实测，再做 SimNow/国信测试 profile 验收 | 要点梳理 §3.1 / Issue #13 |
