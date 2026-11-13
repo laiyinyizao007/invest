@@ -139,28 +139,16 @@ def test_the_cached_corrupt_message_stays_the_same_across_requests(tmp_path):
     assert "上限" in first or "损坏" in first
 
 
-def test_the_fixtures_and_the_seed_carry_the_same_values():
-    """种子是前端真正拿去用的 mock。改样例忘改种子,不会被任何测试发现——所以守住。"""
-    import json
-    import re
+def test_the_seed_files_are_byte_identical_to_what_the_generator_produces():
+    """种子是前端真正拿去用的 mock。**用生成器逐字节断言**:改样例忘改种子就会红,
+    而且不依赖任何解析方式(格式变了也不怕)。"""
+    import importlib.util
     from pathlib import Path
 
-    web = Path(__file__).resolve().parents[1] / "docs" / "web"
-    seeds = [(web / "lovable-seed" / "mock-data.phase1.ts").read_text(encoding="utf-8"),
-             (web / "lovable-seed" / "mock-data.later.ts").read_text(encoding="utf-8")]
-    drifted = []
-    for f in sorted((web / "fixtures").glob("*.json")):
-        if f.stem == "manifest":
-            continue
-        fixture = json.loads(f.read_text(encoding="utf-8"))
-        for src in seeds:
-            m = re.search(r'"' + re.escape(f.stem) + r'":\s*(\{.*?\}),\n', src, re.S)
-            if not m:
-                continue
-            try:
-                seeded = json.loads(m.group(1))
-            except ValueError:
-                continue
-            if seeded != fixture:
-                drifted.append(f.stem)
-    assert not drifted, drifted
+    repo = Path(__file__).resolve().parents[1]
+    web = repo / "docs" / "web"
+    spec = importlib.util.spec_from_file_location("gen_lovable_seed", repo / "tools" / "webgen" / "gen_lovable_seed.py")
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    for name, content in gen.mock_files().items():
+        assert (web / "lovable-seed" / name).read_text(encoding="utf-8") == content, name
