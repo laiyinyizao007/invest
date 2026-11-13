@@ -79,7 +79,7 @@ flowchart LR
 | GUI | `scripts/run_gui.py` | 完成(人工观察用,非无人值守) |
 | SG / DR | `scripts/simnow_guard.py`、`scripts/drill.py` | 代码完成,**演练从未实跑**(`docs/simnow-drills.md` 尚不存在,首次实跑时由脚本生成);阶段一,见 §2.4 |
 | UR | `scripts/unattended_report.py` | 完成(离线自检通过,真实 webhook 待配,probe 未通过;连续 5 天证据未攒齐);纯逻辑在 `evidence/logstats.py` |
-| 状态页 | `dashboard/`(含 `dashboard/evolution.py`)、`scripts/status_server.py`、`requirements-dashboard.txt`、`tools/build_static_manifest.py` | **后端阶段①已实现并有测试**(2026-11-12/13):只读、仅回环、令牌鉴权(令牌在专属目录 `data/dashboard/`,不在交易侧目录树)、全 GET/HEAD、缺失/过期/损坏永不显示为正常。**前端未构建**(占位页)。**G8 审查:两轮都已确认过线**——codex 那轮经十六轮复核到 **46.0/50**;Gemini 那轮 **45/50**(其发现的『提示语说详见服务端日志却没记日志』已修)。**复核过程中的关键教训**:校验规则必须与产出规则同源(曾因另写一份键集,导致所有真实回测被判成损坏);测试必须走到被守的那条分支(容差与缓存都可能让断言恒真);样例必须是『服务器真能产出的』,否则前端会照着学一条不存在的规则
+| 状态页 | `dashboard/`(含 `dashboard/evolution.py`)、`scripts/status_server.py`、`requirements-dashboard.txt`、`tools/build_static_manifest.py` | **后端阶段①已实现并有测试**(2026-11-12/13):只读、仅回环、令牌鉴权(令牌在专属目录 `data/dashboard/`,不在交易侧目录树)、全 GET/HEAD、缺失/过期/损坏永不显示为正常。**前端未构建**(占位页)。**G8 审查:两轮都已确认过线**——codex 那轮经十六轮复核到 **46.0/50**;Gemini 那轮 **45/50**(其发现的『提示语说详见服务端日志却没记日志』已修)。**连续段口径**(用户 2026-11-13 拍板):只有严重事件才打断,警告不打断但必须数出来(`streak_warning_count`);无法判断的日子与缺日志的工作日仍打断。**复核过程中的关键教训**:校验规则必须与产出规则同源(曾因另写一份键集,导致所有真实回测被判成损坏);测试必须走到被守的那条分支(容差与缓存都可能让断言恒真);样例必须是『服务器真能产出的』,否则前端会照着学一条不存在的规则
 
 
 ### 2.2 目标架构与演进路线(已迁出)
