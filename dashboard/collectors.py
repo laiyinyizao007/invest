@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -38,21 +39,29 @@ def _reason(section: str, level: str, text: str) -> dict:
 
 # ---------------------------------------------------------------- 交易与风控
 
-def _read_heartbeat(path: Path) -> float | None:
-    """心跳文件内容是 epoch 秒;内容不可解析时退回文件修改时间;文件不存在返回 None。"""
+HEARTBEAT_MAX_BYTES = 1024           # 心跳文件就是一个数字;更大的一定是异常
+CLOCK_SKEW_TOLERANCE = 60.0          # 允许文件时间戳比本机时钟超前这么多秒(两台机器/NTP 校时的正常误差)
+GUARD_STALE_AFTER = 180.0            # 风控状态运行时至少每 60 秒落盘一次(risk/account_guard.py),留 3 倍余量
+
+
+def _read_heartbeat(path: Path) -> tuple[float | None, str | None]:
+    """心跳文件内容是 epoch 秒。返回 (时间戳, 错误类别),错误类别:None / "missing" / "corrupt"。
+
+    内容不合法就是 corrupt,不退回文件 mtime(G8 第 2 轮审查:曾经退回 mtime,刚写入的垃圾文件会被显示成『运行中』)。
+    """
     try:
-        text = path.read_text(encoding="utf-8").strip()
+        text = m.read_text_limited(path, HEARTBEAT_MAX_BYTES).strip()
     except FileNotFoundError:
-        return None
-    except OSError:
-        return m.mtime(path)
+        return None, "missing"
+    except (OSError, m.TooLarge):
+        return None, "corrupt"
     try:
         value = float(text)
-        if math.isfinite(value) and value > 0:
-            return value
     except ValueError:
-        pass
-    return m.mtime(path)
+        return None, "corrupt"
+    if not math.isfinite(value) or value <= 0:
+        return None, "corrupt"
+    return value, None
 
 
 def _validate_guard(raw: Any, limits: dict) -> dict | None:
@@ -82,17 +91,31 @@ def _validate_guard(raw: Any, limits: dict) -> dict | None:
 def collect_trading(settings: Settings, now: float) -> Result:
     state_dir = settings.paths["state_dir"]
     stale_after = settings.stale_after("trading")
-    hb_ts = _read_heartbeat(state_dir / "heartbeat")
-    raw, err = m.read_json(state_dir / "account_guard.json")
-    guard = _validate_guard(raw, settings.limits) if err is None else None
-    if err is None and guard is None:
-        err = "corrupt"
+    hb_ts, hb_err = _read_heartbeat(state_dir / "heartbeat")
+    guard_path = state_dir / "account_guard.json"
+    raw, g_err = m.read_json(guard_path)
+    guard = _validate_guard(raw, settings.limits) if g_err is None else None
+    if g_err is None and guard is None:
+        g_err = "corrupt"
 
-    if hb_ts is None:
-        heartbeat = {"process": "unknown", "last_beat_at": None, "age_seconds": None}
-    else:
-        age = round(max(now - hb_ts, 0.0), 1)
-        heartbeat = {"process": "running" if age <= stale_after else "stopped", "last_beat_at": m.iso(hb_ts), "age_seconds": age}
+    # ---- 心跳:时间戳不能是未来(超出容忍的时钟误差)——否则时钟回拨或文件异常会让『0 秒新鲜』长期成立
+    heartbeat = {"process": "unknown", "last_beat_at": None, "age_seconds": None}
+    hb_future = False
+    if hb_ts is not None:
+        if hb_ts - now > CLOCK_SKEW_TOLERANCE:
+            hb_future, hb_err, hb_ts = True, "corrupt", None
+        else:
+            age = round(max(now - hb_ts, 0.0), 1)
+            heartbeat = {"process": "running" if age <= stale_after else "stopped", "last_beat_at": m.iso(hb_ts), "age_seconds": age}
+
+    # ---- 风控状态:有自己的年龄。心跳新鲜不代表权益/盈亏/锁定状态是当前值
+    guard_mtime = m.mtime(guard_path)
+    guard_future = guard_mtime is not None and guard_mtime - now > CLOCK_SKEW_TOLERANCE
+    guard_age = None if guard_mtime is None else round(max(now - guard_mtime, 0.0), 1)
+    if guard is not None:
+        guard["as_of"] = None if guard_mtime is None else m.iso(guard_mtime)
+        guard["age_seconds"] = guard_age
+    guard_stale = guard is not None and (guard_future or (guard_age is not None and guard_age > GUARD_STALE_AFTER))
 
     flag = state_dir / PAUSE_FLAG_NAME
     paused_at = m.mtime(flag)
@@ -102,31 +125,43 @@ def collect_trading(settings: Settings, now: float) -> Result:
         "pause": {"paused": paused_at is not None, "since": None if paused_at is None else m.iso(paused_at)},
         "live_admission": {"approved": (state_dir / "promotion_approval.json").exists()},
     }
-    as_of = hb_ts if hb_ts is not None else m.mtime(state_dir / "account_guard.json")
+    as_of = hb_ts if hb_ts is not None else guard_mtime
 
-    reasons: list[dict] = []
-    if err == "corrupt":
-        state, message = "corrupt", "account_guard.json 损坏、被占用或格式不符(已重试一次)"
-    elif hb_ts is None and err == "missing":
+    # ---- 区块状态:取最差。顺序即优先级
+    if hb_err == "corrupt" or g_err == "corrupt":
+        what = "心跳文件内容无法解析或时间戳在未来(时钟回拨或文件异常)" if hb_err == "corrupt" else "account_guard.json 损坏、被占用或格式不符(已重试一次)"
+        state, message = "corrupt", what
+    elif hb_err == "missing" and g_err == "missing":
         state, message = "missing", "未找到心跳和风控状态文件(交易进程未启动,或状态页不在交易机上)"
-    elif hb_ts is None:
+    elif hb_err == "missing":
         state, message = "unknown", "未找到心跳文件:无法确认交易进程是否在运行"
-    elif err == "missing":
+    elif g_err == "missing":
         state, message = "unknown", "未找到风控状态文件:无法确认风控状态(运行时可能没有配置 state_file)"
     elif heartbeat["process"] == "stopped":
         state, message = "stale", f"心跳已停 {heartbeat['age_seconds'] / 3600:.1f} 小时:交易进程可能已退出"
+    elif guard_stale:
+        state = "stale"
+        message = ("风控状态文件的时间戳在未来(时钟回拨或文件异常)" if guard_future else
+                   f"风控状态文件已落后 {guard_age / 60:.0f} 分钟(运行时至少每分钟落盘一次):当前权益、盈亏、锁定状态可能不是最新")
     else:
         state, message = "ok", None
 
+    reasons: list[dict] = []
     if guard and guard["hard_locked"]:
+        # 锁定状态不会因为文件旧了就失效:陈旧的『已硬锁定』同样报 critical
         level, headline = "critical", "账户已硬锁定"
         reasons.append(_reason("trading", "critical", f"账户已硬锁定:{guard['hard_reason'] or '原因未记录'}"))
     elif guard and guard["daily_locked_day"] and guard["daily_locked_day"] == guard["day"]:
         level, headline = "critical", "当日熔断:禁止新开仓"
         reasons.append(_reason("trading", "critical", "当日熔断已触发:今日禁止新开仓"))
-    elif state in ("missing", "corrupt", "unknown", "stale"):
+    elif state != "ok":
         level = "unknown"
-        headline = {"missing": "无状态文件", "corrupt": "状态文件损坏", "unknown": "无法确认进程状态"}.get(state)             or f"心跳已停 {heartbeat['age_seconds'] / 3600:.1f} 小时"          # 只有 stale 才一定有 age_seconds
+        if state == "stale" and heartbeat["process"] == "stopped":
+            headline = f"心跳已停 {heartbeat['age_seconds'] / 3600:.1f} 小时"
+        elif state == "stale":
+            headline = "风控状态已过期"
+        else:
+            headline = {"missing": "无状态文件", "corrupt": "状态文件损坏"}.get(state, "无法确认进程状态")
         reasons.append(_reason("trading", "unknown", f"无法判断交易状态:{message}"))
     elif data["pause"]["paused"]:
         level, headline = "warn", "已暂停开仓"
@@ -163,11 +198,90 @@ def _nonempty(path: Path) -> bool:
         return False
 
 
+PARSE_CACHE_MAX = 64
+FINGERPRINT_BYTES = 64
+_PARSE_LOCK = threading.Lock()
+
+
+@dataclass
+class _ParseState:
+    parser: ls.DayLogParser
+    offset: int                 # 已喂给解析器的字节数
+    fingerprint: bytes          # 已读部分末尾的若干字节:用来确认文件只是被追加,没有被替换
+    mtime_ns: int
+    size: int
+
+
+_PARSE_CACHE: dict[str, _ParseState] = {}
+
+
+def _read_range(path: Path, start: int, end: int | None = None) -> bytes:
+    with path.open("rb") as fh:
+        fh.seek(start)
+        return fh.read() if end is None else fh.read(max(end - start, 0))
+
+
+def _tail_fingerprint(path: Path, offset: int) -> bytes:
+    """文件 [offset-N, offset) 这段的内容。固定很小(64 字节),单独实现——_read_range 只表示『喂给解析器的数据读取』,便于测试断言读了多少。"""
+    with path.open("rb") as fh:
+        fh.seek(max(offset - FINGERPRINT_BYTES, 0))
+        return fh.read(min(offset, FINGERPRINT_BYTES))
+
+
+def _parse_cached(path: Path) -> ls.DayStats:
+    """增量解析并缓存单个日志文件。
+
+    为什么需要(G8 审查实测):5 MB 的单日日志整份解析要约 0.9 秒,20 MB 约 4 秒,60 MB 约 12 秒;总览里 days 与 alerts
+    各解析一遍,前端每 8 秒轮询一次——日志一大请求就会堆积、耗尽线程池,且恰恰发生在日志刷屏、最需要看状态的时候。
+    当天的日志一直在增长,所以光按 (mtime, size) 缓存没用;这里记住解析器和已读偏移,只处理新增的字节。
+
+    什么时候必须全量重解析(宁可慢也不能错):
+    - 文件变小(被截断或轮转);
+    - 文件变大,但已读部分末尾的指纹对不上(整个文件被换成了另一个更大的文件,从旧偏移继续读就是错的)。
+    返回的是副本——调用方(_days)会合并修改 events。整个『校验 + 读取 + 喂入』在锁内完成,避免两个请求同时推进同一个解析器。
+    """
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return ls.parse_day_log(path)
+    with _PARSE_LOCK:
+        state = _PARSE_CACHE.get(key)
+        try:
+            if state is not None and (st.st_mtime_ns, st.st_size) == (state.mtime_ns, state.size):
+                pass                                                          # 没变:直接用
+            elif state is not None and st.st_size >= state.offset and _tail_fingerprint(path, state.offset) == state.fingerprint:
+                state.parser.feed(_read_range(path, state.offset, st.st_size))   # 只追加:读新增部分
+                state.offset, state.size, state.mtime_ns = st.st_size, st.st_size, st.st_mtime_ns
+                state.fingerprint = _tail_fingerprint(path, state.offset)
+            else:                                                             # 首次 / 被截断 / 被替换:全量
+                parser = ls.DayLogParser(ls._day_from_filename(path))
+                parser.feed(_read_range(path, 0, st.st_size))
+                state = _ParseState(parser, st.st_size, _tail_fingerprint(path, st.st_size), st.st_mtime_ns, st.st_size)
+                if len(_PARSE_CACHE) >= PARSE_CACHE_MAX and key not in _PARSE_CACHE:
+                    _PARSE_CACHE.clear()
+                _PARSE_CACHE[key] = state
+        except OSError:
+            _PARSE_CACHE.pop(key, None)
+            return ls.parse_day_log(path)
+        snap = state.parser.snapshot(key)
+    return snap
+
+
+def warm_up(settings: Settings) -> None:
+    """启动时预热日志解析缓存,让用户第一次打开页面时已经是热的(60 MB 日志冷解析约 11 秒)。
+    预热只是优化:任何异常都吞掉,绝不能阻止服务启动。"""
+    try:
+        _days(settings)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _days(settings: Settings) -> list[ls.DayStats]:
     """按天汇总,只统计有内容的日志(与 _log_files 同一口径)。"""
     merged: dict[str, ls.DayStats] = {}
     for f in _log_files(settings):
-        stats = ls.parse_day_log(f)
+        stats = _parse_cached(f)
         target = merged.setdefault(stats.day, ls.DayStats(day=stats.day))
         target.started += stats.started
         target.trades += stats.trades
@@ -191,8 +305,8 @@ def _checklist_item(text: str) -> str:
 
 def _heartbeat_day_label(settings: Settings, now: float) -> tuple[str, str] | None:
     """(心跳所属日, 文字)。心跳只挂在当天那一行;用注入的 now 计算,不读真实时钟。"""
-    ts = _read_heartbeat(settings.paths["state_dir"] / "heartbeat")
-    if ts is None:
+    ts, err = _read_heartbeat(settings.paths["state_dir"] / "heartbeat")
+    if err is not None or ts is None or ts - now > CLOCK_SKEW_TOLERANCE:       # 损坏或在未来的心跳不当作证据
         return None
     age = max(now - ts, 0.0)
     day = datetime.fromtimestamp(ts, m.BEIJING).strftime("%Y-%m-%d")

@@ -5,7 +5,7 @@
     python scripts/status_server.py                  # 启动,监听 127.0.0.1:8770(可在 config/status_dashboard.json 改端口)
 
 - 只监听本机回环地址(配置层强制;经局域网访问属于阶段⑤,须另写 ADR)。
-- 令牌文件默认 data/state/status.token,不存在则自动生成。**令牌内容不会被打印**;浏览器里打开页面后手工输入。
+- 令牌文件默认 data/dashboard/status.token(面板专属目录,不在交易侧目录树里),不存在则自动生成。**令牌内容不会被打印**;浏览器里打开页面后手工输入。
 - 本进程不连接交易进程、不读取 .env、不 import vnpy / trading;杀掉它不影响交易。
 - 依赖见 requirements-dashboard.txt(与交易环境隔离)。
 """
@@ -72,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"缺少 Web 依赖: {exc}。请安装 requirements-dashboard.txt(与交易环境隔离)。", file=sys.stderr)
         return 3
     app = create_app(settings, token)
+    from dashboard import collectors
+    collectors.warm_up(settings)                 # 日志可能很大:启动时先解析一遍,第一个请求就不用等
     if app.state.site.rejected:
         print(f"警告: 前端清单里有 {len(app.state.site.rejected)} 个文件缺失或哈希不符,不会被托管: {app.state.site.rejected[:5]}", file=sys.stderr)
     if not app.state.site.has_index:

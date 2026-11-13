@@ -4,7 +4,7 @@
 - 账号:只留头尾各 2 位,星号数固定(不泄露长度);
 - 令牌、`CTP_*` 环境变量赋值、敏感键名的值;
 - 本机绝对路径(Windows 盘符路径与常见 POSIX 目录);
-- 已登记的明文秘密(经 `notify.webhook.redact`,脱敏的唯一出处);
+- 已登记的明文秘密(经 `notify.redact.redact`,脱敏的唯一出处);
 - 非有限浮点(NaN / inf 不是合法 JSON)、过深嵌套、过长字符串与列表。
 
 面板不读取 `.env`,所以不知道交易账号的明文;账号靠键名(`account_id` 等)识别并掩码,
@@ -17,7 +17,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from notify.webhook import redact
+from notify.redact import redact
 
 MAX_DEPTH = 12
 MAX_ITEMS = 200

@@ -81,3 +81,17 @@ def test_default_config_file_follows_the_root_argument(tmp_path):
     other = tmp_path / "empty"
     other.mkdir()
     assert c.load(root=other).environment["label"] == "unknown"           # root 下没有就用默认值,而不是回落到仓库根
+
+
+@pytest.mark.parametrize("token_file", ["data/state/status.token", "data/state/sub/t", "runtime/data/state/t", "runtime/vntrader/log/t", ".ops/recording/t",
+                                        "pending_strategies/t", "data/research/t", "data/research-control/t"])
+def test_a_token_file_inside_a_directory_the_dashboard_reads_is_refused(tmp_path, token_file):
+    """令牌文件不能放在交易侧的状态/日志/录制/研究目录里:创建它就是在写交易系统的目录。"""
+    cfg = _write(tmp_path, {"token_file": token_file, "log_dirs": ["runtime/vntrader/log"], "state_dir": "data/state"})
+    with pytest.raises(c.ConfigError, match="令牌"):
+        c.load(path=cfg, root=tmp_path)
+
+
+def test_the_default_token_file_is_in_its_own_directory(tmp_path):
+    s = c.load(path=tmp_path / "none.json", root=tmp_path)
+    assert s.paths["token_file"] == (tmp_path / "data" / "dashboard" / "status.token").resolve()

@@ -31,6 +31,9 @@ def env(tmp_path):
     (st / "account_guard.json").write_text(json.dumps({
         "account_id": ACCOUNT, "last_equity": 9870.5, "peak_equity": 10120.0, "day": "2026-11-13", "day_start_equity": 10000.0,
         "daily_locked_day": None, "hard_locked": False, "hard_reason": ""}), encoding="utf-8")
+    import os
+    os.utime(st / "account_guard.json", (NOW - 3, NOW - 3))        # NOW 是虚构的 2027 年;真实 mtime 会被正确判为落后几个月
+    os.utime(st / "heartbeat", (NOW - 4, NOW - 4))
     return tmp_path, settings
 
 

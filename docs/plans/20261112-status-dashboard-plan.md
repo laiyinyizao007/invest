@@ -91,7 +91,7 @@ flowchart LR
 - [ ] **T6** fork 并改造(`dashboard/app.py` + `scripts/status_server.py`),拆为子任务:
   - **T6a 谱系**:`dashboard/NOTICE-vnpy_webtrader.md`(版本 1.1.0、安装包 SHA-256、MIT 全文、处置表);派生文件头部注明来源
   - **T6b 剥离**:删除 `POST /token`、`/tick` 订阅、`POST/DELETE /order`、WebSocket 与 `rpc_callback`、`RpcClient`、全部 `vnpy.*` import、passlib / python-jose / python-multipart 依赖
-  - **T6c 鉴权**:令牌文件(`data/state/status.token`,不存在则安全随机生成)+ 常量时间比较 + 每分钟限流
+  - **T6c 鉴权**:令牌文件(`data/dashboard/status.token`,面板专属目录,不存在则安全随机生成)+ 常量时间比较 + 每分钟限流
   - **T6d 路由**:契约里阶段①的接口;区块级 try/except;GET/HEAD-only
   - **T6e FastAPI 默认行为**:关闭 `/docs` `/redoc` `/openapi.json` 与斜杠重定向;统一异常处理器输出 `{"error","code"}` 且不回显请求内容(422/404/405/500);中间件加 CSP / `nosniff` / `no-store`;405 带 `Allow`
   - **T6f 入口**:拒绝非回环地址;静态托管只服务构建清单内的文件

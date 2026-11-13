@@ -85,7 +85,7 @@ python scripts/status_server.py --check       # 只校验配置
 python scripts/status_server.py               # 启动,默认 127.0.0.1:8770
 ```
 - **只读、仅回环**:全部接口是 GET;监听 `0.0.0.0` 或局域网地址会被配置层拒绝启动(经局域网访问属于阶段⑤,须另写 ADR)。
-- **令牌**:首次启动在 `data/state/status.token` 自动生成(不入库,内容不会被打印);浏览器里粘贴它。令牌放 `Authorization: Bearer` 头,不要放 URL。
+- **令牌**:首次启动在 `data/dashboard/status.token`(面板专属目录,不在交易侧目录树里)自动生成(不入库,内容不会被打印);浏览器里粘贴它。令牌放 `Authorization: Bearer` 头,不要放 URL。
 - **环境标签**:在 `config/status_dashboard.json` 里设 `environment`(`simnow` / `guoxin-test` / `live`)。不设则页面横幅显示『环境未知』——面板不读 `.env`,不会猜。
 - **状态目录**:默认 `data/state`(直接用 Python 运行的机器);Docker 运行则在配置里把 `state_dir` 指向挂载出来的 `runtime/data/state`,`log_dirs` 默认 `runtime/vntrader/log`。**不要把 `.vntrader/log` 加进去**——单元测试会污染它。
 - **面板必须与交易运行时在同一台机器**(它读同一批文件)。杀掉面板不影响交易;它不写任何被读取的文件(测试强制)。

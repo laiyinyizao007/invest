@@ -176,12 +176,23 @@ def test_get_doc_truncates_huge_files(tmp_path):
 
 # ---------------------------------------------------------------- 总览
 
+def write_guard(tmp_path, **over):
+    """写风控状态文件,mtime 对齐到测试时钟(NOW 是虚构的 2027 年;真实 mtime 会被正确判为落后几个月)。"""
+    st = tmp_path / "data" / "state"
+    st.mkdir(parents=True, exist_ok=True)
+    data = {"account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d", "day_start_equity": 1.0, "hard_locked": False}
+    data.update(over)
+    p = st / "account_guard.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    os.utime(p, (NOW - 2, NOW - 2))
+    return p
+
+
 def write_healthy_trading(tmp_path):
     st = tmp_path / "data" / "state"
     st.mkdir(parents=True, exist_ok=True)
     (st / "heartbeat").write_text(str(NOW - 3), encoding="utf-8")
-    (st / "account_guard.json").write_text(json.dumps({"account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d",
-                                                        "day_start_equity": 1.0, "hard_locked": False}), encoding="utf-8")
+    write_guard(tmp_path)
     log = tmp_path / "runtime" / "vntrader" / "log"
     log.mkdir(parents=True, exist_ok=True)
     p = log / "vt_20261112.log"
@@ -209,8 +220,7 @@ def test_overview_takes_the_worst_level_and_sorts_reasons_by_severity(tmp_path):
     o = col.collect_overview(S(tmp_path), NOW)
     assert o["level"] == "warn"
     assert [r["level"] for r in o["reasons"]] == sorted((r["level"] for r in o["reasons"]), key={"critical": 0, "unknown": 1, "warn": 2, "ok": 3}.get)
-    (tmp_path / "data" / "state" / "account_guard.json").write_text(json.dumps({"account_id": "1", "last_equity": 1.0, "peak_equity": 2.0, "day": "d",
-                                                                                 "day_start_equity": 1.0, "hard_locked": True, "hard_reason": "累计回撤"}), encoding="utf-8")
+    write_guard(tmp_path, peak_equity=2.0, hard_locked=True, hard_reason="累计回撤")
     o = col.collect_overview(S(tmp_path), NOW)
     assert o["level"] == "critical" and o["reasons"][0]["level"] == "critical"
 

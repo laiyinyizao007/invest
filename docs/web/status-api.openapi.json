@@ -1088,7 +1088,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "只读令牌(data/state/status.token)。放 Authorization 头,绝不放 URL。"
+        "description": "只读令牌(data/dashboard/status.token)。放 Authorization 头,绝不放 URL。"
       },
       "writeToken": {
         "type": "http",

@@ -18,7 +18,7 @@
 
 ## 2. 鉴权
 
-- 读接口:`Authorization: Bearer <只读令牌>`。令牌由部署者生成(`data/state/status.token`),**不入版本库**。
+- 读接口:`Authorization: Bearer <只读令牌>`。令牌由部署者生成(`data/dashboard/status.token`),**不入版本库**。
 - 静态页面(`/`、`/assets/*`)**不需要令牌**(它们不含数据),页面加载后弹出令牌输入框。
 - 令牌由前端放在 `sessionStorage`,每次请求通过 Authorization 头发送。**不得**放 URL、`localStorage`、Cookie;不得写进日志或错误上报。
 - 401 响应:清除内存中的令牌并回到输入框;**响应体不含任何关于正确令牌的信息**(不提示长度、前缀)。

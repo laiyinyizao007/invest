@@ -110,35 +110,75 @@ def _day_from_filename(path: Path) -> str:
     return stem
 
 
+class DayLogParser:
+    """可增量喂入的单日日志解析器:feed(新增字节) 可以反复调用,snapshot() 随时取当前结果。
+
+    为什么需要:当天的日志一直在增长,状态页每次轮询都重新解析整份文件,60 MB 要约 12 秒。增量解析只处理新增的部分。
+    等价性靠构造保证:只处理到缓冲里最后一个换行符(LF)为止的完整文本,并对这段文本调用 str.splitlines(),
+    与一次性全量解析用的是同一个行分割语义(它还把 CR、VT、FF、U+2028 等也当行分隔符),
+    所以任意切分方式的结果都与全量解析一致。
+    最后一行没写完(没有换行结尾)时留在缓冲里,等下次补全再处理,不会被数两次。
+    """
+
+    def __init__(self, day: str) -> None:
+        self.day = day
+        self.trades = 0
+        self.events: Counter = Counter()
+        self.first_ts = ""
+        self.last_ts = ""
+        self._started_ok = 0          # 『已启动』与『启动耗时』各自计数,快照时取较大者——不能只存最终值,否则无法继续累加
+        self._start_attempts = 0
+        self._pending = b""           # 尚未遇到换行的残余字节(可能切在多字节字符中间,所以按字节缓冲)
+
+    def feed(self, data: bytes) -> None:
+        buf = self._pending + data
+        cut = buf.rfind(b"\n")
+        if cut < 0:
+            self._pending = buf
+            return
+        self._pending = buf[cut + 1:]
+        self._consume(buf[: cut + 1].decode("utf-8", errors="replace"))
+
+    def finish(self) -> None:
+        """文件到此为止:把没有换行结尾的最后一行也算进去(全量解析就是这个语义)。"""
+        if self._pending:
+            text, self._pending = self._pending.decode("utf-8", errors="replace"), b""
+            self._consume(text)
+
+    def _consume(self, text: str) -> None:
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            ts = _parse_ts(line)
+            if ts:
+                if not self.first_ts:
+                    self.first_ts = ts
+                self.last_ts = ts
+            # "已启动"与"启动耗时"每次成功启动各出现一次,取较大者,避免同一次启动被数成两次
+            if "已启动" in line:
+                self._started_ok += 1
+            elif "启动耗时" in line:
+                self._start_attempts += 1
+            if TRADE_MARKER in line:
+                self.trades += 1
+            for marker, (level, name) in EVENT_MARKERS.items():
+                if marker in line:
+                    self.events[(level, name)] += 1
+
+    def snapshot(self, log_path: str = "") -> DayStats:
+        return DayStats(day=self.day, started=max(self._started_ok, self._start_attempts), trades=self.trades,
+                        events=Counter(self.events), first_ts=self.first_ts, last_ts=self.last_ts, log_path=log_path)
+
+
 def parse_day_log(path: Path) -> DayStats:
     """解析一天的 vn.py 日志,统计启动次数、成交笔数与异常事件。"""
-    stats = DayStats(day=_day_from_filename(path), log_path=str(path))
+    parser = DayLogParser(_day_from_filename(path))
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        parser.feed(path.read_bytes())
     except OSError:
-        return stats
-    started_ok = 0
-    start_attempts = 0
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        ts = _parse_ts(line)
-        if ts:
-            if not stats.first_ts:
-                stats.first_ts = ts
-            stats.last_ts = ts
-        # "已启动"与"启动耗时"每次成功启动各出现一次,取较大者,避免同一次启动被数成两次
-        if "已启动" in line:
-            started_ok += 1
-        elif "启动耗时" in line:
-            start_attempts += 1
-        if TRADE_MARKER in line:
-            stats.trades += 1
-        for marker, (level, name) in EVENT_MARKERS.items():
-            if marker in line:
-                stats.events[(level, name)] += 1
-    stats.started = max(started_ok, start_attempts)
-    return stats
+        return parser.snapshot(str(path))
+    parser.finish()
+    return parser.snapshot(str(path))
 
 
 def collect_days(log_dirs: list[Path], day_filter: str = "") -> list[DayStats]:

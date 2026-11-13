@@ -83,6 +83,19 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
     return None, last_error
 
 
+class TooLarge(Exception):
+    """文件超过读取上限。上限是防止异常增长的文件在单次请求里耗尽内存/CPU(面板与交易系统同机)。"""
+
+
+def read_text_limited(path: Path, limit: int) -> str:
+    """最多读 limit 字节;文件更大就抛 TooLarge,**不截断后继续当作正常数据**。FileNotFoundError / OSError 原样抛出。"""
+    with path.open("rb") as fh:
+        raw = fh.read(limit + 1)
+    if len(raw) > limit:
+        raise TooLarge(f"{path.name} 超过 {limit} 字节上限")
+    return raw.decode("utf-8", errors="replace")
+
+
 def mtime(path: Path) -> float | None:
     try:
         return path.stat().st_mtime

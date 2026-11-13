@@ -37,14 +37,7 @@ DIGEST_MIN_ITEMS = 3
 DIGEST_MAX_LINES = 20
 
 
-def redact(text: str, secrets: Iterable[str]) -> str:
-    """替换已知敏感值；长度不足 3 的值不替换，避免误伤普通文本。
-
-    长值优先替换，避免短密钥是长密钥前缀时留下后缀。
-    """
-    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
-        text = text.replace(secret, "***")
-    return text
+from notify.redact import redact  # noqa: E402,F401  脱敏的唯一出处已移到 notify/redact.py(无 requests 依赖),这里重新导出保持兼容
 
 
 def _redact_key(key, secrets: Iterable[str]):

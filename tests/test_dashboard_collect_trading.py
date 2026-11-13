@@ -18,6 +18,7 @@ def put(tmp_path, name, text):
     p = tmp_path / "data" / "state" / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text if isinstance(text, str) else json.dumps(text), encoding="utf-8")
+    os.utime(p, (NOW - 1, NOW - 1))        # 夹具文件的 mtime 对齐到测试时钟(NOW 是虚构的 2027 年,真实 mtime 会被正确判为落后几个月)
     return p
 
 
@@ -137,15 +138,78 @@ def test_non_finite_numbers_in_the_guard_file_are_corrupt_not_passed_through(tmp
     json.dumps(r.section, allow_nan=False)
 
 
-def test_future_heartbeat_after_clock_rollback_is_age_zero_not_negative(tmp_path):
+# ---------------------------------------------------------------- G8 第 2 轮审查(codex)发现
+
+@pytest.mark.parametrize("content", ["garbage", "not-a-number", "", "nan", "inf", "-5", "0", "12abc"])
+def test_a_corrupt_heartbeat_is_corrupt_and_never_falls_back_to_file_mtime(tmp_path, content):
+    """曾经:内容不可解析时退回文件 mtime,刚写入的垃圾文件会被显示成『运行中』。"""
+    p = put(tmp_path, "heartbeat", content)
+    os.utime(p, (NOW - 1, NOW - 1))                                          # mtime 很新,但内容是垃圾
+    put(tmp_path, "account_guard.json", guard())
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.section["data"] is None and r.level == "unknown"
+    assert "running" not in json.dumps(r.section)
+
+
+def test_a_heartbeat_far_in_the_future_is_not_fresh_evidence(tmp_path):
+    """曾经:max(now - ts, 0) 把任何未来时间戳当成 0 秒新鲜(时钟回拨、文件异常后可长期显示正常)。"""
     put(tmp_path, "heartbeat", str(NOW + 500))
     put(tmp_path, "account_guard.json", guard())
-    s = run(tmp_path).section
-    assert s["age_seconds"] == 0.0 and s["state"] == "ok"
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level == "unknown" and "未来" in r.section["message"]
 
 
-def test_heartbeat_file_with_garbage_falls_back_to_mtime(tmp_path):
-    p = put(tmp_path, "heartbeat", "not-a-number")
-    os.utime(p, (NOW - 5, NOW - 5))
+def test_small_clock_skew_into_the_future_is_tolerated(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW + 20))
     put(tmp_path, "account_guard.json", guard())
-    assert run(tmp_path).section["data"]["heartbeat"]["age_seconds"] == 5.0
+    s = run(tmp_path).section
+    assert s["state"] == "ok" and s["age_seconds"] == 0.0
+
+
+def test_a_stale_guard_file_is_stale_even_when_the_heartbeat_is_fresh(tmp_path):
+    """风控状态运行时至少每 60 秒落盘一次(risk/account_guard.py);落后很多说明权益/盈亏/锁定状态不是当前值。"""
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    g = put(tmp_path, "account_guard.json", guard())
+    os.utime(g, (NOW - 86400, NOW - 86400))
+    r = run(tmp_path)
+    assert r.section["state"] == "stale" and r.level == "unknown"
+    assert "风控状态" in r.section["message"] and r.section["data"]["guard"]["age_seconds"] >= 86000
+    assert r.section["data"]["heartbeat"]["process"] == "running"             # 进程在跑这个事实本身没错,错的是风控数字可能过期
+
+
+def test_a_fresh_guard_reports_its_own_age(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    g = put(tmp_path, "account_guard.json", guard())
+    os.utime(g, (NOW - 30, NOW - 30))
+    guard_data = run(tmp_path).section["data"]["guard"]
+    assert guard_data["age_seconds"] == 30.0 and guard_data["as_of"].endswith("+08:00")
+
+
+def test_a_hard_lock_is_still_critical_when_the_guard_file_is_stale(tmp_path):
+    """陈旧的『已硬锁定』也必须报警:锁定状态不会因为文件旧了就失效。"""
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    g = put(tmp_path, "account_guard.json", guard(hard_locked=True, hard_reason="累计回撤"))
+    os.utime(g, (NOW - 86400, NOW - 86400))
+    r = run(tmp_path)
+    assert r.level == "critical" and r.section["state"] == "stale"
+
+
+def test_a_guard_file_dated_in_the_future_is_not_fresh(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    g = put(tmp_path, "account_guard.json", guard())
+    os.utime(g, (NOW + 9999, NOW + 9999))
+    assert run(tmp_path).section["state"] in ("corrupt", "stale", "unknown")
+
+
+def test_an_oversized_heartbeat_file_is_corrupt_not_read_into_memory(tmp_path):
+    """内容是一个完全合法的时间戳加十万个空格——strip() 之后 float() 能解析,所以只有大小上限能拦住它。
+    (曾用 '1'*100000 做输入:它会溢出成 inf 被 isfinite 兜住,测不到大小上限。)"""
+    put(tmp_path, "heartbeat", str(NOW - 2) + " " * 100_000)
+    put(tmp_path, "account_guard.json", guard())
+    assert run(tmp_path).section["state"] == "corrupt"
+
+
+def test_a_heartbeat_just_under_the_size_limit_is_still_accepted(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2) + " " * 900)
+    put(tmp_path, "account_guard.json", guard())
+    assert run(tmp_path).section["state"] == "ok"
