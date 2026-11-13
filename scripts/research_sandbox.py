@@ -228,6 +228,15 @@ def is_approved(path: Path, approvals_file: Path) -> bool:
     return file_sha256(path) in _load_approvals(approvals_file)
 
 
+def is_approved_sha(sha256: str, approvals_file: Path) -> bool:
+    """按**哈希**查审批记录(不再读一次文件)。
+
+    隐藏子入口用它:子进程拿到的是父进程算好的哈希,而 `import_candidate` 会再读一次文件
+    并校验"当前内容 == 这个哈希"——所以被执行的字节一定是被批准的那一份,
+    不必为了查审批再读一遍文件(两处读之间文件若被改,查的就是另一个版本的内容)。"""
+    return sha256 in _load_approvals(approvals_file)
+
+
 def record_approval(path: Path, approvals_file: Path, now: datetime | None = None) -> str:
     approvals_file = Path(approvals_file)
     data = _load_approvals(approvals_file)

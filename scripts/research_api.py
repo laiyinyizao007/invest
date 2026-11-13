@@ -291,16 +291,20 @@ def child_file(path: Path) -> Path:
         raise JobError(EXIT_REFUSED, "策略文件不在 pending_strategies/ 目录内") from None
 
 
-def child_approved(path: Path) -> None:
-    """子进程自己查审批记录。
+def child_approved(sha256: str) -> None:
+    """子进程自己查审批记录(按**哈希**查,不再读一遍文件)。
 
     `--sha256` 只证明"文件没变",**不证明"人看过"**——哈希谁都能自己算。
     子入口能被直接调用,不查审批就能跑一份从未被人审阅过的候选,
     而"运行前由人读过代码"正是这套设计最核心的前提(威胁模型的第一条)。
-    审批记录按**内容哈希**存,所以文件一改就自动失效。"""
+    审批记录按内容哈希存,所以文件一改就自动失效。
+
+    查的是**父进程算好的那个哈希**:`import_candidate` 随后会再读一次文件并校验
+    "当前内容 == 这个哈希",所以被执行的字节一定就是被批准的那一份——
+    不必为了查审批再读一遍文件(两处读之间文件若被改,查的就是另一个版本的内容)。"""
     _, paths = settings()
     try:
-        if not rs.is_approved(path, paths["approvals_file"]):
+        if not rs.is_approved_sha(sha256, paths["approvals_file"]):
             raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
@@ -685,7 +689,7 @@ def run_gate_child(args) -> int:
     from vnpy.trader.constant import Exchange
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
-        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
+        child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
         random_runs, prior_trials = child_int_args(args)
     except JobError as exc:
@@ -725,7 +729,7 @@ def run_evaluate_child(args) -> int:
     from vnpy.trader.constant import Exchange
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
-        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
+        child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
     except JobError as exc:
         print(exc.message, file=sys.stderr)
@@ -760,7 +764,7 @@ def run_child(args) -> int:
     from strategies.instruments import INSTRUMENTS
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
-        child_approved(path)                  # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
+        child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
         print(exc.message, file=sys.stderr)
