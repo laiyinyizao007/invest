@@ -1476,9 +1476,20 @@
               "null"
             ],
             "description": "给人看的说明,例如『文件不存在』『JSON 损坏』"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "warn",
+              "critical",
+              "unknown"
+            ],
+            "description": "严重程度,决定徽标。**与 state 分开**:state 决定内容能不能看(missing/corrupt 时 data 为 null),level 决定徽标——这样前端能区分『数据是坏的』(state=unknown)与『有些内容没列出来/没检查』(state=ok + level=warn)。"
           }
         },
         "required": [
+          "level",
           "state"
         ],
         "additionalProperties": true

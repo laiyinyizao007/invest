@@ -70,5 +70,6 @@
     "longest_clean_streak": 1,
     "required_streak": 5,
     "missing_weekdays": []
-  }
+  },
+  "level": "ok"
 }

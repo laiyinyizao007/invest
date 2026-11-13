@@ -35,5 +35,6 @@
     "live_admission": {
       "approved": false
     }
-  }
+  },
+  "level": "ok"
 }

@@ -16,6 +16,7 @@ export interface SectionBase {
   age_seconds?: number | null;
   stale_after_seconds?: number | null;
   message?: string | null;
+  level: "ok" | "warn" | "critical" | "unknown";
 }
 
 export interface ApiError {

@@ -29,6 +29,16 @@ class Result:
     headline: str
     reasons: list[dict] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """把级别写进区块外壳。
+
+        `state` 决定内容能不能看,`level` 决定徽标:前端要能区分
+        『数据是坏的』(state=unknown)和『有些内容没列出来/没检查』(state=ok + level=warn)。
+        """
+        self.section.setdefault("level", self.level)
+        if self.section.get("level") != self.level:
+            self.section["level"] = self.level
+
 
 def _num(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -462,10 +472,12 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
-    # 严重事件的判据是『**最新的有严重事件的天**』,不是『最新的天』:
-    # 最新那天不可信(正在写)时,前一天已确认的硬锁定不能被降级成『有日志无法识别』。
-    severe_days = [d for d in days if d.has_severe]
-    latest_severe = severe_days[-1] if severe_days else None
+    # 严重事件的判据是『**最新的可信天**』,与 collect_alerts 同一口径:
+    # - 不能用『最新的天』:最新那天正在写(不可信)时,前一天已确认的硬锁定会被降级成『有日志无法识别』;
+    # - 也不能用『历史任意一天』:43 天前的一次硬锁定会把总状态条永久钉在 critical,
+    #   等到今天真的硬锁定时反而看不出来(严重级别被历史事件占住了)。
+    trusted_days = _days(settings, only_trusted=True)
+    latest_trusted = trusted_days[-1] if trusted_days else None
     bad_logs = _unreadable_logs(settings)
     if bad_logs and state == "ok":
         # **有数据没显示 → 状态不能是 ok**:契约规定前端『先看 state』,ok 会渲染成绿卡片。
@@ -473,10 +485,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         state = "unknown"
     bad_msg = f"有 {bad_logs} 个日志文件内容无法识别(格式变了、被写坏或日期与文件名不符),这些天不能算作『无异常』"
     reasons: list[dict] = []
-    if latest_severe is not None:
-        level, headline = "critical", f"{latest_severe.day} 有严重事件"
-        reasons.append(_reason("days", "critical", f"{latest_severe.day} 日志里有严重事件:"
-                                + "、".join(n for (lv, n) in latest_severe.events if lv == "严重")))
+    if latest_trusted is not None and latest_trusted.has_severe:
+        level, headline = "critical", f"{latest_trusted.day} 有严重事件"
+        reasons.append(_reason("days", "critical", f"{latest_trusted.day} 日志里有严重事件:"
+                                + "、".join(n for (lv, n) in latest_trusted.events if lv == "严重")))
     elif bad_logs:
         # 有日志文件但内容无法识别——哪怕另一天是好的。曾经只在『一个好日志都没有』时才报,
         # 于是『昨天干净、今天的日志坏了』显示成一切正常。坏掉的那天是『无法判断』,不是『无异常』。
@@ -903,14 +915,16 @@ def collect_research(settings: Settings, now: float) -> Result:
     problems, notes = [], []
     if unscanned:
         # 超出扫描上限的旧结果**从未被校验**:里面若有损坏文件就彻底不可见。
-        # 所以它属于『有数据没显示』,不能只放在 notes 里(state 仍是 ok 就会渲染成绿卡片)。
-        problems.append(f"更早的 {unscanned} 个运行结果未检查(它们的状态未知,不能当作正常)")
+        # 所以要明确说明(不是静默),但它与『读出来是坏的』不同:前者只是没检查,后者是坏了。
+        notes.append(f"更早的 {unscanned} 个运行结果未检查(它们的状态未知,不能当作正常)")
     if unreadable_runs:
         problems.append(f"{unreadable_runs} 个运行结果文件损坏或无法读取,未显示")
     if unscanned:
         notes.append(f"更早的 {unscanned} 个运行结果未检查")
     if unreadable_pending:
-        problems.append(f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
+        problems.append(f"有 {unreadable_pending} 个待审候选未列出(只显示最近 {MAX_PENDING_LISTED} 个)"
+                        if unreadable_pending > MAX_PENDING_LISTED else
+                        f"{unreadable_pending} 个待审候选无法读取(损坏或超过大小上限),未显示")
     reasons = [_reason("research", "warn", "研究沙盒有数据无法显示:" + ";".join(problems))] if problems else []
     if problems:
         level, headline = "warn", "有数据无法显示"

@@ -10,5 +10,6 @@
     "open_orders": [],
     "trades_today": [],
     "ticks": []
-  }
+  },
+  "level": "warn"
 }

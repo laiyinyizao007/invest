@@ -73,8 +73,8 @@ def test_unscanned_research_results_make_the_block_unknown(tmp_path):
     assert "未检查" in (r.section["message"] or "")
 
 
-def test_a_severe_event_on_an_earlier_day_is_not_hidden_by_an_untrusted_latest_day(tmp_path):
-    """最新那天不可信(正在写)时,前一天已确认的硬锁定不能被降级成『有日志无法识别』。"""
+def test_a_severe_event_is_still_reported_when_the_latest_day_is_untrustworthy(tmp_path):
+    """最新那天不可信(正在写)时,最新的**可信天**上的硬锁定不能被降级成『有日志无法识别』。"""
     from dashboard import collectors as col
     from dashboard import config as appconfig
 
@@ -83,8 +83,32 @@ def test_a_severe_event_on_an_earlier_day_is_not_hidden_by_an_untrusted_latest_d
     d.mkdir(parents=True)
     (d / "vt_20261111.log").write_text(
         "2026-11-11 09:00:00 | INFO | R | 已启动\n2026-11-11 10:00:00 | ERROR | R | 硬锁定\n", encoding="utf-8")
-    (d / "vt_20261112.log").write_text("2026-11-12 09:00:00 | INFO | R | 已启动\n" + chr(0x200B), encoding="utf-8")
+    # 11-12 的最后一行停在多字节字符中间(进程正好崩在写入一半的行上)→ 那天不可信
+    (d / "vt_20261112.log").write_bytes(
+        "2026-11-12 09:00:00 | INFO | R | 已启动\n2026-11-12 10:00:00 | ERROR | R | 硬锁定".encode("utf-8")[:-2])
     settings = appconfig.load(path=root / "none.json", root=root)
     r = col.collect_days(settings, 1_800_000_000.0)
     assert r.level == "critical", f"级别应为 critical,实际 {r.level}({r.headline})"
     assert "2026-11-11" in r.headline
+
+
+def test_a_historical_severe_event_does_not_pin_the_overview_at_critical(tmp_path):
+    """43 天前的一次硬锁定不能把总状态条永久钉在 critical——那样今天真的硬锁定时反而看不出来。
+
+    判据是『最新的可信天』:历史事件仍在表里可见,但不参与当前的严重判定。
+    """
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    d = root / "runtime" / "vntrader" / "log"
+    d.mkdir(parents=True)
+    (d / "vt_20261001.log").write_text(
+        "2026-10-01 09:00:00 | INFO | R | 已启动\n2026-10-01 10:00:00 | ERROR | R | 硬锁定\n", encoding="utf-8")
+    (d / "vt_20261002.log").write_text("2026-10-02 09:00:00 | INFO | R | 已启动\n", encoding="utf-8")
+    settings = appconfig.load(path=root / "none.json", root=root)
+    r = col.collect_days(settings, 1_800_000_000.0)
+    assert r.level != "critical", f"历史严重事件不该把当前钉在 critical(实际 {r.level}: {r.headline})"
+    # 但它仍然在表里可见
+    days = {row["day"]: row for row in r.section["data"]["days"]}
+    assert days["2026-10-01"]["has_severe"] is True

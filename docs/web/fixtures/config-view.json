@@ -19,5 +19,6 @@
       "heartbeat_stale_seconds": 60.0,
       "live_snapshot_stale_seconds": 15.0
     }
-  }
+  },
+  "level": "ok"
 }

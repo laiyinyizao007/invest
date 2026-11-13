@@ -4,5 +4,6 @@
   "age_seconds": 10.0,
   "stale_after_seconds": 60.0,
   "message": "account_guard.json 损坏",
-  "data": null
+  "data": null,
+  "level": "unknown"
 }
