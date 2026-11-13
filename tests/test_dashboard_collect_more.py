@@ -241,3 +241,71 @@ def test_run_id_format_is_the_first_line_of_defence_against_traversal(tmp_path, 
 def test_sections_never_report_a_negative_age(tmp_path):
     from dashboard import models
     assert models.section("ok", {}, as_of=NOW + 500, now=NOW)["age_seconds"] == 0.0
+
+
+# ---------------------------------------------------------------- G8 第 1 轮审查发现
+
+def test_a_run_file_that_is_a_symlink_pointing_outside_the_results_dir_is_not_read(tmp_path):
+    """符号链接/junction:文件名合法,但解析后的真实位置在结果目录之外——必须拒绝。"""
+    res(tmp_path, runs=[(RID, RUN)])
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"kind": "backtest", "report": "OUTSIDE-SECRET"}), encoding="utf-8")
+    link = tmp_path / "data" / "research" / "20261112-220000-000000.json"
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("本机不允许创建符号链接")
+    assert col.get_run(S(tmp_path), "20261112-220000-000000") is None
+    assert "OUTSIDE-SECRET" not in json.dumps(col.collect_research(S(tmp_path), NOW).section, ensure_ascii=False)
+
+
+def test_sha_cache_is_bounded(tmp_path):
+    col._SHA_CACHE.clear()
+    pend = tmp_path / "pending_strategies"
+    pend.mkdir()
+    for i in range(col.SHA_CACHE_MAX + 50):
+        f = pend / f"s{i}.py"
+        f.write_bytes(f"x = {i}\n".encode())
+        col._sha256(f)
+    assert len(col._SHA_CACHE) <= col.SHA_CACHE_MAX
+
+
+def test_alerts_with_an_outbox_but_no_logs_cannot_claim_there_are_no_new_alerts(tmp_path):
+    """没有任何日志,就没有『进程在运行』的证据;空队列不能被解读成『一切正常』。"""
+    ob = tmp_path / "data" / "state" / "webhook_outbox.jsonl"
+    ob.parent.mkdir(parents=True)
+    ob.write_text("", encoding="utf-8")
+    r = col.collect_alerts(settings(tmp_path), NOW)
+    assert r.section["state"] != "ok" and r.level == "unknown"
+
+
+def test_a_pending_candidate_that_is_a_symlink_outside_the_pending_dir_is_not_hashed_or_listed(tmp_path):
+    res(tmp_path, pending={"ok.py": "x = 1\n"})
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"secret = 1\n")
+    try:
+        os.symlink(outside, tmp_path / "pending_strategies" / "linked.py")
+    except (OSError, NotImplementedError):
+        pytest.skip("本机不允许创建符号链接")
+    names = [p["name"] for p in col.collect_research(S(tmp_path), NOW).section["data"]["pending"]]
+    assert names == ["ok.py"]
+
+
+def test_run_id_with_a_trailing_newline_is_not_a_valid_run_id(tmp_path):
+    res(tmp_path, runs=[(RID, RUN)])
+    assert col.get_run(S(tmp_path), RID + "\n") is None
+
+
+def test_legitimate_files_are_still_found_when_the_project_root_itself_is_reached_through_a_link(tmp_path):
+    """_really_inside 要求目录已是解析过的真实路径;项目根本身经符号链接访问时,正常文件不能被误判为越界。"""
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    res(real_root, runs=[(RID, RUN)], pending={"demo.py": "x = 1\n"})
+    link_root = tmp_path / "linked_root"
+    try:
+        os.symlink(real_root, link_root, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("本机不允许创建符号链接")
+    d = col.collect_research(settings(link_root), NOW).section["data"]
+    assert [r["run_id"] for r in d["recent_runs"]] == [RID] and [p["name"] for p in d["pending"]] == ["demo.py"]
+    assert col.get_run(settings(link_root), RID)["run_id"] == RID

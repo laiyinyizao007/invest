@@ -71,3 +71,13 @@ def test_non_loopback_hosts_are_refused_at_config_level(tmp_path, host):
     """阶段①只监听本机回环;经局域网访问是阶段⑤的事,须另写 ADR。这条承诺在配置层落实,任何入口都绕不过。"""
     with pytest.raises(c.ConfigError, match="回环"):
         c.load(path=_write(tmp_path, {"host": host}), root=tmp_path)
+
+
+def test_default_config_file_follows_the_root_argument(tmp_path):
+    """审查发现:root 变了,缺省配置路径却仍指向仓库根,导致 --root 无法隔离(测试读到了真实的 config/status_dashboard.json)。"""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "status_dashboard.json").write_text(json.dumps({"environment": "live"}), encoding="utf-8")
+    assert c.load(root=tmp_path).environment["label"] == "live"           # 读的是 root 下的配置
+    other = tmp_path / "empty"
+    other.mkdir()
+    assert c.load(root=other).environment["label"] == "unknown"           # root 下没有就用默认值,而不是回落到仓库根

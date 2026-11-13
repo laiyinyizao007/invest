@@ -215,3 +215,14 @@ def test_killing_the_dashboard_leaves_the_state_files_untouched(server):
     proc.kill()
     proc.wait(timeout=10)
     assert (hb.read_bytes(), hb.stat().st_mtime_ns) == before
+
+
+def test_uvicorn_is_started_without_the_server_header():
+    """不对外暴露 uvicorn 版本。"""
+    assert "server_header=False" in (ROOT / "scripts" / "status_server.py").read_text(encoding="utf-8")
+
+
+def test_a_real_server_does_not_send_a_server_header(server):
+    base, tmp, proc = server
+    with urllib.request.urlopen(base + "/", timeout=5) as r:
+        assert r.headers.get("Server") is None

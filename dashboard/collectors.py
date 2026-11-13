@@ -288,7 +288,8 @@ def collect_alerts(settings: Settings, now: float) -> Result:
     data = {"outbox": {"pending": pending, "oldest_age_seconds": oldest}, "recent": recent}
 
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
-    state = m.freshness(newest, now, stale_after) if newest is not None else ("ok" if outbox_state == "ok" else "unknown")
+    # 没有任何非空日志 = 没有『进程在运行』的证据;空队列不能被解读成『一切正常』
+    state = m.freshness(newest, now, stale_after) if newest is not None else "unknown"
     latest = days[-1] if days else None
     reasons: list[dict] = []
     if latest and latest.has_severe:
@@ -385,6 +386,7 @@ def collect_recording(settings: Settings, now: float) -> Result:
 RUN_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{6}$")
 MAX_JSON_BYTES = 2_000_000
 MAX_SOURCE_BYTES = 1_000_000
+SHA_CACHE_MAX = 256
 _SHA_CACHE: dict[tuple[str, float, int], str] = {}
 
 
@@ -416,6 +418,8 @@ def _sha256(path: Path) -> str | None:
         if key not in _SHA_CACHE:
             if st.st_size > MAX_SOURCE_BYTES:
                 return None
+            if len(_SHA_CACHE) >= SHA_CACHE_MAX:
+                _SHA_CACHE.clear()                       # 简单的有界缓存:满了就整体清空(条目很便宜,命中率不重要)
             _SHA_CACHE[key] = hashlib.sha256(path.read_bytes()).hexdigest()
         return _SHA_CACHE[key]
     except OSError:
@@ -443,10 +447,19 @@ def _brief_run(run_id: str, result: dict) -> dict:
             "headline": _headline_of(result)}
 
 
+def _really_inside(path: Path, directory: Path) -> bool:
+    """文件解析后的真实位置必须直接位于 directory 内。符号链接/junction 指向目录外的一律不算。"""
+    try:
+        return path.resolve(strict=True).parent == directory
+    except OSError:
+        return False
+
+
 def _run_files(results_dir: Path) -> list[Path]:
+    """结果目录里的运行结果文件。**在源头过滤**:后面所有读取都只会拿到真实位于目录内的文件,不依赖每处调用都记得检查。"""
     if not results_dir.is_dir():
         return []
-    return sorted((p for p in results_dir.glob("*.json") if RUN_ID.match(p.stem)), reverse=True)
+    return sorted((p for p in results_dir.glob("*.json") if RUN_ID.fullmatch(p.stem) and _really_inside(p, results_dir)), reverse=True)
 
 
 def collect_research(settings: Settings, now: float) -> Result:
@@ -461,7 +474,7 @@ def collect_research(settings: Settings, now: float) -> Result:
 
     ledger_path = results_dir / "submissions.jsonl"
     runs = _run_files(results_dir)
-    pending_files = sorted(pending_dir.glob("*.py")) if pending_dir.is_dir() else []
+    pending_files = sorted(f for f in pending_dir.glob("*.py") if _really_inside(f, pending_dir)) if pending_dir.is_dir() else []
     if not (results_dir.is_dir() or pending_dir.is_dir() or ledger_path.exists()):
         sec = m.section("missing", None, now=now, message="未找到研究沙盒目录(沙盒未部署或尚未使用)")
         return Result(sec, "unknown", "沙盒未部署", [_reason("research", "unknown", "未找到研究沙盒目录")])
@@ -523,7 +536,7 @@ def get_run(settings: Settings, run_id: str) -> dict | None:
     if results_dir is None:
         return None
     path = results_dir / f"{run_id}.json"
-    if path.parent != results_dir:
+    if not _really_inside(path, results_dir):          # 符号链接/junction 指向结果目录之外:拒绝
         return None
     try:
         if path.stat().st_size > MAX_JSON_BYTES:

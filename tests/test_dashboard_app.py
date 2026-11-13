@@ -236,12 +236,29 @@ def test_rate_limit_returns_429_with_retry_after(tmp_path):
     assert c.get("/api/meta", headers=AUTH).status_code == 200
 
 
-def test_unauthenticated_requests_also_consume_the_rate_limit(tmp_path):
-    """防暴力猜测令牌:未带令牌的请求同样计入限流。"""
+def test_failed_auth_attempts_are_throttled_in_their_own_stricter_bucket(tmp_path):
+    """防暴力猜测令牌:鉴权失败请求有独立且更严的限额(总限额的 1/4)。"""
     cfg = tmp_path / "c.json"
-    cfg.write_text(json.dumps({"rate_limit_per_minute": 2}), encoding="utf-8")
+    cfg.write_text(json.dumps({"rate_limit_per_minute": 8}), encoding="utf-8")
     c = TestClient(appmod.create_app(config.load(path=cfg, root=tmp_path), TOKEN, mono=lambda: 0.0))
     assert [c.get("/api/meta").status_code for _ in range(4)] == [401, 401, 429, 429]
+
+
+def test_garbage_requests_cannot_lock_the_legitimate_user_out(tmp_path):
+    """审查发现:单桶限流下,任何本机进程用垃圾请求就能耗尽额度,让合法用户收到 429。分桶后不会。"""
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"rate_limit_per_minute": 8}), encoding="utf-8")
+    c = TestClient(appmod.create_app(config.load(path=cfg, root=tmp_path), TOKEN, mono=lambda: 0.0))
+    for _ in range(50):
+        c.get("/api/meta", headers={"Authorization": "Bearer garbage"})                 # 失败桶被打满
+    assert c.get("/api/meta", headers=AUTH).status_code == 200                          # 合法请求不受影响
+
+
+def test_the_authenticated_bucket_still_limits_a_runaway_legitimate_client(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"rate_limit_per_minute": 3}), encoding="utf-8")
+    c = TestClient(appmod.create_app(config.load(path=cfg, root=tmp_path), TOKEN, mono=lambda: 0.0))
+    assert [c.get("/api/meta", headers=AUTH).status_code for _ in range(5)] == [200, 200, 200, 429, 429]
 
 
 # ---------------------------------------------------------------- 静态托管
@@ -333,3 +350,68 @@ def test_rendered_frontend_routes_serve_the_page_and_the_whitelist_covers_every_
     assert all(any(r.match(p) for r in appmod.FRONTEND_ROUTES) for p in pages)
     assert any(r.match("docs/unattended-log") for r in appmod.FRONTEND_ROUTES) and not any(r.match("docs/../.env") for r in appmod.FRONTEND_ROUTES)
     assert all(f"`/{p}`" in spec or p in spec for p in ("trading", "alerts"))
+
+
+# ---------------------------------------------------------------- G8 第 1 轮对抗性审查发现
+
+def raw_get(app, path, headers=()):
+    """直接喂 ASGI scope,绕过任何 HTTP 客户端的 URL 解析。
+    为什么必须这样:httpx 会把『//api/trading』当成协议相对 URL(主机 api、路径 /trading)改写后再发,
+    用 TestClient 测这类路径测的其实是客户端而不是服务器——这个盲区是 G8 审查时发现的。"""
+    import asyncio
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http", "path": path,
+             "raw_path": path.encode(), "query_string": b"", "headers": [(b"host", b"127.0.0.1")] + list(headers),
+             "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8770)}
+    out = {"status": None, "body": b""}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+
+    asyncio.run(app(scope, receive, send))
+    return out["status"], out["body"].decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("path", ["//api/trading", "///api/trading", "//", "//trading", "/trading//", "/api//trading", "//docs/unattended-log", "/./api/trading"])
+def test_ambiguous_raw_paths_are_never_served_as_the_frontend_or_as_data(env, path):
+    """原始路径(未经客户端改写)含双斜杠等歧义写法时:不得返回前端页面,更不得返回数据。"""
+    _, settings = env
+    status, body = raw_get(appmod.create_app(settings, TOKEN), path)
+    assert status in (401, 404), (path, status)
+    assert "invest 状态页" not in body and '"state"' not in body, path
+
+
+def test_raw_canonical_paths_still_work_so_the_ambiguity_test_is_meaningful(env):
+    _, settings = env
+    app = appmod.create_app(settings, TOKEN)
+    assert raw_get(app, "/trading")[0] == 200
+    assert raw_get(app, "/api/trading")[0] == 401
+    assert raw_get(app, "/api/trading", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])[0] == 200
+
+
+def test_authentication_is_attached_to_each_api_route_not_derived_from_a_path_prefix(env):
+    """鉴权必须跟路由绑定:不论请求路径怎么写,只要命中 API 路由就必须已鉴权。用不带令牌的请求遍历大量写法,
+    任何 200 且含 state 字段的响应都是泄露。"""
+    _, settings = env
+    c = client(settings)
+    shapes = ["/api/trading", "/api//trading", "//api/trading", "/api/./trading", "/./api/trading", "/api/trading/", "/api/trading//",
+              "/api/%74rading", "/%61pi/trading", "/api/trading%2f", "/api/trading;x=1", "/api/trading?a=b", "/API/trading", "/Api/trading"]
+    for p in shapes:
+        r = c.get(p)
+        assert not (r.status_code == 200 and '"state"' in r.text), p
+
+
+def test_every_api_route_declares_the_auth_dependency(env):
+    """路由级保证:app.routes 里每个 /api 路由都挂着鉴权依赖(不是只靠中间件)。"""
+    _, settings = env
+    app = appmod.create_app(settings, TOKEN)
+    api_routes = [r for r in app.routes if getattr(r, "path", "").startswith("/api")]
+    assert api_routes
+    for r in api_routes:
+        deps = [d.call for d in r.dependant.dependencies]
+        assert app.state.require_token in deps, r.path

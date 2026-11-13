@@ -19,7 +19,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -103,32 +103,24 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
                mono: Callable[[], float] = time.monotonic) -> FastAPI:
     app = FastAPI(title="invest 状态页", docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     site = StaticSite(settings.paths["static_dir"])
-    limiter = auth.RateLimiter(settings.raw["rate_limit_per_minute"], mono)
+    limiter = auth.RateLimiter(settings.raw["rate_limit_per_minute"], mono)            # 已鉴权请求
+    fail_limiter = auth.RateLimiter(settings.raw["rate_limit_per_minute"] // 4 or 1, mono)   # 鉴权失败请求:更严,专门防暴力猜测
     app.state.settings, app.state.site = settings, site
 
     def respond(payload) -> JSONResponse:
         """唯一的 JSON 出口:先净化(令牌也作为已知秘密脱敏),再序列化。"""
         return JSONResponse(sanitize(payload, secrets=[token]), headers={"Cache-Control": "no-store"})
 
-    # ---- 中间件:方法白名单、安全响应头、/api 限流与鉴权 ----
+    # ---- 中间件:方法白名单与安全响应头。鉴权不在这里——它挂在每个 API 路由的依赖项上(见 require_token) ----
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        path = request.url.path
         if request.method not in ALLOWED_METHODS:
             resp = error_response(405, "方法不允许", headers={"Allow": ", ".join(ALLOWED_METHODS)})
-        elif path == "/api" or path.startswith("/api/"):
-            wait = limiter.check()
-            if wait is not None:
-                resp = error_response(429, "请求过于频繁", headers={"Retry-After": str(int(wait) + 1)})
-            elif not auth.token_matches(token, request.headers.get("authorization")):
-                resp = error_response(401, "未授权", headers={"WWW-Authenticate": "Bearer"})
-            else:
-                resp = await call_next(request)
         else:
             resp = await call_next(request)
         for k, v in SECURITY_HEADERS.items():
             resp.headers[k] = v
-        if path.startswith("/api"):
+        if request.url.path.startswith("/api"):
             resp.headers["Cache-Control"] = "no-store"
         return resp
 
@@ -136,7 +128,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException):
         status = exc.status_code
-        return error_response(status, {404: "不存在", 405: "方法不允许"}.get(status, "请求失败"), headers=getattr(exc, "headers", None))
+        text = {401: "未授权", 404: "不存在", 405: "方法不允许", 429: "请求过于频繁"}.get(status, "请求失败")
+        return error_response(status, text, headers=getattr(exc, "headers", None))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
@@ -146,7 +139,26 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     async def unexpected(request: Request, exc: Exception):
         return error_response(500, "服务器内部错误", code="internal")
 
+    def require_token(request: Request) -> None:
+        """路由级鉴权:命中 API 路由就必然经过这里,不依赖路径字符串前缀(审查发现:前缀判断与路由匹配是两套规则,容易分叉)。
+        鉴权失败与已鉴权请求分桶限流:本机任何进程用垃圾请求都挤不掉合法用户,而暴力猜测仍受更严的限制。"""
+        if not auth.token_matches(token, request.headers.get("authorization")):
+            wait = fail_limiter.check()
+            if wait is not None:
+                raise StarletteHTTPException(429, headers={"Retry-After": str(int(wait) + 1)})
+            raise StarletteHTTPException(401, headers={"WWW-Authenticate": "Bearer"})
+        wait = limiter.check()
+        if wait is not None:
+            raise StarletteHTTPException(429, headers={"Retry-After": str(int(wait) + 1)})
+
+    app.state.require_token = require_token
+
     def get(path: str):
+        """API 路由:一律 GET/HEAD,且一律带鉴权依赖。"""
+        return app.api_route(path, methods=list(ALLOWED_METHODS), dependencies=[Depends(require_token)])
+
+    def get_public(path: str):
+        """静态页与 SPA 回退:无数据,不需要令牌。"""
         return app.api_route(path, methods=list(ALLOWED_METHODS))
 
     # ---- API:全部只读 ----
@@ -204,14 +216,14 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
             return FileResponse(site.lookup("index.html"), media_type="text/html", headers={"Cache-Control": "no-cache"})
         return HTMLResponse(PLACEHOLDER, headers={"Cache-Control": "no-cache"})
 
-    @get("/")
+    @get_public("/")
     def root():
         return index_response()
 
-    @get("/{rel_path:path}")
+    @get_public("/{rel_path:path}")
     def static_or_spa(rel_path: str):
-        if rel_path == "api" or rel_path.startswith("api/"):
-            return error_response(404, "不存在")
+        if rel_path == "api" or rel_path.startswith("api/") or rel_path.startswith("/") or "//" in rel_path:
+            return error_response(404, "不存在")                                   # /api 一律不进前端;含双斜杠的歧义路径不进前端
         path = site.lookup(rel_path)
         if path is not None:
             headers = {"Cache-Control": "public, max-age=31536000, immutable" if rel_path.startswith("assets/") else "no-cache"}

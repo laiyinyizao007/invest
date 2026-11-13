@@ -94,7 +94,7 @@ def _resolve(root: Path, rel: str, what: str) -> Path:
 def load(path: Path | None = None, root: Path = ROOT) -> Settings:
     """读配置(缺文件用默认值),校验取值与路径。非法即抛 ConfigError,由入口转为拒绝启动。"""
     raw = json.loads(json.dumps(DEFAULTS))
-    cfg_path = CONFIG_PATH if path is None else path
+    cfg_path = (root / "config" / "status_dashboard.json") if path is None else path       # 缺省配置跟着 root 走
     if cfg_path.exists():
         try:
             over = json.loads(cfg_path.read_text(encoding="utf-8"))

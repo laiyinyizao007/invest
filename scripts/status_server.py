@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"警告: 前端清单里有 {len(app.state.site.rejected)} 个文件缺失或哈希不符,不会被托管: {app.state.site.rejected[:5]}", file=sys.stderr)
     if not app.state.site.has_index:
         print("提示: 尚未找到前端构建产物(dashboard/static/manifest.json),将显示占位页;API 可正常使用。")
-    uvicorn.run(app, host=settings.raw["host"], port=settings.raw["port"], log_level="warning", access_log=False)
+    uvicorn.run(app, host=settings.raw["host"], port=settings.raw["port"], log_level="warning", access_log=False, server_header=False)
     return 0
 
 
