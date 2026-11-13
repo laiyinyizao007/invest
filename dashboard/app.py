@@ -59,7 +59,7 @@ FRONTEND_ROUTES = (
     re.compile(r"^research/runs/[0-9]{8}-[0-9]{6}-[0-9]{6}$"),
     # 阶段②-⑤ 的页面:后端对应阶段上线前前端不显示入口,但直接访问深链接时仍应得到前端页面(由前端按 capabilities 处理)
     re.compile(r"^(live|equity|control|audit|nodes|data|drills|config)$"),
-    re.compile(r"^research/(runs|candidates/[a-z0-9_]{1,40}\.py)$"),
+    re.compile(r"^research/(runs|evolution|candidates/[a-z0-9_]{1,40}\.py)$"),
 )
 
 ERROR_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "bad_request",
