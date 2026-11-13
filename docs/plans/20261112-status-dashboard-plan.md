@@ -530,42 +530,48 @@ days/alerts/research 在有内容读不出来时 `state=unknown`(data 仍保留;
 **已知风险(如实写明)**:未逐次核实『连接断开』之后是否都成功重连——只看了关键字分级。`委托被拒`与`账户变更`不是网络抖动
 (前者可能是策略在发有问题的单子,后者可能有人动过账户),本次按用户选择一并放过;若日后想更稳妥,可改为只放过网络类警告。
 
-## 推送状态(2026-11-13)——**推送已暂停,待用户决定**
+## 推送状态(2026-11-13)——**核查已完成,可推送,待用户确认**
 
-**先说结论**:本地 `main` 领先 `origin/main` 212 个提交,技术上可以普通推送(`origin/main` 是它的祖先,无需强推);
-**但推送前核查发现了一个必须先处理的问题,所以暂停。**
+本地 `main` 领先 `origin/main` **212 个提交**(作者均为同一人;含引擎侧会话提交到 `main` 的内容)。`origin/main` 是它的祖先,
+**普通 `git push` 即可,无需强推,不会改写远端历史。**
 
-### 发现:两个券商 `.rar` 误入库,且已随两个远端分支发出
+### 推送前核查发现并处理的问题:两个券商 `.rar` 误入库
 
-- 文件:`docs/API--整个文件包发送给客户.rar`(约 20 MB)与 `docs/API--整个文件包发送给客户-无乱码.rar`(约 19 MB)——**券商发来的 API 文件包**。
-- 入库提交:`e7372f8`(`fix(dashboard): G8 第2轮(codex)剩余发现……`,2026-11-12)。提交说明是 dashboard 的,但同一提交里还有 `scripts/drill.py`、`scripts/use_env.py`
-  的改动,说明当时有别的未提交内容被一起扫进去。**很可能是批量 `git add -A docs` 误带入**(`.gitignore` 里的 `docs/API--*/` 带斜杠,只匹配目录,不匹配这两个文件),
-  不能排除是我(状态页这一侧)的操作。`.gitignore` 第 28 行的注释写明『券商原始文件,不入库』——入库违背了本意。
-- **内容**:用本机 `.env` 的 `BROKER_TEST_CONTACT` / `BROKER_TEST_SUBMITTER`(都是 2 个字的中文值)在历史里搜,两个 `.rar` 的字节里都含该值。
-  2 个字的值有巧合命中的可能,**我无法确认它就是真实姓名**——但按『真实个人信息不进版本库,与仓库是否私有无关』的规则,不能当作巧合放过。
-- **已经发出去了**:含 `e7372f8` 的远端分支有 `origin/feat/16-constitution`、`origin/feat/16-ladder-eta`(各含这 2 个 `.rar`)。
-  `origin/main` 与 `origin/feat/14-guoxin-new-template` **不含**。本地 `main`、`feat/15-trial-ledger-dsr`、`feat/16-constitution`、`fix/constitution-round7` 也含。
-  **若现在推送 `main`,它们会首次出现在远端 `main` 上。**
-- 其余核查:`.env` 里 `BROKER_TEST_EMAIL` / `PHONE` / `SYSTEM_NAME`、`CTP_USERNAME`、`WEBHOOK_TELEGRAM_CHAT_ID` 在将被推送的提交里**均无命中**;
-  `BROKER_TEST_ALLOWED_MD/TD` 命中的是 SimNow 公开前置地址、`BROKER_TEST_VERSION` 命中的是版本号字符串,都不是个人信息;
-  对代码改动按 `api_key / secret / password / token = 长串` 模式扫描无命中。**将被推送的范围里新增的非源码文件只有这两个 `.rar` 与 `docker/research/Dockerfile`。**
+- 文件:`docs/API--整个文件包发送给客户.rar`(约 20 MB)与 `…-无乱码.rar`(约 19 MB)——券商发来的 API 文件包。`.gitignore` 第 28 行注释写明『券商原始文件,不入库』。
+- 入库提交:`e7372f8`(2026-11-12,提交说明是 dashboard 的,但同一提交里还有 `scripts/drill.py`、`scripts/use_env.py` 的改动,说明当时有别的未提交内容被一起扫进去)。
+  很可能是批量 `git add -A docs` 误带入;`.gitignore` 里的 `docs/API--*/` 带斜杠,只匹配目录,不匹配这两个文件。**不能排除是状态页这一侧的操作。**
+- **个人信息担忧已撤销**:我曾发现两个文件的字节里含 `.env` 的 `BROKER_TEST_CONTACT/SUBMITTER`(2 个字的中文值),**用户确认该值不是真实姓名**,属于占位/巧合。
+- **压缩包内容未能核实**:文件名为空或不可读(GNU tar 与 Windows bsdtar 都读不出条目名),没有解压查看。券商的文件包通常是 SDK/文档,但这是推测。
+- **已随远端分支发出**:含 `e7372f8` 的 `origin/feat/16-constitution`、`origin/feat/16-ladder-eta` 已带着这两个文件(`origin/main` 与 `origin/feat/14-guoxin-new-template` 不含)。
+  **git 对象在远端是共享的:这些 blob 已经在远端对象库里,推送 `main` 不会新增任何暴露**,只是让 `main` 也引用它们——而本次提交(`204347a`)已把它们从 `main` 的最新树里取消跟踪。
 
-### 为什么我之前的建议要收回
+### 已做的处理(`204347a`,不改写历史)
 
-我之前建议『现在就推 main、不必删备份分支』,理由里有一条是『远端是私有仓库』。**这正是用户明确不认同的理由**(规则无条件适用),我不该拿它来放宽判断;
-而且当时的扫描只看了代码改动,没有扫二进制文件的字节。
+1. `git rm --cached`:取消跟踪两个文件,**本机文件保留**。
+2. `.gitignore` 加 `*.rar` / `*.7z` / `*.zip`(只把我自己的几行放进暂存区,**没有带走引擎侧会话未提交的 `.env.*` 改动**)。
+3. 新增 `tests/test_no_binary_blobs_tracked.py`:被跟踪的文件里不得有压缩包、不得超过 5 MB、`docs/` 下的压缩包必须被 `.gitignore` 忽略。
+   补的是 `tests/test_no_personal_data.py` 的盲区——它为了跳过二进制而**不检查大于 2 MB 的文件**,所以两道防线都没拦住。修复前该测试三项全红。
 
-### 待用户决定(我没有擅自动手——这些都涉及改写历史或对外强推)
+**没有改写历史**:这两个 blob 仍留在 `e7372f8` 起的历史里。彻底清除需要改写 212 个提交并**强推两个引擎侧分支**(破坏性、对外可见、会让引擎侧会话的分支分叉),
+在个人信息担忧已撤销的前提下不值得。若日后仍想清除,须先与引擎侧会话协调,并另行取得明确同意。
 
-1. **先确认**:这两个 `.rar` 里的 2 字值是不是真实姓名?(我没有打印该值,也无法替你判断。)
-2. **本地**:清理未推送的历史——先**新建一个新的备份分支**,再把这两个文件从 `main` 及含 `e7372f8` 的本地分支里剔除(改写这些提交的哈希)。
-   **注意**:`feat/15-trial-ledger-dsr`、`feat/16-constitution`、`fix/constitution-round7` 属于引擎侧会话的工作,**必须先与它协调**,否则它的分支会与改写后的历史分叉。
-3. **远端**:`origin/feat/16-constitution`、`origin/feat/16-ladder-eta` 已含这两个文件。清掉它们需要**强推这两个分支**(破坏性、对外可见,且会影响引擎侧会话)——须用户明确同意;
-   即使强推,文件也可能仍留在 GitHub 对象缓存里,仓库私有只是缩小了暴露面。
-4. **无论哪种**:加一条 `.gitignore` 规则(如 `docs/API--*.rar`),并让提交前守卫拒绝 `docs/` 下的二进制压缩包,防止再发生。
-5. **清理完成之前不要推 `main`。** `backup/pre-scrub-20261112` 与 `refs/original` 继续保留(不删),它们是仅本地的引用,显式推送 `main` 不会带上它们。
+### 其余核查(均干净)
 
-- issue #12 保持打开。工作区里 `.gitignore` 与 `Dockerfile` 的未提交改动属于引擎侧会话,不会随推送发出。
+`.env` 里的 `BROKER_TEST_EMAIL` / `PHONE` / `SYSTEM_NAME`、`CTP_USERNAME`、`WEBHOOK_TELEGRAM_CHAT_ID` 在将被推送的提交里**均无命中**;
+`BROKER_TEST_ALLOWED_MD/TD` 命中的是 SimNow 公开前置地址,`BROKER_TEST_VERSION` 命中的是版本号字符串,都不是个人信息;
+对代码改动按 `api_key / secret / password / token = 长串` 扫描无命中。待推送范围里新增的非源码文件只有那两个 `.rar` 与 `docker/research/Dockerfile`。
+
+### 关于备份分支与推送
+
+- `backup/pre-scrub-20261112` 与 `refs/original/refs/heads/main`(同指 `7981913`)是**仅本地**引用,远端没有它们的提交;**显式推送 `main`(`git push origin main`)不会带上它们**。
+  备份保存着清洗历史之前的 4 个提交,是唯一的回退依据,**确认清洗结果无误后再删**。
+- 工作区里 `.gitignore`(`.env.*` 一段)与 `Dockerfile` 的未提交改动属于引擎侧会话,**不会**随推送发出。issue #12 保持打开。
+- **推送是对外可见的动作,须经用户确认后才执行。**
+
+### 复盘:这次核查暴露的两个盲点
+
+1. **只扫代码改动、不扫二进制字节**:第一次扫描漏了这两个文件;是拿 `.env` 的值去搜历史才发现的。
+2. **拿『远端是私有仓库』放宽判断**:这是用户明确不认同的理由(规则无条件适用),我曾把它写进推送建议里,事后收回。
 
 ## 收口时的已知项(不阻断,按 codex 建议转为文档条目)
 
