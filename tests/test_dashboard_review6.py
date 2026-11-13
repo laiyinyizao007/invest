@@ -208,5 +208,5 @@ def test_the_campaign_list_says_honestly_when_it_did_not_scan_every_campaign(tmp
     settings = appconfig.load(path=root / "none.json", root=root)
     monkeypatch.setattr(col, "MAX_CAMPAIGNS_SUMMARIZED", 2)
     r = col.collect_evolution(settings, 1_800_000_000.0)
-    texts = json.dumps(r.section["data"], ensure_ascii=False)
-    assert "未统计" in texts and "未检查" in texts
+    assert r.section["data"]["unscanned"] == 3
+    assert "未检查" in (r.section["message"] or "")

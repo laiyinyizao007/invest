@@ -332,37 +332,11 @@ def read_heatmap(directory: Path, run_id: str) -> dict | None:
 def candidate_source(directory: Path, sha256: str) -> str | None:
     """按哈希取候选源码。目录里找不到就返回 None(不猜、不按名字找)。
 
-    目录里的每个候选都要读一遍才算哈希,所以**按目录内容缓存**:候选是只增不改的(批准后改动会被拒绝),
-    缓存键是 (文件名, 大小, mtime)。
+    **不做缓存**:候选只有几十个、每个 ≤256 KB,读一遍算哈希也就几十毫秒;
+    而按元数据(大小/mtime)做缓存会在『同长度改写并恢复 mtime』后返回旧源码——审阅接口给出
+    磁盘上已经不存在的代码,比慢更糟。
     """
-    key = (str(directory), sha256)
-    cached = _SOURCE_CACHE.get(key)
-    if cached is not None and cached[0] == _directory_signature(directory):
-        return cached[1]
-    source = _scan_candidate_source(directory, sha256)
-    if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX:
-        _SOURCE_CACHE.clear()
-    _SOURCE_CACHE[key] = (_directory_signature(directory), source)
-    return source
-
-
-_SOURCE_CACHE: dict[tuple[str, str], tuple[tuple, str | None]] = {}
-_SOURCE_CACHE_MAX = 64
-
-
-def _directory_signature(directory: Path) -> tuple:
-    """目录内容的指纹(每个 .py 的名字、大小、mtime)。变了就重新扫描。"""
-    items = []
-    try:
-        for path in sorted(directory.glob("*.py")):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            items.append((path.name, stat.st_size, stat.st_mtime))
-    except OSError:
-        return ()
-    return tuple(items)
+    return _scan_candidate_source(directory, sha256)
 
 
 def _scan_candidate_source(directory: Path, sha256: str) -> str | None:

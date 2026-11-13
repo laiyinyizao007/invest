@@ -3217,10 +3217,25 @@
             "items": {
               "$ref": "#/components/schemas/EvolutionCampaign"
             }
+          },
+          "total": {
+            "type": "integer",
+            "description": "战役总数"
+          },
+          "checked": {
+            "type": "integer",
+            "description": "本次实际统计的战役数"
+          },
+          "unscanned": {
+            "type": "integer",
+            "description": "未检查的战役数(>0 时区块级别为 warn)"
           }
         },
         "required": [
-          "campaigns"
+          "campaigns",
+          "total",
+          "checked",
+          "unscanned"
         ],
         "additionalProperties": true
       },

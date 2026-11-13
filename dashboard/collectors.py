@@ -990,10 +990,8 @@ class EvolutionUnavailable(Exception):
 # 而前端每 30 秒轮询一次。缓存键是 (路径, 大小, mtime):追加写会让后两者都变,缓存自然失效。
 # **前提**:台账由我们自己的引擎写(只追加);对项目目录有写权限的本地攻击者本来就在威胁模型之外
 # (见 ADR 20261112-status-dashboard.md 的令牌创建竞态一节)。曲线与日志接口**不读缓存**,每次现读。
-_EVOLUTION_SUMMARY_CACHE: dict[tuple[str, int, float], dict] = {}
+_EVOLUTION_SUMMARY_CACHE: dict[tuple[str, str], dict] = {}
 _EVOLUTION_CACHE_MAX = 64
-MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
-MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
 MAX_CAMPAIGNS_SUMMARIZED = 50          # 一次最多统计多少个战役(超出的如实说明,不装作已看过)
 
 
@@ -1005,7 +1003,9 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
         stat = path.stat()
     except OSError as exc:
         raise ev.EvolutionError("台账无法读取") from exc
-    key = (str(path), stat.st_size, stat.st_mtime)
+    # 缓存键是**内容哈希**,不是元数据:同长度改写并恢复 mtime 后,元数据看不出来,哈希能。
+    # 台账最大 8 MB,算一次哈希比重新解析整份台账便宜得多。
+    key = (str(path), _file_digest(path))
     cached = _EVOLUTION_SUMMARY_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1027,6 +1027,20 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
     return summary
 
 
+def _file_digest(path: Path) -> str:
+    """文件内容的 SHA-256。读不了就返回空串(下面的读取会再报一次错)。"""
+    import hashlib
+
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
 def collect_evolution(settings: Settings, now: float) -> Result:
     """进化战役列表。可选子系统:没有战役时是 missing,不计入总体级别(不因为还没跑进化就显示整体异常)。"""
     directory = settings.paths["evolution_dir"]
@@ -1039,20 +1053,25 @@ def collect_evolution(settings: Settings, now: float) -> Result:
         except ev.EvolutionError as exc:
             campaigns.append({"campaign_id": name, "generations": 0, "latest_generation": None, "records": 0,
                               "updated_at": None, "best_sharpe": None, "state": "corrupt", "message": str(exc)})
-    if unscanned:
-        campaigns.append({"campaign_id": f"(还有 {unscanned} 个战役未统计)", "generations": 0, "latest_generation": None,
-                          "records": 0, "updated_at": None, "best_sharpe": None, "state": "unknown",
-                          "message": f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,更早的 {unscanned} 个未检查"})
-    data = {"campaigns": campaigns}
+    data = {"campaigns": campaigns, "total": len(names), "checked": len(names) - unscanned, "unscanned": unscanned}
     state = "ok" if campaigns else "missing"
     message = None if campaigns else "还没有进化战役(引擎侧还没开始产生记录)"
+    reasons: list[dict] = []
+    if unscanned:
+        # **没检查 ≠ 没问题**:剩下的战役可能有坏台账,区块不能显示正常。
+        message = ";".join(filter(None, [message, f"一次最多统计 {MAX_CAMPAIGNS_SUMMARIZED} 个战役,"
+                                                 f"更早的 {unscanned} 个未检查(它们的状态未知)"]))
+        reasons.append(_reason("evolution", "warn",
+                                f"还有 {unscanned} 个战役未检查:它们的状态未知,不能当作正常"))
     # 台账损坏 = 无法判断这个战役的状态,整体不能显示正常(『不制造虚假安心』)
     broken = [c["campaign_id"] for c in campaigns if c["state"] == "corrupt"]
-    reasons = [_reason("evolution", "warn", f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断")] if broken else []
     if broken:
         message = ";".join(filter(None, [message, f"{len(broken)} 个战役的台账损坏或读不了"]))
-        state = "ok"                       # 区块数据仍然可用(其它战役正常),但级别与横幅要说清楚
-        level, headline = "warn", f"{len(campaigns)} 个战役({len(broken)} 个台账损坏)"
+        reasons.append(_reason("evolution", "warn",
+                                f"{len(broken)} 个战役的台账损坏或读不了:这些战役的状态无法判断"))
+        level, headline = "warn", f"已检查 {data['checked']}/{data['total']} 个战役({len(broken)} 个台账损坏)"
+    elif unscanned:
+        level, headline = "warn", f"已检查 {data['checked']}/{data['total']} 个战役"
     else:
         level, headline = ("ok", f"{len(campaigns)} 个战役") if campaigns else ("unknown", "暂无战役")
     return Result(m.section(state, data, now=now, message=message), level, headline, reasons)

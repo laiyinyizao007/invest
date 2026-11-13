@@ -390,6 +390,9 @@ export interface WhoAmI {
 /** 战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。 */
 export interface EvolutionList {
   campaigns: Array<EvolutionCampaign>;
+  total: number;
+  checked: number;
+  unscanned: number;
 }
 
 export interface EvolutionCampaign {

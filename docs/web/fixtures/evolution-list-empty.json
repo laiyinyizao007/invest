@@ -1,3 +1,6 @@
 {
-  "campaigns": []
+  "campaigns": [],
+  "total": 0,
+  "checked": 0,
+  "unscanned": 0
 }
