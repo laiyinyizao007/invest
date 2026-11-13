@@ -258,3 +258,15 @@ def test_zero_width_characters_outside_a_path_are_left_byte_identical():
     """净化不应改动与路径无关的原文。"""
     text = "文本" + chr(0x200B) + "中间" + chr(0x200E) + "结束"
     assert safe.scrub_text(text) == text
+
+
+def test_a_huge_percent_encoded_blob_does_not_cost_unbounded_work():
+    """净化在**输出**末尾才截断,于是输入多大就要处理多大:8 轮解码会被放大。
+    输入也要先截断(截掉的部分本来也不会显示,不会泄露)。"""
+    import time
+
+    blob = "%2f" * 200_000
+    t0 = time.perf_counter()
+    out = safe.scrub_text("x " + blob + " y")
+    assert time.perf_counter() - t0 < 0.2, "净化耗时过长"
+    assert len(out) <= safe.MAX_STR

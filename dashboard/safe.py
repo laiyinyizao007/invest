@@ -124,7 +124,13 @@ def _scrub_encoded_token(match: re.Match) -> str:
 
 
 def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) -> str:
-    """文本净化。保留换行与普通内容,只替换已知的泄露形态。"""
+    """文本净化。保留换行与普通内容,只替换已知的泄露形态。
+
+    **输入先截断**:否则净化在输出末尾才截断,输入多大就要处理多大——一个几百 KB 的百分号串
+    会让 8 轮解码做很久(实测 600 KB 要 300 毫秒)。被截掉的部分本来也不会显示,不会泄露。
+    """
+    if len(text) > limit + 1:                # 多留一个字符:末尾的 clip 仍能加上省略号
+        text = text[: limit + 1]
     out = redact(text, secrets)
     out = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _COOKIE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
