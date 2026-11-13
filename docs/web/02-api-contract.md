@@ -51,6 +51,10 @@
 
 **判断规则(前端)**:先看 `state`,再决定是否渲染 `data`。`state` 非 `ok` 时,绝不能用绿色表示『正常』。
 
+> **注意:有两个都叫 `level` 但取值不同的字段**,别混:
+> - **区块的 `level`**(就是上面这个):`ok` / `warn` / `critical` / `unknown` —— 徽标用;
+> - **事件的 `level`**(`data.days[].events[].level`、`data.recent[].level`):`severe` / `warning` —— 是『这件事有多严重』,与无人值守日志的口径一致。
+
 `GET /api/overview` 和 `GET /api/meta` 不是区块,没有这层外壳。
 
 ## 4. 总体级别(Overview)
