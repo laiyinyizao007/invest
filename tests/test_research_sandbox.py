@@ -70,6 +70,18 @@ def test_screen_reports_syntax_error_instead_of_crashing():
     assert any("语法" in f for f in rs.screen_source("def (:\n"))
 
 
+@pytest.mark.parametrize("src, needle", [
+    ("operator.attrgetter('__dict__')(self)\n", "__dict__"),
+    ("x.__class__.__bases__\n", "__class__"),
+])
+def test_screen_flags_forbidden_attr_names_used_as_strings(src, needle):
+    """属性名当字符串用,能绕开"禁止访问 __dict__"的属性写法。
+
+    operator.attrgetter('__dict__')(self) 的调用点看不出访问的是什么,只有字符串本身露馅。"""
+    findings = rs.screen_source(src)
+    assert findings and any(needle in f for f in findings), findings
+
+
 # ---------- 子进程环境白名单 ----------
 
 def test_sandbox_env_drops_trading_credentials_and_unknown_vars():

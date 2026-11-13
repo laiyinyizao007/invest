@@ -87,6 +87,10 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
             findings.append(f"第 {node.lineno} 行: 禁止调用 {node.func.id}()")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
+        # 属性名当字符串用:operator.attrgetter('__dict__')(self) 能绕开"禁止访问 __dict__"的
+        # 属性写法(调用点看不出访问的是什么)。这些名字作为字符串出现时一律拒绝。
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_ATTRS:
+            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.value} 字符串")
     return findings
 
 

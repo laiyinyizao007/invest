@@ -102,8 +102,10 @@ def test_param_grid_literal_must_not_name_protected_parameters():
     assert any("risk_budget" in f and "param_grid" in f for f in screen(src))
 
 
-def test_syntax_errors_are_left_to_the_sandbox_screener():
-    assert screen("class C(:\n") == []
+def test_syntax_errors_fail_closed():
+    """解析不过就等于没筛查,返回空列表会让"没查"看起来像"查过没问题"。"""
+    findings = screen("class C(:\n")
+    assert findings and any("语法错误" in f for f in findings), findings
 
 
 # ---------- 清单文件:只能追加 ----------
@@ -425,6 +427,22 @@ def test_defining_mutation_dunders_is_rejected(snippet):
     src = f"class C:\n    {snippet}\n"
     findings = screen(src)
     assert findings, snippet
+
+
+@pytest.mark.parametrize("snippet", [
+    "f = object.__setattr__\nf(self, 'risk_budget', 10**12)",
+    "f = type.__setattr__\nf(self, 'risk_budget', 10**12)",
+    "f = object.__delattr__\nf(self, 'risk_budget')",
+])
+def test_aliasing_a_mutation_dunder_is_rejected(snippet):
+    """先取别名再调用同样能改写属性,而调用点已经看不出是谁。
+
+    只拦"直接调用 object.__setattr__(...)"是不够的:`f = object.__setattr__` 之后
+    `f(self, "risk_budget", 1e12)` 的调用点是裸名,静态层看不出被调用的是什么。
+    因此受禁 dunder 的**任何引用**都要拦。"""
+    src = f"class C:\n    def entry_signal(self):\n        {snippet}\n        return 0\n"
+    findings = screen(src)
+    assert findings, f"未拦下: {snippet}"
 
 
 def test_runtime_rejects_a_candidate_defining_setattr():

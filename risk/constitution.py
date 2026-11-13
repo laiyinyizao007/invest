@@ -228,13 +228,13 @@ def _is_protected(name: str, c: Constitution) -> bool:
 def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     """静态筛查:返回可疑构造的中文说明;空列表表示未发现问题。**不是安全保证**,只是纵深防御的一层。
 
-    语法错误不在这里报(由 `research_sandbox.screen_source` 统一报告),本函数对语法错误返回空列表。
+    语法错误在这里报(fail-closed):解析不过就等于没筛查,返回空列表会让"没查"看起来像"查过没问题"。
     静态层不判断"是否重写了模板成员"——模板成员名单要到运行时才知道;那一层由 `check_class` 负责。"""
     c = c or default()
     try:
         tree = ast.parse(source)
-    except SyntaxError:
-        return []
+    except SyntaxError as exc:
+        return [f"语法错误: {exc.msg} (第 {exc.lineno} 行)"]
 
     findings: list[str] = []
     for node in ast.walk(tree):
@@ -276,17 +276,18 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {target.attr}")
             elif isinstance(target, ast.Name) and _is_protected(target.id, c):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
-        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Del):
-            if _is_protected(node.attr, c):
+        elif isinstance(node, ast.Attribute):
+            # 受禁 dunder 的**任何引用**都要拦,不只调用:`f = object.__setattr__` 之后
+            # `f(self, "risk_budget", 1e9)` 同样能改写实例属性,而调用点已经看不出是谁了。
+            if node.attr in BUILTIN_FORBIDDEN_DUNDERS:
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.attr}(可绕过属性改写检查)")
+            elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute):
                 if func.attr in c.forbidden_order_calls:
                     findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.attr})")
-                elif func.attr in BUILTIN_FORBIDDEN_DUNDERS:
-                    # object.__setattr__(self, "risk_budget", 1e9):改写实例属性,绕开静态赋值检查
-                    findings.append(f"第 {node.lineno} 行: 禁止通过 {func.attr}() 改写属性")
             elif isinstance(func, ast.Name):
                 if func.id in c.forbidden_order_calls:
                     findings.append(f"第 {node.lineno} 行: 禁止直接下单/撤单({func.id})")
