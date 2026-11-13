@@ -222,11 +222,26 @@ def _class_body_names(node: ast.ClassDef) -> set[str]:
 
 
 def _is_protected(name: str, c: Constitution) -> bool:
+    """名字是否受保护。
+
+    两个集合是**各自独立**的:清单文件里两者有交集时 `load()` 会拒绝加载,内置常量里
+    `BUILTIN_PROTECTED_NAMES` 已包含 `BUILTIN_PROTECTED_PARAMETERS`。这里仍然查两遍,
+    免得"参数只登记在 protected_parameters"时被漏掉。
+    """
     return name in c.protected_names or name in c.protected_parameters
 
 
 def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     """静态筛查:返回可疑构造的中文说明;空列表表示未发现问题。**不是安全保证**,只是纵深防御的一层。
+
+    检查项:
+    - 类体内覆盖受保护成员或方法
+    - 类体内定义受禁 dunder(如 `__setattr__`)
+    - 自定义 metaclass、使用类装饰器
+    - 实例上改写或删除受保护属性
+    - 改写受保护的风控模块函数
+    - 引用受禁 dunder(裸名或别名)、引用下单/撤单接口(裸名或别名)
+    - `param_grid` 字面量里含受保护参数
 
     语法错误在这里报(fail-closed):解析不过就等于没筛查,返回空列表会让"没查"看起来像"查过没问题"。
     静态层不判断"是否重写了模板成员"——模板成员名单要到运行时才知道;那一层由 `check_class` 负责。"""
