@@ -156,12 +156,44 @@ def test_stability_is_skipped_off_session(tmp_path):
         e.main.close()
 
 
-def test_stability_restores_limits_even_if_sending_raises(env, monkeypatch):
+def test_stability_send_exception_becomes_failed_evidence_and_restores_limits(env, monkeypatch):
     limit = env.risk.rules["每日上限检查"].total_order_limit
     monkeypatch.setattr(bt, "send", lambda ctx, req: (_ for _ in ()).throw(RuntimeError("boom")))
-    with pytest.raises(RuntimeError):
-        bt.step_stability(env.ctx, env.book, total=3)
+    bt.step_stability(env.ctx, env.book, total=3)                    # 不再把异常抛出去:否则整次运行的证据都丢了
+    ev = item(env, "P1.3")
+    assert ev.status == be.FAIL and "boom" in ev.summary
     assert env.risk.rules["每日上限检查"].total_order_limit == limit
+
+
+def test_stability_cleanup_exception_still_restores_limits_and_cancel_count(env, monkeypatch):
+    daily, guard = env.risk.rules["每日上限检查"], env.rule
+    before = (daily.total_order_limit, guard.cancel_lock_limit, guard.cancel_count)
+    env.ctx.stability_interval = 0
+    monkeypatch.setattr(bt, "cancel_active", lambda ctx, ids: (_ for _ in ()).throw(RuntimeError("cancel boom")))
+    bt.step_stability(env.ctx, env.book, total=3)
+    ev = item(env, "P1.3")
+    assert ev.status == be.FAIL and "cancel boom" in ev.summary
+    assert (daily.total_order_limit, guard.cancel_lock_limit, guard.cancel_count) == before
+
+
+def test_stability_fails_when_orders_are_still_active_after_cleanup(env, monkeypatch):
+    env.ctx.stability_interval = 0
+    env.ctx.stability_wait = 0.0
+    monkeypatch.setattr(bt, "cancel_active", lambda ctx, ids: None)           # 撤单没发出去:订单仍然挂着
+    bt.step_stability(env.ctx, env.book, total=3)
+    ev = item(env, "P1.3")
+    assert ev.status == be.FAIL and "未清场 3" in ev.summary
+    assert any("未确认撤销" in line for line in ev.shots[0].lines)
+
+
+def test_final_safety_reports_orders_that_stay_active(env, monkeypatch):
+    env.gw.mode = "accept"
+    oid = bt.send(env.ctx, bt.make_req(env.ctx, price=bt.probe_price(env.ctx)))
+    assert oid
+    monkeypatch.setattr(bt, "FINAL_CANCEL_WAIT", 0.0)
+    monkeypatch.setattr(env.main, "cancel_order", lambda *a, **k: None)        # 撤单请求被吞掉
+    notes = bt.final_safety(env.ctx)
+    assert any("⚠⚠" in n and "未确认撤销" in n for n in notes)
 
 
 def test_stability_is_gated_by_flat_check_like_other_order_steps():

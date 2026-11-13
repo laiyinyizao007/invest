@@ -308,7 +308,7 @@ class Outcome:
 COVER2 = "程序化补充测试报告"
 EXTERNAL_ITEMS = ("P1.1", "P1.2", "P1.3")              # 「外部接入系统测试」部分(模板 1.1/1.2/2.1);其余为程序化补充测试
 SECTION_NO = {no: item for item, no in TEMPLATE_NO.items()}
-HEADING = re.compile(r"^([1-7])\.([1-9])")
+HEADING = re.compile(r"^([1-7])\.([1-9])(?!\d)")
 
 
 def split_parts(doc: Docx) -> tuple[int, int, int]:
@@ -364,6 +364,17 @@ def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
     pic = picture_paragraph(doc, png, f"{ev.item}-{shot.label or 'shot'}", _PIC_ID[0])
     last.addnext(pic)
     return pic
+
+
+def find_numbered_row(table, number: str):
+    """按章节编号找行:编号后不能紧跟数字(「1.1」不能命中「1.10」)。"""
+    pattern = re.compile(rf"^{re.escape(number)}(?!\d)")
+    for tr in table.findall(TR):
+        cells = tr.findall(TC)
+        for idx, tc in enumerate(cells):
+            if pattern.match(text_of(tc).strip()):
+                return tr, cells, idx
+    return None
 
 
 def _results_table(tables: list):
@@ -426,15 +437,18 @@ def fill_report(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome
     else:
         passed = {"external": True, "programmatic": True}
         for item, number in TEMPLATE_NO.items():
-            hit = find_row(results, number)
+            part = "external" if item in EXTERNAL_ITEMS else "programmatic"
+            hit = find_numbered_row(results, number)
             if not hit:
                 outcome.warnings.append(f"报告:找不到「{number}」结果行")
+                if is_mandatory(item):                 # 必测项的行都找不到:结论不可判定,绝不能勾「通过」
+                    passed[part] = False
+                    outcome.missing.append(f"{ITEMS[item]}:模板里找不到「{number}」结果行,结论不可判定")
                 continue
             cells, col = hit[1], hit[2]
             ev = evs.get(item)
             choice = result_choice(ev, item, three_way=not is_mandatory(item))
             set_checks(cells[col + 1], {choice} if choice else set())
-            part = "external" if item in EXTERNAL_ITEMS else "programmatic"
             if is_mandatory(item) and (ev is None or ev.status != PASS):
                 passed[part] = False
                 outcome.missing.append(f"{ITEMS[item]}:{_status_note(ev)}")

@@ -386,3 +386,29 @@ def test_fill_covers_prints_submitter_name_beside_signature_line(tmp_path):
     etree.SubElement(etree.SubElement(p2, br.R), br.T).text = "提测方（签字/盖章(加盖骑缝章)）：  "
     br.fill_covers(doc, ctx(submitter_name=""))
     assert br.text_of(p2) == "提测方（签字/盖章(加盖骑缝章)）：  "
+
+
+def test_missing_mandatory_result_row_makes_the_conclusion_undecidable(tmp_path):
+    """必测项的结果行在模板里找不到时,不能因为「没发现失败」就勾「通过」。"""
+    template = build_template(tmp_path / "t.docx")
+    with zipfile.ZipFile(template) as z:
+        parts = {n: z.read(n) for n in z.namelist()}
+    parts["word/document.xml"] = parts["word/document.xml"].replace("5.2.错误提示功能".encode(), "5-2.错误提示功能".encode())
+    with zipfile.ZipFile(template, "w") as z:
+        for n, data in parts.items():
+            z.writestr(n, data)
+    evs = evidences()
+    out_dir = render_images(tmp_path, evs)
+    outcome = br.build_report(template, out_dir, tmp_path / "o.docx", ctx(), evs)
+    doc = br.Docx(outcome.path)
+    external, programmatic = conclusion_rows(doc)
+    assert checked_labels(external[1]) == ["通过"] and checked_labels(programmatic[1]) == []
+    assert any("5.2" in w for w in outcome.warnings) and any("结论不可判定" in m for m in outcome.missing)
+
+
+def test_section_numbers_are_matched_as_whole_tokens_not_prefixes():
+    assert br.HEADING.match("1.10 其他") is None and br.HEADING.match("1.1.连通性").group(2) == "1"
+    from docx_fixture import cell, row, table
+    tbl = etree.fromstring(f'<root xmlns:w="{br.W_NS}">' + table(row(cell("1.10.其他"), cell("x")), row(cell("1.1.连通性"), cell("y"))) + "</root>")[0]
+    hit = br.find_numbered_row(tbl, "1.1")
+    assert br.text_of(hit[1][0]) == "1.1.连通性"

@@ -79,6 +79,7 @@ EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN = 0, 1, 2, 3
 # 会向柜台发委托的测试项:这些步骤之前必须先确认账户空仓
 ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1"})
 STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
+FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上限(秒)
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
 
 
@@ -599,59 +600,83 @@ def step_stability(ctx: Ctx, book: Book, total: int | None = None) -> None:
             setattr(rule, attr, STABILITY_LIMIT)
 
     daily, active, dup, guard = ctx.rule(DAILY_RULE), ctx.rule("活动委托检查"), ctx.rule(DUP_RULE), ctx.rule(ACCOUNT_RULE_NAME)
-    for rule, attrs in ((daily, ("total_order_limit", "contract_order_limit", "total_cancel_limit", "contract_cancel_limit")),
-                        (active, ("active_order_limit",)), (dup, ("duplicate_order_limit",)), (guard, ("cancel_lock_limit",))):
-        for attr in attrs:
-            lift(rule, attr)
     saved_cancel_count = getattr(guard, "cancel_count", None)
     ids: list[str] = []
     blocked = 0
     elapsed_acked = elapsed_sent = 0.0
     final: dict[str, int] = {}
-    leftover = 0
-    try:
-        t0 = ctx.clock()
-        for n in range(total):
-            oid = send(ctx, make_req(ctx, price=probe_price(ctx)))
-            if oid:
-                ids.append(oid)
-            else:
-                blocked += 1
-            if ctx.stability_interval:
-                ctx.sleep(ctx.stability_interval)
-        elapsed_sent = ctx.clock() - t0
+    problems: list[str] = []
 
-        def all_acked() -> bool:
-            for oid in ids:
-                order = ctx.collector.order_of(oid)
-                if order is None or order.status == Status.SUBMITTING:
-                    return False
-            return True
-
-        ctx.wait_until(all_acked, ctx.stability_wait)
-        elapsed_acked = ctx.clock() - t0
+    def unresolved() -> int:
+        """没有回报或仍可撤的演示委托数:拿不到委托数据的一律按「未清场」算,不当成已撤。"""
+        count = 0
         for oid in ids:
             order = ctx.collector.order_of(oid)
-            key = order.status.value if order is not None else "无回报"
-            final[key] = final.get(key, 0) + 1
+            if order is None or order.is_active():
+                count += 1
+        return count
+
+    def cleanup() -> None:
+        try:
+            cancel_active(ctx, ids)                                # 无论如何清场:不留 200 笔挂单
+            ctx.wait_until(lambda: unresolved() == 0, ctx.stability_wait)
+        except Exception as exc:    # noqa: BLE001  清场出错也必须继续还原上限
+            problems.append(f"清场出错:{exc!r}")
+
+    try:                                                           # 抬高上限之前就进入保护区:中途异常也能还原
+        for rule, attrs in ((daily, ("total_order_limit", "contract_order_limit", "total_cancel_limit", "contract_cancel_limit")),
+                            (active, ("active_order_limit",)), (dup, ("duplicate_order_limit",)), (guard, ("cancel_lock_limit",))):
+            for attr in attrs:
+                lift(rule, attr)
+        try:
+            t0 = ctx.clock()
+            for n in range(total):
+                oid = send(ctx, make_req(ctx, price=probe_price(ctx)))
+                if oid:
+                    ids.append(oid)
+                else:
+                    blocked += 1
+                if ctx.stability_interval:
+                    ctx.sleep(ctx.stability_interval)
+            elapsed_sent = ctx.clock() - t0
+
+            def all_acked() -> bool:
+                for oid in ids:
+                    order = ctx.collector.order_of(oid)
+                    if order is None or order.status == Status.SUBMITTING:
+                        return False
+                return True
+
+            ctx.wait_until(all_acked, ctx.stability_wait)
+            elapsed_acked = ctx.clock() - t0
+            for oid in ids:
+                order = ctx.collector.order_of(oid)
+                key = order.status.value if order is not None else "无回报"
+                final[key] = final.get(key, 0) + 1
+        except Exception as exc:    # noqa: BLE001  转成失败的证据:不让异常冒出去丢掉整次运行的证据
+            problems.append(f"下单过程出错:{exc!r}")
+        finally:
+            cleanup()
     finally:
-        cancel_active(ctx, ids)                                   # 无论如何清场:不留 200 笔挂单
-        ctx.wait_until(lambda: all(not (ctx.collector.order_of(o) and ctx.collector.order_of(o).is_active()) for o in ids),
-                       ctx.stability_wait)
-        leftover = sum(1 for o in ids if ctx.collector.order_of(o) is not None and ctx.collector.order_of(o).is_active())
         for rule, attr, value in lifted:
-            setattr(rule, attr, value)
+            try:
+                setattr(rule, attr, value)
+            except Exception as exc:    # noqa: BLE001  单项还原失败不影响其余项
+                problems.append(f"还原 {attr} 失败:{exc!r}")
         if guard is not None and saved_cancel_count is not None:
             guard.cancel_count = saved_cancel_count
+    leftover = unresolved()
     rejected = final.get(Status.REJECTED.value, 0)
     silent = final.get("无回报", 0) + final.get(Status.SUBMITTING.value, 0)
-    ok = len(ids) == total and rejected == 0 and silent == 0
+    ok = len(ids) == total and rejected == 0 and silent == 0 and leftover == 0 and not problems
     lines = [f"{ctx.now()} 持续下单 {total} 笔(买开 1 手,不易成交的限价,逐笔间隔 {ctx.stability_interval}s)",
              f"经风控放行 {len(ids)} 笔,被本地风控拦截 {blocked} 笔",
              f"下单耗时 {elapsed_sent:.1f} 秒;至全部回报到达共 {elapsed_acked:.1f} 秒",
              "委托终态分布:" + ("、".join(f"{k} {v}" for k, v in sorted(final.items())) or "-"),
-             "清场:演示委托已全部撤销" if not leftover else f"⚠ 仍有 {leftover} 笔演示委托未撤销,请人工处理"]
-    summary = "" if ok else f"放行 {len(ids)}/{total} 笔,拒单 {rejected},无回报 {silent}"
+             "清场:演示委托已全部撤销" if not leftover else f"⚠ 仍有 {leftover} 笔演示委托未确认撤销,请人工处理"]
+    lines += [f"⚠ {text}" for text in problems]
+    summary = "" if ok else (f"放行 {len(ids)}/{total} 笔,拒单 {rejected},无回报 {silent},未清场 {leftover}"
+                             + (";" + ";".join(problems) if problems else ""))
     book.add("P1.3", PASS if ok else FAIL, summary, [Shot(f"{total}笔", lines)], started,
              metrics={"orders": total, "accepted": len(ids), "rejected": rejected, "elapsed_seconds": round(elapsed_acked, 1),
                       "send_seconds": round(elapsed_sent, 1)})
@@ -758,8 +783,12 @@ def final_safety(ctx: Ctx) -> list[str]:
         for order in active:
             ctx.main_engine.cancel_order(order.create_cancel_request(), order.gateway_name)
         if active:
-            notes.append(f"收尾:撤销了 {len(active)} 笔遗留委托")
-            ctx.sleep(1.0)
+            ctx.wait_until(lambda: not list(ctx.main_engine.get_all_active_orders()), FINAL_CANCEL_WAIT)
+            left = len(list(ctx.main_engine.get_all_active_orders()))
+            if left:
+                notes.append(f"⚠⚠ 收尾:发出撤单请求后仍有 {left}/{len(active)} 笔委托未确认撤销,请立即人工撤单!")
+            else:
+                notes.append(f"收尾:撤销了 {len(active)} 笔遗留委托(已确认)")
         held, _ = check_positions(ctx.main_engine, ctx.symbol, wait=ctx.position_wait, early_exit=False)
         if held:
             notes.append(f"⚠⚠ 收尾发现账户有持仓 {held},请立即人工平仓!")
