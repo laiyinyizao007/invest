@@ -1153,7 +1153,8 @@ def _campaign_summary(settings: Settings, name: str) -> dict:
 def _remember_summary(path_key: str, hash_key, summary: dict, now: float) -> None:
     """把摘要写进两个缓存。**淘汰按上限逐出最旧的**,不是 clear() 全部清空。"""
     if hash_key is not None:
-        # 逐出**最久没用**的:dict 对已存在的键重新赋值不改变插入顺序,按插入顺序逐出会挤掉热条目。
+        # 逐出**最久没用**的。之前按插入顺序逐出,而 dict 对已存在的键重新赋值并不改变插入顺序——
+        # 于是**每次刷新一个已存在的键都会逐出一个无关条目**(缓存被摊薄),而不是热条目被挤掉。
         if hash_key in _EVOLUTION_SUMMARY_CACHE:
             del _EVOLUTION_SUMMARY_CACHE[hash_key]
         while len(_EVOLUTION_SUMMARY_CACHE) >= _EVOLUTION_CACHE_MAX:

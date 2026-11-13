@@ -121,7 +121,8 @@ def test_an_oversized_ledger_is_not_hashed_in_full(tmp_path, monkeypatch):
         return real(path)
 
     monkeypatch.setattr(col, "_file_digest", counting)
-    col.collect_evolution(settings, NOW)                        # TTL 内
+    settings.raw["evolution"]["summary_ttl"] = 0.0             # TTL 置 0:让缓存真的过期,
+    col.collect_evolution(settings, NOW)                        # 否则第二次命中 TTL,走不到哈希,测试守不住
     assert digests["n"] == 0, f"超限台账被哈希了 {digests['n']} 次"
 
 
@@ -136,3 +137,30 @@ def test_the_cached_corrupt_message_stays_the_same_across_requests(tmp_path):
     second = col.collect_evolution(settings, NOW).section["data"]["campaigns"][0]["message"]
     assert first == second, (first, second)
     assert "上限" in first or "损坏" in first
+
+
+def test_the_fixtures_and_the_seed_carry_the_same_values():
+    """种子是前端真正拿去用的 mock。改样例忘改种子,不会被任何测试发现——所以守住。"""
+    import json
+    import re
+    from pathlib import Path
+
+    web = Path(__file__).resolve().parents[1] / "docs" / "web"
+    seeds = [(web / "lovable-seed" / "mock-data.phase1.ts").read_text(encoding="utf-8"),
+             (web / "lovable-seed" / "mock-data.later.ts").read_text(encoding="utf-8")]
+    drifted = []
+    for f in sorted((web / "fixtures").glob("*.json")):
+        if f.stem == "manifest":
+            continue
+        fixture = json.loads(f.read_text(encoding="utf-8"))
+        for src in seeds:
+            m = re.search(r'"' + re.escape(f.stem) + r'":\s*(\{.*?\}),\n', src, re.S)
+            if not m:
+                continue
+            try:
+                seeded = json.loads(m.group(1))
+            except ValueError:
+                continue
+            if seeded != fixture:
+                drifted.append(f.stem)
+    assert not drifted, drifted
