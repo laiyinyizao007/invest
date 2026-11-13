@@ -54,3 +54,25 @@ def test_the_clean_streak_does_not_count_an_untrusted_day(tmp_path):
     days.append(broken)
     assert ls.longest_clean_streak(days) == 3                # 周四不可信 → 连续段在周三结束
     assert ls.longest_clean_streak(days + [ls.DayStats(day="2026-11-13", trusted=True)]) == 3
+
+
+def test_a_day_with_an_untrustworthy_log_is_not_reported_as_a_missing_day(tmp_path):
+    """日志存在但不可信 ≠ 没有日志。两种情况都要保守(都不能算无异常),但文案不能说错。"""
+    from dashboard import collectors as col
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    log_dir = root / "runtime" / "vntrader" / "log"
+    log_dir.mkdir(parents=True)
+    (log_dir / "vt_20261109.log").write_bytes(b"2026-11-09 08:00:00 | INFO | Runtime | \xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\n")
+    (log_dir / "vt_20261110.log").write_bytes(b"2026-11-10 08:00:00 | INFO | Runtime | \xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\n")
+    # 周二这份的尾部被截断(可能藏着严重事件)
+    (log_dir / "vt_20261111.log").write_bytes(
+        b"2026-11-11 08:00:00 | INFO | Runtime | \xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\n"
+        + "2026-11-11 09:00:00 | ERROR | Runtime | \xe7\xa1\xac\xe9\x94\x81\xe5\xae\x9a".encode("utf-8")[:-3])
+    settings = appconfig.load(path=root / "none.json", root=root)
+    r = col.collect_days(settings, 1_800_000_000.0)
+    assert r.section["data"] is not None
+    missing = r.section["data"]["missing_weekdays"]
+    assert "2026-11-11" not in missing, "日志存在(只是不可信),不能报成缺天"
+    assert r.level == "unknown"

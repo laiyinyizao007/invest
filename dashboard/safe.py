@@ -102,15 +102,28 @@ def clip(text: str, limit: int) -> str:
 
 def _decoded_has_path(token: str) -> bool:
     """对**检测副本**做有界的百分号解码,看解码后是否出现路径。替换作用于原文,所以没有路径的编码文本(%E4%B8%AD、%20)不受影响。"""
-    current = _PCT_U.sub(lambda m: chr(int(m.group(1), 16)), token)
+    current = token
     for _ in range(_DECODE_ROUNDS):
+        current = _PCT_U.sub(lambda m: chr(int(m.group(1), 16)), current)   # %u 写法:每轮都要再试一次
         decoded = unquote(current)
         if decoded == current:
             break
         current = decoded
-        if _UNC.search(current) or _WIN_PATH.search(current) or _POSIX_PATH.search(current):
+        if _looks_like_path(current):
             return True
-    return _UNC.search(current) is not None or _WIN_PATH.search(current) is not None or _POSIX_PATH.search(current) is not None
+    current = _PCT_U.sub(lambda m: chr(int(m.group(1), 16)), current)
+    return _looks_like_path(current)
+
+
+def _looks_like_path(text: str) -> bool:
+    """文本里有没有路径。**规则要齐全**:漏掉一条就等于留下一个绕过
+    (曾漏:没有盘符的根路径、全角写法)。"""
+    if _UNC.search(text) or _WIN_PATH.search(text) or _WIN_ROOTED_PATH.search(text) or _POSIX_PATH.search(text):
+        return True
+    full = _FULLWIDTH_PATH.search(text)
+    if full and (any(ch in full.group(0) for ch in _FULLWIDTH_MARKS) or not full.group(0)[0].isascii()):
+        return True                       # 全角写法:『Ｃ：＼Users＼x』。半角的 s://(https://)不算
+    return False
 
 
 def _scrub_fullwidth(match: re.Match) -> str:

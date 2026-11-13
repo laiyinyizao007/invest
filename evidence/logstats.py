@@ -110,6 +110,15 @@ RECORD = re.compile(r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}(?:\.\d+)? \| (DEBUG
 MIN_RECORD_RATIO = 0.2          # 记录至少占非空行的这个比例;容忍 traceback 续行,挡住『一行合规 + 大量垃圾』
 
 
+def _message_part(line: str) -> str:
+    """取记录的消息部分(『时间 | 级别 | 来源 | 内容』里的最后一段)。
+
+    前缀检测只看消息:时间戳与来源里出现的字不该被当成关键字的前缀。
+    """
+    parts = line.split("|")
+    return parts[-1] if len(parts) >= 4 else line
+
+
 def _parse_ts(line: str) -> str:
     """从 vn.py 日志行里取出时间戳。
 
@@ -245,11 +254,15 @@ class DayLogParser:
         """
         if not self._tail_partial:
             return False
+        message = _message_part(self._tail_partial)
         for marker in EVENT_MARKERS:
-            if marker in self._tail_partial:
+            if marker in message:
                 continue                      # 事件已完整出现并被计入,不是『被藏起来』
             for cut in range(1, len(marker)):
-                if marker[:cut] in self._tail_partial:
+                # **只看结尾**:截断只能发生在行尾。整行任意位置搜索会把普通消息
+                # (如『当前权益 10000』里的『当』是『当日熔断』的前缀)误判成不可信,
+                # 还会让已经完整识别出的严重事件整份日志被排除(严重级别降成未知)。
+                if message.endswith(marker[:cut]):
                     return True
         return False
 
@@ -437,11 +450,13 @@ def missing_weekdays(days: list[DayStats]) -> list[str]:
 def acceptance_checklist(days: list[DayStats]) -> list[str]:
     """按运行手册第 6 节列出验收项与当前状态。"""
     total = len(days)
+    untrusted = sum(1 for d in days if not d.trusted)
     streak = longest_clean_streak(days)
     missing = missing_weekdays(days)
     checklist = [
         f"- [ ] 连续 ≥ 5 个交易日无人值守:已记录 {total} 天"
-        + (f"(最长连续无异常 {streak} 天)" if streak else ""),
+        + (f"(最长连续无异常 {streak} 天)" if streak else "")
+        + (f"(**其中 {untrusted} 天的日志不可信,不能算作『无异常』,需人工核对**)" if untrusted else ""),
         f"- [ ] 告警全部到达手机:需配合 `--probe-webhook` 的自检结果",
         f"- [ ] 没有重复下单:成交笔数与委托笔数需人工抽查(日志里没有重复下单的直接证据)",
         f"- [ ] 没有止损未触发 / 持仓与策略不一致:见上表异常事件列",

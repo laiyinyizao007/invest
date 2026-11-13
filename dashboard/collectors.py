@@ -362,10 +362,24 @@ def warm_up(settings: Settings) -> None:
         pass
 
 
-def _days(settings: Settings) -> list[ls.DayStats]:
-    """按天汇总,只统计有内容的日志(与 _log_files 同一口径)。"""
+def _all_log_files(settings: Settings) -> list[Path]:
+    """所有非空日志文件(**不管可信与否**)。用于区分『这天没有日志』与『这天日志不可信』。"""
+    files: list[Path] = []
+    for d in settings.paths["log_dirs"]:
+        if d.is_dir():
+            files += [f for f in sorted(d.glob("vt_*.log")) if _nonempty(f)]
+    return files
+
+
+def _days(settings: Settings, *, only_trusted: bool = True) -> list[ls.DayStats]:
+    """按天汇总。
+
+    only_trusted=True(默认):只统计**可信**的日志——不可信的日志不能进连续无异常的统计。
+    only_trusted=False:全部日志(用于判断『某天到底有没有日志』:日志存在但不可信 ≠ 没有日志)。
+    """
     merged: dict[str, ls.DayStats] = {}
-    for f in _log_files(settings):
+    files = _log_files(settings) if only_trusted else _all_log_files(settings)
+    for f in files:
         stats = _parse_cached(f)
         target = merged.setdefault(stats.day, ls.DayStats(day=stats.day))
         target.trusted = target.trusted and stats.trusted        # 任一文件不可信 → 那天不可信
@@ -422,7 +436,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     streak = ls.longest_clean_streak(days)
-    missing_days = ls.missing_weekdays(days)
+    # 缺天要按**实际存在的日志**判断:日志存在但不可信 ≠ 没有日志(两者都要保守,但文案不能错)
+    missing_days = ls.missing_weekdays(_days(settings, only_trusted=False))
     hb = _heartbeat_day_label(settings, now)
     rows = []
     for stats in reversed(days[-limit:]):
@@ -730,6 +745,10 @@ def _valid_run(run_id: str, body: Any) -> bool:
         err = body.get("error")
         if not (isinstance(err, dict) and isinstance(err.get("type"), str) and isinstance(err.get("message"), str)):
             return False
+        if not err["type"].strip() or not err["message"].strip():
+            return False
+    elif "error" in body:
+        return False                        # 成功的运行不该带 error 字段(矛盾)
     if body["kind"] in ("gate", "evaluate"):
         passed, failures = body.get("passed"), body.get("failures")
         if not isinstance(passed, bool):
@@ -739,12 +758,15 @@ def _valid_run(run_id: str, body: Any) -> bool:
         if not (isinstance(failures, list) and all(isinstance(x, str) for x in failures)):
             return False
         return (not failures) if passed else bool(failures)             # 通过 ⇔ 没有失败项(risk/candidate_eval.py:passed = not failures)
+    if "passed" in body:
+        return False                        # backtest 没有『通过』这个概念,带了就矛盾
     return errored or (isinstance(body.get("stats"), dict) and bool(body["stats"]))
 
 
 def _brief_run(run_id: str, result: dict) -> dict:
     kind = result["kind"]                                               # 调用方已用 _valid_run 校验
-    passed = result.get("passed")
+    # passed 只对 gate/evaluate 有意义(backtest 没有『通过』这个概念)
+    passed = result.get("passed") if kind in ("gate", "evaluate") else None
     return {"run_id": run_id, "kind": kind, "status": result.get("status") if isinstance(result.get("status"), str) else None,
             "passed": passed if isinstance(passed, bool) else None,
             "strategy_file": result.get("strategy_file") if isinstance(result.get("strategy_file"), str) else None,
