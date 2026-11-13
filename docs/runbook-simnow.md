@@ -89,6 +89,7 @@ python scripts/status_server.py               # 启动,默认 127.0.0.1:8770
 - **环境标签**:在 `config/status_dashboard.json` 里设 `environment`(`simnow` / `guoxin-test` / `live`)。不设则页面横幅显示『环境未知』——面板不读 `.env`,不会猜。
 - **状态目录**:默认 `data/state`(直接用 Python 运行的机器);Docker 运行则在配置里把 `state_dir` 指向挂载出来的 `runtime/data/state`,`log_dirs` 默认 `runtime/vntrader/log`。**不要把 `.vntrader/log` 加进去**——单元测试会污染它。
 - **面板必须与交易运行时在同一台机器**(它读同一批文件)。杀掉面板不影响交易;它不写任何被读取的文件(测试强制)。
+- **进化视图(阶段④)默认关闭**:在 `config/status_dashboard.json` 里设 `"evolution": {"enabled": true}` 才会注册那 6 个接口;关闭时总览里也没有进化区块(一个用户打不开的子系统不该出现在总览里)。数据由引擎侧写进 `data/research/evolution/` 与 `data/research/heatmaps/`,面板只读。
 - 前端未构建时 `/` 显示占位页;API 可直接用(带令牌)。前端构建与入库见 `docs/web/05-lovable-guide.md`。
 
 #### `scripts/unattended_report.py` —— 无人值守验收的证据
