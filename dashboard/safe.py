@@ -24,7 +24,11 @@ MAX_ITEMS = 200
 MAX_STR = 2000
 
 ACCOUNT_KEYS = frozenset({"account_id", "accountid", "account", "user_id", "userid", "username", "investor_id"})
-SENSITIVE_KEY = re.compile(r"(?i)pass(word|wd)?|secret|token|auth_?code|app_?id|api_?key|credential|private_?key")
+# 『pass』的处理要小心:passed / bypass / compass / pass_rate 是普通键(曾因含 pass 被整个替换成 ***)。
+# 规则:password / passwd / passphrase 在任何位置都算敏感;单独的 pass 只在它是整个键或位于键的末尾时才算(user-pass、db_pass)。
+# 其余词(secret / token / api_key ...)含义明确,宁严勿松。
+SENSITIVE_KEY = re.compile(
+    r"(?i)pass(?:word|wd|phrase)|(?:^|[^a-z])pass$|secret|token|auth_?code|app_?id|api_?key|credential|private_?key")
 
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{8,}")
 _CTP_ENV = re.compile(r"(?i)\bCTP_[A-Z0-9_]+\s*[=:]\s*\S+")

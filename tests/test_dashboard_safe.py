@@ -89,3 +89,27 @@ def test_property_no_input_string_keeps_a_registered_secret():
         pre = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 20)))
         post = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 20)))
         assert TOKEN not in safe.scrub_text(pre + TOKEN + post, secrets=[TOKEN])
+
+
+@pytest.mark.parametrize("key", ["passed", "bypass", "compass", "pass_rate", "passes", "passing"])
+def test_ordinary_keys_that_merely_contain_pass_are_not_hidden(key):
+    """回归:『passed』曾被当成密码键整个替换成 ***,研究页的通过状态因此永远显示星号。"""
+    assert safe.sanitize({key: False})[key] is False
+
+
+@pytest.mark.parametrize("key", ["password", "PASSWORD", "db_password", "passwd", "pass", "user-pass", "api_key", "apiKey", "secret_x",
+                                 "auth_token", "CTP_AUTH_CODE", "app_id", "private_key", "credentials"])
+def test_genuinely_sensitive_keys_are_still_hidden(key):
+    assert safe.sanitize({key: "value"})[key] == "***"
+
+
+def test_every_contract_fixture_survives_sanitize_unchanged():
+    """净化层不能把契约里的合法数据改掉:全部示例经 sanitize 后必须与原样相等。"""
+    import json
+    from pathlib import Path
+    fx = Path(__file__).resolve().parents[1] / "docs" / "web" / "fixtures"
+    for p in sorted(fx.glob("*.json")):
+        if p.stem == "manifest":
+            continue
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert safe.sanitize(data) == data, p.stem
