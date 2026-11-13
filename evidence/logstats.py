@@ -84,6 +84,24 @@ class DayStats:
         return not self.events and self.trusted
 
     @property
+    def breaks_streak(self) -> bool:
+        """这一天会不会打断『连续无严重事件』的连续段(用户 2026-11-13 拍板的口径)。
+
+        **只有严重事件、或这一天无法判断,才打断**;警告(连接断开、行情停更、网关错误……)不打断。
+        验收要证明的是『无人值守也能运行』,不是『网络永不抖动』——夜盘一次重连就从头再数 5 天,
+        这个标准会逼着人去调标准,而不是去修问题。
+
+        不可信的日子仍然打断:日志损坏、日期对不上、尾部不完整时,『没看到事件』不等于『没有事件』。
+        警告不会被藏起来:见 streak_warning_count,它们和连续段一起被数出来。
+        """
+        return (not self.trusted) or self.has_severe
+
+    @property
+    def warning_count(self) -> int:
+        """这一天的警告级事件总次数(验收时要和连续段一起给出,不能让结论悄悄变宽)。"""
+        return sum(count for (level, _), count in self.events.items() if level == "警告")
+
+    @property
     def has_severe(self) -> bool:
         """这一天有没有"严重"级别的事件(熔断、紧急平仓、硬锁定、对账失败…)。
 
@@ -370,7 +388,10 @@ def render_table(days: list[DayStats], heartbeat: str = "", heartbeat_on: str = 
 
 
 def longest_clean_streak(days: list[DayStats]) -> int:
-    """最长的一段"连续无异常"**交易日**天数。
+    """最长的一段"连续无严重事件"**交易日**天数。
+
+    **判定口径(用户 2026-11-13 拍板)**:只有严重事件、或无法判断的日子才打断;警告不打断,
+    但会被 streak_warning_count 数出来。函数名里的 clean 是历史遗留——它从来指『验收意义上的干净』。
 
     验收要求的是"连续 ≥ 5 个交易日",所以必须算**连续**段,
     不能拿"总共干净了几天"顶替(中间夹一个有异常的日子,连续性就断了)。
@@ -389,38 +410,61 @@ def longest_clean_streak(days: list[DayStats]) -> int:
     节假日无法从本地数据判断 —— 法定假日会被当成"缺天",让连续段偏短。
     这是保守方向(宁可少报不可多报),符合"证据不足就不算数"的原则。
     """
+    return _scan_streak(days)[0]
+
+
+def streak_warning_count(days: list[DayStats]) -> int:
+    """最长连续段**里面**的警告次数。
+
+    放宽口径(警告不打断连续段)之后,必须把警告数出来和连续段一起给出,
+    否则验收结论会悄悄变宽:『连续 5 天』里可能夹着十几次连接断开。
+    多段并列最长时取**最近**的一段(与验收时最关心的『眼下这段』一致)。
+    """
+    return _scan_streak(days)[1]
+
+
+def _scan_streak(days: list[DayStats]) -> tuple[int, int]:
+    """(最长连续段天数, 该段里的警告次数)。按日历逐天走,缺天与不可信的天都打断。"""
     by_day = {d.day: d for d in days}
     if not by_day:
-        return 0
+        return 0, 0
     try:
         start = date.fromisoformat(min(by_day))
         end = date.fromisoformat(max(by_day))
     except ValueError:
         # 日期格式不是 ISO(理论上不会发生)→ 退回"只按日志里的天算"
-        best = current = 0
+        best = current = best_warn = warn = 0
         for day in days:
-            current = current + 1 if day.clean else 0
-            best = max(best, current)
-        return best
+            if day.breaks_streak:
+                current = warn = 0
+            else:
+                current, warn = current + 1, warn + day.warning_count
+            if current >= best:
+                best, best_warn = current, warn
+        return best, best_warn
 
-    best = current = 0
+    best = current = best_warn = warn = 0
     cursor = start
     while cursor <= end:
         stats = by_day.get(cursor.isoformat())
         if cursor.weekday() >= 5:
             # 周末不是交易日:既不计入也不打断(除非有严重事件)。
             if stats is not None and stats.has_severe:
-                current = 0
+                current = warn = 0
         elif stats is not None:
-            # 工作日有日志:干净就计入连续段,有异常就断
-            current = current + 1 if stats.clean else 0
+            # 工作日有日志:没有严重事件且可信就计入连续段;警告也一并数着
+            if stats.breaks_streak:
+                current = warn = 0
+            else:
+                current, warn = current + 1, warn + stats.warning_count
         else:
             # 工作日却没有任何日志 → 进程静默死亡(那天的日志文件根本没生成)。
             # 只按"日志里有的天"遍历会把这一天悄悄跳过,连续段被拉长,验收结论虚高。
-            current = 0
-        best = max(best, current)
+            current = warn = 0
+        if current >= best and current > 0:
+            best, best_warn = current, warn
         cursor += timedelta(days=1)
-    return best
+    return best, best_warn
 
 
 def missing_weekdays(days: list[DayStats]) -> list[str]:
@@ -452,11 +496,12 @@ def acceptance_checklist(days: list[DayStats]) -> list[str]:
     total = len(days)
     untrusted = sum(1 for d in days if not d.trusted)
     streak = longest_clean_streak(days)
+    warnings = streak_warning_count(days)
     missing = missing_weekdays(days)
     checklist = [
         f"- [ ] 连续 ≥ 5 个交易日无人值守:已记录 {total} 天"
-        + (f"(最长连续无异常 {streak} 天)" if streak else "")
-        + (f"(**其中 {untrusted} 天的日志不可信,不能算作『无异常』,需人工核对**)" if untrusted else ""),
+        + (f"(最长连续无严重事件 {streak} 天" + (f",期间 {warnings} 次警告" if warnings else "") + ")" if streak else "")
+        + (f"(**其中 {untrusted} 天的日志不可信,不能算作『无严重事件』,需人工核对**)" if untrusted else ""),
         f"- [ ] 告警全部到达手机:需配合 `--probe-webhook` 的自检结果",
         f"- [ ] 没有重复下单:成交笔数与委托笔数需人工抽查(日志里没有重复下单的直接证据)",
         f"- [ ] 没有止损未触发 / 持仓与策略不一致:见上表异常事件列",

@@ -447,15 +447,17 @@ def _heartbeat_day_label(settings: Settings, now: float) -> tuple[str, str] | No
     return day, (f"{age:.0f} 秒前" if age <= settings.stale_after("trading") else f"已停 {age / 3600:.1f} 小时")
 
 
-def _streak_headline(streak: int) -> str:
+def _streak_headline(streak: int, warnings: int = 0) -> str:
     """连续天数的标题。
 
     连续天数可以**超过**要求(已经达标之后继续跑),写成『9/5 天』读起来像出了错,
     所以超过要求时换个说法。
     """
+    # 警告不打断连续段,但**必须被数出来**:否则放宽口径后,『连续 5 天』里夹着多少次连接断开就看不见了
+    tail = f",期间 {warnings} 次警告" if warnings else ""
     if streak > REQUIRED_STREAK:
-        return f"连续无异常 {streak} 天(要求 {REQUIRED_STREAK} 天,已达标)"
-    return f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+        return f"连续无严重事件 {streak} 天(要求 {REQUIRED_STREAK} 天,已达标){tail}"
+    return f"连续无严重事件 {streak}/{REQUIRED_STREAK} 天{tail}"
 
 
 def collect_days(settings: Settings, now: float, limit: int | None = None) -> Result:
@@ -482,6 +484,8 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
 
     newest = max((t for t in (m.mtime(f) for f in _log_files(settings)) if t is not None), default=None)
     streak = ls.longest_clean_streak(days)
+    # 口径(用户 2026-11-13 拍板):只有严重事件或无法判断的日子才打断连续段;警告不打断,但要数出来
+    streak_warnings = ls.streak_warning_count(days)
     # 缺天要按**实际存在的日志**判断:日志存在但不可信 ≠ 没有日志(两者都要保守,但文案不能错)
     missing_days = ls.missing_weekdays(_days(settings, only_trusted=False))
     hb = _heartbeat_day_label(settings, now)
@@ -499,7 +503,7 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
     raw_items = ls.acceptance_checklist(days)
     checklist = [{"text": _checklist_item(t), "checked": (streak >= REQUIRED_STREAK) if i == 0 else None} for i, t in enumerate(raw_items)]
     data = {"days": rows, "checklist": checklist, "longest_clean_streak": streak, "required_streak": REQUIRED_STREAK,
-            "missing_weekdays": missing_days}
+            "streak_warning_count": streak_warnings, "missing_weekdays": missing_days}
 
     state = m.freshness(newest, now, stale_after)
     latest = days[-1]
@@ -540,10 +544,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         level, headline = "warn", "日志长时间未更新"
         reasons.append(_reason("days", "warn", "每日日志长时间没有更新(交易进程可能已停止)"))
     elif latest.events or missing_days:
-        level, headline = "warn", _streak_headline(streak)
+        level, headline = "warn", _streak_headline(streak, streak_warnings)
         reasons.append(_reason("days", "warn", "最新一天有警告级事件" if latest.events else f"有 {len(missing_days)} 个工作日没有日志"))
     else:
-        level, headline = "ok", _streak_headline(streak)
+        level, headline = "ok", _streak_headline(streak, streak_warnings)
     notes = [x for x in ({"stale": "每日日志长时间未更新", "corrupt": FUTURE_LOG_MESSAGE}.get(state), bad_msg if bad_logs else None) if x]
     return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=";".join(notes) or None), level, headline, reasons)
 

@@ -2084,7 +2084,8 @@
             }
           },
           "longest_clean_streak": {
-            "type": "integer"
+            "type": "integer",
+            "description": "最长连续『无严重事件』的交易日数。**警告不打断**,只有严重事件、无法判断的日子、缺日志的工作日才打断(用户 2026-11-13 拍板)"
           },
           "required_streak": {
             "type": "integer"
@@ -2094,14 +2095,20 @@
             "items": {
               "type": "string"
             }
+          },
+          "streak_warning_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "上面那段连续段里的警告次数。警告不打断连续段,但必须显示出来,不能让放宽的口径把它们藏起来"
           }
         },
         "required": [
-          "days",
           "checklist",
+          "days",
           "longest_clean_streak",
+          "missing_weekdays",
           "required_streak",
-          "missing_weekdays"
+          "streak_warning_count"
         ],
         "additionalProperties": true
       },

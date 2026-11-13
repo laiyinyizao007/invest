@@ -225,7 +225,7 @@
 
 补充:
 1. /alerts:待补发队列 pending>0 时显示警告"有告警因断网等原因尚未送达手机",并显示最老一条的年龄;recent 事件按日期倒序、severe 在前,级别用徽标(严重/警告)。pending=0 且 recent 为空时显示"无待补发,近期无异常事件"(这是空态,与 missing 不同)。
-2. /days:顶部进度"longest_clean_streak / required_streak 天";每日表列:日期、启动次数、成交笔数(0 显示"—")、事件徽标列表(无事件写"无异常")、心跳;has_severe 的行整行加严重标记。
+2. /days:顶部进度"longest_clean_streak / required_streak 天"(口径:只有严重事件打断;旁边必须显示 streak_warning_count 次警告);每日表列:日期、启动次数、成交笔数(0 显示"—")、事件徽标列表(无事件写"无异常")、心跳;has_severe 的行整行加严重标记。
    **但 `trusted=false` 的行不能写"无异常"**——那天的日志读不懂,`events` 可能是空的但事件被藏起来了。这种行显示"日志无法识别,这天无法判断"(尾行没写完的 `tail_uncertain=true` 显示"日志正在写入");`clean` 也是 false,不计入连续天数。
 3. 验收清单:checked 为 true/false/null,null 显示"需人工核对"而不是未勾选。
 4. missing_weekdays 非空时显示"以下工作日没有日志:…"。

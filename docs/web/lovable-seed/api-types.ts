@@ -154,6 +154,7 @@ export interface DaysData {
   longest_clean_streak: number;
   required_streak: number;
   missing_weekdays: Array<string>;
+  streak_warning_count: number;
 }
 
 export interface RecordingData {

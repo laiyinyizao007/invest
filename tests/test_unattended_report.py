@@ -134,7 +134,7 @@ def test_the_clean_streak_counts_consecutive_days_not_the_total():
     """验收要求"连续 ≥ 5 个交易日",中间夹一个有异常的日子连续性就断了。"""
     days = [u.DayStats(day="2026-11-02"),
             u.DayStats(day="2026-11-03"),
-            u.DayStats(day="2026-11-04", events=Counter({("WARN", "网关连接失败"): 1})),
+            u.DayStats(day="2026-11-04", events=Counter({("严重", "网关连接失败"): 1})),      # 真实表里它是严重事件
             u.DayStats(day="2026-11-05"),
             u.DayStats(day="2026-11-06")]
     assert u.longest_clean_streak(days) == 2
@@ -185,7 +185,7 @@ def test_the_clean_streak_of_an_empty_run_is_zero():
 def test_the_checklist_reports_the_longest_clean_streak():
     days = [u.DayStats(day=f"2026-11-{d:02d}") for d in range(2, 7)]
     text = "\n".join(u.acceptance_checklist(days))
-    assert "最长连续无异常 5 天" in text
+    assert "最长连续无严重事件 5 天" in text
 
 
 def test_the_heartbeat_belongs_to_one_day_only(tmp_path):
