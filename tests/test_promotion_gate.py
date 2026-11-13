@@ -9,7 +9,9 @@ import pytest
 from risk.promotion_gate import (  # noqa: E402
     CandidateMetrics,
     GateThresholds,
+    CHECK_IDS,
     check_gate,
+    check_gate_ids,
     sharpe_ci,
     sharpe_standard_error,
 )
@@ -136,3 +138,57 @@ def test_non_finite_or_out_of_range_dsr_fails_closed(bad_dsr):
 def test_invalid_trial_counts_fail_closed(bad_n):
     fails = check_gate(replace(GOOD, n_trials=bad_n))
     assert any("试验次数" in f for f in fails), bad_n
+
+
+# ---------- 稳定 ID:外层只能看到这些,看不到带验证窗口数字的中文说明 ----------
+
+def test_a_passing_candidate_has_no_failed_ids():
+    assert check_gate(GOOD) == [] and check_gate_ids(GOOD) == []
+
+
+@pytest.mark.parametrize("change, expected_id", [
+    ({"oos_sharpe": 9.0}, "sharpe_suspicious"),
+    ({"oos_sharpe": 0.1}, "sharpe_low"),
+    ({"max_drawdown_pct": -60.0}, "drawdown_pct"),
+    ({"max_drawdown_yuan": -99999.0}, "drawdown_yuan"),
+    ({"round_trips": 3}, "round_trips"),
+    ({"random_entry_percentile": 10.0}, "random_percentile"),
+    ({"stress_sharpe": -1.0}, "stress_sharpe"),
+    ({"data_adjusted": False}, "data_not_adjusted"),
+    ({"parameter_on_plateau": False}, "not_on_plateau"),
+    ({"dsr": None}, "dsr_missing"),
+    ({"dsr": 0.2}, "dsr_low"),
+    ({"dsr": 1.5}, "dsr_invalid"),
+    ({"n_trials": 0}, "dsr_trials_invalid"),
+    ({"oos_years": 0.0}, "years_invalid"),
+])
+def test_each_failure_maps_to_its_stable_id(change, expected_id):
+    ids = check_gate_ids(replace(GOOD, **change))
+    assert expected_id in ids
+
+
+def test_the_ids_line_up_one_to_one_with_the_chinese_messages_in_the_same_order():
+    worst = replace(GOOD, oos_sharpe=0.1, max_drawdown_pct=-60.0, max_drawdown_yuan=-99999.0, round_trips=3,
+                    random_entry_percentile=10.0, stress_sharpe=-1.0, data_adjusted=False,
+                    parameter_on_plateau=False, dsr=0.2)
+    texts, ids = check_gate(worst), check_gate_ids(worst)
+    assert len(texts) == len(ids) >= 9
+    assert ids.index("sharpe_low") < ids.index("drawdown_pct") < ids.index("round_trips") < ids.index("dsr_low")
+
+
+def test_every_id_the_gate_can_emit_is_registered():
+    """新增检查项却忘了登记 ID:`check_gate_ids` 会抛错,而不是把它悄悄放过。"""
+    seen = set()
+    for change in ({"oos_sharpe": 9.0}, {"oos_sharpe": 0.1}, {"oos_years": 0.0}, {"max_drawdown_pct": -60.0},
+                   {"max_drawdown_yuan": -99999.0}, {"round_trips": 3}, {"random_entry_percentile": 10.0},
+                   {"stress_sharpe": -1.0}, {"data_adjusted": False}, {"parameter_on_plateau": False},
+                   {"dsr": None}, {"dsr": 0.2}, {"dsr": 1.5}, {"n_trials": 0}):
+        seen |= set(check_gate_ids(replace(GOOD, **change)))
+    assert seen <= set(CHECK_IDS) and "sharpe_ci" in CHECK_IDS
+    assert len(CHECK_IDS) == len(set(CHECK_IDS)) == 15
+
+
+def test_the_ids_contain_no_numbers_from_the_validation_window():
+    import re
+    for check_id in CHECK_IDS:
+        assert re.fullmatch(r"[a-z_]+", check_id)

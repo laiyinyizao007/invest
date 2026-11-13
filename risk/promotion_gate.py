@@ -51,53 +51,79 @@ class CandidateMetrics:
     n_trials: int = 0                # 计算 DSR 所用的累计试验次数;0 = 未记账,按未通过处理
 
 
-def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> list[str]:
-    """返回未通过的条目(中文说明);空列表表示全部通过。"""
+def _run_gate(m: CandidateMetrics, t: GateThresholds) -> tuple[list[str], list[str]]:
+    """(未通过条目的中文说明, 未通过条目的稳定 ID)。两个列表一一对应。"""
     fails: list[str] = []
+    ids: list[str] = []
+
+    def fail(check_id: str, text: str) -> None:
+        ids.append(check_id)
+        fails.append(text)
 
     if m.oos_sharpe > t.max_suspicious_sharpe:
-        fails.append(f"样本外夏普 {m.oos_sharpe:.2f} 高于 {t.max_suspicious_sharpe}:先排查前视偏差/过拟合,不予通过")
+        fail("sharpe_suspicious", f"样本外夏普 {m.oos_sharpe:.2f} 高于 {t.max_suspicious_sharpe}:先排查前视偏差/过拟合,不予通过")
     elif m.oos_sharpe < t.min_oos_sharpe:
-        fails.append(f"样本外夏普 {m.oos_sharpe:.2f} < {t.min_oos_sharpe}")
+        fail("sharpe_low", f"样本外夏普 {m.oos_sharpe:.2f} < {t.min_oos_sharpe}")
 
     if m.oos_years > 0:
         low, high = sharpe_ci(m.oos_sharpe, m.oos_years)
         if low <= t.min_sharpe_ci_lower:
-            fails.append(f"夏普 95% 置信区间 [{low:.2f}, {high:.2f}] 下界未超过 {t.min_sharpe_ci_lower}:不能排除没有优势")
+            fail("sharpe_ci", f"夏普 95% 置信区间 [{low:.2f}, {high:.2f}] 下界未超过 {t.min_sharpe_ci_lower}:不能排除没有优势")
     else:
-        fails.append("样本外年数必须为正")
+        fail("years_invalid", "样本外年数必须为正")
 
     dd_pct = abs(m.max_drawdown_pct)
     if dd_pct >= t.max_drawdown_pct:
-        fails.append(f"最大回撤 {dd_pct:.1f}% ≥ {t.max_drawdown_pct}%")
+        fail("drawdown_pct", f"最大回撤 {dd_pct:.1f}% ≥ {t.max_drawdown_pct}%")
     dd_yuan = abs(m.max_drawdown_yuan)
     if dd_yuan > t.max_drawdown_yuan:
-        fails.append(f"最大回撤 {dd_yuan:.0f} 元 > {t.max_drawdown_yuan:.0f} 元")
+        fail("drawdown_yuan", f"最大回撤 {dd_yuan:.0f} 元 > {t.max_drawdown_yuan:.0f} 元")
 
     if m.round_trips < t.min_round_trips:
-        fails.append(f"样本外往返 {m.round_trips} 笔 < {t.min_round_trips}:统计意义不足")
+        fail("round_trips", f"样本外往返 {m.round_trips} 笔 < {t.min_round_trips}:统计意义不足")
 
     if m.random_entry_percentile < t.min_random_percentile:
-        fails.append(f"仅超过随机入场对照的 {m.random_entry_percentile:.0f}% < {t.min_random_percentile:.0f}%:入场信号无明显贡献")
+        fail("random_percentile", f"仅超过随机入场对照的 {m.random_entry_percentile:.0f}% < {t.min_random_percentile:.0f}%:入场信号无明显贡献")
 
     if m.stress_sharpe < t.min_stress_sharpe:
-        fails.append(f"成本翻倍后夏普 {m.stress_sharpe:.2f} < {t.min_stress_sharpe}:对成本过于敏感")
+        fail("stress_sharpe", f"成本翻倍后夏普 {m.stress_sharpe:.2f} < {t.min_stress_sharpe}:对成本过于敏感")
 
     if not m.data_adjusted:
-        fails.append("回测数据未复权:主力连续换月跳空会污染 ATR/均线/止损")
+        fail("data_not_adjusted", "回测数据未复权:主力连续换月跳空会污染 ATR/均线/止损")
 
     if not m.parameter_on_plateau:
-        fails.append("最优参数不在参数高原:邻域表现不稳定,疑似过拟合")
+        fail("not_on_plateau", "最优参数不在参数高原:邻域表现不稳定,疑似过拟合")
 
     if m.dsr is None:
-        fails.append("DSR 未计算:缺少去通胀检验,不予通过")
+        fail("dsr_missing", "DSR 未计算:缺少去通胀检验,不予通过")
     else:
         # 审计字段严格校验:NaN 比较恒为 False、bool 是 int 的子类,宽松比较会把它们放过
         if isinstance(m.n_trials, bool) or not isinstance(m.n_trials, int) or m.n_trials < 1:
-            fails.append("DSR 缺少有效的试验次数:无法核对多重检验的去通胀是否到位,不予通过")
+            fail("dsr_trials_invalid", "DSR 缺少有效的试验次数:无法核对多重检验的去通胀是否到位,不予通过")
         if isinstance(m.dsr, bool) or not isinstance(m.dsr, (int, float)) or not math.isfinite(m.dsr) or not 0.0 <= m.dsr <= 1.0:
-            fails.append(f"DSR 取值非法({m.dsr!r}):必须是 [0, 1] 内的有限数,不予通过")
+            fail("dsr_invalid", f"DSR 取值非法({m.dsr!r}):必须是 [0, 1] 内的有限数,不予通过")
         elif m.dsr < t.min_dsr:
-            fails.append(f"DSR {m.dsr:.3f} < {t.min_dsr}(累计试验 {m.n_trials} 次):扣除多重检验后不能排除是运气")
+            fail("dsr_low", f"DSR {m.dsr:.3f} < {t.min_dsr}(累计试验 {m.n_trials} 次):扣除多重检验后不能排除是运气")
 
-    return fails
+    return fails, ids
+
+
+def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> list[str]:
+    """返回未通过的条目(中文说明);空列表表示全部通过。"""
+    return _run_gate(m, t)[0]
+
+
+# 门槛检查项的稳定 ID(封闭集合)。外层(进化回路)只能看到这些 ID,看不到带验证窗口数字的中文说明
+# (见 risk/outward.py)。新增检查项必须同时加进这里,否则 `check_gate_ids` 会抛错而不是悄悄放行。
+CHECK_IDS = ("sharpe_suspicious", "sharpe_low", "sharpe_ci", "years_invalid", "drawdown_pct", "drawdown_yuan",
+             "round_trips", "random_percentile", "stress_sharpe", "data_not_adjusted", "not_on_plateau",
+             "dsr_missing", "dsr_trials_invalid", "dsr_invalid", "dsr_low")
+
+
+def check_gate_ids(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> list[str]:
+    """未通过的检查项 ID(与 `check_gate` 一一对应,顺序相同)。"""
+    ids = _run_gate(m, t)[1]
+    unknown = [i for i in ids if i not in CHECK_IDS]
+    if unknown:
+        raise ValueError(f"门槛检查项缺少稳定 ID 登记: {unknown}")
+    return ids

@@ -12,7 +12,7 @@ import math
 from typing import Iterable, Sequence
 
 from risk.dsr import deflated_sharpe, deflated_sharpe_detail
-from risk.promotion_gate import CandidateMetrics, GateThresholds, check_gate
+from risk.promotion_gate import CandidateMetrics, GateThresholds, check_gate, check_gate_ids
 
 TRADING_DAYS_PER_YEAR = 240
 DEFAULT_RANDOM_RUNS = 200
@@ -90,8 +90,9 @@ def evaluate(pooled: dict, stress_sharpe: float, random_sharpes: Sequence[float]
     结果里的 `dsr_variance` 记录了 V 用的是什么、依据是什么(含"样本不足"退回理论值这件事)。"""
     metrics = build_metrics(pooled, stress_sharpe, random_sharpes, data_adjusted, on_plateau, n_trials, sharpe_stats)
     failures = check_gate(metrics, thresholds)
+    failed_check_ids = check_gate_ids(metrics, thresholds)
     returns = pooled.get("daily_returns")
     variance = (deflated_sharpe_detail(returns, n_trials, sharpe_stats)["variance"]
                 if n_trials is not None and returns else None)
-    return {"passed": not failures, "failures": failures,
+    return {"passed": not failures, "failures": failures, "failed_check_ids": failed_check_ids,
             "metrics": metrics.__dict__ | {"random_runs": len(random_sharpes)}, "dsr_variance": variance}
