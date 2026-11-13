@@ -1076,9 +1076,11 @@ def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(
     # 这条写法静态层看不出来:`strategies` 是候选**必须**导入的包(继承基类),
     # 静态层没有理由禁它;能抓住它的只有身份指纹(第四层)。
     # 候选改写模板类的方法,与改写风控函数等价——模板方法正是风控判定的入口。
+    # (第 10 轮:`get_size` 已经进了受保护名单,静态层就能拦;这里用一个静态层
+    #  按名字看不见的成员,专门盯住"第四层还在工作"这件事。)
     path.write_text(
         "import strategies.trend_atr_15m_strategy as t\n"
-        "t.TrendAtr15mStrategy.get_size = lambda self: 10**9\n"
+        "t.TrendAtr15mStrategy.get_pricetick = lambda self: 10**9\n"
         "from vnpy_ctastrategy import CtaTemplate\n"
         "class S(CtaTemplate):\n"
         "    pass\n",
@@ -1087,6 +1089,26 @@ def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(
     with pytest.raises(api.JobError) as exc:
         api.import_candidate(path, "S", api.rs.file_sha256(path))
     assert "受保护的框架对象" in str(exc.value)
+
+
+def test_a_candidate_that_shadows_get_size_on_the_instance_is_refused(tree, monkeypatch):
+    """候选在**实例**上遮蔽 `get_size` 也要被拒(第 10 轮自查发现的 Critical)。
+
+    `self.get_size = lambda: 0.001` 把合约乘数 10 换成 0.001:
+    300 元单笔预算算成 0.003 元,任何止损距离都"在预算内"。
+    类字典里没有这个赋值,四层防线原本全都放行——现在静态层按名字拦住了。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(
+        "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy\n"
+        "class S(TrendAtr15mStrategy):\n"
+        "    def entry_signal(self):\n"
+        "        self.get_size = lambda: 0.001\n"
+        "        return 1\n",
+        encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    with pytest.raises(api.JobError) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "get_size" in str(exc.value)
 
 
 def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monkeypatch):

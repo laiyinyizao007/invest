@@ -480,6 +480,98 @@ tampered = check_protected_state(before, after)   # 被替换/被删除/被新�
    `PROTECTED_RUNTIME_PACKAGES` 这种"多一项更严"的常量已登记,但语义级守卫仍未做。
 5. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
 
+### 第 10 轮补记:函数对象的**状态**、实例上的**遮蔽**,以及"判定逻辑本身"可被改写
+
+第 9 轮引入的运行期第四层(受保护对象的**身份指纹**)把"换个写法改写框架对象"堵住了,
+但它比的是**身份**(`("id", value)`)。第 10 轮 codex 复核与本地自查各抓到一条 Critical,
+两条都**四层防线全部放行**,且都不是"写法"的问题:
+
+#### Critical 1(codex):改的是函数**对象的状态**,不是它的名字
+
+    from strategies.trend_atr_strategy import within_budget
+    within_budget.__defaults__ = (0.0,)        # volume 的默认值变成 0
+
+`within_budget` 还是**那个函数对象**,身份没变,只比身份完全看不见;
+而改完之后单笔风险金额恒为 0,300 元预算形同虚设。
+实测:`within_budget(500, 10, 300)` 由 `False` 变成 `True`。
+
+处理(纵深,三处各自独立):
+
+- **静态层**:把 `__defaults__`/`__kwdefaults__`/`__annotations__`/`__wrapped__`
+  加进 `BUILTIN_FORBIDDEN_DUNDERS`,沙盒的 `FORBIDDEN_ATTRS`/`FORBIDDEN_STRINGS` 同步;
+  候选没有任何正当理由碰这些 dunder。
+- **静态层(读)**:新增 `BUILTIN_PROTECTED_READ_ATTRS`
+  (`within_budget`/`stop_distance`/`risk_per_trade`/`DailyLossGuard`/`TrailingStop`/`trading_day`)——
+  候选**不得读**风控对象。风控由基类固定,候选只写信号逻辑;
+  拿到定义就多一条改写它的路。只收**不会误伤**的名字:泛用词
+  (`reset`/`can_open`/`on_trade_closed`/`ceil_to`/`floor_to`)不在其中。
+- **第四层**:指纹对函数不再只比身份,而是比
+  `(函数对象, __code__ 的 id, __defaults__, __kwdefaults__, 闭包单元格内容)`。
+  就地改写默认参数、换掉代码对象、改闭包里捕获的变量,都会被报出来。
+
+#### Critical 2(自查):在**实例**上遮蔽模板方法
+
+    def entry_signal(self):
+        self.get_size = lambda: 0.001        # 真实合约乘数 10
+        return 1
+
+`within_budget(dist, self.get_size(), self.risk_budget)` 读到的是 0.001,
+300 元预算算成 0.003 元,任何止损距离都"在预算内"。
+类字典里没有这个赋值(`check_class` 比不出来),实例字段快照只盯三个底线值,
+指纹只覆盖模块属性与类成员——所以四层全放行。
+
+处理:
+
+- **静态层**:`get_size` 进 `BUILTIN_PROTECTED_NAMES`(它是"决定风险金额"的框架方法),
+  `self.get_size = ...` 按名字被拦。
+- **第三层**:新增"实例上不许遮蔽模板方法"的核对——模板 MRO 里的**可调用**成员,
+  实例字典里不许出现这些名字(白名单里的 `entry_signal` 等除外)。
+  这里只查"实例上有没有遮蔽",不比"实现是不是同一个":同一个家族里日线模板与
+  15 分钟模板本来就有各自的实现,按"必须等于某个模板的实现"去比会误伤合法的日线策略。
+
+#### 其余发现(同轮)
+
+- **High 1——`trading_day` 没被保护**:熔断器按它分日("今天亏了几笔"),
+  改掉它就能把昨天的亏损算到今天,当日连亏熔断随之失效。
+  已进 `BUILTIN_PROTECTED_MODULE_ATTRS` 与 `BUILTIN_PROTECTED_READ_ATTRS`。
+- **High 2——指纹"跳过所有 dunder"**:于是改写类的 `__getattribute__`
+  (让 `self.get_size()` 返回假的)或 `__instancecheck__`(把 isinstance 判定废掉)都拍不到。
+  改成**显式忽略清单**(`_FINGERPRINT_IGNORED_DUNDERS`,只放过纯元数据),
+  其余 dunder 一律进指纹;`__instancecheck__`/`__subclasscheck__`/`__subclasshook__`/`__prepare__`
+  同时进受禁 dunder 名单。
+- **High 2 的另一半——家族判定本身可被改写**:第三层原来用
+  `isinstance(strategy, family_root(template))` 判"这是不是模板家族的策略",
+  而 `isinstance` 的判定逻辑正是 `ABCMeta.__instancecheck__`——把它换掉,
+  第三层直接判成"不适用"而放行。改成按 **MRO** 判定(结构判定,没有可改写的入口)。
+- **Medium 1——受保护模块成员"只禁写不禁读"**:读一次就多一条改写的路,
+  由上面 `BUILTIN_PROTECTED_READ_ATTRS` 补上(只收不会误伤的名字)。
+- **Medium 3——第四层的"回测前"基准拍晚了**:`backtest_lib` 里基准是在
+  `engine.add_strategy()` **之后**拍的,构造期的改写会被当成"基线"。
+  基准前移到构造之前(`run_engine` 与 `run_engine_bars` 两处)。
+- **Medium 4——第四层的**执行点**没人守**:删掉 `check_protected_state(...)` 那一行,
+  常量集合没变、清单文件也没变,第四层就此失效。
+  `tools/check_constitution_history.py` 新增 `CALL_SITE_REGISTRY`,
+  按"引用次数只许增不许减"守 `snapshot_protected_state`/`check_protected_state`
+  在 `backtest_lib` 与 `research_api` 两处的引用次数(实测:删掉调用后守卫退出码 1)。
+- **Low 1——泛用名按名字一刀切**:`self.indicator.reset = 1` 这种普通写法会被
+  `reset`(TrailingStop 的方法名)误拒。带主的名字改成**主人也在路径里**才算命中
+  (`BUILTIN_MODULE_ATTR_OWNERS`),路径断在调用表达式上时只认底线成员。
+- **Low 3——比对可能抛异常**:numpy 数组的 `==` 返回数组,放进 `bool()` 会抛 ValueError,
+  原实现会把它当成"被改写"(误报)。指纹改用 `_safe_token`:能按值比的按值比
+  (浮点用 `repr` 解决 nan),不能的一律退化成身份标记,**比对永不抛异常**。
+
+#### 第 10 轮之后仍然存在的残余缺口(如实记录)
+
+1. **第四层仍是"前后差分"**:候选若在回测途中"改→用→还原",差分看不出来。
+   这一类要靠**能力收走**来堵(见"执行时的能力隔离":候选的内建里没有
+   `setattr`/`getattr`/`type`,`sys`/`importlib`/`ctypes` 等模块导不进来),
+   静态层则保证**源码里可见的**改写一律按名字被拦。
+   两层叠加之后,"纯动态取得受保护对象再改"的路已经堵死,但差分本身的盲区仍在。
+2. **指纹覆盖三个包、约 3400 个键**:一次快照约 6 毫秒(第 9 轮是 2.5 毫秒,
+   多出来的是 dunder 覆盖与函数状态)。每次回测拍两张,代价可接受。
+3. **静态层仍然是纵深防御,不是安全边界**——真正的边界仍是容器隔离与"运行前由人读过代码"。
+4. 晋级门槛仍缺**逐笔风险预算审计**(第 8 轮登记的遗留项,本轮未动)。
+
 ### 关于"vnpy 全家只有一处按名 setter"这句话的更正
 
 早先这里写的是"已核过 vnpy 全家,按名 setter 只有 `update_setting` 一处"——**说过头了**。
@@ -508,18 +600,19 @@ tampered = check_protected_state(before, after)   # 被替换/被删除/被新�
 | 类别 | 名字 | 出处 |
 |---|---|---|
 | 受保护参数(不得出现在设置字典、网格、字典键、关键字参数里) | `risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_PARAMETERS` |
-| 受保护成员(不得在类体里重写) | `guard`、`trail`、`am`、`bg`、`pending_dist`、`pending_entry`、`_stop_armed`、`atr_value`、`stop_price`、`entry_price`、`entry_dist`、`prev_pos`、`skipped_by_budget`、`trail_side`、`trail_extreme`、`trail_stop`、`is_live`、`state_consistent`、`cta_engine`、`__init__`、`on_bar`、`on_tick`、`on_init`、`on_start`、`on_stop`、`on_trade`、`on_order`、`on_stop_order`、`on_account_status`、`on_position`、`on_cancel_order`、`on_disconnect`、`_process_daily_bar`、`_manage_position`、`_try_enter`、`_send_entry`、`_place_protective_stop`、`_place_pending_entry`、`_stop_order_price`、`_ensure_protective_stop`、`_complete_stale_daily_bar`、`risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_NAMES` |
-| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__`、`__new__` | `BUILTIN_FORBIDDEN_DUNDERS` |
+| 受保护成员(不得在类体里重写) | `guard`、`trail`、`am`、`bg`、`pending_dist`、`pending_entry`、`_stop_armed`、`atr_value`、`stop_price`、`entry_price`、`entry_dist`、`prev_pos`、`skipped_by_budget`、`trail_side`、`trail_extreme`、`trail_stop`、`is_live`、`state_consistent`、`cta_engine`、`get_size`、`__init__`、`on_bar`、`on_tick`、`on_init`、`on_start`、`on_stop`、`on_trade`、`on_order`、`on_stop_order`、`on_account_status`、`on_position`、`on_cancel_order`、`on_disconnect`、`_process_daily_bar`、`_manage_position`、`_try_enter`、`_send_entry`、`_place_protective_stop`、`_place_pending_entry`、`_stop_order_price`、`_ensure_protective_stop`、`_complete_stale_daily_bar`、`risk_budget`、`max_daily_losses`、`atr_window`、`history_vt_symbol` | `BUILTIN_PROTECTED_NAMES` |
+| 受禁 dunder(不得定义、引用或调用) | `__setattr__`、`__delattr__`、`__getattribute__`、`__getattr__`、`__init_subclass__`、`__set_name__`、`__dict__`、`__class__`、`__mro__`、`__bases__`、`__subclasses__`、`__globals__`、`__code__`、`__func__`、`__self__`、`__closure__`、`__reduce__`、`__reduce_ex__`、`__getnewargs__`、`__getstate__`、`__setstate__`、`__del__`、`__mro_entries__`、`__new__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__` | `BUILTIN_FORBIDDEN_DUNDERS` |
 | 受保护的**风控执行点**(不得引用,连取别名都不许) | `_try_enter`、`_send_entry`、`_manage_position`、`_place_protective_stop`、`_place_pending_entry`、`_process_daily_bar`、`_ensure_protective_stop`、`_stop_order_price`、`_complete_stale_daily_bar` | `BUILTIN_PROTECTED_ENTRY_POINTS` |
 | 受保护的**风控状态对象**(不得引用,连读都不许) | `guard`、`trail`、`cta_engine` | `BUILTIN_PROTECTED_STATE_OBJECTS` |
 | 受保护的**属性路径**(整条路径不得出现在源码里) | `am.array` | `BUILTIN_PROTECTED_PATHS` |
-| 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
+| 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset`、`trading_day` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
+| 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day` | `BUILTIN_PROTECTED_READ_ATTRS` |
 | 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
 | 运行期**受保护包**(第四层身份指纹覆盖范围:整包模块与类成员) | `risk`、`strategies`、`vnpy_ctastrategy` | `PROTECTED_RUNTIME_PACKAGES` |
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
-| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__` | `research_sandbox.FORBIDDEN_ATTRS` |
 | 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
 | 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |

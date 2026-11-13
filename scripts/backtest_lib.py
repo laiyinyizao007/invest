@@ -60,9 +60,12 @@ def run_engine(
         pricetick=inst.pricetick,
         capital=capital,
     )
+    # 第四层的"回测前"基准要在**构造实例之前**拍:
+    # 实例构造(__init__)也是候选能碰到的时机,构造期改写的东西如果发生在拍快照之后,
+    # 就成了"基线",指纹再也看不出来(第 10 轮 codex 的 Medium 3)。
+    _protected = _protected_state_snapshot()
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
-    _protected = _protected_state_snapshot()
     engine.load_data()
     if not engine.history_data:
         raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
@@ -120,9 +123,9 @@ def run_engine_bars(
         pricetick=inst.pricetick,
         capital=capital,
     )
+    _protected = _protected_state_snapshot()          # 同 run_engine:基准拍在构造实例之前
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
-    _protected = _protected_state_snapshot()
     engine.history_data = list(bars)
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)

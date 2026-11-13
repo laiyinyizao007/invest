@@ -46,6 +46,7 @@ BUILTIN_SETS = (
     "BUILTIN_PROTECTED_PARAMETERS",
     "BUILTIN_FORBIDDEN_ORDER_CALLS",
     "BUILTIN_PROTECTED_MODULE_ATTRS",
+    "BUILTIN_PROTECTED_READ_ATTRS",
     "BUILTIN_FORBIDDEN_DUNDERS",
     "BUILTIN_FORBIDDEN_BY_NAME_SETTERS",
     "BUILTIN_ALLOWED_TEMPLATES",
@@ -75,6 +76,15 @@ BUILTIN_REGISTRY = (
 # 常量集合没变、清单文件也没变,但下单黑名单不再被执行——只有"字段名被引用的次数"会变。
 # 字段名与常量名分开登记,免得两套语义混在一张表里。
 FIELD_REGISTRY = ((CONSTITUTION_SOURCE_REL, CONSTITUTION_FIELDS),)
+
+# 运行期第四层的**执行点**(第 10 轮 codex 的 Medium 4):
+# 把 `check_protected_state(...)` 那一行删掉,常量集合没变、清单文件也没变,
+# 但"指纹比对"就此不再发生——受保护对象被改写也照样放行。
+# 这两个名字是**函数名**而不是常量,所以按"引用次数只许增不许减"来守。
+CALL_SITE_REGISTRY = (
+    ("scripts/backtest_lib.py", ("snapshot_protected_state", "check_protected_state")),
+    ("scripts/research_api.py", ("snapshot_protected_state", "check_protected_state")),
+)
 
 # 单值常量:不是集合,没有"只增不减"可言。它只能通过"必须落在白名单里"来约束。
 SINGLE_CONSTANTS = (("risk/constitution.py", "BUILTIN_TEMPLATE", "BUILTIN_ALLOWED_TEMPLATES"),)
@@ -228,6 +238,7 @@ def check_protected_usage(root: Path) -> list[str]:
     # (文件, 名字列表, 这些名字是不是"源码里的常量")
     registry = [(rel, names, True) for rel, names in BUILTIN_REGISTRY]
     registry += [(rel, names, False) for rel, names in FIELD_REGISTRY]
+    registry += [(rel, names, False) for rel, names in CALL_SITE_REGISTRY]
     for rel, names, is_constant in registry:
         current_source = (root / rel).read_text(encoding="utf-8")
         if is_constant:

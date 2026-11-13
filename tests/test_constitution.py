@@ -1258,3 +1258,144 @@ def test_the_protected_state_is_taken_before_the_candidate_imports_anything():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip().endswith("True"), out.stdout + out.stderr
+
+
+# ---------- 第 10 轮 codex:函数对象的**状态**与实例上的**遮蔽**(两条 Critical) ----------
+
+def test_the_static_layer_refuses_an_instance_shadow_of_get_size():
+    """候选在**实例**上遮蔽 `get_size`,静态层必须拦。
+
+    `self.get_size = lambda: 0.001` 把真实合约乘数 10 换成 0.001:
+    `within_budget(dist, self.get_size(), self.risk_budget)` 算出来的风险金额是
+    dist × 0.001,300 元预算等于 0.003 元,任何止损距离都"在预算内"。
+    类字典里没有这个赋值(`check_class` 比不出来),实例字段快照也不盯它——
+    四层防线全都放行(第 10 轮自查实测)。"""
+    src = textwrap.dedent(
+        """
+        from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+        class S(TrendAtr15mStrategy):
+            def entry_signal(self):
+                self.get_size = lambda: 0.001
+                return 1
+        """)
+    findings = const.screen_source(src)
+    assert findings, "实例上遮蔽 get_size 没被拦"
+    assert any("get_size" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_tampering_with_a_functions_state():
+    """改函数**对象的状态**(默认参数)也要拦。
+
+    `within_budget.__defaults__ = (0.0,)` 把 volume 的默认值变成 0,
+    单笔风险金额恒为 0——改的不是名字,是对象的状态,按名字的黑名单全都看不见。"""
+    findings = const.screen_source("f.__defaults__ = (0.0,)\n")
+    assert findings, "改写函数的默认参数没被拦"
+    assert any("__defaults__" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_reading_the_risk_functions():
+    """候选没有正当理由拿到风控函数的**定义**:风控由基类固定,候选只写信号逻辑。
+
+    拿到定义就多一条改写的路(改对象状态,连名字都不用碰)。"""
+    findings = const.screen_source("from strategies.trend_atr_strategy import within_budget\n")
+    assert findings, "导入风控函数没被拦"
+    assert any("within_budget" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_the_type_check_entry_points():
+    """改掉 `__instancecheck__` 就能把 isinstance 判定废掉(运行时第三层的家族判定)。"""
+    findings = const.screen_source("x.__instancecheck__\n")
+    assert findings, "__instancecheck__ 没被拦"
+    assert any("__instancecheck__" in f for f in findings), findings
+
+
+def test_the_protected_state_notices_an_in_place_mutation_of_a_function_object():
+    """指纹比的不只是**身份**,还有函数**对象的状态**。
+
+    第 10 轮 codex 实测:只比身份时,`within_budget.__defaults__ = (0.0,)` 完全看不见,
+    300 元单笔预算就此恒真,而四层防线全部放行。"""
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.within_budget.__defaults__
+    try:
+        rg.within_budget.__defaults__ = (0.0,)
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "就地改写函数对象的状态没被抓到"
+        assert any("within_budget" in f for f in findings), findings
+    finally:
+        rg.within_budget.__defaults__ = original
+
+
+def test_the_protected_state_notices_a_patched_class_dunder():
+    """类的 dunder 也在指纹里:改写 `__getattribute__` 能让 `self.get_size()` 返回假的。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    before = const.snapshot_protected_state()
+    original = TrendAtr15mStrategy.__getattribute__
+    try:
+        TrendAtr15mStrategy.__getattribute__ = lambda self, name: 0.001
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写类的 __getattribute__ 没被抓到"
+    finally:
+        TrendAtr15mStrategy.__getattribute__ = original
+
+
+def _bare_family_instance():
+    """造一个**不跑 __init__** 的家族实例:只用来核对第三层的判定逻辑。"""
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+
+    return object.__new__(TrendAtrStrategy)
+
+
+def test_the_instance_state_check_notices_a_shadowed_template_method():
+    """实例上遮蔽模板方法(第三层):类字典比不出来的那一类改写。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = _bare_family_instance()
+    findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy)
+    assert not findings, findings
+
+    strategy.get_size = lambda: 0.001
+    findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy)
+    assert findings, "实例上遮蔽模板方法没被抓到"
+    assert any("get_size" in f for f in findings), findings
+
+
+def test_the_family_check_does_not_depend_on_isinstance():
+    """家族判定走 MRO(结构),不走 isinstance(判定逻辑可被改写)。
+
+    第 10 轮 codex 实测:把 `abc.ABCMeta.__instancecheck__` 换掉之后,
+    isinstance 一律返回 False,第三层直接判成"不适用"而放行。"""
+    import abc
+
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = _bare_family_instance()
+    snapshot = const.snapshot_instance_state(strategy)          # 底线原值
+    strategy.risk_budget = 10 ** 12                            # 途中被改写
+
+    original = abc.ABCMeta.__instancecheck__
+    try:
+        abc.ABCMeta.__instancecheck__ = lambda cls, instance: False
+        findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy, snapshot=snapshot)
+    finally:
+        abc.ABCMeta.__instancecheck__ = original
+    assert findings, "家族判定被改写之后第三层就不工作了"
+    assert any("risk_budget" in f for f in findings), findings
+
+
+def test_the_static_layer_does_not_flag_an_ordinary_reset():
+    """`reset` 这类泛用名字不该按名字一刀切(第 10 轮 codex 的 Low 1)。
+
+    `reset` 是 TrailingStop 的方法名,但候选代码里 `self.indicator.reset = 1` 太常见——
+    按名字一刀切会把正常候选整片拒掉。带主的名字只在**主人也在路径里**时才算命中。"""
+    findings = const.screen_source("class C:\n    def f(self):\n        self.indicator.reset = 1\n")
+    assert not findings, findings
+    assert not const.screen_source("make().reset = 1\n")
+
+
+def test_the_static_layer_still_flags_the_risk_objects_own_reset():
+    """带主的名字在主人出现时照样拦:`TrailingStop.reset` 被换掉等于移动止损失效。"""
+    findings = const.screen_source("rg.TrailingStop.reset = lambda self: None\n")
+    assert findings, "改写移动止损的 reset 没被拦"

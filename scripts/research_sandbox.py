@@ -41,7 +41,14 @@ FORBIDDEN_MODULES = {
 # AST 看不见被调的是谁。只拦调用等于给别名留了门。
 FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input",
                    "type"}      # type(self).__base__ 之类的反射入口
-FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
+FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__",
+                   # 函数对象的**状态**(第 10 轮 codex 实测的 Critical):
+                   # `within_budget.__defaults__ = (0.0,)` 把 volume 默认值改成 0,
+                   # 单笔风险金额恒为 0,300 元预算形同虚设——改的不是名字,是对象的状态。
+                   "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
+                   # 类型判定入口:改掉 `__instancecheck__` 之后 isinstance 一律返回 False,
+                   # 运行时第三层的家族判定直接失效。
+                   "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__"}
 
 # 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
 # `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,

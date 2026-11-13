@@ -40,6 +40,7 @@ import importlib
 import json
 import re
 import sys
+import types
 from pathlib import Path
 
 CONSTITUTION_FILE = Path(__file__).resolve().parents[1] / "config" / "immutable_constitution.json"
@@ -74,6 +75,12 @@ BUILTIN_PROTECTED_NAMES = (
     # (`self.cta_engine.size = 0.001` 会让止损距离算出来的风险金额接近 0,
     #  两道回撤门槛随之失效——第 7 轮 codex 实测)。
     "cta_engine",
+    # 仓位规模(合约乘数):它决定"止损距离 × 乘数"这个**风险金额**。
+    # 候选在**实例**上遮蔽它(`self.get_size = lambda: 0.001`)就能让预算判定恒真:
+    # 真实乘数 10 被换成 0.001,300 元预算算成 0.003 元,任何止损距离都"在预算内"。
+    # 类字典里看不到实例上的赋值(check_class 比不出来),所以这一层由名字兜住;
+    # 运行时第三层再核一次"实例上有没有遮蔽模板方法"(见 _shadowed_template_callables)。
+    "get_size",
     # 下单与持仓管理路径:重写即绕过预算检查与连亏熔断
     "__init__", "on_bar", "on_tick", "on_init", "on_start", "on_stop", "on_trade", "on_order",
     "on_stop_order", "on_account_status", "on_position", "on_cancel_order", "on_disconnect",
@@ -150,6 +157,32 @@ BUILTIN_PROTECTED_MODULE_ATTRS = (
     "within_budget", "stop_distance", "risk_per_trade", "ceil_to", "floor_to",
     "DailyLossGuard", "TrailingStop",
     "can_open", "on_trade_closed", "reset",
+    # 交易日归属:熔断器按它分日("今天亏了几笔")。改掉它就能把昨天的亏损算到今天,
+    # 当日连亏熔断随之失效(第 10 轮 codex 实测:四层防线全部放行)。
+    "trading_day",
+)
+
+# 有些模块级成员的名字**太泛**(`reset`/`can_open`/`on_trade_closed`),
+# 按名字一刀切会把普通写法(`self.indicator.reset = 1`)整片拒掉(第 10 轮 codex 的 Low 1)。
+# 它们各有主人:只有路径里**同时出现主人**时才算命中。
+BUILTIN_MODULE_ATTR_OWNERS = {
+    "reset": "TrailingStop",
+    "can_open": "DailyLossGuard",
+    "on_trade_closed": "DailyLossGuard",
+}
+
+# 候选**不得引用**的风控对象:风控由基类固定,候选只写信号逻辑。
+#
+# 为什么"禁止改写"还不够:拿到引用就多一条改写的路,而改写可以绕开一切按名字的检查
+# (第 10 轮 codex 实测:`within_budget.__defaults__ = (0.0,)` 把 volume 默认值变成 0,
+# 300 元单笔预算恒真,而四层防线全部放行——因为改的是**函数对象的状态**,不是它的名字)。
+# 所以这里禁的是"**读**":候选没有正当理由拿到风控函数的定义。
+#
+# 只收**不会误伤**的名字:泛用词(`reset`/`can_open`/`on_trade_closed`/`ceil_to`/`floor_to`)
+# 不在这里——候选代码里出现 `reset` 太常见,按名字一刀切会把正常候选整片拒掉。
+BUILTIN_PROTECTED_READ_ATTRS = (
+    "within_budget", "stop_distance", "risk_per_trade",
+    "DailyLossGuard", "TrailingStop", "trading_day",
 )
 
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
@@ -178,6 +211,17 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     #    候选没有正当理由自定义 `__new__`(模板也没有),直接禁掉。
     #    ——第 9 轮 codex 实测:定义 `__new__` 三层全放行。
     "__new__",
+    # ④ 函数对象的**状态**(第 10 轮 codex 实测的 Critical):
+    #    `within_budget.__defaults__ = (0.0,)` 把 volume 的默认值改成 0,
+    #    单笔风险金额恒为 0,300 元预算形同虚设——四层防线全部放行。
+    #    改的是函数**对象的状态**而不是它的名字,按名字的黑名单全都看不见。
+    #    指纹层已经改成比"函数状态"而不是只比身份,但静态层也要先把这条路堵上:
+    #    候选没有正当理由碰这些 dunder。
+    "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
+    # ⑤ 类型判定入口:改掉 `ABCMeta.__instancecheck__` 之后 isinstance 一律返回 False,
+    #    运行时第三层的"家族判定"直接判成"不适用"而放行(第 10 轮 codex 实测)。
+    #    第三层已改成按 MRO 判定(结构判定,没有可改写的入口),这里再加一道静态保险。
+    "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -448,17 +492,29 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
     path = _attr_path(target)
     if path:
         for index, segment in enumerate(path):
-            if (segment in c.protected_names or segment in c.protected_parameters
-                    or segment in c.protected_module_attrs):
+            if segment in c.protected_names or segment in c.protected_parameters:
+                return ".".join(path[index:])
+            if segment in c.protected_module_attrs and _module_attr_owner_ok(segment, path):
                 return ".".join(path[index:])
         return None
-    # 路径断在调用表达式上:退回按末段属性名判
+    # 路径断在调用表达式上:退回按末段属性名判。
+    # 模块级成员名(`reset` 之类)太泛,这里只在**主人也在路径里**时才算命中。
     if isinstance(target, ast.Attribute):
         attr = target.attr
-        if (attr in c.protected_names or attr in c.protected_parameters
-                or attr in c.protected_module_attrs):
+        if attr in c.protected_names or attr in c.protected_parameters:
+            return attr
+        if attr in c.protected_module_attrs and _module_attr_owner_ok(attr, _attr_path(target) or []):
             return attr
     return None
+
+
+def _module_attr_owner_ok(name: str, path: list[str]) -> bool:
+    """模块级成员名**有主**时,只有主人也在路径里才算命中。
+
+    `reset` 是 TrailingStop 的方法名,但候选代码里 `self.indicator.reset = 1` 太常见——
+    按名字一刀切会把正常候选整片拒掉(第 10 轮 codex 的 Low 1)。"""
+    owner = BUILTIN_MODULE_ATTR_OWNERS.get(name)
+    return owner is None or owner in path
 
 
 def _container_alias(value: ast.AST) -> str | None:
@@ -559,7 +615,8 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 violation = _write_violation(target, c)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
-                elif target.attr in c.protected_module_attrs:
+                elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
+                        target.attr, _attr_path(target) or []):
                     findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
             elif isinstance(target, ast.Subscript):
                 # `self.am.close[0] = 999`:改的是被下标取到的那个对象(行情数组本体)
@@ -574,7 +631,8 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     violation = _write_violation(target, c)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
-                    elif target.attr in c.protected_module_attrs:
+                    elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
+                            target.attr, _attr_path(target) or []):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
                 elif isinstance(target, ast.Subscript):
                     violation = _write_violation(target.value, c)
@@ -617,6 +675,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             elif node.attr in c.protected_entry_points:
                 # 风控执行点:候选不重写它,直接调用它就把预算判定与熔断判定一起绕过了。
                 findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.attr}(调用它可绕开预算与熔断判定)")
+            elif node.attr in BUILTIN_PROTECTED_READ_ATTRS:
+                # 拿到风控函数的**定义**就多一条改写它的路(改函数对象的状态,连名字都不用碰)。
+                findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.attr}(拿到定义就能架空风控判定)")
             elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
             else:
@@ -633,6 +694,16 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 findings.append(f"第 {node.lineno} 行: 禁止引用下单/撤单接口 {node.id}")
             elif node.id in c.protected_entry_points:
                 findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.id}(调用它可绕开预算与熔断判定)")
+            elif node.id in BUILTIN_PROTECTED_READ_ATTRS:
+                findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.id}(拿到定义就能架空风控判定)")
+        elif isinstance(node, ast.ImportFrom):
+            # 从受保护模块里**导入**风控对象:候选不需要它,拿到就多一条改写它的路。
+            # (`from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 不受影响——
+            #  模板基类不在这个名单里,候选本来就要继承它。)
+            for alias in node.names:
+                if alias.name in BUILTIN_PROTECTED_READ_ATTRS:
+                    findings.append(
+                        f"第 {node.lineno} 行: 不得导入受保护的风控对象 {alias.name}(拿到定义就能架空风控判定)")
         elif isinstance(node, ast.keyword) and node.arg:
             # 关键字参数是**按名**传参的另一个入口:`dict(risk_budget=1e12)` 里这个名字
             # 是 ast.keyword.arg,既不是属性赋值也不是字典键,按语法位置筛查看不见。
@@ -755,6 +826,48 @@ def snapshot_instance_state(strategy: object) -> dict[str, object]:
     return snap
 
 
+def _shadowed_template_callables(strategy: object, template: type) -> list[str]:
+    """实例上**遮蔽**模板方法的检出。
+
+    候选可以在实例上给模板方法塞一个假实现:
+        def entry_signal(self):
+            self.get_size = lambda: 0.001      # 真实合约乘数 10
+            return 1
+    类字典里看不到这个赋值(`check_class` 比的是类字典),实例字段快照也只盯
+    `risk_budget`/`atr_window`/`max_daily_losses` 三个底线值——所以四层防线全都放行。
+    而 `within_budget(dist, self.get_size(), self.risk_budget)` 读到的是 0.001,
+    300 元预算算成 0.003 元,任何止损距离都"在预算内"(第 10 轮自查实测)。
+
+    这里从模板的 MRO 里取出所有**可调用**成员,核对一件事:
+    实例字典里不许出现这些名字(实例属性遮蔽了模板方法)。
+    白名单里的成员(`entry_signal` 等)例外——候选本来就可以重写它们。
+
+    只查"实例上有没有遮蔽",不比"实现是不是同一个":
+    同一个家族里日线模板与 15 分钟模板本来就有各自的实现(同一个成员名、两份代码),
+    按"必须等于某个模板的实现"去比,会把合法的日线策略判成"实现被换掉"。
+    "实现被换掉"由另外两层负责:类字典层(`check_class`)与指纹层(第四层)。"""
+    findings: list[str] = []
+    try:
+        instance_dict = vars(strategy)
+    except TypeError:                                       # noqa: BLE001 - 没有 __dict__ 的对象不看
+        return findings
+    root = family_root(template)
+    names = template_members(template) | template_members(root)
+    for name in sorted(names):
+        if name in BUILTIN_ALLOWED_OVERRIDES:
+            continue
+        owner_impl = None
+        for klass in template.__mro__:
+            if name in vars(klass):
+                owner_impl = vars(klass)[name]
+                break
+        if owner_impl is None or not callable(owner_impl):
+            continue                                        # 数据成员遮蔽不致命,方法才致命
+        if name in instance_dict:
+            findings.append(f"实例上遮蔽了模板方法 {name}(在实例属性里被覆盖)")
+    return findings
+
+
 def check_instance_state(strategy: object, template: type | None = None, c: Constitution | None = None,
                          expected_size: float | None = None, snapshot: dict | None = None,
                          expected: dict | None = None) -> list[str]:
@@ -784,12 +897,19 @@ def check_instance_state(strategy: object, template: type | None = None, c: Cons
         except ConstitutionError:
             return []
     # 只管模板家族的策略:别的策略(随机入场对照、演示策略)有各自的参数,不该被拿模板的底线比
+    #
+    # 家族判定走 **MRO**(结构)而不是 isinstance:
+    # isinstance 的判定逻辑本身是可以被改写的——`abc.ABCMeta.__instancecheck__` 被换掉之后,
+    # isinstance 一律返回 False,这一层直接判成"不适用"而放行(第 10 轮 codex 实测)。
+    # MRO 由解释器给出,没有可改写的判定入口。
+    root = family_root(template)
     try:
-        if not isinstance(strategy, family_root(template)):
+        if not any(klass is root for klass in type(strategy).__mro__):
             return []
-    except Exception:                                       # noqa: BLE001 - 家族判定失败就当不适用
+    except Exception:                                       # noqa: BLE001 - 判定失败就当不适用
         return []
     findings: list[str] = []
+    findings.extend(_shadowed_template_callables(strategy, template))
 
     current = snapshot_instance_state(strategy)
 
@@ -870,20 +990,67 @@ def _preload_protected_modules() -> None:
             continue
 
 
+def _safe_token(value: object) -> object:
+    """把任意值转成"**可以安全比较**"的标记。
+
+    比对必须**永不抛异常**,否则一次比较失败就被当成"被改写"(误报)或者直接崩掉:
+    - numpy 数组的 `==` 返回数组,放进 `bool()` 会抛 ValueError(第 10 轮 codex 的 Low 3);
+    - 浮点 nan 与自己不相等,按值比会永远判成"变了"。
+
+    所以:能按值比的按值比(用 repr 解决 nan),不能的一律退化成**身份**标记
+    (id 变了就是换了对象)。"""
+    if value is None or isinstance(value, (bool, int, str, bytes)):
+        return value
+    if isinstance(value, float):
+        return ("f", repr(value))               # nan 按 repr 相等
+    if isinstance(value, (list, tuple)):
+        return ("seq", tuple(_safe_token(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return ("set", frozenset(_safe_token(item) for item in value))
+    if isinstance(value, dict):
+        return ("map", tuple((_safe_token(k), _safe_token(v)) for k, v in value.items()))
+    return ("id", id(value))
+
+
 def _protected_fingerprint_value(value: object) -> tuple[str, object]:
     """把受保护对象的值转成"可比对的指纹"。
 
     容器(list/dict/set)取**副本**:候选在**原地**改模板的 `parameters` 列表时,
-    对象身份不变,只比身份会漏掉。函数与类比身份(被换掉就是被换掉)。"""
+    对象身份不变,只比身份会漏掉。
+
+    函数比的不只是**身份**,还有**状态**(第 10 轮 codex 实测的 Critical):
+        within_budget.__defaults__ = (0.0,)
+    把 volume 的默认值改成 0,单笔风险金额恒为 0,300 元预算形同虚设——
+    而函数对象**还是那个对象**,只比身份完全看不见。
+    所以这里连同 `__code__`、默认参数、关键字默认参数、闭包单元格的内容一起比。"""
+    if isinstance(value, (classmethod, staticmethod)):
+        return _protected_fingerprint_value(value.__func__)
+    if isinstance(value, types.FunctionType):
+        cells = value.__closure__ or ()
+        return ("func", (
+            value,                       # 留住函数对象本身:既保证 id 不会被复用,也比身份更严格
+            id(value.__code__),
+            _safe_token(value.__defaults__),
+            _safe_token(value.__kwdefaults__),
+            _safe_token(tuple(_cell_token(cell) for cell in cells)),
+        ))
     if isinstance(value, list):
-        return ("seq", tuple(value))
+        return ("seq", _safe_token(tuple(value)))
     if isinstance(value, tuple):
-        return ("seq", tuple(value))
+        return ("seq", _safe_token(tuple(value)))
     if isinstance(value, dict):
-        return ("map", dict(value))
+        return ("map", _safe_token(dict(value)))
     if isinstance(value, (set, frozenset)):
-        return ("set", set(value))
+        return ("set", _safe_token(set(value)))
     return ("id", value)
+
+
+def _cell_token(cell: object) -> object:
+    """闭包单元格的内容:空单元格没有内容,按标记处理。"""
+    try:
+        return cell.cell_contents                        # type: ignore[attr-defined]
+    except ValueError:
+        return ("empty",)
 
 
 def _protected_values_same(before: tuple[str, object], after: tuple[str, object]) -> bool:
@@ -897,10 +1064,28 @@ def _protected_values_same(before: tuple[str, object], after: tuple[str, object]
         return False
 
 
+# 指纹里**忽略**的 dunder:纯元数据,框架不会在运行期动它们,收了只是平白多出几千个键。
+#
+# 其余 dunder 一律纳入指纹。早先的写法是"跳过所有 dunder",于是:
+# - 候选改写类的 `__getattribute__`(让 `self.get_size()` 返回假的)拍不到;
+# - 候选改写 `__instancecheck__`(把 isinstance 判定废掉)也拍不到
+#   (第 10 轮 codex 实测:四层防线全部放行)。
+_FINGERPRINT_IGNORED_DUNDERS = frozenset({
+    "__dict__", "__weakref__", "__module__", "__qualname__", "__doc__",
+    "__builtins__", "__annotations__", "__abstractmethods__",
+    "__firstlineno__", "__static_attributes__", "__type_params__", "__parameters__",
+})
+
+
+def _fingerprint_skip(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__") and name in _FINGERPRINT_IGNORED_DUNDERS
+
+
 def snapshot_protected_state() -> dict[str, tuple[str, object]]:
     """给受保护的模块与类拍一张**身份指纹**。
 
-    覆盖:受保护包下**所有已加载模块**的公开属性,以及其中每个**类**的成员。
+    覆盖:受保护包下**所有已加载模块**的公开属性,以及其中每个**类**的成员
+    (dunder 也在内,只放过 `_FINGERPRINT_IGNORED_DUNDERS` 里的纯元数据)。
     模板类(`TrendAtr15mStrategy.get_size` 等)与风控模块(`risk_per_trade` 等)都在里面。"""
     _preload_protected_modules()
     snapshot: dict[str, tuple[str, object]] = {}
@@ -910,12 +1095,12 @@ def snapshot_protected_state() -> dict[str, tuple[str, object]]:
         if name.split(".")[0] not in PROTECTED_RUNTIME_PACKAGES:
             continue
         for attr, value in list(vars(module).items()):
-            if attr.startswith("__") and attr.endswith("__"):
+            if _fingerprint_skip(attr):
                 continue
             snapshot[f"{name}.{attr}"] = _protected_fingerprint_value(value)
             if isinstance(value, type):
                 for member, member_value in list(vars(value).items()):
-                    if member.startswith("__") and member.endswith("__"):
+                    if _fingerprint_skip(member):
                         continue
                     snapshot[f"{name}.{attr}.{member}"] = _protected_fingerprint_value(member_value)
     return snapshot
