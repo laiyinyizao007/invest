@@ -7,5 +7,5 @@
 |---|---|---|
 | [20261110-guard-watchdog-plan.md](20261110-guard-watchdog-plan.md) | `46615c1`(CTP 废单/看门狗改造) | 已完成 |
 | [20261110-walk-forward-optimizer-plan.md](20261110-walk-forward-optimizer-plan.md) | `6cd0fad`,Issue #3 | 已完成 |
-| [20261112-web-frontend-lovable-plan.md](20261112-web-frontend-lovable-plan.md) | 前端 React + Lovable;`docs/web/` | 待执行(M0 已完成) |
-| [20261112-status-dashboard-plan.md](20261112-status-dashboard-plan.md) | ADR `20261112-status-dashboard.md`,Issue #1 | 待执行(ADR 待确认) |
+| [20261112-web-frontend-lovable-plan.md](20261112-web-frontend-lovable-plan.md) | 前端 React + Lovable;`docs/web/` | 待执行(M0 已完成;后端阶段①已就绪) |
+| [20261112-status-dashboard-plan.md](20261112-status-dashboard-plan.md) | ADR `20261112-status-dashboard.md`(已采纳),Issue #1 | 后端已实现;T7 前端待做,T10 的 G8 双轮审查未全部完成(见计划『执行记录』) |

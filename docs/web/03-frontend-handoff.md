@@ -84,7 +84,18 @@ dashboard/
   static/                    # 构建产物(提交到仓库;后端托管)
 ```
 
-- 构建产物**提交进仓库**,这样部署机不需要 Node。需要一个 `npm run build` 把产物写到 `dashboard/static/` 并生成清单(文件名 + SHA-256),后端据此只托管清单内的文件。
+- 构建产物**提交进仓库**,这样部署机不需要 Node。`npm run build` 把产物写到 `dashboard/static/`,然后运行清单工具:
+
+  ```bash
+  python tools/build_static_manifest.py dashboard/static            # 生成 manifest.json
+  python tools/build_static_manifest.py dashboard/static --check    # 只校验(可放进前端 CI)
+  ```
+
+  清单格式是**前后端的硬约定**(不要自己手写):`{"files": {"index.html": "<sha256>", "assets/app-1a2b.js": "<sha256>", ...}}`,键是相对路径(正斜杠),值是文件内容的 SHA-256。
+  后端**只服务清单里的文件,而且每次请求都重新校验哈希**:清单之外的文件、构建后又被改动的文件、被换成符号链接的文件,一律 404。所以**改了任何产物文件都必须重新生成清单**,否则那个文件会 404。
+  工具会拒绝符号链接、空目录、没有 `index.html` 的目录。`tests/test_build_static_manifest.py` 断言后端接受这个工具写出的一切。
+  注意:它与 `docs/web/fixtures/manifest.json`(示例数据清单)同名但完全无关。
+- 前端路由(如 `/trading`、`/docs/unattended-log`)刷新时由后端回退到 `index.html`,但**只限白名单里的页面路径**(见 `dashboard/app.py::FRONTEND_ROUTES`)。新增页面路由时需要在那里登记,否则刷新会 404——请在需求里告诉后端同事。
 - 资源文件名带内容哈希;`index.html` 引用它们。
 - 构建要**可复现**:锁依赖版本,CI 里 `npm ci`。
 

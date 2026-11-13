@@ -18,6 +18,8 @@
   Bisheng ADR 里的章节引用改指 `docs/roadmap.md`。
 
 ### Added（新增）
+- `tools/build_static_manifest.py`:生成 / 校验前端构建产物清单 `manifest.json`(`{"files": {相对路径: sha256}}`)——**前后端的硬约定**。后端只服务清单内、哈希匹配的文件,每次请求重新校验;改了产物就必须重新生成。拒绝符号链接、空目录、没有 `index.html` 的目录;`--check` 可放进前端 CI;测试断言后端接受本工具写出的一切。
+- 契约:`Guard` 新增 `as_of` / `age_seconds`(风控状态文件自己的年龄);新增示例 `trading-guard-stale`(进程在跑但风控状态陈旧——前端最容易做错的状态);契约文档新增 §10.1 `corrupt` 的完整含义与读取上限、§10.2 `stopped` 录制、`HEAD` 语义。示例共 40 个。
 - **状态页后端阶段①**(只读 Web 监控面板,ADR `20261112-status-dashboard.md`):`dashboard/`(派生自 vnpy_webtrader 1.1.0,MIT,保留版权与许可证,见 `dashboard/NOTICE-vnpy_webtrader.md`)+ `scripts/status_server.py` + `requirements-dashboard.txt`。接口 `meta` `overview` `trading` `alerts` `days` `recording` `research` `research/runs/{id}` `docs/{key}`,全部 GET/HEAD;令牌文件 + 常量时间比较 + 滚动窗口限流;统一错误形状且不回显输入;CSP 等安全头;关闭 FastAPI 自动文档与斜杠重定向;静态托管只服务清单内且哈希匹配的文件,SPA 回退限定在前端路由白名单;仅监听回环(配置层强制)。**缺失、过期、损坏永远不是 ok**,总体取最差(unknown 比 warn 更糟);录制与研究是可选子系统,未部署只显示缺失、不拖低总体级别。响应一律经唯一净化出口 `dashboard/safe.py`(账号掩码、令牌/路径/环境变量清理、敏感键名、非有限数)。**前端尚未构建**(显示占位页)。新增 `evidence/logstats.py`:从 `unattended_report.py` 抽出的纯逻辑(302 行原样移动,脚本重新导出,既有 46 个测试不变),因为该脚本经 `bootstrap` 会间接加载 vnpy。边界测试(`tests/test_dashboard_boundaries.py`)把 ADR 承诺变成自动检查:不 import vnpy/trading、不读 `.env`、Web 依赖不进交易环境、上游危险代码不在(基于 AST)、真实进程冒烟(含『杀掉面板不改变状态文件』)。
 - 状态页前端(React + Lovable)的计划与文档:`docs/plans/20261112-web-frontend-lovable-plan.md`;`docs/web/05-lovable-guide.md`(真实数据不得进入 Lovable、导出物默认带外部依赖的对策、总流程、可粘贴的项目约束、导出审计闸门)、`06-design-system.md`(深色冷调 Bento + 克制的玻璃拟态;设计令牌对比度经脚本实测深浅两套均达 WCAG AA;玻璃降级规则;状态视觉表达;盈亏色与状态色分离;不用新拟态)、`07-lovable-prompts.md`(P0–P14 提示词,每步带验收点与纠正话术);`docs/web/lovable-seed/`(由 OpenAPI 生成的 `api-types.ts` 与示例数据,经 `tsc --strict` 编译通过,由 `tools/webgen/gen_lovable_seed.py` 重新生成,契约测试断言与契约同步)。`tools/audit_frontend_export.py`:拦截外部脚本(含 Lovable 风格的在线编辑脚本)、内联脚本、Supabase 与统计依赖、`innerHTML`、令牌写入 `localStorage`、API 客户端之外的请求、交易类文案,有 10 条测试。
 - 状态页完整 Web 规划(`docs/web/`,供前端同事接手):产品规格(页面、状态语义、无障碍)、API 通用约定、前端交接说明(硬性约束与验收清单)、五阶段规划;机器可读契约 `status-api.openapi.json`(OpenAPI 3.1,22 个接口、37 个模型,每个接口标注阶段与角色)与 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)。`tests/test_web_contract.py` 校验示例符合模型,并把边界写成断言:阶段①全部 GET、写操作恰好是暂停/解除、任何阶段都没有下单撤单连接改风控解锁批准类路径。新增测试依赖 `jsonschema`。仅文档与测试,无运行时代码。
@@ -241,6 +243,16 @@
 - 明确记录:**15 分钟基准的测试段(2024-01 ~ 2026-06)已被使用一次**,新候选策略不能再用它做最终确认。
 
 ### Fixed（修复）
+- **状态页 G8 第 2 轮(codex)审查的 12 条发现,全部处理**(2026-11-12/13;1 Critical / 6 High / 3 Medium / 1 Low,每项都做了变异检查):
+  - **[Critical] 令牌文件默认写在交易系统的状态目录 `data/state/`**,违反『绝不写入交易系统』。改到专属目录 `data/dashboard/`,`dashboard/config.py` 拒绝令牌位于任何面板读取目录或交易侧目录树;新增对交易侧 6 棵目录树做完整快照(含目录 mtime)的测试。令牌创建改为『先写临时文件再 `os.link` 原子发布』,任何时刻文件要么不存在要么内容完整,并发首次启动安全;所有 I/O 错误包成不含路径的 `TokenError`。
+  - **[High] 假安心类**:损坏的心跳曾退回文件 mtime 显示『运行中』(并有测试固化);时间戳在未来曾被当作 0 秒新鲜;新鲜心跳曾掩盖陈旧的风控状态(风控状态现有独立年龄,落后 >180 秒即 `stale`,依据 `on_timer` 每秒调用 `guard.update()`、至少每 60 秒落盘,并有读源码的耦合测试);任意非空垃圾日志曾被当成『干净的一天』(现要求含可解析时间戳,全是垃圾 = `corrupt`,与『没找到』区分);录制 `stopped` 单独一行曾显示 ok(现要求合法终态时间);批准记录损坏曾被当成『0 个批准』;损坏的运行结果曾被静默丢弃;哈希缓存曾使已改动的候选继续显示『已批准』(已删除缓存)。待补发队列读不了曾被说成『不存在』。
+  - **[High] 净化层泄露**:数字账号、`account_no` / `login_id` 等键、`pwd` / `authorization` / `cookie` / `session` 键、`PASSWORD=` / `Authorization:` / `Cookie:` 文本、UNC 与 `\\?\` 路径、URL 编码路径、更多 POSIX 根。键名先 NFKC 规范化并去分隔符。账号掩码只对标量,容器继续递归(契约示例 `live.data.account` 是资金对象,曾被整个字符串化)。
+  - **[Medium]** 静态文件哈希曾只在启动时校验一次(现每次请求读入字节、校验、发出同一份字节,无 check-then-use);`HEAD` 曾执行完整采集并在 ASGI 层发出 body(现只验证令牌,恒 200);心跳、账本、队列曾无上限读取(现有上限,超限判 `corrupt` 而不截断)。
+- 状态页自查(G8 复核时发现):**日志增量解析的指纹只看末尾 64 字节,会被『旧长度处末尾相同、更早内容不同、文件更长』的替换文件骗过**,旧文件的计数混进新文件(对干净的新日志报严重事件)。指纹加上文件开头 64 字节。上一版同名测试没有真正构造出碰撞(在弱实现下也通过),已重写并断言构造成立。符号链接检查里有一个恒为假的冗余子句,已简化。
+- 状态页:`dashboard.safe` 曾经 `notify.webhook` 间接 `import requests`,而 `requests` 不在 `requirements-dashboard.txt` 里——只装了 Web 依赖的环境会导入失败。`redact` 抽到无依赖的 `notify/redact.py`(`notify.webhook` 重新导出,既有调用不变);新增测试:面板用到的第三方包必须全部在 `requirements-dashboard.txt` 里声明。
+- 状态页:`unattended_report.py` 的纯逻辑抽到 `evidence/logstats.py` 后,容器镜像需要同样复制该包(`Dockerfile` 已由另一会话补上 `COPY evidence`)。状态页本身**不**进交易镜像,有测试守着。
+- 状态页性能:当日日志在增长时,5 / 20 / 60 MB 日志下总览请求曾分别需要约 1.9 / 8.3 / 24 秒(前端每 8 秒轮询,日志一大请求就堆积)。新增可增量喂入的 `DayLogParser` 与带前缀指纹的增量缓存,现在与日志大小无关(约 15–20 毫秒),并在启动时预热。等价性靠构造保证:任意切分点、200 种随机切分、特殊换行符(CR / VT / FF / U+2028 等)的结果都与一次性全量解析逐字段相同。
+- 测试方法论发现:`httpx` 会把 `//api/trading` 当协议相对 URL 改写成 `/trading`,所以 `TestClient` 测不到服务器对原始双斜杠路径的行为——这类路径改用直接构造 ASGI scope;本环境经 bash heredoc 写入的 `\\` 会被折叠成 `\`,含 UNC 的测试曾因此没有真正测到 UNC,已用 Edit 工具重写。
 - 状态页:`dashboard/safe.py` 的敏感键名正则曾把 `passed` / `bypass` / `pass_rate` 当成密码键整个替换成 `***`(研究页的通过状态会永远显示星号);改为 `password`/`passwd`/`passphrase` 任何位置都算,单独的 `pass` 只在整个键或键末尾才算。新增『所有契约示例经净化后原样不变』的回归测试。
 - 状态页:每日日志只统计有内容的文件。真实数据验证发现——交易进程停了 71 小时,别的进程新建了 0 字节的当天日志,曾让『日志』与『告警』区块显示『刚更新、ok』。
 - `drill.py latency` 开仓限价改为「卖一 + N 跳」(新参数 `--aggress-ticks`,默认 3,0 = 贴卖一):夜盘后段清淡行情里贴着卖一挂的限价买单 30 秒没成交;限价买单按对手价成交,上限只封顶滑点。单测断言挂价。**尚未在真实行情下重测**。

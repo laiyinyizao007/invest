@@ -1,6 +1,6 @@
 # 计划:状态页前端(React + Lovable)
 
-- 状态:**待执行**(与后端阶段①计划 `20261112-status-dashboard-plan.md` 并行,以契约解耦)
+- 状态:**待执行**(M0 已完成;**后端阶段①已就绪**,M5 联调的前置已满足——`python scripts/status_server.py` 可直接联调,详见 `docs/web/README.md`『现状』;与后端计划 `20261112-status-dashboard-plan.md` 以契约解耦)
 - 决策依据:`docs/adr/20261112-status-dashboard.md`;前端规范 `docs/web/`(尤其 `03-frontend-handoff.md`、`05-lovable-guide.md`)
 - 关联:Issue #1
 
@@ -87,12 +87,12 @@ graph TD
 - [ ] **F14** 在 Lovable 里同步 GitHub;本机克隆 `npm ci && npm test && npm run build`
 - [ ] **F15** 审计:`python tools/audit_frontend_export.py --dist dist --src src --api-dir src/api --strict`;error=0
   - 依赖:F14;失败则回到 F6–F13 修,**不得手改后绕过审计**
-- [ ] **F16** 产物放入 `dashboard/static/`,源码放入 `dashboard/frontend/`;更新 CHANGELOG / PROJECTWIKI;提交
+- [ ] **F16** 产物放入 `dashboard/static/`,源码放入 `dashboard/frontend/`;**运行 `python tools/build_static_manifest.py dashboard/static` 生成清单**(后端只托管清单内、哈希匹配的文件;改了产物就必须重新生成);更新 CHANGELOG / PROJECTWIKI;提交
   - 依赖:F15
 
 ### 阶段 4:联调与验收
 - [ ] **F17** 后端阶段①完成后本机联调(`VITE_API_MODE=http`);故意停掉交易进程、删除/损坏状态文件,确认页面显示过期/缺失/损坏而非正常
-  - 依赖:F16 + 后端 T6、T9
+  - 依赖:F16;后端 T6 已完成、T9 的后端部分已完成(后端不再是阻塞项)。联调时注意 `docs/web/README.md`『现状』里列的几点——后端真实行为比示例更严格(`corrupt` 触发条件、`trading-guard-stale`、`HEAD` 语义)
 - [ ] **F18** CSP 零违规检查(带真实响应头的服务下,控制台无违规);HTML 注入测试
 - [ ] **F19** 验收清单 `03-frontend-handoff.md` §7 全部勾选
 - [ ] **F20** G8 两轮审查(重点:状态语义、注入、令牌)
