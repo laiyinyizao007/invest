@@ -74,7 +74,7 @@ def run_engine(
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
     _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
-                               bars=engine.history_data,
+                               bars=_market_feed(_market, engine),
                                market_baseline=_market.get("market"))
     return engine
 
@@ -134,28 +134,41 @@ def run_engine_bars(
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
     _assert_risk_floor_intact(engine.strategy, _snapshot, inst.size, _protected,
-                               bars=engine.history_data,
+                               bars=_market_feed(_market, engine),
                                market_baseline=_market.get("market"))
     return engine
 
 
 def _install_market_baseline(engine) -> dict:
-    """包住引擎的 `new_bar`:第一次回放前拍一份行情容器基准(此时预热已经结束)。
+    """行情容器的基准与"预热喂入"的记录(运行时第五层的输入)。
 
-    日线族的 `on_init` 会先加载一段历史日线做预热,那些根数同样记在 `am.count` 里——
-    不把预热单独剥出来,就会把"预热"误判成"凭空多出来的 K 线"(第 12 轮补记的实测教训)。"""
+    基准必须拍在 **`on_init` 之前**(构造完成时,此时容器是空的):
+    若拍在预热之后,候选在 `on_init` 里往容器塞的假 K 线就成了"基线",第五层再也看不见
+    (第 13 轮自查实测:预热期塞 40 根假 K 线,`am.count=160` 而引擎只喂了 120,第一版照样放行)。
+
+    日线族的 `on_init` 会经 `engine.load_bar` 加载一段历史日线做预热,那些根数也记在
+    `am.count` 里——不能把它们误判成"凭空多出来的 K 线"。所以包住 `engine.load_bar`,
+    把**引擎实际交出去的**预热 K 线记下来,与回放的 K 线一起当作"合法喂入"。"""
     from risk import constitution as const
 
-    holder: dict = {}
-    original = engine.new_bar
+    holder: dict = {"warmup": [], "market": const.snapshot_market_data(engine.strategy)}
+    original = engine.load_bar
 
-    def new_bar_with_baseline(data):
-        if "market" not in holder:
-            holder["market"] = const.snapshot_market_data(engine.strategy)
-        original(data)
+    def load_bar_recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        try:
+            holder["warmup"].extend(result or [])
+        except TypeError:                                   # noqa: BLE001 - 返回值不是可迭代就不记
+            pass
+        return result
 
-    engine.new_bar = new_bar_with_baseline
+    engine.load_bar = load_bar_recording
     return holder
+
+
+def _market_feed(holder: dict, engine) -> list:
+    """第五层眼里"引擎合法喂过的 K 线":预热喂入 + 回放喂入。"""
+    return list(holder.get("warmup") or []) + list(engine.history_data)
 
 
 def _risk_floor_snapshot(strategy) -> dict:

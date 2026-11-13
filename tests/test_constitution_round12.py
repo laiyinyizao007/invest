@@ -270,6 +270,36 @@ def test_a_class_that_lies_about_its_module_does_not_get_the_exemption():
     assert not const._is_in_repo_strategy_class(Cand)
 
 
+def test_the_fifth_layer_notices_bars_forged_during_the_warm_up():
+    """第 13 轮自查:基准若拍在预热之后,候选在 `on_init` 里塞的假 K 线就成了"基线"。
+
+    实测(基准拍在预热后的第一版):预热期塞 40 根假 K 线,`am.count=160`、
+    引擎只喂了 120 根,第五层照样放行。基准必须拍在 `on_init` 之前,
+    预热的合法根数只认引擎 `load_bar` 实际交出的那些。"""
+    import backtest_lib
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+    from vnpy.trader.object import BarData
+
+    bars = _synth_bars()
+
+    class PreheatForger(TrendAtr15mStrategy):
+        def on_init(self):
+            b0 = bars[0]
+            for _ in range(40):
+                self.am.update_bar(BarData(
+                    symbol=b0.symbol, exchange=b0.exchange, datetime=b0.datetime,
+                    interval=b0.interval, open_price=2000.0, high_price=2000.1,
+                    low_price=1999.9, close_price=2000.0, volume=1, turnover=0.0,
+                    open_interest=0.0, gateway_name="TEST"))
+
+    with pytest.raises(RuntimeError, match="凭空"):
+        backtest_lib.run_engine_bars(
+            PreheatForger,
+            {"risk_budget": 300.0, "max_daily_losses": 3, "atr_window": 14,
+             "history_vt_symbol": "C15"},
+            "C15", bars)
+
+
 # ---------- High 2:历史守卫的执行点检查 ----------
 
 def _guard_root(tmp_path):
