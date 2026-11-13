@@ -35,6 +35,7 @@ from risk import constitution as const
 from risk.report import backtest_stats_row, render_report
 from risk.candidate_eval import TRADING_DAYS_PER_YEAR
 from risk.dsr import MAX_TRIAL_SHARPE
+from risk.heatmap import HeatmapError, save_heatmap, validate_heatmap
 from risk.trial_ledger import (MAX_TOTAL_SHARPES, TrialLedgerError, record_sharpes, record_trials, total_trials,
                                trial_sharpe_stats, valid_trial_sharpes)
 
@@ -99,6 +100,28 @@ def prior_trials(paths: dict) -> int:
         return total_trials(trials_path(paths))
     except TrialLedgerError as exc:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
+def take_heatmap(body: dict) -> tuple[dict | None, str | None]:
+    """把热力图从作业结果里**拿出来**(它不并入落盘的结果,更不并入给外层的响应),并校验。
+
+    正文来自候选所在的子进程,不可信:不合法就丢弃并说明,不让一份坏图挡住整个评估结果。"""
+    heatmap = body.pop("heatmap", None)
+    if heatmap is None:
+        return None, None
+    try:
+        validate_heatmap(heatmap)
+    except HeatmapError as exc:
+        return None, f"热力图被丢弃: {exc}"
+    return heatmap, None
+
+
+def save_job_heatmap(paths: dict, run_id: str, heatmap: dict) -> None:
+    """结果已落盘、run_id 已确定之后,把热力图另存给面板。写不进去就大声失败:缺失的图不能让面板显示成正常。"""
+    try:
+        save_heatmap(Path(paths["results_dir"]) / "heatmaps", run_id, heatmap)
+    except HeatmapError as exc:
+        raise JobError(EXIT_FAILED, f"结果已保存(run_id={run_id}),但热力图写入失败: {exc}") from exc
 
 
 def prior_sharpe_stats(paths: dict) -> tuple[int, float, float]:
@@ -700,9 +723,11 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
            "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior),
            *sharpe_stats_argv(stats)]
     body = spawn_child(cmd, timeout)
+    heatmap, heatmap_note = None, None
     if "error" not in body:
         top_up_grid_trials(paths, body)
         record_job_sharpes(paths, body)
+        heatmap, heatmap_note = take_heatmap(body)
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
@@ -710,7 +735,11 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
     else:
         result = {**base, **body}
+        if heatmap_note:
+            result["heatmap_note"] = heatmap_note
     save_with_report(result, paths)
+    if heatmap is not None:
+        save_job_heatmap(paths, result["run_id"], heatmap)
     return result
 
 

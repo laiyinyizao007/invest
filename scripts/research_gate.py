@@ -13,6 +13,7 @@ from typing import Callable, Sequence
 
 from research_grid import GridError, select_params
 from risk import candidate_eval as ce
+from risk.heatmap import build_heatmap
 from risk.dsr import MAX_TRIAL_SHARPE, merge_stats, sharpe_stats as sharpe_stats_of
 from risk.diagnosis import diagnose
 
@@ -115,7 +116,8 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     merged_stats = merge_stats(sharpe_stats or (0, 0.0, 0.0), sharpe_stats_of(cell_sharpes))
     if selection["best_params"] is None:
         return {"passed": False, "failures": ["无法选参: " + selection["note"]], "params": None,
-                "selection": summary, "kind_detail": "selection-only", "trials": trials}
+                "selection": summary, "kind_detail": "selection-only", "trials": trials,
+                "heatmap": build_heatmap(selection)}
     result = run_gate(candidate_cls=candidate_cls, params=selection["best_params"], windows=validation_windows, bars=bars,
                       runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
                       on_plateau=selection["on_plateau"], capital=capital,
@@ -123,6 +125,8 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     result["trials"] = trials
     result["params"] = selection["best_params"]
     result["selection"] = summary
+    # 完整得分表(选参窗口)交给父进程单独落盘给面板看;父进程在把结果交出去之前把它拿掉,**不并入**外层响应
+    result["heatmap"] = build_heatmap(selection)
     result["kind_detail"] = "selection+gate"
     return result
 

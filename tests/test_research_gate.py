@@ -300,3 +300,26 @@ def test_extreme_cell_sharpes_are_clamped_so_one_outlier_cannot_void_the_whole_b
     sharpes = result["trials"]["cell_sharpes"]
     assert sharpes and all(abs(s) <= MAX_TRIAL_SHARPE for s in sharpes)
     assert max(sharpes) == MAX_TRIAL_SHARPE
+
+
+# ---------- 阶段 3:热力图随评估一起产出,但不进摘要 ----------
+
+def test_the_evaluation_carries_a_valid_heatmap_for_the_dashboard():
+    from risk.heatmap import validate_heatmap
+    result = evaluate(prior_trials=10)
+    validate_heatmap(result["heatmap"])
+    assert result["heatmap"]["source"] == "selection"
+    assert len(result["heatmap"]["scores"]) == 27
+
+
+def test_the_full_score_table_stays_out_of_the_selection_summary():
+    """摘要是给外层看的:完整得分表只在 heatmap 里(父进程会把它拿出来单独落盘)。"""
+    result = evaluate(prior_trials=10)
+    assert "plateau" not in result["selection"] and "cell_sharpes" not in result["selection"]
+    assert "scores" not in result["selection"]
+
+
+def test_a_selection_only_failure_still_carries_the_heatmap():
+    result = evaluate(runner=make_runner(trips=3), prior_trials=10)
+    assert result["kind_detail"] == "selection-only" and result["heatmap"]["on_plateau"] is False
+    assert all(row[3] == "-inf" for row in result["heatmap"]["scores"])        # 往返笔数不够:每个格子都无效
