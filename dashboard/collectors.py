@@ -428,6 +428,17 @@ def _heartbeat_day_label(settings: Settings, now: float) -> tuple[str, str] | No
     return day, (f"{age:.0f} 秒前" if age <= settings.stale_after("trading") else f"已停 {age / 3600:.1f} 小时")
 
 
+def _streak_headline(streak: int) -> str:
+    """连续天数的标题。
+
+    连续天数可以**超过**要求(已经达标之后继续跑),写成『9/5 天』读起来像出了错,
+    所以超过要求时换个说法。
+    """
+    if streak > REQUIRED_STREAK:
+        return f"连续无异常 {streak} 天(要求 {REQUIRED_STREAK} 天,已达标)"
+    return f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+
+
 def collect_days(settings: Settings, now: float, limit: int | None = None) -> Result:
     limit = limit or settings.raw["days_default"]
     stale_after = settings.stale_after("days")
@@ -510,10 +521,10 @@ def collect_days(settings: Settings, now: float, limit: int | None = None) -> Re
         level, headline = "warn", "日志长时间未更新"
         reasons.append(_reason("days", "warn", "每日日志长时间没有更新(交易进程可能已停止)"))
     elif latest.events or missing_days:
-        level, headline = "warn", f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+        level, headline = "warn", _streak_headline(streak)
         reasons.append(_reason("days", "warn", "最新一天有警告级事件" if latest.events else f"有 {len(missing_days)} 个工作日没有日志"))
     else:
-        level, headline = "ok", f"连续无异常 {streak}/{REQUIRED_STREAK} 天"
+        level, headline = "ok", _streak_headline(streak)
     notes = [x for x in ({"stale": "每日日志长时间未更新", "corrupt": FUTURE_LOG_MESSAGE}.get(state), bad_msg if bad_logs else None) if x]
     return Result(m.section(state, data, as_of=newest, now=now, stale_after=stale_after, message=";".join(notes) or None), level, headline, reasons)
 

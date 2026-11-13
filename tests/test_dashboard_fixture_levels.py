@@ -84,3 +84,12 @@ def test_every_section_fixture_carries_a_valid_level():
         # state 不是 ok 时,level 不能是 ok(否则前端渲染成绿色)
         if body["state"] != "ok":
             assert body["level"] != "ok", f.stem
+
+
+def test_the_streak_headline_does_not_say_nine_out_of_five():
+    """连续天数可以超过要求(达标之后继续跑),写成『9/5 天』读起来像出了错。"""
+    from dashboard import collectors as col
+
+    assert col._streak_headline(3) == "连续无异常 3/5 天"
+    assert "已达标" in col._streak_headline(9)
+    assert "/5" not in col._streak_headline(9)
