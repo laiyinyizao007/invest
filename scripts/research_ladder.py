@@ -23,7 +23,6 @@ import json
 import sys
 from pathlib import Path
 
-import bootstrap  # noqa: F401  (必须先于 vnpy;这里不用 vnpy,但与同目录脚本保持同一入口约定)
 import research_api as api
 from risk.ladder import Ladder, LadderError, anchor_path_for
 
@@ -33,6 +32,7 @@ def ladder_for(paths: dict) -> Ladder:
 
 
 def main(argv: list[str] | None = None) -> int:
+    api.rconsole.reconfigure_stdio()           # 原先靠 import bootstrap 顺带改的输出编码;研究侧不再 import bootstrap
     parser = argparse.ArgumentParser(
         description="梯子的人工入口(只读 status;显式 renew,留痕;reset 从头开始——最重的一项,只留给人)")
     sub = parser.add_subparsers(dest="command", required=True)

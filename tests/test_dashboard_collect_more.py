@@ -255,7 +255,7 @@ def test_run_id_format_is_the_first_line_of_defence_against_traversal(tmp_path, 
     touched = []
     real = col.m.read_json
     monkeypatch.setattr(col.m, "read_json", lambda p, **k: (touched.append(str(p)), real(p, **k))[1])
-    for bad in ("../../secret", "..\secret", RID + "/../x", "x", "", RID + ".json"):
+    for bad in ("../../secret", r"..\secret", RID + "/../x", "x", "", RID + ".json"):
         assert col.get_run(S(tmp_path), bad) is None
     assert not any("secret" in t or t.endswith("x.json") for t in touched)
 

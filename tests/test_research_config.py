@@ -46,6 +46,9 @@ def test_partial_file_overrides_only_what_it_names(tmp_path):
     {"candidates": {"name_pattern": "("}},         # 非法正则
     {"candidates": {"name_pattern": ".*"}},        # 放开任意文件名(含路径分隔符)
     {"gateway": {"host": "0.0.0.0"}},              # 暴露到所有网卡
+    {"gateway": {"host": "::0"}},                  # IPv6 全接口的等价写法(第 16 轮 A 的 L3)
+    {"gateway": {"host": "0"}},                    # INADDR_ANY 的简写
+    {"gateway": {"host": "[::]"}},
     {"gateway": {"host": "::"}},
     {"gateway": {"port": 0}},
     {"gateway": {"port": 70000}},
@@ -120,6 +123,77 @@ def test_shipped_paths_keep_approvals_and_token_in_the_control_directory():
     assert cfg["paths"]["approvals_file"].startswith("data/research-control/")
     assert cfg["gateway"]["token_file"].startswith("data/research-control/")
     assert not cfg["paths"]["results_dir"].startswith("data/research-control")      # 结果目录(容器可写)与控制目录(容器只读)分开
+
+
+# ---------- 受保护目录/凭据文件:大小写不敏感,且三个路径都要查(第 6 轮 codex 的 M3) ----------
+
+@pytest.mark.parametrize("key,value", [
+    ("pending_dir", "Strategies"),              # 正式策略目录
+    ("results_dir", "strategies"),
+    ("approvals_file", "Strategies/approvals.json"),
+    ("pending_dir", "data"),                    # data 本身不是受保护目录,这条是反向对照
+])
+def test_paths_must_not_point_at_protected_directories(tmp_path, key, value):
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"paths": {key: value}}), encoding="utf-8")
+
+    if value == "data":                          # 反向对照:普通目录应当放行
+        assert rc.load(path)["paths"][key] == value
+        return
+    with pytest.raises(rc.ConfigError):
+        rc.load(path)
+
+
+def test_token_file_must_not_borrow_a_credential_file(tmp_path):
+    """`token_file="data/.ENV"` 在 Windows 上就是 .env:网关令牌会覆盖 CTP 凭据文件。"""
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"gateway": {"token_file": "data/.ENV"}}), encoding="utf-8")
+
+    with pytest.raises(rc.ConfigError):
+        rc.load(path)
+
+
+def test_approvals_file_must_not_borrow_a_credential_file(tmp_path):
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"paths": {"approvals_file": "data/.env"}}), encoding="utf-8")
+
+    with pytest.raises(rc.ConfigError):
+        rc.load(path)
+
+
+# ---------- 控制目录与文件名是**钉死**的:改了路径就必须被拒(第 10 轮 codex 的 M7) ----------
+
+@pytest.mark.parametrize("key,value", [
+    ("approvals_file", "data/other/approvals.json"),              # 换个目录
+    ("approvals_file", "data/research-control/approvals.json.bak"),  # 换个文件名
+    ("approvals_file", "../data/research-control/approvals.json"),   # 越出仓库
+    ("approvals_file", "data/research-control/other.json"),          # 目录对、名字不对
+])
+def test_the_approvals_file_path_is_pinned(tmp_path, key, value):
+    """批准记录的位置是**结构约束**,不是"文件名不在黑名单里"。
+
+    钉死它的理由:批准记录是"人批准过"的唯一凭据,位置一变,批准页、
+    网关校验与 CLI 三处对不上就是静默失配(第 7 轮 codex 的 F8)。"""
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"paths": {key: value}}), encoding="utf-8")
+
+    with pytest.raises(rc.ConfigError):
+        rc.load(path)
+
+
+@pytest.mark.parametrize("value", [
+    "data/other/gateway.token",
+    "data/research-control/gateway.token.bak",
+    "data/research-control/other.token",
+    "../data/research-control/gateway.token",
+])
+def test_the_gateway_token_path_is_pinned(tmp_path, value):
+    """网关令牌同理:固定目录 + 固定文件名,没有借名的余地。"""
+    path = tmp_path / "cfg.json"
+    path.write_text(json.dumps({"gateway": {"token_file": value}}), encoding="utf-8")
+
+    with pytest.raises(rc.ConfigError):
+        rc.load(path)
 
 
 def test_grid_section_has_sane_shipped_values():

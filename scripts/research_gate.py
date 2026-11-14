@@ -10,7 +10,7 @@ from __future__ import annotations
 import functools
 import math
 from datetime import datetime
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from research_grid import GridError, select_params, MIN_GRID_CELLS
 from risk import candidate_eval as ce

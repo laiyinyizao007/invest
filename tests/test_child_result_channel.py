@@ -59,10 +59,22 @@ class FakeChild:
         return self.stdout, self.stderr
 
 
+class _FakeTTY:
+    """假装 stdin 是交互式终端(main #26 起批准类动作要求「人在场」,pytest 里 stdin 是管道)。"""
+
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return ""
+
+
 @pytest.fixture
 def tree(tmp_path, monkeypatch):
     (tmp_path / "pending_strategies").mkdir()
-    monkeypatch.setattr(api.bootstrap, "ROOT", tmp_path)
+    monkeypatch.setattr(api.rc, "ROOT", tmp_path)   # 合并 main #26 后研究侧不再用 bootstrap.ROOT
+    monkeypatch.setattr(api.sys, "stdin", _FakeTTY())
+    monkeypatch.setattr(api, "_prompt_hash", lambda sha: sha)    # `--confirm-reviewed` 要粘贴完整哈希:测试里「人」粘对
     return tmp_path
 
 
@@ -783,6 +795,20 @@ def test_a_child_that_refused_before_scanning_is_not_charged_for_cells_it_never_
 
 # ---------------- 第 32 轮:入口自身可被改写、拒绝原因的来源与完整性 ----------------
 
+def _allow_test_only_imports(monkeypatch, *modules):
+    """合并 main #22 的导入白名单后,候选不能再直接 `import walk_forward_optimizer` / `research_api`。
+    这两条用例要模拟的是"候选在**导入期**改写框架模块的属性"(同进程反射到的结果),
+    所以仅在测试里把这几个模块加进白名单,让候选能跑到改写那一步;生产配置不动。
+    白名单本身的放行/拦截另有用例(tests/test_research_sandbox.py、test_sandbox_round25_rules.py)。"""
+    real_load = api.rc.load
+
+    def load(*a, **k):
+        cfg = real_load(*a, **k)
+        cfg["screening"]["allowed_modules"] = list(cfg["screening"]["allowed_modules"]) + list(modules)
+        return cfg
+    monkeypatch.setattr(api.rc, "load", load)
+
+
 def test_a_candidate_that_replaces_the_call_site_name_cannot_displace_the_real_entry(tree, monkeypatch, capsys):
     """候选把**调用点真正用的那个名字**换掉 → 指纹检查必须照样执行(响亮地失败)。
 
@@ -797,6 +823,7 @@ def test_a_candidate_that_replaces_the_call_site_name_cannot_displace_the_real_e
             "class S(CtaTemplate):\n"
             "    pass\n")
     path = make_strategy(tree, body)
+    _allow_test_only_imports(monkeypatch, "research_api")
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
     approve(path)
 

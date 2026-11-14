@@ -1,7 +1,14 @@
 """本机毕昇 API 小工具:验证码答案取自本机后端自己的日志(仅用于本机自有实例)。不打印任何密钥。"""
-import base64, json, re, subprocess, urllib.request, urllib.error, uuid
-from dotenv import dotenv_values
+import base64
+import json
+import re
+import subprocess
+import urllib.error
+import urllib.request
+import uuid
+
 import rsa
+from dotenv import dotenv_values
 
 BASE = "http://127.0.0.1:7860/api/v1"
 ENV = dotenv_values(r"C:\Dev\projects\bisheng-rs\bisheng\docker\.env")
@@ -10,9 +17,11 @@ def _req(method, path, body=None, token=None, headers=None, raw=None):
     h = dict(headers or {})
     data = raw
     if body is not None:
-        data = json.dumps(body).encode(); h["Content-Type"] = "application/json"
+        data = json.dumps(body).encode()
+        h["Content-Type"] = "application/json"
     if token:
-        h["Authorization"] = f"Bearer {token}"; h["Cookie"] = f"access_token_cookie={token}"
+        h["Authorization"] = f"Bearer {token}"
+        h["Cookie"] = f"access_token_cookie={token}"
     req = urllib.request.Request(BASE + path, data=data, headers=h, method=method)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
