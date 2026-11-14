@@ -40,26 +40,37 @@
     不存在"为了凑一个数去调阈值"的情况。
 
 ### Fixed（修复）
-- **候选"写辅助模块再 import"这条逃逸,以及另外两条已封的逃逸(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+- **候选"写辅助模块再 import"这条逃逸,以及另外三条已封的逃逸(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
   ADR `20261113-evolution-engine`「第 22 轮补记」):本轮全部结论来自**动态探针**(真的写文件、真的 import、真的看结果),
   不是静态推理——静态推理一定漏(见 memory `static-ban-rules-need-dynamic-probes`)。
-  - **实测到的三条逃逸**:①候选用 `numpy.savetxt` 写一个 `.py` 再 import 它(辅助模块在 import 机制里执行,拿到真实内建);
+  - **实测到的四条逃逸**:①候选用 `numpy.savetxt` 写一个 `.py` 再 import 它(辅助模块在 import 机制里执行,拿到真实内建);
     ②候选模块的 `__loader__.exec_module(m)`(用真实内建把源码再跑一遍);③`e.__traceback__.tb_frame.f_builtins`
-    (拿到我们自己的模块帧里的真实内建)。三条都**不经过禁用名单**——名单是黑名单,堵不住机制。
+    (拿到我们自己的模块帧里的真实内建);④`from <包> import <子模块>`(子模块的 import 在**导入机制内部**完成,
+    **不经过**候选那层的守卫;而 `scripts/` 这种没有 `__init__.py` 的目录是**命名空间包**,origin 为 `None`,
+    凡“看 origin”的规则都会放行——实测 `from scripts import research_api` 拿到带 `subprocess` 的框架模块,
+    等于任意命令执行)。四条都**不经过禁用名单**——名单是黑名单,堵不住机制。
   - **规则改成按路径裁决**(`scripts/research_sandbox.py::RepoImportGuard`):仓库内只允许 `ALLOWED_REPO_IMPORT_DIRS`(`strategies/`)里
     **且在候选开始运行之前就已存在、此后没被改过**的模块;仓库外(标准库、站点包)也必须"运行之前就存在"
     (站点包在宿主机上通常可写,这是第 21 轮遗漏的洞)。定位来源用 `PathFinder.find_spec`——只找文件、**不执行**被检查的模块。
     时间比较按文件系统自身的时间粒度取整后再比(NTFS 100ns、网络盘可达 1s),否则会漏掉"刚写出来就被取整到开始时刻之前"的文件。
   - **逃逸二**:候选模块不再挂 `__spec__`/`__loader__`。**逃逸三**:受限导入器用自己造的一帧(globals 里 `__builtins__` 是受限字典),
     并且**在 except 块之外**抛干净的异常——在 except 里抛,原始异常会挂在 `__context__` 上,候选顺着它一样能摸到 import 机制的帧。
+  - **逃逸四(封堵)**:受限导入器在 `fromlist` 非空时**另外裁决**——先裁**包位置**
+    (`RepoImportGuard.check_package`,用 `spec.submodule_search_locations`;这条必须**独立存在**,因为 `from 包 import *`
+    会把包位置下的所有子模块都导入一遍,逐项裁决根本管不到),再**逐个裁 fromlist 里的子模块**
+    (于是“候选自己刚写出来、但所在目录合法”的模块同样被拒)。
   - **白名单登记进宪法历史守卫**(`tools/check_constitution_history.py`):`ALLOWED_REPO_IMPORT_DIRS` 与 `BUILTIN_ALLOWED_OVERRIDES` 同等对待,
     **只减不增**,引用次数也进入"只能增不能减"的守望。
   - **如实记录的残余**:第三方模块(如 `numpy`)的帧里**仍然是真实内建**——实测确认。
     所以"进程内执行不受信代码"做不到安全,能力隔离是纵深防御的一层,**不是边界**;
     真正的边界仍是**人工审批 + 容器隔离**。ADR 里"把能力收走"那句话已就地更正:
     收走的是**候选自己那些帧**里的能力,不是整个进程的。
-  - **用例**:`tests/test_helper_module_escape.py`(13 条)+ `tests/test_candidate_escape_production_path.py`(12 条,走生产入口 `import_candidate`)。
-    7 个变异全部被抓住(还原 loader / 用模块级全局造帧 / 去掉路径裁决 / 去掉时间规则 / 去掉允许目录 / 去掉快照存在性 / 去掉 mtime 比对)。
+  - **用例**:`tests/test_helper_module_escape.py`(13 条)+ `tests/test_candidate_escape_production_path.py`(16 条,走生产入口 `import_candidate`),
+    共 **29 条**。**9 个变异全部被抓住**(还原 loader / 用模块级全局造帧 / 去掉路径裁决 / 去掉时间规则 / 去掉允许目录 /
+    去掉快照存在性 / 去掉 mtime 比对 / 去掉包位置裁决 / 去掉 fromlist 逐项裁决)。
+  - **一条方法教训(已写进 ADR)**:变异验证里有个变异**没被抓住**——查下来是那条用例**根本没走到它想走的那条路**
+    (没把假仓库插到 `sys.path` 最前面,`strategies` 解析到了**真仓库**那个包,import 因“找不到模块”而失败,断言照样绿)。
+    **断言“被拒绝了”不够,还要断言“是被哪一条规则拒绝的”**;修好之后 9 个变异全部变红。
 
 ### Changed（变更）
 - 状态页后端方案由『不使用 vnpy_webtrader』改为『fork 并改造』(用户决定,2026-11-12;仅文档):ADR 新增『fork 范围』——上游 MIT,保留版权与许可证全文;逐项处置(保留应用骨架与静态托管模式;删除 JWT 登录与写死密钥、订阅与下单撤单接口、WebSocket 与 RPC、全部 `vnpy` import;`WebEngine` 不装进交易进程);列出 FastAPI 默认行为与契约的冲突及处理(关闭自动文档、统一错误形状、关闭斜杠重定向、安全响应头、强制回环);Web 依赖隔离在 `requirements-dashboard.txt`,不进交易环境。计划 T6 拆为 T6a–T6g。如实记录:改造后上游残留代码很少,价值主要是许可证谱系与起步骨架;若 FastAPI 默认行为的处理成本高于收益,可回退到完全自写后端。

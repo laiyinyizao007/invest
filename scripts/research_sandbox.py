@@ -111,10 +111,10 @@ EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
 ALLOWED_REPO_IMPORT_DIRS = ("strategies",)
 
 
-def module_origin(name: str) -> str | None:
-    """解析一个模块的来源文件路径;解析不出来返回 None。
+def _spec_chain(name: str):
+    """逐段解析一个模块名,返回 (最后一段的 spec, 解析时用的路径表)。
 
-    **不执行**该模块,也**不执行**它的父包——这一点是刻意的:
+    **不执行**被检查的模块,也**不执行**它的父包——这一点是刻意的:
     用 `importlib.util.find_spec` 定位子模块会真的 import 父包(跑父包的代码),
     探测动作本身就变成了执行入口。这里用底层的 `PathFinder.find_spec`,
     它只在给定的路径表里搜文件,不 import 任何东西。
@@ -123,22 +123,34 @@ def module_origin(name: str) -> str | None:
 
     parts = name.split(".")
     path = None
-    origin = None
     for index, part in enumerate(parts):
         try:
             spec = _machinery.PathFinder.find_spec(part, path)
         except Exception:                                       # noqa: BLE001 - 探测失败按"查不到"处理
-            return None
+            return None, None
         if spec is None:
-            return None
-        origin = spec.origin
+            return None, None
         if index == len(parts) - 1:
-            return origin
+            return spec, path
         locations = spec.submodule_search_locations
         if locations is None:
-            return None                                          # 不是包,更深的导入本来也不成立
+            return None, None                                   # 不是包,更深的导入本来也不成立
         path = list(locations)
-    return origin
+    return None, None
+
+
+def module_origin(name: str) -> str | None:
+    """解析一个模块的来源文件路径;解析不出来返回 None(命名空间包没有文件,也是 None)。"""
+    spec, _ = _spec_chain(name)
+    return spec.origin if spec is not None else None
+
+
+def module_locations(name: str) -> list[str]:
+    """一个**包**的名字空间位置(子模块可以从哪些目录里找);不是包或查不到返回空表。"""
+    spec, _ = _spec_chain(name)
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    return list(spec.submodule_search_locations)
 
 
 def snapshot_allowed_files(repo_root: Path, allowed_dirs: Sequence[str] = ALLOWED_REPO_IMPORT_DIRS) -> dict:
@@ -235,6 +247,34 @@ class RepoImportGuard:
             return f"禁止导入 {name}:该文件在候选运行期间被改动过"
         return None
 
+    def check_package(self, name: str) -> str | None:
+        """裁决"从一个**包**里 import 子模块"这种写法;返回拒绝理由(None 表示放行)。
+
+        为什么必须有这一层(第 22 轮实测,不是推理出来的):
+        `from <包> import <子模块>` 的子模块 import 是在**导入机制内部**完成的,
+        根本不经过 `check()`——守卫只在候选的 import 语句**入口**上生效。
+        而命名空间包(`scripts/`、`pending_strategies/` 这种没有 `__init__.py` 的目录)
+        的 origin 是 None,按"看 origin"的规则会被放行。于是:
+
+        - `from scripts import research_api` -> 候选拿到带 `subprocess` 的框架模块
+          (等于任意命令执行),四层防线全绿;
+        - `from pending_strategies import evil` -> 候选自己写的辅助模块**被执行**,
+          拿到真实内建——"按路径裁决"整条规则被绕开。
+
+        修法:包的**名字空间位置**只要落在仓库内、且不在允许目录里,就拒绝这种导入。
+        """
+        for loc in module_locations(name):
+            try:
+                resolved = Path(loc).resolve()
+            except OSError:
+                continue
+            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+                continue                                        # 仓库之外(站点包)照旧放行
+            if not self._under_allowed_dir(resolved):
+                return (f"禁止从 {name} 导入:包位置 {loc} 不在允许的目录 {list(self.allowed_dirs)} 内"
+                        f"(候选不得导入框架、风控或回测模块)")
+        return None
+
 
 def safe_builtins(forbidden_modules: Sequence[str] = (), repo_guard: "RepoImportGuard | None" = None) -> dict:
     """候选执行时用的**最小内建集合**:去掉 `UNSAFE_BUILTINS`,并把 `__import__` 换成受限版。
@@ -270,6 +310,19 @@ def safe_builtins(forbidden_modules: Sequence[str] = (), repo_guard: "RepoImport
             reason = repo_guard.check(target)
             if reason:
                 raise ImportError(reason)
+            if fromlist:
+                # fromlist 非空 = "从包里 import 若干个子模块"。
+                # 那些子模块的 import 是在**导入机制内部**完成的,不经过 `check()`,
+                # 所以必须在这里预先裁一遍(第 22 轮实测的绕过:命名空间包 + fromlist)。
+                reason = repo_guard.check_package(target)
+                if reason:
+                    raise ImportError(reason)
+                for item in fromlist:
+                    if item == "*":
+                        continue            # 通配符:子模块全部来自包位置,上面已经裁过
+                    reason = repo_guard.check(f"{target}.{item}")
+                    if reason:
+                        raise ImportError(reason)
         try:
             return real_import(name, globals, locals, fromlist, level)
         except ImportError:

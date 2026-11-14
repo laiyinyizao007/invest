@@ -7,15 +7,21 @@
 背景(第 21 轮动态实测,不是静态推理出来的):
 - 逃逸一(辅助模块):候选写一个 .py 再 import 它 → import 机制用**真实内建**执行它;
 - 逃逸二(模块 loader):候选模块的 `__loader__.exec_module(m)` 能用真实内建把源码再跑一遍;
-- 逃逸三(异常链):`e.__traceback__.tb_frame.f_builtins` 能拿到**我们自己的帧**的真实内建。
+- 逃逸三(异常链):`e.__traceback__.tb_frame.f_builtins` 能拿到**我们自己的帧**的真实内建;
+- 逃逸四(from-import):`from <包> import <子模块>` 的子模块 import 在**导入机制内部**完成,
+  不经过守卫;命名空间包(`scripts/` 这种没有 `__init__.py` 的目录)origin 为 `None`,按"看 origin"的规则会被放行。
 
-三条路都已封堵。本文件用生产入口复验,并把"真的拿到真实内建"这件事显式测出来,
+四条路都已封堵。本文件用生产入口复验,并把"真的拿到真实内建"这件事显式测出来,
 而不是靠"没报错"推断——静态推理一定漏,见 [[static-ban-rules-need-dynamic-probes]]。
+
+**断言"被拒绝了"是不够的**:还必须确认是**哪一条规则**拒绝的——
+本文件的一条用例曾经在守卫失灵时依然全绿(它压根没走到自己要走的那条路上),详见 ADR 第 22 轮补记。
 
 **已知仍然敞着的一条**(不在本文件的断言范围内,别把它当成已修):
 任何第三方模块的模块字典里就是真实内建。
 进程内执行不受信代码无法做到安全;真正的边界是**人工审批 + 容器隔离**(见 ADR 残余风险)。
 """
+import sys
 import textwrap
 
 import pytest
@@ -26,6 +32,18 @@ import research_api as api
 def build(*parts):
     """把几段代码拼成一份候选源码(每段各自去掉缩进,免得拼出来的缩进不一致)。"""
     return "\n".join(textwrap.dedent(part) for part in parts)
+
+
+def purge_modules(monkeypatch, *prefixes):
+    """把同名顶层模块从 `sys.modules` 里清掉(monkeypatch 会在用例结束后还原)。
+
+    不清就会踩一个很难查的坑:假仓库里的 `strategies` 会和**真仓库**的 `strategies`
+    重名——真包一旦已经在 `sys.modules` 里,`from strategies import evil` 就直接命中它,
+    根本不去假仓库找。用例会因"别的测试先跑过"而莫名其妙地绿(测的不是我们以为的那条路)。
+    """
+    for name in [n for n in list(sys.modules)
+                 if any(n == prefix or n.startswith(prefix + ".") for prefix in prefixes)]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
 
 
 @pytest.fixture()
@@ -112,6 +130,130 @@ def test_the_module_loader_is_not_exposed_to_the_candidate(tmp_path, monkeypatch
     cls = run_candidate(tmp_path, monkeypatch, source)
 
     assert cls.PASS["loader"] is False, "候选拿到了能执行代码的 loader"
+
+
+def test_the_candidate_cannot_reach_a_framework_module_through_a_from_import(tmp_path, monkeypatch):
+    """逃逸四(第 22 轮外部复核时才发现):`from <包> import <子模块>` 绕过路径规则。
+
+    `scripts/` 这种目录没有 `__init__.py`,是**命名空间包**:它的 origin 是 None,
+    按"看 origin"的规则会被放行;而子模块的 import 是在**导入机制内部**完成的,
+    根本不经过我们的守卫。结果:候选 `from scripts import research_api` 就拿到了
+    一个带 `subprocess` 的框架模块——四层防线全绿,等于任意命令执行。
+
+    这条用例用**真实仓库根**(`bootstrap.ROOT` 不改),因为要绕过的正是真实仓库里的
+    `scripts/` 包;用假仓库的话,"scripts" 会解析到真实仓库,与守卫的仓库根对不上。
+    """
+    purge_modules(monkeypatch, "scripts")
+    source = build(
+        BASE,
+        """
+        try:
+            from scripts import research_api as fw
+            LEAK["got_framework"] = hasattr(fw, "subprocess")
+        except Exception:
+            LEAK["got_framework"] = False
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["got_framework"] is False, "候选通过 from-import 拿到了框架模块"
+
+
+def test_the_candidate_cannot_run_its_own_helper_module_through_a_from_import(tmp_path, monkeypatch, repo):
+    """逃逸四的另一半:`from <命名空间包> import <自己写的辅助模块>` 整条路径规则作废。
+
+    这里用一个**自造的命名空间目录**(`helperpkg/`,没有 `__init__.py`),
+    候选把辅助模块写进去再 `from helperpkg import evil`:
+    包位置落在仓库内、但不在允许目录 `strategies/` 里 -> 必须被拒。
+    """
+    pkg = repo / "helperpkg"
+    pkg.mkdir()
+    monkeypatch.syspath_prepend(str(repo))
+    purge_modules(monkeypatch, "helperpkg", "strategies")
+    target = str(pkg / "evil.py").replace("\\", "/")
+    source = build(
+        BASE,
+        f"""
+        try:
+            import numpy as np
+            np.savetxt("{target}", np.array(["MARKER = 'EXECUTED'"]), fmt="%s")
+            from helperpkg import evil
+            LEAK["helper_executed"] = evil.MARKER
+        except Exception:
+            LEAK["helper_executed"] = "denied"
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["helper_executed"] == "denied", "候选通过 from-import 跑起了自己的辅助模块"
+
+
+def test_the_candidate_cannot_reach_a_newly_written_module_in_the_allowed_directory(tmp_path, monkeypatch, repo):
+    """允许目录里的 from-import 同样要过"运行之前就存在"这一关。
+
+    `from strategies import evil`(evil.py 是候选刚写的)——包位置是合法的 `strategies/`,
+    但子模块本身不在快照里 -> 必须被拒。
+
+    注意这里**必须把假仓库插到 sys.path 最前面**:否则 `strategies` 解析到的是**真仓库**
+    那个包(真仓库根在 pytest 的 pythonpath 里),候选写出来的 evil.py 在真仓库里根本不存在,
+    于是 `from strategies import evil` 因为"找不到模块"而失败——用例照样绿,但绿得毫无意义,
+    去掉逐项裁决也照样绿(守不住)。
+    """
+    monkeypatch.syspath_prepend(str(repo))
+    purge_modules(monkeypatch, "strategies")
+    target = str(repo / "strategies" / "evil.py").replace("\\", "/")
+    source = build(
+        BASE,
+        f"""
+        try:
+            import numpy as np
+            np.savetxt("{target}", np.array(["MARKER = 'EXECUTED'"]), fmt="%s")
+            from strategies import evil
+            LEAK["helper_executed"] = evil.MARKER
+        except Exception:
+            LEAK["helper_executed"] = "denied"
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["helper_executed"] == "denied", "候选导入了自己刚写出来的模块"
+
+
+def test_the_candidate_cannot_use_a_wildcard_from_import_to_run_its_own_helper(tmp_path, monkeypatch, repo):
+    """通配符形式 `from <包> import *`:逐个子模块的裁决管不到它,只能靠"包位置"那条。
+
+    `import *` 会把包位置下的**所有**子模块都导入一遍——候选写在命名空间目录里的
+    辅助模块照样会被执行。所以"包位置不在允许目录里 -> 拒绝"这条必须独立存在,
+    否则逐项裁决会被通配符绕过。
+    """
+    pkg = repo / "helperpkg"
+    pkg.mkdir()
+    monkeypatch.syspath_prepend(str(repo))
+    purge_modules(monkeypatch, "helperpkg")
+    target = str(pkg / "evil.py").replace("\\", "/")
+    source = build(
+        BASE,
+        f"""
+        try:
+            import numpy as np
+            np.savetxt("{target}", np.array(["MARKER = 'EXECUTED'"]), fmt="%s")
+            from helperpkg import *
+            LEAK["helper_executed"] = "evil" in dir()
+        except Exception:
+            LEAK["helper_executed"] = "denied"
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["helper_executed"] == "denied", "候选用通配符 from-import 跑起了自己的辅助模块"
 
 
 def test_the_traceback_of_our_own_frames_does_not_expose_the_real_builtins(tmp_path, monkeypatch, repo):
