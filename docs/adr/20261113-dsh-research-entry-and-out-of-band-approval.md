@@ -113,7 +113,7 @@
 | 带外批准进程 | `scripts/research_approval_server.py` | 只监听 `127.0.0.1` 的一次性网页;**批准记录的两个合法入口之一**(`approvals.json` 的低层写入者只有 `research_sandbox.record_approval`;另一个入口是等价 CLI `research_api.py review/approve`) |
 | DSH `research` Preset 模板 | `tools/research_mcp/dsh-research-preset.patch.yml` | 只挂 `persona` + `research-mcp`;不含任何文件读写/命令/网页/子 Agent 工具;Auto review 不启用 |
 | 依赖隔离 | `requirements-research.txt` | `mcp` SDK 会拖进 starlette/uvicorn/pydantic,**不进交易环境**;交易环境仍只装 `requirements.txt` |
-| 测试 | 研究侧九份测试文件共 **561 项**(`test_research_api` 98、`test_research_gateway` 87、`test_research_sandbox` 130、`test_research_config` 54、`test_research_approval_server` 34、`test_research_mcp` 29、`test_research_grid` 25、`test_research_gate` 21、`test_research_boundary` 83) | 工具枚举恰为三项、批准写入者唯一、负向路径、Preset 边界(结构级)、返回值不含 URL/哈希 |
+| 测试 | 研究侧九份测试文件共 **566 项**(`test_research_api` 98、`test_research_gateway` 87、`test_research_sandbox` 132、`test_research_config` 57、`test_research_approval_server` 34、`test_research_mcp` 29、`test_research_grid` 25、`test_research_gate` 21、`test_research_boundary` 83) | 工具枚举恰为三项、批准写入者唯一、负向路径、Preset 边界(结构级)、返回值不含 URL/哈希 |
 | 研究栈与交易栈解耦 | `scripts/segment_windows.py`(窗口常量,纯数据)、`scripts/segment_ledger.py`(不再 import bootstrap) | 研究侧 CI 闸门**不装交易环境**也能跑:窗口常量原先经 `optimize → bootstrap → vnpy` 拖进交易栈,现已抽成纯数据模块 |
 
 实测结论:
@@ -126,8 +126,8 @@
   返回**恰 3 个**工具:`start_research` / `research_status` / `request_approval`(名字与描述一并取回)。
   **仍未验证**:在**真实 DSH 会话**里模型侧看到的工具目录(要跑起 DSH 与模型会话才能确认 Preset 装配后的最终形态)。
 - **多轮研究的同名冲突已实测修好(2026-11-14 20:39)**:用新想法在真实开放 API 上跑了一轮——工作流的 `tool_feedback` 节点拿到了网关返回的 `pending_candidates`(三个已落盘的候选名),起名节点据此**起了一个新名字** `open30_atr_midline_trail`(不在列表里),**没有再撞 409**。该轮最终停在**静态筛查**(候选把受保护容器 `am.high`/`am.low` 传给了 `max()`/`min()`),这是宪法筛查在正常拦人(见下面的坑 2),不是本次改动的缺陷。
-- **断耦演练**:停掉毕昇全部容器后跑测试套件,**2736 项通过**(该数字是断耦演练当时的计数);本分支当前全量 **2881 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑),3 项失败 + 5 项 error 与本改动无关,**已取 `origin/main` 版本逐条比对确认完全相同**(状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`);交易与风控不受影响。
-  研究侧九份测试单独跑:**561 项全过**(本机,2026-11-13 重算);模拟 CI「无交易栈」时 **541 通过 + 20 跳过**(=561;跳过的 20 项是带 `requires_trading_stack` 标记的回测子进程用例)。
+- **断耦演练**:停掉毕昇全部容器后跑测试套件,**2736 项通过**(该数字是断耦演练当时的计数);本分支当前全量 **2886 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑),3 项失败 + 5 项 error 与本改动无关,**已取 `origin/main` 版本逐条比对确认完全相同**(状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`);交易与风控不受影响。
+  研究侧九份测试单独跑:**566 项全过**(本机,2026-11-13 重算);模拟 CI「无交易栈」时 **546 通过 + 20 跳过**(=566;跳过的 20 项是带 `requires_trading_stack` 标记的回测子进程用例)。
 
 五个必须记下的坑:
 
@@ -157,7 +157,7 @@
 | 第 14 轮(A) | codex `exec` 并行两份之一(安全/边界) | **38/50**(**未达 45**);无 Critical / High,三条 Medium 均为「闸门漏判」 | **Medium**:①`redact_paths` 对**正斜杠盘符路径的多词段**只盖掉前半段(`C:/Documents and Settings/x.txt` → `error at <路径> and Settings/x.txt later`,目录名与文件名残留——`Path.as_posix()` 是常见写法);②批准写入者判定器漏「**变量中转模块字典**」(`_D = rs.__dict__` 之后 `_D["record_approval"](…)`,实测闸门全绿);③**三条模型可见通道的「按值凭据清单」并不共享**——ADR 写「凭据清单也共享」,实现里只有 MCP 侧盖毕昇密钥,CLI 与网关只盖网关令牌。**Low**:④中文句末标点(`。！？；，、`)不进主扫描终止符集,`C:\Users\alice\.env。后面` 把整句吃掉;⑤`Users` 目录规则多吃一个散文词(`C:\Users\alice failed` → 吃掉 `failed`);⑥多词段前瞻上限 4 个词,5 词以上的路径尾部泄漏;⑦POSIX 绝对路径带空格时同样只盖前半段;⑧「直接写批准记录」判定器可被**两段式**拆开绕过(写操作与「提到 approvals」不在同一作用域);⑨`_folded_str` 仍有 `chr()` 分隔符 / 模块级常量分隔符 / 切片三种拼法折不出来;⑩网关与 CLI/MCP 的按值替换**长度门槛不一致**(网关无下限、CLI/MCP 是 ≥8)。**已修**:M1(正斜杠多词段)、M2(模块字典变量中转)、M3(按值凭据清单抽成 `research_config.known_secret_values()`,三侧共用)、L4(中文终止符)、L5(散文词判据)、L6(前瞻上限 8)、L7(POSIX 带空格)、L8(两段式改成**调用图口径**)、L9(f-string / `%` / `format` 三种拼法)、L10(网关改走 `rs.scrub_text`,门槛统一)。**未做并如实登记**:L9 剩下的三种折不出形态(纵深防御层,非可利用绕过)见残留第 11 条。|
 | 第 14 轮(B) | codex `exec` 并行两份之一(架构/文档/测试) | **38.5/50**(**未达 45**);无 Critical / High,一条 Medium 是**文档与实测相反** | **Medium**:残留第 9 条的结论**与实测相反**(它称「受限子进程里整批 setup ERROR」是确定现象、并给出「`--basetemp` 指向仓库内可列目录即可绕过」的绕法;而 pytest 对**给定的 `--basetemp` 同样执行 `mkdir(mode=0o700)`**(`_pytest/tmpdir.py:152`),那条绕法并不成立;本机直接跑 559 项全过)。**Low**:①`except*` / `match` 只补进了三个 walker 中的一个,`async with` 甚至在 `_module_level_imports` 里直接抛 `AttributeError`;②「仓库里」这个说法应当是「**入库集**(git 跟踪集)」,评审脚手架目录(`reviewtmp/` 等)已 gitignore、不在跟踪集里;③`scripts/segment_ledger.py` 不再 import bootstrap,顺带**取消了 bootstrap 的 `os.chdir(ROOT)` 副作用**,pytest 会话的 CWD 不再被强制切到仓库根;④`find_spec` 守卫的**爆炸半径**(交易栈装了但装坏 ⇒ 模块导入期抛错 ⇒ pytest 收集阶段中止 ⇒ 整轮一个用例都不跑)没有在正文登记。**已修**:Medium(残留第 9 条按实测重写,并说明「权限口径」与「pytest 的 mode 语义」两件事)、L1(四个 walker 语义统一,并补一条把 `except*` / `match` / `async with` 的 import 植入临时文件、断言四个 walker 都看得见的**对照用例**——这条用例当场逮住 `async with` 的 `AttributeError`)、L2(口径改成「入库集」)、L3(研究侧路径锚点必须 `.resolve()`,且研究栈里不许出现 `os.chdir` / `os.getcwd`,已钉成断言;CWD 行为变化写进本 ADR)、L4(爆炸半径登记进残留第 8 条)。|
 | 第 15 轮 | codex `exec` 并行两份 | **未完成,无分数**:两份评审在中途被会话中断,**没有产出最终报告**;第 16 轮已重跑 | (中途探针见残留第 13 条;不是报告结论)|
-| 第 16 轮(A) | codex `exec` 并行两份之一(安全/边界) | **38/50**(**未达 45**);无 Critical,**1 条 High** | **High**:`_looks_like_repr_escape` 只看「主机名首字符是 n」,`nas`/`net` 开头的 UNC 在 repr/JSON 形态下**整条漏盖**(三条模型可见通道共用内核,同时中招)。**Medium**:研究侧与 `dashboard/safe.py` 的路径规则已漂移,研究侧漏编码/全角/零宽等 5 类形态;CWD 断言覆盖不足;残留第 8 条后半段过期;**提交 `ecb19ce` 误带入 512 个 pytest 临时产物**(`r15tmp/`,无凭据)。**Low**:`str.format` 关键字实参折不出、`FORBIDDEN_HOSTS` 漏 `::0`/`0`、多词段 8 词上限、路径后 ASCII 标点被一并吃掉、`_child_reason` 不带 secrets、`init-token` 往 stdout 打本机路径。**已修**:H1(按反斜杠个数区分,并补回归用例)、M3(`87ef82d` 移出入库集并补 `.gitignore`)。**未修**:研究侧/面板侧清洗内核漂移(M1)、其余 Low,留待下一轮。**第 14 轮七项修复全部实测有效。** |
+| 第 16 轮(A) | codex `exec` 并行两份之一(安全/边界) | **38/50**(**未达 45**);无 Critical,**1 条 High** | **High**:`_looks_like_repr_escape` 只看「主机名首字符是 n」,`nas`/`net` 开头的 UNC 在 repr/JSON 形态下**整条漏盖**(三条模型可见通道共用内核,同时中招)。**Medium**:研究侧与 `dashboard/safe.py` 的路径规则已漂移,研究侧漏编码/全角/零宽等 5 类形态;CWD 断言覆盖不足;残留第 8 条后半段过期;**提交 `ecb19ce` 误带入 512 个 pytest 临时产物**(`r15tmp/`,无凭据)。**Low**:`str.format` 关键字实参折不出、`FORBIDDEN_HOSTS` 漏 `::0`/`0`、多词段 8 词上限、路径后 ASCII 标点被一并吃掉、`_child_reason` 不带 secrets、`init-token` 往 stdout 打本机路径。**已修**:H1(按反斜杠个数区分,并补回归用例)、M3(`87ef82d` 移出入库集并补 `.gitignore`)。**随后一并修了**:M1(`dashboard.safe.scrub_path_forms` 抽成公共函数,研究侧 `redact_paths` 第二遍复用,编码/全角/零宽/无盘符根路径都盖住;UNC 与引号规则因过贪婪不借)、L1(`str.format` 关键字实参折叠)、L3(`::0` / `0` / `[::]` 等价写法进禁用名单,改用 `ipaddress.is_unspecified`)。**未修**:L2/L4/L5/L6,留待下一轮。**第 14 轮七项修复全部实测有效。** |
 | 第 16 轮(B) | codex `exec` 并行两份之一(架构/文档/测试) | **40/50**(**未达 45**);无 Critical,**1 条 High** | **High**:`_module_level_imports` 在 module-level `with` 上仍抛 `AttributeError`(第 14 轮只拆了 `AsyncWith`),对照用例没覆盖 `with`。**Medium**:残留第 9 条 ③ 的机制结论与受限环境实测相反;调用图判定器误报「内容里提到 approval」;「四个 walker 语义一致」不成立(类体 import 一个看不到);CWD 断言锚点清单漏 `tools/research_mcp/server.py` 的 `ROOT`(无 `.resolve()`)、对 `chdir`/`getcwd` 只认一种形态、`server.py:607` 有一处随启动目录漂移的相对路径;六处条数过期一项(559→560);全量口径 2879+3+5≠collect 总数;`r15tmp/` 误入库(已被 `87ef82d` 修掉,历史里仍留着)。**已修**:H-1(`with` 并入 `AsyncWith` 分支 + 对照用例加 `with`)、M-2(残留 9 重写)、M-3(措辞收紧)、M-4/M-6(MCP 的 `ROOT` 加 `.resolve()`、兜底命令改绝对路径)、M-5(CWD 断言认任意接收者与裸名)、M-7/M-8(条数重算为 561,全量口径写全)。**未修**:M-1 误报(残留 14)、M-7 的自动化核对(残留 15)。|
 | 第 11 轮 | codex `exec` 并行两份(复核第 10 轮的修复) | A **33/50**、B **38/50**(**均未达 45**) | **A(安全/边界)**:**Critical** 候选能顺**异常回溯帧**拿回真 `os`(`e.__traceback__.tb_frame.f_globals` 指向 numpy 内部帧的真全局命名空间)→ 任意写文件(可伪造 `approvals.json`)、读 `.env`/令牌、执行命令,而两层静态筛查**零告警**;**High** 模块代理**不包裹**从模块取到的函数/类(`np.load.__globals__['os']` 运行期畅通);**Medium** 静态层只判「字符串常量**等于**禁用名」→ 模板字符串(`"{0.__globals__}".format(...)`)藏得住;`redact_paths` 对 JSON/repr 形态的 Windows 路径只做部分替换(泄露盘符 + 用户名 + 文件名);凭据**按值**脱敏只有网关有、MCP 通道没有;批准写入者判定器可被**非常量折叠**绕过(`chr()`/`join()`),同时把无关字典键/文档字符串误判成「持有写入函数」;**Low** `pandas.io` 被整个命名空间误伤;静态层不报**单下划线**私有属性(与运行期口径不一致);两处正则覆盖边界偏窄。**B(架构/文档/测试)**:**High** 「例外函数只被 `*_child` 调用」那条断言**空转**(`_call_sites` 对整个 `research_api.py` 返回 0 个调用点,`for` 循环体一次都没执行);**High** 交易栈 import 藏在 `if/for/try/with` 复合语句里就看不见(三个 walker 各有一套遍历语义);**Medium** 不变量只挡得住 `import` 语句(`importlib.import_module` / `__import__` / `exec` 隐形,而本仓库里已有这种写法);判定器把任何含 `record_approval` 的字符串常量都算成引用(假阳性);Preset 白名单的两个通用分支在仓库自带的测试里**一次都没被走到**;文档把一条空转断言写成了已生效的约束;**Low** 「全量测试」数字不可复现、基线日期自相矛盾、CI 第二步一份文件收集失败会废掉整步、宪法守卫扫的是整个文件系统而不是 git 跟踪集、ruff 清单漏 `dashboard/__init__.py`。|
 
@@ -600,7 +600,7 @@
    「全量 N 项通过」这类数字离开环境就没有意义,**且合并前必须重算**——
    第 13 轮复核期间工作树被并发改动,文档里的九份测试条数当场从 531 变成 534,
    六处文档(ADR / CHANGELOG / PROJECTWIKI / roadmap / PR 正文 / 提交信息)因此全部作废。
-   现已统一重算为 **561 项**并在六处回填;**今后任何改动测试条数都要重跑一次 collect**。
+   现已统一重算为 **566 项**并在六处回填;**今后任何改动测试条数都要重跑一次 collect**。
    **第 14 轮 B 的 Medium:关于 `tmp_path` 的 PermissionError,原结论与实测相反,现更正为**:
    ①**现象不是确定的,而是环境相关**:本机直接跑 `python -m pytest tests/test_research_sandbox.py`
    **129 项全过**(非受限环境;受限子进程里 `--basetemp` 也不行,见下);而**受限的评审子进程**里
@@ -718,5 +718,5 @@
     这是**误报**而非漏报,方向偏安全,但守卫自己的注释警告过「误报一多,断言迟早被加白名单绕过」。
     修法(实参须路径形态、落点须在接收者/第一个实参上 + 补对照用例)留待下一轮。
 15. **文档里的测试条数没有自动化核对**(第 16 轮 B 的 M-7/M-8,**未做**):六处口径靠人手同步,
-    数字随树变;全量口径是 通过 + 失败 + error + skip = collect 总数(第 16 轮后:2881 + 3 + 5 + 6 = 2895)。
+    数字随树变;全量口径是 通过 + 失败 + error + skip = collect 总数(第 16 轮后:2886 + 3 + 5 + 6 = 2900)。
     彻底的做法是把九份测试的条数做成可执行断言,与本 ADR 的数字比对。

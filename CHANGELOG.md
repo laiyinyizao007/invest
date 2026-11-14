@@ -357,15 +357,16 @@
       - **「仓库里」改成「入库集(git 跟踪集)」**(B 的 L2):评审脚手架目录已 gitignore、不在跟踪集里。
       - **`find_spec` 守卫的爆炸半径如实登记**(B 的 L4):交易栈装了但装坏 ⇒ 模块导入期抛错
         ⇒ pytest 收集阶段中止 ⇒ **整轮一个用例都不跑**;已写进 ADR 残留第 8 条。
-      - **数字口径再次重算**:研究侧九份测试共 **561 项**(CI 模拟 **541 通过 + 20 跳过**)。
+      - **数字口径再次重算**:研究侧九份测试共 **566 项**(CI 模拟 **546 通过 + 20 跳过**)。
     - **第 16 轮 codex 复核**(A **38/50**、B **40/50**,**均未达 45 的发布线**;无 Critical,A、B 各一条 High;第 15 轮中途被中断、无报告):
       - **repr/JSON 形态的 UNC 路径不再漏盖**(A 的 High):换行转义只有 2 个反斜杠、UNC 的 repr 形态是 4 个,原判据只看主机名首字符是 `n`,`nas`/`net` 开头的主机整条漏盖(三条模型可见通道同时中招);现按反斜杠个数区分并补回归用例。
       - **`_module_level_imports` 对 module-level `with` 不再抛 `AttributeError`**(B 的 High):第 14 轮只拆了 `AsyncWith`;对照用例补上多上下文管理器的 `with`,「四个 walker 一致」的措辞收紧为「模块级复合语句上一致」。
       - **CWD 断言变强**(B 的 M-4/5/6):认任意接收者与裸名的 `chdir`/`getcwd`/`cwd`,锚点清单补上 MCP 侧;`tools/research_mcp/server.py` 的 `ROOT` 加 `.resolve()`,兜底命令改成绝对路径。
       - **误提交的 512 个 pytest 临时产物已移出入库集**(A 的 M3,无凭据;`87ef82d`),`.gitignore` 补评审脚手架目录;历史里仍留着,合并请 squash。
       - **残留第 9 条再重写**:两个环境(非受限 / 受限评审子进程)对「`mkdir(mode=0o700)` 是否可列」的实测相反,不下统一结论;撤回「与 mode 无关」两句。
-      - **未修并登记**:研究侧/面板侧清洗内核漂移与 5 类编码形态(A 的 M1)、调用图判定器的「内容里提到 approval」误报(残留 14)、条数无自动化核对(残留 15)、其余 Low。
-      - **数字口径重算**:研究侧九份测试共 **561 项**(541 通过 + 20 跳过)。
+      - **研究侧路径清洗复用面板侧的全套形态**(A 的 M1):`dashboard.safe.scrub_path_forms` 抽成公共函数,`redact_paths` 第二遍调用,URL 编码 / 全角 / 零宽 / 无盘符根路径都盖住(UNC 与引号规则过贪婪,不借);另修 `str.format` 关键字实参折叠(L1)与网关 `::0`/`0`/`[::]` 监听地址(L3)。
+      - **未修并登记**:其余 Low(L2/L4/L5/L6)、调用图判定器的「内容里提到 approval」误报(残留 14)、条数无自动化核对(残留 15)、其余 Low。
+      - **数字口径重算**:研究侧九份测试共 **566 项**(546 通过 + 20 跳过)。
 
   - **工具目录在协议层实测过**:真的把 `research-mcp` 起起来(stdio),用 MCP 客户端 `initialize` + `list_tools`,
     返回**恰 3 个**工具(`start_research`/`research_status`/`request_approval`)。**仍未验证**的只有「真实 DSH 会话里模型侧看到的工具目录」。
@@ -385,8 +386,8 @@
     `tools/research_mcp/server.py` 带着一处 SyntaxError(`except/elif` 写在 try 里)进过工作树,当时没有任何 job 会跑 ruff 或 compileall;
     「边界测试没有闸门」是第 7 轮 codex 的 High。
   - 验证:工具目录恰为三项、批准写入者唯一、批准页的 URL/哈希不在返回值里、候选名来源、填错可重试、越权路径全拒、
-    脱敏 fail-closed、非 TTY 拒绝批准、陈旧锁不永久锁死——研究侧九份测试文件共 **561 项**(本机有交易栈时全过,
-    模拟 CI 无交易栈时 **539 通过 + 20 跳过**——跳过的是带 `requires_trading_stack` 标记的回测子进程用例);本分支全量测试 **2881 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑;CI 是 Python 3.12 + pytest 8.3.4)
+    脱敏 fail-closed、非 TTY 拒绝批准、陈旧锁不永久锁死——研究侧九份测试文件共 **566 项**(本机有交易栈时全过,
+    模拟 CI 无交易栈时 **539 通过 + 20 跳过**——跳过的是带 `requires_trading_stack` 标记的回测子进程用例);本分支全量测试 **2886 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑;CI 是 Python 3.12 + pytest 8.3.4)
     (3 项失败 + 5 项 error 为**既有问题**,本轮已取 `origin/main` 版本逐条比对确认**完全相同**:
     状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`;
     另有 `tests/test_constitution_round11.py` 与 `round12.py` 的 **10 项**曾在本机因 `scripts/bootstrap.py` 的

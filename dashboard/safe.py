@@ -156,6 +156,24 @@ def _scrub_encoded_token(match: re.Match) -> str:
     return "<path>" if _decoded_has_path(match.group(0)) else match.group(0)
 
 
+def scrub_path_forms(text: str, *, include_unc: bool = True) -> str:
+    """只做路径这一类:引号包着的、全角、UNC、盘符、URL 编码、POSIX、无盘符根路径、百分号编码片段。
+
+    抽成公共函数,让研究侧的 `research_sandbox.redact_paths` 复用同一套规则
+    (第 16 轮 A 的 M1:研究侧原先漏了编码/全角/零宽/无盘符根路径五类形态,「同源」名不副实)。
+    """
+    out = _QUOTED_PATH.sub("<path>", text) if include_unc else text
+    out = _FULLWIDTH_PATH.sub(_scrub_fullwidth, out)
+    if include_unc:      # 研究侧自带「按段」的 UNC 扫描,不借这条贪婪规则(会把 r"\d+" 吃掉)
+        out = _UNC.sub("<path>", out)
+    out = _WIN_PATH.sub("<path>", out)
+    out = _ENC_WIN_PATH.sub("<path>", out)
+    out = _ENC_POSIX_PATH.sub("<path>", out)
+    out = _POSIX_PATH.sub("<path>", out)
+    out = _WIN_ROOTED_PATH.sub("<path>", out)
+    return _PCT_TOKEN.sub(_scrub_encoded_token, out)
+
+
 def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) -> str:
     """文本净化。保留换行与普通内容,只替换已知的泄露形态。
 
@@ -172,15 +190,7 @@ def scrub_text(text: str, *, secrets: Iterable[str] = (), limit: int = MAX_STR) 
     out = _ASSIGN.sub(lambda m: f"{m.group(1)}{m.group(2)}***", out)
     out = _BEARER.sub("Bearer ***", out)
     out = _CTP_ENV.sub("<env>", out)
-    out = _QUOTED_PATH.sub("<path>", out)
-    out = _FULLWIDTH_PATH.sub(_scrub_fullwidth, out)
-    out = _UNC.sub("<path>", out)
-    out = _WIN_PATH.sub("<path>", out)
-    out = _ENC_WIN_PATH.sub("<path>", out)
-    out = _ENC_POSIX_PATH.sub("<path>", out)
-    out = _POSIX_PATH.sub("<path>", out)
-    out = _WIN_ROOTED_PATH.sub("<path>", out)
-    out = _PCT_TOKEN.sub(_scrub_encoded_token, out)
+    out = scrub_path_forms(out)
     return clip(out, limit)
 
 

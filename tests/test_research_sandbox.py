@@ -841,6 +841,30 @@ def test_scrub_covers_the_repr_and_json_form_of_a_unc_path_with_an_n_host():
             assert host + "\\\\" not in cleaned and "secret.txt" not in cleaned, cleaned
 
 
+def test_screen_folds_str_format_keyword_arguments():
+    """`"{a}{b}".format(a="__gl", b="obals__")` 的关键字实参形态也要折出来(第 16 轮 A 的 L1)。"""
+    assert rs.screen_source('x = "{a}{b}".format(a="__gl", b="obals__")')
+    assert not rs.screen_source('x = "{a}{b}".format(a="hello", b="world")')
+
+
+def test_redact_paths_covers_encoded_fullwidth_zero_width_and_rooted_forms():
+    """研究侧清洗复用面板侧的全套路径形态(第 16 轮 A 的 M1):
+    URL 编码、全角、零宽字符、无盘符根路径原先都原样出去。"""
+    bs = chr(92)
+    cases = [
+        "C%3A%5CUsers%5Calice%5C.env",
+        "%2Fhome%2Falice%2F.env",
+        "C：＼Users＼alice＼.env",
+        "C:" + chr(0x200b) + bs + "Users" + bs + "alice" + bs + ".env",
+        bs + "Users" + bs + "alice" + bs + ".env",
+    ]
+    for case in cases:
+        cleaned = rs.redact_paths("open failed: " + case)
+        assert "alice" not in cleaned, (case, cleaned)
+    # 普通文字与 URL 不受影响
+    assert rs.redact_paths("see https://example.com/docs/a/b ok") == "see https://example.com/docs/a/b ok"
+
+
 def test_redact_digests_covers_a_digest_inside_a_longer_hex_string():
     """64 位摘要**藏在更长的十六进制串里**时原先原样出去(第 12 轮 codex 的 L2)——
     而「前面拼一段前缀、后面拼一段后缀」正是最常见的拼接形态。"""

@@ -46,6 +46,9 @@ def test_partial_file_overrides_only_what_it_names(tmp_path):
     {"candidates": {"name_pattern": "("}},         # 非法正则
     {"candidates": {"name_pattern": ".*"}},        # 放开任意文件名(含路径分隔符)
     {"gateway": {"host": "0.0.0.0"}},              # 暴露到所有网卡
+    {"gateway": {"host": "::0"}},                  # IPv6 全接口的等价写法(第 16 轮 A 的 L3)
+    {"gateway": {"host": "0"}},                    # INADDR_ANY 的简写
+    {"gateway": {"host": "[::]"}},
     {"gateway": {"host": "::"}},
     {"gateway": {"port": 0}},
     {"gateway": {"port": 70000}},

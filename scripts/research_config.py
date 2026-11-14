@@ -62,7 +62,7 @@ INT_BOUNDS = {
     ("gateway", "rate_limit_per_minute"): (1, 6_000),
     ("gateway", "max_body_bytes"): (1, 4_194_304),
 }
-FORBIDDEN_HOSTS = {"0.0.0.0", "::", "", "*"}
+FORBIDDEN_HOSTS = {"0.0.0.0", "::", "", "*", "0", "::0"}
 # 候选策略目录不得指向这些(正式策略、批准目录),凭据文件也不得被借用为令牌文件
 RESERVED_DIRS = {"strategies", "approved", "risk", "trading", "scripts", "tests", "config", ".git"}
 RESERVED_FILES = {".env", ".env.simnow.bak"}
@@ -103,6 +103,16 @@ def _relative_inside(value: Any, name: str) -> Path:
     return path
 
 
+def _is_unspecified_address(host: str) -> bool:
+    """`0.0.0.0` / `::` 的任意等价写法(`::0`、`0:0:0:0:0:0:0:0`、`[::]`)都是「所有网卡」
+    (第 16 轮 A 的 L3:原先只枚举了字面量)。"""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host.strip().strip("[]")).is_unspecified
+    except ValueError:
+        return False
+
+
 def _validate(cfg: dict) -> None:
     for (section, key), (low, high) in INT_BOUNDS.items():
         value = cfg[section][key]
@@ -112,7 +122,7 @@ def _validate(cfg: dict) -> None:
             raise ConfigError(f"{section}.{key}={value} 超出允许范围 [{low}, {high}]")
 
     host = cfg["gateway"]["host"]
-    if not isinstance(host, str) or host.strip() in FORBIDDEN_HOSTS:
+    if not isinstance(host, str) or host.strip() in FORBIDDEN_HOSTS or _is_unspecified_address(host):
         raise ConfigError(f"gateway.host={host!r} 不允许:网关不得监听所有网卡")
 
     pattern = cfg["candidates"]["name_pattern"]

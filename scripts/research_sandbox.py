@@ -806,7 +806,11 @@ def redact_paths(text: str) -> str:
     text = _mask_windows_paths(text)
     text = _PATH_RE_POSIX_ROOT.sub("<路径>", text)
     text = _mask_posix_paths(text)
-    return re.sub(r"\x00(\d+)\x00", lambda m: urls[int(m.group(1))], text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: urls[int(m.group(1))], text)
+    # 第二遍:面板侧那套更全的形态(URL 编码 / 全角 / 零宽 / 无盘符根路径 / %uXXXX),
+    # 第 16 轮 A 的 M1。`dashboard.safe` 只依赖 notify.redact,不会拖进交易栈。
+    from dashboard.safe import scrub_path_forms
+    return scrub_path_forms(text, include_unc=False).replace("<path>", "<路径>")
 
 
 def resolve_pending(arg: str, root: Path, pending_dir: str = PENDING_DIR) -> Path:
@@ -890,9 +894,13 @@ def _folded_str(node: ast.AST) -> str | None:
         template = _folded_str(node.func.value)
         if template is not None:
             args = [_folded_str(arg) for arg in node.args]
-            if all(arg is not None for arg in args):
+            # 关键字实参(`"{a}{b}".format(a="__gl", b="obals__")`,第 16 轮 A 的 L1);
+            # `**kw` 展开(arg 为 None)折不出,保持放弃。
+            kwargs = {kw.arg: _folded_str(kw.value) for kw in node.keywords if kw.arg}
+            if all(arg is not None for arg in args) and all(v is not None for v in kwargs.values()) \
+                    and all(kw.arg for kw in node.keywords):
                 try:
-                    return template.format(*args)
+                    return template.format(*args, **kwargs)
                 except (IndexError, KeyError, ValueError):
                     return None
     return None
