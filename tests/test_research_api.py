@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,9 +52,12 @@ class FakeChild:
 def child_capture(monkeypatch, tmp_path, func, args):
     """在进程内跑一个子入口:给它一份交接单,再把写回的结果读出来。
 
-    返回 (退出码, 结果字典)。子入口现在把结果写进**父进程建的随机文件**,不再打 stdout。"""
+    返回 (退出码, 结果字典)。子入口现在把结果写进**父进程建的随机文件**,不再打 stdout。
+    交接单按**真实路径**喂给入口(走 stdin):入口的引用在闭包里,改模块属性改不动它,
+    而且指纹会比对入口本身 —— 改模块属性只会让框架响亮地拒绝,不是"注入成功"。"""
+    import io
     handoff = {"path": str(tmp_path / "child_result.json"), "key": "k" * 64, "dir": str(tmp_path)}
-    monkeypatch.setattr(api, "_child_handoff", lambda: handoff)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(handoff) + "\n"))
     code = func(args)
     payload = {}
     path = Path(handoff["path"])
@@ -1075,14 +1079,35 @@ def test_a_child_refusal_reaches_the_caller_with_its_reason():
     """子进程的"拒绝"必须原样传到父层。
 
     早先一律压成"回测失败(退出码 3)",于是子入口里那些拒绝的原因只进了本机 stderr,
-    永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。"""
+    永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。
+
+    第 31 轮加了一层:只有**框架自己写的**那行(带 `[框架]` 标记)才会被回传 ——
+    候选与框架同进程,它 print 的内容不能顶替框架的结论(见
+    tests/test_child_result_channel.py::test_only_the_frameworks_own_lines_are_relayed_back_as_the_reason)。"""
     import subprocess
     import sys
 
+    script = ("import sys; sys.stderr.write(%r + '参数 risk_budget 属于受保护项\\n'); sys.exit(2)"
+              % api.FRAMEWORK_TAG)
     with pytest.raises(api.JobError) as excinfo:
-        api.spawn_child([sys.executable, "-c", "import sys; sys.stderr.write('参数 risk_budget 属于受保护项'); sys.exit(2)"], 30)
+        api.spawn_child([sys.executable, "-c", script], 30)
     assert excinfo.value.code == api.EXIT_REFUSED
     assert "risk_budget" in excinfo.value.message
+
+
+def test_a_candidate_written_refusal_reason_is_not_relayed_as_the_frameworks_own():
+    """反向:候选自己 print 的"拒绝原因"不被当成框架的结论回传。
+
+    候选与框架同进程,它的 print 走同一条 stderr;以前父层取"最后一行非空输出",
+    候选只要在被拒之后打印一行就能顶替框架的结论(也能把验证窗口的数字塞进去)。"""
+    import sys
+
+    script = "import sys; sys.stderr.write('close=2728.0 是验证窗口的收盘价\\n'); sys.exit(2)"
+    with pytest.raises(api.JobError) as excinfo:
+        api.spawn_child([sys.executable, "-c", script], 30)
+    assert excinfo.value.code == api.EXIT_REFUSED
+    assert "2728.0" not in excinfo.value.message
+    assert "拒绝执行" in excinfo.value.message
 
 
 def test_a_child_entrypoint_refuses_a_candidate_that_was_never_approved(tree, capsys):

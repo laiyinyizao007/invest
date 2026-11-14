@@ -76,6 +76,25 @@ def approve(path):
     api.rs.record_approval(path, api.settings()[1]["approvals_file"])
 
 
+def inject_handoff(monkeypatch, handoff: dict) -> None:
+    """把交接单按**真实路径**喂给子进程入口:走 stdin,不是改模块属性。
+
+    为什么不用 `monkeypatch.setattr(api, "_child_handoff", ...)`:入口的引用是闭包里的
+    (候选改写模块属性对写结果这条路不起作用),而且指纹里会比对入口本身 ——
+    改模块属性会让框架**响亮地拒绝**,不是"注入成功"。
+    喂 stdin 才是子进程拿到交接单的真实途径,测的就是这条路。"""
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(handoff) + "\n"))
+
+
+def _utf8_env() -> dict:
+    """子进程的 stderr 要能读出中文(Windows 默认 cp1252 会变成 ?)。"""
+    import os
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 # ---------------- Critical:结果不能由候选在 stdout 上伪造 ----------------
 
 def test_a_forged_result_line_on_stdout_is_never_taken_as_the_result(tree, monkeypatch, capsys):
@@ -256,7 +275,7 @@ def test_a_candidate_named_grid_error_in_the_validation_window_keeps_the_message
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
 
     handoff = {"path": str(tree / "child_result.json"), "key": "k" * 64, "dir": str(tree)}
-    monkeypatch.setattr(api, "_child_handoff", lambda: handoff)
+    inject_handoff(monkeypatch, handoff)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
     code = api.run_evaluate_child(args)
@@ -397,22 +416,22 @@ def test_the_candidate_atexit_hook_cannot_rewrite_the_result_after_it_was_writte
     atexit 钩子一起清掉(覆盖率统计等),那是副作用不是被测行为。"""
     scripts_dir = str(Path(api.__file__).resolve().parent)
     result_path = tmp_path / "child_result.json"
+    handoff = {"path": str(result_path), "key": "k" * 64, "dir": str(tmp_path)}
     script = tmp_path / "child.py"
     script.write_text(
         "import atexit, sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {scripts_dir!r})\n"
         "import research_api as api\n"
-        f"handoff = {{'path': {str(result_path)!r}, 'key': 'k' * 64, 'dir': {str(tmp_path)!r}}}\n"
-        "api._child_handoff = lambda: handoff\n"
         "def sabotage():\n"
-        f"    Path(handoff['path']).write_text('FORGED', encoding='utf-8')\n"
+        "    Path(r'''%s''').write_text('FORGED', encoding='utf-8')\n"
         "atexit.register(sabotage)\n"
-        "api.emit_result({'stats': {'sharpe': 1.0}})\n",
+        "api.emit_result({'stats': {'sharpe': 1.0}})\n" % str(result_path),
         encoding="utf-8")
 
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace")
+                          encoding="utf-8", errors="replace",
+                          input=json.dumps(handoff) + "\n")
     assert proc.returncode == 0, proc.stderr
 
     envelope = json.loads(result_path.read_text(encoding="utf-8"))
@@ -456,3 +475,245 @@ def test_a_result_file_just_under_the_cap_is_still_read(tree, monkeypatch, capsy
 
     out = json.loads(capsys.readouterr().out)
     assert code == api.EXIT_OK and out["stats"]["sharpe"] == 1.2
+
+
+def test_a_candidate_that_replaces_the_result_entry_point_cannot_hide_the_result(tmp_path):
+    """候选把 `emit_result` 换成空函数 → 通道不许把这当成"写成功了"。
+
+    第 30 轮 codex 实测:指纹只核对叶子对象(`json.dumps` 等),入口被整体替换时
+    那段检查**根本不执行** —— 探针实测退出码 0、父进程照常采信。
+    现在:调用方走导入时按住的引用(改写模块属性对这条路不起作用),
+    指纹里也比对入口本身 → 被改写就**响亮地失败**(退出码 2),结果不写出去。"""
+    scripts_dir = str(Path(api.__file__).resolve().parent)
+    result_path = tmp_path / "child_result.json"
+    handoff = {"path": str(result_path), "key": "k" * 64, "dir": str(tmp_path)}
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {scripts_dir!r})\n"
+        "import research_api as api\n"
+        "api.emit_result = lambda body: None        # 候选把入口换成空函数\n"
+        "print('EXIT', api._emit_or_fail({'stats': {'sharpe': 42.0}}))\n",
+        encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          input=json.dumps(handoff) + "\n", env=_utf8_env())
+    assert proc.returncode == 0, proc.stderr
+    assert "EXIT 2" in proc.stdout                      # 拒绝(EXIT_REFUSED),不是"写成功了"
+    assert "运行时对象被改写" in proc.stderr
+    assert not result_path.exists()                    # 真结果没写出去
+
+
+def test_a_candidate_that_replaces_the_handoff_reader_is_detected(tmp_path):
+    """候选把"读交接单"这一步换掉 → 指纹比对入口本身 → **响亮地失败**。
+
+    交接单里有结果文件的路径与 MAC 密钥。若候选能改写这一步,
+    它就能让框架把结果写到它选的文件里(越出父进程指定的位置)。
+    现在:指纹里比对了入口本身 → 被改写过就拒绝回传(退出码 2),结果不写出去。"""
+    scripts_dir = str(Path(api.__file__).resolve().parent)
+    result_path = tmp_path / "child_result.json"
+    other_path = tmp_path / "elsewhere.json"
+    handoff = {"path": str(result_path), "key": "k" * 64, "dir": str(tmp_path)}
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {scripts_dir!r})\n"
+        "import research_api as api\n"
+        f"api._child_handoff = lambda: {{'path': {str(other_path)!r}, 'key': 'k' * 64, 'dir': {str(tmp_path)!r}}}\n"
+        "print('EXIT', api._emit_or_fail({'stats': {'sharpe': 1.0}}))\n",
+        encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          input=json.dumps(handoff) + "\n", env=_utf8_env())
+    assert proc.returncode == 0, proc.stderr
+    assert "EXIT 2" in proc.stdout
+    assert "运行时对象被改写" in proc.stderr
+    assert not result_path.exists() and not other_path.exists()
+
+
+def test_a_candidate_that_bypasses_the_fingerprint_still_cannot_redirect_the_write(tmp_path):
+    """双向(更狠的一版):候选连**指纹比对的那一环**一起绕过 → 写结果的去向仍不受它摆布。
+
+    候选把 `_child_handoff` 和 `_ORIGINAL_HANDOFF_READER` 一起换成自己的,
+    指纹里"入口被改写"这一项就看不出差别了(两个都是候选的)。
+    这时真正兜住的是**闭包**:读交接单的那一侧是闭包单元里的原版,
+    候选改模块属性改不到它 → 结果仍写进父进程通过 stdin 给的那条路径,
+    候选自选路径上什么都没有。"""
+    scripts_dir = str(Path(api.__file__).resolve().parent)
+    result_path = tmp_path / "child_result.json"
+    other_path = tmp_path / "elsewhere.json"
+    handoff = {"path": str(result_path), "key": "k" * 64, "dir": str(tmp_path)}
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {scripts_dir!r})\n"
+        "import research_api as api\n"
+        f"fake = lambda: {{'path': {str(other_path)!r}, 'key': 'k' * 64, 'dir': {str(tmp_path)!r}}}\n"
+        "api._child_handoff = fake\n"
+        "api._ORIGINAL_HANDOFF_READER = fake      # 连指纹比对那一环一起绕过\n"
+        "print('EXIT', api._emit_or_fail({'stats': {'sharpe': 1.0}}))\n",
+        encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          input=json.dumps(handoff) + "\n", env=_utf8_env())
+    assert proc.returncode == 0, proc.stderr
+    assert "EXIT 0" in proc.stdout
+    assert result_path.exists()          # 写进了父进程指定的那条路径
+    assert not other_path.exists()       # 候选自选路径上没有结果
+
+
+# ---------------- 第 31 轮:子进程中途死掉,格子数按保守值记账 ----------------
+
+def test_a_child_that_dies_mid_way_still_charges_the_declared_grid(tree, monkeypatch):
+    """子进程中途死掉(超时/崩溃/被杀)→ 没人回报扫过多少格子 → 按**保守值**补记。
+
+    此前这条路上补记完全不发生:账本只留预扣的 27 格,而那一轮最多已扫 64 格,
+    少记 37 次试验 = DSR 的 N 偏小 = **悄悄放松**已锁定的 DSR ≥ 0.95(ADR 第 9 条)。"""
+    make_strategy(tree, "class S:\n"
+                        "    param_grid = {'a': [1, 2, 3, 4], 'b': [1, 2, 3, 4], 'c': [1, 2, 3, 4]}\n")
+
+    def die(cmd, timeout):
+        raise api.JobError(api.EXIT_TIMEOUT, "子进程超时")
+
+    monkeypatch.setattr(api, "spawn_child", die)
+
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    from risk.trial_ledger import total_trials
+    assert total_trials(api.trials_path(api.settings()[1])) == 64      # 27 预扣 + 37 补记
+
+
+def test_a_dead_child_with_a_grid_the_parent_cannot_read_charges_the_configured_maximum(tree, monkeypatch):
+    """动态网格(静态读不出格子数)→ 按配置上限记,取保守方向(宁可多记,不可少记)。"""
+    make_strategy(tree, "class S:\n    param_grid = dict(a=[1, 2, 3])\n")
+
+    def die(cmd, timeout):
+        raise api.JobError(api.EXIT_TIMEOUT, "子进程超时")
+
+    monkeypatch.setattr(api, "spawn_child", die)
+
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    from risk.trial_ledger import total_trials
+    assert total_trials(api.trials_path(api.settings()[1])) == api.settings()[0]["grid"]["max_cells"]
+
+
+def test_a_dead_child_with_a_small_grid_still_costs_the_minimum(tree, monkeypatch):
+    """双向:声明的网格比最小网格还小 → 仍按最小网格 27 记(预扣的那份不退,不变成 8 格)。"""
+    make_strategy(tree, "class S:\n    param_grid = {'a': [1, 2], 'b': [1, 2], 'c': [1, 2]}\n")
+
+    def die(cmd, timeout):
+        raise api.JobError(api.EXIT_TIMEOUT, "子进程超时")
+
+    monkeypatch.setattr(api, "spawn_child", die)
+
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    from risk.trial_ledger import total_trials
+    assert total_trials(api.trials_path(api.settings()[1])) == 27
+
+
+def test_the_declared_grid_is_read_statically_from_the_source():
+    """静态读格子数:只认字面量;读不出就说读不出(不猜)。"""
+    assert api.declared_grid_cells("class S:\n    param_grid = {'a': [1, 2, 3], 'b': [1, 2], 'c': [1]}\n") == 6
+    assert api.declared_grid_cells("class S:\n    param_grid = dict(a=[1, 2, 3])\n") is None
+    assert api.declared_grid_cells("class S:\n    pass\n") == 0            # 没有网格 → 只有单一配置
+    assert api.declared_grid_cells("class S:\n    param_grid = {'a': [1, 2, 3]}\n") == 3
+    assert api.declared_grid_cells("param_grid = {'a': [1, 2, 3]}\n") is None   # 类外的网格读不准 → 保守
+
+
+def test_the_conservative_charge_never_goes_below_the_precharged_minimum():
+    """双向:保守值不得低于预扣的最小网格(否则等于退还试验次数)。"""
+    assert api.conservative_grid_cells("class S:\n    pass\n", 343) == 27
+    assert api.conservative_grid_cells("class S:\n    param_grid = {'a': [1, 2]}\n", 343) == 27
+    assert api.conservative_grid_cells("class S:\n    param_grid = {'a': [1, 2, 3, 4]}\n", 343) == 27
+    assert api.conservative_grid_cells("class S:\n    param_grid = {'a': list(range(99))}\n", 343) == 343
+
+
+# ---------------- 第 31 轮:拒绝原因只回传"框架自己写的"那一行 ----------------
+
+def test_only_the_frameworks_own_lines_are_relayed_back_as_the_reason():
+    """候选与框架同进程:候选 print 的内容不得被当成"框架的拒绝原因"传出去。
+
+    以前父层取 stderr 的最后一行非空输出 —— 候选只要在被拒绝之后打印一行,
+    就能顶替框架的结论;也可以把验证窗口的数字塞进 stderr,让那串数字
+    被当成框架的话传回调用方/LLM。"""
+    # 框架自己写的那行会被回传
+    assert api._child_reason("[框架] 审批缺失") == "审批缺失"
+    # 候选自己写的一行(哪怕只有这一行)不被回传
+    assert api._child_reason("close=2728.0 是验证窗口的收盘价") == "子进程拒绝执行(原因见本机日志)"
+    # 候选写的那行排在框架的行**后面**也顶替不了
+    assert api._child_reason("[框架] 审批缺失\nclose=2728.0 是验证窗口的收盘价") == "审批缺失"
+    # 候选那行排在前面也一样:回传的是框架的行,验证窗口的数字不出现在回传内容里
+    assert "2728.0" not in api._child_reason("close=2728.0 是验证窗口的收盘价\n[框架] 审批缺失")
+
+
+def test_a_candidate_cannot_smuggle_a_fake_reason_out_through_stderr(monkeypatch):
+    """端到端:子进程以"拒绝"退出,但 stderr 里写的是候选自己的话 → 回传的消息不含它。"""
+    stderr = "close=2728.0 是验证窗口的收盘价\n"
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=None, returncode=api.EXIT_REFUSED,
+                                                            stderr=stderr))
+    with pytest.raises(api.JobError) as excinfo:
+        api.spawn_child(["python", "-c", "pass"], 10)
+    assert "2728.0" not in excinfo.value.message
+    assert "拒绝执行" in excinfo.value.message
+
+
+def test_the_frameworks_own_refusal_reason_is_still_relayed(monkeypatch):
+    """双向:框架写的拒绝原因照旧原样传到父层(标记只是过滤手段,不是把诊断掐了)。"""
+    stderr = "[框架] 策略代码尚未批准\n"
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=None, returncode=api.EXIT_REFUSED,
+                                                            stderr=stderr))
+    with pytest.raises(api.JobError) as excinfo:
+        api.spawn_child(["python", "-c", "pass"], 10)
+    assert "策略代码尚未批准" in excinfo.value.message
+
+
+# ---------------- 第 31 轮:结果里该有上界的数字,都要有上界 ----------------
+
+def test_an_out_of_range_sharpe_in_the_selection_summary_is_refused():
+    """选参窗口汇总里的 best_sharpe / best_smoothed 也是夏普 → 一样要卡上界。
+
+    漏了这个形状,就等于给"结果形状是 selection 的那类作业"留了一个后门。"""
+    with pytest.raises(api.JobError) as excinfo:
+        api.check_result_bounds({"selection": {"best_sharpe": 1e9}})
+    assert "best_sharpe" in excinfo.value.message
+
+    with pytest.raises(api.JobError):
+        api.check_result_bounds({"selection": {"best_smoothed": 1e9}})
+
+
+def test_a_normal_selection_summary_is_still_accepted():
+    """双向:正常的选参汇总照常采信(别把正常结果也拒了)。"""
+    api.check_result_bounds({"selection": {"best_sharpe": 1.8, "best_smoothed": 1.5,
+                                           "best_cell": [0, 1], "on_plateau": False}})
+
+
+def test_a_non_finite_number_in_the_stats_is_refused():
+    """stats 里的非夏普数字(回撤额、成交笔数)只查"是不是有限数"。
+
+    NaN/Inf 会顺着下游计算传下去(回撤、夏普、诊断);但回撤额本来就可能远大于
+    夏普上界,拿夏普上界去卡它会误杀正常结果。"""
+    with pytest.raises(api.JobError) as excinfo:
+        api.check_result_bounds({"stats": {"sharpe": 1.2, "max_drawdown_yuan": float("nan")}})
+    assert "max_drawdown_yuan" in excinfo.value.message
+
+    api.check_result_bounds({"stats": {"sharpe": 1.2, "max_drawdown_yuan": 987654.0,
+                                       "round_trips": 1234}})
+
+
+def test_a_non_finite_or_over_long_pnl_list_is_refused():
+    """逐笔盈亏:每一笔都得是有限数字;条数有上限。"""
+    with pytest.raises(api.JobError):
+        api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": [1.0, float("inf")]})
+    with pytest.raises(api.JobError):
+        api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": ["1.0"]})
+    with pytest.raises(api.JobError):
+        api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": {"a": 1}})
+    api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": [1.0, -2.5, 0.0]})
