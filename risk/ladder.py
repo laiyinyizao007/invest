@@ -95,10 +95,14 @@ def _file_lock(path: Path, timeout: float = 10.0):
         # 锁文件建不出来(目录被占、权限不足……)也必须 fail-closed,且**不泄露本地路径**。
         raise LadderError(f"梯子锁文件无法创建(fail-closed,未做任何修改): {_why(exc)}") from exc
     try:
+        # 锁的是**第 0 个字节**。Windows 的 msvcrt.locking 锁的是字节区间,越界会报错,
+        # 所以文件至少要有 1 个字节;写入后必须 flush 并落盘,否则另一个进程可能按尚未落盘的长度去锁。
+        # (两个进程同时初始化时可能各写一个字节,文件长到 2 字节——不影响锁的语义。)
         stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:                       # msvcrt 要锁的字节范围必须在文件内
+        if stream.tell() == 0:
             stream.write(bytes([0]))
             stream.flush()
+            os.fsync(stream.fileno())
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -274,16 +278,20 @@ class Ladder:
             raise LadderError("梯子头指针不合法(fail-closed)")
         return head
 
-    def _read_anchor(self) -> tuple[tuple[int, str] | None, bool]:
-        """返回 ((seq, hash) 或 None, 末行是否撕裂)。"""
+    def _read_anchor(self) -> tuple[tuple[int, str] | None, str | None]:
+        """返回 ((seq, hash) 或 None, 撕裂的末行碎片原文 或 None)。
+
+        碎片原文要留着:锚点末行崩在追加中途时,那半行里仍然带着**它本来要见证的那条记录的哈希前缀**
+        (锚点写的是 `<seq> <hash>`)。用它跟日志里的哈希对前缀,就能知道"锚点本来见证的是哪一条、
+        日志那一条有没有被改过"——而不是把日志自己的哈希当成见证(那是拿日志证明日志,白查)。"""
         if self.anchor is None or not self.anchor.exists():
-            return None, False
+            return None, None
         try:
             text = self.anchor.read_text(encoding="utf-8")
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
         last_seq, last = 0, None
-        torn = False
+        torn: str | None = None
         items = [item for item in text.splitlines() if item.strip()]
         for index, line in enumerate(items):
             try:
@@ -292,7 +300,7 @@ class Ladder:
                 # 只有**末行**、且文件不以换行结尾时才是撕裂(崩在追加中途),那半行不算(第 17 轮 M3);
                 # "完整但缺换行"解析得出来,会被保留(第 19 轮 L4)。
                 if index == len(items) - 1 and text and not text.endswith(chr(10)):
-                    torn = True
+                    torn = line
                     break
                 raise LadderError(f"梯子锚点格式不合法(fail-closed): {_why(exc)}") from exc
             if seq <= last_seq:                              # 第 17 轮:锚点自身必须严格递增、从 1 起(seq=0 会把下标读成 rows[-1])
@@ -307,20 +315,49 @@ class Ladder:
         if anchored is None:
             if not rows:
                 return
+            if len(rows) == 1 and torn is not None:
+                # 锚点**只有**一行且那行是撕裂的:它本来要见证的就是第 1 条。
+                # 用碎片里的哈希前缀对日志第 1 条——对不上就是日志被改过(fail-closed)。
+                self._check_torn_witness(rows, 1, torn)
+                if repair:
+                    self._write_anchor(rows[0])
+                return
             if len(rows) == 1:                          # 第一条日志已追加、锚点还没写完就崩了
                 if repair:
                     self._write_anchor(rows[0])
                 return
             raise LadderError("梯子有日志却没有锚点(fail-closed):锚点被删过,或日志是被换进来的")
         seq, digest = anchored
-        if torn and len(rows) > seq:
-            # 锚点末行撕裂:它本来要记的是第 seq+1 条(锚点只落后于"根本没写"的情形,撕裂是另一种)。
-            # 用日志里那一条的哈希把见证范围补回——**只在内存里补**,不改文件(只读入口不许写)。
-            # 补不回(日志本身没有那一条)时见证范围就是 seq,比正常少一条,登记为残余。
-            seq, digest = seq + 1, rows[seq]["hash"]
+        # 见证范围**只用锚点自己记下的那一条**。第 19 轮曾在这里用"日志里那条的哈希"把范围补大一号,
+        # 那是拿日志证明日志:补大之后比对的是 rows[seq] 与 rows[seq] 自己,**锚点真正的见证从未被核对**,
+        # 反而给"截断锚点+改写日志"留了一条绕过路径。锚点的全部价值就在这一条比对上,不能丢。
         if len(rows) < seq or rows[seq - 1]["hash"] != digest:
             raise LadderError("梯子日志与锚点对不上(fail-closed):日志被回滚、截断或整条换掉;"
                               "确认要从头开始请由人执行 `scripts/research_ladder.py reset --reason ...`")
+        if torn is not None:
+            # 锚点末行撕裂:它本来要见证的是第 seq+1 条。用碎片里的哈希**前缀**与日志那一条比对——
+            # 前缀对不上,说明日志那一条被改过(fail-closed);对得上,见证范围才真的补到 seq+1。
+            self._check_torn_witness(rows, seq + 1, torn)
+
+    def _check_torn_witness(self, rows: list[dict], seq: int, torn: str) -> None:
+        """核对锚点撕裂末行**本来要见证**的那一条日志(第 19 轮 L4 的更正)。
+
+        锚点行是 `<seq> <hash>`,而且**日志那一条先 fsync、锚点行后写**——所以碎片里的 seq
+        一定是 `seq`,而且日志里必须有那一条。碎片是那次写入的**前缀**,因此它带的哈希前缀
+        必须与日志那一条的哈希前缀一致。
+
+        - 碎片里的 seq 不是 `seq`(锚点被改写)→ fail-closed;
+        - 日志里没有第 seq 条(日志被截断/回滚)→ fail-closed;
+        - 碎片带哈希前缀而与日志对不上(那一条被改过)→ fail-closed;
+        - 碎片只写到 seq 就崩了(还没写哈希)→ 无从核对,见证范围停在最后一条**完整**锚点行。"""
+        head, _, prefix = torn.partition(" ")
+        if not head.isdigit() or int(head) != seq:
+            raise LadderError("梯子锚点末行与日志对不上(fail-closed):锚点被改写或日志被换掉")
+        if len(rows) < seq:
+            raise LadderError("梯子锚点指向的记录在日志里不存在(fail-closed):日志被截断或回滚")
+        if prefix and not rows[seq - 1]["hash"].startswith(prefix):
+            raise LadderError("梯子锚点末行与日志对不上(fail-closed):日志第 "
+                              f"{seq} 条的哈希与锚点碎片不一致(该条被改过)")
 
     @staticmethod
     def _trim_torn_tail(path: Path, parse=None) -> None:
@@ -592,8 +629,12 @@ class Ladder:
                 raise LadderError("梯子状态正常,不得重置;确需从头开始请显式 force"
                                   "(重置会清零 best 与查询数,并作废全部历史揭示存档)")
             moved = []
+            # 归档编号:在锁内算(第 19 轮的跨进程锁保证这一步与挪文件之间没有别的进程插手)。
+            # 从 1 起,取第一个"所有目标文件都没被占用的"编号。
             n = 1
-            while any(Path(str(f) + f".bak-{n}").exists() for f in files):
+            while True:
+                if not any(Path(str(f) + f".bak-{n}").exists() for f in files):
+                    break
                 n += 1
             log_path = self.path.parent / "ladder.reset.log"
             self.path.parent.mkdir(parents=True, exist_ok=True)

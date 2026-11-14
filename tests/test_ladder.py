@@ -529,15 +529,48 @@ def test_an_anchor_whose_sequence_is_not_strictly_increasing_from_one_fails_clos
 
 
 def test_a_torn_anchor_tail_is_ignored_and_trimmed_on_the_next_write(tmp_path):
+    """锚点末行崩在追加中途:梯子照常可用,下次写入前把那半行截掉。
+
+    注意这里的构造顺序:日志那一行**先 fsync**,锚点行后写,所以真实的撕裂场景里
+    日志里已经有那一条,锚点碎片只是那一次写入的前缀。"""
+    ladder = anchored(tmp_path)
+    for _ in range(4):
+        ladder.submit(0.0)
+    lines = ladder.anchor.read_text(encoding="utf-8").splitlines()
+    ladder.anchor.write_text("\n".join(lines[:-1] + [lines[-1][:8]]), encoding="utf-8")   # 崩在哈希中途
+    assert ladder.status()["queries_used"] == 4
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 5
+    assert all(len(l.split(" ")[1]) == 64 for l in ladder.anchor.read_text(encoding="utf-8").splitlines())
+
+
+def test_a_torn_anchor_tail_whose_hash_prefix_disagrees_with_the_log_is_detected(tmp_path):
+    """锚点碎片里的哈希前缀与日志那一条对不上 → 那一条被改过,fail-closed。
+
+    这是"用锚点见证范围"的全部价值所在:第 19 轮曾用"日志自己的哈希"补范围,
+    那是拿日志证明日志——补大之后锚点真正的见证从未被核对,反而留了一条绕过路径。"""
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    lines = ladder.anchor.read_text(encoding="utf-8").splitlines()
+    seq = lines[-1].split(" ")[0]
+    ladder.anchor.write_text("\n".join(lines[:-1] + [seq + " ffffffffffff"]), encoding="utf-8")
+
+    with pytest.raises(LadderError, match="对不上"):
+        ladder.status()
+
+
+def test_an_anchor_naming_a_record_the_log_does_not_have_is_corruption(tmp_path):
+    """锚点提到了日志里没有的那一条 → 日志被截断或回滚,fail-closed。
+
+    日志那一条先于锚点行 fsync,所以这种状态在正常运行下不可能出现。"""
     ladder = anchored(tmp_path)
     for _ in range(2):
         ladder.submit(0.0)
     with open(ladder.anchor, "a", encoding="utf-8") as stream:
-        stream.write("3 dea")                                         # 崩在追加中途
-    assert ladder.status()["queries_used"] == 2
-    ladder.submit(0.0)
-    assert ladder.status()["queries_used"] == 3
-    assert all(len(l.split(" ")[1]) == 64 for l in ladder.anchor.read_text(encoding="utf-8").splitlines())
+        stream.write("3 deadbeef")                                    # 锚点说第 3 条在,日志里没有
+    with pytest.raises(LadderError, match="不存在"):
+        ladder.status()
 
 
 def test_a_torn_log_tail_is_ignored_and_trimmed_on_the_next_write(tmp_path):
@@ -595,6 +628,64 @@ def test_force_renew_after_exhaustion_is_not_labelled_forced(tmp_path):
 
 
 # ---------- 第 19 轮 codex ----------
+
+def test_two_processes_cannot_interleave_a_reset_and_a_submit(tmp_path):
+    """第 19 轮 codex 的 M2:**跨进程**实测,不是同一进程里模拟。
+
+    没有跨进程锁时:CLI 的 `reset` 把日志挪走,与网关那次已经读到旧状态的 `submit` 交错,
+    submit 用陈旧的 rows 算出 seq=N+1 写进空日志,之后每次读都报"seq 不连续"——梯子永久报废。
+    这里起两个真进程:一个反复 submit,另一个反复 reset,最后梯子必须仍然可用
+    (能读出状态、能继续提交),不能出现断链。
+
+    没有这把锁时本用例会变红:submit 会把 seq=N+1 的记录写进刚被挪空的日志。"""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    repo = str(Path(__file__).resolve().parents[1])
+    script = textwrap.dedent("""
+        import sys, time
+        from pathlib import Path
+        from risk.ladder import Ladder, LadderError
+        mode, path, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
+        ladder = Ladder(Path(path), anchor=Path(anchor))
+        deadline = time.time() + 4.0
+        ok = 0
+        while time.time() < deadline:
+            try:
+                if mode == "submit":
+                    ladder.submit(0.0)
+                else:
+                    ladder.reset("并发演练", force=True)
+                ok += 1
+            except LadderError:
+                pass
+            except Exception:
+                pass
+        print(ok)
+    """)
+
+    script_path = tmp_path / "worker.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    ladder = anchored(tmp_path)
+    for _ in range(2):
+        ladder.submit(0.0)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = repo
+    env["PYTHONIOENCODING"] = "utf-8"
+    procs = [subprocess.Popen([sys.executable, str(script_path), mode, str(ladder.path), str(ladder.anchor)],
+                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+             for mode in ("submit", "reset")]
+    for proc in procs:
+        proc.wait(timeout=180)
+
+    # 梯子必须仍然可用:能读出状态,还能继续提交
+    assert ladder.status()["queries_used"] >= 0
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] >= 1
 
 def test_a_complete_last_line_that_only_lacks_its_newline_is_kept_and_the_ladder_stays_usable(tmp_path):
     """第 19 轮 codex 的 M1(我上轮引入的回归):"完整但缺换行"不是撕裂。
