@@ -31,6 +31,10 @@ from pathlib import Path
 
 import pytest
 
+# 合并 main #22 之后:`research_api` 不再在模块顶部 import bootstrap(为了不在导入时 chdir),
+# 而这些用例会导入 `strategies` 模板 -> vnpy.trader.database,后面别的用例首次 import bootstrap 就会炸
+# ("bootstrap 必须先于 vnpy.trader.database 导入")。所以这里先 import,与生产脚本的约定一致。
+import bootstrap  # noqa: E402,F401
 import research_api as api
 import research_sandbox as rs
 
@@ -62,7 +66,7 @@ def repo(tmp_path, monkeypatch):
                  if n == "strategies" or n.startswith("strategies.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.syspath_prepend(str(root))
-    monkeypatch.setattr(api.bootstrap, "ROOT", root)
+    monkeypatch.setattr(api.rc, "CODE_ROOT", root)
     monkeypatch.chdir(root)
     return root
 

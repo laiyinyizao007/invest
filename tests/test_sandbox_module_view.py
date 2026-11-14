@@ -22,56 +22,92 @@ import research_sandbox as rs      # noqa: E402
 # 一、模块视图:候选拿到的不是模块,是视图
 # ---------------------------------------------------------------------------
 
-DANGEROUS_ATTRIBUTES = ("sys", "os")
+DANGEROUS_ATTRIBUTES = ("sys",)      # 合并后拿 `enum` 当载体,它只挂着 `sys`(`logging` 的 os 路径见 ADR)
 
 
-def test_the_candidate_gets_a_view_instead_of_the_real_module():
-    """`import logging` 给候选的必须是**视图**,不是模块本身。
+# 合并 main #22 之后:`logging` 不在导入白名单里(main 刻意排除,它自己 import 了 os),
+# 候选根本导不进来。原来这几条用例拿 `logging` 当"会泄漏的模块",现在改用**白名单内**
+# 同样会泄漏的 `enum`(`enum.sys` 是真的 sys 模块):检验的仍是同一件事——
+# 候选拿到的不是真模块,经它摸不到危险模块。
+#
+# 两边口径的合并(见 ADR):
+# - **名字层**(main:下划线属性、`LEAKY_MODULE_ATTRS` 里的名字)抛 `ImportError`;
+# - **对象层**(#26:属性值是危险模块/能力来源)抛 `AttributeError`。
+# 同一次访问两层都会拒时**名字层先拒**(它不需要取值),所以 `enum.sys` 报的是名字层。
+# 对象层要换一个**名字不在名单里**的属性去测(见下面的 `test_the_object_layer_*`)。
 
-    否则候选一句 `logging.__dict__` 就摸回真模块(视图这一层就白做了)。
+def test_the_candidate_gets_a_proxy_instead_of_the_real_module():
+    """`import enum` 给候选的必须是**代理**,不是模块本身。
+
+    否则候选一句 `enum.__dict__` 就摸回真模块(这一层就白做了)。
     """
     safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    view = safe["__import__"]("enum")
 
-    assert not isinstance(view, type(rs)), "给候选的是模块本身,不是视图"
-    assert isinstance(view, rs.ModuleView)
-    with pytest.raises(AttributeError):
+    assert type(view) is not type(rs), "给候选的是模块本身,不是代理"
+    assert isinstance(view, rs._GuardedModule)
+    with pytest.raises(ImportError) as exc:
         view.__dict__
+    assert "读写任意文件或拿到真模块" in str(exc.value), str(exc.value)
 
 
 @pytest.mark.parametrize("name", DANGEROUS_ATTRIBUTES)
 def test_the_view_does_not_hand_out_the_dangerous_modules(name):
     """视图把危险模块的属性挡下来,并在理由里写明是哪一条规则。"""
     safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    view = safe["__import__"]("enum")
 
-    with pytest.raises(AttributeError) as exc:
+    with pytest.raises(ImportError) as exc:
         getattr(view, name)
 
     message = str(exc.value)
-    assert "模块视图" in message or "能力泄漏" in message, message
+    assert f"模块属性 {name} 不可用" in message and "挂在属性上" in message, message
 
 
-def test_the_view_closes_the_logging_sys_route():
-    """第 24 轮 codex 实测的那条路:`logging.sys.modules["os"].system(...)`。
+def test_the_view_closes_the_enum_sys_route():
+    """第 24 轮 codex 实测的那条路(原型是 `logging.sys.modules["os"].system(...)`,
+    合并后 `logging` 进不来,同形的 `enum.sys.modules[...]` 是白名单内的对应物)。
 
     走完之后必须**摸不到** `os`——不是"摸到了但用不了"。
     """
     safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    view = safe["__import__"]("enum")
 
-    with pytest.raises(AttributeError) as exc:
+    with pytest.raises(ImportError) as exc:
         view.sys
-    assert "禁止访问 logging.sys" in str(exc.value), str(exc.value)
+    assert "模块属性 sys 不可用" in str(exc.value), str(exc.value)
+
+
+def test_the_object_layer_still_refuses_under_a_name_the_name_layer_does_not_know(tmp_path, monkeypatch):
+    """对象层(#26)的独立价值:危险模块换个**名单里没有的名字**挂着,名字层看不见,对象层看得见。
+
+    `leaky_pkg.helper_handle` 的值就是真 `os`——名字层(按名字)放行,
+    对象层(按 `__name__`)拒,而且报的是 `模块视图` 这条规则。
+    """
+    pkg = tmp_path / "leaky_pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("import os as helper_handle" + chr(10) + "VALUE = 1" + chr(10), encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in [n for n in list(sys.modules) if n == "leaky_pkg" or n.startswith("leaky_pkg.")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+
+    safe = rs.safe_builtins((), ["leaky_pkg"])
+    proxy = safe["__import__"]("leaky_pkg")
+
+    assert proxy.VALUE == 1
+    with pytest.raises(AttributeError) as exc:
+        proxy.helper_handle
+    assert "规则:模块视图" in str(exc.value), str(exc.value)
 
 
 def test_the_view_still_gives_the_ordinary_attributes():
     """放行方向:视图不能把正常的东西也一起收走。"""
     safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    view = safe["__import__"]("enum")
 
-    assert view.getLogger is not None
-    assert "getLogger" in dir(view)
+    assert view.Enum is not None
+    assert "Enum" in dir(view)
+    assert "sys" not in dir(view)
 
 
 def test_the_view_refuses_a_module_that_hands_out_a_capability_class():
@@ -239,8 +275,10 @@ def test_the_view_cache_does_not_keep_the_module_alive():
     """
     import weakref
 
-    safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    # 合并后候选拿到的是代理(`_GuardedModule`,缓存 `_PROXY_CACHE` 在候选运行结束时由
+    # `guarded_scope`/`restore_guarded` 清空);弱引用判据属于**直接用 `_view_for` 的视图**,
+    # 这里对视图本身检验(视图类仍保留,供对象层规则的单测使用)。
+    view = rs._view_for(sys.modules["enum"])
 
     ref = object.__getattribute__(view, "_view_module_ref")
     assert isinstance(ref, weakref.ref), "视图强引用了模块,弱引用缓存形同虚设"
@@ -250,10 +288,10 @@ def test_the_view_cache_does_not_keep_the_module_alive():
 def test_the_view_still_works_after_the_fix():
     """改弱引用不能把视图改坏:普通属性照常给,危险属性照常拒。"""
     safe = rs.safe_builtins(())
-    view = safe["__import__"]("logging")
+    view = safe["__import__"]("enum")
 
-    assert view.getLogger is not None
-    with pytest.raises(AttributeError):
+    assert view.Enum is not None
+    with pytest.raises(ImportError):
         view.sys
 
 

@@ -26,6 +26,10 @@ from types import ModuleType
 
 import pytest
 
+# 合并 main #22 之后:`research_api` 不再在模块顶部 import bootstrap(为了不在导入时 chdir),
+# 而这些用例会导入 `strategies` 模板 -> vnpy.trader.database,后面别的用例首次 import bootstrap 就会炸
+# ("bootstrap 必须先于 vnpy.trader.database 导入")。所以这里先 import,与生产脚本的约定一致。
+import bootstrap  # noqa: E402,F401
 import research_api as api
 import research_sandbox as rs
 
@@ -59,7 +63,7 @@ def repo(tmp_path, monkeypatch):
                  if n == "strategies" or n.startswith("strategies.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.syspath_prepend(str(root))
-    monkeypatch.setattr(api.bootstrap, "ROOT", root)
+    monkeypatch.setattr(api.rc, "CODE_ROOT", root)
     monkeypatch.chdir(root)
     return root
 
@@ -241,7 +245,6 @@ def test_from_pkgx_import_sub_does_not_hand_out_the_real_module(tmp_path, monkey
     # 于是视图取 'sub' 会失败 -> 触发 CPython 的回退。
     (pkg / "__init__.py").write_text(
         textwrap.dedent("""
-            import sys
             from . import sub
             del sub
         """), encoding="utf-8")
@@ -250,7 +253,10 @@ def test_from_pkgx_import_sub_does_not_hand_out_the_real_module(tmp_path, monkey
     for name in [n for n in list(sys.modules) if n == "pkgx" or n.startswith("pkgx.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
 
-    safe = rs.safe_builtins(())
+    # 合并 main #22 之后:`pkgx` 不在内置导入白名单里,走配置追加(`allowed_modules`),
+    # 这样被检验的才是**视图/回退**这条规则,而不是被"白名单"在更前面拒掉。
+    # (原夹具里的 `import sys` 去掉了:配置追加的模块要过准入审计,`sys` 挂在属性上会被拒。)
+    safe = rs.safe_builtins((), ["pkgx"])
     namespace = {"__name__": "probe", "__builtins__": safe}
     exec(compile(textwrap.dedent("""
         try:
@@ -284,18 +290,35 @@ def test_the_runtime_import_gate_refuses_the_network_and_write_modules(name):
     assert name in str(exc.value)
 
 
-@pytest.mark.parametrize("name", ["numpy", "matplotlib", "psutil"])
+@pytest.mark.parametrize("name", ["numpy", "pandas"])
 def test_the_runtime_import_gate_still_allows_the_ordinary_stack(name):
     """放行:候选正当需要的科学栈照常能导(第 25 轮 codex 的 High 3)。
 
-    `matplotlib` 与 `psutil` 的命名空间里都有 `subprocess`(matplotlib 建字体缓存要用),
-    曾经因为"整块拒绝会递出能力的模块"而被整个拒掉——误伤比漏检更糟。
+    numpy 的命名空间里有 `subprocess`(`numpy.f2py`)——曾经因为"整块拒绝会递出能力的模块"
+    而被整个拒掉,误伤比漏检更糟。
+
+    **合并 main #22 之后的口径变化**:原来这条用例还放行 `matplotlib` 与 `psutil`
+    (它们的命名空间里也有 `subprocess`)。main 的**导入白名单**默认不含这两个,
+    所以默认拒收——见下一条用例;配置追加它们也过不了准入审计(见
+    `tests/test_merge_main_sandbox_union.py`)。这是两边口径的真实冲突,取 main 的更严一侧,
+    没有放宽任何一边。
     """
     safe = rs.safe_builtins(())
 
     module = safe["__import__"](name)
 
     assert module is not None
+
+
+@pytest.mark.parametrize("name", ["matplotlib", "psutil"])
+def test_modules_outside_the_import_allowlist_are_refused_by_the_allowlist_rule(name):
+    """拦截方向(合并 main #22 后新增):不在白名单里的科学栈模块,**由白名单规则**拒。"""
+    safe = rs.safe_builtins(())
+
+    with pytest.raises(ImportError) as exc:
+        safe["__import__"](name)
+
+    assert "未列入白名单" in str(exc.value), str(exc.value)
 
 
 # ------------------------------------------- Medium 6:静态层要看得见 fromlist

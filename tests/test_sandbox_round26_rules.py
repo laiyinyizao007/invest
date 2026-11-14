@@ -29,6 +29,10 @@ from types import ModuleType
 
 import pytest
 
+# 合并 main #22 之后:`research_api` 不再在模块顶部 import bootstrap(为了不在导入时 chdir),
+# 而这些用例会导入 `strategies` 模板 -> vnpy.trader.database,后面别的用例首次 import bootstrap 就会炸
+# ("bootstrap 必须先于 vnpy.trader.database 导入")。所以这里先 import,与生产脚本的约定一致。
+import bootstrap  # noqa: E402,F401
 import research_api as api
 import research_sandbox as rs
 
@@ -62,7 +66,7 @@ def repo(tmp_path, monkeypatch):
                  if n == "strategies" or n.startswith("strategies.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.syspath_prepend(str(root))
-    monkeypatch.setattr(api.bootstrap, "ROOT", root)
+    monkeypatch.setattr(api.rc, "CODE_ROOT", root)
     monkeypatch.chdir(root)
     return root
 
@@ -377,7 +381,8 @@ def test_a_relative_import_cannot_fall_back_to_the_real_module(tmp_path, monkeyp
     for name in [n for n in list(sys.modules) if n == "pkgrel" or n.startswith("pkgrel.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
 
-    safe = rs.safe_builtins(())
+    # 合并 main #22:`pkgrel` 走配置追加的白名单,被检验的才是"回退键"这条规则本身。
+    safe = rs.safe_builtins((), ["pkgrel"])
     namespace = {"__name__": "pkgrel.probe", "__package__": "pkgrel", "__builtins__": safe}
     exec(compile(textwrap.dedent("""
         try:
@@ -404,7 +409,8 @@ def test_an_ordinary_relative_import_of_a_clean_module_still_works(tmp_path, mon
     for name in [n for n in list(sys.modules) if n == "pkgok" or n.startswith("pkgok.")]:
         monkeypatch.delitem(sys.modules, name, raising=False)
 
-    safe = rs.safe_builtins(())
+    # 合并 main #22:`pkgok` 走配置追加的白名单(它不在内置白名单里)。
+    safe = rs.safe_builtins((), ["pkgok"])
     namespace = {"__name__": "pkgok.probe", "__package__": "pkgok", "__builtins__": safe}
     exec(compile(textwrap.dedent("""
         try:

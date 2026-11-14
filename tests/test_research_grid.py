@@ -2,6 +2,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import importlib.util
+
 import pytest
 
 import research_grid as rg
@@ -21,6 +23,20 @@ BARS = [bar(datetime(2021, 1, 4, 9, 0)), bar(datetime(2021, 6, 1, 9, 0)), bar(da
 
 
 # ---------- 声明校验 ----------
+
+# 这两条用例要 import 交易栈(walk_forward_optimizer / strategies.*)才能核对常量:
+# CI 的研究侧闸门不装交易环境,那里**跳过**而不是失败(缺依赖 ≠ 行为不对)。
+def _trading_stack_missing() -> bool:
+    try:
+        return importlib.util.find_spec("vnpy_ctastrategy") is None
+    except (ImportError, ValueError):
+        return True
+
+
+requires_trading_stack = pytest.mark.skipif(
+    _trading_stack_missing(),
+    reason="需要交易栈:CI 的研究侧闸门不装交易环境")
+
 
 def test_valid_grid_returns_axes_in_declared_order():
     axes = rg.validate_grid(GRID, Cand, max_cells=100)
@@ -138,6 +154,7 @@ def test_result_is_json_serialisable():
     json.dumps(result, ensure_ascii=False)
 
 
+@requires_trading_stack
 def test_first_validation_start_is_locked_to_the_walk_forward_windows():
     import walk_forward_optimizer as wf
     assert rg.FIRST_VALIDATION_START == wf.build_windows()[0].valid_start

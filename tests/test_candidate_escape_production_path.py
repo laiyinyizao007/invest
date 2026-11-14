@@ -26,6 +26,10 @@ import textwrap
 
 import pytest
 
+# 合并 main #22 之后:`research_api` 不再在模块顶部 import bootstrap(为了不在导入时 chdir),
+# 而这些用例会导入 `strategies` 模板 -> vnpy.trader.database,后面别的用例首次 import bootstrap 就会炸
+# ("bootstrap 必须先于 vnpy.trader.database 导入")。所以这里先 import,与生产脚本的约定一致。
+import bootstrap  # noqa: E402,F401
 import research_api as api
 
 
@@ -72,14 +76,24 @@ def repo(tmp_path, monkeypatch):
     (root / "strategies").mkdir(parents=True)
     (root / "strategies" / "__init__.py").write_text("", encoding="utf-8")
     git_commit_all(root)
-    monkeypatch.setattr(api.bootstrap, "ROOT", root)
+    monkeypatch.setattr(api.rc, "CODE_ROOT", root)
     monkeypatch.chdir(root)
     return root
 
 
-def run_candidate(tmp_path, monkeypatch, source, cls_name="S"):
-    """把一段候选源码走生产入口 `import_candidate` 跑一遍,返回它的类。"""
+def run_candidate(tmp_path, monkeypatch, source, cls_name="S", static=False):
+    """把一段候选源码走生产入口 `import_candidate` 跑一遍,返回它的类。
+
+    `static=False`(默认,**合并 main #22 之后加的**):绕开静态筛查,只测**运行期**那几层。
+    原因:main 的静态层新增了**导入白名单**与更多被禁属性(`__spec__`/`__loader__`…),
+    这些探针用的辅助包名(`helperpkg`/`evil_helper`…)不在白名单里,会在静态层就被拒掉——
+    用例照样绿,可测到的是静态层,不是它们本来要测的运行期规则(第 22 轮踩过的坑)。
+    静态层拒绝这类源码另由 `tests/test_merge_main_sandbox_union.py` 逐条断言。
+    需要走完整流水线(静态 + 运行期)的用例显式传 `static=True`。
+    """
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    if not static:
+        monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
     path = tmp_path / "candidate.py"
     path.write_text(source, encoding="utf-8")
     return api.import_candidate(path, cls_name, api.rs.file_sha256(path))
@@ -519,7 +533,7 @@ def test_the_production_path_refuses_to_walk_the_stack(tmp_path, monkeypatch, re
     source = build(BASE, PROBE_TRACEBACK, TAIL)
 
     with pytest.raises(api.JobError) as exc:
-        run_candidate(tmp_path, monkeypatch, source)
+        run_candidate(tmp_path, monkeypatch, source, static=True)
 
     message = str(exc.value)
     assert "静态筛查未通过" in message, message
@@ -632,7 +646,7 @@ def test_the_candidate_still_gets_the_legitimate_imports(tmp_path, monkeypatch, 
         TAIL,
     )
 
-    cls = run_candidate(tmp_path, monkeypatch, source)
+    cls = run_candidate(tmp_path, monkeypatch, source, static=True)
 
     assert cls.PASS["ok"] is True
 
@@ -659,7 +673,7 @@ def test_the_name_blocklist_still_holds_on_the_production_path(tmp_path, monkeyp
     )
 
     try:
-        cls = run_candidate(tmp_path, monkeypatch, source)
+        cls = run_candidate(tmp_path, monkeypatch, source, static=True)
     except api.JobError as exc:
         assert "静态筛查未通过" in str(exc), f"{name} 被拒的理由不对:{exc}"
         return
@@ -817,7 +831,7 @@ def test_the_candidate_cannot_reach_a_native_library_through_an_allowed_package(
     )
 
     with pytest.raises(api.JobError) as exc:
-        run_candidate(tmp_path, monkeypatch, source)
+        run_candidate(tmp_path, monkeypatch, source, static=True)
 
     assert "静态筛查未通过" in str(exc.value), str(exc.value)
 

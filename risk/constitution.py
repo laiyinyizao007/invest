@@ -266,6 +266,15 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     #    运行时第三层的"家族判定"直接判成"不适用"而放行(第 10 轮 codex 实测)。
     #    第三层已改成按 MRO 判定(结构判定,没有可改写的入口),这里再加一道静态保险。
     "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__",
+    # ⑥ 异常回溯帧(第 11 轮 codex 实测的 Critical):候选在自己代码里
+    # `except BaseException as e:` 中顺着 `e.__traceback__.tb_frame.f_globals`
+    # 拿回**真 os**(numpy 内部帧的全局命名空间里有 os),于是任意写文件
+    # (可伪造 approvals.json)、读文件(.env、网关令牌)、执行命令,
+    # 而**两层静态筛查零告警**——这条路上一个禁用名都不出现。
+    # 拿到帧**必经**这几个名字,它们是必经之路而不是可选路径。
+    "__traceback__", "__context__", "__cause__",
+    "tb_frame", "tb_next", "tb_lasti",
+    "f_globals", "f_locals", "f_builtins", "f_back", "f_code", "f_lineno",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -1137,7 +1146,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # 候选目录不得落在这些仓库目录里。与 `scripts/research_config.py` 的 `RESERVED_DIRS` **必须一致**
 # (宪法模块不能 import 它:它依赖 bootstrap/vnpy;一致性由
 # `tests/test_constitution_round12.py::test_the_pending_dir_reserved_names_match_the_sandbox_config` 守)。
-_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config"})
+# `.git` 也在内:候选目录指到版本库里,等于让受保护对象躲进"没人会去看的目录"。
+_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config", ".git"})
 _DEFAULT_PENDING_DIR = "pending_strategies"
 
 

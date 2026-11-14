@@ -1011,7 +1011,7 @@ G8 要求双轮都 ≥45 才算发布档;第 12/13/14 轮 codex 为 **38.5 / 38.
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
-| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__`、**走栈**(第 24 轮新增):`__traceback__`、`__context__`、`__cause__`、`__suppress_context__`、`tb_frame`、`tb_next`、`tb_lasti`、`tb_lineno`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`f_back`、`f_lineno`、`gi_frame`、`gi_code`、`cr_frame`、`cr_code`、`ag_frame`、`ag_code`、`__getattribute__`、`__closure__`、`cell_contents` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__`、`__spec__`、`__loader__`、`__file__`、`__path__`、`__package__`、`__reduce__`、`__reduce_ex__`、`__getattr__`(第 11 轮,main #22 并入)、**走栈**(第 24 轮新增):`__traceback__`、`__context__`、`__cause__`、`__suppress_context__`、`tb_frame`、`tb_next`、`tb_lasti`、`tb_lineno`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`f_back`、`f_lineno`、`gi_frame`、`gi_code`、`cr_frame`、`cr_code`、`ag_frame`、`ag_code`、`__getattribute__`、`__closure__`、`cell_contents` | `research_sandbox.FORBIDDEN_ATTRS` |
 | 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__`,**危险模块名当钥匙**(第 24 轮新增):`subprocess`、`ctypes`、`_os`、`real_import` | `research_sandbox.FORBIDDEN_STRINGS` |
 | 禁用字符串·**按键取语境**(危险模块的**短名**:当键取时拒,当普通词时放行——第 24 轮自查修,见下) | `os`、`sys`、`posix`、`nt` | `research_sandbox.FORBIDDEN_KEY_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
@@ -1734,6 +1734,49 @@ worktree 的 git-common-dir : .../main/.git
 > 它的两条 HIGH 与三条 Medium 是在这次补修里改的,**补修之后没有再跑一轮 codex**,
 > 所以"补修之后的分数未知"——不替它加分,也不替它扣分。
 
+
+### 合并 main #22 的取舍(Issue #26,PR #27)
+
+main 已合并 #22(DSH 研究入口与带外批准,commit `e7c0589`),它与本分支**都在加固同一个沙盒,且各自重写了"导入门"**。
+合并原则:两边的防御都保留,不为省事丢任何一边;每条被合并的规则做过"放行 + 拦截"双向探针
+(`tests/test_merge_main_sandbox_union.py`),拦截用例断言**是哪条规则拒的**。
+
+**两道导入门怎么叠**(顺序有意义):
+
+| 序 | 规则 | 来源 | 为什么放这里 |
+|---|---|---|---|
+| 1 | 黑名单(`FORBIDDEN_MODULES`/`EXTRA_FORBIDDEN_MODULES`/`DANGEROUS_MODULE_NAMES`/配置追加禁用) | 两边 | 最硬;配置追加的白名单**不能**把它放出来(`zipfile` 配成白名单仍报"禁止导入") |
+| 2 | 按**全名**禁用(`numpy.ctypeslib`…) | #26 | 根名字 numpy 在白名单里,所以必须先于白名单判 |
+| 3 | 按**路径**裁决(`RepoImportGuard`,含相对导入还原、fromlist、通配符) | #26 | 说得出"为什么"的具体规则放在笼统规则前面 |
+| 4 | **导入白名单**(`ALLOWED_MODULE_ROOTS` + 配置追加,只增不减) | main | 相对导入按**还原后的绝对名**的根判 |
+| 5 | 配置追加模块的**准入审计**(`audit_module`) | main | 自己把 os/sys 挂在属性上的模块整个拒收 |
+| 6 | 返回**代理** `_GuardedModule` | main + #26 | 名字层(下划线/泄漏名,`ImportError`)+ 对象层(危险模块/能力来源,`AttributeError`,共用 `_check_object_rules`) |
+
+**冲突 hunk 的处理**:`research_api` 两处调用合成 `rs.safe_builtins(forbidden, allowed_modules, repo_guard=...)`
+(签名 `(forbidden_modules, allowed_modules, repo_guard)`,main 位置传前两个、#26 关键字传第三个);
+`FORBIDDEN_ATTRS` 取并集;`FORBIDDEN_SUBSTRINGS`/`DANGEROUS_UNDERSCORE_ATTRS`(main)与 `FORBIDDEN_KEY_STRINGS`/`_KEY_ACCESSOR_NAMES`(#26)并存、互不相交
+(前者是**全局子串**强特征串,后者只在"按键取"语境拒短名,所以 `label = "os"` 仍放行);
+`screen_source(source, extra_modules, extra_calls, extra_allowed, package)`——`package` 放最后,按位置传前四个的调用方不受影响;
+`_folded_str` 常量折叠(main)与 `_screen_key_usage`(#26)都接在字符串规则后面。
+
+**真实冲突(没有放宽任何一边,取更严的一侧)**:
+
+1. **`matplotlib` / `psutil`**:#26 第 25 轮 High 3 要求它们可导(命名空间里有 `subprocess`,不递给候选就无害);
+   main 的白名单默认不含,配置追加又过不了准入审计。合并后默认被白名单拒、配置追加被审计拒。
+   要放行得**人工决定**改审计规则(属于 main 的白名单策略),不是合并该替用户做的取舍。
+   原 `test_the_runtime_import_gate_still_allows_the_ordinary_stack` 改成 `numpy`/`pandas`,另加"被白名单拒"与"配置追加被审计拒"两条回归。
+2. **同一次访问两层都拒时的异常类型**:main 代理抛 `ImportError`,#26 视图抛 `AttributeError`(`import_from` 的回退只吃 `AttributeError`,
+   所以对象层必须保持 `AttributeError`);`ImportError`/`AttributeError` 在 CPython 里**布局冲突,不能多重继承**成一个异常类。
+   解法:**名字层先拒**(不需要取值),对象层用"名单里没有的名字"另测(`leaky_pkg.innocent_name` 的值是真 `os`)。
+3. **`logging`**:main 刻意不放进白名单(它自己 import 了 os),原视图用例的载体换成同形的 `enum.sys`;视图类 `ModuleView` 保留(`_view_for` 仍被直接单测)。
+4. **生产入口用例**:main 的静态层现在会在更前面拒掉探针(辅助包名不在白名单、`__spec__`/`__loader__` 属于禁用属性),
+   用例照样绿但测到的是静态层——正是第 22 轮踩过的坑。所以 `run_candidate` 默认 `static=False` 只测运行期,
+   静态层拒绝另在并集用例里逐条断言规则文本。
+5. **仓库根**:main 把 `bootstrap.ROOT` 换成 `rc.ROOT`(数据根)/`rc.CODE_ROOT`(代码根)。`RepoImportGuard`/`verify_trusted_tree`
+   管的是 `strategies/` 这种**代码**,所以用 `rc.CODE_ROOT`。
+
+**残余风险(沿用原结论,合并没有改变)**:代理的取属性帧的 `f_globals` 是本模块的真全局字典——候选若能拿到那一帧的 traceback 就拿到真 `os`。
+静态层禁了走栈属性、运行期受限内建不给 `getattr`,但**这不是边界**(第 21 轮起一贯的结论):边界是人工审批 + 容器隔离。
 
 ## 隐藏子入口的信任模型
 

@@ -6,6 +6,420 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
+  ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
+  且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:
+  - 导入门 = 黑名单(`DANGEROUS_MODULE_NAMES` 等)→ 按全名禁用 → **按路径裁决**(#26)→ **导入白名单**(main)→ 配置追加模块的**准入审计**(main);
+    顺序刻意如此:同一个名字被几条规则同时拒时,报的是**最具体**的那条(路径规则说得出"为什么"),不是笼统的"未列入白名单"。
+  - 候选拿到的是 main 的代理 `_GuardedModule`(名字层:下划线/泄漏属性名,抛 `ImportError`),
+    它的取属性**同时**走 #26 的对象层判据(危险模块/能力来源,抛 `AttributeError`);两层共用 `_check_object_rules`,不各自漂移。
+  - `FORBIDDEN_ATTRS` 取并集(main 的 `__spec__`/`__loader__`/`__file__`/`__path__`/`__package__`/`__reduce__`/`__reduce_ex__`/`__getattr__`
+    + #26 的走栈/闭包单元属性);`FORBIDDEN_SUBSTRINGS`/`DANGEROUS_UNDERSCORE_ATTRS`(main)与 `FORBIDDEN_KEY_STRINGS`/按键取语境(#26)并存。
+  - `research_api`:`rs.safe_builtins(extra_forbidden, allowed_modules, repo_guard=...)` 合成同一个调用,`verify_trusted_tree` 启动期核对保留;
+    仓库根改用 main 引入的 `rc.CODE_ROOT`(代码根;`INVEST_ROOT` 只管数据根——受信目录 `strategies/` 属于代码)。
+  - **两边口径打架的地方(如实记录,没有放宽任何一边)**:① `matplotlib`/`psutil`:#26 第 25 轮要求可导,main 白名单默认不含、
+    配置追加又过不了准入审计 → 取更严的一侧,两条用例已改写并新增回归;② 同一次属性访问两层都拒时异常类型不同
+    (名字层 `ImportError`、对象层 `AttributeError`)→ 名字层先拒,对象层用「名单里没有的名字」另测;③ `logging` 不在白名单,
+    原视图用例改用同形的 `enum.sys`。
+  - 测试:新增 `tests/test_merge_main_sandbox_union.py`(76 条,放行+拦截双向,拦截断言规则文本);
+    生产入口用例改成 `run_candidate(static=False)` 默认只测运行期层(静态层先拒会让用例测到别的层),
+    静态层拒绝另在并集用例里逐条断言;4 个测试文件补 `import bootstrap`(main 的 research_api 不再顶层 import 它)。
+- **DSH 研究入口与带外批准**(Issue [#22](https://github.com/laiyinyizao007/invest/issues/22),
+  ADR `20261113-dsh-research-entry-and-out-of-band-approval`):在 DSH Desktop 里用 `research` Preset 发起研究、查进度、请求人工批准,
+  批准在本机 `127.0.0.1` 的一次性网页里由人完成——**模型只能请求,不能授予**。
+  - `tools/research_mcp/server.py`:MCP 服务,工具恰为三项(`start_research`/`research_status`/`request_approval`),
+    经毕昇开放 API `POST /api/v2/workflow/invoke` 编排;**开放 API 与续跑协议已实测**(必须同时带 `session_id` 与 `message_id`)。
+  - `scripts/research_approval_server.py`:**批准记录的两个合法入口之一**(低层写入者只有 `research_sandbox.record_approval` 一个函数;另一个入口是等价 CLI `research_api.py approve`/`review`)。只监听回环、校验 Host/Origin/Sec-Fetch-Site 与一次性 CSRF 令牌,
+    展示完整源码(脱敏)、静态筛查结果与父策略 diff,人输入**完整 64 位 sha256** 才写账本,后端自己重算哈希并把**刚核对过的那个哈希**写进去
+    (不在写入前再读一次文件),填错可改正重试(上限 5 次),决定后进程立刻退出。
+  - `tools/research_mcp/dsh-research-preset.patch.yml`:DSH `research` Preset 模板,只挂 `persona` + `research-mcp`,
+    不含任何文件读写/命令/网页/子 Agent 工具,Auto review 不启用;密钥只用 `process.env` 引用。
+  - `requirements-research.txt`:MCP SDK 会拖进 starlette/uvicorn/pydantic,**不进交易环境**(交易环境仍只装 `requirements.txt`)。
+    **措辞更正(第 4~5 轮评审)**:该文件**不是**完整运行环境——研究环境是「仓库依赖 + 本文件」,
+    隔离的真正含义是「mcp 不装进交易 venv / 交易镜像」。**第 5 轮再更正一次**:需要 vnpy 的**只有回测子进程**
+    (回测要 import `strategies.*`);筛查(`const.load()` / `const.screen_source()`)是纯 AST 分析,批准/编排/网关/MCP 进程都不 import vnpy。
+  - **G8 双轮评审(codex CLI 第 2~16 轮:33/50 → 39/50 → 36/50 → 40/50 → 39 与 37 → 38 与 33 → 37 与 36 → **32 与 35** → **36 与 36** → **40 与 40** → **38 与 38.5** → (15 中断)→ **38 与 40**,均未达 45 的发布线)后按发现逐轮加固**:
+    - 第 2 轮最要紧的一条:**批准页地址与 sha256 一律不进工具返回值**(只进本机浏览器)——
+      返回里带上它们,一个有本地 HTTP 能力的模型就能自己去 POST 批准页,把「带外人工批准」变成「模型自我批准」。
+      其余:批准记录写入加独占锁与唯一临时名(并发写不丢更新);候选名改为以**文件系统增量**为准(模型散文里的文件名只在候选目录里核对存在才算);
+      页面把源码标为**不可信数据**并经 `dashboard/safe.scrub_text` 脱敏;批准绑定的哈希与「人核对过的」那一份同源(消除 TOCTOU);
+      `research-mcp` 的配置从数据根读取;边界测试补上「直接写批准文件」的扫描。
+    - 第 3~4 轮闭合的漏洞:**哈希与批准命令仍会经毕昇 tip 模板漏进模型通道**(网关响应把 sha256 原样回给模型 → 模型可在聊天里替人念哈希,
+      「人核对完整 64 位」退化成橡皮章)。现为三层防线:网关响应不再回哈希 → 毕昇 tip 模板不再回显工具输出与批准命令 →
+      MCP 输出再脱敏一层(64 位十六进制与 `approve` 命令行替换为占位符)。
+      同轮还收紧:批准页 POST 必须带浏览器来源标记(`Origin` 或 `Sec-Fetch-Site`);脱敏模块不可用时**拒绝提供页面**(fail-closed,
+      不拿占位符顶上);CSRF 改用字节比对(非 ASCII 令牌被拒而非抛 TypeError);`review` 与 `--confirm-reviewed` **必须在交互式终端**里执行,
+      自动化调用不得批准代码;锁文件判陈旧(Windows 下用 `OpenProcess` 探活,不用 `os.kill(pid,0)`——那在 Windows 上是终止进程);
+      `os.replace` 加重试;研究侧不再 `import bootstrap`,因此**筛查/批准/编排/网关/MCP 进程都不再 import vnpy、不再加载 `.env` 里的交易凭据**
+      (网关是最后一个还在 import 的组件,第 4 轮一并去掉;边界测试新增两条 AST 级断言锁住这条声明)。
+      ⚠️ 措辞更正:「研究进程不再 import vnpy」只在**筛查/批准/编排/网关/MCP** 这几个进程成立;
+      **回测子进程仍然 import vnpy**(回测要 import `strategies.*`),这一条别被上句话带偏。
+    - 第 5 轮闭合的漏洞(40/50,仍未达发布线):
+      - **批准页地址彻底不落盘**:批准进程**自己开浏览器**,URL 只活在那一个进程的内存里,MCP 侧既拿不到 URL,
+        也没有「写进 `.local/research-mcp/approval-page.txt` 再删掉」这种中间态可依赖——此前那句「地址只在本机文件里」
+        依赖的是「模型没有本地文件工具」这个**未经验证**的前提,现已不再需要。MCP 的返回文案改指终端回退路径。
+      - **CLI 的 stdout 里不再有哈希**:`approve`/`review` 的返回值去掉 `sha256` 键,哈希只留在 stderr(给人的通道);
+        交互提示语也一并改走 stderr(`input(prompt)` 会把提示语写进 stdout,那样 stdout 就不是纯 JSON 了)。
+      - **网关响应剥掉哈希**(`_strip_digests`):磁盘结果文件里的哈希是内部账本,但响应会进毕昇工作流输出再回到模型,故出口处剥掉。
+      - **MCP 的 fail-closed 原因要透出来**:批准进程拒绝提供页面(比如脱敏模块不可用)时,工具返回要写明原因,
+        而不是笼统的「批准进程没起来」;所有 MCP 返回统一过脱敏。
+      - **没有会话就不许请求批准**:原先没有会话记录时照常拉起批准进程,模型可以把候选目录里的**任意旧文件**推给人批——
+        批准流程本身成了「批任意文件」的后门。现在无会话直接拒绝;人要直接批某个候选走终端里的 `research_api.py review/approve`。
+      - **脱敏失败时关掉已绑定的 socket**:构造批准页失败要 fail-closed,同时把已经绑定的监听端口关掉,不留空转端口。
+      - **锁探活用 `OpenProcess`**:Windows 上 `os.kill(pid, 0)` 是**终止进程**而不是探活,原实现会把进程杀掉。
+      - 事实性更正:原先「Origin/Sec-Fetch-Site 能挡住一切 CSRF」的表述被夸大——它们只挡**跨站浏览器** CSRF,
+        挡不住本机程序。真正的屏障是「192 位一次性 URL 令牌 + 页面 CSRF 令牌 + 完整 64 位哈希」三件套。
+      - **错误消息里的本机路径脱敏**:网关出口统一 `redact_paths`,只盖本机绝对路径(URL 与候选文件名保留)——
+        网关响应会回到模型,本机目录结构对它没用却是一条指纹识别信息。
+      - **CLI 的 stdout 整段是纯 JSON**:交互提示语原先进 stdout(`input(prompt)` 的副作用),改走 stderr。
+    - 第 6 轮(自查 + codex 复核)补上的几处:
+      - **模型可见通道的清洗统一到一个出口**:此前路径脱敏只加在网关的两个异常分支上,
+        而网关有**五条**模型可见的出口(`_data`、`_candidates`、作业的三种 `view`、`_results`、`_feedback`)——
+        结果文件里的 `error.message`、失败 Trace 的 `failures`、作业的 `report` 都可能夹着本机路径。
+        现把清洗**收在 `handle` 的唯一出口**(`_scrub`:剥哈希键 + 盖本机绝对路径):
+        散落在各端点就会漏,漏一条等于边界没守住;收在出口就没有「漏掉某个端点」这回事。
+      - **MCP 侧同样补上路径脱敏**:`redact_for_model` 原先只脱敏 64 位十六进制与批准命令行,
+        现在也盖掉本机绝对路径;两处会带出脚本路径的返回(`找不到批准进程:` / `拉不起批准进程:`)一并改走脱敏。
+      - **批准页的头名一律小写化**:`handle` 原先不统一头名大小写,直接调用它的地方
+        (绕过 HTTP 传输层的小写化)可以用大写的 `Sec-Fetch-Site: cross-site` 绕过来源检查——
+        实测修前该头被判为「允许」、修后判为「拒绝」。
+      - **CI 关卡补上 `scripts/research_gate.py`**(此前只在边界测试的清单里,没进 ruff 关卡)。
+      - **调用方提前断开不再刷整段 traceback**:毕昇工具节点超时或关页时,网关与批准进程的
+        `wfile.write` 会抛 `BrokenPipeError`,socketserver 把整段 traceback 打进日志——真正的错误反而被淹没。
+        两处都改成安静收尾(实测本机网关日志里就有这么一大段)。
+      - **修掉一个「代码与数据两棵树混用」的隐患**:`research-mcp` 原先把 `ROOT/scripts` 插在 `sys.path` 的**最前面**,
+        于是 `INVEST_ROOT` 指向别的树时(worktree + 主检出),**代码**会从那棵树的 `scripts/` 导入——
+        跑的是另一份代码。实测表现为「新 `server.py` 配旧 `research_sandbox.py` → `AttributeError`」。
+        现改为**代码一律从 `CODE_ROOT` 取**(数据根的切换交给 `research_config` 自己处理),并加了断言锁住这条。
+    - 第 6 轮(codex CLI 并行两份复核:A 39/50、B 37/50,均未达 45 的发布线)闭合的发现:
+      - **自由文本里的哈希也盖掉**:原先只剥「`sha256` 这种形状的键」,结果文件里的 `error.message`、
+        作业 `report`、失败 Trace 里随手写的一句「hash=0123…(64 位)」就能原样回到模型。
+        现整段文本过 `redact_digests`(任何 64 位十六进制串 → 占位符),网关 `_scrub` 与 MCP `redact_for_model` 两侧都盖。
+      - **批准命令行也不进模型通道**:`research_api.py approve` / `research_approval_server.py` 这类命令行
+        出现在文本里,模型就能在聊天里替人念命令。现由 `redact_approve_commands` 盖掉;MCP 的「请求批准」返回
+        只说「请让本机的人在本机终端里操作」,**不含命令行**(命令行只进本机 MCP 的 stderr)。
+      - **`redact_paths` 补齐三类漏网路径**:UNC(`\\server\share`)、Windows 扩展长度(`\\?\C:\…`)、
+        POSIX 单段绝对路径(`/etc`、`/tmp` 这类根目录直属项)——原来只认「至少两段」的 POSIX 路径。
+      - **配置的三条路径 + 令牌文件统一查受保护目录/凭据文件**:原先只有 `pending_dir` 查,
+        `results_dir`/`approvals_file`/`token_file` 仍可被指到 `strategies/` 或借用 `.env`;
+        现全部**大小写不敏感**地查(`data/.ENV` 在 Windows 上就是 `.env`)。
+      - **同名候选不再让整条工作流中止**:多轮研究时 LLM 复用上一个候选名 → 网关 409 → 毕昇把非 2xx
+        变成 `api_call_fail` 并**中止整个工作流**。修法不是自动改名(改名会让「模型看到的名字」与
+        「人批准的文件」脱钩,可能批准错文件),而是**把现存的候选名喂给起名这一步**并要求不得重复使用;
+        网关的 `_feedback` 返回现存候选名(不含路径、不含源码)供续跑避让。
+      - **边界测试从「按名字匹配」升级为 AST 判定**:写入者识别认得属性访问、裸名、import 别名、`getattr`
+        与常量拼接;并按**传递 import 闭包**检查研究侧是否间接 import 了 vnpy/交易栈,
+        且区分「导入期闭包」与「回测子进程(唯一允许 vnpy 的地方)」。
+      - **CI 真正跑边界测试**:此前 `research-guard.yml` 只跑 compileall + ruff,
+        **没有任何 job 会跑那些边界测试**——写进仓库却无闸门。现在同一个 job 里跑研究侧九份测试
+        (闸门**分两步**跑:先单跑边界不变量那一份,再跑其余——同一个 pytest 调用里只要有一个文件在收集阶段报错,
+        整轮就中止、一个测试都不会跑);ruff 清单也补齐了本 issue 改过的文件。
+    - 第 7~8 轮(codex CLI 并行两份复核:A **38/50**、B **33/50**,均未达 45 的发布线)补上的几处:
+      - **静态筛查从「模块黑名单」改为「能力白名单」**:黑名单漏了 `zipfile`/`tarfile`/`shelve`/`sqlite3` 等——
+        它们自己 import 了 `os` 并挂在模块属性上,候选一句 `import zipfile` 就能拿到 `zipfile.os.system`
+        (实测筛查**零告警**)。现只放行候选真正需要的能力,其余一律 `ImportError`;
+        筛查层另加「取模块危险属性(`X.os`/`X.shutil`/`X.importlib`)」的静态规则。
+        **这是纵深防御,不是沙盒**——候选仍以当前用户权限运行,真正的硬保障是「人读过源码 + 批准带外」。
+      - **CLI 的 stdout 统一过清洗**:`emit()` 现在过 `rs.scrub_model_visible`,`strategy_sha256` 之类键不再出现在 stdout
+        (stdout 是模型可见通道);交互提示语与哈希只在 stderr。
+      - **批准页的 URL 与哈希彻底不进 stdout**:ready 事件只带 `event/strategy/screening_passed/findings`,
+        URL 与「不要粘进聊天窗口」的警告走 stderr;另加 `redact_approval_urls` 做纵深防御。
+      - **清洗升级为「共享内核 + 唯一出口」**:网关的 `SandboxError` 分支原先绕过统一清洗(现改走 `_scrub`);
+        MCP 与 CLI 共用 `rs.scrub_text`,并新增**凭据形态**规则(密钥赋值 / `Authorization:` 头 / `Bearer` / `CTP_*`)。
+      - **批准必须「TTY + 粘贴完整匹配的 sha256」**;URL 令牌比对改用常数时间;`record_approval` 自己重算哈希,不一致即拒。
+      - **写入者识别补上 `__dict__["record_approval"]`**;MCP 侧改为 AST 判定(不再是子串匹配)。
+      - **「直接写批准文件」那条断言的判定器重写**:分三层(明确写方法 / 带模块限定的文件函数 / 有歧义的名字且接收者像路径),
+        统一 `open` 家族的 mode 位置、`os.open` 走标志位、`_atomic_replace` 计入写操作、路径名做常量折叠;
+        判定器**自己**有了对照用例(必须抓到的绕过写法与不该误报的写法)。
+      - **研究栈与交易栈解耦**(窗口常量抽到 `scripts/segment_windows.py`,`scripts/segment_ledger.py` 不再 import bootstrap),
+        CI 的研究侧闸门因此能**不装交易环境**真跑起来——此前整轮在收集阶段中止,**一个测试都没执行过**。
+      - **并发与超时的负向测试补齐**,并当场逼出两个真 bug:批准记录的临时文件名只带 pid(同进程并发会撞名)、
+        锁文件在 Windows 上被别的进程读着时删不掉(删不掉 = 之后所有批准都被锁死)。都已修。
+      - **Preset 边界从「文本 grep」升级为「结构断言」**(解析 YAML,断言只挂 persona + research-mcp)。
+        **如实说明**:CI 里没有 DSH,「渲染后的整棵配置树」仍只有本机手工实测那一次。
+    - 第 9 轮(codex CLI 并行两份复核:A **37/50**、B **36/50**,均未达 45 的发布线)补上的几处:
+      - **能力白名单自身泄漏 `os`/`sys`——静态层 + 运行期双防线**(第 9 轮最严重的一条):
+        白名单里的模块把 `os`/`sys` 挂在自己的属性上——`statistics.sys`、`typing.sys`、`enum.sys`、
+        `dataclasses.sys`/`dataclasses.inspect`、`fractions.sys`、`collections._sys`、`random._os`、
+        `numpy.select`、`pandas.io.pickle`、`pandas.io.common.os` 都实测存在。候选一句
+        `import statistics` + `statistics.sys.exit()` 就能逃出沙盒,而筛查**零告警**。现在:
+        ①静态层的属性链判定改成**任意深度**(`X.os`、`X.y.os` 都算),并新增「`from X import os`」形态;
+        ②运行期把白名单模块换成 `_GuardedModule` 代理,取危险属性一律抛 `ImportError`,
+        `guarded_scope()` 退出时**恢复原模块**(不留代理);③通过配置额外放行的模块也要过这道审计
+        ——原先这条配置项本身就是攻击面。
+      - **清洗内核补齐两种凭据形态**:`Authorization: Bearer <token>`(原先只盖普通头形态)、
+        以及 JSON 形态的 CTP 凭据(`"CTP_BROKER_ID": "..."`)。清洗顺序固定为**赋值 → Bearer → 头 → CTP**。
+      - **删掉死代码**:批准进程里那段「与常量做常数时间比较」的预检(比较对象与令牌无关)已删除,
+        令牌比对的每一处都走 `secrets.compare_digest`。
+      - **清洗内核收敛**:`research_api._child_reason` 原先另起一套本地正则,现统一走 `rs.scrub_text`;
+        `review` 的帮助文案改成实际流程。
+      - **CI 关卡**:python 3.11 → **3.12**(3.11 上 `-W error::SyntaxWarning` 对无效转义**只是
+        DeprecationWarning**,闸门注释承诺的检查在 CI 上是空操作);ruff 清单补上
+        `scripts/optimize.py` 与 `tests/test_segment_ledger.py`;compileall 覆盖
+        `scripts tools tests dashboard risk notify strategies trading ctp_tools`(研究闭包不只在 scripts/tools/tests 之下);
+        新增 `concurrency` 组(连续推送只跑最新一次)。
+      - **MCP 侧的「不许写 approvals」改为 AST 判定**(原先是子串匹配,换个变量名就能写账本),
+        并与边界测试**共用同一个判定器**;Preset 结构断言从只扫 key 改成**key 与 value 都扫**。
+      - **新增负向用例**:approvals 文件路径与网关令牌文件的**固定路径**各 4 个负向用例
+        (指向受保护目录 / 借用 `.env`,含 Windows 大小写不敏感与 `data/.ENV` 变体);
+        **常驻研究进程不得 import 交易栈**的 AST 级不变量(回测子进程是唯一允许 vnpy 的地方);
+        批准写入者按**引用计数**判定(只有两个「人机交互入口」可以*提到* `record_approval`,别处只字不许提)。
+      - **依赖面说明更正**:`requirements-research.txt` 改为「研究运行时 = 标准库 + 本文件;
+        `requirements.txt` 是交易环境,研究侧不需要」(此前说法与实测相反)。
+    - 第 10 轮(codex CLI 并行两份复核:A **32/50**、B **35/50**,均未达 45 的发布线)补上的几处:
+      - **模块代理不再放行 dunder 与私有名**(第 10 轮 A 的 Critical,已实测闭合):
+  上一轮修好了「白名单模块把 os/sys 挂在属性上」,但同一类失效模式换了属性名 `__spec__` 活下来——
+  `mod.__spec__.loader.get_data(path)` 能**读任意文件**(`.env`、网关令牌),
+  `set_data(path, bytes)` 能**写任意文件**(直接改 `approvals.json`,于是「人读过源码才批准」
+  这道仪式被候选单方面废掉),而静态筛查**零告警**。现在:
+  - 代理改为**默认拒绝**:除少数安全名(`__name__`/`__doc__`/`__all__`/`__version__`/
+    `__annotations__`/`__qualname__`)外,凡以 `_` 开头的属性一律取不到;
+  - 静态层把 `__spec__`/`__loader__`/`__file__`/`__path__`/`__package__`/`__reduce__`/
+    `__reduce_ex__`/`__getattr__` 加进 `FORBIDDEN_ATTRS`(裸名与字符串形态都拒);
+  - 代理不再改写 `sys.modules`,改用**代理缓存**(`guarded_scope()` 退出即失效),
+    取到的**子模块**也递归包成代理(`pandas.io.common.os` 这条链堵得住);
+  - 新增负向用例:`__spec__`/`__loader__`/`__dict__`/`__getattribute__`/`_module`
+    在运行期必须抛 `ImportError`,静态层必须报错;另有**对照用例**保证
+    numpy/pandas 的正常用法(`arr.mean()`/`.sum()`/DataFrame)没被误伤
+    (第 10 轮 A 的一条 High 就是「叶子审计把 numpy 打成不可用」,已一并修掉)。
+- **清洗内核的凭据形态与顺序**:Bearer 规则提到**最前**(原先 assign 规则先把 `Bearer` 当值吞掉,
+  真令牌留在原地:`token: Bearer abc123def456` → 令牌原样保留);
+  POSIX 路径的两条规则不再重复遮盖(同一路径被盖成两个 `<路径>`)。
+- **网关按值盖掉自己的鉴权令牌**:清洗规则是按**名字**认凭据的,令牌一旦被读成原文再塞进
+  作业消息,名字那一层就认不出来——网关出口(`handle` 的唯一出口)现在额外按**值**替换令牌原文。
+- **CI 关卡**:compileall 加 `-f`(强制重编译;否则**已存在的 .pyc** 会让这道闸门变成空操作),
+  ruff 清单补 `risk/` 与 `notify/`(整个研究闭包),workflow 注释改成「**预防网**」而不是「已修缺陷」;
+  `scripts/segment_windows.py` 补入库(原先未入库,CI 会因找不到路径直接红)。
+- **Preset 边界从「名字黑名单」改成「结构白名单」**(第 10 轮 B 的 M1):第 10 轮实测变体——
+  只在 persona 插件的 `config` 下加一行 `tools: [tool-exec]`,**六条 Preset 断言全部 PASS**。
+  现在:任何能力类键(`tools`/`skills`/`mcpServers`/`hooks`/`agents`/…)一律拒,
+  任何以 `tool-`/`dsh-tool-`/`skill-` 开头的字符串值一律拒,
+  每个插件的 `config` **逐键**断言「只有已知那几个键」,插件**包名**也只允许那两个。
+- **批准写入者的「引用」判定补上字符串常量形态**(第 10 轮 B 的 M2):
+  `getattr(rs, "record_approval")` 与 `rs.__dict__["record_approval"]` 原先**整条漏掉**
+  (能同时骗过「唯一写入者」与「只字不许提」两条断言),现在算引用;
+  并补了对照用例(属性/别名/getattr/`__dict__` 四种写法都要被抓住)。
+- **「常驻研究进程不 import 交易栈」从浅不变量改成传递闭包 + 只在子进程入口碰交易栈**
+  (第 10 轮 B 的 L6):原先只查那三个文件自己的 import,`research_api` 在函数体里 import 交易栈没人管;
+  现在:常驻进程的**导入期闭包**里不许出现交易栈;研究侧文件里的交易栈 import
+  只能出现在 `*_child` 子进程入口(或两个登记在案的例外函数,且它们只被 `*_child` 调用)。
+  第 11 轮把这条从「文档里的一句话」变成**真正在跑的断言**:原先 `_call_sites` 对整个
+  `research_api.py` 返回 0 个调用点,那条断言**空转**(第 11 轮 B 的 F1);现三个 walker 收敛成
+  一个带作用域栈的 walker,并各配一条对照用例。
+- **文档与测试数字**(**第 11 轮当时的快照**):研究侧九份测试共 **518 项**(CI 模拟:**498 通过 + 20 跳过**)。
+    - 第 11 轮(codex CLI 并行两份复核:A **33/50**、B **38/50**,均未达 45 的发布线)补上的几处:
+      - **静态层认得「异常回溯帧」这一类逃逸**(本轮最严重的一条,Critical):
+        第 10 轮修住了「模块的 dunder」,同一类失效模式换了**属性名**活下来——
+        `e.__traceback__.tb_frame.f_globals` 直接指向 numpy 内部帧的**真全局命名空间**(里面有真 `os`),
+        `np.load.__globals__['os']` 同理;两条路**一个禁用名都不出现**,上一轮筛查返回 `[]`,
+        于是候选能任意写文件(可伪造 `approvals.json`)、读 `.env`/令牌、执行命令。
+        现在 `__traceback__`/`__context__`/`__cause__`/`tb_frame`/`tb_next`/`tb_lasti`/
+        `f_globals`/`f_locals`/`f_builtins`/`f_back`/`f_code`/`f_lineno`/`__globals__`/
+        `__code__`/`__spec__`/`__loader__`/`__mro__`/`__subclasses__`/`__getattribute__`/
+        `__dict__`/`__reduce__` 一律进 `FORBIDDEN_ATTRS` 与 `FORBIDDEN_SUBSTRINGS`
+        (裸名 / 字符串 / **模板**三种形态都拦),并同步进宪法层的 `BUILTIN_FORBIDDEN_DUNDERS`;
+        单下划线的私有属性(`numpy._module`)也按「能力入口」判,静态层与运行期口径终于一致。
+        **如实说明**:本轮只闭合**静态**那一半——运行期代理**不包裹**从模块取到的函数与类
+        (`np.load.__globals__['os']` 运行期仍畅通),这一条**必须靠容器隔离(4b/4c)兜底**,
+        静态筛查的作用是让人**看见告警**,不是拦住。已登记进 ADR 的残留清单。
+      - **凭据按值脱敏补上第二条通道**:原先只有网关按**值**盖掉自己的鉴权令牌,MCP 侧没有——
+        「网关盖住、MCP 不盖」就是一条漏的通道。现在 MCP 的 `redact_for_model`
+        会把**已知的凭据值**(毕昇开放 API 密钥 + 网关令牌)按值替换掉。
+      - **`redact_paths` 的路径形态**:JSON/repr 形态的 Windows 路径(`"C:\\Users\\…"` 两个反斜杠)
+        原先只盖掉 `Users` 一段,尾部段(含用户名与文件名)留在外面;UNC 规则同时会**误伤正则字面量**。
+        现在 Windows 规则先于 UNC 规则、UNC 要求**恰好两个**前导反斜杠且主机名形状合法,
+        `\\?\C:\…` 与 `\\server\share\…` 仍然盖掉,而 `re.compile(r"\\d+")` 不动。
+      - **模板字符串藏不住禁用名**:静态层原先只判「字符串常量**等于**禁用名」,
+        `"{0.__globals__}".format(np.mean)` 这种写法能把名字拆到模板里;现在字符串常量只要**含有**禁用串就报。
+      - **批准写入者的判定器**:原先把**任何**含 `record_approval` 的字符串常量都算成「持有写入函数」
+        (文档字符串、普通错误提示语都会被误判),而 `chr()`/`join()` 那种**非常量折叠**又完全看不见。
+        现在:字符串常量的判定**看上下文**(只有作为调用的实参或下标才算)、文档字符串排除在外,
+        并补了一条**能力规则**——凡是以模块别名为接收者的 `getattr`/`vars`/`dir`/`attrgetter` 一律算引用。
+      - **边界测试的三个 walker 收敛成一个**(两条 High):`_local_imports`/`_trading_import_sites`/`_call_sites`
+        原先各有**一套不同的遍历语义**,于是「例外函数只被 `*_child` 调用」那条断言**空转**
+        (`_call_sites` 对整个 `research_api.py` 返回 0 个调用点,`for` 循环体一次都没执行),
+        而复合语句(`if/for/try/with`)里的 import 与调用**根本看不见**。现统一成一个带**作用域栈**的 walker
+        (函数的默认值与装饰器属外层作用域、函数体属内层作用域;复合语句的 `body`/`orelse`/`finalbody`/`handlers`
+        递归下钻),三条断言共用它,并各配一条**对照用例**(合成一个不在 `*_child` 作用域里的调用/import,必须被判出来)。
+      - **动态导入也纳入不变量**:`importlib.import_module("vnpy…")` 与 `__import__("vnpy")`
+        对只看 `import` 语句的不变量**完全隐形**,而本仓库里**已经有**这种写法
+        (`risk/constitution.py` 的模板载入)。现新增断言:动态导入只许出现在回测子进程入口里。
+      - **Preset 白名单的两个通用分支补上对照用例**:「能力类键归一」与「字符串值前缀」两个分支
+        原先在仓库自带的测试里**一次都没被走到**,可以被无声删掉;现补 7 条**参数化的负向用例**
+        (能力键的大小写变体 / 分隔符变体 / 值前缀 / 未知配置键 / 未知插件 / 未知插件包),在内存里构造结构、不落盘。
+      - **CI 关卡与工具**:第二步加 `--continue-on-collection-errors`(一份文件收集失败不再把整步的研究侧测试全废掉);
+        宪法守卫改为只扫 **git 跟踪集**(`git ls-files --cached --others --exclude-standard`),
+        开发者落在仓库里的临时 `.py` 不再把守卫弄红(而报错完全指不到「你的临时文件」);
+        `.gitignore` 补 `.pytest_tmp_codex/`;ruff 清单补 `dashboard/__init__.py`。
+      - **文档诚实度**:ADR 与本文件里「例外函数只被 `*_child` 调用」原先把一条**空转**断言写成了已生效的约束,
+        现已随判定器一并修好并补上对照用例;「全量测试」的失败项补注(round11/12 那 10 项因 vnpy 导入顺序而失败,
+        **是本分支引入的**,已按上面的方式修掉——不是环境问题,此前那句「改动前后一致」是错的,现已改正);
+        基线日期统一为 2026-11-13(复核时钟为本机时区,原文混用了 +0800 与本地时区两种记法)。
+      - **导入顺序回归(本分支引入,已修)**:解耦后 `tests/test_constitution_round11.py` 与 `round12.py` **合跑**会失败 10 项,
+        报 `bootstrap 必须先于 vnpy.trader.database 导入`。根因如上(宪法指纹预加载 `vnpy_ctastrategy.backtesting`
+        → 连带加载 `vnpy.trader.database`;原先靠 conftest 间接导入 bootstrap 兜底,解耦后兜底消失)。
+        修法:两份文件在导入期显式 `import bootstrap`;合跑 **92 项全过**。
+    - 第 12 轮(codex CLI 并行两份复核:A **36/50**、B **36/50**,均未达 45 的发布线)补上的几处:
+      - **本机路径的清洗改成「扫描式」**(A 的 M1,触及「模型可见通道无本机绝对路径」这条不变量):
+        原先三条正则各有一个可复现的漏——盘符前紧贴一个 ASCII 字母时**整条绝对路径原样出去**
+        (`openC:\Users\alice\.env`)、用户目录里带空格的显示名只盖掉前半段(**OS 用户名残留**)、
+        UNC 主机名不允许空格(`\\My Server\share\…` 整条逃逸)。
+        现在:先找路径**起点**(盘符/UNC),再扫描到路径真的结束——**空格算不算路径的一部分,
+        看它后面的词是不是紧跟分隔符**(`C:\Users\John Doe\.env` 里的空格在路径里;
+        `C:\Users\alice\.env failed` 里的空格是散文,路径到 `.env` 为止,句子照旧保留);
+        profile 目录额外多吃一个词(OS 用户名要紧)。UNC 要求「主机名后面必须跟分隔符」,
+        所以 repr 里的 `\n` 不会被当成路径起点——否则后面的正文会被整段盖掉(过度遮蔽同样丢诊断信息)。
+      - **静态层认得「常量拼接」出来的禁用名**(A 的 M4):「字符串/模板形态都拦」这条规则原先**逐常量**判定,
+        `'{0.__gl' + 'obals__}'` 一行拼接即绕过——而这条规则的全部价值就是「人批准前能看见告警」。
+        现在先把 `BinOp(Add)` 递归折叠再判;`FORBIDDEN_SUBSTRINGS` 同时补齐成 `FORBIDDEN_ATTRS` 的子集
+        (ADR 原来列举的十几个名字只在精确匹配里,模板形态不拦)。
+      - **CLI 这条模型可见通道补上按值脱敏**(A 的 M5):三条通道(网关/MCP/CLI)里原先只有网关与 MCP 有
+        「按值盖掉已知凭据」这一层,CLI 的 stdout 只有「按名字」认——候选把令牌连名字一起塞进异常文本时,
+        网关与 MCP 盖住、CLI 不盖。现在 `scrub_model_visible` 接受 `secrets`,
+        CLI 在唯一的 stdout 出口 `emit()` 处读一次网关令牌按值盖掉(读不到就跳过,不让整条脱敏失效)。
+      - **私有属性的静态口径与运行期对齐**(A 的 L1):`self._state` / `self._file` 这类**候选自己的**私有字段
+        原先被**直接拒掉**(运行期的模块代理只拦模块属性);现在这条规则只对「属性链的根是导入进来的模块」生效
+        (`np._module` 照样报)。
+      - **清洗规则的三个边界**(A 的 L2/L4/L5):64 位摘要改成「**连续 64 位以上的十六进制一律隐去**」
+        (原先要求两侧非十六进制,于是「前缀+摘要+后缀」这种最常见的拼接形态整条逃逸);
+        批准页地址的 scheme 改成可选(`127.0.0.1:8765/a/TOKEN` 同样是模型能直接用的地址);
+        Cookie 头改成**整条隐去**(原先只隐去第一个值,`;` 后面的键值对原样出去)。
+      - **凭据读不到时在 stderr 留痕**(A 的 L3):按值脱敏这一层原先是**静默降级**的
+        (令牌文件读不到 → 这一层直接消失,没有任何痕迹);现在 MCP 侧在 **stderr**(不进模型通道)记一行,
+        免得「以为它还在」。按值替换的长度下限仍取 8:更短的凭据值会把正文整片糊掉,那是另一种信息损失。
+      - **交易栈侧的导入顺序不再被静默吞掉**(B 的 M1):`try/except ImportError: pass` 会把
+        「交易栈装了但装坏了」的错误吞掉——bootstrap 于是没被导入,后面报的是「导入顺序错了」,
+        真实原因(交易栈没装好)反而看不见,排查方向被带偏。现在用 `importlib.util.find_spec("vnpy")`
+        **只判断「在不在」**,不吞异常。
+      - **边界测试的模块级 import 收集器走进复合语句**(B 的 L6):`if True: import bootstrap` 这种合法写法
+        原先会被误报;现在递归下钻 `if/with/for/while` 体,并补了对照用例。
+      - **CI 关卡两处对齐注释**(B 的 L4/L5):`compileall` 的清单补上 `.github`(注释承诺的是「整个仓库都要能编译」);
+        依赖改为 `pip install -r requirements-research.txt`(声明的依赖文件原先从不被 CI 安装,
+        改了这个文件 CI 却不会发现)。
+      - **测试数据里不留本机绝对路径**(A 的 L6):`tests/test_research_mcp.py` 里那条真实目录布局换成明显虚构的路径。
+      - **两条判定器问题(A 的 M2/M3)已由 B 轮的等价发现先行修好并复核**:假阳性(错误提示/日志里把
+        `record_approval` 当实参传)3/3 消解、假阴性(`__dict__[…]` 下标、动态取模块)2/2 命中——
+        按 A 轮的原始输入逐条复核通过。
+      - **本轮新增的遗留(如实登记,不是已解决)**:交易栈侧的 92 项宪法回归与 `test_segment_ledger`
+        **在任何 CI job 里都不会被执行**(研究侧闸门刻意不装交易环境,装了就破掉解耦保证);
+        已实测 `test_segment_ledger.py` 经 `optimize` 依赖 vnpy、在「无交易栈」下 4 项失败,
+        所以它**不能**并入研究侧闸门。**缓解**:那条导入顺序约束已被改写成一条**纯 AST 的断言**
+        (研究侧闸门**会**跑它),但 92 项行为回归本身仍只在本机跑。
+      - **文档与测试数字**(**第 12 轮当时的快照**):研究侧九份测试共 **531 项**(CI 模拟:**511 通过 + 20 跳过**——
+        跳过的是回测子进程那些「要 vnpy 才跑得起来」的用例)。
+    - 第 13 轮(codex CLI 并行两份复核:A **40/50**、B **40/50**,均未达 45 的发布线;
+      **无 Critical / High**,两份报告同为本分支最高分)补上的几处:
+      - **路径清洗按「段」推进**(A 的 M1):带空格的 Windows 路径原先在空格处就断,目录名只盖掉前半段、
+        **OS 用户名残留**;现在改成一串「空格 + 不含分隔符的词」连续推进,直到遇到真正的终止符
+        (句读、冒号、引号、换行)才停;`C:\Users\John Doe\file.py` 这种**空格后面还跟文件段**的形态也一并盖掉。
+        另修:新规则曾**多吃一个散文词**(`error at <路径> later`,`retry` 丢失)、`\n` 转义被 UNC 规则当成 UNC 起点。
+      - **批准写入者判定器补三条取函数的形态**(A 的 M2):`rs.__dict__.get("record_approval")`、
+        `rs.__dict__.items()`、`from … import *` 后**裸用** `record_approval` —— 原先都判不出来,现已全部命中并各配对照用例。
+      - **`file://` 形态的本机路径不再原样出去**(A 的 L1):`_URL_RE` 原先把所有 URL 摘出来保护,
+        `file:///C:/Users/…` 于是整条原样返回;现在 `file:` 开头的 URL 不走 stash,直接替换成 `<路径>`。
+      - **CLI 的按值脱敏降级会留痕**(A 的 L2):读不到网关令牌时原先**静默**退化成「只按名字脱敏」一层,
+        现在往 **stderr** 打一行(stderr 不进模型通道),与 MCP 侧口径一致。
+      - **常量折叠再折两种拼法**(A 的 L3):`_folded_str` 原先只折 `+`,现多折 `"".join([...])` 与 `bytes` 常量。
+        **如实说明**:这一层是**纵深防御**(让「人批准前看得见告警」变厚),不是可利用绕过的封堵。
+      - **研究侧闸门不再每个 PR 都红**(B 的 **High**):第 12 轮把 CI 依赖改成「从 `requirements-research.txt` 装」之后,
+        该文件漏了测试真正需要的 numpy / pandas(第 13 轮 codex 的 High)——现已补上,并标注**仅测试期需要**。
+      - **宪法守卫不再 fail-open**(B 的 Medium①):`tools/check_constitution_history.py` 用 git 视角取跟踪集时,
+        原先「取不到」会退化成扫全文件系统,实测会出现「扫不到文件 = 判定没问题」;现在退路是**扫全文件系统**,
+        两处口径统一为 fail-closed。
+      - **契约测试锁住守卫的「谓词」而不只是「守卫的存在」**(B 的 Low③):
+        「vnpy 须在 bootstrap 之后」那半截原先**恒空转**,且只查存在性不查谓词
+        (把 `find_spec("vnpy") is not None` 改成 `is None`,断言照样绿);现在断言直接查谓词,
+        并补了「函数体里的 import 不算模块级导入」的对照。
+      - **模块级 import 收集器补齐 `async with` / `match` / `except*`**(B 的 Low④)。
+      - **测试数据里不写本机绝对路径**(A 的 L6):新夹具里的本机目录布局改成明显合成的 `C:\Example\research`。
+      - **残留第 9 条被更正**(B 的 Low⑤):原先写「tmp_path 的 PermissionError 本机复现不出来、**未复现**」——
+        该结论**已被实测推翻**,现改为「本机可复现,但取决于进程拿到的权限;CI 是 Linux 不受影响」。
+      - **未做并如实登记**(B 的 Low⑦):交易栈侧的导入顺序守卫仍散在两个测试文件里,
+        彻底的做法是下沉到一个共享 helper,已登记为 ADR 残留第 10 条。
+      - **数字口径统一重算**(B 的 Medium②):复核期间工作树被并发改动,六处文档的测试条数当场作废
+        (531 → 534)。现已统一重算为 **539 项**(CI 模拟 **519 通过 + 20 跳过**)并在六处回填
+        (**第 14 轮再次重算为 559 项 / 539 通过 + 20 跳过**,见上);
+        **今后任何改动测试条数都要重跑一次 collect**(数字随树变)。
+    - **第 14 轮 codex 复核**(A **38/50**、B **38.5/50**,**均未达 45 的发布线**;无 Critical / High)的边界收紧:
+      - **正斜杠路径的多词段也按段推进**(A 的 M1):`Path.as_posix()` 写出来的
+        `C:/Documents and Settings/x.txt` 原先只盖掉前半段(目录名与文件名残留);
+        现在 `/` 与 `\` 同等对待,并给散文里的相对路径留了判据(前一个词像文件名就不算路径的一部分)。
+      - **批准写入者判定器认得「变量中转模块字典」**(A 的 M2):`_D = rs.__dict__` 之后
+        `_D["record_approval"](…)` 照样写得成账本,而原判定只认「直接下标 / 直接方法调用」;
+        现在先收集「被赋值成模块字典」的变量名(`rs.__dict__` / `.copy()` / `vars(rs)` /
+        `dict(rs.__dict__.items())`),并各配一条对照用例。
+      - **三条模型可见通道共用同一份「按值凭据清单」**(A 的 M3/L10):原先只有 MCP 侧盖毕昇密钥,
+        CLI 与网关只盖网关令牌(ADR 写的是「凭据清单也共享」);现在清单抽成
+        `research_config.known_secret_values()`,三处共用,网关侧也改走 `rs.scrub_text`
+        (长度门槛 ≥8 三侧一致)。
+      - **路径清洗的四个边界**(A 的 L4~L7):中文句末标点进终止符集(不再把「。后面」整句吃掉)、
+        `Users` 目录规则不再多吃一个散文词、多词段前瞻上限 4 → 8、POSIX 绝对路径带空格也按段推进。
+      - **「直接写批准记录」的判定改成调用图口径**(A 的 L8):原先是**作用域**口径,
+        拆成两个函数就能绕过去;现在沿**同文件**的调用链往下追 2 层,
+        落点作用域用「提到批准记录的参数」写文件 ⇒ 违规(并配一条不误报的对照用例)。
+      - **常量折叠再折三种拼法**(A 的 L9):`f-string` / `%` 格式化 / `str.format` 现在都折得出来;
+        **如实说明**:剩下三种折不出(算出来的分隔符 / 模块级常量分隔符 / 切片),
+        属纵深防御层、不是可利用绕过,已登记为 ADR 残留第 11 条。
+      - **四个 import walker 的语义统一,并钉上对照用例**(B 的 L1):上一轮只把 `except*` / `match`
+        补进了三个 walker,`async with` 在 `_module_level_imports` 里直接抛 `AttributeError`
+        (`AsyncWith` 没有 `orelse` 分支);新加的对照用例(把三种写法的 import 植入临时文件,
+        断言四个 walker 都看得见)当场逮住了它。
+      - **研究侧不再依赖进程 CWD,并钉成断言**(B 的 L3):`scripts/segment_ledger.py` 不再 import bootstrap,
+        顺带取消了 bootstrap 的 `os.chdir(ROOT)` 副作用(pytest 会话的 CWD 不再被强制切到仓库根);
+        研究栈里因此不许出现 `os.chdir` / `os.getcwd`,路径锚点必须 `.resolve()` 成绝对路径。
+        **交易侧不受影响**(那边的脚本自己 import bootstrap,`APPROVAL_RELATIVE` 永远与 `bootstrap.ROOT` 一起拼)。
+      - **残留第 9 条按实测重写**(B 的 Medium):原结论与实测相反——「整批 setup ERROR」**不是确定现象**
+        (本机直接跑 129 项全过),原先给的绕法(`--basetemp` 指向仓库内可列目录)**不成立**
+        (pytest 对指定的 `--basetemp` 同样执行 `mkdir(mode=0o700)`),而且「mode 在 Windows 上落成 DACL」
+        这条机制解释经实测不成立(本机建出来的目录创建者能正常列)。现已按**本机实测**重写并标明环境。
+      - **「仓库里」改成「入库集(git 跟踪集)」**(B 的 L2):评审脚手架目录已 gitignore、不在跟踪集里。
+      - **`find_spec` 守卫的爆炸半径如实登记**(B 的 L4):交易栈装了但装坏 ⇒ 模块导入期抛错
+        ⇒ pytest 收集阶段中止 ⇒ **整轮一个用例都不跑**;已写进 ADR 残留第 8 条。
+      - **数字口径再次重算**:研究侧九份测试共 **566 项**(CI 模拟 **546 通过 + 20 跳过**)。
+    - **第 16 轮 codex 复核**(A **38/50**、B **40/50**,**均未达 45 的发布线**;无 Critical,A、B 各一条 High;第 15 轮中途被中断、无报告):
+      - **repr/JSON 形态的 UNC 路径不再漏盖**(A 的 High):换行转义只有 2 个反斜杠、UNC 的 repr 形态是 4 个,原判据只看主机名首字符是 `n`,`nas`/`net` 开头的主机整条漏盖(三条模型可见通道同时中招);现按反斜杠个数区分并补回归用例。
+      - **`_module_level_imports` 对 module-level `with` 不再抛 `AttributeError`**(B 的 High):第 14 轮只拆了 `AsyncWith`;对照用例补上多上下文管理器的 `with`,「四个 walker 一致」的措辞收紧为「模块级复合语句上一致」。
+      - **CWD 断言变强**(B 的 M-4/5/6):认任意接收者与裸名的 `chdir`/`getcwd`/`cwd`,锚点清单补上 MCP 侧;`tools/research_mcp/server.py` 的 `ROOT` 加 `.resolve()`,兜底命令改成绝对路径。
+      - **误提交的 512 个 pytest 临时产物已移出入库集**(A 的 M3,无凭据;`87ef82d`),`.gitignore` 补评审脚手架目录;历史里仍留着,合并请 squash。
+      - **残留第 9 条再重写**:两个环境(非受限 / 受限评审子进程)对「`mkdir(mode=0o700)` 是否可列」的实测相反,不下统一结论;撤回「与 mode 无关」两句。
+      - **研究侧路径清洗复用面板侧的全套形态**(A 的 M1):`dashboard.safe.scrub_path_forms` 抽成公共函数,`redact_paths` 第二遍调用,URL 编码 / 全角 / 零宽 / 无盘符根路径都盖住(UNC 与引号规则过贪婪,不借);另修 `str.format` 关键字实参折叠(L1)与网关 `::0`/`0`/`[::]` 监听地址(L3)。
+      - **未修并登记**:其余 Low(L2/L4/L5/L6)、调用图判定器的「内容里提到 approval」误报(残留 14)、条数无自动化核对(残留 15)、其余 Low。
+      - **数字口径重算**:研究侧九份测试共 **566 项**(546 通过 + 20 跳过)。
+
+  - **工具目录在协议层实测过**:真的把 `research-mcp` 起起来(stdio),用 MCP 客户端 `initialize` + `list_tools`,
+    返回**恰 3 个**工具(`start_research`/`research_status`/`request_approval`)。**仍未验证**的只有「真实 DSH 会话里模型侧看到的工具目录」。
+  - **多轮研究的同名冲突已实测修好**:在真实开放 API 上用新想法跑了一轮,工作流的 `tool_feedback` 节点拿到了网关返回的
+    `pending_candidates`(已落盘的候选名),起名节点据此起了**新名字**(不在列表里),**没有再撞 409**;
+    该轮最终停在**静态筛查**(候选把受保护容器传给 `max()`/`min()`,宪法正常拦人),不是本次改动的缺陷。
+  - **毕昇工作流已重建**:本机毕昇 3.0.0-beta5 的工作流 `1194f8540b9944fea4353b07f0493cbf` 已用改后的
+    `build_v3.py` 重建(`--update`,2026-11-14 11:04),tip 模板里的候选哈希与 `research_api.py approve` 命令行
+    **已不在**工作流里(实测读回 `output_tip` 节点确认)——此前这条是「改了仓库但跑的还是旧工作流」的残留。
+  - **`.gitattributes`:`*.sh text eol=lf`**。Windows 上 `core.autocrlf=true` 会把 `docker/research/entrypoint.sh` 检出成 CRLF,
+    `docker build` 后容器报 `exec /entrypoint.sh: no such file or directory`(shebang 的 `
+` 让解释器找不到)——
+    研究网关镜像因此起不来,且报错信息完全指不到「换行符」上。
+  - **CI 关卡** `.github/workflows/research-guard.yml`:整个仓库跑 `compileall`(`-W error::SyntaxWarning`,告警即失败)+
+    研究侧 `ruff` + **研究侧测试(含边界不变量)**,**不安装交易环境**(与 `constitution-guard.yml`
+    同一条理由:根 conftest 依赖 vnpy)。动机是第 8 轮复核期间
+    `tools/research_mcp/server.py` 带着一处 SyntaxError(`except/elif` 写在 try 里)进过工作树,当时没有任何 job 会跑 ruff 或 compileall;
+    「边界测试没有闸门」是第 7 轮 codex 的 High。
+  - 验证:工具目录恰为三项、批准写入者唯一、批准页的 URL/哈希不在返回值里、候选名来源、填错可重试、越权路径全拒、
+    脱敏 fail-closed、非 TTY 拒绝批准、陈旧锁不永久锁死——研究侧九份测试文件共 **566 项**(本机有交易栈时全过,
+    模拟 CI 无交易栈时 **539 通过 + 20 跳过**——跳过的是带 `requires_trading_stack` 标记的回测子进程用例);本分支全量测试 **2886 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑;CI 是 Python 3.12 + pytest 8.3.4)
+    (3 项失败 + 5 项 error 为**既有问题**,本轮已取 `origin/main` 版本逐条比对确认**完全相同**:
+    状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`;
+    另有 `tests/test_constitution_round11.py` 与 `round12.py` 的 **10 项**曾在本机因 `scripts/bootstrap.py` 的
+    「bootstrap 必须先于 vnpy.trader.database 导入」顺序检查而失败——**这次失败是本分支引入的,不是环境问题**
+    (取 origin/main 版本对比:同样的两个文件在 origin/main 上是 **92 项全过**)。
+    根因:这两份用例经 `const.snapshot_protected_state()` 预加载 `vnpy_ctastrategy.backtesting`,连带加载了
+    `vnpy.trader.database`;而「bootstrap 一定先于它导入」这条顺序原先是**靠 `conftest → segment_ledger → bootstrap`
+    兜住的**,登记文件与交易栈解耦(不再 import bootstrap)后那层兜底没了。
+    修法:在 round11/round12 的**导入期**显式 `import bootstrap`(交易栈侧固定时区的既定前置),
+    并在研究侧边界测试里钉成一条**可跑在研究 CI 上**的 AST 断言(两份文件必须在模块导入期 import bootstrap,
+    且不得在它之前 import vnpy 族模块);
+    不把 bootstrap 塞回 `scripts/segment_ledger.py`(那会把交易栈重新拖回研究侧,破掉解耦保证);
+    修完这两个文件**合跑 92 项全过**,与 origin/main 一致);
+    断耦演练(停掉毕昇全部容器)交易与风控不受影响。
 - **第二个品种的复权连续序列已构建并核实**(Issue [#18](https://github.com/laiyinyizao007/invest/issues/18),
   ADR `20261113-evolution-engine`「数据(本机核实)」):除玉米外,**塑料 L** 与**豆粕 M** 的 15 分钟复权连续合约已构建完成,
   文件在 `C:/Dev/data/invest/derived/`(不在仓库内)。
