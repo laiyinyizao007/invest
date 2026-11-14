@@ -62,7 +62,6 @@ DEFAULT_QUERY_BUDGET = 60      # 总查询预算上限:状态里的预算只能 
 STATE_VERSION = 2
 GENESIS = "0" * 64
 MAX_NOTE = 200
-MAX_ORPHANS = 200          # 审计里最多记多少个被孤立的 run_id
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _EPS = 1e-9
 _RECORD_KEYS = {"seq", "event", "run_id", "queries", "best", "budget", "note", "prev", "hash"}
@@ -103,9 +102,16 @@ def _file_lock(path: Path, timeout: float = 10.0):
         # (两个进程同时初始化时可能各写一个字节,文件长到 2 字节——不影响锁的语义。)
         stream.seek(0, os.SEEK_END)
         if stream.tell() == 0:
-            stream.write(bytes([0]))
-            stream.flush()
-            os.fsync(stream.fileno())
+            try:
+                stream.write(bytes([0]))
+                stream.flush()
+                os.fsync(stream.fileno())
+            except OSError as exc:
+                # 锁文件的字节写不进去(磁盘满、权限、共享冲突……)时必须 fail-closed,
+                # 且报的是"梯子不可用"而不是别的——第 20 轮 codex 的 L2:
+                # 这里原本裸调 `stream.write`,OSError 会一路冒到网关,变成"内部错误",
+                # 运维看不出是梯子锁坏了。
+                raise LadderError(f"梯子锁文件无法写入(fail-closed,未做任何修改): {_why(exc)}") from exc
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -165,6 +171,24 @@ def _body(record: dict) -> dict:
     return {k: record[k] for k in _RECORD_KEYS - {"hash"}}
 
 
+def _split_lines(data: bytes) -> tuple[list[str], bool]:
+    """按"记录以 \\n 结尾"的规则切分字节内容(第 20 轮 codex 的 L3)。
+
+    返回 `(行列表, 文件是否以换行结尾)`。
+
+    - **只有 \\n 是行分隔符**:与按字节找最后一个 \\n 的撕裂判定(`_trim_torn_tail`)同一口径。
+      之前读日志/锚点走的是文本模式的通用换行,单独的 \\r 也会被当成行分隔——
+      于是"读"与"按字节截尾"两边对同一个文件的行数看法不一致:锚点最后一条**完整**见证
+      被当成撕裂截掉,梯子从此对不上账。
+    - 行尾允许一个 \\r(CRLF 兼容),行内的 \\r 不特殊处理,交给解析器判它不合法。"""
+    text = data.decode("utf-8")           # 解码失败是 ValueError,交给调用方 fail-closed
+    ended = not text or text.endswith(chr(10))
+    parts = text.split(chr(10))
+    if parts and parts[-1] == "":
+        parts.pop()                       # 文件以换行结尾:最后一段是空的
+    return [p[:-1] if p.endswith(chr(13)) else p for p in parts], ended
+
+
 def _parse_log_line(text: str) -> dict:
     """一行日志是不是**完整**的记录(第 19 轮 M1:用来区分"撕裂"与"完整但缺换行")。
 
@@ -178,8 +202,11 @@ def _parse_log_line(text: str) -> dict:
 
 
 def _parse_anchor_line(text: str) -> tuple[int, str]:
-    """一行锚点是不是**完整**的 `<seq> <hash>`(第 19 轮 L4,同上)。"""
-    parts = text.split(" ")
+    """一行锚点是不是**完整**的 `<seq> <hash>`(第 19 轮 L4,同上)。
+
+    行尾允许一个 \\r(第 20 轮 codex 的 L3):撕裂判定是按字节找最后一个 \\n,
+    "完整但缺换行"的末行原文会带着 \\r 进来,不容忍它就会把**完整**的末行误判成撕裂并截掉。"""
+    parts = text.strip(chr(13) + chr(10)).split(" ")
     if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
         raise ValueError("锚点行不完整")
     seq = int(parts[0])
@@ -210,8 +237,8 @@ class Ladder:
         if not self.log_path.exists():
             return []
         try:
-            text = self.log_path.read_text(encoding="utf-8")
-            lines = [line for line in text.splitlines() if line.strip()]
+            raw, ended = _split_lines(self.log_path.read_bytes())
+            lines = [line for line in raw if line.strip()]
             rows: list[dict] = []
             for index, line in enumerate(lines):
                 try:
@@ -219,7 +246,7 @@ class Ladder:
                 except ValueError as exc:
                     # 只有**末行**、且文件不以换行结尾时才是撕裂(崩在追加中途),那半行不算(第 17 轮 M3);
                     # 其余情况一律损坏(fail-closed)。"完整但缺换行"解析得出来,会被保留(第 19 轮 M1)。
-                    if index == len(lines) - 1 and text and not text.endswith(chr(10)):
+                    if index == len(lines) - 1 and not ended:
                         break
                     raise LadderError(f"梯子日志损坏或无法读取(fail-closed): {_why(exc)}") from exc
         except (OSError, ValueError) as exc:
@@ -270,6 +297,15 @@ class Ladder:
             if row["run_id"] is not None:
                 bad("续期事件不带 run_id")
 
+    def _head_token(self) -> tuple[int, str] | None:
+        """头指针的**变更令牌** `(seq, hash)`(第 20 轮 codex 的 M1)。
+
+        用来判断"快照读完之后梯子有没有被动过":头指针是独立的小文件,读一次很便宜,
+        不用像日志那样整条重读并逐条重算 SHA-256(第 19 轮 codex 的 L3 的性能目标因此得以保留)。
+        梯子被 `reset` 之后头指针被挪走,令牌变成 None——这正好也是"快照已过期"的信号。"""
+        head = self._head()
+        return None if head is None else (head["seq"], head["hash"])
+
     def _head(self) -> dict | None:
         if not self.path.exists():
             return None
@@ -290,19 +326,19 @@ class Ladder:
         if self.anchor is None or not self.anchor.exists():
             return None, None
         try:
-            text = self.anchor.read_text(encoding="utf-8")
+            raw, ended = _split_lines(self.anchor.read_bytes())
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
         last_seq, last = 0, None
         torn: str | None = None
-        items = [item for item in text.splitlines() if item.strip()]
+        items = [item for item in raw if item.strip()]
         for index, line in enumerate(items):
             try:
                 seq, digest = _parse_anchor_line(line)
             except ValueError as exc:
                 # 只有**末行**、且文件不以换行结尾时才是撕裂(崩在追加中途),那半行不算(第 17 轮 M3);
                 # "完整但缺换行"解析得出来,会被保留(第 19 轮 L4)。
-                if index == len(items) - 1 and text and not text.endswith(chr(10)):
+                if index == len(items) - 1 and not ended:
                     torn = line
                     break
                 raise LadderError(f"梯子锚点格式不合法(fail-closed): {_why(exc)}") from exc
@@ -523,15 +559,29 @@ class Ladder:
 
         `reset` 把梯子清空之后,这些 run 的揭示存档还在,但梯子日志里已经没有它们——
         回放按"被伪造"fail-closed,于是这些 run **永远读不出来**,`/feedback` 也就静默变空。
-        外层必须能分辨"这个 run 从未揭示过"与"这个 run 被 reset 孤立了",所以这里把名单读出来。"""
+        外层必须能分辨"这个 run 从未揭示过"与"这个 run 被 reset 孤立了",所以这里把名单读出来。
+
+        **这份名单只用于"分类",不用于"放行"**(第 20 轮 codex 的 H2):
+        被孤立的 run 一样读不出任何数据——区别只在于跳过时说的是"被人工重置孤立"
+        还是"被篡改"。所以即使这份名单被伪造,后果也只是**跳过原因**被说错,
+        不会泄漏任何验证窗口信息;真正的篡改信号(数据对不上)一条都不放松。"""
         log_path = self.path.parent / "ladder.reset.log"
         if not log_path.exists():
             return []
+        try:
+            stat = log_path.stat()
+            token = (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            token = None
+        cached = getattr(self, "_orphans_cache", None)
+        if cached is not None and cached[0] == token:
+            return list(cached[1])               # 名单只增不减:文件没变就直接用缓存
         try:
             text = log_path.read_text(encoding="utf-8")
         except OSError:
             return []
         names: list[str] = []
+        seen: set[str] = set()
         for line in text.splitlines():
             if not line.strip():
                 continue
@@ -541,9 +591,11 @@ class Ladder:
                 continue
             if isinstance(entry, dict) and entry.get("event") == "reset-intent":
                 for run_id in entry.get("orphaned_run_ids") or []:
-                    if isinstance(run_id, str):
+                    if isinstance(run_id, str) and run_id not in seen:
+                        seen.add(run_id)
                         names.append(run_id)
-        return names
+        self._orphans_cache = (token, list(names))
+        return list(names)
 
     def snapshot(self) -> "LadderSnapshot":
         """一次读入的只读快照(第 19 轮 codex 的 L3)。
@@ -552,9 +604,14 @@ class Ladder:
         SHA-256 校验**(实测 400 个结果 + 60 条日志:冷 2.4 s / 热 0.52 s,而 `ladder.has()` 全量占 305 ms/300 个)。
         这是进化回路每次迭代都要打的热路径。快照把状态读一次,之后 `has`/`preview` 走内存。
 
-        快照是**只读**的:要消耗查询的 `submit` 仍然走真梯子(它必须写)。"""
+        快照是**只读**的:要消耗查询的 `submit` 仍然走真梯子(它必须写)。
+
+        **令牌先读、状态后读**(第 20 轮 codex 的 M1):这样"快照里的行"永远不早于令牌,
+        令牌与当前头指针一比就能判断快照是不是过期了(过期就重读,见 `LadderSnapshot._fresh_rows`)。"""
         with _lock:
-            return LadderSnapshot(self, self._load(repair=False))
+            token = self._head_token()
+            rows = self._load(repair=False)
+            return LadderSnapshot(self, rows, token)
 
     def preview(self, sharpe, run_id: str | None = None) -> dict:
         """`submit` 会返回什么——但**不写任何东西、不消耗查询**。预算用尽(且这个 run 没提交过)抛 LadderExhausted。"""
@@ -652,9 +709,14 @@ class Ladder:
             log_path = self.path.parent / "ladder.reset.log"
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # 意图行先落盘(第 19 轮 M3):哪怕后面某一步抛错,审计里也有"动过手"的记录
+            # **不截断**(第 20 轮 codex 的 M4):此前只记前 200 个被孤立的 run_id,
+            # 返回值却报总数(300 报 200)——"被孤立"与"没被孤立"因此可能同时成立,
+            # 判定"这次重置孤立了哪些 run"就不可信了。名单与梯子日志里的 run 同量级,
+            # 一次写全不引入新的量级风险,另记 `orphaned_count` 便于事后核对。
             intent = {"event": "reset-intent", "archive": n, "reason": reason.strip(),
                       "discarded_best": dropped["best"], "discarded_queries": dropped["queries"],
-                      "orphaned_run_ids": dropped["run_ids"][:MAX_ORPHANS]}
+                      "orphaned_count": len(dropped["run_ids"]),
+                      "orphaned_run_ids": list(dropped["run_ids"])}
             # **意图行写不进去就不许动东西**(第 19 轮 codex 的 MEDIUM):审计先落盘是这次排序的全部意义,
             # 意图行静默丢失之后照样挪文件,等于"审计先落盘"名存实亡——事后只剩归档文件,看不出谁动过手。
             self._append_reset_log(log_path, intent, required=True)
@@ -716,20 +778,44 @@ class Ladder:
 class LadderSnapshot:
     """梯子的只读快照:一次读入,之后 `has`/`preview` 走内存(第 19 轮 codex 的 L3)。
 
-    只暴露只读查询。`submit` 不在这里——消耗查询必须走真梯子(要写日志、头指针与锚点)。
-    """
+    只暴露只读查询。消耗查询的写操作**不在快照里做**——`submit` 只是转交真梯子
+    (写日志、头指针与锚点都由真梯子负责)。
 
-    def __init__(self, ladder: Ladder, rows: list[dict]) -> None:
+    **快照会过期**(第 20 轮 codex 的 M1):读完之后梯子可能被 `reset`(日志与头指针被挪走)、
+    也可能被别的进程提交过。过期快照里的行留着**重置前**的 best 与查询数——
+    拿它回放就会把重置前的成绩当成"现在的话"报出去(泄漏),`queries_left` 也是旧账。
+    所以每次用之前先对一下**变更令牌**(头指针的 `seq`/`hash`),对不上就重读。"""
+
+    def __init__(self, ladder: Ladder, rows: list[dict], token: tuple[int, str] | None = None) -> None:
         self._ladder = ladder
         self._rows = rows
+        self._token = token
         self._run_ids = {r["run_id"] for r in rows if r.get("run_id") is not None}
 
+    def _fresh_rows(self) -> list[dict]:
+        """快照过期就重读(第 20 轮 codex 的 M1)。
+
+        令牌取自**头指针**:梯子被 `reset` 之后头指针被挪走,令牌变成 None,
+        于是"重置过"这件事一定会让快照作废——否则就会拿重置前的 best 与查询数继续回放。"""
+        token = self._ladder._head_token()
+        if token != self._token:
+            self._rows = self._ladder._load(repair=False)
+            self._run_ids = {r["run_id"] for r in self._rows if r.get("run_id") is not None}
+            self._token = token
+        return self._rows
+
     def has(self, run_id: str) -> bool:
-        return run_id in self._run_ids
+        with _lock:
+            self._fresh_rows()
+            return run_id in self._run_ids
 
     def preview(self, sharpe, run_id: str | None = None) -> dict:
         with _lock:
-            return self._ladder._plan(self._rows, sharpe, run_id)
+            return self._ladder._plan(self._fresh_rows(), sharpe, run_id)
+
+    def orphaned_run_ids(self) -> list[str]:
+        """被人工 `reset` 孤立的 run 名单:读**真梯子**的(名单只增不减,快照里的行会过期)。"""
+        return self._ladder.orphaned_run_ids()
 
     def submit(self, sharpe, run_id: str | None = None) -> dict:
         """消耗查询的写操作**不走快照**,回真梯子(它要写日志、头指针与锚点)。
@@ -740,8 +826,14 @@ class LadderSnapshot:
         **已经提交过的 run 直接用快照回答**(第 19 轮 codex 的 L3 收尾):这种提交是**纯回放**——
         不写日志、不扣查询、汇报值就是当初那一条。走真梯子只会把整条日志重读并重校验一遍,
         而 `/feedback` 每次迭代都要扫几十上百个 run,那是进化回路的热路径(实测 400 个结果
-        要重读 400 次)。快照里的行就是从日志读出来的,回放值与真梯子一致。"""
-        if run_id is not None and run_id in self._run_ids:
-            with _lock:
-                return self._ladder._plan(self._rows, sharpe, run_id)     # 纯回放:不写、不扣
+        要重读 400 次)。
+
+        **回放值以"快照读到的那些行"为准,并且快照过期就重读**(第 20 轮 codex 的 M1):
+        此前这句话写的是"回放值与真梯子一致"——那只在**没人动过梯子**时成立:
+        `reset` 之后快照里还留着重置前的 best 与查询数,拿它回放就是把已经作废的成绩
+        当成现在的话报出去(泄漏)。现在每次回放前都对一次变更令牌,过期就重读。"""
+        with _lock:
+            rows = self._fresh_rows()
+            if run_id is not None and run_id in self._run_ids:
+                return self._ladder._plan(rows, sharpe, run_id)             # 纯回放:不写、不扣
         return self._ladder.submit(sharpe, run_id=run_id)

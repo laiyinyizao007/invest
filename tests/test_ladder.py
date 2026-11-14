@@ -833,6 +833,138 @@ def test_reset_archives_the_reveal_store_so_no_dead_archives_are_left(tmp_path):
     assert any(p.name.startswith("outward.bak-") for p in tmp_path.iterdir())
 
 
+# ---------- 第 20 轮 codex ----------
+
+def test_a_lock_file_whose_byte_cannot_be_written_fails_closed_as_a_ladder_error(tmp_path, monkeypatch):
+    """第 20 轮 codex 的 L2:锁文件那一个字节写不下去时,必须报"梯子不可用"。
+
+    此前是裸调 `stream.write`,OSError 一路冒到网关,变成"内部错误"——
+    运维看不出是梯子的锁坏了,更看不出系统因此 fail-closed(什么都没做)。"""
+    import risk.ladder as ladder_mod
+    real_open = open
+
+    class BadLockStream:
+        def write(self, _data):
+            raise OSError("磁盘满了")
+        def flush(self):
+            pass
+        def seek(self, *_a):
+            return 0
+        def tell(self):
+            return 0
+        def fileno(self):
+            return 0
+        def close(self):
+            pass
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        if "a+b" in mode and str(file).endswith(".lock"):
+            return BadLockStream()
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(ladder_mod, "open", fake_open, raising=False)
+    ladder = Ladder(tmp_path / "ladder.json")
+    with pytest.raises(LadderError, match="锁文件"):
+        ladder.submit(1.10)
+    assert not (tmp_path / "ladder.json").exists()          # fail-closed:什么都没做
+
+
+def test_an_anchor_line_ending_with_a_carriage_return_keeps_its_witness(tmp_path):
+    """第 20 轮 codex 的 L3:撕裂判定按字节找最后一个换行符,而锚点行的解析不容忍行尾的回车。
+
+    两者口径不一致时,一条**完整**的见证会被当成撕裂截掉——锚点从此不再见证最新那条记录,
+    而外部锚点存在的全部意义就是那一条比对。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(1.10)
+    ladder.submit(2.20)
+    raw = ladder.anchor.read_bytes()
+    ladder.anchor.write_bytes(raw.rstrip(b"\n") + b"\r")   # 末行的换行变成回车(别的工具写的 CRLF/半截)
+    ladder.submit(3.30)
+
+    seqs = [int(line.split(" ")[0]) for line in ladder.anchor.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert seqs == [1, 2, 3], f"锚点的见证序号必须连续,不能有缺口:{seqs}"
+    assert ladder.status()["reported"] == 3.30
+
+
+def test_the_log_and_the_anchor_agree_on_how_many_records_there_are(tmp_path):
+    """第 20 轮 codex 的 L3:读日志与读锚点必须用同一套行切分规则。
+
+    否则"读"看到的行数与"按字节截尾"看到的行数不一致,撕裂判定就会误伤完整的末行。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(1.10)
+    raw = ladder.log_path.read_bytes()
+    ladder.log_path.write_bytes(raw.rstrip(b"\n") + b"\r")
+    ladder.submit(2.20)
+
+    rows = log_rows(ladder)
+    assert len(rows) == 2, f"日志里应当有两条完整记录,实际 {len(rows)}"
+    assert rows[-1]["best"] == 2.20
+    assert ladder.status()["queries_used"] == 2
+
+
+def test_reset_records_every_orphaned_run_and_the_count_it_returns_matches(tmp_path):
+    """第 20 轮 codex 的 M4:被孤立的 run 名单此前只记前 200 个,返回值却报总数。
+
+    于是"这次重置孤立了哪些 run"变得不可信:名单说没有,总数说有。"""
+    ladder = anchored(tmp_path)
+    total = 250
+    done = 0
+    while done < total:
+        try:
+            ladder.submit(0.0, run_id=f"run-{done:03d}")
+        except LadderExhausted:
+            ladder.renew("测试用续期", force=True)
+            continue                          # 预算用尽时那次提交**没有**发生,重试同一个 run_id
+        done += 1
+
+    out = ladder.reset("清空", force=True)
+
+    assert out["orphaned_run_ids"] == total                       # 返回值 = 落盘内容
+    assert len(ladder.orphaned_run_ids()) == total
+    assert set(ladder.orphaned_run_ids()) == {f"run-{i:03d}" for i in range(total)}
+    line = [json.loads(x) for x in (ladder.path.parent / "ladder.reset.log")
+            .read_text(encoding="utf-8").splitlines() if x.strip()][0]
+    assert line["orphaned_count"] == total and len(line["orphaned_run_ids"]) == total
+
+
+def test_a_snapshot_taken_before_a_reset_does_not_replay_the_pre_reset_best(tmp_path):
+    """第 20 轮 codex 的 M1:快照会过期。
+
+    过期快照里留着重置前的 best 与查询数:拿它回放就是把已经作废的成绩当成现在的话报出去(泄漏),
+    而且 `queries_left` 是旧账。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(2.20, run_id="run-a")
+    snap = ladder.snapshot()
+    assert snap.preview(0.0, run_id="run-a")["reported"] == 2.20
+
+    ladder.reset("人工重置", force=True)
+
+    assert snap.has("run-a") is False                            # 快照必须发现自己过期了
+    assert snap.preview(0.0, run_id="run-a")["reported"] == 0.0   # 不再回放重置前的成绩
+
+
+def test_a_snapshot_reports_the_current_remaining_queries_after_a_new_submit(tmp_path):
+    """第 20 轮 codex 的 M1:快照过期不只影响 best,`queries_left` 也是旧账。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0, run_id="run-a")
+    snap = ladder.snapshot()
+    assert snap.preview(0.0)["queries_left"] == 58                # 快照里只记着一次提交
+    ladder.submit(0.0, run_id="run-b")
+    assert snap.preview(0.0)["queries_left"] == 57                # 现在的账:两次提交
+
+
+def test_a_snapshot_picks_up_a_run_submitted_after_it_was_taken(tmp_path):
+    """第 20 轮 codex 的 M1:快照的"变更令牌"要能看出别人提交过。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0, run_id="run-a")
+    snap = ladder.snapshot()
+    assert snap.has("run-b") is False
+
+    ladder.submit(0.0, run_id="run-b")
+
+    assert snap.has("run-b") is True
+
+
 def test_a_snapshot_answers_has_and_preview_without_rereading_the_log(tmp_path):
     """第 19 轮 codex 的 L3:快照只读一次,之后走内存。"""
     ladder = anchored(tmp_path)

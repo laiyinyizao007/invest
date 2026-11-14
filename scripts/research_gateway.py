@@ -31,7 +31,8 @@ import bootstrap
 import research_config as rc
 import research_sandbox as rs
 from risk.ladder import Ladder, LadderError, LadderExhausted, anchor_path_for
-from risk.outward import OutwardError, OutwardTampered, RevealStore, reveal
+from risk.outward import (OutwardError, OutwardOrphaned, OutwardTampered, OutwardUnavailable, RevealStore,
+                          reveal)
 from risk.trial_ledger import TrialLedgerError, record_trials
 
 ROUTES = {
@@ -50,6 +51,8 @@ MAX_TRACE_TEXT = 300
 LADDER_EXHAUSTED = ("验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,需要人工续期"
                     "(选参窗口的信息、/research/feedback 里已揭示过的结果不受影响)")
 LADDER_UNAVAILABLE = "梯子状态或揭示存档不可用(fail-closed):拒绝给出任何验证窗口的信息,请人工检查"
+ORPHANED_BY_RESET = ("这条结果的验证窗口信息已被一次人工梯子重置作废:重置会清零 best 与查询数,"
+                     "已经泄漏出去的信息收不回来,该 run 需要重新评估才能再被揭示")
 PHASE_LABELS = {"declaration": "声明期", "selection": "选参窗口回放", "validation": "验证窗口回放"}
 RESULT_KINDS = ("evaluate", "gate", "backtest")      # 只有这几种 JSON 是"运行结果";results 目录里别的 *.json 不是
 VALID_SEGMENT_REFUSED = ("验证段的回测不能经网关直接读取:它会绕过梯子直接给出验证窗口的完整统计。"
@@ -380,6 +383,20 @@ class GatewayApp:
             if not skip_bad_result:
                 return 500, {"error": LADDER_UNAVAILABLE}, None
             return 200, None, "tampered"
+        except OutwardOrphaned as exc:
+            # 一次**合法的人工重置**不是安全事件(第 20 轮 codex 的 H2)。
+            # 但被孤立的 run 一样读不出数据:这里只把"为什么读不出"说准,不放行任何信息。
+            print(f"结果已被人工重置孤立,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 410, {"error": ORPHANED_BY_RESET}, None
+            return 200, None, "orphaned_by_reset"
+        except OutwardUnavailable as exc:
+            # 读不到/写不进是**可用性**故障:既不是篡改,也不是结果不合法(第 20 轮 codex 的 M2/M3)。
+            # 单列一类,运维才知道该去查磁盘/权限,而不是去查结果文件。
+            print(f"揭示存档暂时不可用,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "unavailable"
         except OutwardError as exc:
             print(f"结果不合法,已跳过: {exc}", file=sys.stderr)
             if not skip_bad_result:
@@ -488,7 +505,7 @@ class GatewayApp:
         traces = []
         # 跳过必须**看得见**(第 19 轮 codex 的 H1):此前跳过坏结果/坏存档时响应里没有任何提示,
         # 外层与运维分不清"没有失败"和"失败被藏了"。现在计数并分类上报(只给计数与分类,不给内容)。
-        skipped = {"tampered": 0, "invalid_result": 0, "unreadable": 0, "orphaned_by_reset": 0}
+        skipped = {"tampered": 0, "invalid_result": 0, "unreadable": 0, "orphaned_by_reset": 0, "unavailable": 0}
         # 一次只读一次梯子(第 19 轮 L3):此前每扫一个结果就重读并重校验整条日志。
         try:
             ladder = self._ladder().snapshot()
@@ -521,8 +538,6 @@ class GatewayApp:
                 elif reason is not None:
                     skipped[reason] += 1
                 continue
-            if reason is not None:
-                skipped[reason] += 1
             error = view.get("error") if isinstance(view.get("error"), dict) else None
             if view.get("status") == "strategy_error" and error:
                 detail = str(error.get("message") or "报错原文仅人可见")[:MAX_TRACE_TEXT]      # 验证窗口回放里的原文已在视图里去掉

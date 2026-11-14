@@ -38,7 +38,7 @@ from typing import Any
 from risk import structured_diagnosis as sd
 from risk.behavior import CELL_PATTERN
 from risk.describe import SEARCHABLE_PARAMS
-from risk.ladder import Ladder
+from risk.ladder import Ladder, LadderError
 from risk.promotion_gate import CHECK_IDS
 
 VIEW_VERSION = 1
@@ -64,6 +64,24 @@ _lock = threading.Lock()
 
 class OutwardError(Exception):
     """对外揭示的存档损坏或写入失败(fail-closed)。"""
+
+
+class OutwardUnavailable(OutwardError):
+    """揭示存档**暂时拿不到**(第 20 轮 codex 的 M2/M3):权限、共享冲突、磁盘满、路径被占。
+
+    与"被篡改"必须分开:读不到是**可用性**问题(操作没发生),篡改是**安全事件**(有人动过手)。
+    把读不到算成篡改,一次磁盘故障就会被记成安全事件;把写失败算成"结果不合法",
+    则是把操作失败说成了数据有问题——两者都会让 `/feedback` 的诊断通道给出错误的失败原因。"""
+
+
+class OutwardOrphaned(OutwardError):
+    """这个 run 被一次**合法的人工梯子重置**孤立了(第 20 轮 codex 的 H2)。
+
+    `reset` 把梯子清空之后,历史 run 的揭示存档与梯子日志再也对不上——
+    此前这一律按"被篡改"记,于是**一次正常的人工重置被记成安全事件**。
+    它与篡改必须分开,但**同样不放行任何数据**:被孤立的 run 一样读不出验证窗口信息。
+    这条异常只用于**分类**(跳过时说的是"被重置孤立"而不是"被篡改"),
+    不用于放行——所以"孤立名单被伪造"的后果最多是跳过原因被说错,不会泄漏信息。"""
 
 
 class OutwardTampered(OutwardError):
@@ -263,9 +281,15 @@ class RevealStore:
         try:
             if path.stat().st_size > MAX_STORED_BYTES:
                 raise OutwardTampered("揭示存档超过大小上限")
-            view = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise OutwardTampered(f"揭示存档损坏(fail-closed): {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # 读不到(权限、共享冲突、路径被换成目录……)是**可用性**故障,不是篡改证据:
+            # 文件根本没被读到,凭什么说它被改过?(第 20 轮 codex 的 M2)
+            raise OutwardUnavailable(f"揭示存档暂时读不到: {type(exc).__name__}") from exc
+        try:
+            view = json.loads(raw)
+        except ValueError as exc:
+            raise OutwardTampered(f"揭示存档损坏(fail-closed): {exc}") from exc
         if not validate_view(view):
             raise OutwardTampered("揭示存档不合法(fail-closed)")
         return view
@@ -285,8 +309,25 @@ class RevealStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp, path)
-        except (OSError, ValueError) as exc:
-            raise OutwardError(f"揭示存档写入失败: {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
+        except OSError as exc:
+            # 写失败是**可用性**故障,不是"结果不合法"(第 20 轮 codex 的 M3):
+            # 把它算成 invalid_result,运维会去查结果文件,而不是查磁盘/权限。
+            raise OutwardUnavailable(f"揭示存档写入失败: {type(exc).__name__}") from exc
+        except ValueError as exc:
+            raise OutwardError(f"揭示存档写入失败: {exc}") from exc
+
+
+def _is_orphaned(ladder: Ladder, run_id: str) -> bool:
+    """这个 run 是不是被一次**合法的人工梯子重置**孤立了(第 20 轮 codex 的 H2)。
+
+    名单只用于**分类**:被孤立的 run 一样读不出数据,区别只在于跳过时说的是
+    "被人工重置孤立"还是"被篡改"——一次正常的人工重置不该被记成安全事件。
+
+    名单读不出来时一律当作"不是孤立"(fail-closed):读不到名单就没有理由去原谅任何一条记录。"""
+    try:
+        return run_id in set(ladder.orphaned_run_ids())
+    except (OSError, LadderError):
+        return False
 
 
 def _replay(stored: dict, view: dict, result: dict, sharpe: Any, run_id: str, ladder: Ladder) -> dict:
@@ -296,6 +337,11 @@ def _replay(stored: dict, view: dict, result: dict, sharpe: Any, run_id: str, la
     重新生成的视图逐字段相等;报告就是视图的确定性重推导。任何一条对不上都当作被改过 fail-closed。
     返回的是**当前**的剩余查询数(第 16 轮 L1:不回放旧的 `queries_left`)。"""
     if not ladder.has(run_id):
+        # 梯子日志里没有这个 run:先问"它是不是被一次合法的人工重置孤立了"(第 20 轮 codex 的 H2)。
+        # 是 → 归类为孤立(不是篡改),但**一样不放行数据**;不是 → 仍按篡改 fail-closed。
+        if _is_orphaned(ladder, run_id):
+            raise OutwardOrphaned("揭示存档对应的 run 已被一次人工梯子重置孤立(fail-closed):"
+                                   "重置作废了历史揭示存档,不再给出任何验证窗口的信息")
         raise OutwardTampered("揭示存档在梯子日志里没有对应的查询记录(fail-closed):存档被伪造或梯子被回滚")
     plan = ladder.preview(sharpe, run_id=run_id)
     block = stored.get("ladder")
@@ -338,8 +384,16 @@ def reveal(result: dict, *, ladder, store: RevealStore, allow_query: bool = True
             return _replay(stored, view, result, sharpe, run_id, ladder)
         # 没有存档,但梯子日志里有这个 run:上一次揭示在"扣了查询、存档没写成"处失败了(第 15 轮 codex 的 High)。
         # 它已经被扣过一次查询,重建视图只是回放当时的汇报值——不是"偷偷揭示",也不会再扣。
-        if not allow_query and not ladder.has(run_id):
-            return None
+        if not ladder.has(run_id):
+            # 梯子里没有这个 run:要么从未提交过(不能偷偷揭示),
+            # 要么被一次**合法的人工重置**孤立了(第 20 轮 codex 的 H2)——
+            # 后者不再重新揭示:重置的语义就是"历史揭示存档一并作废",
+            # 重新揭示等于拿刚清零的预算去补发一条已经被作废的成绩。
+            if _is_orphaned(ladder, run_id):
+                raise OutwardOrphaned("这个 run 已被一次人工梯子重置孤立(fail-closed):"
+                                       "重置作废了历史揭示存档,不再给出任何验证窗口的信息")
+            if not allow_query:
+                return None
         # 梯子的提交按 run_id **幂等**:同一个 run 重复提交只回放当时的汇报值、不再扣查询。
         # 所以存档写失败之后重试是安全的:不会重复扣、也没有新的信息泄漏(重试本来就拿得到同样的值)。
         reported = ladder.submit(sharpe, run_id=run_id)

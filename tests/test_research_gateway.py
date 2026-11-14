@@ -315,6 +315,42 @@ def test_feedback_reports_runs_orphaned_by_a_reset_instead_of_calling_them_tampe
     assert body["skipped"]["tampered"] == 0
 
 
+def test_feedback_counts_an_unreadable_archive_as_unavailable_not_tampered(tmp_path):
+    """第 20 轮 codex 的 M2:读不到存档是可用性故障,不能算成篡改,也不能算成"结果不合法"。"""
+    app = make_app(tmp_path, feedback={"limit": 5})
+    seed_revealed(app, "20261112-210000-000000", kind="gate", passed=False, failures=["x"],
+                  failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+    call(app, "GET", "/research/feedback")
+    store = app.paths["results_dir"] / "outward" / "20261112-210000-000000.json"
+    store.unlink()
+    store.mkdir()                                           # 路径被占成目录:读不到,但没被改过
+
+    status, body = call(app, "GET", "/research/feedback")
+
+    assert status == 200
+    assert body["skipped"]["unavailable"] == 1
+    assert body["skipped"]["tampered"] == 0
+    assert body["skipped"]["invalid_result"] == 0
+    assert body["skipped_total"] == sum(body["skipped"].values())
+
+
+def test_the_single_run_endpoint_says_gone_for_an_orphaned_run_not_tampered(tmp_path):
+    """第 20 轮 codex 的 H2:单条接口此前对"被人工重置孤立"的 run 回 500 并在 stderr 喊"篡改"。
+
+    一次正常的人工重置不该被报成安全事件;但被孤立的 run 一样读不出数据,所以是 410 而不是放行。"""
+    app = make_app(tmp_path)
+    seed_revealed(app, "20261112-210000-000000", kind="gate", passed=False, failures=["x"],
+                  failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+    call(app, "GET", "/research/feedback")                        # 生成揭示存档
+    app._ladder().reset("人工重置", force=True)                  # 不带 outward:存档留在原地
+
+    status, body = call(app, "GET", "/research/results/20261112-210000-000000")
+
+    assert status == 410
+    assert "重置" in body["error"]
+    assert "ladder" not in body                                  # 不放行任何验证窗口信息
+
+
 def test_feedback_reads_the_ladder_only_once_per_request(tmp_path):
     """第 19 轮 codex 的 L3:此前每扫一个结果就重读并重校验整条日志。"""
     import risk.ladder as ladder_mod

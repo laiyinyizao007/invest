@@ -1,8 +1,14 @@
-"""梯子的人工入口:`status`(只读)与 `renew`(显式续期,留痕)。
+"""梯子的人工入口:`status`(只读)、`renew`(显式续期,留痕)与 `reset`(从头开始,只留给人)。
 
 用法:
     python scripts/research_ladder.py status
     python scripts/research_ladder.py renew --reason "第 1 批候选已复核,续 60 次"
+    python scripts/research_ladder.py reset --reason "结果目录只恢复了一半,梯子对不上账" --force
+
+`reset` 会把梯子日志、头指针、锚点**与全部历史揭示存档**一起归档(改名加 `.bak-<序号>`),
+`best` 与查询数归零——**已经泄漏出去的信息收不回来**,所以它是比 `renew` 更重的操作:
+梯子状态正常时默认拒绝,必须显式 `--force`;被拒绝的尝试也会写进 `ladder.reset.log` 留痕。
+(第 20 轮 codex 的 L6:此前这段用法只列了 `status` 与 `renew`,`reset --force` 的存在与代价都没写。)
 
 为什么需要它(第 15 轮 codex 的 High):梯子的总查询预算用尽后,续期原先只能手工编辑状态文件——
 续期与回滚无法区分,而且没有审计钩子。现在状态是带哈希链的日志(risk/ladder.py),手工编辑会被当成篡改而 fail-closed;

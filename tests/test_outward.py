@@ -4,8 +4,8 @@ import json
 import pytest
 
 from risk.ladder import Ladder, LadderExhausted
-from risk.outward import (MAX_ERROR_MESSAGE, OutwardError, RevealStore, build_outward, outward_report, reveal,
-                          validate_view, validation_sharpe)
+from risk.outward import (MAX_ERROR_MESSAGE, OutwardError, OutwardOrphaned, OutwardTampered, OutwardUnavailable,
+                          RevealStore, build_outward, outward_report, reveal, validate_view, validation_sharpe)
 from risk.promotion_gate import CHECK_IDS
 from risk.structured_diagnosis import structure
 from risk.diagnosis import diagnose
@@ -431,6 +431,64 @@ def test_a_forged_selection_only_result_carries_no_bits(env):
     view = reveal({"run_id": "s1", "kind": "evaluate", "kind_detail": "selection-only", "passed": True,
                    "failed_check_ids": ["sharpe_low", "dsr_low"]}, ladder=env[0], store=env[1])
     assert view["passed"] is False and view["failed_checks"] is None
+
+
+def test_a_reveal_archive_that_cannot_be_read_is_unavailable_not_tampered(tmp_path):
+    """第 20 轮 codex 的 M2:读不到是**可用性**故障,不是篡改证据。
+
+    文件根本没被读到,凭什么说它被改过?把它算成篡改,一次磁盘/权限故障
+    就会被记成安全事件,真正的篡改反而淹没在里面。"""
+    store = RevealStore(tmp_path / "outward")
+    (tmp_path / "outward").mkdir(parents=True)
+    (tmp_path / "outward" / "run42.json").mkdir()            # 路径被占成目录:读不到,但没被改过
+    with pytest.raises(OutwardUnavailable) as excinfo:
+        store.get("run42")
+    assert not isinstance(excinfo.value, OutwardTampered)
+
+
+def test_a_reveal_archive_that_cannot_be_written_is_unavailable_not_an_invalid_result(tmp_path, monkeypatch):
+    """第 20 轮 codex 的 M3:写失败是操作失败,不是"结果不合法"。
+
+    算成 invalid_result 的话,运维会去查结果文件,而不是查磁盘/权限。"""
+    import risk.outward as outward_mod
+    real_open = open
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        if "w" in mode and str(file).endswith(".tmp"):
+            raise OSError("磁盘满了")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(outward_mod, "open", fake_open, raising=False)
+    store = RevealStore(tmp_path / "outward")
+    with pytest.raises(OutwardUnavailable) as excinfo:
+        store.put("run42", build_outward(full_result()))
+    assert not isinstance(excinfo.value, OutwardTampered)
+    assert not isinstance(excinfo.value, OutwardError) or isinstance(excinfo.value, OutwardUnavailable)
+
+
+def test_a_run_orphaned_by_a_legal_reset_is_not_reported_as_tampering(env):
+    """第 20 轮 codex 的 H2:一次**合法的人工重置**不是安全事件。
+
+    此前这类 run 一律按"被伪造"报出去——人工重置于是被记成安全事件,真正的篡改反而淹没在里面。"""
+    ladder, store = env
+    reveal(full_result(run_id="g1"), ladder=ladder, store=store)
+    ladder.reset("人工重置", force=True)                       # 不带 outward:揭示存档留在原地
+    with pytest.raises(OutwardOrphaned) as excinfo:
+        reveal(full_result(run_id="g1"), ladder=ladder, store=store)
+    assert not isinstance(excinfo.value, OutwardTampered)
+
+
+def test_an_orphaned_run_reveals_nothing_even_when_its_archive_is_gone(env):
+    """第 20 轮 codex 的 H2:被孤立的 run 不再重新揭示。
+
+    重置的语义是"历史揭示存档一并作废";重新揭示等于拿刚清零的预算补发一条已作废的成绩。"""
+    ladder, store = env
+    reveal(full_result(run_id="g2"), ladder=ladder, store=store)
+    ladder.reset("人工重置", force=True)
+    (store.directory / "g2.json").unlink()                     # 存档随重置一起没了
+    with pytest.raises(OutwardOrphaned):
+        reveal(full_result(run_id="g2"), ladder=ladder, store=store)
+    assert ladder.status()["queries_used"] == 0                # 没有为它白烧一次查询
 
 
 def test_the_replay_reports_the_current_remaining_queries_not_the_stale_one(env):
