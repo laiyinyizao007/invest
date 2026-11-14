@@ -1237,3 +1237,88 @@ def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monk
     with pytest.raises(api.JobError) as exc:
         api.import_candidate(path, "S", api.rs.file_sha256(path))
     assert "静态筛查未通过" in str(exc.value)
+
+
+# ---------- 第 32 轮(复审):评估输入在候选导入之前取定 ----------
+
+def _install_fake_evaluation_modules(monkeypatch, windows_factory):
+    """装一套假的 wf / backtest_lib / research_gate,返回 (wf 模块, 记录 run_evaluation 实参的字典)。"""
+    import sys
+    import types as pytypes
+    seen = {}
+
+    def fake_run_evaluation(**kw):
+        seen.update(kw)
+        return {"passed": True, "sharpe": 1.0}
+
+    wf = pytypes.ModuleType("walk_forward_optimizer")
+    wf.DATA_FILE = "x.csv"
+    wf.SYMBOL = "c2701.DCE"
+    wf.KEY = "CADJ"
+    wf.build_windows = windows_factory
+    bl = pytypes.ModuleType("backtest_lib")
+    bl.DEFAULT_CAPITAL = 100000.0
+    bl.load_bars_csv = lambda *a, **k: []
+    rg = pytypes.ModuleType("research_gate")
+    rg.engine_runner = lambda key: (lambda *a, **k: None)
+    rg.run_evaluation = fake_run_evaluation
+    rnd = pytypes.ModuleType("strategies.random_entry_15m_strategy")
+    rnd.RandomEntry15mStrategy = object
+    for name, mod in (("walk_forward_optimizer", wf), ("backtest_lib", bl), ("research_gate", rg),
+                      ("strategies.random_entry_15m_strategy", rnd)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return wf, seen
+
+
+class _Win:
+    def __init__(self, name, train_start, train_end, valid_start, valid_end):
+        self.name, self.train_start, self.train_end = name, train_start, train_end
+        self.valid_start, self.valid_end = valid_start, valid_end
+
+
+def test_a_candidate_cannot_change_the_validation_windows_by_rebinding_the_builder(tree, monkeypatch):
+    """候选在导入期改写 `wf.build_windows`,想让"样本外"变成选参窗口(样本内)→ 框架用的仍是导入前取定的窗口。
+
+    第 32 轮 codex 复审实测:此前窗口在候选导入**之后**才读,验证窗口 == 选参窗口。"""
+    body = ("import walk_forward_optimizer as wf\n"
+            "class W:\n"
+            "    name, train_start, train_end, valid_start, valid_end = 'EVIL', 1, 2, 1, 2\n"
+            "wf.build_windows = lambda: [W()]\n"
+            "wf.DATA_FILE = 'attacker.csv'\n"
+            "from vnpy_ctastrategy import CtaTemplate\n"
+            "class S(CtaTemplate):\n"
+            "    pass\n")
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    _, seen = _install_fake_evaluation_modules(
+        monkeypatch, lambda: [_Win("W1", 1, 2, 3, 4)])
+    loaded = {}
+    import backtest_lib
+    monkeypatch.setattr(backtest_lib, "load_bars_csv", lambda path, *a, **k: loaded.setdefault("path", path) and [])
+
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_OK, payload
+    assert seen["select_window"] == (1, 2)
+    assert seen["validation_windows"] == [("W1", 3, 4)], "验证窗口必须是导入前取定的那一份"
+    assert loaded["path"] == "x.csv", "数据文件必须是导入前取定的那一份"
+
+
+def test_windows_where_validation_is_not_after_selection_are_refused(tree, monkeypatch, capsys):
+    """窗口不变量自己复查(不信任 `wf.Window.__post_init__`):验证窗口必须晚于选参窗口的结束。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text("from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    _install_fake_evaluation_modules(monkeypatch, lambda: [_Win("W1", 1, 5, 3, 4)])    # 验证开始 3 <= 选参结束 5
+
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_REFUSED
+    assert "验证窗口晚于选参窗口" in capsys.readouterr().err

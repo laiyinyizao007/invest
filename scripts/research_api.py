@@ -281,6 +281,27 @@ def declared_grid_cells(source: str) -> int | None:
             sizes.append(total)
     if unknown:
         return None
+    # **fail-closed 兜底**(第 32 轮 codex 复审的 Critical):上面只认"类体里的字面量赋值",
+    # 其它写法会被**静默忽略** —— 类外 `S.param_grid = {...}`(目标是 Attribute)、
+    # `param_grid |= {...}`(AugAssign)、`param_grid.update({...})`(调用)、字符串键……
+    # 声明小网格、再用这些写法塞进大网格,子进程中途死掉就只记 27 格(实测少记 316)。
+    # 所以:`param_grid` 在源码里**出现的次数**必须正好等于"被认出的那几条字面量赋值"的次数,
+    # 多出来的任何一次出现(读/写/属性/字符串/关键字)一律当"读不出",走保守上限。
+    # 代价:候选只是**读** `self.param_grid` 也会走保守值 —— 只影响"中途死掉"那条路,方向是更严。
+    mentions = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "param_grid":
+            mentions += 1
+        elif isinstance(node, ast.Attribute) and node.attr == "param_grid":
+            mentions += 1
+        elif isinstance(node, ast.Constant) and node.value == "param_grid":
+            mentions += 1
+        elif isinstance(node, (ast.keyword, ast.arg)) and getattr(node, "arg", None) == "param_grid":
+            mentions += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "param_grid":
+            mentions += 1
+    if mentions != len(sizes):
+        return None
     if not sizes:
         return 0
     return max(sizes)
@@ -339,12 +360,11 @@ def say_refusal(message: str) -> None:
     带同样标记的文本 —— 标记挡的是"误顶替"(候选随口打印与候选蓄意伪造是两回事)。
     真正挡得住"候选伪造框架结论"的是候选独立进程化(已登记为后续工作)。
 
-    **整条原因写成一行**(第 32 轮):此前逐行打标记,父层取"第一段连续带标记的行" ——
-    但候选的 atexit 钩子紧跟在框架那行后面(同样是带标记的行、同样连续),于是**整段**被回传,
-    候选那行照样顶掉框架的结论。
-    现在:换行折成" / "写成**一行**,父层只取**第一行**带标记的行 → 框架那行赢。
-    细节不丢(都折在这一行里),候选在退出时打的那行排在后面 → 不采信。"""
-    text = " / ".join(part.strip() for part in str(message).splitlines() if part.strip())
+    **整条原因写成一行**(第 32 轮):2a3901f 的旧实现是整条消息只在**开头**打一个标记,
+    多行消息的后续行没有标记,父层取"带标记的行"时只剩第一行,细节(是哪一条)丢了。
+    现在:换行折成" | "写成**一行**(不用" / ":路径脱敏正则会把它吃成 <路径>),
+    父层只取**第一行**带标记的行 → 框架先写的那行赢,候选在退出时补打的行排在后面不被采信。"""
+    text = " | ".join(part.strip() for part in str(message).splitlines() if part.strip())
     print(f"{FRAMEWORK_TAG} {text}", file=sys.stderr)
 
 
@@ -364,9 +384,11 @@ def _child_reason(stderr: str) -> str:
     候选可以注册 atexit 钩子(atexit 不在禁用名单里),在**框架写完原因之后**再打一行
     带同样标记的文本,于是候选那行**排到最后**、被优先回传。
     改成"第一行"之后,框架自己那行(先写的)赢。
-    (框架自己把多行原因折成一行写,见 `say_refusal` —— 细节在这一行里,不会因为取一行而丢。
-    仍取不到的情形:候选在**框架拒绝之前**就打了一行带标记的文本 ——
-    同进程内无法区分谁写的,已登记为残余。)"""
+    (框架自己把多行原因折成一行写,见 `say_refusal` —— 细节在这一行里,不会因为只取一行而丢。)
+
+    **已登记的残余**:候选在**框架拒绝之前**就打了一行带标记的文本时,父层取到的**就是候选那行**
+    (是"取错",不是"取不到"),验证窗口的数字也可能借此外传 —— 同进程内无法区分谁写的,
+    彻底闭合靠候选独立进程化。"""
     tagged: list[str] = []
     for line in (stderr or "").splitlines():
         stripped = line.strip()
@@ -401,15 +423,8 @@ def _child_reason(stderr: str) -> str:
 # 要彻底堵住,得让候选在**另一个进程**里执行、由框架进程独立汇总——那是架构改动,已登记为后续工作。
 # 现在能堵住的是**盲伪造**:不知道随机路径与随机密钥的伪造(含 atexit 打印那一行)一律被验签拒绝。
 #
-# 写结果用到的运行时对象在**模块导入时**(候选还没跑)先按住指纹:候选若改写了它们,
-# 结果就可能被它编排,这种结果一律不采信。
-_JSON_DUMPS = json.dumps
-_JSON_LOADS = json.loads
-_HMAC_NEW = hmac.new
-_SHA256 = hashlib.sha256
-_OS_REPLACE = os.replace
-_PATH_WRITE_TEXT = Path.write_text
-_ATEXIT_CLEAR = atexit._clear
+# 写结果用到的运行时对象在**模块导入时**(候选还没跑)按进 `_make_channel` 的闭包单元里
+# (不是模块全局:期望值若也是模块全局,候选把两边一起改写,检查就静音了)。
 
 
 def _make_handoff() -> dict:
@@ -1171,79 +1186,79 @@ def _child_handoff() -> dict:
     return handoff
 
 
-# 通道**自己的入口**要按住,而且要按住得**真的挡得住**:
-# 第 30 轮 codex 实测,候选只要 `api.emit_result = lambda body: None` 就把整段指纹检查跳过了
-# (指纹核对的是叶子对象,入口被换掉就不进那段代码)。更糟的是,把引用存成模块级常量
-# (`_EMIT_RESULT = emit_result`)也**挡不住**:模块里的名字候选随时能重新绑定,
-# `api._EMIT_RESULT = 假函数` 一样生效。
-# 现在:两个入口都由**闭包**生成,读的是闭包单元(模块属性改不到):
-#   - 写结果那一侧捕获"交接单读取器" → 候选改模块属性,写结果的去向不受它摆布;
-#   - 回传那一侧捕获"写结果那一侧" → 候选把 `api.emit_result` 换成空函数,指纹检查照样会跑,
-#     被改写过就**响亮地失败**(退出码 2),不是"改了就当没发生"。
-_ORIGINAL_HANDOFF_READER = _child_handoff
-
-
-def _clear_atexit() -> None:
+# 通道**自己的入口**要按住,而且要按住得**真的挡得住**(第 30~32 轮 codex 逐轮实测):
+#   - 入口存成模块级常量不行:候选改 `api._EMIT_RESULT = 假函数` 一样生效;
+#   - 指纹的"被比的"与"期望的"若都是模块全局也不行:候选两边一起改,检查就静音;
+#   - 调用点查模块全局也不行:候选换掉它,整段指纹检查压根不执行。
+# 现在:入口与指纹的期望值都在 `_make_channel` / `_make_child_entry` 的闭包单元里,
+# 候选改模块属性 → 要么改不到(写的去向),要么被指纹逮到并**响亮地失败**(退出码 2)。
+def _clear_atexit(clear) -> None:
     """清掉候选注册的 atexit 钩子。
 
     结果写完就退出:钩子若还能跑,就只剩"事后篡改"的机会(候选可以顺手把结果文件改掉)。
     框架自己在这条路径上没有必须执行的 atexit,所以整体清空是安全的。
-
-    用**导入时按住的那个** `atexit._clear`:候选若把 `atexit._clear` 换成空函数,
-    这里调用的就还是原版(否则"清空"这一步会被候选自己取消)。"""
+    `clear` 是**闭包里按住的那个** `atexit._clear`:候选把模块属性换成空函数也取消不了这一步。"""
     try:
-        _ATEXIT_CLEAR()
+        clear()
     except Exception:                                    # noqa: BLE001 - 清不掉就清不掉,验签照样兜着
         pass
 
 
-def _make_result_writer(handoff_reader):
-    """生成写结果的那一侧。`handoff_reader` 进闭包单元:候选改模块属性改不动它。
+def _make_channel(handoff_reader):
+    """生成结果通道的两个入口:`(emit_result, emit_or_fail)`。
 
-    内层函数**不叫** `emit_result`:同名的话,函数体里的 `emit_result` 会解析到
-    外层作用域的局部名(闭包单元)而不是模块全局,指纹比对就成了"自己比自己"。"""
+    **指纹比对的两侧都得改不动**(第 32 轮 codex 复审的 High):此前"期望值"一侧
+    (`_JSON_DUMPS`、`_EMIT_RESULT`、`_ORIGINAL_HANDOFF_READER`……)是模块全局,
+    候选把"被比的"与"期望的"**一起**改写,检查就静音了;静音之后再劫持 `json.dumps`,
+    框架自己会在伪造的 payload 上算出**真 MAC**(真子进程实测:父层验签通过、采信)。
+    现在:期望值全部在本函数的局部变量里(闭包单元),候选改模块属性改不到;
+    payload 与 MAC 也用闭包里按住的那份序列化器/哈希算,不再查可被劫持的全局。
+
+    内层函数**不叫** `emit_result`:同名的话,函数体里的 `emit_result` 会解析到外层作用域
+    的局部名(闭包单元)而不是模块全局,指纹比对就成了"自己比自己"。"""
+    json_dumps, json_loads, hmac_new = json.dumps, json.loads, hmac.new
+    sha256, os_replace, write_text = hashlib.sha256, os.replace, Path.write_text
+    atexit_clear = atexit._clear
+    expected: dict = {}
+
+    def _tampered() -> bool:
+        return (json.dumps is not json_dumps or json.loads is not json_loads or hmac.new is not hmac_new
+                or hashlib.sha256 is not sha256 or os.replace is not os_replace
+                or Path.write_text is not write_text or atexit._clear is not atexit_clear
+                or emit_result is not expected["write"] or _emit_or_fail is not expected["emit"]
+                or _child_handoff is not handoff_reader)
+
     def _write(body: dict) -> None:
         """把结果写进父进程建的随机文件,并附上 MAC。stdout 只是日志,不是结果通道。"""
-        if (json.dumps is not _JSON_DUMPS or json.loads is not _JSON_LOADS or hmac.new is not _HMAC_NEW
-                or hashlib.sha256 is not _SHA256 or os.replace is not _OS_REPLACE
-                or Path.write_text is not _PATH_WRITE_TEXT or atexit._clear is not _ATEXIT_CLEAR
-                or emit_result is not _EMIT_RESULT or _emit_or_fail is not _EMIT_OR_FAIL
-                or _child_handoff is not _ORIGINAL_HANDOFF_READER):
+        if _tampered():
             raise JobError(EXIT_REFUSED, "写结果前发现运行时对象被改写,拒绝回传结果")
         handoff = handoff_reader()
         # 真结果已经算好了,现在把候选注册的 atexit 钩子清掉:钩子是在进程退出时跑的,
-        # 不清掉的话它能在**结果写完之后**再改一次那个文件(改坏了会被父进程验签拒掉,
-        # 但那是一次"结果明明跑完了却被判失败"的响亮失败)。清空只影响这一个子进程。
-        _clear_atexit()
-        payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
-        mac = hmac.new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        # 不清掉的话它能在**结果写完之后**再改一次那个文件。清空只影响这一个子进程。
+        _clear_atexit(atexit_clear)
+        payload = json_dumps(body, ensure_ascii=False, sort_keys=True)
+        mac = hmac_new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), sha256).hexdigest()
         path = Path(handoff["path"])
-        envelope = json.dumps({"mac": mac, "body": payload}, ensure_ascii=False)
+        envelope = json_dumps({"mac": mac, "body": payload}, ensure_ascii=False)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(envelope, encoding="utf-8")
-        os.replace(tmp, path)
-    return _write
+        write_text(tmp, envelope, encoding="utf-8")
+        os_replace(tmp, path)
 
-
-emit_result = _make_result_writer(_child_handoff)
-_EMIT_RESULT = emit_result
-
-
-def _make_emit_or_fail(writer):
-    """生成回传的那一侧。`writer` 进闭包单元:候选把 `api.emit_result` 换成空函数,
-    这里调用的仍是原版,指纹检查因此**真的会执行**。"""
     def _emit_or_fail(body: dict) -> int:
-        """把结果写回去;写不回去(没有交接单、信封坏了)就**响亮地失败**,不静默退出 0。"""
+        """把结果写回去;写不回去(没有交接单、信封坏了)就**响亮地失败**,不静默退出 0。
+        `_write` 在闭包单元里:候选把 `api.emit_result` 换成空函数,指纹检查照样会执行。"""
         try:
-            writer(body)
+            _write(body)
         except JobError as exc:
             say_refusal(exc.message)
             return exc.code
         return EXIT_OK
-    return _emit_or_fail
+
+    expected["write"], expected["emit"] = _write, _emit_or_fail
+    return _write, _emit_or_fail
 
 
-_emit_or_fail = _make_emit_or_fail(_EMIT_RESULT)
+emit_result, _emit_or_fail = _make_channel(_child_handoff)
 _EMIT_OR_FAIL = _emit_or_fail
 
 
@@ -1287,6 +1302,11 @@ def _handle_gate_child(args, emit) -> int:
     if args.on_plateau not in ("0", "1"):
         say("--on-plateau 只能是 0 或 1")
         return EXIT_REFUSED
+    # 评估输入(数据文件、品种、键、滚动窗口)在**候选导入之前**取成不可变的局部值:
+    # 此前这些都在导入之后才读 `wf.*`,候选改写 `wf.build_windows`/`wf.Window` 就能自己决定
+    # "样本外"是哪一段、用哪份数据(第 32 轮 codex 复审实测:验证窗口被换成了选参窗口)。
+    data_file, symbol, key = wf.DATA_FILE, wf.SYMBOL, wf.KEY
+    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -1294,11 +1314,10 @@ def _handle_gate_child(args, emit) -> int:
         return exc.code
     except CandidateError as exc:
         return emit({"error": exc.detail})
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     try:
         result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
+                          runner=engine_runner(key), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
                           prior_trials=prior_trials, run_variances=run_variances)
     except Exception as exc:
@@ -1325,6 +1344,15 @@ def _handle_evaluate_child(args, emit) -> int:
     except JobError as exc:
         say(exc.message)
         return exc.code
+    # 评估输入在**候选导入之前**取成不可变的局部值(见 _handle_gate_child 的说明)。
+    data_file, symbol, key = wf.DATA_FILE, wf.SYMBOL, wf.KEY
+    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
+    windows = [(w.name, w.train_start, w.train_end, w.valid_start, w.valid_end) for w in wf.build_windows()]
+    # 窗口不变量自己复查,不信任 `wf.Window.__post_init__`:验证窗口必须整体晚于选参窗口的结束。
+    select_window = (windows[0][1], windows[0][2])
+    if any(valid_start <= select_window[1] for _, _, _, valid_start, _ in windows):
+        say("滚动窗口不满足\"验证窗口晚于选参窗口\",拒绝评估")
+        return EXIT_REFUSED
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -1332,15 +1360,13 @@ def _handle_evaluate_child(args, emit) -> int:
         return exc.code
     except CandidateError as exc:
         return emit({"error": exc.detail})
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = wf.build_windows()
-    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     try:
         result = run_evaluation(
-            candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
+            candidate_cls=candidate, bars=bars, runner=engine_runner(key), random_cls=RandomEntry15mStrategy,
             random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
-            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials,
+            min_round_trips=cfg["grid"]["min_round_trips"], select_window=select_window,
+            validation_windows=[(name, vs, ve) for name, _, _, vs, ve in windows], prior_trials=prior_trials,
             run_variances=run_variances)
     except Exception as exc:
         # 评估跑在**验证窗口**上(选参窗口里的错由 research_gate 自己分段并显式给阶段);

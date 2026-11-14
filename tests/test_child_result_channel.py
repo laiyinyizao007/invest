@@ -533,14 +533,13 @@ def test_a_candidate_that_replaces_the_handoff_reader_is_detected(tmp_path):
     assert not result_path.exists() and not other_path.exists()
 
 
-def test_a_candidate_that_bypasses_the_fingerprint_still_cannot_redirect_the_write(tmp_path):
-    """双向(更狠的一版):候选连**指纹比对的那一环**一起绕过 → 写结果的去向仍不受它摆布。
+def test_a_candidate_that_rewrites_both_sides_of_the_fingerprint_is_still_caught(tmp_path):
+    """双向(更狠的一版):候选把"被比的"与"期望的"**一起**改写 → 指纹照样逮到。
 
-    候选把 `_child_handoff` 和 `_ORIGINAL_HANDOFF_READER` 一起换成自己的,
-    指纹里"入口被改写"这一项就看不出差别了(两个都是候选的)。
-    这时真正兜住的是**闭包**:读交接单的那一侧是闭包单元里的原版,
-    候选改模块属性改不到它 → 结果仍写进父进程通过 stdin 给的那条路径,
-    候选自选路径上什么都没有。"""
+    第 32 轮 codex 实测:此前期望值(`_ORIGINAL_HANDOFF_READER` 等)是模块全局,
+    候选把 `_child_handoff` 和它一起换成自己的,比对就成了"自己比自己",检查静音、
+    结果照写(再配合劫持 `json.dumps`,框架会在伪造的 payload 上算出**真 MAC**)。
+    现在期望值在闭包单元里,候选改不到 → 退出码 2,哪条路径上都没有结果。"""
     scripts_dir = str(Path(api.__file__).resolve().parent)
     result_path = tmp_path / "child_result.json"
     other_path = tmp_path / "elsewhere.json"
@@ -552,7 +551,7 @@ def test_a_candidate_that_bypasses_the_fingerprint_still_cannot_redirect_the_wri
         "import research_api as api\n"
         f"fake = lambda: {{'path': {str(other_path)!r}, 'key': 'k' * 64, 'dir': {str(tmp_path)!r}}}\n"
         "api._child_handoff = fake\n"
-        "api._ORIGINAL_HANDOFF_READER = fake      # 连指纹比对那一环一起绕过\n"
+        "api._ORIGINAL_HANDOFF_READER = fake      # 老版本里的期望侧(现已不存在,改写它没有任何作用)\n"
         "print('EXIT', api._emit_or_fail({'stats': {'sharpe': 1.0}}))\n",
         encoding="utf-8")
 
@@ -560,9 +559,38 @@ def test_a_candidate_that_bypasses_the_fingerprint_still_cannot_redirect_the_wri
                           encoding="utf-8", errors="replace",
                           input=json.dumps(handoff) + "\n", env=_utf8_env())
     assert proc.returncode == 0, proc.stderr
-    assert "EXIT 0" in proc.stdout
-    assert result_path.exists()          # 写进了父进程指定的那条路径
-    assert not other_path.exists()       # 候选自选路径上没有结果
+    assert "EXIT 2" in proc.stdout
+    assert "运行时对象被改写" in proc.stderr
+    assert not result_path.exists() and not other_path.exists()
+
+
+def test_a_candidate_that_hijacks_the_serializer_and_its_expected_value_cannot_forge_a_valid_mac(tmp_path):
+    """候选劫持 `json.dumps` 并把(老版本里的)期望值指向它 → 不能得到"带真 MAC 的伪造结果"。"""
+    scripts_dir = str(Path(api.__file__).resolve().parent)
+    result_path = tmp_path / "child_result.json"
+    handoff = {"path": str(result_path), "key": "k" * 64, "dir": str(tmp_path)}
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import json, sys\n"
+        f"sys.path.insert(0, {scripts_dir!r})\n"
+        "import research_api as api\n"
+        "real = json.dumps\n"
+        "def evil(obj, *a, **k):\n"
+        "    if isinstance(obj, dict) and 'stats' in obj:\n"
+        "        obj = {'stats': {'sharpe': 42.0}}\n"
+        "    return real(obj, *a, **k)\n"
+        "json.dumps = evil\n"
+        "api._JSON_DUMPS = evil\n"
+        "print('EXIT', api._emit_or_fail({'stats': {'sharpe': 1.0}}))\n",
+        encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          input=json.dumps(handoff) + "\n", env=_utf8_env())
+    assert proc.returncode == 0, proc.stderr
+    assert "EXIT 2" in proc.stdout
+    assert "运行时对象被改写" in proc.stderr
+    assert not result_path.exists()
 
 
 # ---------------- 第 31 轮:子进程中途死掉,格子数按保守值记账 ----------------
@@ -755,7 +783,7 @@ def test_a_child_that_refused_before_scanning_is_not_charged_for_cells_it_never_
 
 # ---------------- 第 32 轮:入口自身可被改写、拒绝原因的来源与完整性 ----------------
 
-def test_a_candidate_that_replaces_the_emit_entry_point_cannot_skip_the_fingerprint(tree, monkeypatch, capsys):
+def test_a_candidate_that_replaces_the_call_site_name_cannot_displace_the_real_entry(tree, monkeypatch, capsys):
     """候选把**调用点真正用的那个名字**换掉 → 指纹检查必须照样执行(响亮地失败)。
 
     第 32 轮 codex 实测:此前子进程入口的调用点查的是**模块全局** `_EMIT_OR_FAIL`,
@@ -785,11 +813,13 @@ def test_a_candidate_that_replaces_the_emit_entry_point_cannot_skip_the_fingerpr
     finally:
         api._EMIT_OR_FAIL = original
 
-    assert code == api.EXIT_REFUSED, "候选换掉入口之后必须响亮地失败,而不是照常回传结果"
-    assert not (tree / "child_result.json").exists(), "被改写时不得写出任何结果"
-    # 必须是**指纹**逮到的(不是别的拒绝理由):否则这条用例会因为"别的原因也退出 2"而空转
-    err = capsys.readouterr().err
-    assert "运行时对象被改写" in err, err
+    # 入口走闭包单元里的那一份 → 候选改模块全局**不起任何作用**:框架照常把自己的结果写出去
+    # (旧写法下,假函数顶替了入口、什么都没写,退出码 0、父进程拿不到结果也不报警)。
+    assert code == api.EXIT_OK, capsys.readouterr().err
+    result_file = tree / "child_result.json"
+    assert result_file.exists(), "框架自己的结果必须写出去(没写 = 入口被候选顶替了)"
+    envelope = json.loads(result_file.read_text(encoding="utf-8"))
+    assert set(envelope) == {"mac", "body"}, "写出去的必须是带 MAC 的信封"
 
 
 def test_the_frameworks_own_reason_wins_over_a_candidate_line_printed_at_exit():
@@ -805,9 +835,9 @@ def test_the_frameworks_own_reason_wins_over_a_candidate_line_printed_at_exit():
 
 
 def test_a_multiline_refusal_reason_is_relayed_in_full(capsys):
-    """多行的拒绝原因**每一行都要带标记**,否则细节(是哪一条)全丢。
+    """多行的拒绝原因要**完整传到父层**(折成一行写),否则细节(是哪一条)全丢。
 
-    此前只给第一行加标记:框架写"静态筛查未通过:\n  第 1 行: 禁止导入 os",
+    多行消息的后续行没有标记,父层只剩首行:框架写"静态筛查未通过:\n  第 1 行: 禁止导入 os",
     父层只回传'静态筛查未通过:'——被丢掉的正是**是哪一条**。"""
     api.say_refusal("静态筛查未通过:\n  第 1 行: 禁止导入 os\n  第 2 行: 禁止导入 sys")
     err = capsys.readouterr().err
@@ -836,3 +866,45 @@ def test_a_grid_declared_with_a_tuple_target_is_not_treated_as_no_grid():
     → 少记试验次数 = 悄悄放松已锁定的 DSR ≥ 0.95(第 32 轮 codex 的 Low-2)。"""
     assert api.declared_grid_cells("class S:\n    param_grid, x = {'a': [1, 2]}, 1\n") is None
     assert api.conservative_grid_cells("class S:\n    param_grid, x = {'a': [1, 2]}, 1\n", 343) == 343
+
+
+# ---------------- 第 32 轮(复审):静态读网格 fail-closed ----------------
+
+@pytest.mark.parametrize("source", [
+    # 类外重绑:目标是 Attribute,旧实现连 unknown 都不置位 → 只认到类体里那个 3 格的小网格
+    "class S:\n    param_grid = {'a': [1, 2, 3]}\nS.param_grid = {'a': [1]*7, 'b': [1]*7, 'c': [1]*7}\n",
+    # 增强赋值
+    "class S:\n    param_grid = {'a': [1, 2, 3]}\n    param_grid |= {'b': [1]*10, 'c': [1]*10}\n",
+    # 原地更新
+    "class S:\n    param_grid = {'a': [1, 2, 3]}\n    param_grid.update({'b': [1]*10})\n",
+    # 字符串键
+    "GRID = {'param_grid': {'a': [1]}}\nclass S:\n    pass\n",
+    # 只是读:保守(更严),不是少记
+    "class S:\n    param_grid = {'a': [1, 2, 3]}\n    def f(self):\n        return self.param_grid\n",
+])
+def test_any_other_mention_of_the_grid_makes_the_declared_size_unreadable(source):
+    """`param_grid` 的出现次数必须正好等于被认出的字面量赋值次数,多一次就当"读不出"。
+
+    第 32 轮 codex 复审实测:声明小网格、再用类外重绑/`|=`/`.update()` 塞进大网格,
+    子进程中途死掉时账本只记 27 格(真实 343),少记 316 次试验 = 悄悄放松 DSR ≥ 0.95。"""
+    assert api.declared_grid_cells(source) is None
+    assert api.conservative_grid_cells(source, 343) == 343
+
+
+def test_a_single_literal_grid_is_still_read_exactly():
+    """双向:兜底不能把正常写法误伤成"读不出"。"""
+    assert api.declared_grid_cells("class S:\n    param_grid = {'a': [1, 2, 3]}\n") == 3
+    assert api.declared_grid_cells("class S:\n    param_grid: dict = {'a': [1, 2, 3]}\n") == 3
+    assert api.declared_grid_cells("class S:\n    pass\n") == 0
+
+
+def test_the_child_entries_really_close_over_the_emit_function():
+    """闭包性质要被钉住:入口是壳,`emit` 必须是闭包单元,且就是导入时生成的那一份。
+
+    第 32 轮 codex 复审:变异"入口改回查模块全局"存活 —— 旧的静态用例只断言
+    `handler in entry.__closure__`,变异后闭包里只剩 handler,照样通过。"""
+    for name in ("run_child", "run_evaluate_child", "run_gate_child"):
+        entry = getattr(api, name)
+        assert "emit" in entry.__code__.co_freevars, f"{name} 没有把 emit 放进闭包单元"
+        cells = dict(zip(entry.__code__.co_freevars, (c.cell_contents for c in entry.__closure__)))
+        assert cells["emit"] is api._EMIT_OR_FAIL, f"{name} 闭包里的 emit 不是导入时生成的那一份"
