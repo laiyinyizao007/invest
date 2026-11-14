@@ -473,3 +473,13 @@ def test_validate_rejects_a_description_that_is_not_clean(mutate):
 @pytest.mark.parametrize("junk", [None, [], "x", 5, {}])
 def test_validate_rejects_non_descriptions(junk):
     assert not describe.validate(junk)
+
+
+def test_a_ledger_written_with_the_old_exact_dsr_is_still_readable_and_appendable(tmp_path):
+    """第 17 轮 L2:写端严格,读端容忍旧口径并就地量化;旧台账不会因此"损坏"。"""
+    old = rec(1, dsr=0.4)
+    old["dsr"] = 0.76151234
+    path = tmp_path / "c.jsonl"
+    path.write_text(json.dumps(old, ensure_ascii=False) + chr(10), encoding="utf-8")
+    assert read_records(tmp_path, "c")[0]["dsr"] == 0.5
+    assert append_record(tmp_path, "c", rec(2, generation=2, parent_sha256=old["candidate_sha256"]))["generation"] == 2

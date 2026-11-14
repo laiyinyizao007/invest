@@ -27,14 +27,15 @@ DSR 只惩罚试验次数、不惩罚每次试验带回的信息量,而测试段
 - **同一个 `run_id` 的提交是幂等的**:已经提交过的 run 只回放当时的汇报值,不再扣查询。这让"揭示存档写失败后重试"安全
   (不会重复扣查询、也没有新的信息泄漏——重试本来就拿得到同样的值),见 risk/outward.py。
 
-**锚点(第 16 轮 codex 的 H2)**:哈希链**没有密钥**,头指针与日志又在同一目录——"截断日志并同步改写头指针"得到的是一条
+**锚点(第 16、17 轮 codex 的 H2)**:哈希链**没有密钥**,头指针与日志又在同一目录——"截断日志并同步改写头指针"得到的是一条
 完全合法的更短的链,链内的所有不变式(`queries` +1、`best` 只升)它都满足,所以只靠链**检测不到一致回滚**(上一版注释与 ADR
 说"回滚/截断 fail-closed"是过度声明)。现在可以给梯子配一个**锚点文件**(`anchor`,放在另一个目录,每次追加写一行
 `<seq> <hash>`):读取时要求日志里第 `seq` 行的哈希恰好是锚点记下的那个——日志被截到锚点之前、或整条链被换成另一条,
 都会对不上。锚点只会**落后**日志(崩溃在写锚点之前),不会超前,所以"锚点超前"就是回滚。
 
-诚实的边界:锚点不是信任边界——它只是把"一致回滚"从**改两个文件**变成**改三个、其中一个在别的目录**,并让部分篡改与
-误操作被发现。拥有文件系统写权限的人**同时**改写日志、头指针与锚点、或把三者全部删掉(整条梯子从头开始),**仍然发现不了**;
+诚实的边界(第 17 轮更正):锚点是**误操作与部分篡改的探测器,不是回滚探测器**——它与日志同一个信任域,
+把日志、头指针**和锚点一起截到同一位置**(不需要重算任何哈希)就是一条完全自洽的更短的链;只截日志或只换链才会被发现。
+拥有文件系统写权限的人同时改写三者、或把三者全部删掉(整条梯子从头开始),**发现不了**;
 真正的外部锚点需要另一个信任域(密钥不在候选与网关可写的位置,或把头指针镜像到只增的外部存储),这里没有。
 候选代码碰不到这些文件(沙盒里没有 `open`、没有文件系统模块,见 ADR)。
 
@@ -120,7 +121,10 @@ class Ladder:
         if not self.log_path.exists():
             return []
         try:
-            lines = [line for line in self.log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            text = self.log_path.read_text(encoding="utf-8")
+            if text and not text.endswith(chr(10)):         # 崩在追加一行的中途:最后那半行不算(第 17 轮 M3),写入口会把它截掉
+                text = text[: text.rfind(chr(10)) + 1]
+            lines = [line for line in text.splitlines() if line.strip()]
             rows = [json.loads(line) for line in lines]
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子日志损坏或无法读取(fail-closed): {_why(exc)}") from exc
@@ -185,15 +189,21 @@ class Ladder:
         if self.anchor is None or not self.anchor.exists():
             return None
         try:
-            lines = [line for line in self.anchor.read_text(encoding="utf-8").splitlines() if line.strip()]
+            text = self.anchor.read_text(encoding="utf-8")
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
-        if not lines:
-            return None
-        parts = lines[-1].split(" ")
-        if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
-            raise LadderError("梯子锚点格式不合法(fail-closed)")
-        return int(parts[0]), parts[1]
+        if text and not text.endswith(chr(10)):             # 撕裂的末行(崩在追加中途)不算;写入口会截掉它
+            text = text[: text.rfind(chr(10)) + 1]
+        last_seq, last = 0, None
+        for line in (item for item in text.splitlines() if item.strip()):
+            parts = line.split(" ")
+            if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+                raise LadderError("梯子锚点格式不合法(fail-closed)")
+            seq = int(parts[0])
+            if seq < 1 or seq <= last_seq:                  # 第 17 轮:锚点自身必须严格递增、从 1 起(seq=0 会把下标读成 rows[-1])
+                raise LadderError("梯子锚点的序号不是严格递增的正整数(fail-closed)")
+            last_seq, last = seq, parts[1]
+        return None if last is None else (last_seq, last)
 
     def _check_anchor(self, rows: list[dict], repair: bool) -> None:
         if self.anchor is None:
@@ -209,13 +219,25 @@ class Ladder:
             raise LadderError("梯子有日志却没有锚点(fail-closed):锚点被删过,或日志是被换进来的")
         seq, digest = anchored
         if len(rows) < seq or rows[seq - 1]["hash"] != digest:
-            raise LadderError("梯子日志与锚点对不上(fail-closed):日志被回滚、截断或整条换掉")
+            raise LadderError("梯子日志与锚点对不上(fail-closed):日志被回滚、截断或整条换掉;"
+                              "确认要从头开始请由人执行 `scripts/research_ladder.py reset --reason ...`")
+
+    @staticmethod
+    def _trim_torn_tail(path: Path) -> None:
+        """文件不以换行结尾 = 上次崩在追加一行的中途:把那半行截掉,再追加(第 17 轮 M3)。"""
+        if not path.exists():
+            return
+        data = path.read_bytes()
+        if data and not data.endswith(bytes([10])):
+            with open(path, "r+b") as stream:
+                stream.truncate(data.rfind(bytes([10])) + 1)
 
     def _write_anchor(self, record: dict) -> None:
         if self.anchor is None:
             return
         try:
             self.anchor.parent.mkdir(parents=True, exist_ok=True)
+            self._trim_torn_tail(self.anchor)
             with open(self.anchor, "a", encoding="utf-8", newline="") as stream:
                 stream.write(f"{record['seq']} {record['hash']}" + chr(10))
                 stream.flush()
@@ -272,9 +294,13 @@ class Ladder:
         record = {"seq": prev["seq"] + 1, "event": event, "run_id": run_id, "queries": queries, "best": best,
                   "budget": min(prev["budget"], self.budget), "note": note, "prev": prev["hash"], "hash": ""}
         record["hash"] = _digest(prev["hash"], _body(record))
-        size_before = self.log_path.stat().st_size if self.log_path.exists() else 0
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._trim_torn_tail(self.log_path)
+        except OSError as exc:
+            raise LadderError(f"梯子日志写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
+        size_before = self.log_path.stat().st_size if self.log_path.exists() else 0
+        try:
             with open(self.log_path, "a", encoding="utf-8", newline="") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + chr(10))
                 stream.flush()
@@ -360,6 +386,33 @@ class Ladder:
             self._append(rows, "submit", run_id=run_id, queries=plan["queries_used"], best=plan["reported"], note=None)
             return plan
 
+    def reset(self, reason: str) -> dict:
+        """**人工**从头开始(第 17 轮 H2):把日志、头指针、锚点各自改名归档(`.bak-<序号>`),梯子回到全新状态。
+
+        什么时候要用:清理/恢复结果目录时只带走了一半文件(锚点在 `data/ladder_anchor/`,日志在 `data/research/ladder/`),
+        梯子因"日志与锚点对不上"而 fail-closed。**代价必须说清**:`best` 归零、查询数归零——已经泄漏的信息收不回来,
+        所以它是比 `renew` 更重的操作,只留给人;归档文件保留着全部历史,原因写进 `ladder.reset.log`。"""
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_NOTE:
+            raise LadderError(f"reset 必须给出 1..{MAX_NOTE} 字符的原因")
+        files = [f for f in (self.path, self.log_path, self.anchor) if f is not None]
+        with _lock:
+            moved = []
+            n = 1
+            while any(Path(str(f) + f".bak-{n}").exists() for f in files):
+                n += 1
+            try:
+                for f in files:
+                    if f.exists():
+                        target = Path(str(f) + f".bak-{n}")
+                        os.replace(f, target)
+                        moved.append(target.name)
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.path.parent / "ladder.reset.log", "a", encoding="utf-8", newline="") as stream:
+                    stream.write(json.dumps({"archive": n, "files": moved, "reason": reason.strip()}, ensure_ascii=False) + chr(10))
+            except OSError as exc:
+                raise LadderError(f"reset 失败: {_why(exc)}") from exc
+        return {"archived": moved, "archive_number": n}
+
     def renew(self, note: str, *, force: bool = False) -> dict:
         """人工续期:`queries` 归零、**保留 `best`**,必须给出非空原因,留一条审计记录。
 
@@ -372,7 +425,8 @@ class Ladder:
             state = self._state(rows, self.budget)
             if not force and state["queries"] < state["budget"]:
                 raise LadderError(f"预算还没用尽({state['queries']}/{state['budget']}),不得续期;确需提前续期请显式 force(审计里会标注)")
-            text = note.strip() if not force else "[强制] " + note.strip()
+            early = state["queries"] < state["budget"]                 # 第 17 轮 L1:只有真的提前续期才标"强制"
+            text = "[强制] " + note.strip() if (force and early) else note.strip()
             if len(text) > MAX_NOTE:
                 raise LadderError(f"续期原因加前缀后超过 {MAX_NOTE} 字符")
             record = self._append(rows, "renew", run_id=None, queries=0, best=state["best"], note=text)

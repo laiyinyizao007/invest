@@ -219,6 +219,14 @@ def ledger_path(directory: Path, campaign_id: str) -> Path:
     return Path(directory) / f"{campaign_id}.jsonl"
 
 
+def _legacy_dsr(row):
+    """读侧容忍旧口径(精确 dsr):就地量化成档位再校验(第 17 轮 L2)。**写侧仍然严格**——旧台账可以读、可以继续追加。"""
+    value = row.get("dsr") if isinstance(row, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value not in DSR_LEVELS and 0.0 <= value <= 1.0:
+        row = {**row, "dsr": dsr_level(value)}
+    return row
+
+
 def read_records(directory: Path, campaign_id: str) -> list[dict]:
     """读整份台账并**逐条校验**。文件不存在 = 空;任何一行不合法 = 损坏,抛 LineageError(fail-closed)。"""
     path = ledger_path(directory, campaign_id)
@@ -238,7 +246,7 @@ def read_records(directory: Path, campaign_id: str) -> list[dict]:
         if len(rows) >= MAX_LEDGER_LINES:
             raise LineageError("台账行数超过上限")
         try:
-            row = validate_record(json.loads(line))
+            row = validate_record(_legacy_dsr(json.loads(line)))
         except ValueError as exc:                                    # JSONDecodeError 是 ValueError
             raise LineageError(f"台账第 {number} 行无法解析(fail-closed): {exc}") from exc
         except LineageError as exc:

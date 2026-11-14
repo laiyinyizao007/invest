@@ -33,11 +33,18 @@ def main(argv: list[str] | None = None) -> int:
     renew = sub.add_parser("renew", help="续期:queries 归零、保留 best,留审计记录")
     renew.add_argument("--reason", required=True, help="续期原因(必填,写进审计日志,至多 200 字符)")
     renew.add_argument("--force", action="store_true", help="预算还没用尽也续期(审计日志里标注 [强制])")
+    reset = sub.add_parser("reset", help="从头开始:归档日志/头指针/锚点(best 与查询数都归零,只留给人)")
+    reset.add_argument("--reason", required=True, help="原因(必填,写进 ladder.reset.log,至多 200 字符)")
     args = parser.parse_args(argv)
     _, paths = api.settings()
     ladder = ladder_for(paths)
     try:
-        out = ladder.status() if args.command == "status" else ladder.renew(args.reason, force=args.force)
+        if args.command == "status":
+            out = ladder.status()
+        elif args.command == "reset":
+            out = ladder.reset(args.reason)
+        else:
+            out = ladder.renew(args.reason, force=args.force)
     except LadderError as exc:
         print(f"拒绝: {exc}", file=sys.stderr)
         return 1

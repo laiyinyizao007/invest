@@ -354,14 +354,19 @@ class GatewayApp:
             return 500, {"error": LADDER_UNAVAILABLE}
         return (429, {"error": LADDER_EXHAUSTED}) if left <= 0 else None
 
-    def _reveal(self, result: dict, *, allow_query: bool = True):
-        """落盘结果 → 净化视图。梯子用尽 429;梯子/存档损坏 500(fail-closed,不放出任何验证窗口信息)。"""
+    def _reveal(self, result: dict, *, allow_query: bool = True, skip_bad_result: bool = False):
+        """落盘结果 → 净化视图。梯子用尽 429;梯子/存档损坏 500(fail-closed,不放出任何验证窗口信息)。
+
+        `skip_bad_result`(批量接口 `/feedback` 用,第 17 轮 M2):**单个**结果/存档不合法只跳过这一个(返回 None),
+        梯子本身不可用仍然整体 500——一份坏结果文件不该让进化回路唯一的诊断通道整体下线。"""
         try:
             view = reveal(result, ladder=self._ladder(), store=self._reveal_store(), allow_query=allow_query)
         except LadderExhausted:
             return 429, {"error": LADDER_EXHAUSTED}
-        except (LadderError, OutwardError):
+        except LadderError:
             return 500, {"error": LADDER_UNAVAILABLE}
+        except OutwardError:
+            return (200, None) if skip_bad_result else (500, {"error": LADDER_UNAVAILABLE})
         return 200, view
 
     def _reveal_outcome(self, outcome: tuple):
@@ -468,7 +473,7 @@ class GatewayApp:
                 continue
             if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
                 continue
-            status, view = self._reveal(result, allow_query=False)
+            status, view = self._reveal(result, allow_query=False, skip_bad_result=True)
             if status != 200:
                 return status, view
             if view is None:                                    # 从未揭示过:不在这里揭示

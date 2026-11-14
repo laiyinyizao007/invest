@@ -479,7 +479,7 @@ def test_a_crash_before_the_anchor_is_written_is_not_a_false_alarm(tmp_path):
 def test_a_garbled_anchor_fails_closed(tmp_path):
     ladder = anchored(tmp_path)
     ladder.submit(0.0)
-    ladder.anchor.write_text("garbage", encoding="utf-8")
+    ladder.anchor.write_text("garbage" + chr(10), encoding="utf-8")
     with pytest.raises(LadderError, match="锚点"):
         ladder.status()
 
@@ -500,3 +500,95 @@ def test_status_has_and_preview_never_write(tmp_path):
     before = {f: f.read_bytes() for f in (ladder.path, ladder.log_path, ladder.anchor)}
     ladder.status(), ladder.has("x"), ladder.preview(2.0)
     assert before == {f: f.read_bytes() for f in before}
+
+
+# ---------- 第 17 轮 codex ----------
+
+def test_a_truncated_anchor_does_NOT_defeat_a_consistent_truncation_only_if_it_is_not_cut_too(tmp_path):
+    """如实记录(H1):锚点与日志**一起**截,梯子发现不了——锚点是误操作探测器,不是回滚探测器。"""
+    ladder = anchored(tmp_path)
+    for _ in range(5):
+        ladder.submit(0.0)
+    consistent_truncate(ladder, 2)
+    lines = ladder.anchor.read_text(encoding="utf-8").splitlines(keepends=True)
+    ladder.anchor.write_text("".join(lines[:2]), encoding="utf-8")
+    assert ladder.status()["queries_used"] == 2                       # 被接受:这是残余 #12 里写明的边界
+
+
+@pytest.mark.parametrize("content", [
+    "0 " + "a" * 64 + chr(10),                                       # seq=0:曾经把下标读成 rows[-1]
+    "2 " + "a" * 64 + chr(10) + "1 " + "b" * 64 + chr(10),           # 不递增
+    "1 " + "a" * 64 + chr(10) + "1 " + "a" * 64 + chr(10),           # 重复
+])
+def test_an_anchor_whose_sequence_is_not_strictly_increasing_from_one_fails_closed(tmp_path, content):
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    ladder.anchor.write_text(content, encoding="utf-8")
+    with pytest.raises(LadderError, match="锚点"):
+        ladder.status()
+
+
+def test_a_torn_anchor_tail_is_ignored_and_trimmed_on_the_next_write(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(2):
+        ladder.submit(0.0)
+    with open(ladder.anchor, "a", encoding="utf-8") as stream:
+        stream.write("3 dea")                                         # 崩在追加中途
+    assert ladder.status()["queries_used"] == 2
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 3
+    assert all(len(l.split(" ")[1]) == 64 for l in ladder.anchor.read_text(encoding="utf-8").splitlines())
+
+
+def test_a_torn_log_tail_is_ignored_and_trimmed_on_the_next_write(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(2):
+        ladder.submit(0.0)
+    with open(ladder.log_path, "a", encoding="utf-8") as stream:
+        stream.write('{"seq":3,"eve')
+    assert ladder.status()["queries_used"] == 2
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 3
+
+
+def test_log_and_head_deleted_while_the_anchor_remains_is_recoverable_only_by_an_explicit_reset(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    ladder.log_path.unlink()
+    ladder.path.unlink()
+    with pytest.raises(LadderError, match="reset"):
+        ladder.status()                                               # 报错里给出出路
+    out = ladder.reset("清理结果目录时只带走了一半文件")
+    assert out["archived"] and ladder.status()["queries_used"] == 0
+    assert (ladder.path.parent / "ladder.reset.log").exists()
+
+
+def test_reset_archives_everything_and_keeps_the_history_and_never_overwrites_an_archive(tmp_path):
+    ladder = anchored(tmp_path)
+    ladder.submit(5.5)
+    first = ladder.reset("第一次")
+    ladder.submit(0.0)
+    second = ladder.reset("第二次")
+    assert first["archive_number"] == 1 and second["archive_number"] == 2
+    assert any(p.name.endswith(".bak-1") for p in ladder.path.parent.iterdir())
+    assert ladder.status()["reported"] == 0.0
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "x" * 201, None])
+def test_reset_needs_a_real_reason_and_touches_nothing_without_it(tmp_path, reason):
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    with pytest.raises(LadderError):
+        ladder.reset(reason)
+    assert ladder.status()["queries_used"] == 1
+
+
+def test_force_renew_after_exhaustion_is_not_labelled_forced(tmp_path):
+    ladder = Ladder(tmp_path / "l.json", budget=2)
+    ladder.submit(0.0)
+    ladder.submit(0.0)
+    ladder.renew("用尽后续期", force=True)
+    assert "[强制]" not in ladder.log_path.read_text(encoding="utf-8")
+    ladder.renew("提前续期", force=True)
+    assert "[强制] 提前续期" in ladder.log_path.read_text(encoding="utf-8")

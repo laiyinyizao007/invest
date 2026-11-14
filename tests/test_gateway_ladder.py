@@ -214,13 +214,25 @@ def test_feedback_includes_failures_that_carry_no_validation_numbers(tmp_path):
     assert ladder_of(app).status()["queries_used"] == 0
 
 
-def test_a_tampered_reveal_archive_makes_feedback_fail_closed(tmp_path):
+def test_a_tampered_reveal_archive_is_skipped_by_feedback_but_fails_closed_on_the_single_run(tmp_path):
+    """第 17 轮 M2:一份坏存档不该让批量的 /feedback 整体下线;单个 run 的读取仍然 fail-closed。"""
+    app = make_app(tmp_path)
+    seed(app, full_result())
+    seed(app, full_result(run_id="other"))
+    call(app, "GET", "/research/results/run42")
+    call(app, "GET", "/research/results/other")
+    (app.paths["results_dir"] / "outward" / "run42.json").write_text("garbage", encoding="utf-8")
+    status, body = call(app, "GET", "/research/feedback")
+    assert status == 200 and [t["run_id"] for t in body["traces"]] == ["other"]       # 坏的那份被跳过,好的照常给
+    assert call(app, "GET", "/research/results/run42")[0] == 500
+
+
+def test_a_broken_ladder_still_takes_the_whole_feedback_endpoint_down(tmp_path):
     app = make_app(tmp_path)
     seed(app, full_result())
     call(app, "GET", "/research/results/run42")
-    (app.paths["results_dir"] / "outward" / "run42.json").write_text("garbage", encoding="utf-8")
+    (app.paths["results_dir"] / "ladder" / "ladder.json").write_text("garbage", encoding="utf-8")
     assert call(app, "GET", "/research/feedback")[0] == 500
-    assert call(app, "GET", "/research/results/run42")[0] == 500
 
 
 def test_the_gateway_still_has_exactly_the_whitelisted_routes():
