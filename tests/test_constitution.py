@@ -190,7 +190,8 @@ def _write(tmp_path, payload):
 
 BASE = {"version": 1, "template": "strategies.trend_atr_15m_strategy:TrendAtr15mStrategy",
         "allowed_overrides": [], "protected_names": [], "protected_parameters": [],
-        "forbidden_order_calls": [], "protected_module_attrs": []}
+        "forbidden_order_calls": [], "protected_module_attrs": [],
+        "protected_entry_points": [], "protected_state_objects": [], "protected_paths": []}
 
 
 def test_json_can_extend_but_never_shrink_the_builtin_lists(tmp_path):
@@ -760,3 +761,641 @@ def test_assigning_a_by_name_setter_in_a_class_body_is_rejected():
     """`class C: update_setting = print` 同理:按名 setter 的赋值形式也要拦。"""
     findings = const.screen_source("class C:" + chr(10) + "    update_setting = print" + chr(10))
     assert findings and any("update_setting" in f for f in findings), findings
+
+
+# ---------- 第 7 轮 codex 复核:C1/C2 与历史守卫的执行点 ----------
+
+# 这一节的每条用例都对应一条**实测复现**过的绕过(真实 15 分钟玉米数据回测,
+# 不是推测):
+#   C1  候选直接调 self._send_entry(...) → 绕开 _try_enter 里的 within_budget
+#       与 guard.can_open。atr_mult=50 时诚实模板成交 0 笔(157 次被预算拦下),
+#       候选成交 2 笔、单笔止损距离 508.7(≈17 倍 300 元预算)。
+#   C2  候选写 self.guard.max_losses / self.guard._losses / self.cta_engine.size
+#       → 熔断器失效;后者把回撤从 -4272 元/-39.97% 缩成 -0 元/-0.00%,
+#       promotion_gate 的 2000 元与 20% 两道门槛同时失效。
+# 两条在当时都是**三层校验全绿**。
+
+EVIL_CALLS_ENTRY = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            signal = super().entry_signal()
+            if signal:
+                self._send_entry(signal, float(self.atr_value) * 50.0, float(self.am.close[-1]))
+            return 0
+''')
+
+EVIL_TAMPERS_BREAKER = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.guard.max_losses = 999
+            self.guard._losses = 0
+            return super().entry_signal()
+''')
+
+EVIL_TAMPERS_ENGINE = textwrap.dedent('''
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    class Evil(TrendAtr15mStrategy):
+        def entry_signal(self) -> int:
+            self.cta_engine.size = 0.001
+            return super().entry_signal()
+''')
+
+
+@pytest.mark.parametrize("source", [EVIL_CALLS_ENTRY, EVIL_TAMPERS_BREAKER, EVIL_TAMPERS_ENGINE])
+def test_round7_bypass_candidates_are_rejected_by_the_static_layer(source):
+    """第 7 轮实测的三条绕过:静态层必须全部拦下(原来全是空的)。"""
+    findings = screen(source)
+    assert findings, "第 7 轮的绕过候选没有被静态层拦下:" + source
+
+
+@pytest.mark.parametrize("method", [
+    "_send_entry", "_try_enter", "_manage_position", "_place_protective_stop",
+    "_place_pending_entry", "_process_daily_bar",
+])
+def test_referencing_a_protected_entry_point_is_rejected(method):
+    """风控执行点连"引用"都不许——`f = self._send_entry` 之后 `f(...)` 的调用点看不出是谁。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           f"        f = self.{method}\n        return 0\n")
+    findings = screen(src)
+    assert findings and any("风控执行点" in f for f in findings), findings
+
+
+@pytest.mark.parametrize("statement", [
+    "self.guard.max_losses = 999",
+    "self.guard._losses = 0",
+    "self.cta_engine.size = 0.001",
+    "self.trail.stop = 0.0",
+    "self.am.close = [1.0]",
+    "del self.guard.max_losses",
+])
+def test_writing_into_a_protected_object_is_rejected(statement):
+    """写受保护对象的**内部状态**要拦——早先只看末段属性名,整条属性路径没人看。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement} 未被拦下:{findings}"
+
+
+@pytest.mark.parametrize("statement", [
+    "g = self.guard",
+    "g = self.trail",
+    "g = self.cta_engine",
+    "arr = self.am.array",
+])
+def test_aliasing_a_protected_object_is_rejected(statement):
+    """取别名也要拦:只禁"写"会被 `g = self.guard` 之后的 `g.max_losses = 999` 绕过去。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings, f"{statement} 未被拦下:{findings}"
+
+
+def test_reading_a_protected_state_object_is_rejected():
+    """熔断器与引擎连读都不许:候选读得到它们,就离改写它们只差一步。"""
+    src = "class C:\n    def entry_signal(self):\n        n = self.guard._losses\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("风控状态对象" in f for f in findings), findings
+
+
+def test_a_candidate_may_still_keep_its_own_nested_state():
+    """别把候选自己的状态也一起拦了:风控底线之外的东西必须还能写。
+
+    这条是上面几条的**反面**用例:静态层拦的是"受保护的对象",
+    不是"所有带点号的赋值"。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        self.my_state.counter = self.my_state.counter + 1\n        return 0\n")
+    assert screen(src) == []
+
+
+def test_reading_the_market_data_is_still_allowed():
+    """候选的正当用途不能被误伤:读 `self.am.close[-1]` 是它存在的意义。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        close = self.am.close[-1]\n        return 1 if close > 0 else 0\n")
+    assert screen(src) == []
+
+
+# ---------- 第 8 轮自查发现的两个缺口(别名改写 + 行情数组被原地改写) ----------
+
+@pytest.mark.parametrize("statement", [
+    "s = self\n        s.risk_budget = 1e12",          # 给 self 取别名之后改底线
+    "o = object()\n        o.risk_budget = 1e12",      # 根不是 self 也要拦
+    "s = self\n        s.am.close = [1.0]",
+])
+def test_writing_a_protected_member_is_rejected_whatever_the_root_is(statement):
+    """写受保护成员不看根:只认 `self.` 开头的话,`s = self` 之后就绕过去了。
+
+    早先的实现只按 `self.` 开头的路径判定(第 8 轮自查实测:三种写法静态层全返回空列表),
+    现在改成"属性路径里任何一段命中受保护成员就算越权"。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement!r} 未被拦下:{findings}"
+
+
+@pytest.mark.parametrize("statement", [
+    "self.am.close[0] = 999.0",     # 原地改写行情数组(下标赋值)
+    "self.am.close_array[-1] = 999.0",
+])
+def test_writing_into_the_price_array_in_place_is_rejected(statement):
+    """下标赋值改的是被取到的那个对象本身——行情数组被改 = 回测数据被伪造。"""
+    src = "class C:\n    def entry_signal(self):\n        " + statement + "\n        return 0\n"
+    findings = screen(src)
+    assert findings and any("受保护" in f for f in findings), f"{statement!r} 未被拦下:{findings}"
+
+
+def test_binding_the_price_array_to_another_name_is_rejected():
+    """`arr = self.am.close` 之后 `arr[0] = 999` 改的是同一个数组——别名也不许取。
+
+    vn.py 的 ArrayManager 里 `close` 是 property,返回的就是 `close_array` 本身
+    (不是副本),所以"取出来再改"和"直接改"是一回事。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        arr = self.am.close\n        arr[0] = 999.0\n        return 0\n")
+    findings = screen(src)
+    assert findings and any("容器" in f for f in findings), findings
+
+
+def test_reading_a_single_price_is_still_allowed():
+    """取别名这条不许太宽:带下标的读(取到的是一个数)与带调用的读都要放行。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        close = self.am.close[-1]\n"
+           "        atr = self.am.atr(14)\n"
+           "        return 1 if close > 0 else 0\n")
+    assert screen(src) == []
+
+
+# ---------- 运行时第三层:回测跑完之后核对受保护对象的实例状态 ----------
+
+class _FakeGuard:
+    def __init__(self, max_losses: int) -> None:
+        self.max_losses = max_losses
+        self._losses = 0
+
+
+class _FakeEngine:
+    def __init__(self, size: float) -> None:
+        self.size = size
+
+
+def _fake_strategy(**overrides):
+    """造一个"模板家族的实例"但不跑 __init__:运行时第三层只对模板家族生效。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = TrendAtr15mStrategy.__new__(TrendAtr15mStrategy)
+    strategy.risk_budget = 300.0
+    strategy.atr_window = 14
+    strategy.max_daily_losses = 2
+    strategy.guard = _FakeGuard(2)
+    strategy.cta_engine = _FakeEngine(10.0)
+    for key, value in overrides.items():
+        setattr(strategy, key, value)
+    return strategy
+
+
+def test_instance_state_check_passes_for_an_untouched_strategy():
+    assert const.check_instance_state(_fake_strategy(), expected_size=10.0) == []
+
+
+def test_instance_state_check_ignores_strategies_outside_the_template_family():
+    """别的策略(随机入场对照等)有各自的参数,不该被拿模板的底线比。"""
+
+    class Other:
+        risk_budget = 999.0
+        atr_window = 7
+        max_daily_losses = 9
+        guard = _FakeGuard(1)
+        cta_engine = _FakeEngine(1.0)
+
+    assert const.check_instance_state(Other(), expected_size=10.0) == []
+
+
+def test_instance_state_check_catches_a_tampered_breaker():
+    """熔断器阈值与策略用的阈值不一致 = 候选在回测途中改写了其中一个。"""
+    strategy = _fake_strategy()
+    strategy.guard.max_losses = 999
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("熔断" in f for f in findings), findings
+
+
+def test_instance_state_check_catches_a_tampered_contract_size():
+    """合约乘数被改小 → 止损距离算出来的风险金额接近 0 → 两道回撤门槛同时失效。"""
+    strategy = _fake_strategy()
+    strategy.cta_engine.size = 0.001
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("合约乘数" in f for f in findings), findings
+
+
+def test_instance_state_check_catches_a_tampered_risk_budget():
+    strategy = _fake_strategy()
+    strategy.risk_budget = 1e12
+    findings = const.check_instance_state(strategy, expected_size=10.0)
+    assert findings and any("风险预算" in f for f in findings), findings
+
+
+# ---------- 参数层:嵌套也要查(Medium 5) ----------
+
+def test_check_params_rejects_a_protected_key_in_a_nested_dict():
+    """嵌套里的受保护键同样要查:静态层对任何位置的字典字面量都查,口径必须一致。"""
+    findings = const.check_params({"outer": {"risk_budget": 1}})
+    assert findings, "嵌套的受保护参数未被拒绝"
+    assert any("risk_budget" in f for f in findings), findings
+
+
+def test_check_params_rejects_a_protected_key_in_a_nested_list():
+    findings = const.check_params({"outer": [{"Risk_Budget": 1}]})
+    assert findings, "嵌套列表里的受保护参数(大小写不同)未被拒绝"
+
+
+def test_check_params_still_accepts_ordinary_nested_settings():
+    assert const.check_params({"fast_window": [10, 20], "nested": {"slow_window": 40}}) == []
+
+
+# ---------- 受禁 dunder 的补齐(Low 6)与 __slots__(Low 7) ----------
+
+@pytest.mark.parametrize("dunder", [
+    "__del__", "__reduce__", "__reduce_ex__", "__mro_entries__",
+    "__dict__", "__class__", "__mro__", "__globals__", "__code__",
+])
+def test_reflecting_dunders_may_not_be_referenced(dunder):
+    """反射型 dunder 能拿到"装着状态的那个容器",从那里绕回来改写状态。"""
+    src = f"class C:\n    def entry_signal(self):\n        x = self.guard.{dunder}\n        return 0\n"
+    findings = screen(src)
+    assert findings and any(dunder in f for f in findings), findings
+
+
+def test_defining_a_forbidden_dunder_is_rejected():
+    for dunder in ("__del__", "__reduce__", "__reduce_ex__", "__mro_entries__"):
+        findings = screen(f"class C:\n    def {dunder}(self):\n        pass\n")
+        assert findings and any(dunder in f for f in findings), findings
+
+
+def test_slots_hiding_a_protected_name_is_rejected():
+    """`__slots__ = ("risk_budget",)` 早先只有运行时层拦得住,静态层也扫一遍。"""
+    findings = screen("class C:\n    __slots__ = ('risk_budget',)\n")
+    assert findings and any("__slots__" in f for f in findings), findings
+
+
+# ---------- 历史守卫:守"执行点",白名单只减不增(High 3) ----------
+
+def test_history_guard_notices_a_deleted_enforcement_site():
+    """把 `if name in BUILTIN_FORBIDDEN_DUNDERS:` 整块删掉,常量集合没变,底线不再被执行。
+
+    第 7 轮 codex 实测:这类改法下守卫退出码是 0(全绿)。守卫必须看住**执行点**。"""
+    from tools.check_constitution_history import usage_regressions
+
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    assert "BUILTIN_FORBIDDEN_DUNDERS" in source
+    # 改的是**执行点**(引用),常量定义本身留着——这正是"常量还在、底线不执行"的那种改法
+    mutilated = source.replace("in BUILTIN_FORBIDDEN_DUNDERS", "in SOMETHING_ELSE")
+    assert mutilated != source, "用例本身失效:源码里找不到 BUILTIN_FORBIDDEN_DUNDERS 的引用"
+    regressions = usage_regressions(mutilated, source, ("BUILTIN_FORBIDDEN_DUNDERS",))
+    assert "BUILTIN_FORBIDDEN_DUNDERS" in regressions, regressions
+
+
+def test_history_guard_notices_a_removed_field_branch():
+    """删掉 `c.forbidden_order_calls` 的执行分支:清单与常量都没变,下单黑名单却不再被执行。"""
+    from tools.check_constitution_history import usage_regressions
+
+    source = (ROOT / "risk" / "constitution.py").read_text(encoding="utf-8")
+    mutilated = source.replace("c.forbidden_order_calls", "c.something_else", 1)
+    assert mutilated != source, "用例本身失效:源码里找不到 c.forbidden_order_calls"
+    regressions = usage_regressions(mutilated, source, ("forbidden_order_calls",))
+    assert "forbidden_order_calls" in regressions, regressions
+
+
+def test_history_guard_treats_the_override_whitelist_as_shrink_only():
+    """白名单多一项 = 多放开一点底线,与保护清单"只能追加"的规则正好相反。"""
+    from tools.check_constitution_history import shrink_only_additions
+
+    assert shrink_only_additions({"entry_signal", "get_size"}, {"entry_signal"}) == {"get_size"}
+    assert shrink_only_additions({"entry_signal"}, {"entry_signal", "get_size"}) == set()
+
+
+def test_the_shipped_manifest_has_the_new_fields():
+    """清单文件必须带上新字段:缺字段一律 fail-closed,不能让新规则静默失效。"""
+    constitution = const.load()
+    assert constitution.protected_entry_points
+    assert constitution.protected_state_objects
+    assert "_send_entry" in constitution.protected_entry_points
+    assert "guard" in constitution.protected_state_objects
+
+
+# ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)、__new__ 早于快照(High 2) ----------
+
+def test_patching_a_risk_guard_helper_is_rejected():
+    """`rg.risk_per_trade = lambda ...: 0.0` 直接架空单笔风险预算。
+
+    第 9 轮 codex 实测:这一行让 skipped_by_budget 从 326 变成 0、单笔止损算出 2901 元
+    (预算的 9.7 倍),而静态层/沙盒层/check_class/check_instance_state **四层全部放行**。
+    `risk_per_trade` 此前根本不在受保护的模块属性名单里——`within_budget` 只是把算术委托给它。"""
+    findings = screen('''
+import risk.risk_guard as rg
+
+rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+''')
+    assert findings, "模块级 monkey-patch 没被静态层拦下"
+    assert any("risk_per_trade" in f for f in findings)
+
+
+def test_patching_the_loss_breaker_class_is_rejected():
+    """`rg.DailyLossGuard.can_open = lambda self, day: True` 架空当日连亏熔断。
+
+    末段属性名是 `can_open`,不在受保护名单里;**受保护的是路径中间的 `DailyLossGuard`**,
+    所以必须按整条路径判,不能只看末段。"""
+    findings = screen('''
+import risk.risk_guard as rg
+
+rg.DailyLossGuard.can_open = lambda self, day: True
+''')
+    assert findings, "改写熔断器类没被静态层拦下"
+    assert any("DailyLossGuard" in f for f in findings)
+
+
+def test_patching_a_risk_guard_module_is_rejected_however_it_is_spelled():
+    """别名、深层路径都要拦:枚举写法封不住"能力",但能给出清楚的拒绝理由。"""
+    for source in (
+        '''
+import risk.risk_guard as rg
+rg.within_budget = lambda *a, **k: True
+''',
+        '''
+import risk.risk_guard
+risk.risk_guard.risk_per_trade = lambda *a, **k: 0.0
+''',
+        '''
+from risk import risk_guard
+risk_guard.TrailingStop.update = lambda *a, **k: 0.0
+''',
+    ):
+        findings = screen(source)
+        assert findings, source
+
+
+def test_a_write_whose_root_is_a_call_is_rejected():
+    """根不是可解析的名字时(`type(cls).risk_budget = 1e12`)也要按末段属性名判。
+
+    属性路径解析遇到调用表达式就断了,于是整条路径判不到——第 9 轮 codex 与本次自查
+    都实测到这一类放行。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        type(self).risk_budget = 1e12
+        return 0
+''')
+    assert findings, "根是调用表达式的写入没被拦下"
+    assert any("risk_budget" in f for f in findings)
+
+
+def test_defining_new_is_rejected():
+    """`__new__` 在实例构造时执行,**早于**回测前的快照:它里面的改写会被当成"基线"。
+
+    第 9 轮 codex 实测三层全放行。候选没有正当理由自定义 `__new__`,直接禁掉。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(cls)
+''')
+    assert findings, "自定义 __new__ 没被拦下"
+    assert any("__new__" in f for f in findings)
+
+
+def test_referencing_new_is_rejected():
+    """引用 `__new__` 同样要拦:定义被拦了,拿别名再调用还在。"""
+    findings = screen('''
+class Evil(TrendAtr15mStrategy):
+    def entry_signal(self) -> int:
+        obj = super().__new__(type(self))
+        return 0
+''')
+    assert findings and any("__new__" in f for f in findings)
+
+
+# ---------- 运行期第四层:受保护模块与模板类的"身份指纹" ----------
+
+def test_the_protected_state_covers_the_risk_guard_and_the_template():
+    """指纹必须覆盖风控模块**和**模板类:两者都是候选够得着的改写目标。"""
+    snapshot = const.snapshot_protected_state()
+    keys = " ".join(snapshot)
+    assert "risk_per_trade" in keys
+    assert "DailyLossGuard" in keys
+    assert "get_size" in keys, "模板类的方法不在指纹里"
+
+
+def test_an_untouched_protected_state_produces_no_findings():
+    before = const.snapshot_protected_state()
+    after = const.snapshot_protected_state()
+    assert const.check_protected_state(before, after) == []
+
+
+def test_the_protected_state_notices_a_patched_risk_helper():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.risk_per_trade
+    try:
+        rg.risk_per_trade = lambda stop_dist, size, volume=1: 0.0
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写风控模块函数没被抓到"
+        assert any("risk_per_trade" in f for f in findings)
+    finally:
+        rg.risk_per_trade = original
+
+
+def test_the_protected_state_notices_a_patched_breaker_method():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.DailyLossGuard.can_open
+    try:
+        rg.DailyLossGuard.can_open = lambda self, day: True
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写熔断方法没被抓到"
+    finally:
+        rg.DailyLossGuard.can_open = original
+
+
+def test_the_protected_state_notices_a_patched_template_method():
+    """模板类被改写同样致命:`get_size` 改一下,风险金额算出来就不一样了。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    before = const.snapshot_protected_state()
+    original = TrendAtr15mStrategy.get_size
+    try:
+        TrendAtr15mStrategy.get_size = lambda self: 100
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写模板类方法没被抓到"
+        assert any("get_size" in f for f in findings)
+    finally:
+        TrendAtr15mStrategy.get_size = original
+
+
+def test_the_protected_state_notices_a_deleted_member():
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.within_budget
+    try:
+        del rg.within_budget
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "删掉风控函数没被抓到"
+    finally:
+        rg.within_budget = original
+
+
+def test_the_protected_state_is_taken_before_the_candidate_imports_anything():
+    """子进程里候选执行前就要把模板模块**预先导入**并拍快照。
+
+    否则模板模块是候选自己 import 的,快照里根本没有它,候选在导入期把它改写了也抓不到。"""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys;"
+        "from risk import constitution as const;"
+        "snap = const.snapshot_protected_state();"
+        "print(any('get_size' in k for k in snap))"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip().endswith("True"), out.stdout + out.stderr
+
+
+# ---------- 第 10 轮 codex:函数对象的**状态**与实例上的**遮蔽**(两条 Critical) ----------
+
+def test_the_static_layer_refuses_an_instance_shadow_of_get_size():
+    """候选在**实例**上遮蔽 `get_size`,静态层必须拦。
+
+    `self.get_size = lambda: 0.001` 把真实合约乘数 10 换成 0.001:
+    `within_budget(dist, self.get_size(), self.risk_budget)` 算出来的风险金额是
+    dist × 0.001,300 元预算等于 0.003 元,任何止损距离都"在预算内"。
+    类字典里没有这个赋值(`check_class` 比不出来),实例字段快照也不盯它——
+    四层防线全都放行(第 10 轮自查实测)。"""
+    src = textwrap.dedent(
+        """
+        from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+        class S(TrendAtr15mStrategy):
+            def entry_signal(self):
+                self.get_size = lambda: 0.001
+                return 1
+        """)
+    findings = const.screen_source(src)
+    assert findings, "实例上遮蔽 get_size 没被拦"
+    assert any("get_size" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_tampering_with_a_functions_state():
+    """改函数**对象的状态**(默认参数)也要拦。
+
+    `within_budget.__defaults__ = (0.0,)` 把 volume 的默认值变成 0,
+    单笔风险金额恒为 0——改的不是名字,是对象的状态,按名字的黑名单全都看不见。"""
+    findings = const.screen_source("f.__defaults__ = (0.0,)\n")
+    assert findings, "改写函数的默认参数没被拦"
+    assert any("__defaults__" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_reading_the_risk_functions():
+    """候选没有正当理由拿到风控函数的**定义**:风控由基类固定,候选只写信号逻辑。
+
+    拿到定义就多一条改写的路(改对象状态,连名字都不用碰)。"""
+    findings = const.screen_source("from strategies.trend_atr_strategy import within_budget\n")
+    assert findings, "导入风控函数没被拦"
+    assert any("within_budget" in f for f in findings), findings
+
+
+def test_the_static_layer_refuses_the_type_check_entry_points():
+    """改掉 `__instancecheck__` 就能把 isinstance 判定废掉(运行时第三层的家族判定)。"""
+    findings = const.screen_source("x.__instancecheck__\n")
+    assert findings, "__instancecheck__ 没被拦"
+    assert any("__instancecheck__" in f for f in findings), findings
+
+
+def test_the_protected_state_notices_an_in_place_mutation_of_a_function_object():
+    """指纹比的不只是**身份**,还有函数**对象的状态**。
+
+    第 10 轮 codex 实测:只比身份时,`within_budget.__defaults__ = (0.0,)` 完全看不见,
+    300 元单笔预算就此恒真,而四层防线全部放行。"""
+    import risk.risk_guard as rg
+
+    before = const.snapshot_protected_state()
+    original = rg.within_budget.__defaults__
+    try:
+        rg.within_budget.__defaults__ = (0.0,)
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "就地改写函数对象的状态没被抓到"
+        assert any("within_budget" in f for f in findings), findings
+    finally:
+        rg.within_budget.__defaults__ = original
+
+
+def test_the_protected_state_notices_a_patched_class_dunder():
+    """类的 dunder 也在指纹里:改写 `__getattribute__` 能让 `self.get_size()` 返回假的。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    before = const.snapshot_protected_state()
+    original = TrendAtr15mStrategy.__getattribute__
+    try:
+        TrendAtr15mStrategy.__getattribute__ = lambda self, name: 0.001
+        findings = const.check_protected_state(before, const.snapshot_protected_state())
+        assert findings, "改写类的 __getattribute__ 没被抓到"
+    finally:
+        TrendAtr15mStrategy.__getattribute__ = original
+
+
+def _bare_family_instance():
+    """造一个**不跑 __init__** 的家族实例:只用来核对第三层的判定逻辑。"""
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+
+    return object.__new__(TrendAtrStrategy)
+
+
+def test_the_instance_state_check_notices_a_shadowed_template_method():
+    """实例上遮蔽模板方法(第三层):类字典比不出来的那一类改写。"""
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = _bare_family_instance()
+    findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy)
+    assert not findings, findings
+
+    strategy.get_size = lambda: 0.001
+    findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy)
+    assert findings, "实例上遮蔽模板方法没被抓到"
+    assert any("get_size" in f for f in findings), findings
+
+
+def test_the_family_check_does_not_depend_on_isinstance():
+    """家族判定走 MRO(结构),不走 isinstance(判定逻辑可被改写)。
+
+    第 10 轮 codex 实测:把 `abc.ABCMeta.__instancecheck__` 换掉之后,
+    isinstance 一律返回 False,第三层直接判成"不适用"而放行。"""
+    import abc
+
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+    strategy = _bare_family_instance()
+    snapshot = const.snapshot_instance_state(strategy)          # 底线原值
+    strategy.risk_budget = 10 ** 12                            # 途中被改写
+
+    original = abc.ABCMeta.__instancecheck__
+    try:
+        abc.ABCMeta.__instancecheck__ = lambda cls, instance: False
+        findings = const.check_instance_state(strategy, template=TrendAtr15mStrategy, snapshot=snapshot)
+    finally:
+        abc.ABCMeta.__instancecheck__ = original
+    assert findings, "家族判定被改写之后第三层就不工作了"
+    assert any("risk_budget" in f for f in findings), findings
+
+
+def test_the_static_layer_does_not_flag_an_ordinary_reset():
+    """`reset` 这类泛用名字不该按名字一刀切(第 10 轮 codex 的 Low 1)。
+
+    `reset` 是 TrailingStop 的方法名,但候选代码里 `self.indicator.reset = 1` 太常见——
+    按名字一刀切会把正常候选整片拒掉。带主的名字只在**主人也在路径里**时才算命中。"""
+    findings = const.screen_source("class C:\n    def f(self):\n        self.indicator.reset = 1\n")
+    assert not findings, findings
+    assert not const.screen_source("make().reset = 1\n")
+
+
+def test_the_static_layer_still_flags_the_risk_objects_own_reset():
+    """带主的名字在主人出现时照样拦:`TrailingStop.reset` 被换掉等于移动止损失效。"""
+    findings = const.screen_source("rg.TrailingStop.reset = lambda self: None\n")
+    assert findings, "改写移动止损的 reset 没被拦"

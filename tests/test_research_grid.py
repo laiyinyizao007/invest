@@ -2,6 +2,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import importlib.util
+
 import pytest
 
 import research_grid as rg
@@ -21,6 +23,20 @@ BARS = [bar(datetime(2021, 1, 4, 9, 0)), bar(datetime(2021, 6, 1, 9, 0)), bar(da
 
 
 # ---------- 声明校验 ----------
+
+# 这两条用例要 import 交易栈(walk_forward_optimizer / strategies.*)才能核对常量:
+# CI 的研究侧闸门不装交易环境,那里**跳过**而不是失败(缺依赖 ≠ 行为不对)。
+def _trading_stack_missing() -> bool:
+    try:
+        return importlib.util.find_spec("vnpy_ctastrategy") is None
+    except (ImportError, ValueError):
+        return True
+
+
+requires_trading_stack = pytest.mark.skipif(
+    _trading_stack_missing(),
+    reason="需要交易栈:CI 的研究侧闸门不装交易环境")
+
 
 def test_valid_grid_returns_axes_in_declared_order():
     axes = rg.validate_grid(GRID, Cand, max_cells=100)
@@ -138,6 +154,7 @@ def test_result_is_json_serialisable():
     json.dumps(result, ensure_ascii=False)
 
 
+@requires_trading_stack
 def test_first_validation_start_is_locked_to_the_walk_forward_windows():
     import walk_forward_optimizer as wf
     assert rg.FIRST_VALIDATION_START == wf.build_windows()[0].valid_start
@@ -153,3 +170,31 @@ def test_grid_rejects_protected_parameters():
 
     with pytest.raises(GridError, match="risk_budget"):
         validate_grid({"fast_window": [1, 2, 3], "slow_window": [1, 2, 3], "risk_budget": [1, 2, 3]}, C, 100)
+
+
+def test_grid_rejects_a_protected_axis_with_a_different_case():
+    """网格的受保护轴检查必须与 `check_params` 同一把尺子(大小写不敏感)。
+
+    原来这里只查 `protected_parameters` 且大小写敏感,而参数层查的是「成员 ∪ 参数」
+    且大小写不敏感——同一把尺子两处量纲不同:候选把参数名写成 `Risk_Budget`
+    并把网格键拼出来,网格层就放行了(第 7 轮 codex 实测)。"""
+    from research_grid import GridError, validate_grid
+
+    class C:
+        parameters = ["fast_window", "slow_window", "atr_mult", "Risk_Budget"]
+
+    with pytest.raises(GridError, match="Risk_Budget"):
+        validate_grid({"fast_window": [1, 2, 3], "slow_window": [1, 2, 3],
+                       "Risk_Budget": [1, 2, 3]}, C, 100)
+
+
+def test_grid_rejects_an_axis_named_after_a_protected_member():
+    """受保护**成员**也不许进网格(它同样装着风控状态)。"""
+    from research_grid import GridError, validate_grid
+
+    class C:
+        parameters = ["fast_window", "slow_window", "atr_mult", "guard"]
+
+    with pytest.raises(GridError, match="guard"):
+        validate_grid({"fast_window": [1, 2, 3], "slow_window": [1, 2, 3],
+                       "guard": [1, 2, 3]}, C, 100)
