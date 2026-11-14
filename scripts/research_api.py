@@ -344,16 +344,22 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         code = compile(source, str(path), "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise JobError(EXIT_REFUSED, f"策略文件语法错误: {exc}") from exc
-    # 模块元数据用标准 loader 准备(保留 __spec__/__loader__/__package__),
-    # 但**不调用** exec_module:执行的是上面编译好的、经过校验的那份字节,
-    # .pyc 没有机会生效(那正是第 4 轮修掉的 .pyc 绕过)。
+    # 模块元数据只留 `__file__`/`__package__`/`__name__`:**不给候选真正的 loader**(第 21 轮实测的逃逸之三)。
+    #
+    # 此前把 `spec` 与 `spec.loader` 挂到候选模块上("保留标准 loader 元数据"),
+    # 于是候选可以:
+    #     import types
+    #     m = types.ModuleType("pending_strategy")
+    #     __loader__.exec_module(m)          # 用**真实内建**把候选源码再跑一遍
+    #     b = m.__dict__["__builtins__"]      # 真实内建:setattr / eval / exec / open 全在
+    # 受限内建那一层就此作废(实测)。现在 loader 与 spec 都不给:
+    # `__spec__`/`__loader__` 保持模块默认值(None),候选摸不到能执行代码的入口。
+    # 执行的是上面编译好的、经过校验的那份字节,.pyc 没有机会生效(第 4 轮修掉的 .pyc 绕过)。
     module = types.ModuleType("pending_strategy")
     module.__file__ = str(path)
     try:
         spec = importlib.util.spec_from_file_location("pending_strategy", path)
         if spec is not None:
-            module.__spec__ = spec
-            module.__loader__ = spec.loader
             module.__package__ = spec.parent or ""
             module.__name__ = spec.name
     except Exception:                                        # noqa: BLE001 - 元数据拿不到不该拦住执行
@@ -361,9 +367,24 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 候选执行时用**最小内建集合**:静态层能封住已知的写法,封不住能力本身——
     # `e.__traceback__.tb_frame.f_builtins.setattr(...)` 这类路径上的名字都不在禁用名单里,
     # 而 `unittest.mock.patch.object` 只要能 import 就能改写实例属性。
-    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
+    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,能封住一批已知的路径
     # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
-    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"])
+    #
+    # **但这一层不是边界**(第 21 轮实测,别把它当边界写进结论里):真实内建还能从
+    # ①候选模块的 loader ②异常链上的帧 ③任何第三方模块的 `__dict__["__builtins__"]` 拿到。
+    # ①②已在本文件与 scripts/research_sandbox.py 里封掉;③**仍然敞着**——
+    # 进程内执行不受信代码无法做到安全,真正的边界是人工审批 + 容器隔离(见 ADR 残余风险)。
+    #
+    # 另外加一道**按路径**的导入裁决(第 21 轮):名单只拦得住"名字",
+    # 拦不住"候选自己写一个辅助模块再 import 它"——辅助模块是在 import 机制里执行的,
+    # 拿到的是真实内建,静态层与受限内建对它都不生效。
+    # 快照必须在**候选开始运行之前**拍:文件必须早就存在,否则拒绝导入。
+    started_at_ns = time.time_ns()
+    repo_guard = rs.RepoImportGuard(bootstrap.ROOT,
+                                    snapshot=rs.snapshot_allowed_files(bootstrap.ROOT),
+                                    started_at_ns=started_at_ns)
+    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"],
+                                                      repo_guard=repo_guard)
     # 运行期第四层:候选执行**前后**各拍一张"受保护对象身份指纹"。
     # 静态层按名字判断,拦不住"换个写法"改写框架对象——第 9 轮 codex 实测:
     # `import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`

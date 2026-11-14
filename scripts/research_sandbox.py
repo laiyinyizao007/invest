@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -78,6 +79,11 @@ ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", 
 # 候选执行时的内建字典里**没有 setattr**,那么无论它怎么拿到内建字典都没用——
 # 连 `frame.f_builtins` 也只会拿到这份受限字典。
 #
+# **但这句话只对"候选自己那些帧"成立**(第 22 轮补记,Issue #26):
+# 别人的帧——导入机制的帧、第三方库(如 numpy)的帧——里的 f_builtins 仍然是**真实内建**,
+# 候选顺着异常链能摸到。所以这一层是纵深防御,**不是边界**:
+# 真正的边界是人工审批 + 容器隔离。别把"受限内建"当成"进程里没有 setattr"。
+#
 # 代价:候选用到这些名字会得到 NameError(而不是静默放行),由人在批准前看出来。
 UNSAFE_BUILTINS = frozenset({
     "setattr", "delattr", "getattr", "eval", "exec", "compile", "open",
@@ -89,14 +95,158 @@ UNSAFE_BUILTINS = frozenset({
 # 这些模块能改写任意对象的属性(`unittest.mock.patch.object`)或拿到内建本身,同样禁掉。
 EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
 
+# ---------------------------------------------------------------------------
+# 仓库内允许被候选导入的目录(相对仓库根)。
+#
+# 为什么要按**路径**而不是按名字管导入(第 21 轮实测):
+# 禁用名单是黑名单,而"候选写一个辅助模块再 import 它"这条逃逸**根本不经过名单**——
+# 候选用不受限的第三方库(如 numpy.savetxt)把 .py 写进可写目录,
+# 再 import 它。辅助模块是在 import 机制里执行的,拿到的是**真实内建**,
+# 于是 os/sys/subprocess 全都有了:静态筛查(它只筛候选那份源码)与
+# 受限内建(它只对候选那份源码生效)对它都不起作用。
+#
+# 按名字堵是不收敛的(第 12-14 轮已验证:堵一个名字就出现下一个,而且会误伤
+# 候选本来就要用的 `from strategies.<模板> import <基类>`)。
+# 所以规则改成:**仓库内的模块,只有落在允许目录里、且在候选开始运行之前就已存在的才可导入。**
+ALLOWED_REPO_IMPORT_DIRS = ("strategies",)
 
-def safe_builtins(forbidden_modules: Sequence[str] = ()) -> dict:
+
+def module_origin(name: str) -> str | None:
+    """解析一个模块的来源文件路径;解析不出来返回 None。
+
+    **不执行**该模块,也**不执行**它的父包——这一点是刻意的:
+    用 `importlib.util.find_spec` 定位子模块会真的 import 父包(跑父包的代码),
+    探测动作本身就变成了执行入口。这里用底层的 `PathFinder.find_spec`,
+    它只在给定的路径表里搜文件,不 import 任何东西。
+    """
+    import importlib.machinery as _machinery
+
+    parts = name.split(".")
+    path = None
+    origin = None
+    for index, part in enumerate(parts):
+        try:
+            spec = _machinery.PathFinder.find_spec(part, path)
+        except Exception:                                       # noqa: BLE001 - 探测失败按"查不到"处理
+            return None
+        if spec is None:
+            return None
+        origin = spec.origin
+        if index == len(parts) - 1:
+            return origin
+        locations = spec.submodule_search_locations
+        if locations is None:
+            return None                                          # 不是包,更深的导入本来也不成立
+        path = list(locations)
+    return origin
+
+
+def snapshot_allowed_files(repo_root: Path, allowed_dirs: Sequence[str] = ALLOWED_REPO_IMPORT_DIRS) -> dict:
+    """候选开始运行**之前**拍一张"允许目录里的文件"快照:路径 -> mtime_ns。
+
+    这张快照是"文件必须早就存在"这条规则的依据。
+    用 mtime 而不是"只记有哪些文件":候选把既有文件**改写**再导入,
+    名字还在清单里,只有 mtime 变了才认得出来。
+    """
+    root = Path(repo_root).resolve()
+    snapshot: dict[str, int] = {}
+    for name in allowed_dirs:
+        base = root / name
+        if not base.is_dir():
+            continue
+        for path in base.rglob("*.py"):
+            try:
+                snapshot[str(path.resolve())] = path.stat().st_mtime_ns
+            except OSError:
+                continue
+    return snapshot
+
+
+def _timestamp_granularity(value_ns: int) -> int:
+    """从文件自身的时间戳反推文件系统的时间粒度(纳秒)。
+
+    文件系统写时间戳时会把时间**向下取整**到自己的粒度(NTFS 是 100ns,有些网络盘是 1ms 甚至 1s)。
+    判断"这个文件是不是候选运行期间写出来的"必须按同一粒度取整,否则会漏:
+    候选在开始后 0.5ms 写文件,时间戳被向下取整到开始时刻**之前**,直接比大小就判不出来。
+    """
+    for step in (1_000_000_000, 1_000_000, 10_000, 100):
+        if value_ns % step == 0:
+            return step
+    return 1
+
+
+def _floor_to_granularity(value_ns: int, granularity: int) -> int:
+    return value_ns - (value_ns % granularity) if granularity > 1 else value_ns
+
+
+class RepoImportGuard:
+    """按**路径**裁决候选能不能导入某个模块。
+
+    规则(按顺序):
+    - 模块来源不是磁盘上的文件(标准库内建、命名空间包、找不到) -> 不由本规则裁决;
+    - 在仓库根之下、但不在允许目录里 -> 拒绝(框架、风控、回测模块一律不许碰);
+    - 在允许目录里 -> 还必须"候选开始运行之前就存在、且此后没被改过",否则拒绝;
+    - 在仓库根**之外**(标准库、站点包)-> 也必须"候选开始运行之前就存在":
+      否则候选往站点包里写一个辅助模块就能绕开仓库内的路径规则(站点包在宿主机上通常可写)。
+    """
+
+    def __init__(self, repo_root: Path, allowed_dirs: Sequence[str] = ALLOWED_REPO_IMPORT_DIRS,
+                 snapshot: Mapping[str, int] | None = None, started_at_ns: int | None = None):
+        self.repo_root = Path(repo_root).resolve()
+        self.allowed_dirs = tuple(allowed_dirs)
+        self.snapshot = dict(snapshot or {})
+        self.started_at_ns = started_at_ns if started_at_ns is not None else time.time_ns()
+
+    def _under_allowed_dir(self, resolved: Path) -> bool:
+        for name in self.allowed_dirs:
+            base = self.repo_root / name
+            if base == resolved or base in resolved.parents:
+                return True
+        return False
+
+    def check(self, name: str) -> str | None:
+        """返回拒绝理由(None 表示放行)。"""
+        origin = module_origin(name)
+        if not origin:
+            return None                                        # 不是磁盘上的文件,不由路径规则裁决
+        try:
+            resolved = Path(origin).resolve()
+            stat = resolved.stat()
+        except OSError:
+            return None                                        # 拿不准就当"不是候选写的文件"
+        if self.repo_root != resolved and self.repo_root not in resolved.parents:
+            # 仓库之外(标准库/站点包):仍要求"候选开始运行之前就存在"。
+            # 站点包在宿主机上通常可写,候选往里写一个辅助模块就能绕开仓库内的规则。
+            # 比较前按文件系统粒度取整,否则会漏掉"刚写出来就被取整到开始时刻之前"的文件。
+            granularity = _timestamp_granularity(stat.st_mtime_ns)
+            if stat.st_mtime_ns >= _floor_to_granularity(self.started_at_ns, granularity):
+                return (f"禁止导入 {name}:该文件在候选开始运行之后才出现"
+                        f"(候选运行期间写出的文件一律不得被导入)")
+            return None
+        if not self._under_allowed_dir(resolved):
+            return (f"禁止导入仓库内模块 {name}:它不在允许的目录 {list(self.allowed_dirs)} 内"
+                    f"(候选不得导入框架、风控或回测模块)")
+        key = str(resolved)
+        known = self.snapshot.get(key)
+        if known is None:
+            return (f"禁止导入 {name}:该文件在候选开始运行之前并不存在"
+                    f"(候选运行期间写出的文件一律不得被导入)")
+        if stat.st_mtime_ns != known:
+            return f"禁止导入 {name}:该文件在候选运行期间被改动过"
+        return None
+
+
+def safe_builtins(forbidden_modules: Sequence[str] = (), repo_guard: "RepoImportGuard | None" = None) -> dict:
     """候选执行时用的**最小内建集合**:去掉 `UNSAFE_BUILTINS`,并把 `__import__` 换成受限版。
 
     受限导入器只放行不在禁用名单里的模块——候选必须能 import(模板与策略基类就是这么来的),
     但 `import builtins` / `import unittest.mock` 这类"拿到内建或改写属性能力"的入口必须关上。
+
+    `repo_guard` 是**按路径**的第二道裁决(见 `RepoImportGuard`):
+    名单管不住"候选自己写一个辅助模块再 import 它"这条逃逸,路径规则管得住。
     """
     import builtins as _builtins
+    import types as _types
 
     blocked = set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES) | set(forbidden_modules)
     real_import = _builtins.__import__
@@ -105,10 +255,42 @@ def safe_builtins(forbidden_modules: Sequence[str] = ()) -> dict:
         root = name.split(".")[0]
         if root in blocked:
             raise ImportError(f"禁止导入 {name}")
-        return real_import(name, globals, locals, fromlist, level)
+        if repo_guard is not None:
+            # 相对导入(level>0)按当前模块的包还原成绝对名字再裁决,
+            # 否则 `from . import x` 会绕过路径规则(名字看起来像仓库内的相对路径)。
+            target = name
+            if level:
+                package = (globals or {}).get("__package__") or ""
+                if not package:
+                    raise ImportError(f"禁止相对导入 {name}:当前模块不在任何包内")
+                base = package.split(".")
+                if level > 1:
+                    base = base[: -(level - 1)]
+                target = ".".join([p for p in base if p] + ([name] if name else []))
+            reason = repo_guard.check(target)
+            if reason:
+                raise ImportError(reason)
+        try:
+            return real_import(name, globals, locals, fromlist, level)
+        except ImportError:
+            # **不要**把导入机制的异常原样抛给候选(第 21 轮实测的逃逸之二):
+            # 那个异常的 traceback 里带着 import 机制的帧,候选顺着
+            # `e.__traceback__.tb_frame.f_builtins` 就能拿到**真实内建**。
+            # 这里换一个"干净的"异常:抛出点在下面(不在 except 里),
+            # 于是新异常的 traceback 只有"我们自己那一帧 + 候选自己的帧",
+            # 帧的内建都是受限的那一份。
+            reason = f"导入 {name} 失败"
+        raise ImportError(reason) from None
 
     safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
-    safe["__import__"] = restricted_import
+    # 把受限导入器放进一份**自己的**全局环境:它的帧的 `f_builtins` 取自
+    # `f_globals["__builtins__"]`,所以候选顺着异常回溯摸到我们这一帧时,
+    # 摸到的是受限字典,而不是真实内建(第 21 轮实测的逃逸之二)。
+    guard_globals = {"__builtins__": safe, "real_import": real_import,
+                     "blocked": blocked, "repo_guard": repo_guard}
+    safe["__import__"] = _types.FunctionType(restricted_import.__code__, guard_globals,
+                                             "restricted_import", restricted_import.__defaults__,
+                                             restricted_import.__closure__)
     return safe
 
 

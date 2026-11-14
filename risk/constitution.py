@@ -284,6 +284,10 @@ BUILTIN_FORBIDDEN_DUNDERS = (
 # (第 7 轮实测:经异常回溯拿到 frame.f_builtins 里的 setattr;以及 unittest.mock.patch.object)。
 # 真正把能力收走的是**执行时不给这些内建**(scripts/research_sandbox.py::safe_builtins):
 # 候选的内建字典里没有 setattr,那些路径就都不成立。
+#
+# **准确口径**(第 22 轮补记,Issue #26):收走的是**候选自己那些帧**里的能力。
+# 别人的帧(导入机制、第三方库)里仍然是真实内建——所以这一层是纵深防御,不是边界;
+# 真正的边界是人工审批 + 容器隔离。
 BUILTIN_FORBIDDEN_BY_NAME_SETTERS = ("update_setting",)
 
 # 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。

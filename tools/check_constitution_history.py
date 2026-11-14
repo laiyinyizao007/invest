@@ -68,15 +68,24 @@ BUILTIN_SETS = (
 )
 
 # 同为"白名单"语义的内置常量:只减不增。
-BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES",)
+# `ALLOWED_REPO_IMPORT_DIRS` 也在列:它是仓库内导入白名单,多一项就多放开一点
+# 候选能 import 的东西(第 21 轮新增)。
+BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES", "ALLOWED_REPO_IMPORT_DIRS")
 
 # 沙盒层的内置 deny set 同样是"代码内置的保护",一并纳入比对。
 SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS")
 
+# 沙盒层的**允许**集合(第 21 轮新增的仓库内导入白名单):语义与 deny set 相反——
+# 多一项 = 多放开一点仓库内的模块(候选能 import 的东西变多),所以它必须**只减不增**。
+# 登记在 `BUILTIN_SHRINK_ONLY_SETS` 里;同时登记进注册表是为了让它进入
+# 引用次数的守望(执行点不许消失)——按现有先例(`BUILTIN_ALLOWED_OVERRIDES`),
+# 两个方向都被冻住:要改这个白名单必须显式改守卫,不能顺手加一项。
+SANDBOX_ALLOW_SETS = ("ALLOWED_REPO_IMPORT_DIRS",)
+
 # 注册表:(文件相对路径, 该文件里受保护的常量名)
 BUILTIN_REGISTRY = (
     (CONSTITUTION_SOURCE_REL, BUILTIN_SETS),
-    ("scripts/research_sandbox.py", SANDBOX_SETS),
+    ("scripts/research_sandbox.py", SANDBOX_SETS + SANDBOX_ALLOW_SETS),
 )
 
 # 清单**字段**的执行点也要守:删掉 `if node.attr in c.forbidden_order_calls:` 这个分支,
