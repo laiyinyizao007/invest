@@ -7,7 +7,9 @@
 - `diagnosis` 是结构化诊断(枚举 + 0–1 数值,见 risk/structured_diagnosis.py),写入前校验;
 - `cell` 必须是 MAP-Elites 格子名(`H<0-3>F<0-3>`);
 - `description` 是程序从代码抽取的可验证描述(risk/describe.py),写入前校验;
-- `fail_reason` 是程序给出的短字符串(限长 200),`reflection` 只存档给人看(限长 2000),**外层响应从不回传它们**;
+- `fail_reason` 只接受**封闭文法**:门槛检查项 ID(逗号分隔)、固定短语,或"策略运行报错:<标准异常名>"——
+  不再只是"限长"(第 15 轮 codex 的 Medium:台账里没有自由文本这条承诺原先只由写者自觉保证、不由模式保证);
+  `reflection` 是只存档给人看的字段,**引擎从不写它**,所以写端只接受 None;
 - **未知字段一律拒绝**——否则额外字段就是夹带自由文本的后门。
 
 只增不减:本模块不提供删除/改写接口;追加前先校验整份台账(损坏即 fail-closed,不在已坏的台账上继续累计);
@@ -33,6 +35,8 @@ from typing import Any
 from risk import describe as describe_mod
 from risk import structured_diagnosis as sd
 from risk.behavior import CELL_PATTERN
+from risk.outward import STANDARD_ERROR_TYPES
+from risk.promotion_gate import CHECK_IDS
 
 CAMPAIGN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")      # 与读取侧一致
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -42,7 +46,8 @@ MAX_LEDGER_BYTES = 8 * 1024 * 1024                                  # 与读取�
 MAX_LEDGER_LINES = 20_000
 MAX_GENERATION = 1_000_000
 MAX_FAIL_REASON = 200
-MAX_REFLECTION = 2000
+MAX_REFLECTION = 2000          # 读取侧的上限;写端只接受 None
+FIXED_REASONS = ("无法选参", "策略运行报错")
 FIELDS = ("generation", "candidate_sha256", "parent_sha256", "run_id", "status", "sharpe", "total_return",
           "max_drawdown", "dsr", "n_trials", "fail_reason", "reflection", "created_at", "cell", "diagnosis",
           "fitness", "description")
@@ -80,6 +85,16 @@ def _opt_text(record: dict, key: str, limit: int) -> str | None:
     return value
 
 
+def _valid_fail_reason(text: str) -> bool:
+    """失败原因的封闭文法:检查项 ID 列表 | 固定短语 | "策略运行报错:" + 标准异常名。"""
+    if text in FIXED_REASONS:
+        return True
+    if text.startswith("策略运行报错:"):
+        return text.split(":", 1)[1] in STANDARD_ERROR_TYPES
+    ids = text.split(",")
+    return bool(ids) and all(i in CHECK_IDS for i in ids)
+
+
 def validate_record(record: Any) -> dict:
     """校验一条记录并返回规整后的副本(缺省字段补 None)。不合法抛 LineageError。"""
     if not isinstance(record, dict):
@@ -113,6 +128,11 @@ def validate_record(record: Any) -> dict:
     description = record.get("description")
     if description is not None and not describe_mod.validate(description):
         raise LineageError("description 必须是程序抽取的可验证描述")
+    fail_reason = _opt_text(record, "fail_reason", MAX_FAIL_REASON)
+    if fail_reason is not None and not _valid_fail_reason(fail_reason):
+        raise LineageError("fail_reason 必须是门槛检查项 ID、固定短语或\"策略运行报错:<标准异常名>\"(台账不收自由文本)")
+    if record.get("reflection") is not None:
+        raise LineageError("reflection 是只给人看的字段,引擎不写:写端只接受 None(台账不收自由文本)")
     created_at = record.get("created_at")
     if created_at is not None:
         if not isinstance(created_at, str) or len(created_at) > 40:
@@ -126,8 +146,7 @@ def validate_record(record: Any) -> dict:
         "status": record["status"], "sharpe": _opt_number(record, "sharpe"),
         "total_return": _opt_number(record, "total_return"), "max_drawdown": _opt_number(record, "max_drawdown"),
         "dsr": _opt_number(record, "dsr", 0.0, 1.0), "n_trials": n_trials,
-        "fail_reason": _opt_text(record, "fail_reason", MAX_FAIL_REASON),
-        "reflection": _opt_text(record, "reflection", MAX_REFLECTION), "created_at": created_at,
+        "fail_reason": fail_reason, "reflection": None, "created_at": created_at,
         "cell": cell, "diagnosis": diagnosis, "fitness": _opt_number(record, "fitness"),
         "description": description,
     }
@@ -138,12 +157,12 @@ def _short_reason(result: dict) -> str | None:
     if result.get("status") == "strategy_error":
         error = result.get("error") if isinstance(result.get("error"), dict) else {}
         etype = error.get("type")
-        return ("策略运行报错:" + etype[:60])[:MAX_FAIL_REASON] if isinstance(etype, str) and etype.isidentifier() else "策略运行报错"
+        return f"策略运行报错:{etype}" if isinstance(etype, str) and etype in STANDARD_ERROR_TYPES else "策略运行报错"
     if result.get("kind_detail") == "selection-only":
         return "无法选参"
     ids = result.get("failed_check_ids")
     if isinstance(ids, list) and ids:
-        return ",".join(i for i in ids if isinstance(i, str) and re.fullmatch(r"[a-z_]+", i))[:MAX_FAIL_REASON] or None
+        return ",".join(i for i in ids if isinstance(i, str) and i in CHECK_IDS) or None
     return None
 
 
