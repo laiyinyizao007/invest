@@ -4,6 +4,10 @@
 # 许可证(2026-11-13 核对):mcp MIT;协议版本 2025-06-18,与 DSH 的
 # @deepseek-ai/dsh-mcp-client 0.2.0-rc.2(底层 @modelcontextprotocol/client 2.0.0)兼容。
 mcp==1.19.0
+# mcp 1.19.0 的 func_metadata 要从 pydantic._internal._typing_extra 取 eval_type_backport,
+# pydantic 2.12 起移除了它 → CI 不钉版本会装到新版并在收集阶段 ImportError(2026-11-14 实测)。
+# 本机验证过的版本是 2.11.9。
+pydantic==2.11.9
 # 【仅测试期需要】Preset 的**结构**断言要解析 YAML(!!js 是 DSH 的自定义标签,
 # 解析时保留表达式原文)。研究侧的**运行时**用不到它——Preset 是给 DSH(Node)读的,
 # Python 这边只在测试里断言它的结构。
