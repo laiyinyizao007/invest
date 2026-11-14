@@ -559,7 +559,7 @@ def test_log_and_head_deleted_while_the_anchor_remains_is_recoverable_only_by_an
     ladder.path.unlink()
     with pytest.raises(LadderError, match="reset"):
         ladder.status()                                               # 报错里给出出路
-    out = ladder.reset("清理结果目录时只带走了一半文件")
+    out = ladder.reset("清理结果目录时只带走了一半文件")   # 已经坏了:不需要 force
     assert out["archived"] and ladder.status()["queries_used"] == 0
     assert (ladder.path.parent / "ladder.reset.log").exists()
 
@@ -567,9 +567,9 @@ def test_log_and_head_deleted_while_the_anchor_remains_is_recoverable_only_by_an
 def test_reset_archives_everything_and_keeps_the_history_and_never_overwrites_an_archive(tmp_path):
     ladder = anchored(tmp_path)
     ladder.submit(5.5)
-    first = ladder.reset("第一次")
+    first = ladder.reset("第一次", force=True)
     ladder.submit(0.0)
-    second = ladder.reset("第二次")
+    second = ladder.reset("第二次", force=True)
     assert first["archive_number"] == 1 and second["archive_number"] == 2
     assert any(p.name.endswith(".bak-1") for p in ladder.path.parent.iterdir())
     assert ladder.status()["reported"] == 0.0
@@ -592,3 +592,125 @@ def test_force_renew_after_exhaustion_is_not_labelled_forced(tmp_path):
     assert "[强制]" not in ladder.log_path.read_text(encoding="utf-8")
     ladder.renew("提前续期", force=True)
     assert "[强制] 提前续期" in ladder.log_path.read_text(encoding="utf-8")
+
+
+# ---------- 第 19 轮 codex ----------
+
+def test_a_complete_last_line_that_only_lacks_its_newline_is_kept_and_the_ladder_stays_usable(tmp_path):
+    """第 19 轮 codex 的 M1(我上轮引入的回归):"完整但缺换行"不是撕裂。
+
+    上轮把"文件不以换行结尾"一律当成撕裂,于是短写只差一个换行时整行被丢掉——
+    而头指针与锚点已经指向那一行,梯子从此**永久报废**(第 17 轮同一场景是好的)。"""
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    text = ladder.log_path.read_text(encoding="utf-8")
+    ladder.log_path.write_text(text.rstrip(chr(10)), encoding="utf-8")        # 只少一个换行
+    assert ladder.status()["queries_used"] == 3                                # 梯子仍然可用
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 4
+    assert ladder.log_path.read_text(encoding="utf-8").endswith(chr(10))
+
+
+def test_a_torn_log_tail_is_still_dropped(tmp_path):
+    """撕裂(崩在追加中途)照旧丢弃——与"完整但缺换行"分开。"""
+    ladder = anchored(tmp_path)
+    for _ in range(2):
+        ladder.submit(0.0)
+    with open(ladder.log_path, "a", encoding="utf-8") as stream:
+        stream.write('{"seq":3,"eve')
+    assert ladder.status()["queries_used"] == 2
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 3
+
+
+def test_a_complete_anchor_line_that_only_lacks_its_newline_is_kept(tmp_path):
+    """第 19 轮 codex 的 L4:锚点末行完整只是缺换行时不能被丢掉。"""
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    text = ladder.anchor.read_text(encoding="utf-8")
+    ladder.anchor.write_text(text.rstrip(chr(10)), encoding="utf-8")
+    assert ladder.status()["queries_used"] == 3
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 4
+
+
+def test_a_reset_that_races_with_a_submit_cannot_corrupt_the_chain(tmp_path):
+    """第 19 轮 codex 的 M2:reset 与网关并发时,不得写出断链的记录。
+
+    没有这层防护时:submit 读到 3 行 → 人工 reset 把日志挪走 → submit 用陈旧的 rows
+    算出 seq=4 写进空日志 → 之后每次读都报"seq 不连续",**梯子永久报废**。
+    """
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    stale_rows = ladder._load(repair=False)
+    ladder.reset("并发演练", force=True)
+    with pytest.raises(LadderError, match="期间"):
+        ladder._append(stale_rows, "submit", run_id="x", queries=4, best=0.0, note=None)
+    assert ladder.status()["queries_used"] == 0                              # 梯子没有被写坏
+
+
+def test_reset_leaves_an_audit_intent_line_before_it_moves_anything(tmp_path):
+    """第 19 轮 codex 的 M3:审计必须在搬文件**之前**落盘,中途失败也不该零审计。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(5.5)
+    ladder.reset("第一次", force=True)
+    lines = [json.loads(x) for x in (ladder.path.parent / "ladder.reset.log").read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["event"] == "reset-intent"
+    assert lines[0]["discarded_best"] == 5.5                                  # 被丢弃的 best 也留痕
+    assert lines[0]["reason"] == "第一次"
+
+
+def test_reset_records_the_run_ids_it_orphans(tmp_path):
+    """第 19 轮 codex 的 H1/L2:reset 之后这些 run 永远读不出来,必须能查。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0, run_id="run-a")
+    ladder.submit(0.0, run_id="run-b")
+    out = ladder.reset("清空", force=True)
+    assert out["orphaned_run_ids"] == 2
+    assert set(ladder.orphaned_run_ids()) == {"run-a", "run-b"}
+
+
+def test_reset_refuses_a_healthy_ladder_unless_forced(tmp_path):
+    """第 19 轮 codex 的 L1:比 renew 更重的 reset 不能没有护栏。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    with pytest.raises(LadderError, match="force"):
+        ladder.reset("手滑")
+    assert ladder.status()["queries_used"] == 1                                # 什么都没动
+
+
+def test_reset_of_a_damaged_ladder_needs_no_force(tmp_path):
+    """已经坏了的时候 reset 正是出路,不能被护栏挡住。"""
+    ladder = anchored(tmp_path)
+    for _ in range(2):
+        ladder.submit(0.0)
+    ladder.log_path.unlink()
+    ladder.path.unlink()
+    out = ladder.reset("修砖")
+    assert out["archived"]
+    assert ladder.status()["queries_used"] == 0
+
+
+def test_reset_archives_the_reveal_store_so_no_dead_archives_are_left(tmp_path):
+    """第 19 轮 codex 的 L2:揭示存档要么一起归档,要么留下永远失效的死档。"""
+    ladder = anchored(tmp_path)
+    outward = tmp_path / "outward"
+    outward.mkdir()
+    (outward / "run-a.json").write_text("{}", encoding="utf-8")
+    ladder.submit(0.0, run_id="run-a")
+    ladder.reset("清空", force=True, outward=outward)
+    assert not (outward / "run-a.json").exists()
+    assert any(p.name.startswith("outward.bak-") for p in tmp_path.iterdir())
+
+
+def test_a_snapshot_answers_has_and_preview_without_rereading_the_log(tmp_path):
+    """第 19 轮 codex 的 L3:快照只读一次,之后走内存。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0, run_id="run-a")
+    snap = ladder.snapshot()
+    assert snap.has("run-a") and not snap.has("run-b")
+    assert snap.preview(0.0, run_id="run-a")["replay"] is True
+    assert ladder.status()["queries_used"] == 1                                # 快照没有消耗查询

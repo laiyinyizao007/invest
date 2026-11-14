@@ -266,6 +266,78 @@ def test_feedback_never_echoes_free_text_fields_other_than_known_ones(tmp_path):
     assert "IGNORE PREVIOUS" not in dumped and "secret.py" not in dumped and "C:/" not in dumped
 
 
+# ---------- 第 19 轮 codex ----------
+
+def test_feedback_reports_how_many_results_it_skipped_and_why(tmp_path):
+    """第 19 轮 codex 的 H1:跳过必须有信号。
+
+    此前一份坏结果/坏存档被静默跳过,响应里什么都没有——外层分不清"没有失败"与"失败被藏了"。"""
+    app = make_app(tmp_path, feedback={"limit": 5})
+    seed_revealed(app, "20261112-210000-000000", kind="gate", passed=False, failures=["x"],
+                  failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+    call(app, "GET", "/research/feedback")                                # 先生成揭示存档
+    store = app.paths["results_dir"] / "outward" / "20261112-210000-000000.json"
+    store.write_text("{ 这不是合法视图", encoding="utf-8")                # 存档被改坏
+
+    status, body = call(app, "GET", "/research/feedback")
+
+    assert status == 200
+    assert body["skipped"]["tampered"] == 1                               # 篡改单独计数
+    assert body["skipped_total"] == sum(body["skipped"].values())
+    assert body["traces"] == []                                           # 坏的这一条不进 trace
+
+
+def test_feedback_counts_a_result_that_cannot_be_validated_as_invalid_not_tampered(tmp_path):
+    """第 19 轮 codex 的 H1:"结果本身不合法"与"存档被篡改"必须能分开。"""
+    app = make_app(tmp_path, feedback={"limit": 5})
+    seed_result(app, "20261112-210000-000000", kind="gate", passed=False,
+                failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+
+    status, body = call(app, "GET", "/research/feedback")
+
+    assert status == 200
+    assert body["skipped"]["invalid_result"] == 1
+    assert body["skipped"]["tampered"] == 0
+
+
+def test_feedback_reports_runs_orphaned_by_a_reset_instead_of_calling_them_tampered(tmp_path):
+    """第 19 轮 codex 的 H1:人工重置不是安全事件,不能被记成"篡改"。"""
+    app = make_app(tmp_path, feedback={"limit": 5})
+    seed_revealed(app, "20261112-210000-000000", kind="gate", passed=False, failures=["x"],
+                  failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+    call(app, "GET", "/research/feedback")
+    app._ladder().reset("人工重置", force=True)
+
+    status, body = call(app, "GET", "/research/feedback")
+
+    assert status == 200
+    assert body["skipped"]["orphaned_by_reset"] == 1
+    assert body["skipped"]["tampered"] == 0
+
+
+def test_feedback_reads_the_ladder_only_once_per_request(tmp_path):
+    """第 19 轮 codex 的 L3:此前每扫一个结果就重读并重校验整条日志。"""
+    import risk.ladder as ladder_mod
+    calls = []
+    original = ladder_mod.Ladder._read_log
+
+    def counting(self):
+        calls.append(1)
+        return original(self)
+
+    app = make_app(tmp_path, feedback={"limit": 5})
+    for i in range(4):
+        seed_revealed(app, f"20261112-21000{i}-000000", kind="gate", passed=False, failures=["x"],
+                      failed_check_ids=["sharpe_low"], **{"class": "S", "key": "C15"})
+    ladder_mod.Ladder._read_log = counting
+    try:
+        call(app, "GET", "/research/feedback")
+    finally:
+        ladder_mod.Ladder._read_log = original
+
+    assert len(calls) == 1, f"一次 /feedback 读了 {len(calls)} 次梯子日志(应当只有快照那一次)"
+
+
 # ---------- 环境自检与令牌 ----------
 
 def test_start_refuses_when_trading_credentials_are_in_the_environment():

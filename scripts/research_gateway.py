@@ -31,7 +31,7 @@ import bootstrap
 import research_config as rc
 import research_sandbox as rs
 from risk.ladder import Ladder, LadderError, LadderExhausted, anchor_path_for
-from risk.outward import OutwardError, RevealStore, reveal
+from risk.outward import OutwardError, OutwardTampered, RevealStore, reveal
 from risk.trial_ledger import TrialLedgerError, record_trials
 
 ROUTES = {
@@ -354,26 +354,45 @@ class GatewayApp:
             return 500, {"error": LADDER_UNAVAILABLE}
         return (429, {"error": LADDER_EXHAUSTED}) if left <= 0 else None
 
-    def _reveal(self, result: dict, *, allow_query: bool = True, skip_bad_result: bool = False):
+    def _reveal(self, result: dict, *, allow_query: bool = True, skip_bad_result: bool = False,
+                ladder=None, store=None):
         """落盘结果 → 净化视图。梯子用尽 429;梯子/存档损坏 500(fail-closed,不放出任何验证窗口信息)。
 
         `skip_bad_result`(批量接口 `/feedback` 用,第 17 轮 M2):**单个**结果/存档不合法只跳过这一个(返回 None),
-        梯子本身不可用仍然整体 500——一份坏结果文件不该让进化回路唯一的诊断通道整体下线。"""
+        梯子本身不可用仍然整体 500——一份坏结果文件不该让进化回路唯一的诊断通道整体下线。
+
+        **但跳过必须有信号**(第 19 轮 codex 的 H1):跳过时在 stderr 记一行,并把原因分类返回给调用方。
+        分两类:
+        - `OutwardTampered`(揭示存档被改过):**篡改信号**,必须计数上报,不能和"没有失败"长得一样;
+        - `OutwardError`(结果本身不合法):这一条没法揭示,跳过它,通道继续。
+        两者都不再与"从未揭示过"(None)共用同一个语义。
+
+        `ladder`/`store` 可由调用方传入**已读好的快照**(第 19 轮 L3):批量接口一次只读一次梯子。"""
         try:
-            view = reveal(result, ladder=self._ladder(), store=self._reveal_store(), allow_query=allow_query)
+            view = reveal(result, ladder=ladder if ladder is not None else self._ladder(),
+                          store=store if store is not None else self._reveal_store(), allow_query=allow_query)
         except LadderExhausted:
-            return 429, {"error": LADDER_EXHAUSTED}
+            return 429, {"error": LADDER_EXHAUSTED}, None
         except LadderError:
-            return 500, {"error": LADDER_UNAVAILABLE}
-        except OutwardError:
-            return (200, None) if skip_bad_result else (500, {"error": LADDER_UNAVAILABLE})
-        return 200, view
+            return 500, {"error": LADDER_UNAVAILABLE}, None
+        except OutwardTampered as exc:
+            print(f"揭示存档被篡改,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "tampered"
+        except OutwardError as exc:
+            print(f"结果不合法,已跳过: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "invalid_result"
+        return 200, view, None
 
     def _reveal_outcome(self, outcome: tuple):
         status, payload = outcome
         if status != 200 or not isinstance(payload, dict):
             return outcome                                   # 作业层的错误原样返回(不含验证窗口信息)
-        return self._reveal(payload)
+        status, view, _ = self._reveal(payload)
+        return status, view
 
     def _run_job(self, func, **kwargs):
         import research_api as api
@@ -456,7 +475,8 @@ class GatewayApp:
         if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
             return 404, {"error": "没有这条结果"}            # results 目录里不是运行结果的 *.json(审批记录等)不外露
         # 落盘的是给人看的完整记录;外层只看净化视图。第一次读到带验证窗口数字的 run 才消耗一次梯子查询,之后回放
-        return self._reveal(result)
+        status, view, _ = self._reveal(result)
+        return status, view
 
     def _feedback(self, _data, _params):
         """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
@@ -466,18 +486,43 @@ class GatewayApp:
         失败原因是门槛检查项的稳定 ID,不是带验证窗口数字的中文句子。"""
         limit = self.cfg["feedback"]["limit"]
         traces = []
+        # 跳过必须**看得见**(第 19 轮 codex 的 H1):此前跳过坏结果/坏存档时响应里没有任何提示,
+        # 外层与运维分不清"没有失败"和"失败被藏了"。现在计数并分类上报(只给计数与分类,不给内容)。
+        skipped = {"tampered": 0, "invalid_result": 0, "unreadable": 0, "orphaned_by_reset": 0}
+        # 一次只读一次梯子(第 19 轮 L3):此前每扫一个结果就重读并重校验整条日志。
+        try:
+            ladder = self._ladder().snapshot()
+        except LadderError:
+            return 500, {"error": LADDER_UNAVAILABLE}
+        store = self._reveal_store()
+        try:
+            orphaned = set(self._ladder().orphaned_run_ids())
+        except LadderError:
+            orphaned = set()
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
             try:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
+                skipped["unreadable"] += 1
                 continue
             if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
                 continue
-            status, view = self._reveal(result, allow_query=False, skip_bad_result=True)
+            status, view, reason = self._reveal(result, allow_query=False, skip_bad_result=True,
+                                                ladder=ladder, store=store)
             if status != 200:
                 return status, view
-            if view is None:                                    # 从未揭示过:不在这里揭示
+            if view is None:                                    # 跳过了这个 run:必须说清为什么
+                # "被 reset 孤立"既不是"从未揭示过",也不是"被篡改"——reset 把梯子清空了,
+                # 历史 run 因此永远读不出来(回放时梯子里查无此 run,若当成篡改就是**误报**)。
+                # 这三种情况必须分开计数,否则 reset 一执行,诊断通道就静默变空,
+                # 或者一次正常的人工重置就被记成安全事件(第 19 轮 codex 的 H1)。
+                if run_id in orphaned:
+                    skipped["orphaned_by_reset"] += 1
+                elif reason is not None:
+                    skipped[reason] += 1
                 continue
+            if reason is not None:
+                skipped[reason] += 1
             error = view.get("error") if isinstance(view.get("error"), dict) else None
             if view.get("status") == "strategy_error" and error:
                 detail = str(error.get("message") or "报错原文仅人可见")[:MAX_TRACE_TEXT]      # 验证窗口回放里的原文已在视图里去掉
@@ -497,7 +542,8 @@ class GatewayApp:
             })
             if len(traces) >= limit:
                 break
-        return 200, {"limit": limit, "traces": traces}
+        return 200, {"limit": limit, "traces": traces, "skipped": skipped,
+                     "skipped_total": sum(skipped.values())}
 
 
 def build_server(app: GatewayApp, host: str, port: int) -> ThreadingHTTPServer:

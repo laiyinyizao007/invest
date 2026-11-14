@@ -44,12 +44,14 @@ DSR 只惩罚试验次数、不惩罚每次试验带回的信息量,而测试段
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
 import os
 import re
 import threading
+import time
 from pathlib import Path
 
 LADDER_ETA = 1.10              # ADR 已登记(2026-11-13),不得为让候选更容易汇报而改小
@@ -57,6 +59,7 @@ DEFAULT_QUERY_BUDGET = 60      # 总查询预算上限:状态里的预算只能 
 STATE_VERSION = 2
 GENESIS = "0" * 64
 MAX_NOTE = 200
+MAX_ORPHANS = 200          # 审计里最多记多少个被孤立的 run_id
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _EPS = 1e-9
 _RECORD_KEYS = {"seq", "event", "run_id", "queries", "best", "budget", "note", "prev", "hash"}
@@ -71,6 +74,61 @@ def anchor_path_for(results_dir) -> Path:
 
 class LadderError(Exception):
     """梯子状态损坏、被篡改或回滚、写入失败,或参数想放宽已登记的量。"""
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, timeout: float = 10.0):
+    """跨进程互斥锁(第 19 轮 codex 的 M2)。
+
+    同一进程内已有 `threading.Lock`,这一层补的是**跨进程**的:CLI 的 `reset`/`renew` 与网关的 `submit`
+    可能同时操作同一个梯子。少了它,`reset` 把日志挪走之后,网关里那次已经读到旧状态的 `submit`
+    会用陈旧的 `rows` 算出 seq=4 写进空日志,之后每次读都报"seq 不连续"——**梯子永久报废**,
+    而这恰好是运维看到 500 之后最可能走的那条修砖路径。
+
+    锁的是梯子自己的状态文件旁边的一个 `.lock` 文件,不是梯子状态本身(锁文件不参与对账,
+    删掉它也只是退回到"跨进程不加锁"的老口径)。Windows 用 `msvcrt.locking`,POSIX 用 `fcntl.flock`。
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stream = open(path, "a+b")
+    except OSError as exc:
+        # 锁文件建不出来(目录被占、权限不足……)也必须 fail-closed,且**不泄露本地路径**。
+        raise LadderError(f"梯子锁文件无法创建(fail-closed,未做任何修改): {_why(exc)}") from exc
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:                       # msvcrt 要锁的字节范围必须在文件内
+            stream.write(bytes([0]))
+            stream.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise LadderError("梯子正被另一个进程占用(fail-closed,未做任何修改)")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    stream.seek(0)
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        stream.close()
 
 
 class LadderExhausted(LadderError):
@@ -100,6 +158,29 @@ def _body(record: dict) -> dict:
     return {k: record[k] for k in _RECORD_KEYS - {"hash"}}
 
 
+def _parse_log_line(text: str) -> dict:
+    """一行日志是不是**完整**的记录(第 19 轮 M1:用来区分"撕裂"与"完整但缺换行")。
+
+    撕裂(崩在追加中途)截出来的是 JSON 的前缀,`json.loads` 会抛;
+    完整但缺换行的那一行 `json.loads` 是好的——两者靠"能不能解析"分开。
+    这里还额外要求字段齐全:解析成功但字段不全的半条记录不算完整。"""
+    row = json.loads(text)
+    if not isinstance(row, dict) or set(row) != _RECORD_KEYS:
+        raise ValueError("日志行的字段不完整")
+    return row
+
+
+def _parse_anchor_line(text: str) -> tuple[int, str]:
+    """一行锚点是不是**完整**的 `<seq> <hash>`(第 19 轮 L4,同上)。"""
+    parts = text.split(" ")
+    if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+        raise ValueError("锚点行不完整")
+    seq = int(parts[0])
+    if seq < 1:
+        raise ValueError("锚点序号必须从 1 起")
+    return seq, parts[1]
+
+
 class Ladder:
     """持久化的梯子。`path` 是头指针文件;日志在同目录同名的 `.jsonl`。"""
 
@@ -111,6 +192,7 @@ class Ladder:
             raise LadderError(f"总查询预算必须是 1..{DEFAULT_QUERY_BUDGET} 的整数(上限已登记,不得放宽)")
         self.path = Path(path)
         self.log_path = self.path.with_suffix(".jsonl")
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")   # 跨进程互斥锁(第 19 轮 M2)
         self.anchor = Path(anchor) if anchor is not None else None
         self.eta = float(eta)
         self.budget = budget
@@ -122,10 +204,17 @@ class Ladder:
             return []
         try:
             text = self.log_path.read_text(encoding="utf-8")
-            if text and not text.endswith(chr(10)):         # 崩在追加一行的中途:最后那半行不算(第 17 轮 M3),写入口会把它截掉
-                text = text[: text.rfind(chr(10)) + 1]
             lines = [line for line in text.splitlines() if line.strip()]
-            rows = [json.loads(line) for line in lines]
+            rows: list[dict] = []
+            for index, line in enumerate(lines):
+                try:
+                    rows.append(_parse_log_line(line))
+                except ValueError as exc:
+                    # 只有**末行**、且文件不以换行结尾时才是撕裂(崩在追加中途),那半行不算(第 17 轮 M3);
+                    # 其余情况一律损坏(fail-closed)。"完整但缺换行"解析得出来,会被保留(第 19 轮 M1)。
+                    if index == len(lines) - 1 and text and not text.endswith(chr(10)):
+                        break
+                    raise LadderError(f"梯子日志损坏或无法读取(fail-closed): {_why(exc)}") from exc
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子日志损坏或无法读取(fail-closed): {_why(exc)}") from exc
         prev_hash, prev = GENESIS, {"queries": 0, "best": 0.0, "budget": DEFAULT_QUERY_BUDGET, "seq": 0}
@@ -185,30 +274,36 @@ class Ladder:
             raise LadderError("梯子头指针不合法(fail-closed)")
         return head
 
-    def _read_anchor(self) -> tuple[int, str] | None:
+    def _read_anchor(self) -> tuple[tuple[int, str] | None, bool]:
+        """返回 ((seq, hash) 或 None, 末行是否撕裂)。"""
         if self.anchor is None or not self.anchor.exists():
-            return None
+            return None, False
         try:
             text = self.anchor.read_text(encoding="utf-8")
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
-        if text and not text.endswith(chr(10)):             # 撕裂的末行(崩在追加中途)不算;写入口会截掉它
-            text = text[: text.rfind(chr(10)) + 1]
         last_seq, last = 0, None
-        for line in (item for item in text.splitlines() if item.strip()):
-            parts = line.split(" ")
-            if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
-                raise LadderError("梯子锚点格式不合法(fail-closed)")
-            seq = int(parts[0])
-            if seq < 1 or seq <= last_seq:                  # 第 17 轮:锚点自身必须严格递增、从 1 起(seq=0 会把下标读成 rows[-1])
+        torn = False
+        items = [item for item in text.splitlines() if item.strip()]
+        for index, line in enumerate(items):
+            try:
+                seq, digest = _parse_anchor_line(line)
+            except ValueError as exc:
+                # 只有**末行**、且文件不以换行结尾时才是撕裂(崩在追加中途),那半行不算(第 17 轮 M3);
+                # "完整但缺换行"解析得出来,会被保留(第 19 轮 L4)。
+                if index == len(items) - 1 and text and not text.endswith(chr(10)):
+                    torn = True
+                    break
+                raise LadderError(f"梯子锚点格式不合法(fail-closed): {_why(exc)}") from exc
+            if seq <= last_seq:                              # 第 17 轮:锚点自身必须严格递增、从 1 起(seq=0 会把下标读成 rows[-1])
                 raise LadderError("梯子锚点的序号不是严格递增的正整数(fail-closed)")
-            last_seq, last = seq, parts[1]
-        return None if last is None else (last_seq, last)
+            last_seq, last = seq, digest
+        return (None if last is None else (last_seq, last)), torn
 
     def _check_anchor(self, rows: list[dict], repair: bool) -> None:
         if self.anchor is None:
             return
-        anchored = self._read_anchor()
+        anchored, torn = self._read_anchor()
         if anchored is None:
             if not rows:
                 return
@@ -218,26 +313,49 @@ class Ladder:
                 return
             raise LadderError("梯子有日志却没有锚点(fail-closed):锚点被删过,或日志是被换进来的")
         seq, digest = anchored
+        if torn and len(rows) > seq:
+            # 锚点末行撕裂:它本来要记的是第 seq+1 条(锚点只落后于"根本没写"的情形,撕裂是另一种)。
+            # 用日志里那一条的哈希把见证范围补回——**只在内存里补**,不改文件(只读入口不许写)。
+            # 补不回(日志本身没有那一条)时见证范围就是 seq,比正常少一条,登记为残余。
+            seq, digest = seq + 1, rows[seq]["hash"]
         if len(rows) < seq or rows[seq - 1]["hash"] != digest:
             raise LadderError("梯子日志与锚点对不上(fail-closed):日志被回滚、截断或整条换掉;"
                               "确认要从头开始请由人执行 `scripts/research_ladder.py reset --reason ...`")
 
     @staticmethod
-    def _trim_torn_tail(path: Path) -> None:
-        """文件不以换行结尾 = 上次崩在追加一行的中途:把那半行截掉,再追加(第 17 轮 M3)。"""
+    def _trim_torn_tail(path: Path, parse=None) -> None:
+        """文件不以换行结尾 = 上次追加没写完。**先试解析**(第 19 轮 M1/L4):
+
+        - 解析得出来 → 这一行是**完整的,只是缺换行**,补一个换行就留下它
+          (第 17 轮的做法是直接截掉,于是"完整但缺换行"被当成撕裂,整条梯子永久报废——第 19 轮 codex 实测的回归);
+        - 解析不出来 → 真的撕裂(崩在追加中途),截掉(第 17 轮 M3)。"""
         if not path.exists():
             return
         data = path.read_bytes()
         if data and not data.endswith(bytes([10])):
-            with open(path, "r+b") as stream:
-                stream.truncate(data.rfind(bytes([10])) + 1)
+            tail = data[data.rfind(bytes([10])) + 1:]
+            complete = False
+            if parse is not None and tail.strip():
+                try:
+                    parse(tail.decode("utf-8"))
+                    complete = True
+                except (ValueError, UnicodeDecodeError):
+                    complete = False
+            if complete:
+                with open(path, "ab") as stream:          # 补上换行:这一行是完整的,不能丢
+                    stream.write(bytes([10]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                with open(path, "r+b") as stream:
+                    stream.truncate(data.rfind(bytes([10])) + 1)
 
     def _write_anchor(self, record: dict) -> None:
         if self.anchor is None:
             return
         try:
             self.anchor.parent.mkdir(parents=True, exist_ok=True)
-            self._trim_torn_tail(self.anchor)
+            self._trim_torn_tail(self.anchor, parse=_parse_anchor_line)
             with open(self.anchor, "a", encoding="utf-8", newline="") as stream:
                 stream.write(f"{record['seq']} {record['hash']}" + chr(10))
                 stream.flush()
@@ -290,13 +408,21 @@ class Ladder:
             raise LadderError(f"梯子头指针写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
 
     def _append(self, rows: list[dict], event: str, *, run_id: str | None, queries: int, best: float, note: str | None) -> dict:
+        # 写之前再核对一次磁盘上的现状(第 19 轮 M2):调用方给的 `rows` 可能已经过时——
+        # 期间若发生过 `reset`(日志被挪走)或别的进程追加过,拿陈旧的 seq 去写就会写出一条断链的记录,
+        # 之后每次读都报"seq 不连续",梯子永久报废。这里 fail-closed:拒绝这次写入,让人重试。
+        on_disk = self._read_log()
+        expect = rows[-1]["hash"] if rows else GENESIS
+        actual = on_disk[-1]["hash"] if on_disk else GENESIS
+        if expect != actual:
+            raise LadderError("梯子状态在本次操作期间被改动(fail-closed):期间发生过 reset 或并发写入,请重试")
         prev = rows[-1] if rows else {"seq": 0, "hash": GENESIS, "budget": self.budget}
         record = {"seq": prev["seq"] + 1, "event": event, "run_id": run_id, "queries": queries, "best": best,
                   "budget": min(prev["budget"], self.budget), "note": note, "prev": prev["hash"], "hash": ""}
         record["hash"] = _digest(prev["hash"], _body(record))
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._trim_torn_tail(self.log_path)
+            self._trim_torn_tail(self.log_path, parse=_parse_log_line)
         except OSError as exc:
             raise LadderError(f"梯子日志写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
         size_before = self.log_path.stat().st_size if self.log_path.exists() else 0
@@ -352,6 +478,44 @@ class Ladder:
         with _lock:
             return any(r["run_id"] == run_id for r in self._load(repair=False))
 
+    def orphaned_run_ids(self) -> list[str]:
+        """被 `reset` 孤立掉的 run_id(第 19 轮 codex 的 H1/L2)。
+
+        `reset` 把梯子清空之后,这些 run 的揭示存档还在,但梯子日志里已经没有它们——
+        回放按"被伪造"fail-closed,于是这些 run **永远读不出来**,`/feedback` 也就静默变空。
+        外层必须能分辨"这个 run 从未揭示过"与"这个 run 被 reset 孤立了",所以这里把名单读出来。"""
+        log_path = self.path.parent / "ladder.reset.log"
+        if not log_path.exists():
+            return []
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        names: list[str] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and entry.get("event") == "reset-intent":
+                for run_id in entry.get("orphaned_run_ids") or []:
+                    if isinstance(run_id, str):
+                        names.append(run_id)
+        return names
+
+    def snapshot(self) -> "LadderSnapshot":
+        """一次读入的只读快照(第 19 轮 codex 的 L3)。
+
+        `/feedback` 要扫很多 run,每扫一个都 `has()`/`preview()` 一次——每次都是**整条日志重读 + 逐条
+        SHA-256 校验**(实测 400 个结果 + 60 条日志:冷 2.4 s / 热 0.52 s,而 `ladder.has()` 全量占 305 ms/300 个)。
+        这是进化回路每次迭代都要打的热路径。快照把状态读一次,之后 `has`/`preview` 走内存。
+
+        快照是**只读**的:要消耗查询的 `submit` 仍然走真梯子(它必须写)。"""
+        with _lock:
+            return LadderSnapshot(self, self._load(repair=False))
+
     def preview(self, sharpe, run_id: str | None = None) -> dict:
         """`submit` 会返回什么——但**不写任何东西、不消耗查询**。预算用尽(且这个 run 没提交过)抛 LadderExhausted。"""
         with _lock:
@@ -378,7 +542,7 @@ class Ladder:
         - 给了 `run_id`:同一个 run 重复提交是**幂等**的(回放当时的汇报值,不扣查询)。"""
         if run_id is not None and (not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id)):
             raise LadderError("run_id 不合法")
-        with _lock:
+        with _lock, _file_lock(self.lock_path):
             rows = self._load()
             plan = self._plan(rows, sharpe, run_id)
             if plan["replay"]:
@@ -386,32 +550,85 @@ class Ladder:
             self._append(rows, "submit", run_id=run_id, queries=plan["queries_used"], best=plan["reported"], note=None)
             return plan
 
-    def reset(self, reason: str) -> dict:
+    def reset(self, reason: str, *, force: bool = False, outward: Path | None = None) -> dict:
         """**人工**从头开始(第 17 轮 H2):把日志、头指针、锚点各自改名归档(`.bak-<序号>`),梯子回到全新状态。
 
         什么时候要用:清理/恢复结果目录时只带走了一半文件(锚点在 `data/ladder_anchor/`,日志在 `data/research/ladder/`),
-        梯子因"日志与锚点对不上"而 fail-closed。**代价必须说清**:`best` 归零、查询数归零——已经泄漏的信息收不回来,
-        所以它是比 `renew` 更重的操作,只留给人;归档文件保留着全部历史,原因写进 `ladder.reset.log`。"""
+        梯子因"日志与锚点对不上"而 fail-closed。
+
+        **代价必须说清**(第 19 轮 codex 的 L2):`best` 归零、查询数归零——已经泄漏的信息收不回来;
+        **全部历史揭示存档也一并作废**(梯子日志里没有这些 run 了,回放会按"被伪造"fail-closed,
+        `/feedback` 因此会返回空 traces——这也是为什么 `outward` 目录会被一起归档,不留死档);
+        所以它是比 `renew` 更重的操作,只留给人。
+
+        **护栏**(第 19 轮 L1):梯子**状态正常**时默认拒绝,必须显式 `--force`——
+        `renew` 有"预算用尽才允许"这道护栏,比它更重的 `reset` 却没有,等于"总预算"随时可清零。
+
+        **审计顺序**(第 19 轮 M3):**先写意图行**(含被丢弃的 `best`/`queries`、原因、将被孤立的 run_id),
+        再挪文件,最后写完成行——中途失败也留下"有人动过手"的痕迹(第 15 轮给 `renew` 修掉的正是这个)。
+        """
         if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_NOTE:
             raise LadderError(f"reset 必须给出 1..{MAX_NOTE} 字符的原因")
         files = [f for f in (self.path, self.log_path, self.anchor) if f is not None]
-        with _lock:
+        if outward is not None:
+            files.append(Path(outward))
+        with _lock, _file_lock(self.lock_path):
+            # 健康检查:梯子**能正常对账且有状态**时,重置会真的毁掉东西,默认拒绝(第 19 轮 L1)。
+            # 已经损坏(日志/头指针/锚点对不上)时反而允许——那正是 reset 的用武之地。
+            healthy = True
+            dropped = {"best": None, "queries": None, "run_ids": []}
+            try:
+                rows = self._load(repair=False)        # 完整对账:损坏在这里抛 LadderError
+                if rows:
+                    healthy = True
+                    dropped["best"] = rows[-1]["best"]
+                    dropped["queries"] = rows[-1]["queries"]
+                    dropped["run_ids"] = [r["run_id"] for r in rows if r.get("run_id")]
+                else:
+                    healthy = False                     # 空的梯子:重置不损失任何东西,放行
+            except LadderError:
+                healthy = False                          # 已经坏了:reset 正是这时候的出路
+            if healthy and not force:
+                raise LadderError("梯子状态正常,不得重置;确需从头开始请显式 force"
+                                  "(重置会清零 best 与查询数,并作废全部历史揭示存档)")
             moved = []
             n = 1
             while any(Path(str(f) + f".bak-{n}").exists() for f in files):
                 n += 1
+            log_path = self.path.parent / "ladder.reset.log"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # 意图行先落盘(第 19 轮 M3):哪怕后面某一步抛错,审计里也有"动过手"的记录
+            intent = {"event": "reset-intent", "archive": n, "reason": reason.strip(),
+                      "discarded_best": dropped["best"], "discarded_queries": dropped["queries"],
+                      "orphaned_run_ids": dropped["run_ids"][:MAX_ORPHANS]}
+            self._append_reset_log(log_path, intent)
             try:
                 for f in files:
                     if f.exists():
                         target = Path(str(f) + f".bak-{n}")
                         os.replace(f, target)
                         moved.append(target.name)
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.path.parent / "ladder.reset.log", "a", encoding="utf-8", newline="") as stream:
-                    stream.write(json.dumps({"archive": n, "files": moved, "reason": reason.strip()}, ensure_ascii=False) + chr(10))
+                        self._append_reset_log(log_path, {"event": "reset-archived", "archive": n,
+                                                          "name": target.name, "reason": reason.strip()})
             except OSError as exc:
+                self._append_reset_log(log_path, {"event": "reset-failed", "archive": n,
+                                                  "error": _why(exc), "reason": reason.strip()})
                 raise LadderError(f"reset 失败: {_why(exc)}") from exc
-        return {"archived": moved, "archive_number": n}
+            self._append_reset_log(log_path, {"event": "reset-done", "archive": n,
+                                              "files": moved, "reason": reason.strip()})
+        return {"archived": moved, "archive_number": n, "discarded_best": dropped["best"],
+                "discarded_queries": dropped["queries"], "orphaned_run_ids": len(dropped["run_ids"])}
+
+    @staticmethod
+    def _append_reset_log(path: Path, entry: dict) -> None:
+        """审计日志的每一次追加都 fsync——它就是"动过手"的唯一证据,不能自己先丢。"""
+        try:
+            with open(path, "a", encoding="utf-8", newline="") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + chr(10))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            pass                                    # 审计写不进去不该把已经完成的操作变成失败
 
     def renew(self, note: str, *, force: bool = False) -> dict:
         """人工续期:`queries` 归零、**保留 `best`**,必须给出非空原因,留一条审计记录。
@@ -420,7 +637,7 @@ class Ladder:
         `force=True` 强制续期,审计记录里带"[强制]"前缀。"""
         if not isinstance(note, str) or not note.strip() or len(note) > MAX_NOTE:
             raise LadderError(f"续期必须给出 1..{MAX_NOTE} 字符的原因")
-        with _lock:
+        with _lock, _file_lock(self.lock_path):
             rows = self._load()
             state = self._state(rows, self.budget)
             if not force and state["queries"] < state["budget"]:
@@ -432,3 +649,37 @@ class Ladder:
             record = self._append(rows, "renew", run_id=None, queries=0, best=state["best"], note=text)
             return {"reported": float(record["best"]), "step": self.eta, "queries_used": 0,
                     "queries_left": record["budget"], "budget": record["budget"]}
+
+
+class LadderSnapshot:
+    """梯子的只读快照:一次读入,之后 `has`/`preview` 走内存(第 19 轮 codex 的 L3)。
+
+    只暴露只读查询。`submit` 不在这里——消耗查询必须走真梯子(要写日志、头指针与锚点)。
+    """
+
+    def __init__(self, ladder: Ladder, rows: list[dict]) -> None:
+        self._ladder = ladder
+        self._rows = rows
+        self._run_ids = {r["run_id"] for r in rows if r.get("run_id") is not None}
+
+    def has(self, run_id: str) -> bool:
+        return run_id in self._run_ids
+
+    def preview(self, sharpe, run_id: str | None = None) -> dict:
+        with _lock:
+            return self._ladder._plan(self._rows, sharpe, run_id)
+
+    def submit(self, sharpe, run_id: str | None = None) -> dict:
+        """消耗查询的写操作**不走快照**,回真梯子(它要写日志、头指针与锚点)。
+
+        快照只用来做只读判断;真要扣查询时,真梯子会重新读一遍当前状态——同一个 `run_id`
+        的重复提交是幂等的(只回放当时的汇报值,不重复扣查询),所以这里不会多扣。
+
+        **已经提交过的 run 直接用快照回答**(第 19 轮 codex 的 L3 收尾):这种提交是**纯回放**——
+        不写日志、不扣查询、汇报值就是当初那一条。走真梯子只会把整条日志重读并重校验一遍,
+        而 `/feedback` 每次迭代都要扫几十上百个 run,那是进化回路的热路径(实测 400 个结果
+        要重读 400 次)。快照里的行就是从日志读出来的,回放值与真梯子一致。"""
+        if run_id is not None and run_id in self._run_ids:
+            with _lock:
+                return self._ladder._plan(self._rows, sharpe, run_id)     # 纯回放:不写、不扣
+        return self._ladder.submit(sharpe, run_id=run_id)

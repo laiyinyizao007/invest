@@ -66,6 +66,14 @@ class OutwardError(Exception):
     """对外揭示的存档损坏或写入失败(fail-closed)。"""
 
 
+class OutwardTampered(OutwardError):
+    """揭示存档**被改过**(第 19 轮 codex 的 H1)。
+
+    与"结果本身不合法"必须分开:坏结果只是这一条没法揭示,跳过它仍然能继续;
+    存档被篡改是**篡改信号**,吞掉它等于让"失败被藏了"看起来像"没有失败"。
+    所以这一类必须被计数并上报,不能和"从未揭示过"共用同一个 `None` 语义。"""
+
+
 def _finite(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -254,12 +262,12 @@ class RevealStore:
             return None
         try:
             if path.stat().st_size > MAX_STORED_BYTES:
-                raise OutwardError("揭示存档超过大小上限")
+                raise OutwardTampered("揭示存档超过大小上限")
             view = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise OutwardError(f"揭示存档损坏(fail-closed): {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
+            raise OutwardTampered(f"揭示存档损坏(fail-closed): {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
         if not validate_view(view):
-            raise OutwardError("揭示存档不合法(fail-closed)")
+            raise OutwardTampered("揭示存档不合法(fail-closed)")
         return view
 
     def put(self, run_id: str, view: dict) -> None:
@@ -288,24 +296,24 @@ def _replay(stored: dict, view: dict, result: dict, sharpe: Any, run_id: str, la
     重新生成的视图逐字段相等;报告就是视图的确定性重推导。任何一条对不上都当作被改过 fail-closed。
     返回的是**当前**的剩余查询数(第 16 轮 L1:不回放旧的 `queries_left`)。"""
     if not ladder.has(run_id):
-        raise OutwardError("揭示存档在梯子日志里没有对应的查询记录(fail-closed):存档被伪造或梯子被回滚")
+        raise OutwardTampered("揭示存档在梯子日志里没有对应的查询记录(fail-closed):存档被伪造或梯子被回滚")
     plan = ladder.preview(sharpe, run_id=run_id)
     block = stored.get("ladder")
     if not isinstance(block, dict) or block.get("reported_sharpe") != plan["reported"] or block.get("step") != plan["step"]:
-        raise OutwardError("揭示存档的汇报值与梯子对不上(fail-closed)")
+        raise OutwardTampered("揭示存档的汇报值与梯子对不上(fail-closed)")
     body = {k: v for k, v in stored.items() if k not in ("ladder", "report")}
     expected = {k: v for k, v in view.items() if k not in ("ladder", "report")}
     if body != expected:
-        raise OutwardError("揭示存档与落盘结果对不上(fail-closed)")
+        raise OutwardTampered("揭示存档与落盘结果对不上(fail-closed)")
     if stored.get("report") != outward_report(stored):
-        raise OutwardError("揭示存档的报告不是视图的确定性推导(fail-closed)")
+        raise OutwardTampered("揭示存档的报告不是视图的确定性推导(fail-closed)")
     fresh = dict(stored)
     fresh["ladder"] = {"reported_sharpe": plan["reported"], "step": plan["step"], "queries_left": plan["queries_left"]}
     fresh["report"] = outward_report(fresh)
     return fresh
 
 
-def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: bool = True) -> dict | None:
+def reveal(result: dict, *, ladder, store: RevealStore, allow_query: bool = True) -> dict | None:
     """把一个落盘结果揭示给外层,返回净化视图。
 
     - 结果里没有验证窗口数字:直接给视图,不消耗查询;
