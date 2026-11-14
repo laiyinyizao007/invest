@@ -5,6 +5,12 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+
+### Fixed（第 15 轮 codex 复核后,阶段 3 / Issue #21)
+- **梯子**(High):状态改为带哈希链的追加日志 + 头指针,手工编辑/回滚/截断按篡改 fail-closed;`submit` 按 `run_id` 幂等;写失败不留半行、不烧查询;人工续期只能走新增的 `scripts/research_ladder.py renew --reason`(留 `renew` 审计事件,`best` 保留)。
+- **经验方差 V**:改为"各次评估网格夏普方差的中位数"(≥3 次评估、每次 ≥5 格,最近 ≤200 次),仍与 `1/(T-1)` 取 max,只会更严。
+- **泄漏**:错误视图按阶段打标(声明/选参/验证),验证回放的报错不出站;异常类型限定在封闭集合;台账 `fail_reason` 改封闭文法,`reflection` 写端只接受 None。
+- **登记未解决**:ADR「C3」——已锁定的 `DSR ≥ 0.95` 与可疑夏普上限 3.0 在 T=367 下互斥(N=28 需年化夏普 ≈3.03),**未放宽任何阈值**,`tests/test_gate_reachability.py` 以 strict xfail 记录,待用户裁决。
 ### Added（新增）
 - **进化引擎阶段 3:梯子、经验方差 V、谱系台账、MAP-Elites、热力图、对外揭示层**(Issue [#21](https://github.com/laiyinyizao007/invest/issues/21),ADR `20261113-evolution-engine`「阶段 3 实现」):
 `risk/ladder.py`(η = 1.10、总查询预算 60——**预算数字是实现时定的,规格没给**,已登记且只能更紧)、逐试验夏普入账与 `V = max(V_经验, 1/(T-1))`(只能更严,样本 < 20 退回理论值并显式记录)、`risk/lineage.py` 谱系台账(与面板读取侧同口径,未知字段一律拒绝)、`risk/map_elites.py`(16 格,父代均匀选格、同格内加权,**不读 DSR**)、`risk/heatmap.py`(读取侧按名字排序解释轴,写端同步换序)、`risk/structured_diagnosis.py`、`risk/behavior.py`、`risk/describe.py`、`risk/outward.py`。
