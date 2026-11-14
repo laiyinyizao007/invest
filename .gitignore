@@ -62,3 +62,8 @@ tmproot/
 # 评审/探针留下的另两种命名(第 13 轮 codex 实测:`tmpprobe*/` 匹配不到 `.tmpprobe`)
 .tmpprobe/
 .pytest_tmp/
+
+# 评审脚手架的 --basetemp 与探针(第 16 轮 M3:r15tmp 曾被误提交)
+r[0-9]*tmp/
+.r[0-9]*
+probe[0-9]*/
