@@ -510,8 +510,118 @@ def _bound_names(target: ast.AST) -> set[str]:
     return names
 
 
-def _module_defined_names(tree: ast.AST) -> set[str]:
-    """候选**自己**定义的名字(`def` / `class` / 赋值目标)。
+def _direct_bindings(node: ast.AST) -> set[str]:
+    """一条语句**在本作用域**里绑定的名字。
+
+    收:赋值/注解赋值/复合赋值的目标、`for` 目标、`with ... as`、`except ... as`、
+    `match` 的捕获名、`def`/`class` 的名字、海象表达式 `(x := ...)` 的目标。
+    **不收**:
+    - `import` 绑定的名字(那是框架那个对象,不是候选自己的);
+    - 嵌套函数/类体**内部**的绑定(属于它们自己的作用域)。
+    """
+    names: set[str] = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        # 只绑**这个名字**;参数与函数体里的绑定属于它自己的作用域。
+        return {node.name}
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            names.update(_bound_names(target))
+    elif isinstance(node, ast.AnnAssign):
+        names.update(_bound_names(node.target))
+    elif isinstance(node, ast.AugAssign):
+        names.update(_bound_names(node.target))
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        names.update(_bound_names(node.target))
+        names.update(_scope_bindings(node.body))
+        names.update(_scope_bindings(node.orelse))
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                names.update(_bound_names(item.optional_vars))
+        names.update(_scope_bindings(node.body))
+    elif isinstance(node, (ast.If, ast.While)):
+        names.update(_scope_bindings(node.body))
+        names.update(_scope_bindings(node.orelse))
+    elif isinstance(node, ast.Try):
+        names.update(_scope_bindings(node.body))
+        names.update(_scope_bindings(node.orelse))
+        names.update(_scope_bindings(node.finalbody))
+        for handler in node.handlers:
+            if handler.name:
+                names.add(handler.name)            # `except E as e:` 的名字是字符串,不是 ast.Name
+            names.update(_scope_bindings(handler.body))
+    elif isinstance(node, ast.Match):
+        for case in node.cases:
+            names.update(_match_bindings(case.pattern))
+            names.update(_scope_bindings(case.body))
+    elif isinstance(node, ast.Expr):
+        names.update(_walrus_names(node.value))
+    # 海象表达式可能藏在**任何**位置(`if (x := 1):` 的条件里、`a = (y := 2)` 的值里、
+    # 复合语句的体内),所以整条语句扫一遍;嵌套 `def` 里的海象绑在它自己的作用域,跳过。
+    names.update(_statement_walrus_names(node))
+    return names
+
+
+def _statement_walrus_names(node: ast.AST) -> set[str]:
+    """一条语句里(不含嵌套 `def` 内部)所有海象表达式绑定的名字。"""
+    names: set[str] = set()
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        sub = stack.pop()
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue                        # 它里面的海象绑在它自己的作用域
+        if isinstance(sub, ast.NamedExpr):
+            names.update(_bound_names(sub.target))
+        stack.extend(ast.iter_child_nodes(sub))
+    return names
+
+
+def _scope_bindings(stmts: list) -> set[str]:
+    """一层作用域里**直接**绑定的名字(不含嵌套函数/类体内部的绑定)。"""
+    names: set[str] = set()
+    for node in stmts:
+        names.update(_direct_bindings(node))
+    return names
+
+
+def _walrus_names(node: ast.AST) -> set[str]:
+    """海象表达式 `(x := ...)` 绑定的名字。"""
+    return {name for sub in ast.walk(node)
+            if isinstance(sub, ast.NamedExpr) for name in _bound_names(sub.target)}
+
+
+def _match_bindings(pattern: ast.AST) -> set[str]:
+    """`match` 分支捕获的名字(捕获名是字符串字段,不是 ast.Name)。"""
+    names: set[str] = set()
+    for sub in ast.walk(pattern):
+        if isinstance(sub, ast.MatchAs) and sub.name:
+            names.add(sub.name)
+        elif isinstance(sub, ast.MatchStar) and sub.name:
+            names.add(sub.name)
+        elif isinstance(sub, ast.MatchMapping) and sub.rest:
+            names.add(sub.rest)
+    return names
+
+
+def _function_bindings(node: ast.AST) -> set[str]:
+    """一个函数(或 lambda)**自己**作用域里绑定的名字:参数 + 函数体里的绑定。"""
+    names: set[str] = set()
+    args = node.args                                        # type: ignore[attr-defined]
+    for arg in list(getattr(args, "posonlyargs", [])) + list(args.args) + list(args.kwonlyargs):
+        names.add(arg.arg)
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        names.update(_scope_bindings(node.body))
+    else:                                                   # lambda:函数体是一个表达式
+        names.update(_walrus_names(node.body))             # type: ignore[attr-defined]
+    return names
+
+
+class _CandidateScope:
+    """候选源码的**作用域表**:判断某个裸名是不是候选**自己**定义的东西。
 
     第 6 轮 codex 的 High-1:静态层按**名字**拒受保护符号,候选自己写一个
     `def trading_day()`(LLM 候选极常见的辅助名;本仓 `risk/account_guard.py` 就有同名函数)
@@ -519,18 +629,65 @@ def _module_defined_names(tree: ast.AST) -> set[str]:
     两层口径相反:静态筛查先执行,运行期那条"放行"在真实流水线里**永远走不到**。
     这正是 F2 要消灭的那一类误伤(把诚实候选整片拒掉,进化循环因此被闲置)。
 
-    这里只收**候选自己定义**的名字,**不收 import 绑定的名字**:
-    `from risk.market_view import swap_out` 绑的是框架那个,必须照旧拒
-    (那一路由 `ImportFrom` 分支裁决,不受这里的豁免影响)。"""
+    第 7 轮 codex 的 Medium-1/2 把上一版的两个漏洞点破了:
+    - Medium-1:上一版只收 `def`/`class`/赋值目标,**参数、for/with/except/lambda/海象/match 捕获**
+      这些绑定形式全漏了 → 候选把受保护符号当参数传进来会被误拒;
+    - Medium-2:上一版把**整个模块**里出现过的名字都当成"候选自己定义的",
+      于是某个函数里定义的 `swap_out` 会把**模块级**的 `swap_out()` 调用一起豁免掉。
+    现在按**作用域**收:模块级一份,每个函数/类各一份,引用时沿作用域链往上找
+    (Python 的规则:模块作用域处处可见;类作用域只在类体里可见,不进方法)。
+
+    **不收 import 绑定的名字**:`from risk.market_view import swap_out` 绑的是框架那个,
+    必须照旧拒(那一路由 `ImportFrom` 分支裁决,不受这里的豁免影响)。"""
+
+    def __init__(self, tree: ast.AST) -> None:
+        self.module_names = _scope_bindings(getattr(tree, "body", []))
+        self.function_names: dict[int, set[str]] = {}
+        self.class_names: dict[int, set[str]] = {}
+        self.parents: dict[int, ast.AST] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                self.function_names[id(node)] = _function_bindings(node)
+            elif isinstance(node, ast.ClassDef):
+                self.class_names[id(node)] = _scope_bindings(node.body)
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                self.parents[id(child)] = parent
+
+    def is_defined(self, name: str, node: ast.AST) -> bool:
+        """这个裸名在 `node` 所在的作用域链上是不是候选自己绑定的。"""
+        if name in self.module_names:
+            return True
+        current = self.parents.get(id(node))
+        saw_function = False
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                saw_function = True
+                if name in self.function_names.get(id(current), ()):
+                    return True
+            elif isinstance(current, ast.ClassDef):
+                # 类作用域只在**类体**里可见;方法里看不到类属性(Python 的规则)。
+                if not saw_function and name in self.class_names.get(id(current), ()):
+                    return True
+            current = self.parents.get(id(current))
+        return False
+
+
+def _import_bound_names(tree: ast.AST) -> set[str]:
+    """被 import 语句**绑定**的名字(模块别名)。
+
+    `import strategies.trend_atr_strategy as self` 把 `self` 绑成了**模块**,
+    于是 `self.swap_out(...)` 长得像"实例自己的属性",实则一步拿到真发放口
+    (第 7 轮 codex 的 High-1 实测:静态层与运行期同时放行)。"""
     names: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                names.update(_bound_names(target))
-        elif isinstance(node, ast.AnnAssign):
-            names.update(_bound_names(node.target))
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
     return names
 
 
@@ -606,7 +763,7 @@ def _path_after_self(node: ast.AST) -> list[str] | None:
     return path[1:]
 
 
-def _self_instance_attr(node: ast.AST) -> bool:
+def _self_instance_attr(node: ast.AST, import_names: set[str] | None = None) -> bool:
     """`self.<name>` 形状:实例**自己**的属性,不是某个模块的成员。
 
     第 11 轮 codex 的 Medium 1:`trading_day` 进了受保护的模块级成员名单之后,
@@ -614,12 +771,21 @@ def _self_instance_attr(node: ast.AST) -> bool:
     被判成"改写了受保护的风控函数 trading_day",把"每天只开一次仓"这类正常候选整片拒掉
     (第 10 轮放行、第 11 轮误拒,已用旧源码对照验证)。
     根因:模块级成员(`risk.risk_guard.trading_day`)与实例属性(`self.trading_day`)是两回事,
-    前者是全局函数,后者改不到它。"""
+    前者是全局函数,后者改不到它。
+
+    第 7 轮 codex 的 High-1:**光看字面名 `self` 不够**。候选写
+    `import strategies.trend_atr_strategy as self`,`self` 绑的是**模块**,
+    `self.swap_out(...)` 于是被当成"实例自己的属性"而放行——静态层与运行期同时放行,
+    真容器回到候选手里。所以这里额外要求:`self` **不是**被 import 绑定的名字。"""
     path = _attr_path(node)
-    return bool(path) and len(path) == 2 and path[0] == "self"
+    if not path or len(path) != 2 or path[0] != "self":
+        return False
+    if import_names and path[0] in import_names:
+        return False            # `self` 是模块别名,不是实例
+    return True
 
 
-def _write_violation(target: ast.AST, c: Constitution) -> str | None:
+def _write_violation(target: ast.AST, c: Constitution, import_names: set[str] | None = None) -> str | None:
     """写入受保护成员(或受保护对象的内部状态)时返回路径说明,否则 None。
 
     早先只看赋值的**末段**属性名(`target.attr`),于是这两种写法三层全绿:
@@ -658,7 +824,7 @@ def _write_violation(target: ast.AST, c: Constitution) -> str | None:
         if attr in c.protected_names or attr in c.protected_parameters:
             return attr
         if attr in c.protected_module_attrs and _module_attr_owner_ok(attr, _attr_path(target) or []):
-            if _self_instance_attr(target):
+            if _self_instance_attr(target, import_names):
                 return None
             return attr
     return None
@@ -1161,6 +1327,39 @@ def star_import_finding(module: str, level: int = 0) -> str | None:
     return None
 
 
+def import_module_finding(module: str) -> str | None:
+    """裁决 `import <模块>`:该放行返回 None,否则返回拒绝理由(含规则名)。
+
+    第 7 轮 codex 的 High-1:`import strategies.trend_atr_strategy as self` +
+    `self.swap_out(strategy)` 在静态层与运行期**同时放行**,真 ArrayManager 回到候选手里
+    (实测:`strategy.am is 真 ArrayManager` → True,`close[0] = -12345.0` 真的改了真容器;
+    第五层"逐根核对"能发现篡改,所以结果没被伪造,但"候选碰不到换入换出"这个前提被绕开了)。
+    根因之二:宪法层有通配符导入的分支,**没有**具名导入整个模块的分支。
+
+    口径:
+    - **仓库内**的模块:解析它的名字集合,含受保护符号(或名字集合不可证)就拒;
+    - **仓库外**的第三方模块(numpy/pandas 之类):**不管**——它们不含我们的发放口,
+      一律拒会把诚实候选整片拒掉(进化循环因此被闲置),那不是纵深防御,那是自伤。
+    """
+    path = _module_source_file(module)
+    if path is None:
+        return None                      # 仓库外的第三方模块:不含本仓的发放口
+    info = _module_export_info(path)
+    if info is None:
+        return (f"导入 `{module}` 的名字集合无法解析:查不了等于没查,拒绝"
+                f"(规则:候选不得导入含受保护符号的模块)")
+    names, _private, dynamic = info
+    if dynamic:
+        return (f"导入 `{module}` 的名字集合不可证(模块有动态导出):查不了等于没查,拒绝"
+                f"(规则:候选不得导入含受保护符号的模块)")
+    hits = sorted(names & _star_import_blocked_symbols())
+    if hits:
+        return (f"导入 `{module}` 会把受保护符号 {'、'.join(hits)} 握在手里"
+                f"(拿到定义就能架空风控判定,只读视图的换入换出也会被绕开)"
+                f"(规则:候选不得导入含受保护符号的模块)")
+    return None
+
+
 def _protected_runtime_objects() -> dict[int, str]:
     """已加载的受保护模块里,受保护符号的**身份**(id -> 符号名)。
 
@@ -1183,6 +1382,11 @@ def _protected_runtime_objects() -> dict[int, str]:
         namespace = getattr(module, "__dict__", None)
         if not isinstance(namespace, dict):
             continue
+        # 模块**对象**本身也算"握着受保护东西":候选
+        # `import strategies.trend_atr_strategy as t` 之后 `t.swap_out` 一步可达
+        # (第 7 轮 codex 的 High-1)。按名字挑模块不够——挑的是**含受保护符号**的那些模块。
+        if any(name in namespace for name in names):
+            objects.setdefault(id(module), f"模块 {modname}")
         for name in names:
             obj = namespace.get(name)
             if obj is None:
@@ -1232,12 +1436,29 @@ def check_candidate_namespace(namespace: dict) -> list[str]:
     这一层看不见;框架对象本身由运行期第四层(身份指纹)与第五层(逐根核对)盯着。"""
     protected = _protected_runtime_objects()
     if not protected:
-        # 查不了等于没查:受保护模块还没被加载(正常流程里模板先导入,它们一定在),
-        # 这时无法按身份核对,只能按**名字**核对一遍(宁可多拒,不可漏放)。
+        # 受保护模块还没被加载(正常流程里模板先导入,它们一定在)。
+        # 先把模板与框架模块导入进来,再按身份核对:查不了等于没查。
+        _preload_protected_modules()
+        protected = _protected_runtime_objects()
+    if not protected:
+        # 还是拿不到身份表:退回按**名字**核对,但**排除候选自己定义**的同名符号
+        # (第 7 轮 codex 的 Low-1:按名字一刀切会把诚实的 `def trading_day()` 整片拒掉,
+        #  与静态层"候选自己定义的名字放行"的口径相反;判据是**出处**:
+        #  值来自本仓的受保护包 → 拒;来自别的模块 → 候选自己的,放行)。
         blocked = _star_import_blocked_symbols()
-        return [f"候选命名空间里出现了受保护符号 {name}"
-                f"(规则:候选命名空间不得持有受保护对象)"
-                for name in sorted(set(namespace) & blocked)]
+        findings: list[str] = []
+        for name in sorted(set(namespace) & blocked):
+            value = namespace.get(name)
+            if isinstance(value, (bool, int, float, str, bytes, complex, type(None))):
+                continue                # 标量:与身份表同一口径,不算受保护对象
+            origin = getattr(value, "__module__", None)
+            if not isinstance(origin, str):
+                origin = getattr(value, "__name__", None)        # 模块对象
+            if isinstance(origin, str) and origin.split(".")[0] not in _OWN_PROTECTED_PACKAGES:
+                continue                # 候选自己的同名符号:不是框架那个,放行
+            findings.append(f"候选命名空间里出现了受保护符号 {name}"
+                            f"(规则:候选命名空间不得持有受保护对象)")
+        return findings
     findings: list[str] = []
     for holder, value in _namespace_values(namespace):
         symbol = protected.get(id(value))
@@ -1272,10 +1493,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     # 类体里的赋值目标:裸局部名豁免(`am`/`bg`)只对**函数体**生效,
     # 类体里定义 `am = ...` 仍然算"覆盖受保护成员"(见 _class_body_target_ids)。
     class_body_targets = _class_body_target_ids(tree)
-    # 候选**自己**定义的名字(def/class/赋值目标):裸名引用这些名字时,
-    # 指的是候选自己的对象,不是框架那个受保护对象(第 6 轮 codex 的 High-1)。
-    # 运行期那一层已经按**身份**核对(候选自己的同名符号放行),这里与它对齐。
-    defined_names = _module_defined_names(tree)
+    # 候选**自己**定义的名字:裸名引用这些名字时,指的是候选自己的对象,
+    # 不是框架那个受保护对象(第 6 轮 codex 的 High-1)。运行期那一层已经按**身份**核对
+    # (候选自己的同名符号放行),这里与它对齐。
+    # 第 7 轮 codex 的 Medium-1/2:改成**按作用域**判定(参数/for/with/except/lambda/海象/match
+    # 这些绑定形式也算"候选自己定义的";但某个函数里的同名定义不再豁免模块级的引用)。
+    scope = _CandidateScope(tree)
+    # 被 import 绑定的名字:`import strategies.trend_atr_strategy as self` 把 `self`
+    # 绑成了**模块**,`self.swap_out(...)` 于是长得像实例属性(第 7 轮 codex 的 High-1)。
+    import_names = _import_bound_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for name in sorted(_class_body_names(node)):
@@ -1318,15 +1544,15 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
             elif isinstance(target, ast.Attribute):
-                violation = _write_violation(target, c)
+                violation = _write_violation(target, c, import_names)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                 elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
-                        target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
+                        target.attr, _attr_path(target) or []) and not _self_instance_attr(target, import_names):
                     findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
             elif isinstance(target, ast.Subscript):
                 # `self.am.close[0] = 999`:改的是被下标取到的那个对象(行情数组本体)
-                violation = _write_violation(target.value, c)
+                violation = _write_violation(target.value, c, import_names)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
         elif isinstance(node, ast.Assign):
@@ -1335,24 +1561,24 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                         and not _bare_local_allowed(target.id, id(target), class_body_targets):
                     findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
                 elif isinstance(target, ast.Attribute):
-                    violation = _write_violation(target, c)
+                    violation = _write_violation(target, c, import_names)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
                     elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
-                            target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
+                            target.attr, _attr_path(target) or []) and not _self_instance_attr(target, import_names):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
                 elif isinstance(target, ast.Subscript):
-                    violation = _write_violation(target.value, c)
+                    violation = _write_violation(target.value, c, import_names)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
         elif isinstance(node, ast.AugAssign):
             target = node.target
             if isinstance(target, ast.Attribute):
-                violation = _write_violation(target, c)
+                violation = _write_violation(target, c, import_names)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
             elif isinstance(target, ast.Subscript):
-                violation = _write_violation(target.value, c)
+                violation = _write_violation(target.value, c, import_names)
                 if violation:
                     findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
             elif isinstance(target, ast.Name) and _is_protected(target.id, c) \
@@ -1388,7 +1614,7 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 # 拿到风控函数的**定义**就多一条改写它的路(改函数对象的状态,连名字都不用碰)。
                 # 例外:`self.<name>` 是实例自己的属性,改不到模块级函数(第 11 轮 codex 的 Medium 1:
                 # `self.trading_day = ...` 曾被误判成"拿到了受保护对象的定义")。
-                if not _self_instance_attr(node):
+                if not _self_instance_attr(node, import_names):
                     findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.attr}(拿到定义就能架空风控判定)")
             elif isinstance(node.ctx, ast.Del) and _is_protected(node.attr, c):
                 findings.append(f"第 {node.lineno} 行: 删除了受保护属性 {node.attr}")
@@ -1411,8 +1637,22 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                 # 放行(第 6 轮 codex 的 High-1)。注意豁免只对**裸名**有效:
                 # `from risk.market_view import swap_out` 绑的是框架那个,由 ImportFrom 分支照旧拒;
                 # `x = risk.market_view.swap_out` 的**属性**那一路也照旧拒。
-                if node.id not in defined_names:
+                # 第 7 轮 codex 的 Medium-1/2:按**作用域**判定——参数/for/with/except/lambda/
+                # 海象/match 这些绑定形式也算"候选自己定义的";某个函数里的同名定义
+                # 不再豁免**模块级**的引用。
+                if not scope.is_defined(node.id, node):
                     findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.id}(拿到定义就能架空风控判定)")
+        elif isinstance(node, ast.Import):
+            # `import <模块>`:候选把**整个模块对象**握在手里,一步就能走到模块里的发放口。
+            # 第 7 轮 codex 的 High-1 实测:`import strategies.trend_atr_strategy as self` +
+            # `self.swap_out(strategy)` 在静态层与运行期**同时放行**,真 ArrayManager 回到候选手里
+            # (`strategy.am is 真 ArrayManager` → True,`close[0] = -12345.0` 真的改了真容器)。
+            # 根因之二:宪法层有通配符导入的分支(`ImportFrom`),**没有**具名导入整个模块的分支。
+            # `from X import 名字` 仍由 ImportFrom 分支逐名裁决,不受这条影响。
+            for alias in node.names:
+                reason = import_module_finding(alias.name)
+                if reason:
+                    findings.append(f"第 {node.lineno} 行: {reason}")
         elif isinstance(node, ast.ImportFrom):
             # 从受保护模块里**导入**风控对象:候选不需要它,拿到就多一条改写它的路。
             # (`from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 不受影响——
@@ -1896,6 +2136,13 @@ PROTECTED_RUNTIME_PACKAGES = (
     "vnpy.trader.object",
     "vnpy.trader.utility",
 )
+
+# 本仓自己的那三个包(`PROTECTED_RUNTIME_PACKAGES` 里**不带点**的几条):
+# 一个值只要**出处**在这里,它就不是候选自己的东西。
+# 用途:运行期命名空间核对在没有身份表时,按**出处**区分"框架的同名符号"与"候选自己的同名符号"
+# (第 7 轮 codex 的 Low-1)。带点的那些是 vnpy 的第三方模块,受保护对象不住在那儿。
+_OWN_PROTECTED_PACKAGES = frozenset(
+    package for package in PROTECTED_RUNTIME_PACKAGES if "." not in package)
 
 
 def _module_in_scope(name: str, packages: tuple[str, ...]) -> bool:
