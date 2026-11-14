@@ -68,15 +68,38 @@ BUILTIN_SETS = (
 )
 
 # 同为"白名单"语义的内置常量:只减不增。
-BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES",)
+# `ALLOWED_REPO_IMPORT_DIRS` 也在列:它是仓库内导入白名单,多一项就多放开一点
+# 候选能 import 的东西(第 21 轮新增)。
+BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES", "ALLOWED_REPO_IMPORT_DIRS")
 
 # 沙盒层的内置 deny set 同样是"代码内置的保护",一并纳入比对。
-SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS")
+#
+# 第 25 轮(codex 的 Medium 8)补登记了三份:
+# - DANGEROUS_MODULE_NAMES:危险模块名单(属性层与导入门**共用**的那一份);
+# - FORBIDDEN_MODULE_PATHS:按**全名**禁用的路径(numpy.ctypeslib 之类);
+# - CAPABILITY_MODULE_NAMES:会把执行能力递出来的模块(ctypes / subprocess)。
+# 这三份都是"少一项 = 多放开一点能力",所以只能增不能减。
+#
+# 之前它们**既没登记、也没被解析过**:提取器不认 `frozenset({...})` 写法,
+# `check_registry_completeness` 也就没把它们算成"漏登记"——
+# 从危险名单里删掉 "ssl",守卫照样全绿(第 25 轮 codex 实测)。
+# FORBIDDEN_KEY_STRINGS 也在其中:危险模块的**短名**只在"按键取"的语境里拒,
+# 同样是一份 deny 名单(它原先解析不了,所以"漏登记"的检查一直没报)。
+SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS",
+                "DANGEROUS_MODULE_NAMES", "FORBIDDEN_MODULE_PATHS", "CAPABILITY_MODULE_NAMES",
+                "FORBIDDEN_KEY_STRINGS")
+
+# 沙盒层的**允许**集合(第 21 轮新增的仓库内导入白名单):语义与 deny set 相反——
+# 多一项 = 多放开一点仓库内的模块(候选能 import 的东西变多),所以它必须**只减不增**。
+# 登记在 `BUILTIN_SHRINK_ONLY_SETS` 里;同时登记进注册表是为了让它进入
+# 引用次数的守望(执行点不许消失)——按现有先例(`BUILTIN_ALLOWED_OVERRIDES`),
+# 两个方向都被冻住:要改这个白名单必须显式改守卫,不能顺手加一项。
+SANDBOX_ALLOW_SETS = ("ALLOWED_REPO_IMPORT_DIRS",)
 
 # 注册表:(文件相对路径, 该文件里受保护的常量名)
 BUILTIN_REGISTRY = (
     (CONSTITUTION_SOURCE_REL, BUILTIN_SETS),
-    ("scripts/research_sandbox.py", SANDBOX_SETS),
+    ("scripts/research_sandbox.py", SANDBOX_SETS + SANDBOX_ALLOW_SETS),
 )
 
 # 清单**字段**的执行点也要守:删掉 `if node.attr in c.forbidden_order_calls:` 这个分支,
@@ -148,6 +171,19 @@ def const_string_set(source: str, names) -> dict[str, set[str]]:
                     return None
                 out.add(elt.value)
             return out
+        if isinstance(node, ast.Call):
+            # `frozenset({...})` / `set({...})` / `frozenset(("a", "b"))`。
+            # 提取器原来不认这种写法,于是 CAPABILITY_MODULE_NAMES 与
+            # FORBIDDEN_MODULE_PATHS 这两份名单**从来没被解析过**——
+            # 守卫对它们的历史比对一直是空的,而"漏登记"的检查也因此不报。
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id in ("frozenset", "set")):
+                return None
+            if not node.args:
+                return set()
+            if len(node.args) != 1 or node.keywords:
+                return None
+            return evaluate(node.args[0], seen)
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.BitOr)):
             left = evaluate(node.left, seen)
             right = evaluate(node.right, seen)

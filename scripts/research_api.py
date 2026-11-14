@@ -414,16 +414,22 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         code = compile(source, str(path), "exec", dont_inherit=True)
     except SyntaxError as exc:
         raise JobError(EXIT_REFUSED, f"策略文件语法错误: {exc}") from exc
-    # 模块元数据用标准 loader 准备(保留 __spec__/__loader__/__package__),
-    # 但**不调用** exec_module:执行的是上面编译好的、经过校验的那份字节,
-    # .pyc 没有机会生效(那正是第 4 轮修掉的 .pyc 绕过)。
+    # 模块元数据只留 `__file__`/`__package__`/`__name__`:**不给候选真正的 loader**(第 21 轮实测的逃逸之三)。
+    #
+    # 此前把 `spec` 与 `spec.loader` 挂到候选模块上("保留标准 loader 元数据"),
+    # 于是候选可以:
+    #     import types
+    #     m = types.ModuleType("pending_strategy")
+    #     __loader__.exec_module(m)          # 用**真实内建**把候选源码再跑一遍
+    #     b = m.__dict__["__builtins__"]      # 真实内建:setattr / eval / exec / open 全在
+    # 受限内建那一层就此作废(实测)。现在 loader 与 spec 都不给:
+    # `__spec__`/`__loader__` 保持模块默认值(None),候选摸不到能执行代码的入口。
+    # 执行的是上面编译好的、经过校验的那份字节,.pyc 没有机会生效(第 4 轮修掉的 .pyc 绕过)。
     module = types.ModuleType("pending_strategy")
     module.__file__ = str(path)
     try:
         spec = importlib.util.spec_from_file_location("pending_strategy", path)
         if spec is not None:
-            module.__spec__ = spec
-            module.__loader__ = spec.loader
             module.__package__ = spec.parent or ""
             module.__name__ = spec.name
     except Exception:                                        # noqa: BLE001 - 元数据拿不到不该拦住执行
@@ -431,10 +437,44 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 候选执行时用**最小内建集合**:静态层能封住已知的写法,封不住能力本身——
     # `e.__traceback__.tb_frame.f_builtins.setattr(...)` 这类路径上的名字都不在禁用名单里,
     # 而 `unittest.mock.patch.object` 只要能 import 就能改写实例属性。
-    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
+    # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,能封住一批已知的路径
     # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
+    #
+    # **但这一层不是边界**(第 21 轮实测,别把它当边界写进结论里):真实内建还能从
+    # ①候选模块的 loader ②异常链上的帧 ③任何第三方模块的 `__dict__["__builtins__"]` 拿到。
+    # ①②已在本文件与 scripts/research_sandbox.py 里封掉;③**仍然敞着**——
+    # 进程内执行不受信代码无法做到安全,真正的边界是人工审批 + 容器隔离(见 ADR 残余风险)。
+    #
+    # 另外加一道**按路径**的导入裁决(第 21 轮):名单只拦得住"名字",
+    # 拦不住"候选自己写一个辅助模块再 import 它"——辅助模块是在 import 机制里执行的,
+    # 拿到的是真实内建,静态层与受限内建对它都不生效。
+    # 快照必须在**候选开始运行之前**拍:文件必须早就存在,否则拒绝导入。
+    started_at_ns = time.time_ns()
+    # 白名单**显式**传:靠默认参数的话,将来有人把默认值改成
+    # ("strategies","scripts") 就能放开整个 scripts/,而登记在宪法历史守卫里的
+    # 那个常量根本不会被改动(第 24 轮 codex Medium 2)。
+    repo_guard = rs.RepoImportGuard(rc.CODE_ROOT,
+                                    allowed_dirs=rs.ALLOWED_REPO_IMPORT_DIRS,
+                                    snapshot=rs.snapshot_allowed_files(rc.CODE_ROOT),
+                                    started_at_ns=started_at_ns)
+    # 两边合成同一个调用:`allowed_modules`(main #22,导入**白名单**,配置只能追加)
+    # 与 `repo_guard`(#26,按**路径**的导入裁决)是两道独立的闸,谁也不替代谁。
     module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"],
-                                                      cfg["screening"]["allowed_modules"])
+                                                      cfg["screening"]["allowed_modules"],
+                                                      repo_guard=repo_guard)
+    # **启动期核对**(第 26 轮 codex 第二轮复核的 Critical 1,实测):
+    # 框架自己在跑候选**之前**就要预加载受保护的模块
+    # (`risk/constitution.py::_preload_protected_modules` → `import strategies.…`),
+    # 而导入机制导入子模块**之前必定先执行父包的 `__init__.py`**。
+    # 于是"上一轮候选改了 `strategies/__init__.py`"的载荷,会在本轮**预加载阶段**就
+    # 被执行——那时守卫还没构造,用的是**真内建**,在沙盒**之外**
+    # (实测:候选还没跑起来,标记文件就已经被写出来了)。
+    # 守卫那一侧只能拦"候选自己 import",拦不住"框架自己 import",
+    # 所以这里在**预加载之前**先把受信目录整体与仓库提交核对一遍,不一致就拒绝运行。
+    trusted_problems = rs.verify_trusted_tree(rc.CODE_ROOT, rs.ALLOWED_REPO_IMPORT_DIRS)
+    if trusted_problems:
+        raise JobError(EXIT_REFUSED, "受信目录与仓库提交不一致,拒绝运行:"
+                       + chr(10) + "  " + (chr(10) + "  ").join(trusted_problems))
     # 运行期第四层:候选执行**前后**各拍一张"受保护对象身份指纹"。
     # 静态层按名字判断,拦不住"换个写法"改写框架对象——第 9 轮 codex 实测:
     # `import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`

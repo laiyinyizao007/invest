@@ -6,6 +6,24 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
+  ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
+  且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:
+  - 导入门 = 黑名单(`DANGEROUS_MODULE_NAMES` 等)→ 按全名禁用 → **按路径裁决**(#26)→ **导入白名单**(main)→ 配置追加模块的**准入审计**(main);
+    顺序刻意如此:同一个名字被几条规则同时拒时,报的是**最具体**的那条(路径规则说得出"为什么"),不是笼统的"未列入白名单"。
+  - 候选拿到的是 main 的代理 `_GuardedModule`(名字层:下划线/泄漏属性名,抛 `ImportError`),
+    它的取属性**同时**走 #26 的对象层判据(危险模块/能力来源,抛 `AttributeError`);两层共用 `_check_object_rules`,不各自漂移。
+  - `FORBIDDEN_ATTRS` 取并集(main 的 `__spec__`/`__loader__`/`__file__`/`__path__`/`__package__`/`__reduce__`/`__reduce_ex__`/`__getattr__`
+    + #26 的走栈/闭包单元属性);`FORBIDDEN_SUBSTRINGS`/`DANGEROUS_UNDERSCORE_ATTRS`(main)与 `FORBIDDEN_KEY_STRINGS`/按键取语境(#26)并存。
+  - `research_api`:`rs.safe_builtins(extra_forbidden, allowed_modules, repo_guard=...)` 合成同一个调用,`verify_trusted_tree` 启动期核对保留;
+    仓库根改用 main 引入的 `rc.CODE_ROOT`(代码根;`INVEST_ROOT` 只管数据根——受信目录 `strategies/` 属于代码)。
+  - **两边口径打架的地方(如实记录,没有放宽任何一边)**:① `matplotlib`/`psutil`:#26 第 25 轮要求可导,main 白名单默认不含、
+    配置追加又过不了准入审计 → 取更严的一侧,两条用例已改写并新增回归;② 同一次属性访问两层都拒时异常类型不同
+    (名字层 `ImportError`、对象层 `AttributeError`)→ 名字层先拒,对象层用「名单里没有的名字」另测;③ `logging` 不在白名单,
+    原视图用例改用同形的 `enum.sys`。
+  - 测试:新增 `tests/test_merge_main_sandbox_union.py`(76 条,放行+拦截双向,拦截断言规则文本);
+    生产入口用例改成 `run_candidate(static=False)` 默认只测运行期层(静态层先拒会让用例测到别的层),
+    静态层拒绝另在并集用例里逐条断言;4 个测试文件补 `import bootstrap`(main 的 research_api 不再顶层 import 它)。
 - **DSH 研究入口与带外批准**(Issue [#22](https://github.com/laiyinyizao007/invest/issues/22),
   ADR `20261113-dsh-research-entry-and-out-of-band-approval`):在 DSH Desktop 里用 `research` Preset 发起研究、查进度、请求人工批准,
   批准在本机 `127.0.0.1` 的一次性网页里由人完成——**模型只能请求,不能授予**。
@@ -434,6 +452,283 @@
     把阈值改成 2 重跑:SE 中位数 **0.7312**(用 3 时 0.7306)、**η = 1.097**(用 3 时 1.096)——
     **都取整为 1.10**。即 **η 对熔断阈值不敏感**(差 0.08%),登记值不变,
     不存在"为了凑一个数去调阈值"的情况。
+
+### Fixed（修复）
+- **提交基准不许再用 `git status`(第 26 轮 codex 的 Critical 1)**:第 25 轮把"跨轮次逃逸"的基准
+  定成"仓库提交里的那份",实现上用的是 `git status --porcelain` + `git ls-tree`。
+  **但 `git status` 会应用 filter**:filter 的 `clean=` 是一条**命令**,由 git 自己去执行,
+  而候选能写 `.git/config` 与受信目录下的 `.gitattributes` —— 于是候选只要写下一条 filter 命令,
+  **守卫自己跑的那次 `git status` 就替候选执行了它**(实测:标记文件被写了出来,
+  静态筛查 **0 findings**——那条命令是 git 执行的,不是候选执行的)。
+  守卫从"检查者"变成了"执行面"。
+  - 改成三条硬规矩:①**只用不应用 filter 的读法**(`git ls-tree` 读树、`git cat-file` 读对象,
+    两者只读对象库、不碰工作区文件);②**调用时关掉一切能执行命令的配置**
+    (`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、
+    `HOME`/`XDG_CONFIG_HOME`/`USERPROFILE` 重定向到临时空目录、`-c core.fsmonitor=false`、
+    `-c core.pager=cat`、`GIT_OPTIONAL_LOCKS=0`);③**不用 git 去比内容**——
+    取**提交里那份 blob**,与工作区内容只比"**去掉 CRLF 之后**是不是一样"
+    (第 25 轮自己算 blob 哈希曾把 CRLF/LF 误判成"被改写过",那次的教训是"内容基准要交给内容的主人";
+    现在两边都不自己复刻,只比换行,换行之外的任何差异仍判不一致——**不放宽任何已锁定的阈值**)。
+  - 守卫在**构造时**(候选运行之前)记下仓库元数据的内容指纹,`check()` 时核一遍,
+    **不一致就 fail-closed**(候选改写仓库元数据这件事本身被管住)。
+    记哪几份见下面「第 26 轮第二轮 codex 复核之后补修的那几条」(config/HEAD 在哪、第 26 轮 codex
+    第二轮实测出 linked worktree 的坑之后又改过一次)。
+- **通配符导入(`from 包 import *`)补上提交基准(第 26 轮 Critical 2)**:这一路原来**只有**"快照"这一关,
+  没有提交基准 → 第 25 轮堵掉的那条跨轮次逃逸在通配符这条路上**原样可用**
+  (上一轮改写 `strategies/base.py`、这一轮 `from strategies import *`)。
+  现在通配符路径上的**每一个 `.py`** 都套上与 `check()` 同一把尺子的提交基准核对。
+- **相对导入上,视图的"拒绝"被 CPython 的回退绕过 → 拿到真 ctypes(第 26 轮 Critical 3)**:
+  CPython 的 `IMPORT_FROM` 回退键是 `<返回模块的 __name__>.<名字>`(绝对名),
+  而查表用的是**原始名**——相对导入时原始名是 `""`(`from . import x`)→ **查表永远落空**
+  → 视图拒绝之后回退把**真模块**交给候选 → 那个模块 `import ctypes` → `CDLL` 成功(实测)。
+  改用**返回模块的 `__name__`** 查表;静态层同时按 `__package__` 把相对 from-import 还原成绝对名再筛。
+- **危险名单补漏(第 26 轮 High 1/2)**:`_winapi`(Windows,`CreateProcess` 可达——**实测**)、
+  `_ctypes`(**推理**)、`_posixsubprocess`(Linux 对偶,**推理**,本机无法实测)、
+  `codeop`(`compile_command` 把字符串编译成代码)、`types`(`FunctionType` 能用真内建造函数)、
+  `posixpath`/`ntpath`/`genericpath`(报出那条向量时用的杠杆:`posixpath.join.__globals__` 里
+  既有真内建也有 `os`)——全部进 `DANGEROUS_MODULE_NAMES`,导入门与属性层同时生效。
+- **提交基准的路径基准统一(第 26 轮 Medium 1)**:原来提交基准是 repo_root 口径、调用方按 toplevel 口径比,
+  `repo_root ≠ toplevel` 时**受信导入被整片误杀**(埋着的误杀)。现在统一到 **toplevel 口径**
+  (`git ls-tree --full-tree` 从 toplevel 跑),并补了"代码在仓库子目录里"的回归用例。
+- **两处 fail-open 改 fail-closed(第 26 轮 Medium 2 / 静态层)**:`check_package_wildcard` 的
+  `except OSError: continue` 改成拒;静态层现在与运行期**共用同一份危险名单**
+  (`import ssl/codecs/mmap` 原先静态 0 findings,只在运行期才拒——而运行期的拒绝发生在 import **之后**)。
+- **静态层筛相对导入(第 26 轮 Low 3)**:按 `__package__` 还原绝对名;还原不出来就**拒**(fail-closed)。
+  口径说明:`screen_source()` 新增的 `package` 参数**没有生产调用点传值**(候选永远是不在包里的单文件模块),
+  所以生产里的实际行为是"还原不出绝对名 → 直接拒";按 `__package__` 还原这条能力目前只有用例在用。
+- **两处缓存(第 26 轮 Low 1/Low 2)**:`git status` 换成 ls-tree/cat-file(内容按 sha 寻址、不可变 → 缓存永远有效),
+  gitdir 路径进程内缓存;能力泄漏缓存原来用 `len(vars(module))` 判失效,
+  **等量替换**成员会用到旧判定(实测:应为 `ctypes`,实得 `None`)——现在缓存"成员名 → 成员对象",
+  复用前逐个用 `is` 核对。
+  (目录扫描按 mtime 的那处缓存**后来撤掉了**——见下面「第 26 轮第二轮 codex 复核之后补修的那几条」。)
+- **第 26 轮第二轮 codex 复核(34/50)之后补修的那几条**(codex CLI,`mcp__zen__clink`;
+  它的两条 HIGH 都自己做了端到端实测,成立):
+  - **linked worktree 下 `.git/config` 根本没进指纹(实测)**:指纹原来按
+    `git rev-parse --absolute-git-dir` 找,而 linked worktree 里那是 **per-worktree** 的 gitdir,
+    `.git/config` 在 **common dir** 里 → 指纹键只有 `['HEAD','index']`,**没有 config**,
+    候选改写共用 config 完全不被发现。**本仓库自己就是这个形态**(`invest-26` 是 `invest` 的
+    linked worktree)。现在 `config` 与 `info/attributes` 用 `--git-common-dir` 解析,
+    `HEAD` 仍取 per-worktree gitdir;回归用例用**真的 linked worktree**(`git worktree add`)来测。
+  - **`__pycache__/*.pyc` 盖过已核对过的源码(实测)**:提交基准核对的是源码,而 CPython 导入时
+    **优先用 `.pyc`**,`.pyc` 只校验头部里的 mtime+size(候选能伪造)→ 实测守卫放行、导入机制执行的
+    是**伪造字节码**(候选代码在真内建下跑出标记文件)。现在核对完源码就把该 `.pyc` **删掉**,
+    让导入机制从刚核对过的那份源码重新编译(残余:删除与导入之间的极小窗口、只读挂载那一支不清理)。
+  - **`.git/index` 不再进指纹**:提交基准走 `ls-tree HEAD` + `cat-file`,**从不读 index**;
+    而 index 会被任何一次 `git add`/`commit` 改写 → 记它只换来"别人提交了一次就全部误杀"。
+  - **git 二进制钉死 + 子命令白名单**:git 的绝对路径第一次用到时钉死(`shutil.which`),
+    且 `_git_run` **只允许** `rev-parse`/`ls-tree`/`cat-file` 三条只读子命令,别的直接抛错——
+    把"守卫永不执行候选写的东西"从**约定**变成**机制**(以后有人加回 `git status` 就复发不了)。
+  - **目录扫描的 mtime 缓存撤掉**:粗粒度文件系统(1~2 秒一档)上同一秒内新增的文件会看不见,
+    而受信目录只有个位数文件——不值得拿安全换性能。
+  - **口径纠正**:"静态层与运行期共用同一份名单"改成"静态层认 `FORBIDDEN_MODULES ∪ DANGEROUS_MODULE_NAMES`,
+    运行期再多一份配置追加的名单";ADR 里"容器隔离"从**既有边界**改回**阶段四 4b 的前置(尚未实现)**——
+    目前**只有人工审批**这一道闸。
+  - **这一轮补修的验证**:用例 33 条 → **37 条**;**变异验证 15 处全部变红**(比上一轮多 3 处:
+    linked worktree 指纹、`.pyc` 清理、git 子命令白名单)。
+  - **补修时自己写错的一处(如实记录)**:那条"即使指纹不报警也不能跑会应用 filter 的 git 命令"的用例,
+    第一版把 filter 写在守卫**构造之后** → 指纹先报警、守卫根本没跑 git → 用例**测不到命令选择**,
+    "把提交基准改回 `git status`"的变异因此抓不住。改成"把 filter 写在守卫构造**之前**"之后,
+    守卫真的会去跑 git,这时标记文件不出现才说明得了问题。
+  - **分数口径**:codex 给的 **34/50** 是**补修之前**的分数;两条 HIGH 与三条 Medium 在这次补修里改了,
+    但**补修之后没有再跑一轮 codex** → "补修之后的分数未知",不替它加分也不替它扣分。
+- **第 26 轮的验证**:新增 `tests/test_sandbox_round26_rules.py`(先 33 条,补修后 **37 条**),
+  每条规则都有**双向**探针
+  (放行 + 拦截)并断言"**是哪一条规则**拒的";**变异验证**把这一轮的修复逐一改回旧行为
+  (先 12 处,补修后 **15 处**),实测**全部变红**(逐处结果见下)。探针与变异脚本都放在 `%TEMP%`,跑完即删,不进仓库。
+  - **本轮自己写错的五处(如实记录)**:①在受限导入器里用了 `getattr`——那个函数的 `f_globals` 是干净的
+    (只有受限内建)→ `NameError`,是回归用例立刻变红才发现的,改用闭包里的 `object.__getattribute__`;
+    ②元数据指纹拍晚了(先改配置再构造守卫 → 指纹记的是已被改过的配置,测不出东西),
+    改成"先构造守卫、再让候选改写";③目录扫描缓存第一版写成"内容哈希"——那等于每次全扫,缓存没有意义;
+    ④filter 对照探针第一版"整份套件一起跑时必失败":靶子文件内容没真的改动 → git 走 stat 快路径,
+    根本不比对内容、也就不会用 clean filter(单跑时能触发靠的是 git racy-clean 的巧合);
+    改成"靶子文件内容真的改掉"+ 命令用"脚本文件 + `sh <脚本>`"(不用 `touch`——
+    filter 是 git 交给 sh 执行的,没装 Git Bash 的机器上 `touch` 根本不存在);
+    ⑤(第二轮复核补修时)"即使指纹不报警也不能跑会应用 filter 的 git 命令"那条用例第一版把 filter
+    写在守卫**构造之后** → 指纹先报警、守卫根本没跑 git → 用例测不到**命令选择**这条规则,
+    "把提交基准改回 `git status`"的变异因此抓不住;改成"把 filter 写在守卫构造**之前**"。
+  - **改了一处既有测试**:`tests/test_candidate_escape_production_path.py` 的 loader 探针原来用 `import types`
+    造模块对象;`types` 进名单后它在静态层就被拒(变成空断言)。已改写成不依赖 `types` 的写法,
+    并让它比原来**更强**(原来 `__loader__` 根本不存在,探针恒为 False)。
+  - **没有修的一半(如实登记)**:视图仍会递出带 `__globals__`/`__code__` 的 python 函数与类
+    (实测 `posixpath.join.__globals__['os']` 可达)。泛化修法(把函数复制成"净化版")会**打断正当用法**:
+    `dataclasses` 处理每个字段都要读 `sys.modules`,`enum`/`typing` 的 globals 里也有 `sys`——
+    净化掉 `sys` → `@dataclass` 当场失效;保留 `sys` → 那条链原样敞着。
+    报出那条向量的杠杆已进名单堵掉,但**泛化问题未修**,真正的边界仍是人工审批 + 容器隔离。
+- **跨轮次沙盒逃逸(第 25 轮 codex 第二轮的 Critical 1)**:受信目录(`strategies/`)的完整性基准
+  改成**仓库提交里的那份**,不再是"每次运行重拍"的快照(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+  ADR `20261113-evolution-engine`「第 25 轮补记」)。
+  - **为什么必须换**:快照是每次导入重拍的,挡得住"同一次运行里现写现导",挡不住**"上一轮写、这一轮导"**——
+    候选用 `numpy.savetxt` 改写了受信模块,第 1 轮导入被正确拒绝,第 2 轮**重拍**的快照却已经收进了被篡改的文件 →
+    放行 → 那个模块在**导入机制**里执行(拿到真实内建)→ 任意命令执行(codex 端到端复现,标记文件确实被写了出来)。
+  - **基准取不到就拒**(fail-closed,查不了等于没查);规则按"那个目录**能不能写**"分岔:
+    **容器里 `/app` 是只读的**(rootfs `read_only: true`,`strategies/` 烤进镜像)→ 写能力不存在,不需要基准;
+    **宿主机跑 CLI** → 目录可写,必须用提交基准核对。
+  - **一处自曝的误判(如实记录)**:基准最初是"自己算 git 的 blob 哈希",在 Windows 上会把
+    **没被改过**的文件判成"被改写过"(工作区 CRLF vs 提交 LF,`core.autocrlf` 归一化后其实一致)——
+    受信目录里的正常模块一律被拒。改用 **git 自己的比较口径**(`git status` + `git ls-tree`)后消失。
+    教训:内容基准要交给内容的主人,自己复刻哈希算法只会在换行/编码/过滤器这些细节上出错。
+- **视图的"拒绝"被 CPython 的 `import_from` 回退绕过(第 25 轮 High 2)**:视图用"抛 `AttributeError`"表示不给,
+  而 `IMPORT_FROM` 在 `getattr` 失败时会**清掉异常、回退到 `sys.modules["pkg.name"]`**——"拒绝"恰好触发了"交出真模块"。
+  实测 `from pkgx import sub` 拿到的是**真模块**(候选手里就有一份带 `ctypes` 的真模块)。
+  受限导入器现在在 fromlist 这一路**显式查一次 `sys.modules`**,命中真模块就按真模块的规矩裁决。
+- **危险名单两层口径不一致(第 25 轮 High 4)**:危险名单原先**只在属性层**生效,导入门放行了一大片——
+  实测 `httpx`/`urllib3`/`ssl`/`codecs`/`gzip`/`tarfile`/`zipfile`/`sqlite3`/`mmap`/`atexit` 全部放行,
+  网络外传(`httpx.get(...)`)与文件写(`codecs.open(...)`)的能力都还在。导入门现在**复用同一份名单**;
+  名单同时补齐了写能力与外传通道(`codecs`/`mmap`/`sqlite3`/`ssl`/`bz2`/`lzma`)——
+  静态层只拦**字符串字面量**里的 `"open"`,而 `codecs.open` 是 `ast.Attribute`,"从内建里拿掉 open"没封住写能力。
+- **一处误伤,已回退(第 25 轮 High 3)**:导入门曾整块拒绝"会把能力递出来的模块",于是
+  `import matplotlib` 直接 `ImportError`(matplotlib 建字体缓存要用 `subprocess`)、`psutil` 同理——
+  候选只想画个图却整个模块都用不了。**误伤比漏检更糟**:能力交付改由属性层的模块视图负责,
+  导入门只管"危险模块按名单拒"。
+- **静态层看不见 fromlist(第 25 轮 Medium 6)**:`from numpy import ctypeslib` 与 `import numpy.ctypeslib`
+  是同一件事,但原来只看 `node.module`(numpy)→ 这条写法**放行**;而运行期的拒绝发生在 import **之后**
+  (模块已经在导入机制里以真实内建执行过,副作用已经发生)。现在逐个检查 names。
+- **四处 fail-open 改成 fail-closed(第 25 轮 Medium 9)**:解析不到来源文件、包位置 `stat` 不出来、
+  包内文件 `stat` 不出来、能力来源取不到——原先都是"拿不准就放行",与本文件其它地方的口径相反。
+- **能力泄漏判定按模块缓存(第 25 轮 Medium 7)**:原来每次属性访问都全量扫 `vars(module)`
+  (实测视图取一个属性 14.7µs、候选热点循环慢 19 倍:20000 次 `np.random.normal()` 沙盒 0.327s vs 普通 0.017s)。
+- **视图透传 `__version__`(第 25 轮 Low 11)**:原先只透传 `__all__`/`__name__`/`__doc__`/`__package__`,
+  `np.__version__` 直接 `AttributeError`——连"记录本次评估用了哪个库版本"这种正当需求都做不到。
+- **宪法守卫对三份新的 deny 名单是空的(第 25 轮 Medium 8)**:提取器**不认 `frozenset({...})` 写法**,
+  `DANGEROUS_MODULE_NAMES`/`FORBIDDEN_MODULE_PATHS`/`CAPABILITY_MODULE_NAMES`(=外加 `FORBIDDEN_KEY_STRINGS`)
+  既没被解析、也没登记进注册表——两头一凑:从危险名单里删掉 `"ssl"`,守卫照样全绿。
+  现在提取器认 `frozenset`/`set` 调用,四份名单登记进注册表;守卫本体已跑通(退出码 0)。
+- **本轮的验证方式(新增 26 条用例)**:`tests/test_sandbox_round25_rules.py`(17 条)与
+  `tests/test_constitution_round25.py`(9 条),每条规则都有**双向**探针(放行 + 拦截),
+  并断言"**是哪一条规则**拒的";**变异验证**把第 25 轮的 6 处修复逐一拿掉,6 处全部被抓到(用例变红)。
+- **候选"写辅助模块再 import"这条逃逸,以及另外四条已封的逃逸(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+  ADR `20261113-evolution-engine`「第 22 轮补记」):本轮全部结论来自**动态探针**(真的写文件、真的 import、真的看结果),
+  不是静态推理——静态推理一定漏(见 memory `static-ban-rules-need-dynamic-probes`)。
+  - **实测到的五条逃逸**:①候选用 `numpy.savetxt` 写一个 `.py` 再 import 它(辅助模块在 import 机制里执行,拿到真实内建);
+    ②候选模块的 `__loader__.exec_module(m)`(用真实内建把源码再跑一遍);③`e.__traceback__.tb_frame.f_builtins`
+    (拿到我们自己的模块帧里的真实内建);④`from <包> import <子模块>`(子模块的 import 在**导入机制内部**完成,
+    **不经过**候选那层的守卫;而 `scripts/` 这种没有 `__init__.py` 的目录是**命名空间包**,origin 为 `None`,
+    凡“看 origin”的规则都会放行——实测 `from scripts import research_api` 拿到带 `subprocess` 的框架模块,
+    等于任意命令执行);⑤`from <包> import *`(通配符):逐项裁决对 `"*"` 无能为力,而**导入机制自己**会按包的
+    `__all__`(有的话)去 import 那些子模块,整条路**不经过守卫**——探针实证:候选往带 `__all__` 的包里写一个
+    只有一行 `open(...).write("x")` 的模块,`from 包 import *` 之后标记文件被写了出来,
+    说明它**确实在导入机制里执行了**。五条都**不经过禁用名单**——名单是黑名单,堵不住机制。
+  - **规则改成按路径裁决**(`scripts/research_sandbox.py::RepoImportGuard`):仓库内只允许 `ALLOWED_REPO_IMPORT_DIRS`(`strategies/`)里
+    **且在候选开始运行之前就已存在、此后没被改过**的模块;仓库外(标准库、站点包)也必须"运行之前就存在"
+    (站点包在宿主机上通常可写,这是第 21 轮遗漏的洞)。定位来源用 `PathFinder.find_spec`——只找文件、**不执行**被检查的模块。
+    时间比较按文件系统自身的时间粒度取整后再比(NTFS 100ns、网络盘可达 1s),否则会漏掉"刚写出来就被取整到开始时刻之前"的文件。
+  - **逃逸二**:候选模块不再挂 `__spec__`/`__loader__`。**逃逸三**:受限导入器用自己造的一帧(globals 里 `__builtins__` 是受限字典),
+    并且**在 except 块之外**抛干净的异常——在 except 里抛,原始异常会挂在 `__context__` 上,候选顺着它一样能摸到 import 机制的帧。
+  - **逃逸五(封堵)**:通配符这一路改成**扫目录**(`RepoImportGuard.check_package_wildcard`):
+    包内(仓库侧)的每个 `.py` 都必须在快照里、且此后没被改过;只要多出一个文件(候选写的)就拒;
+    **仓库之外的包同样要过"运行之前就存在"这一关**(站点包在宿主机上通常可写,而包自己的 `__all__`
+    可能正好列着某个现在还不存在的子模块名——候选把它写出来,通配符导入就由导入机制去 import 它)。
+    这条**独立于**包位置那条规则——通配符由**导入机制**按 `__all__` 自己拉子模块,守卫连名字都看不到。
+    仓库里 `strategies/__init__.py` 目前没有 `__all__`,所以这条在当前仓库里是**潜伏**的;
+    探针用**自造的包**把它逼出来,不靠"现在还没事"。
+  - **逃逸四(封堵)**:受限导入器在 `fromlist` 非空时**另外裁决**——先裁**包位置**
+    (`RepoImportGuard.check_package`,用 `spec.submodule_search_locations`;这条必须**独立存在**:逐项裁决只管**模块**,
+    候选 `from <包> import <某个不是模块的名字>` 时逐项裁决看不见任何东西),再**逐个裁 fromlist 里的子模块**
+    (于是“候选自己刚写出来、但所在目录合法”的模块同样被拒)。
+  - **白名单登记进宪法历史守卫**(`tools/check_constitution_history.py`):`ALLOWED_REPO_IMPORT_DIRS` 与 `BUILTIN_ALLOWED_OVERRIDES` 同等对待,
+    **只减不增**,引用次数也进入"只能增不能减"的守望。
+  - **如实记录的残余**:第三方模块(如 `numpy`)的帧里**仍然是真实内建**——实测确认。
+    所以"进程内执行不受信代码"做不到安全,能力隔离是纵深防御的一层,**不是边界**;
+    真正的边界仍是**人工审批 + 容器隔离**。ADR 里"把能力收走"那句话已就地更正:
+    收走的是**候选自己那些帧**里的能力,不是整个进程的。
+  - **用例**:`tests/test_helper_module_escape.py`(13 条)+ `tests/test_candidate_escape_production_path.py`(35 条,走生产入口 `import_candidate`),
+    共 **48 条**。**12 个变异全部被抓住**(还原 loader / 用模块级全局造帧 / 去掉路径裁决 / 去掉时间规则 / 去掉允许目录 /
+    去掉快照存在性 / 去掉 mtime 比对 / 去掉包位置裁决 / 去掉 fromlist 逐项裁决 / 去掉通配符目录扫描 /
+    去掉通配符对仓库之外包的时间规则 / 去掉执行原语的禁用名单)。
+  - **一条方法教训(已写进 ADR)**:变异验证里有个变异**没被抓住**——查下来是那条用例**根本没走到它想走的那条路**
+    (没把假仓库插到 `sys.path` 最前面,`strategies` 解析到了**真仓库**那个包,import 因“找不到模块”而失败,断言照样绿)。
+    **断言“被拒绝了”不够,还要断言“是被哪一条规则拒绝的”**;修好之后 12 个变异全部变红。
+    后半句在第 5 条上又应验了一次:换一条规则来拒绝时,用例也得跟着变红。
+
+- **候选的第六类逃逸:执行原语不经过 `__import__`,按路径裁决对它无效**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+  ADR `20261113-evolution-engine`「第 23 轮补记」):第 22 轮那套"按路径裁决导入"只在**候选调用 import** 的那条路上生效,
+  而 `runpy`/`code`/`pkgutil`/`zipimport` 这类**执行原语**根本不经过 `__import__`——于是整套路径规则对它们**完全无效**。
+  - **对照实验**(同一个"候选在运行期间写出来的模块",同一次运行,两条路):
+    `import 它` → **被拒**("该文件在候选开始运行之后才出现");
+    `runpy.run_path(它)` → **执行成功**,辅助模块在**真实内建**下跑起来
+    (探针:辅助模块只有一行 `open(...).write("x")`,`open` 在候选自己那些帧里是被收走的,
+    只有被导入机制执行才拿得到真内建,所以标记文件一旦出现就说明辅助模块在真实内建下执行了)。
+  - 其它实测成立的执行原语:`code.InteractiveInterpreter().runsource(...)`(直接执行字符串,连文件都不用)、
+    `zipimport.zipimporter(...).exec_module(...)`(从 zip 里执行模块)、`pkgutil.get_loader(...)`
+    (拿到 loader,而 loader 的 `exec_module` 同样能执行任意文件)。
+  - **处置**:这一类**不能**再加一条路径规则(它们不走那条路),只能按**名字**堵——
+    `runpy`/`code`/`pkgutil`/`zipimport`/`pty`/`platform`/`webbrowser` 进 `FORBIDDEN_MODULES`,
+    静态层与运行期层**两道独立的闸**同时生效。误伤面为零:仓库里的策略模板只 import
+    random/dataclasses/datetime/vnpy/strategies。
+  - **但名单式封堵不收敛(本轮最重要的结论,不能含糊)**:能力会从**别的模块再导出**。
+    实测 `numpy.ctypeslib` 把 `ctypes` 整个再导出一遍,而 `numpy` 是候选正当需要的包,于是
+    `numpy.ctypeslib.ctypes.CDLL("kernel32").GetCurrentProcessId()` 能直接调原生代码(实测返回 81160)——
+    路径裁决、内建限制、受保护对象指纹**全都管不着**。这条路**堵不住**,也不该假装堵得住。
+    所以边界说得更硬:**"进程内执行不受信代码"做不到安全**,名单只能拿掉便宜的胜利,
+    真正的边界仍是**人工审批 + 容器隔离**。
+  - **新增一条纪律**:"规则管得到的那条路"不等于"只有那条路"。第 22 轮的规则全都挂在 `__import__` 上,
+    "绕开 `__import__`"就是一条没人看过的路;每加一条规则都要问一句:**还有哪些执行路径不经过它?**
+  - **用例**:新增 16 条(运行期层单独拒执行原语 7 条、名字层 7 条、
+    "候选不得让运行期写出的模块被执行" 1 条、"能力再导出这条残余确实漏着" 1 条),共 **48 条**;
+    **12 个变异全部被抓住**(新增 M12:去掉执行原语的禁用名单)。
+    新增用例 `test_the_candidate_cannot_reach_a_native_library_through_an_allowed_package`
+    断言的是"**确实漏着**",目的是把残余钉在测试里——哪天架构变了它会变红,提醒人更新 ADR 残余登记。
+
+- **候选的第七类逃逸:守卫自己那一帧的 `f_globals` 里放着**真导入器**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+  ADR `20261113-evolution-engine`「第 24 轮补记」):第 21 轮把受限导入器的 `f_builtins` 换成了受限字典,
+  可它的 **`f_globals` 里还放着 `real_import`**。候选顺着 ImportError 的异常链走到守卫那一帧,
+  一句 `tb_frame.f_globals["real_import"]` 就把真导入器拿走,接着 `real_import("os").system(...)`
+  = **任意命令执行**(探针实测:标记文件被写出来)。
+  - **对照**:`tb_frame.f_builtins["setattr"]` 拿到的是**受限**字典(第 21 轮封的);
+    `tb_frame.f_globals["real_import"]` 拿到的是**真导入器**(第 24 轮才封)。
+  - **处置**:真导入器、禁用名单、路径规则一律搬进**闭包单元**;守卫那一帧的 `f_globals`
+    换成一份**干净的新字典**(`types.FunctionType(code, {"__builtins__": 受限内建}, ..., closure)`)。
+  - **踩坑留档**:嵌套函数的 `__globals__` 是**定义它的模块**的全局字典,不是外层帧的 locals——
+    想"清空外层那一帧"是清不掉的,直接 `clear()` 会把整个模块命名空间抹掉(实测:模块级类全丢)。
+  - **新纪律**:**守卫自己那一帧也是攻击面**。凡是准备放进守卫帧里的值,都要问一句:
+    "候选摸到这一帧,能不能拿到它?"
+- **模块视图:候选拿到的不是模块,是视图**(第 24 轮):codex 实测 `import logging` 之后
+  `logging.sys.modules["os"].system(...)` = 任意命令执行,而**四层防线全绿**——
+  它们全都只看"名字",而这一条走的是"别的模块把危险模块当属性递出来"。
+  - **处置**:候选拿到的模块是 `ModuleView`:属性值是危险模块 → 不给;属性值是会递出能力的模块 →
+    整个不给;属性值是别的模块 → 给一份**视图**(递归生效);下划线属性(`__class__`/`__dict__`)一律不给。
+- **"名单式封堵不收敛"要更正一半:能力按**对象来源**判定**(第 24 轮):判据从"名字像不像"
+  改成"**这个对象是从哪儿定义的**"(`__module__`)——凡是定义在 `ctypes`/`subprocess` 里的对象
+  (模块、类、函数都算)一律不给,于是 `subprocess.Popen`、`ctypes.CDLL` 这种"只递出类不递出模块"
+  的形态也堵住了,而"换个名字再递一次"骗不过它。`numpy` 本身照常放行(候选正当需要),
+  它的三个危险角落按**全名**禁:`numpy.ctypeslib`(递出 `ctypes`)、`numpy.f2py`
+  (**import 它就会跑 f2py 的主程序**,实测)、`numpy.distutils`。
+- **走栈禁令**(第 24 轮):静态层新增 `__traceback__`/`tb_frame`/`f_globals`/`f_locals`/`f_builtins`/
+  `__closure__`/`cell_contents`/`__getattribute__` 一律不得引用(裸名、属性名、字符串三种写法都拒)。
+  理由:第三方模块的帧里就是真实内建——实测 numpy 自己的 traceback 里印着
+  `numpy/lib/_npyio_impl.py` 第 454 行的 `open(os.fspath(file), "rb")`;
+  我们管不了第三方帧的 globals,于是禁掉"顺着异常链走栈"这个**能力本身**。
+- **几处 fail-closed 与快照加严**(codex 第二轮复核指出的中危项):`stat` 失败一律按
+  "**查不了等于没查**"拒(原先有一支直接放行);快照加 **sha256**(只比 mtime 会被"改写内容再把
+  mtime 还原"骗过,粗粒度文件系统上同秒改写 mtime 根本不变),现在比 mtime + size + sha256 三项;
+  调用点**显式**传允许目录白名单(靠默认值的话,改默认值就能放开整个 `scripts/`);
+  守卫自己的调用一律包 try/except 换成干净的 ImportError——**守卫的帧不进候选看得见的 traceback**。
+- **用例**:逃逸相关的三条测试文件共 **102 条**(新增 `tests/test_sandbox_module_view.py` 49 条:
+  模块视图、能力判定、按全名禁用的子模块、新名单、快照哈希、fail-closed、调用点显式白名单;
+  改写 `tests/test_candidate_escape_production_path.py` 若干条:静态层与运行期**分层测**、
+  断言"**是哪一条规则**拒的"、修掉 codex 指出的**假绿**用例(没把假仓库插到 `sys.path` 最前面,
+  import 因"找不到模块"而失败,断言照样绿))。
+  **18 个变异全部被抓住**(新增 M13 关掉模块视图 / M14 能力判定退回只看模块名 / M15 快照去掉内容哈希 /
+  M16 stat 失败改成放行 / M17 去掉按全名禁用的子模块规则 / M18 静态层不再禁走栈属性;
+  M2 换成"守卫帧的 globals 里又放回真导入器")。
+- **如实记录的残余**(第 24 轮):**能读 `f_locals` 的候选仍能拿到闭包单元**——实测 Python 3.13 的
+  `f_locals` 里看得见 `real_import`。运行期这一层**只**保证 `f_globals` 干净;原因是纯 Python 的死结:
+  凡是这一帧能拿到的对象,候选拿到这一帧就能拿到它(闭包单元、默认参数、代码常量、塞进容器,全都可达)。
+  挡住它的是**静态层的走栈禁令 + 人工审批 + 容器隔离**。新增用例
+  `test_the_runtime_layer_still_exposes_the_closure_cells_through_f_locals` 断言的正是"**确实漏着**",
+  把这条残余钉在测试里。第三方模块的帧里仍是真实内建(继续成立)。
+- **G8 第一轮自查带出的两处小修**(第 24 轮):不是漏洞,但该改,已改。
+  - **模块视图缓存原来永不回收**:`_VIEW_CACHE` 是 `WeakKeyDictionary`,可视图对象**强引用**着模块,
+    value→key 的强引用把弱键托住,条目永不消失——每个导入过的模块都永久驻留(无界增长)。
+    现在视图改用**弱引用**持有模块(`ModuleView._view_module_ref`),模块由 `sys.modules` 持有,视图照常可用,
+    缓存条目可被回收。**教训**:用弱引用做缓存时,value 里不能有指向 key 的强引用。
+  - **危险模块短名的误伤面收窄**:`FORBIDDEN_STRINGS` 里的 `os`/`sys`/`nt`/`posix` 原本是**全局**禁字符串,
+    于是策略里只要出现一个恰好等于这些词的字符串字面量(状态名/列名/打印内容)就被拒。
+    现挪进新的 `FORBIDDEN_KEY_STRINGS`,**只按语境拦"按键取"这个动作**(下标键 / 字典取值方法的参数 / 关键字参数名)——
+    要封的洞(`tb_frame.f_globals["os"]`)正是"按键取",不是这些字符本身。
+    (字符串匹配一直是精确相等,不是子串,所以 `close`/`cost` 从来没被误伤过。)
+  - **用例**:新增 9 条(弱引用缓存 1 条 + 视图仍可用 1 条 + 按键取语境 7 条),
+    逃逸相关用例共 **111 条**;**变异增加到 20 个,全部被抓住**(新增 M19 视图改回强引用 / M20 去掉按键取规则)。
 
 ### Changed（变更）
 - 状态页后端方案由『不使用 vnpy_webtrader』改为『fork 并改造』(用户决定,2026-11-12;仅文档):ADR 新增『fork 范围』——上游 MIT,保留版权与许可证全文;逐项处置(保留应用骨架与静态托管模式;删除 JWT 登录与写死密钥、订阅与下单撤单接口、WebSocket 与 RPC、全部 `vnpy` import;`WebEngine` 不装进交易进程);列出 FastAPI 默认行为与契约的冲突及处理(关闭自动文档、统一错误形状、关闭斜杠重定向、安全响应头、强制回环);Web 依赖隔离在 `requirements-dashboard.txt`,不进交易环境。计划 T6 拆为 T6a–T6g。如实记录:改造后上游残留代码很少,价值主要是许可证谱系与起步骨架;若 FastAPI 默认行为的处理成本高于收益,可回退到完全自写后端。
