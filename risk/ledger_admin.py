@@ -166,8 +166,15 @@ def reset_approvals(path: Path) -> dict:
     path = Path(path)
     kept: list[dict] = []
     dropped: list[str] = []
+    unreadable = False
     if path.exists():
-        data = _load_dict(path)
+        try:
+            data = _load_dict(path)
+        except AdminError:
+            # 容错(与 reset_trials 同口径):读不出 = 没有任何有效前缀,备份原文件后按创世重新定锚。
+            # 严格读取会把"文件被写坏"变成"人工出路也被卡死"(第 32 号 PR 复审 High)。
+            data = {}
+            unreadable = True
         rows = [v for v in data.values() if isinstance(v, dict) and isinstance(v.get("seq"), int)]
         rows.sort(key=lambda r: r["seq"])
         prev = chain.GENESIS
@@ -183,6 +190,8 @@ def reset_approvals(path: Path) -> dict:
             kept.append(row)
             prev = row["hash"]
         dropped = [str(k)[:12] + "…" for k in data if k not in {r["sha"] for r in kept}]
+        if unreadable:
+            dropped = ["<整个文件无法解析,已按创世重新定锚;原文件已备份>"]
     backup = _backup(path, "reset")
     anchor = chain.anchor_path_for(path)
     if kept:

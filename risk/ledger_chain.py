@@ -51,8 +51,11 @@ def seal(record: dict, prev_hash: str, seq: int) -> dict:
 def anchor_path_for(ledger_path) -> Path:
     """锚点位置:账本所在目录的**上一级**下的 `ledger_anchor/`,文件名带账本绝对路径的短哈希。
 
-    与账本不同目录(候选可写/读写的 data/research、data/research-control 都碰不到);
-    文件名带路径哈希,是为了测试里多个 tmp 目录共享同一个上级时互不串账。"""
+    **如实说明**(第 32 号 PR 复审实测):这个目录**不是**"候选碰不到"的位置——没有审计钩子时候选能往
+    `data/ledger_anchor/` 写文件,也能写账本本身。锚点真正的保护有两层:
+    ① 文件名里的 `sha256(账本绝对路径)` 短哈希:候选算不出 sha256(pickle/hashlib 都不在白名单)、也列不出目录,
+       猜不到该写哪个文件;② 读侧要求账本头与锚点**同时**一致。两者都不是密码学意义的保护(见模块文件头"诚实的边界")。
+    多个 tmp 目录共享同一个上级时,路径哈希也让它们互不串账。两本账本共用同一个 `ledger_anchor/` 目录。"""
     ledger = Path(ledger_path)
     resolved = str(ledger.resolve()).replace("\\", "/").lower()
     tag = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:10]
@@ -74,7 +77,7 @@ def read_anchor(anchor: Path) -> tuple[int, str] | None:
     return int(parts[0]), parts[1]
 
 
-def _replace_retry(tmp: Path, target: Path, attempts: int = 8) -> None:
+def _replace_retry(tmp: Path, target: Path, attempts: int = 20) -> None:
     for index in range(attempts):
         try:
             os.replace(tmp, target)
@@ -107,7 +110,7 @@ def verify(rows: list[dict], anchor: Path, *, what: str, allow_ahead: bool, tool
     """逐条核对链并用锚点核对头;任何一处对不上就抛 LedgerChainError。
 
     `rows` 必须已按 seq 升序、且每条都是对象。`what` 只用于消息。"""
-    hint = f"人工核对后可用 `{tool_hint}` 处理(旧账本迁移用 migrate,确认从当前内容重新起算用 reset)"
+    hint = f"人工出路:{tool_hint}"
     prev_hash = GENESIS
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict) or not all(k in row for k in ("seq", "prev", "hash")):
@@ -152,7 +155,7 @@ def read_verified(path: Path, parse_line, *, what: str, allow_ahead: bool, tool_
 
 
 @contextlib.contextmanager
-def file_lock(target: Path, timeout: float = 10.0, stale_seconds: float = 30.0):
+def file_lock(target: Path, timeout: float = 30.0, stale_seconds: float = 30.0):
     """跨进程独占锁(锁文件 + O_EXCL)。账本一旦有哈希链,"两个写者读到同一个尾巴各追加一条"
     就会把链写成分叉——所以试验账本也得跨进程互斥(此前只有同进程锁)。
     残留锁按**年龄**判定(持有者崩了不会清);操作都在毫秒级,30 秒足够保守。"""
@@ -165,7 +168,10 @@ def file_lock(target: Path, timeout: float = 10.0, stale_seconds: float = 30.0):
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
+            # Windows:锁文件刚被持有者 unlink、处于"删除待决"时,别人 O_EXCL 创建它抛的是 **PermissionError**
+            # (WinError 5),不是 FileExistsError——这是"全量里偶发失败"的真根因(8 进程×40 次压测 1/8 复现,
+            # 报错 `[Errno 13] Permission denied: ...chainlock`),不是 10 秒超时。按"锁被占用"重试。
             try:
                 if time.time() - lock.stat().st_mtime > stale_seconds:
                     lock.unlink(missing_ok=True)

@@ -1858,10 +1858,10 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
   **写模式 `open`**(mode 含 `w/a/x/+` **或** flags 含 `O_WRONLY/O_RDWR/O_CREAT/O_APPEND/O_TRUNC/O_EXCL`——io.open 给字符串 mode、os.open 给整数 flags,两个都看)
   与 `os.remove/rename/mkdir`、`shutil.copy*/move/rmtree` 等落在**允许目录之外**的写。允许目录 = 窗口前创建的临时目录,窗口结束清理。
 - **不拦** `exec`/`compile`/`marshal.loads`/`import`:pandas 惰性子模块导入会触发,实测会打断正常候选。
-- 框架自己在候选导入期间要跑的动作(守卫跑只读 `git`、清 `.pyc`)走显式放行路径 `framework_privilege()`,接线只有两处(测试 grep 核对)。
+- 框架自己在候选导入期间要跑的动作(守卫跑只读 `git`、建 git 家目录、清某个 `.pyc`)走**路径级/命令级**豁免 `framework_exempt(paths=…/argv=…)`:只放行那几个路径、恰好那一条 argv 的 Popen,窗口其余部分始终受裁决;接线只有三处(测试 grep 核对;第 32 号 PR 复审前是关全局开关的 `framework_privilege`,已废弃)。
 - 开关防篡改:状态在 `research_sandbox` 模块里;候选 import 不到它(按路径裁决 + 危险名单),代理/视图又不递出下划线名,
   numpy 属性链(`np.os`/`np.sys`/`np.__dict__`/`np._core`…)也拿不到——**用探针验证**,不是推理。
-- 写 `__pycache__` 被拒时抛的是 `PermissionError` 子类,导入机制会静默放弃写缓存,不影响正常导入。
+- `AuditDenied` 继承 **`OSError`**(不是 `PermissionError`):写 `__pycache__` 被拒时导入机制静默放弃缓存;而 Windows 上 `tempfile._mkstemp_inner` 对 `PermissionError` 会重试到 `TMP_MAX`(实测窗口内 `mkstemp` 挂住数分钟),所以不能是后者。
 - pandas 首次导入会 `ctypes.dlopen`(Windows 的 `tzres.dll`),所以 numpy/pandas 须在进入窗口前已导入(子进程入口导入 `backtest_lib` 时已加载)。
 
 ### B. numpy/pandas 移出默认白名单
@@ -1873,7 +1873,7 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 
 ### C. 账本防篡改(`risk/ledger_chain.py`、`risk/ledger_admin.py`、`scripts/research_ledger.py`)
 - 口径与 `feat/21-stage3` 的 `risk/ladder.py` 一致(未另起第三套):每条记录含 `seq`/`prev`/`hash`,`hash = sha256(prev + "|" + 规范化 JSON)`,创世 64 个 0;
-  头指针 `<seq> <hash>` 存 `data/ledger_anchor/`(与 `data/research`、`data/research-control` 分离)。读侧发现链断/回滚/截断/整条被换/无链记录 → fail-closed,消息里带人工出路。
+  头指针 `<seq> <hash>` 存 `data/ledger_anchor/`(与 `data/research`、`data/research-control` 不同目录;**目录分离本身不是保护**,见本节末的更正)。读侧发现链断/回滚/截断/整条被换/无链记录 → fail-closed,消息里带人工出路。
 - 试验账本:`record_trials` 在跨进程锁下先核链再追加再写锚点(有了链,两个写者读到同一尾巴会把链写成分叉,所以跨进程互斥不再可省;此前"跨进程漏记极少量"的限制随之取消)。
   允许"账本比锚点多几条自洽记录"(崩在写锚点之前;多出的只会让 N 变大)。
 - 批准账本:格式仍是 `{sha: 记录}`(看板按此读),记录多带 `sha/seq/prev/hash`;**严格相等**(账本里多出一条自洽的批准正是要拦的攻击),`_load_approvals` 核链后才返回。
@@ -1896,8 +1896,8 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 5. numpy 对象不只来自 import:候选拿到的 `ArrayManager` 数组(`self.am.close` 等)本身是 ndarray,`.tofile()`/`.dump()` 不依赖 import——所以"移出白名单"**不能替代**钩子,钩子才是函数级约束。
 6. 哈希链没有密钥:同时改账本与锚点的人骗得过读侧(`test_known_residual_forging_ledger_and_anchor_together_is_not_detected` 钉住);同时删除两者等于从未有过账本。外部锚点需要另一个信任域(#29)。
    `dashboard/collectors.py` 仍按原样读 `approvals.json` 做**展示**(只计数,不据此放行),看板数字可能含被伪造的记录。
-7. 钩子里的路径判定对符号链接按 `realpath` 解析;`os.open` 打开目录、对 fd 的后续写不重复裁决(fd 来自此前已裁决过的 `open`)。
-8. 本轮**未跑** G8 外部评审(zen codereview + codex),状态:待复核。
+7. 钩子里的路径判定对符号链接按 `realpath` 解析。**对已打开 fd 的写无法裁决**:CPython 没有 `os.write`/`os.pwrite`/`os.ftruncate` 的审计事件(`os.ftruncate` 只发 `os.truncate` 且参数是 fd),所以钩子对 fd 上的写**没有**判定。fd 只能来自此前已裁决过的 `open`(写模式 open 在窗口内被拒;只读 fd 上的 `os.write` 在本机(Windows)实测为 `OSError`/EBADF,POSIX 上我没能实测,按标准语义也是 EBADF——复审称 POSIX 会成功,我**未复现、不能证伪**)。框架在窗口前遗留的可写 fd 是潜在洞口,需要在窗口前关闭;本 PR 没有系统性核查这一点。`os.link` 现在两端都必须在允许目录内(源端在外的硬链接与外部文件同 inode)。
+
 
 ### 变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红)
 | 变异 | 结果 |
@@ -1911,3 +1911,45 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 | numpy/pandas 回到默认白名单 / 去掉对象层规则 | 各红 |
 | 链校验跳过锚点 / 跳过 seq-prev / 批准账本允许多出 / `_load_approvals` 不核链 / `record_trials` 不写锚点 | 各红 |
 | 行情读取挪回导入之后(gate 入口) | 红(evaluate 入口的同类变异**未单独跑**,其探针与 gate 同构) |
+
+### 第 32 号 PR 复审(codex 38/50)的补修与更正
+**更正两句过强的文字**(codex 实测为假,已在 `risk/trial_ledger.py`、`risk/ledger_chain.py` 就地改正):
+- 原"候选写账本的主防线是执行窗口里的审计钩子"——钩子只罩"候选正在跑"这一段。**窗口外候选若还能执行代码,写文件不受限**:
+  本机复现 `np.seterr(all="call")` + `np.seterrcall(cb)` 的回调在窗口外触发时写入成功(`test_known_residual_a_callback_planted_in_the_window_fires_outside_it` 钉住)。
+  今天端到端打不通,依赖的是**宪法的 `__del__` 禁令**(`risk/constitution.py` `BUILTIN_FORBIDDEN_DUNDERS`)与 atexit/threading/weakref/gc 在候选侧取不到。**这个依赖是显式残余**:
+  任何放松该禁令或放出这些模块的改动,都会让本层防线失效而没有任何用例报警——改它们前必须重估本节。
+  彻底做法(钩子 active 覆盖子进程整个生命周期,框架自己的写走显式放行)**本 PR 未做**:成本不小(结果文件/交接单/日志/清缓存都要逐个走显式路径),且与 #29 的独立进程方案重叠。
+- 原"锚点目录候选碰不到"——实测没有钩子时候选能写 `approvals.json`,也能往 `data/ledger_anchor/` 写文件。
+  锚点真正的保护是**文件名里的 `sha256(账本绝对路径)` 短哈希**(候选算不出 sha256、也列不出目录,猜不到该写哪个)与读侧要求"账本头与锚点同时一致",都不是密码学意义的保护。
+  两本账本共用同一个 `data/ledger_anchor/` 目录(记入残余)。
+
+**修复**:
+1. `reset approvals` 改为容错读取(读不出 = 没有有效前缀,备份原文件后按创世重新定锚,仍留审计记录);fail-closed 的报错里写明可执行命令(`reset trials ... --add-trials <N> --force` / `reset approvals --reason ... --force` / `migrate ...`)。
+   用例:JSON 字符串、非 JSON、空文件、数组四种损坏,reset 后可继续批准;CLI 路径同测。
+2. `AuditDenied` 改继承 `OSError`;用例:窗口内 `tempfile.mkstemp(dir=被拒目录)` 在 60 秒保护下很快抛出(子进程里跑);写 `.pyc` 被拒仍静默放弃缓存、导入成功、不记为越权企图。
+3. `os.link`/`os.symlink` 两端都判。`os.write`/`os.pwrite`/`os.ftruncate` **没有审计事件**,无法拒绝(见残余 7);用例确认 `print`/`logging` 在窗口内照常、只读 fd 上的 `os.write` 失败原因是 fd 只读而不是钩子。
+4. `vnpy.trader.utility` 的 `save_json/load_json/get_file_path/get_folder_path/get_icon_path/TRADER_DIR/TEMP_DIR` 进 `UNREACHABLE_MEMBERS`(对象层规则,代理与视图共用,宪法守卫登记只增不减);
+   `ArrayManager`/`BarGenerator`/`virtual`/`round_to`/`floor_to`/`ceil_to` 放行,用例双向。生产入口里 `util.save_json(绝对路径)` 被"任意路径读写原语"规则拒,`from … import save_json` 形态被导入机制转成 ImportError;目标文件都没有被写出。
+   **范围说明**:我只盘点了 `vnpy.trader.utility`;白名单里的 `vnpy`/`vnpy_ctastrategy`/`strategies` 其余模块是否还有同类原语,**没有系统性核查**——这是残余。
+5. 守卫的放行从"关全局开关"改成路径级/命令级豁免(见上),变异验证:改回全局开关用例变红。
+6. **`test_concurrent_writers_in_separate_processes_keep_the_chain_intact` 的偶发失败**:根因**不是**10 秒超时(8 进程×40 次、24 个 CPU 烧机进程下最长等待约 4 秒)。
+   压测复现的报错是 `[Errno 13] Permission denied: …chainlock`:Windows 上锁文件刚被持有者 `unlink`、处于"删除待决"时,等待者的 `O_EXCL` 创建抛 **PermissionError** 而不是 FileExistsError,`file_lock` 只捕 FileExistsError,异常直接冒出去。
+   生产路径同样会撞到(并发的网关/CLI 写试验账本),所以修在 `file_lock`(把 PermissionError 当"被占用"重试),并顺带把锁超时放宽到 30 秒、锚点替换重试增到 20 次。
+   用例:确定性地注入 PermissionError 验证重试(变异:改回只捕 FileExistsError 变红);跨进程用例保留。修复后同一压测连跑 3 轮 0 报错(**不是**统计上的"证明不会再发生")。
+7. 回测入口 `run_child`:`import_candidate` 先于 `run_backtest`→`engine.load_data()`(读 vnpy 数据库,不是 CSV),本 PR **没有**把数据加载前置——
+   `run_backtest` 把取数与回放合在一个函数里,拆开要改 `backtest_lib` 的接口,收益有限(数据库读是只读连接,写库由钩子拒)。如实记为残余。
+
+**新增残余**:`np.seterr`/`np.seterrcall` 等能改**全局 numpy 状态**(窗口内改、窗口外生效);`data/ledger_anchor/` 两本账本共用一个目录;窗口外回调(见上);其余白名单模块的同类路径原语未系统核查。
+**G8**:本轮与上一轮一样**未跑**外部评审,状态:待复核。
+
+第 32 号 PR 复审补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红;**无等价变异**):
+
+| 变异 | 结果 |
+|---|---|
+| 豁免改回关全局开关 | 红 |
+| `AuditDenied` 改回继承 `PermissionError` | 红(`mkstemp` 用例超时) |
+| `os.link` 只查目的端 | 红 |
+| 去掉 `UNREACHABLE_MEMBERS` 规则 | 红 |
+| `reset_approvals` 改回严格读取 | 红 |
+| `file_lock` 不重试 PermissionError | 红 |
+| argv 豁免放行任意 Popen | 红 |

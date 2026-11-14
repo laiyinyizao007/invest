@@ -89,7 +89,7 @@ SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORB
                 "DANGEROUS_MODULE_NAMES", "FORBIDDEN_MODULE_PATHS", "CAPABILITY_MODULE_NAMES",
                 "FORBIDDEN_KEY_STRINGS",
                 # Issue #31:候选执行窗口的审计钩子拒绝名单与"函数级能力库"名单。少一项 = 多放开一种能力,只增不减。
-                "AUDIT_DENIED_EVENTS", "AUDIT_DENIED_EVENT_PREFIXES", "CAPABILITY_LIB_ROOTS")
+                "AUDIT_DENIED_EVENTS", "AUDIT_DENIED_EVENT_PREFIXES", "CAPABILITY_LIB_ROOTS", "UNREACHABLE_MEMBERS")
 
 # 沙盒层的**允许**集合(第 21 轮新增的仓库内导入白名单):语义与 deny set 相反——
 # 多一项 = 多放开一点仓库内的模块(候选能 import 的东西变多),所以它必须**只减不增**。

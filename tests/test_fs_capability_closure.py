@@ -219,23 +219,59 @@ def test_nested_window_keeps_the_outer_allowed_directory(victim):
     assert not rs._AUDIT.active
 
 
-def test_framework_privilege_is_the_only_explicit_bypass(victim):
-    """框架自己的动作(守卫跑 git、清 .pyc)走显式放行路径;离开后窗口恢复。"""
+def test_framework_exemption_is_path_level_not_a_global_switch(victim, tmp_path):
+    """框架的显式豁免是**路径级/命令级**的:豁免期间窗口其余部分仍然受裁决(第 32 号 PR 复审 Medium:
+    原先的 `framework_privilege` 关全局开关,候选 import 仓库模块触发守卫清 .pyc 时,窗口整个暂停)。"""
+    pyc = tmp_path / "fake.pyc"
+    pyc.write_bytes(b"x")
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"y")
     with rs.candidate_window():
-        with rs.framework_privilege():
-            subprocess.run([sys.executable, "-c", "pass"], check=True)
+        with rs.framework_exempt(paths=(pyc,)):
+            os.remove(pyc)                                   # 豁免的那一个:放行
+            with _expect_rule("audit:path-mutation"):        # 同一豁免期间,别的路径照拒
+                os.remove(other)
+            with _expect_rule("audit:open-write"):
+                open(victim, "w")
+            with _expect_rule("audit:subprocess.Popen"):     # 也没有放开进程创建
+                subprocess.run([sys.executable, "-c", "pass"])
+        assert rs._AUDIT.active and rs._AUDIT.exempt_paths == ()      # 退出后复原,窗口始终是开的
+        with _expect_rule("audit:path-mutation"):
+            os.remove(other)
+    assert other.exists()
+
+
+def test_framework_exemption_for_a_command_matches_exactly_one_argv(tmp_path):
+    argv = [sys.executable, "-c", "pass"]
+    with rs.candidate_window():
+        with rs.framework_exempt(argv=argv):
+            subprocess.run(argv, check=True)                              # 恰好这一条:放行
+            with _expect_rule("audit:subprocess.Popen"):
+                subprocess.run([sys.executable, "-c", "print(1)"])        # 同一豁免期间,别的命令照拒
         with _expect_rule("audit:subprocess.Popen"):
-            subprocess.run([sys.executable, "-c", "pass"])
+            subprocess.run(argv)                                           # 豁免结束后同一条也拒
 
 
-def test_privilege_is_wired_only_at_the_two_framework_call_sites():
-    """"只写在文档里的防线等于没有":放行路径必须有且只有这两处调用点(grep 接线)。"""
+def test_the_guard_still_runs_git_and_purges_pyc_inside_the_window(tmp_path):
+    """守卫真实路径(窗口内):只读 git 与清 .pyc 都能工作——框架没有因窗口变瞎。"""
+    pyc = tmp_path / "x.cpython-313.pyc"
+    pyc.write_bytes(b"x")
+    with rs.candidate_window():
+        assert rs._git_run(["rev-parse", "HEAD"], cwd=ROOT) is not None
+        rs._purge_bytecode_cache(tmp_path / "x.py", cached=pyc)
+        assert not pyc.exists()
+        assert rs.window_denials() == ()
+
+
+def test_exemption_is_wired_only_at_the_three_framework_call_sites():
+    """"只写在文档里的防线等于没有":豁免调用点有且只有这三处(grep 接线),且 research_api 里一处都没有。"""
     source = (ROOT / "scripts" / "research_sandbox.py").read_text(encoding="utf-8")
-    calls = [line.strip() for line in source.splitlines() if "framework_privilege()" in line and "def " not in line
-             and not line.strip().startswith(("#", '"""', "用法", "`"))]
-    assert sorted(calls) == ["with framework_privilege():", "with framework_privilege():"], calls
+    calls = [line.strip() for line in source.splitlines()
+             if "with framework_exempt(" in line and not line.strip().startswith("#")]
+    assert len(calls) == 3, calls
+    assert "framework_privilege" not in source
     api_source = (ROOT / "scripts" / "research_api.py").read_text(encoding="utf-8")
-    assert "framework_privilege" not in api_source
+    assert "framework_exempt" not in api_source
 
 
 def test_the_hook_denial_sets_cover_the_required_capabilities():
@@ -876,3 +912,229 @@ def test_the_production_import_cannot_rewrite_the_csv_in_the_first_place(repo, t
     run_candidate(tmp_path, monkeypatch, source)
     assert csv.read_bytes() == before
     assert ("audit:open-write", "open") in rs.window_denials()
+
+
+# ======================================================================
+# 第 32 号 PR 复审的补充项
+# ======================================================================
+
+def test_audit_denied_is_an_oserror_but_not_a_permission_error():
+    """继承 OSError(导入机制吞它,写 .pyc 缓存被拒时静默放弃),但**不是** PermissionError
+    (tempfile 在 Windows 上对 PermissionError 会重试到 TMP_MAX,窗口内实测挂住数分钟)。"""
+    assert issubclass(rs.AuditDenied, OSError) and not issubclass(rs.AuditDenied, PermissionError)
+
+
+def test_mkstemp_into_a_denied_directory_fails_fast_instead_of_hanging(tmp_path):
+    denied_dir = tmp_path / "denied"
+    denied_dir.mkdir()
+    script = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(ROOT / "scripts")!r})
+        import tempfile
+        import research_sandbox as rs
+        started = time.monotonic()
+        with rs.candidate_window():
+            try:
+                tempfile.mkstemp(dir={str(denied_dir)!r})
+            except rs.AuditDenied as exc:
+                print("DENIED", exc.rule, round(time.monotonic() - started, 2))
+            else:
+                print("ALLOWED")
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+    assert proc.stdout.split()[:2] == ["DENIED", "audit:open-write"], (proc.stdout, proc.stderr)
+    assert float(proc.stdout.split()[2]) < 10
+    assert list(denied_dir.iterdir()) == []
+
+
+def test_an_import_inside_the_window_silently_gives_up_writing_its_pyc_cache(tmp_path, monkeypatch):
+    """放行方向:导入机制写 `__pycache__` 被拒时静默放弃缓存,导入本身照常成功,也不算"越权企图"。"""
+    pkg = tmp_path / "pycdemo"
+    pkg.mkdir()
+    (pkg / "mod_pycdemo.py").write_text("VALUE = 41\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(pkg))
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    import importlib
+    with rs.candidate_window():
+        module = importlib.import_module("mod_pycdemo")
+        assert module.VALUE == 41
+        assert rs.window_denials() == ()
+    assert not (pkg / "__pycache__").exists()
+
+
+def test_hardlink_needs_both_ends_inside_the_allowed_directory(victim):
+    """os.link:源端也要判——否则允许目录里的硬链接与外部文件是同一个 inode,经它写就等于改外部文件。"""
+    with rs.candidate_window() as scratch:
+        inner = scratch / "a.txt"
+        inner.write_text("x", encoding="utf-8")
+        os.link(inner, scratch / "b.txt")                         # 两端都在允许目录:放行
+        with _expect_rule("audit:path-mutation"):
+            os.link(victim, scratch / "evil_link.csv")            # 源端在外面:拒
+        with _expect_rule("audit:path-mutation"):
+            os.link(inner, victim.parent / "evil2.csv")           # 目的端在外面:拒
+    assert not (victim.parent / "evil2.csv").exists()
+
+
+def test_os_write_has_no_audit_event_and_stdout_logging_still_works(victim, capsys):
+    """如实钉住一个**限制**:CPython 没有 `os.write`/`os.pwrite` 的审计事件,钩子无法裁决对已打开 fd 的写。
+    fd 只能来自此前已裁决过的 `open`(写模式 open 在窗口内被拒;只读 fd 上的 write 在本机 EBADF);
+    本用例确认:这条限制没被说成"已拦",并且 print/日志在窗口内照常。"""
+    seen = []
+    with rs.candidate_window():
+        print("hello from window")
+        import logging
+        logging.getLogger("fs-capability-test").warning("window log")
+        fd = os.open(str(victim), os.O_RDONLY)
+        try:
+            with pytest.raises(OSError) as info:
+                os.write(fd, b"x")
+            assert not isinstance(info.value, rs.AuditDenied)    # 失败原因是 fd 只读(EBADF),不是钩子
+        finally:
+            os.close(fd)
+        seen.append(rs.window_denials())
+    assert victim.read_text(encoding="utf-8").startswith("a,b")
+    assert "hello from window" in capsys.readouterr().out
+    assert seen == [()]
+
+
+# ---- vnpy.trader.utility 的任意路径写原语 ----
+
+def test_save_json_style_primitives_are_not_reachable_by_the_candidate(tmp_path):
+    """第 32 号 PR 复审 Medium:`vnpy.trader.utility.save_json(filename)` 用 `get_file_path(filename)`(joinpath),
+    绝对路径胜出 = 任意路径写。对象层规则把这些函数从候选可达的属性里拿掉;模板需要的成员仍可取。"""
+    import types
+    import vnpy.trader.utility as util
+    rs.safe_builtins(())
+    proxy = rs._proxy_for(util)
+    members = sorted(m.rsplit(".", 1)[1] for m in rs.UNREACHABLE_MEMBERS if not m.rsplit(".", 1)[1].startswith("_"))
+    assert {"save_json", "load_json", "get_file_path", "get_folder_path", "TEMP_DIR"} <= set(members)
+    for name in members:
+        with pytest.raises(AttributeError, match="任意路径读写"):
+            getattr(proxy, name)
+    # 放行方向:模板正常要的成员照旧
+    for name in ("ArrayManager", "BarGenerator", "virtual", "round_to", "floor_to", "ceil_to"):
+        assert getattr(proxy, name) is getattr(util, name)
+    view = rs._view_for(util)
+    with pytest.raises(AttributeError, match="任意路径读写"):
+        view.save_json
+    assert view.ArrayManager is util.ArrayManager
+    assert isinstance(types, object)
+
+
+def test_the_production_import_path_cannot_call_save_json(repo, tmp_path, monkeypatch):
+    target = tmp_path / "save_json_victim.json"
+    source = f"""
+        from vnpy.trader.utility import ArrayManager, BarGenerator
+        RESULT = {{}}
+        import vnpy.trader.utility as util
+        try:
+            util.save_json({str(target)!r}, {{"x": 1}})
+            RESULT["wrote"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        try:
+            from vnpy.trader.utility import save_json
+            save_json({str(target)!r}, {{"x": 1}})
+            RESULT["wrote2"] = True
+        except Exception as exc:
+            RESULT["err2"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+        S.AM = ArrayManager
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "wrote" not in cls.RESULT and "wrote2" not in cls.RESULT, cls.RESULT
+    assert "任意路径读写" in cls.RESULT["err"], cls.RESULT        # 属性访问形态:报的是这条规则
+    assert "err2" in cls.RESULT                                    # from-import 形态:导入机制把 AttributeError 转成 ImportError
+    assert not target.exists()
+    assert cls.AM.__name__ == "ArrayManager"
+
+
+# ---- reset approvals 的容错(第 32 号 PR 复审 High)与账本锁 ----
+
+@pytest.mark.parametrize("damage", ["corrupted-string", "not json {{{", "", "[1, 2, 3]"],
+                         ids=["JSON 字符串", "非 JSON", "空文件", "数组"])
+def test_reset_approvals_recovers_a_file_damaged_beyond_parsing(approvals, damage):
+    """批准记录被写坏成非对象/非 JSON/空文件:读侧 fail-closed 且消息里有可执行的出路;
+    `reset approvals` 不再被严格读取卡死,备份后按创世重新定锚,之后能继续批准。"""
+    cand, cand2, file = approvals
+    rs.record_approval(cand, file)
+    file.write_text(json.dumps(damage) if damage == "corrupted-string" else damage, encoding="utf-8")
+    with pytest.raises(rs.SandboxError) as info:
+        rs.is_approved_sha("0" * 64, file)
+    assert "research_ledger.py reset approvals" in str(info.value) and "--force" in str(info.value)
+    out = admin.reset_approvals(file)
+    assert out["kept"] == 0 and out["backup"]
+    assert not rs.is_approved_sha(rs.file_sha256(cand), file)          # 没有任何有效前缀:要重新批准
+    sha = rs.record_approval(cand, file)
+    assert rs.is_approved_sha(sha, file)
+    rs.record_approval(cand2, file)
+    assert rs.is_approved_sha(rs.file_sha256(cand2), file)
+
+
+def test_reset_approvals_cli_works_on_a_corrupted_file(tmp_path, monkeypatch, capsys):
+    import research_ledger as cli
+    cand = tmp_path / "c.py"
+    cand.write_text("class C: pass\n", encoding="utf-8")
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    file = tmp_path / "data" / "research-control" / "approvals.json"
+    monkeypatch.setattr(cli, "_paths", lambda: (trials, file))
+    rs.record_approval(cand, file)
+    file.write_text('"corrupted"', encoding="utf-8")
+    assert cli.main(["reset", "approvals", "--reason", "文件被写坏"]) == 0       # 状态异常:不需要 --force
+    capsys.readouterr()
+    assert rs.record_approval(cand, file) == rs.file_sha256(cand)             # 重置后能继续批准
+    log = chain.anchor_path_for(trials).parent / "ledger.admin.log"
+    assert "文件被写坏" in log.read_text(encoding="utf-8")                      # 留审计痕迹
+
+
+def test_trial_ledger_error_messages_carry_runnable_steps(tmp_path):
+    path = make_trials(tmp_path)
+    path.write_text("", encoding="utf-8")
+    with pytest.raises(tl.TrialLedgerError) as info:
+        tl.total_trials(path)
+    text = str(info.value)
+    assert "research_ledger.py reset trials" in text and "--add-trials" in text and "--force" in text
+
+
+def test_file_lock_retries_on_windows_delete_pending_permission_error(tmp_path, monkeypatch):
+    """"全量里偶发失败"的真根因(压测复现:`[Errno 13] Permission denied: ...chainlock`):Windows 上锁文件刚被
+    持有者 unlink、处于删除待决时,别人 O_EXCL 创建抛 PermissionError 而不是 FileExistsError。必须按"被占用"重试。"""
+    real_open = os.open
+    calls = {"n": 0}
+
+    def flaky_open(path, flags, *a, **k):
+        if str(path).endswith(".chainlock") and calls["n"] < 3:
+            calls["n"] += 1
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, *a, **k)
+
+    monkeypatch.setattr(chain.os, "open", flaky_open)
+    with chain.file_lock(tmp_path / "x.jsonl", timeout=10):
+        pass
+    assert calls["n"] == 3
+
+
+def test_known_residual_a_callback_planted_in_the_window_fires_outside_it(tmp_path):
+    """如实钉住的**残余**(第 32 号 PR 复审实测,本机复现):钩子只罩"候选正在跑"这一段。
+    候选若在窗口内埋一个回调(`np.seterrcall` + `np.seterr(all="call")`),它在窗口**外**触发时写文件不受限。
+    今天端到端打不通,靠的是宪法的 `__del__` 禁令与 atexit/threading/weakref/gc 在候选侧取不到——这是显式依赖,
+    不是钩子的能力。本用例不是"期望如此",是防止有人把钩子说成"覆盖了候选的所有执行"。
+    (彻底做法:钩子 active 覆盖子进程整个生命周期,框架自己的写走显式放行;本 PR 未做,见 ADR 残余。)"""
+    out = tmp_path / "planted.txt"
+
+    def callback(kind, flag):
+        open(out, "w", encoding="utf-8").write("written outside the window")
+
+    old = np.seterr(all="ignore")
+    try:
+        with rs.candidate_window():
+            np.seterr(all="call")
+            previous = np.seterrcall(callback)           # 窗口内埋回调:这一步本身不被拒
+        np.float64(1.0) / np.float64(0.0)                 # 窗口外触发
+        assert out.exists(), "若这条变红:说明残余被收掉了,请同步更新 ADR 残余清单"
+    finally:
+        np.seterrcall(previous)
+        np.seterr(**old)

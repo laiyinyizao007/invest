@@ -257,13 +257,13 @@ def _git_run(args: list[str], cwd: Path | None = None, timeout: int = 30):
     """
     if not args or args[0] not in _GIT_READONLY_SUBCOMMANDS:
         raise ValueError(f"守卫只允许跑只读 git 子命令:{args[:1]}")
-    with framework_privilege():
-        return _git_run_unchecked(args, cwd, timeout)
+    return _git_run_unchecked(args, cwd, timeout)
 
 
 def _git_run_unchecked(args: list[str], cwd: Path | None, timeout: int):
     try:
-        _GIT_HOME.mkdir(parents=True, exist_ok=True)
+        with framework_exempt(paths=(_GIT_HOME,)):          # 路径级:只放行建这个家目录
+            _GIT_HOME.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
     cmd = [_git_binary(), "-c", "core.fsmonitor=false", "-c", "core.pager=cat",
@@ -272,7 +272,8 @@ def _git_run_unchecked(args: list[str], cwd: Path | None, timeout: int):
         cmd += ["-C", str(cwd)]
     cmd += args
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_git_env())
+        with framework_exempt(argv=cmd):                    # 命令级:只放行**这一条**只读 git 命令
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_git_env())
     except (OSError, subprocess.SubprocessError):
         return None
     return proc if proc.returncode == 0 else None
@@ -607,7 +608,8 @@ def _purge_bytecode_cache(source: Path, cached: Path | None = None) -> None:
         except (NotImplementedError, ValueError):
             return
     try:
-        Path(target).unlink()
+        with framework_exempt(paths=(target,)):             # 路径级:只放行删**这一个** .pyc
+            Path(target).unlink()
     except OSError:
         pass                    # 没有就没有(不是错误)
 
@@ -764,6 +766,10 @@ def _check_object_rules(module, name, value) -> None:
     合并 main #22 之后,候选拿到的是代理,名字层(下划线/泄漏属性名,抛 ImportError)
     与对象层(这里,抛 AttributeError)两套规则都在代理的取属性里生效。
     """
+    if f"{getattr(module, '__name__', '')}.{name}" in UNREACHABLE_MEMBERS:
+        raise AttributeError(
+            f"禁止访问 {module.__name__}.{name}:它能按调用方给的任意路径读写文件,"
+            f"不交给候选(规则:任意路径读写原语)")
     if isinstance(value, ModuleType):
         if _is_dangerous_module(value):
             raise AttributeError(
@@ -1253,8 +1259,7 @@ class RepoImportGuard:
             # 源码核对过了,但**执行的**可能不是它:CPython 导入时优先用
             # `__pycache__/*.pyc`,而 .pyc 只校验头部里的 mtime+size(候选能伪造)。
             # 把可能伪造的 .pyc 删掉,导入机制就会从刚核对过的那份源码重新编译。
-            with framework_privilege():
-                _purge_bytecode_cache(resolved, cached=cached)
+            _purge_bytecode_cache(resolved, cached=cached)
         return None
 
     def _check_ancestor_packages(self, name: str) -> str | None:
@@ -1648,6 +1653,17 @@ ALLOWED_MODULE_ROOTS = frozenset({
 # 本名单还有第二个用途:对象层规则——候选不得经由别的白名单模块的属性(如 `vnpy.trader.utility.np`)
 # 绕开"没有追加就不给 numpy"这一条。少一项 = 多放开一个库,只增不减(宪法守卫登记)。
 CAPABILITY_LIB_ROOTS = frozenset({"numpy", "pandas"})
+# **白名单模块里自带的任意路径读写原语**(第 32 号 PR 复审 Medium):`vnpy.trader.utility.save_json(filename, data)`
+# 经 `get_file_path`(`TEMP_DIR.joinpath(filename)`,绝对路径胜出)可写任意路径;`load_json` 同理读任意路径,
+# `get_folder_path` 会 mkdir,`TRADER_DIR`/`TEMP_DIR` 把真实目录递给候选。候选没有正当理由用它们
+# (模板需要的 `ArrayManager`/`BarGenerator`/`virtual`/`round_to` 等不受影响)。按"模块名.成员名"登记;
+# 对象层规则在取属性时拒绝(代理与视图共用 `_check_object_rules`)。只增不减(宪法守卫登记)。
+UNREACHABLE_MEMBERS = frozenset({
+    "vnpy.trader.utility.save_json", "vnpy.trader.utility.load_json",
+    "vnpy.trader.utility.get_file_path", "vnpy.trader.utility.get_folder_path",
+    "vnpy.trader.utility.get_icon_path", "vnpy.trader.utility.TRADER_DIR", "vnpy.trader.utility.TEMP_DIR",
+    "vnpy.trader.utility._get_trader_dir",
+})
 # 最近一次 `safe_builtins` 生效的导入白名单根(对象层规则要用);只由框架写,候选碰不到本模块。
 _ACTIVE_ALLOWED_ROOTS: list = [ALLOWED_MODULE_ROOTS]
 
@@ -1877,9 +1893,11 @@ class SandboxError(ValueError):
 #   - 状态在**本模块**里;候选 import 不到 research_sandbox/scripts/risk(按路径裁决 + 危险名单),
 #     模块视图/代理又不递出下划线名,于是候选既拿不到本模块对象也改不了 `_AUDIT`(探针见 tests/test_fs_capability_closure.py)。
 #   - 允许写入目录 = 框架在窗口前创建的**临时目录**(`candidate_window()` 默认新建、退出时清理)。
-class AuditDenied(PermissionError):
-    """审计钩子拒绝了候选在执行窗口里的某个动作。继承 PermissionError(OSError):
-    导入机制写 .pyc 缓存时遇到 OSError 会静默放弃,所以"拒绝写缓存"不会打断正常导入。"""
+class AuditDenied(OSError):
+    """审计钩子拒绝了候选在执行窗口里的某个动作。继承 **OSError**(不是 PermissionError):
+    - 导入机制写 .pyc 缓存时遇到 OSError 会静默放弃,所以"拒绝写缓存"不会打断正常导入;
+    - 但不能是 PermissionError:`tempfile._mkstemp_inner` 在 Windows 上遇到 PermissionError 会 `continue` 重试到
+      TMP_MAX(本机 2147483647),窗口内对被拒目录 `tempfile.mkstemp` 实测会挂住数分钟(第 32 号 PR 复审 Medium)。"""
 
     def __init__(self, rule: str, event: str):
         super().__init__(f"研究沙盒审计钩子拒绝了事件 {event}(规则:{rule})")
@@ -1900,7 +1918,7 @@ AUDIT_DENIED_EVENT_PREFIXES = frozenset({
 # 会改文件系统的事件 -> 需要落在允许目录里的**参数下标**(源路径只读不算,所以 symlink/link/copy 只看目的端)。
 AUDIT_PATH_MUTATION_EVENTS = {
     "os.remove": (0,), "os.rmdir": (0,), "os.mkdir": (0,), "os.truncate": (0,), "os.chmod": (0,), "os.chown": (0,),
-    "os.utime": (0,), "os.rename": (0, 1), "os.link": (1,), "os.symlink": (1,),
+    "os.utime": (0,), "os.rename": (0, 1), "os.link": (0, 1), "os.symlink": (0, 1),
     "shutil.copyfile": (1,), "shutil.copymode": (1,), "shutil.copystat": (1,), "shutil.copytree": (1,),
     "shutil.move": (0, 1), "shutil.rmtree": (0,), "shutil.unpack_archive": (1,), "shutil.make_archive": (0,),
 }
@@ -1910,7 +1928,7 @@ _AUDIT_NULL_DEVICES = frozenset({os.path.normcase(os.devnull), "nul", "/dev/null
 
 
 class _AuditState:
-    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed")
+    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed", "exempt_paths", "exempt_argv", "armed")
 
     def __init__(self):
         self.active = False
@@ -1919,6 +1937,9 @@ class _AuditState:
         self.denials: list[tuple[str, str]] = []
         self.busy = False          # 钩子自己在判定时不再递归判定
         self.installed = False
+        self.exempt_paths: tuple = ()      # 路径级豁免:只放行这几个**规范化路径**的变更/写(框架清 .pyc、建 git 家目录)
+        self.exempt_argv: list | None = None   # 进程级豁免:只放行**这一条**argv 的 Popen(守卫跑只读 git)
+        self.armed = False                 # Popen 匹配后,同一次调用里的底层创建进程事件放行
 
 
 _AUDIT = _AuditState()
@@ -1957,12 +1978,32 @@ def _is_bytecode_cache(norm: str) -> bool:
     return "__pycache__" in norm
 
 
+_SPAWN_EVENTS = frozenset({"_winapi.CreateProcess", "os.posix_spawn", "os.fork", "os.exec", "os.spawn"})
+
+
+def _argv_matches(args, argv) -> bool:
+    """Popen 事件的第二个参数:POSIX 上是 argv 列表,Windows 上是 `list2cmdline` 之后的命令行字符串。"""
+    try:
+        got = args[1]
+        want = [str(x) for x in argv]
+        if isinstance(got, (list, tuple)):
+            return [str(x) for x in got] == want
+        return isinstance(got, str) and got == subprocess.list2cmdline(want)
+    except (TypeError, IndexError):
+        return False
+
+
 def _audit_hook(event, args):
     state = _AUDIT
     if not state.active or state.busy:
         return
     state.busy = True
     try:
+        if event == "subprocess.Popen" and state.exempt_argv is not None and _argv_matches(args, state.exempt_argv):
+            state.armed = True
+            return
+        if state.armed and event in _SPAWN_EVENTS:
+            return
         if event in AUDIT_DENIED_EVENTS:
             _audit_deny("audit:" + event, event)
         for prefix in AUDIT_DENIED_EVENT_PREFIXES:
@@ -1976,7 +2017,7 @@ def _audit_hook(event, args):
                 norm = _audit_norm(path)
                 if norm is None:
                     return          # 文件描述符:来自此前已裁决过的 open
-                if not _audit_inside_allowed(norm, state.allowed):
+                if not _audit_inside_allowed(norm, state.allowed) and norm not in state.exempt_paths:
                     # 写 __pycache__ 是导入机制的缓存动作:照样拒(OSError 会被导入机制吞掉),但不算"越权企图"
                     _audit_deny("audit:open-write", event, record=not _is_bytecode_cache(norm))
             return
@@ -1985,7 +2026,8 @@ def _audit_hook(event, args):
             for index in indexes:
                 if index < len(args):
                     norm = _audit_norm(args[index])
-                    if norm is not None and not _audit_inside_allowed(norm, state.allowed):
+                    if (norm is not None and not _audit_inside_allowed(norm, state.allowed)
+                            and norm not in state.exempt_paths):
                         _audit_deny("audit:path-mutation", event, record=not _is_bytecode_cache(norm))
     finally:
         state.busy = False
@@ -2035,18 +2077,22 @@ def candidate_window(scratch_dir: Path | None = None):
 
 
 @contextlib.contextmanager
-def framework_privilege():
-    """框架自己的动作(守卫跑只读 git、清 .pyc 缓存)发生在候选导入期间,会被窗口拦下,所以给它们一个**显式放行路径**。
+def framework_exempt(paths=(), argv=None):
+    """框架自己的动作发生在候选导入期间,会被窗口拦下,给它们一个**路径级/命令级**的显式豁免(不是关全局开关)。
 
-    只有框架代码调用,参数都由框架决定,候选既拿不到本函数(同模块、候选 import 不到)也不能给它传参;
-    用法限于 `_git_run` 与 `_purge_bytecode_cache` 两处(见 tests/test_fs_capability_closure.py 的接线核对)。
-    进入时暂停判定、退出时恢复;单线程同步执行,期间不会有候选代码在跑。"""
-    was_active = _AUDIT.active
-    _AUDIT.active = False
+    - `paths`:只放行这几个路径的变更/写(守卫清某个 `.pyc`、建 git 家目录);窗口其余部分**始终**受裁决;
+    - `argv`:只放行 argv **恰好等于**它的那一次 `subprocess.Popen`(守卫跑只读 git),
+      以及该次调用内部的底层创建进程事件;别的 Popen 照拒。
+    只有框架代码调用,参数都由框架决定;候选拿不到本函数。用法限于 `_git_run_unchecked` 与 `_purge_bytecode_cache`
+    (tests/test_fs_capability_closure.py 有接线核对 + 变异:改回全局开关用例会变红)。"""
+    previous = (_AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed)
+    _AUDIT.exempt_paths = tuple(p for p in (_audit_norm(x) for x in paths) if p) + previous[0]
+    _AUDIT.exempt_argv = list(argv) if argv is not None else previous[1]
+    _AUDIT.armed = False
     try:
         yield
     finally:
-        _AUDIT.active = was_active
+        _AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed = previous
 
 
 # 本机路径不该出现在**会外发的文本**里(网关响应 → 毕昇工作流 → 模型)。
@@ -2865,7 +2911,9 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-APPROVALS_TOOL_HINT = "python scripts/research_ledger.py"
+APPROVALS_TOOL_HINT = ('旧账本(无链):核对现有每个 sha 后 `python scripts/research_ledger.py migrate approvals --confirm-all-approved`;'
+                       '被写坏/链断:`python scripts/research_ledger.py reset approvals --reason "<原因>" --force`'
+                       '(保留有效前缀、其余丢弃并备份,丢弃的批准需人重新批准;文件已被写成非对象/非 JSON/空文件时同样可用)')
 
 
 def _parse_approvals(approvals_file: Path) -> list[dict]:
@@ -2877,9 +2925,9 @@ def _parse_approvals(approvals_file: Path) -> list[dict]:
     try:
         data = json.loads(approvals_file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise SandboxError(f"批准记录无法读取,拒绝继续(fail-closed): {exc}") from exc
+        raise SandboxError(f"批准记录无法读取,拒绝继续(fail-closed): {exc};人工出路:{APPROVALS_TOOL_HINT}") from exc
     if not isinstance(data, dict):
-        raise SandboxError("批准记录格式错误(应为对象)")
+        raise SandboxError(f"批准记录格式错误(应为对象),拒绝采信(fail-closed);人工出路:{APPROVALS_TOOL_HINT}")
     rows: list[dict] = []
     for key, value in data.items():
         if not isinstance(value, dict) or not isinstance(value.get("seq"), int) or isinstance(value.get("seq"), bool):

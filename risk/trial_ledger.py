@@ -9,8 +9,11 @@
 **防篡改(Issue #31)**:每条记录带 `seq`/`prev`/`hash`(哈希链,口径见 `risk/ledger_chain.py`),头指针写在**另一个目录**的
 锚点文件里;读侧发现链断/回滚/截断/整条被换掉一律抛 TrialLedgerError(fail-closed)。起因:白名单里的 numpy/pandas
 能把任意字节写到任意路径,清空或抹小本账本就让 DSR 的 N 偏小(年化 Sharpe 3.5:N=1620 时 DSR 0.6397 不过,N=1 时 0.9999 过)。
-边界见 `risk/ledger_chain.py`:链没有密钥,同时改账本与锚点的人骗得过它;候选写账本的**主防线**是执行窗口里的审计钩子
-(scripts/research_sandbox.py),本层是钩子被绕过时的第二层。旧账本(无链)不会被静默采信:
+边界见 `risk/ledger_chain.py`:链没有密钥,同时改账本与锚点的人骗得过它。**候选写账本的防线分两层,都有前提,别读成"已闭合"**:
+① 执行窗口里的审计钩子(scripts/research_sandbox.py)——只罩"候选正在跑"这一段,**窗口外候选若还能执行代码,写文件不受限**
+(codex 实测:`np.seterrcall(cb)` + `np.seterr(all="call")` 的回调在窗口外触发时写入成功)。今天端到端打不通,
+依赖的是**宪法的 `__del__` 禁令**(risk/constitution.py `BUILTIN_FORBIDDEN_DUNDERS`)与 atexit/threading/weakref/gc 在候选侧取不到
+——这个依赖是显式残余,不是本层的能力;② 本层的读侧核链:无论怎么写进来的,链断/回滚/截断/无链记录都会被发现(同时改锚点除外)。旧账本(无链)不会被静默采信:
 用 `python scripts/research_ledger.py migrate` 一次性迁移。
 
 阶段 1 只做全局累计(保守:家族划分随阶段 3 的谱系再引入)。同一进程内用线程锁、跨进程用锁文件串行写
@@ -29,7 +32,9 @@ KINDS = ("submission", "grid_cell", "gate_run")
 # 上限:count 过大时 DSR 的尾概率 1-1/N 会舍入成 1.0 并抛 StatisticsError,账本在语法上有效却让评估永久失败
 MAX_ENTRY_COUNT = 10**9
 MAX_TOTAL = 10**12
-TOOL_HINT = "python scripts/research_ledger.py"
+TOOL_HINT = ('旧账本(无链):`python scripts/research_ledger.py migrate trials`;链断/回滚/截断:'
+             '先人工核对,再 `python scripts/research_ledger.py reset trials --reason "<原因>" --add-trials <估计丢失的试验次数> --force`'
+             '(保留有效前缀、重新定锚,原文件备份)')
 _lock = threading.Lock()
 
 

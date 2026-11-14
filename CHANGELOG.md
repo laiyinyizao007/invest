@@ -15,6 +15,11 @@
   - **行情在候选导入前取定**(gate/evaluate 两个子进程入口)。
   - 测试:`tests/test_fs_capability_closure.py`(放行+拦截双向,断言规则);其余 6 个沙盒测试文件用 `numpy_on_allowlist`/`without_audit_window` 夹具保持原有探针对象。
   - **残余**:只拦写不拦读;候选可吞掉钩子异常;哈希链无密钥(同时改账本与锚点骗得过);看板仍原样读 `approvals.json` 展示。G8 外部评审:待复核。
+  - **第 32 号 PR 复审(codex 38/50)的补修**:①更正两句过强的文字(钩子只罩窗口内,窗口外回调不受限,今天打不通靠宪法 `__del__` 禁令与 atexit/threading/weakref/gc 取不到——显式残余;锚点的保护是文件名里的 sha256 短哈希而非目录分离);
+    ②`reset approvals` 容错(文件被写坏成字符串/非 JSON/空文件/数组仍可重置),fail-closed 报错写明可执行命令;③`AuditDenied` 改继承 `OSError`(`tempfile.mkstemp` 对被拒目录不再挂住);
+    ④`os.link`/`os.symlink` 两端都判(`os.write`/`os.pwrite` 没有审计事件,无法拒绝,如实记残余);⑤`vnpy.trader.utility.save_json/load_json/get_file_path/…` 进对象层不可达名单;
+    ⑥守卫的放行从"关全局开关"改成路径级/命令级豁免 `framework_exempt`;⑦账本锁:Windows 删除待决的锁文件会让 `O_EXCL` 抛 PermissionError(并发写试验账本的真实竞态,也是全量里偶发失败的根因),现按"被占用"重试。
+    G8:待复核。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:
