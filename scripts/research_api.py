@@ -970,8 +970,16 @@ def run_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
+    # 回测经 peewee 读 vnpy 数据库(sqlite),会发 `sqlite3.connect` 审计事件:登记这个库的路径,窗口里只放行它。
+    # 取不到就登记空表(那时窗口里的回测读库会被自己的钩子拒——fail-closed,不是放开)。
     try:
-        with rs.candidate_window():
+        from vnpy.trader.setting import SETTINGS
+        from vnpy.trader.utility import get_file_path
+        database_paths = [get_file_path(SETTINGS["database.database"])]
+    except Exception:                                # noqa: BLE001
+        database_paths = []
+    try:
+        with rs.candidate_window(sqlite_paths=database_paths):
             stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))

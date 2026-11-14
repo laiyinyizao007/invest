@@ -19,6 +19,10 @@
     ②`reset approvals` 容错(文件被写坏成字符串/非 JSON/空文件/数组仍可重置),fail-closed 报错写明可执行命令;③`AuditDenied` 改继承 `OSError`(`tempfile.mkstemp` 对被拒目录不再挂住);
     ④`os.link`/`os.symlink` 两端都判(`os.write`/`os.pwrite` 没有审计事件,无法拒绝,如实记残余);⑤`vnpy.trader.utility.save_json/load_json/get_file_path/…` 进对象层不可达名单;
     ⑥守卫的放行从"关全局开关"改成路径级/命令级豁免 `framework_exempt`;⑦账本锁:Windows 删除待决的锁文件会让 `O_EXCL` 抛 PermissionError(并发写试验账本的真实竞态,也是全量里偶发失败的根因),现按"被占用"重试。
+  - **第 37 轮复审(codex 36/50)的补修**:①**Critical**:`from vnpy.trader.database import import_module`(importlib 再导出)给候选不受限的导入原语——`importlib` 进能力来源名单(按 `__module__` 根判),
+    并补上 `import a.b.c as d` 回退到真 `sys.modules` 模块的缺口(只加名单会被这一条绕过,已用例复现),再加 builtins 导入原语与 threading/multiprocessing/pathlib/glob 来源规则;
+    系统性扫描 77 个白名单模块,修前 23 项再导出放行、修后 0(全表在 ADR);②sqlite3.connect 无 `open` 事件,按路径参数判(回测入口登记 vnpy 数据库);`_winapi.CreateFile` 写访问与 winreg 写事件同样处置,
+    无法裁决的原语(mmap/os.write/POSIX mkfifo 等)列入 ADR;③账本锁区分"被占用"与"真权限错误",未来 mtime 视为陈旧;④豁免 `armed` 一次性、argv 须为 git;⑤`vnpy.trader.utility.Path` 登记。
     G8:待复核。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,

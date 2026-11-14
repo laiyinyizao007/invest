@@ -155,25 +155,38 @@ def read_verified(path: Path, parse_line, *, what: str, allow_ahead: bool, tool_
 
 
 @contextlib.contextmanager
-def file_lock(target: Path, timeout: float = 30.0, stale_seconds: float = 30.0):
+def file_lock(target: Path, timeout: float = 30.0, stale_seconds: float = 30.0, permission_grace: float = 3.0):
     """跨进程独占锁(锁文件 + O_EXCL)。账本一旦有哈希链,"两个写者读到同一个尾巴各追加一条"
     就会把链写成分叉——所以试验账本也得跨进程互斥(此前只有同进程锁)。
-    残留锁按**年龄**判定(持有者崩了不会清);操作都在毫秒级,30 秒足够保守。"""
+    残留锁按**年龄**判定(持有者崩了不会清);操作都在毫秒级,30 秒足够保守。**mtime 在未来**同样算陈旧
+    (否则一个时间戳在未来的 .chainlock 会让写账本阻塞满超时)。
+
+    两类失败**分开报**(第 37 轮复审):
+    - **被占用**:`FileExistsError`,或 Windows 上锁文件刚被持有者 unlink、处于"删除待决"时 `O_EXCL` 抛的
+      `PermissionError`(压测复现的真实竞态)——重试;
+    - **真权限错误**(锁路径是目录,或 PermissionError 连续超过 `permission_grace` 秒不消失):原样报"权限错误",
+      不等满 timeout、也不冒充成"被其他进程占用"。"""
     target = Path(target)
     lock = target.with_name(target.name + ".chainlock")
     lock.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
+    perm_since: float | None = None
     while True:
         try:
             fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
             break
-        except (FileExistsError, PermissionError):
-            # Windows:锁文件刚被持有者 unlink、处于"删除待决"时,别人 O_EXCL 创建它抛的是 **PermissionError**
-            # (WinError 5),不是 FileExistsError——这是"全量里偶发失败"的真根因(8 进程×40 次压测 1/8 复现,
-            # 报错 `[Errno 13] Permission denied: ...chainlock`),不是 10 秒超时。按"锁被占用"重试。
+        except (FileExistsError, PermissionError) as exc:
+            if isinstance(exc, PermissionError) and not isinstance(exc, FileExistsError):
+                now = time.monotonic()
+                perm_since = perm_since if perm_since is not None else now
+                if lock.is_dir() or now - perm_since > permission_grace:
+                    raise LedgerChainError(f"账本锁文件无法创建(权限错误,不是被其他进程占用): {exc}") from exc
+            else:
+                perm_since = None
             try:
-                if time.time() - lock.stat().st_mtime > stale_seconds:
+                age = time.time() - lock.stat().st_mtime
+                if age > stale_seconds or age < -stale_seconds:
                     lock.unlink(missing_ok=True)
                     continue
             except OSError:

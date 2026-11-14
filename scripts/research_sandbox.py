@@ -144,7 +144,21 @@ DANGEROUS_MODULE_NAMES = {
 }
 
 # 出现这两个 = 那个模块能把"执行任意代码 / 调原生代码"直接递出来,整块不给。
-CAPABILITY_MODULE_NAMES = frozenset({"ctypes", "subprocess"})
+# `importlib` 在内(第 37 轮 codex 的 Critical):`vnpy.trader.database`/`vnpy.trader.datafeed` 把 `importlib.import_module`
+# 再导出了一遍,候选 `from vnpy.trader.database import import_module` 就拿到一个**不受限的导入原语**——
+# `import_module("os")`/`("sqlite3")`/`("research_grid")` 全部绕过导入门。判据按对象的 `__module__` 根(不是按成员名),
+# 所以任何白名单模块再导出 importlib 的东西(函数、类、模块)都挡;按名字的名单不收敛。
+CAPABILITY_MODULE_NAMES = frozenset({"ctypes", "subprocess", "importlib"})
+# **按来源拒绝非模块成员**(第 37 轮系统性扫描的结论,脚本与全表见 ADR):白名单模块再导出的下列来源的**函数/类/实例**不递给候选。
+# 与 CAPABILITY_MODULE_NAMES 不同,这些来源**不参与**"整个模块泄漏能力"的聚合判定(否则 `vnpy.trader.utility` 因为带一个 `Path`
+# 就整块被拒,`ArrayManager` 也用不了)——只拒这个成员本身。
+#   threading/multiprocessing:候选起线程/进程,代码会在审计窗口**之外**继续跑;
+#   pathlib:`Path`/`TRADER_DIR` 这类把真实路径与读写方法递出来;glob:列目录。
+UNREACHABLE_ORIGINS = frozenset({"threading", "multiprocessing", "pathlib", "glob"})
+# builtins 里的"导入/执行原语"被某个模块当成属性再导出(`mod.__import__`/`mod.open`……),`__module__` 都是 "builtins",按名字判。
+BUILTIN_PRIMITIVE_NAMES = frozenset({"__import__", "open", "exec", "eval", "compile"})
+# `builtins.open.__module__` 是 "io"(不是 "builtins"),按 `__module__` 判会漏——所以另按**身份**判。
+_BUILTIN_PRIMITIVES = tuple(getattr(__import__("builtins"), n) for n in sorted(BUILTIN_PRIMITIVE_NAMES))
 
 # 视图上唯一透传的下划线名字(其余下划线属性一律不给,包括 `__class__`/`__dict__`)。
 # `__version__` 也在内(第 25 轮 codex 的 Low 11):只透传四个名字会让
@@ -651,14 +665,14 @@ def _capability_source(value) -> str | None:
     """
     if isinstance(value, ModuleType):
         name = _module_name(value)
-        return name if name in CAPABILITY_MODULE_NAMES else None
+        return name if name.split(".")[0] in CAPABILITY_MODULE_NAMES else None
     try:
         origin = getattr(value, "__module__", "") or ""
     except Exception:                                    # noqa: BLE001 —— 取不到来源 = 认不准 = 当成"能执行"
         # 第 25 轮 codex 的 Medium 9:原来这里返回 None(判成"无害")。
         # "取不到来源"不等于"无害"——认不准就按**有能力**处理(拒绝交付)。
         return "未知来源"
-    return origin if origin in CAPABILITY_MODULE_NAMES else None
+    return origin if origin.split(".")[0] in CAPABILITY_MODULE_NAMES else None
 
 
 _LEAK_CACHE: "weakref.WeakKeyDictionary[ModuleType, tuple]" = weakref.WeakKeyDictionary()
@@ -786,6 +800,21 @@ def _check_object_rules(module, name, value) -> None:
                 f"禁止访问 {module.__name__}.{name}:它把 {leak} 递出来,"
                 f"等于把执行能力递给候选(规则:能力泄漏)")
         return
+    if not isinstance(value, ModuleType):
+        try:
+            origin = getattr(value, "__module__", "") or ""
+            value_name = getattr(value, "__name__", "") or ""
+        except Exception:                                # noqa: BLE001 —— 取不到来源 = 认不准 = 按有能力处理
+            origin, value_name = "未知来源", ""
+        if any(value is primitive for primitive in _BUILTIN_PRIMITIVES) or (
+                origin == "builtins" and value_name in BUILTIN_PRIMITIVE_NAMES):
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:它是 builtins.{value_name}(导入/执行原语),"
+                f"再导出给候选等于绕过导入门(规则:导入原语)")
+        if isinstance(origin, str) and origin.split(".")[0] in UNREACHABLE_ORIGINS:
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:它来自 {origin},白名单模块再导出它会让候选起线程/进程或拿到真实路径"
+                f"(规则:按来源不可达)")
     # 非模块的值:如果它**定义在** ctypes/subprocess 里(`subprocess.Popen`、
     # `ctypes.CDLL`),递出去一样能执行命令——按对象来源判,不看名字。
     source = _capability_source(value)
@@ -1600,6 +1629,23 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
                 if leak:
                     raise ImportError(f"禁止导入 {name}.{item}:它把 {leak} 递出来,"
                                       f"等于把执行能力递给候选(规则:能力泄漏)")
+        # **`import a.b.c as d` 的回退**(第 37 轮探针实测,这是"按对象判"的又一个缺口):CPython 对 `import a.b.c as d`
+        # 用 IMPORT_FROM 逐段取属性,代理的取属性一旦拒绝(AttributeError),就**回退到 `sys.modules["a.b"]` 取真模块**——
+        # 于是 `import vnpy.trader.database as db` 拿到的是**未包装的真模块**(`db.import_module` 就是真的 importlib 函数),
+        # 对象层规则整个被绕开。所以这里对点号名的**每一级前缀**按真模块再判一次(危险模块/能力泄漏),
+        # 与上面 fromlist 里"回退到 sys.modules 的真模块"同一个道理。
+        if not fromlist and "." in target:
+            parts = target.split(".")
+            for index in range(2, len(parts) + 1):
+                prefix = ".".join(parts[:index])
+                real_prefix = _modules.get(prefix)
+                if real_prefix is not None and isinstance(real_prefix, _mt):
+                    if _danger(real_prefix):
+                        raise ImportError(f"禁止导入 {prefix}:模块视图不把危险模块交给候选(规则:模块视图)")
+                    leak = _leak(real_prefix)
+                    if leak:
+                        raise ImportError(f"禁止导入 {prefix}:它把 {leak} 递出来,"
+                                          f"等于把执行能力递给候选(规则:能力泄漏)")
         # 配置追加的模块:准入审计——自己就把 os/shutil 挂在属性上的模块不许进(main #22)。
         # 审计用的是**刚导进来的那个模块对象**,不额外动态导入(宪法守卫会把带
         # `importlib.import_module` 的模块判成执行入口)。
@@ -1662,7 +1708,7 @@ UNREACHABLE_MEMBERS = frozenset({
     "vnpy.trader.utility.save_json", "vnpy.trader.utility.load_json",
     "vnpy.trader.utility.get_file_path", "vnpy.trader.utility.get_folder_path",
     "vnpy.trader.utility.get_icon_path", "vnpy.trader.utility.TRADER_DIR", "vnpy.trader.utility.TEMP_DIR",
-    "vnpy.trader.utility._get_trader_dir",
+    "vnpy.trader.utility._get_trader_dir", "vnpy.trader.utility.Path",
 })
 # 最近一次 `safe_builtins` 生效的导入白名单根(对象层规则要用);只由框架写,候选碰不到本模块。
 _ACTIVE_ALLOWED_ROOTS: list = [ALLOWED_MODULE_ROOTS]
@@ -1928,7 +1974,7 @@ _AUDIT_NULL_DEVICES = frozenset({os.path.normcase(os.devnull), "nul", "/dev/null
 
 
 class _AuditState:
-    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed", "exempt_paths", "exempt_argv", "armed")
+    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed", "exempt_paths", "exempt_argv", "armed", "sqlite_ok")
 
     def __init__(self):
         self.active = False
@@ -1939,7 +1985,8 @@ class _AuditState:
         self.installed = False
         self.exempt_paths: tuple = ()      # 路径级豁免:只放行这几个**规范化路径**的变更/写(框架清 .pyc、建 git 家目录)
         self.exempt_argv: list | None = None   # 进程级豁免:只放行**这一条**argv 的 Popen(守卫跑只读 git)
-        self.armed = False                 # Popen 匹配后,同一次调用里的底层创建进程事件放行
+        self.armed = False                 # Popen 匹配后,放行**紧接着的一次**底层创建进程事件(用掉即清零)
+        self.sqlite_ok: tuple = ()         # 框架登记的 sqlite 库路径(回测读 vnpy 数据库):窗口外的这几个库允许 connect
 
 
 _AUDIT = _AuditState()
@@ -1978,6 +2025,16 @@ def _is_bytecode_cache(norm: str) -> bool:
     return "__pycache__" in norm
 
 
+# **没有 `open` 审计事件的写原语**(第 37 轮系统性探针,Windows 实测):它们落盘却不经过 `open` 判定,必须各有各的事件规则。
+#   sqlite3.connect(建库/写库,只发 `sqlite3.connect`)→ 按路径参数判;dbm.sqlite3/shelve 底层同走它;
+#   _winapi.CreateFile(带写访问位)→ 按路径参数判;winreg 的写事件 → 整族拒(候选没有任何理由改注册表)。
+# 记入 ADR 但**无法**按路径裁决的:mmap.__new__(只带 fd,fd 来自已裁决的 open)、os.write/pwrite/ftruncate(无事件)、
+# POSIX 的 os.mkfifo/mknod(本机无法实测)。
+_WINAPI_WRITE_ACCESS = 0x40000000 | 0x10000000 | 0x2 | 0x4 | 0x100 | 0x10000 | 0x40000 | 0x80000
+AUDIT_DENIED_EVENTS_WINREG = frozenset({
+    "winreg.CreateKey", "winreg.SetValue", "winreg.DeleteKey", "winreg.DeleteValue", "winreg.SaveKey", "winreg.LoadKey",
+    "winreg.ConnectRegistry",
+})
 _SPAWN_EVENTS = frozenset({"_winapi.CreateProcess", "os.posix_spawn", "os.fork", "os.exec", "os.spawn"})
 
 
@@ -1986,6 +2043,8 @@ def _argv_matches(args, argv) -> bool:
     try:
         got = args[1]
         want = [str(x) for x in argv]
+        if os.path.splitext(os.path.basename(want[0]))[0].lower() != "git":      # 与 docstring 一致:只放行 git
+            return False
         if isinstance(got, (list, tuple)):
             return [str(x) for x in got] == want
         return isinstance(got, str) and got == subprocess.list2cmdline(want)
@@ -2003,8 +2062,9 @@ def _audit_hook(event, args):
             state.armed = True
             return
         if state.armed and event in _SPAWN_EVENTS:
+            state.armed = False                  # 只放行一次:之后同一豁免块里再起进程照拒
             return
-        if event in AUDIT_DENIED_EVENTS:
+        if event in AUDIT_DENIED_EVENTS or event in AUDIT_DENIED_EVENTS_WINREG:
             _audit_deny("audit:" + event, event)
         for prefix in AUDIT_DENIED_EVENT_PREFIXES:
             if event.startswith(prefix):
@@ -2020,6 +2080,21 @@ def _audit_hook(event, args):
                 if not _audit_inside_allowed(norm, state.allowed) and norm not in state.exempt_paths:
                     # 写 __pycache__ 是导入机制的缓存动作:照样拒(OSError 会被导入机制吞掉),但不算"越权企图"
                     _audit_deny("audit:open-write", event, record=not _is_bytecode_cache(norm))
+            return
+        if event == "sqlite3.connect":
+            target = args[0] if args else None
+            if isinstance(target, (str, bytes, os.PathLike)) and os.fsdecode(target) != ":memory:":
+                norm = _audit_norm(target)
+                if (norm is not None and not _audit_inside_allowed(norm, state.allowed)
+                        and norm not in state.exempt_paths and norm not in state.sqlite_ok):
+                    _audit_deny("audit:sqlite3-connect", event)
+            return
+        if event == "_winapi.CreateFile":
+            access = args[1] if len(args) > 1 else 0
+            if isinstance(access, int) and access & _WINAPI_WRITE_ACCESS:
+                norm = _audit_norm(args[0])
+                if norm is not None and not _audit_inside_allowed(norm, state.allowed) and norm not in state.exempt_paths:
+                    _audit_deny("audit:open-write", event)
             return
         indexes = AUDIT_PATH_MUTATION_EVENTS.get(event)
         if indexes is not None:
@@ -2046,10 +2121,11 @@ def window_denials() -> tuple:
 
 
 @contextlib.contextmanager
-def candidate_window(scratch_dir: Path | None = None):
+def candidate_window(scratch_dir: Path | None = None, sqlite_paths=()):
     """候选代码运行窗口:窗口内审计钩子判定,窗口外不判定。可重入(内层窗口沿用外层的允许目录)。
 
     `scratch_dir`:允许写入的目录;缺省新建一个临时目录,退出时清理。
+    `sqlite_paths`:框架登记的 sqlite 库(回测经 peewee 读 vnpy 数据库,会发 `sqlite3.connect`);只放行这几个路径的 connect。
     **numpy/pandas 等要在进入窗口前已经 import 过**:pandas 首次导入会 `ctypes.dlopen`(Windows 上加载 tzres.dll),
     窗口里第一次导入会被拒——research_api 的子进程入口在导入候选前已经加载了它们。"""
     install_audit_hook()
@@ -2064,6 +2140,7 @@ def candidate_window(scratch_dir: Path | None = None):
     scratch = Path(tempfile.mkdtemp(prefix="research-window-")) if own else Path(scratch_dir)
     _AUDIT.denials = []
     _AUDIT.allowed = _audit_norm(scratch)
+    _AUDIT.sqlite_ok = tuple(p for p in (_audit_norm(x) for x in sqlite_paths) if p)
     _AUDIT.depth = 1
     _AUDIT.active = True
     try:
@@ -2072,6 +2149,7 @@ def candidate_window(scratch_dir: Path | None = None):
         _AUDIT.active = False
         _AUDIT.depth = 0
         _AUDIT.allowed = None
+        _AUDIT.sqlite_ok = ()
         if own:
             shutil.rmtree(scratch, ignore_errors=True)
 

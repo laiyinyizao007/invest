@@ -241,15 +241,33 @@ def test_framework_exemption_is_path_level_not_a_global_switch(victim, tmp_path)
     assert other.exists()
 
 
-def test_framework_exemption_for_a_command_matches_exactly_one_argv(tmp_path):
-    argv = [sys.executable, "-c", "pass"]
+def test_framework_exemption_for_a_command_matches_exactly_one_git_argv(tmp_path):
+    git = [rs._git_binary(), "--version"]
     with rs.candidate_window():
-        with rs.framework_exempt(argv=argv):
-            subprocess.run(argv, check=True)                              # 恰好这一条:放行
+        with rs.framework_exempt(argv=git):
+            subprocess.run(git, check=True, capture_output=True)              # 恰好这一条 git:放行
             with _expect_rule("audit:subprocess.Popen"):
-                subprocess.run([sys.executable, "-c", "print(1)"])        # 同一豁免期间,别的命令照拒
+                subprocess.run([rs._git_binary(), "--help"], capture_output=True)   # 同一豁免期间,别的 git 命令照拒
         with _expect_rule("audit:subprocess.Popen"):
-            subprocess.run(argv)                                           # 豁免结束后同一条也拒
+            subprocess.run(git, capture_output=True)                           # 豁免结束后同一条也拒
+        # 豁免的 argv 不是 git(例如被误用来放行 python)也不放行:与 docstring 一致,只放行 git
+        py = [sys.executable, "-c", "pass"]
+        with rs.framework_exempt(argv=py):
+            with _expect_rule("audit:subprocess.Popen"):
+                subprocess.run(py)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="直接调用 _winapi.CreateProcess 只在 Windows 上存在")
+def test_the_spawn_exemption_is_one_shot_not_sticky():
+    """放行一次底层创建进程之后立即清零:同一个豁免块里再直接起进程照拒(原先 armed 黏住,块内 spawn 全放行)。"""
+    import _winapi
+    git = [rs._git_binary(), "--version"]
+    with rs.candidate_window():
+        with rs.framework_exempt(argv=git):
+            subprocess.run(git, check=True, capture_output=True)
+            assert rs._AUDIT.armed is False
+            with _expect_rule("audit:_winapi.CreateProcess"):
+                _winapi.CreateProcess(None, "cmd /c exit 0", None, None, False, 0, None, None, subprocess.STARTUPINFO())
 
 
 def test_the_guard_still_runs_git_and_purges_pyc_inside_the_window(tmp_path):
@@ -311,14 +329,15 @@ def repo(tmp_path, monkeypatch):
     return root
 
 
-def run_candidate(tmp_path, monkeypatch, source, allowed=("numpy", "pandas")):
+def run_candidate(tmp_path, monkeypatch, source, allowed=("numpy", "pandas"), static=False):
     """走生产入口 `import_candidate`(窗口接线在里面),numpy/pandas 经**配置追加**放行(默认已不在白名单)。
     只绕开静态筛查与运行时类校验:这里测的是运行期的窗口。"""
     cfg = copy.deepcopy(api.rc.load())
     cfg["screening"]["allowed_modules"] = list(allowed)
     monkeypatch.setattr(api.rc, "load", lambda *a, **k: cfg)
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
-    monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
+    if not static:
+        monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
     path = tmp_path / "candidate.py"
     path.write_text(textwrap.dedent(source), encoding="utf-8")
     return api.import_candidate(path, "S", api.rs.file_sha256(path))
@@ -1138,3 +1157,234 @@ def test_known_residual_a_callback_planted_in_the_window_fires_outside_it(tmp_pa
     finally:
         np.seterrcall(previous)
         np.seterr(**old)
+
+
+# ======================================================================
+# 第 37 轮复审:导入原语再导出 / sqlite3 无 open 事件 / 账本锁分类
+# ======================================================================
+
+def test_importlib_import_module_reexport_is_refused_by_the_object_layer():
+    """Critical:`vnpy.trader.database`/`datafeed` 再导出了 `importlib.import_module`(不受限的导入原语)。
+    断言是**对象层的"能力泄漏"规则**拒的(按 `__module__` 的根判来源,不是名字名单)。"""
+    import vnpy.trader.database as database
+    import vnpy.trader.datafeed as datafeed
+    rs.safe_builtins(())
+    for module in (database, datafeed):
+        assert module.import_module.__module__ == "importlib"          # 对照:确实是 importlib 的函数
+        proxy = rs._proxy_for(module)
+        with pytest.raises(AttributeError, match="规则:能力泄漏"):
+            proxy.import_module
+        with pytest.raises(AttributeError, match="规则:能力泄漏"):
+            rs._view_for(module).import_module
+    rs._PROXY_CACHE.clear()
+
+
+def test_builtins_import_primitive_reexported_by_a_module_is_refused():
+    import builtins
+    import types
+    carrier = types.ModuleType("carrier_builtins")
+    carrier.importer = builtins.__import__
+    carrier.opener = builtins.open
+    carrier.harmless = len                                            # 对照:别的 builtins 函数照常
+    rs.safe_builtins(())
+    proxy = rs._proxy_for(carrier)
+    assert proxy.harmless is len
+    for name in ("importer", "opener"):
+        with pytest.raises(AttributeError, match="规则:导入原语"):
+            getattr(proxy, name)
+    rs._PROXY_CACHE.clear()
+
+
+def test_threads_processes_paths_reexported_by_whitelisted_modules_are_refused():
+    import vnpy.trader.engine as engine
+    import vnpy.trader.utility as util
+    rs.safe_builtins(())
+    proxy = rs._proxy_for(engine)
+    for name in ("Thread", "current_thread"):
+        with pytest.raises(AttributeError, match="规则:按来源不可达"):
+            getattr(proxy, name)
+    with pytest.raises(AttributeError, match="任意路径读写原语"):       # `vnpy.trader.utility.Path`:成员级规则先拒
+        rs._proxy_for(util).Path
+    assert rs._proxy_for(util).ArrayManager is util.ArrayManager       # 放行方向:模板要的成员照旧
+    rs._PROXY_CACHE.clear()
+
+
+def test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin():
+    """系统性扫描的回归版(完整扫描脚本与结果见 ADR):逐个公开成员按 `__module__`/模块名判来源,
+    凡是危险来源,对象层规则必须拒;不按成员名猜。覆盖脚本扫描里出过命中的那几个模块。"""
+    import importlib
+    import types
+    dangerous = {"importlib", "os", "posix", "nt", "sys", "subprocess", "ctypes", "pickle", "marshal", "socket", "shutil",
+                 "sqlite3", "tempfile", "mmap", "zipfile", "tarfile", "dbm", "shelve", "runpy", "signal", "atexit", "gc",
+                 "inspect", "io", "pathlib", "glob", "threading", "multiprocessing", "requests", "urllib", "http"}
+    rs.safe_builtins(())
+    leaked = []
+    for name in ("vnpy.trader.database", "vnpy.trader.datafeed", "vnpy.trader.engine", "vnpy.trader.utility",
+                 "vnpy.trader.logger", "vnpy.trader.app", "vnpy.event.engine", "vnpy.trader.optimize",
+                 "vnpy_ctastrategy", "vnpy_ctastrategy.engine", "vnpy_ctastrategy.locale"):
+        module = importlib.import_module(name)
+        for member, value in vars(module).items():
+            if member.startswith("_") and member != "__import__":
+                continue
+            origin = value.__name__ if isinstance(value, types.ModuleType) else (getattr(value, "__module__", "") or "")
+            if isinstance(origin, str) and (origin.split(".")[0] in dangerous
+                                           or (origin == "builtins" and member in rs.BUILTIN_PRIMITIVE_NAMES)):
+                try:
+                    rs._check_object_rules(module, member, value)
+                    leaked.append(f"{name}.{member} <- {origin}")
+                except AttributeError:
+                    pass
+    assert leaked == [], leaked
+
+
+def test_production_path_refuses_import_module_and_leaves_framework_modules_untouched(repo, tmp_path, monkeypatch):
+    """端到端(生产 import_candidate,静态筛查开):候选经 `import_module` 复活 research_grid 并改 `validate_grid`
+    ——对象层规则拒,框架模块对象未变(第 33 轮"格子上限失效 → 试验少记"不能原样复活)。"""
+    import research_grid
+    original = research_grid.validate_grid
+    source = """
+        RESULT = {}
+        try:
+            import vnpy.trader.database as db
+            grid = db.import_module("research_grid")
+            grid.validate_grid = lambda *a, **k: None
+            RESULT["patched"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        try:
+            from vnpy.trader.datafeed import import_module as im2
+            RESULT["from_import"] = True
+        except Exception as exc:
+            RESULT["err2"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source, static=True)
+    assert "patched" not in cls.RESULT and "from_import" not in cls.RESULT, cls.RESULT
+    assert "规则:能力泄漏" in cls.RESULT["err"], cls.RESULT            # 对象层的"能力泄漏"规则拒的(不是静态规则)
+    assert "err2" in cls.RESULT
+    assert research_grid.validate_grid is original
+
+
+# ---- 没有 open 事件的写原语 ----
+
+def test_sqlite3_connect_is_judged_by_path_inside_the_window(tmp_path):
+    """第 37 轮唯一实测"钩子完全看不见"的写原语:sqlite3 只发 `sqlite3.connect`,没有 `open` 事件。
+    允许目录内放行、之外拒(并确认文件真的没建)、`:memory:` 放行、框架登记的库放行。"""
+    import sqlite3
+    outside = tmp_path / "outside.db"
+    registered = tmp_path / "vnpy_database.db"
+    registered.write_bytes(b"")
+    with rs.candidate_window(sqlite_paths=[registered]) as scratch:
+        con = sqlite3.connect(scratch / "inside.db")
+        con.execute("create table t(x)")
+        con.commit()
+        con.close()
+        sqlite3.connect(":memory:").close()
+        sqlite3.connect(str(registered)).close()                       # 框架登记的库(回测读 vnpy 数据库)
+        with _expect_rule("audit:sqlite3-connect"):
+            sqlite3.connect(str(outside))
+    assert not outside.exists()
+
+
+def test_sqlite3_backed_dbm_and_shelve_are_denied_outside_the_allowed_directory(tmp_path):
+    import dbm
+    import shelve
+    with rs.candidate_window():
+        for attack in (lambda: shelve.open(str(tmp_path / "s")), lambda: dbm.open(str(tmp_path / "d"), "c")):
+            with pytest.raises(OSError) as info:
+                attack()
+            chain_rules, exc = [], info.value
+            while exc is not None:
+                if isinstance(exc, rs.AuditDenied):
+                    chain_rules.append(exc.rule)
+                exc = exc.__cause__ or exc.__context__
+            assert chain_rules and set(chain_rules) <= {"audit:open-write", "audit:sqlite3-connect",
+                                                         "audit:path-mutation"}, chain_rules
+    assert [p.name for p in tmp_path.iterdir()] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="_winapi 只在 Windows 上")
+def test_winapi_createfile_with_write_access_is_judged_by_path(tmp_path):
+    import _winapi
+    existing = tmp_path / "r.bin"
+    existing.write_bytes(b"x")
+    with rs.candidate_window() as scratch:
+        GENERIC_READ, GENERIC_WRITE, CREATE_ALWAYS, OPEN_EXISTING = 0x80000000, 0x40000000, 2, 3
+        handle = _winapi.CreateFile(str(existing), GENERIC_READ, 0, 0, OPEN_EXISTING, 0x80, 0)     # 只读:放行
+        _winapi.CloseHandle(handle)
+        handle = _winapi.CreateFile(str(scratch / "w.bin"), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0x80, 0)
+        _winapi.CloseHandle(handle)                                                                  # 允许目录内写:放行
+        with _expect_rule("audit:open-write"):
+            _winapi.CreateFile(str(tmp_path / "w2.bin"), GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0x80, 0)
+    assert not (tmp_path / "w2.bin").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="winreg 只在 Windows 上")
+def test_registry_writes_are_denied_inside_the_window():
+    import winreg
+    with contextlib.suppress(OSError):
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\zz_research_probe_should_not_exist")   # 清掉变异运行可能留下的
+    with rs.candidate_window():
+        with _expect_rule("audit:winreg.CreateKey"):
+            winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\zz_research_probe_should_not_exist")
+    with pytest.raises(FileNotFoundError):
+        winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\zz_research_probe_should_not_exist")
+
+
+def test_the_run_child_window_registers_the_vnpy_database_for_sqlite():
+    """接线:回测入口的窗口登记 vnpy 数据库路径(否则回测读库会被自己的钩子拒)。"""
+    source = (ROOT / "scripts" / "research_api.py").read_text(encoding="utf-8")
+    assert "rs.candidate_window(sqlite_paths=database_paths)" in source
+    assert 'get_file_path(SETTINGS["database.database"])' in source
+
+
+# ---- 账本锁:被占用 vs 真权限错误 / 未来 mtime ----
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 上对目录做 O_EXCL 创建抛 PermissionError")
+def test_file_lock_reports_a_real_permission_error_instead_of_waiting_the_full_timeout(tmp_path):
+    import time
+    target = tmp_path / "x.jsonl"
+    (tmp_path / "x.jsonl.chainlock").mkdir()                               # 锁路径是目录:真权限错误,不是"被占用"
+    started = time.monotonic()
+    with pytest.raises(chain.LedgerChainError, match="权限错误") as info:
+        with chain.file_lock(target, timeout=30):
+            pass
+    assert time.monotonic() - started < 5 and "权限错误,不是被其他进程占用" in str(info.value)
+
+
+def test_file_lock_gives_up_on_a_persistent_permission_error_with_a_distinct_message(tmp_path, monkeypatch):
+    import time
+
+    def always_denied(path, flags, *a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(chain.os, "open", always_denied)
+    started = time.monotonic()
+    with pytest.raises(chain.LedgerChainError, match="权限错误"):
+        with chain.file_lock(tmp_path / "y.jsonl", timeout=30, permission_grace=0.3):
+            pass
+    assert time.monotonic() - started < 5
+
+
+def test_file_lock_still_reports_a_genuinely_held_lock_as_busy(tmp_path):
+    target = tmp_path / "z.jsonl"
+    with chain.file_lock(target):
+        with pytest.raises(chain.LedgerChainError, match="被其他进程占用"):
+            with chain.file_lock(target, timeout=0.3):
+                pass
+
+
+def test_a_lockfile_with_a_future_mtime_is_treated_as_stale(tmp_path):
+    import time
+    target = tmp_path / "f.jsonl"
+    lock = tmp_path / "f.jsonl.chainlock"
+    lock.write_bytes(b"")
+    future = time.time() + 3600
+    os.utime(lock, (future, future))
+    started = time.monotonic()
+    with chain.file_lock(target, timeout=3):                              # 否则会阻塞到超时
+        pass
+    assert time.monotonic() - started < 2

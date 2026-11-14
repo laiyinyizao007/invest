@@ -1953,3 +1953,109 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 | `reset_approvals` 改回严格读取 | 红 |
 | `file_lock` 不重试 PermissionError | 红 |
 | argv 豁免放行任意 Popen | 红 |
+
+### 第 37 轮复审(codex 36/50)的补修:导入原语再导出、sqlite3 无 open 事件
+**Critical(已复现并修复)**:`from vnpy.trader.database import import_module`(`vnpy/trader/datafeed.py` 同样)静态筛查 0 findings、对象层放行——
+`import_module.__module__ == "importlib"`,而 `_capability_source` 只认 `ctypes`/`subprocess`。它给候选一个**不受限的导入原语**:
+`import_module("sqlite3")` 在允许目录外建库(钩子看不见)、`import_module("os").environ` 读真凭据、`import_module("research_grid")` 返回框架已导入的那份
+(候选改 `validate_grid` → 第 33 轮"格子上限失效 → 试验少记 → DSR 的 N 偏小"原样复活)。
+
+修法(收敛的那条,不是加名字):
+1. `importlib` 进 `CAPABILITY_MODULE_NAMES`;判据按 `__module__`/模块名的**根**(`importlib.util` 也算),任何白名单模块再导出 importlib 的函数/类/模块都挡。
+2. **只加这一条还不够——这是本轮自己发现的第二个缺口**:`import vnpy.trader.database as db` 用 IMPORT_FROM 逐段取属性,代理的取属性一拒绝(AttributeError),
+   CPython **回退到 `sys.modules["vnpy.trader.database"]` 取真模块**,于是候选拿到**未包装的真模块**,`db.import_module` 就是真函数,对象层规则整个被绕开
+   (用例先在只改第 1 步时复现了 `patched: True`)。所以对点号导入的**每一级前缀**按真模块再判一次(危险模块/能力泄漏)。与 fromlist 里"回退到 sys.modules 的真模块"同一个道理。
+3. 对象层再加两条:`builtins.__import__/open/exec/eval/compile`(按**身份**判,因为 `builtins.open.__module__` 是 `io`)被某模块再导出也拒(规则:导入原语);
+   `UNREACHABLE_ORIGINS = {threading, multiprocessing, pathlib, glob}`:这些来源的**非模块成员**不递给候选(规则:按来源不可达)。后者**不参与**"整模块泄漏"聚合
+   (否则 `vnpy.trader.utility` 因带一个 `Path` 整块被拒,`ArrayManager` 也用不了)。`vnpy.trader.utility.Path` 另在 `UNREACHABLE_MEMBERS` 里显式登记(它被 10 个白名单模块再导出,来源规则统一处置)。
+
+**系统性扫描**(脚本 `%TEMP%\scan_reexports.py`:枚举 vnpy / vnpy_ctastrategy / strategies 与白名单标准库共 77 个模块的公开成员,按 `__module__`/模块名判来源,
+再用当前对象层规则验证是否已挡)。**命中的再导出危险对象全部列在下面**(修前 42 项里 **23 项放行**;修后 **0 项放行**):
+
+| 模块 | 成员 | 类型 | 来源 | 修前 |
+|---|---|---|---|---|
+| dataclasses | sys | 模块 | sys | 已挡 |
+| dataclasses | inspect | 模块 | inspect | 已挡 |
+| enum | sys | 模块 | sys | 已挡 |
+| fractions | sys | 模块 | sys | 已挡 |
+| json.tool | sys | 模块 | sys | 已挡 |
+| statistics | sys | 模块 | sys | 已挡 |
+| typing | sys | 模块 | sys | 已挡 |
+| vnpy.event.engine | Thread | type | threading | **放行** |
+| vnpy.rpc.client | pickle | 模块 | pickle | 已挡 |
+| vnpy.rpc.client | threading | 模块 | threading | 已挡 |
+| vnpy.rpc.common | signal | 模块 | signal | 已挡 |
+| vnpy.rpc.server | pickle | 模块 | pickle | 已挡 |
+| vnpy.rpc.server | threading | 模块 | threading | 已挡 |
+| vnpy.trader.app | Path | type | pathlib._local | **放行** |
+| vnpy.trader.database | import_module | function | importlib | **放行** |
+| vnpy.trader.datafeed | import_module | function | importlib | **放行** |
+| vnpy.trader.engine | os | 模块 | os | 已挡 |
+| vnpy.trader.engine | Thread | type | threading | **放行** |
+| vnpy.trader.engine | current_thread | function | threading | **放行** |
+| vnpy.trader.engine | TRADER_DIR | WindowsPath | pathlib._local | **放行** |
+| vnpy.trader.locale | Path | type | pathlib._local | **放行** |
+| vnpy.trader.locale | localedir | WindowsPath | pathlib._local | **放行** |
+| vnpy.trader.logger | sys | 模块 | sys | 已挡 |
+| vnpy.trader.logger | Path | type | pathlib._local | **放行** |
+| vnpy.trader.logger | log_path | WindowsPath | pathlib._local | **放行** |
+| vnpy.trader.logger | file_path | WindowsPath | pathlib._local | **放行** |
+| vnpy.trader.optimize | get_context | method | multiprocessing.context | **放行** |
+| vnpy.trader.optimize | BaseContext | type | multiprocessing.context | **放行** |
+| vnpy.trader.optimize | DictProxy | type | multiprocessing.managers | **放行** |
+| vnpy.trader.optimize | SyncManager | type | multiprocessing.managers | **放行** |
+| vnpy.trader.optimize | Pool | type | multiprocessing.pool | **放行** |
+| vnpy.trader.utility | sys | 模块 | sys | 已挡 |
+| vnpy.trader.utility | Path | type | pathlib._local | **放行** |
+| vnpy.trader.utility | TRADER_DIR | WindowsPath | pathlib._local | 已挡 |
+| vnpy.trader.utility | TEMP_DIR | WindowsPath | pathlib._local | 已挡 |
+| vnpy.trader.wechat | requests | 模块 | requests | 已挡 |
+| vnpy_ctastrategy | Path | type | pathlib._local | **放行** |
+| vnpy_ctastrategy.engine | importlib | 模块 | importlib | 已挡 |
+| vnpy_ctastrategy.engine | Path | type | pathlib._local | **放行** |
+| vnpy_ctastrategy.engine | glob | function | glob | **放行** |
+| vnpy_ctastrategy.locale | Path | type | pathlib._local | **放行** |
+| vnpy_ctastrategy.locale | localedir | WindowsPath | pathlib._local | **放行** |
+
+读法:`已挡` = 修前就被名字层/对象层拒;`**放行**` = 修前漏。其中真正危险的是:`import_module`(importlib,**Critical**)、`Thread`/`current_thread`(候选起线程,代码在审计窗口之外继续跑)、
+`multiprocessing.*`(`Pool`/`SyncManager`/`get_context`:起进程)、`glob`(列目录)、`Path`/`TRADER_DIR`/`log_path`/`file_path`/`localedir`(pathlib:真实路径与读写方法)。
+**扫描的局限(如实)**:只看**模块级公开成员**的来源,不递归进实例属性/类属性/方法的返回值;只扫了**本机已安装版本**的 vnpy;跳过了 gui/ui/ctp 子包(导入有副作用);
+第三方白名单模块只有 numpy/pandas(经配置追加时),它们没纳入本次扫描,只靠 `_capability_leak` 与既有名字规则。
+
+**sqlite3 与"没有 `open` 事件的写原语"**(Windows 实测,探针 `%TEMP%\probe_prims.py`):
+- `sqlite3.connect`:建库/写库,只发 `sqlite3.connect`,**没有 `open` 事件**——钩子原先完全看不见(`window_denials` 为空)。现按路径参数判(允许目录内放行、`:memory:` 放行、之外拒);
+  回测经 peewee 读 vnpy 数据库会发同一个事件,所以回测入口的窗口登记该库路径(`vnpy_database_paths()`),仅放行那一个库。`dbm.sqlite3`/`shelve` 底层同走它,一并受判。
+- `_winapi.CreateFile`:带写访问位时按路径判(读放行);`winreg.CreateKey/SetValue/DeleteKey/DeleteValue/SaveKey/LoadKey/ConnectRegistry`:整族拒。
+- 经 `open` 事件判定的(已实测):`zipfile`、`tarfile`、`logging.FileHandler`、`dbm.dumb`、`shutil.copyfile`(另有 `shutil.copyfile` 事件)、`tempfile`(`os.open`/`os.mkdir`)、`pathlib.Path.write_*`。
+- **无法按路径裁决的(无事件或事件不带路径,即使今天不可达也列在这里)**:`mmap.__new__`(只带 fd,fd 来自已裁决的 open)、`os.write`/`os.pwrite`/`os.ftruncate`(无事件)、
+  POSIX 的 `os.mkfifo`/`os.mknod`(本机无法实测,**不知道**是否有事件)、`msvcrt.open_osfhandle`(由句柄造 fd)。
+
+**账本锁(High)**:`file_lock` 现在把"被占用"(`FileExistsError`,或 Windows 删除待决窗口里的 `PermissionError`)与**真权限错误**分开:
+锁路径是目录、或 PermissionError 连续超过 3 秒,按"权限错误,不是被其他进程占用"立即报出,不再空等满超时;删除待决竞态仍按占用重试(原用例/变异仍成立)。
+时间戳在**未来**的 `.chainlock` 视为陈旧(否则写账本会阻塞满超时)。**默认超时没有回到 10 秒**:压测(8 进程 × 40 次写入,另有 24 个 CPU 烧机进程)里 10 秒会超时(单次最长等待 8.6~9.8 秒),
+30 秒下 2 轮压测 0 报错(最长 18.6 秒)——这是合成的极端负载,生产路径一个作业只写 2~4 次;**如实**:30 秒是"宁可等"而不是"必要",且最坏情况下一次作业可能在锁上空转到 2 分钟(仅当锁被真占用)。
+
+**`framework_exempt`(Medium)**:`armed` 放行一次底层创建进程后**立即清零**(原先黏住,豁免块内 `os.exec/fork/spawn` 全放行);`_argv_matches` 同时核对可执行文件是 git(与 docstring 一致)。
+
+**新增残余**:① 对象层按 `__module__` 判来源,但**导入原语此前未被覆盖**——白名单加固可被白名单模块的再导出绕过(本轮的 Critical 即是);
+这类问题的根在"按成员枚举"的收敛性:扫描只覆盖已装版本的模块级公开成员,升级 vnpy 后须重跑 `%TEMP%\scan_reexports.py`(本 PR 把其核心判据固化为 `test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin`,只覆盖列出的 11 个模块)。
+② sqlite3 无 `open` 事件(已按 `sqlite3.connect` 单独处置)与上面列出的无法裁决的原语。③ 回测入口窗口里放行了 vnpy 数据库的 sqlite 连接——该库在窗口内可被写(sqlite3 本身候选不可达,但这是个有意留的口子)。
+**G8**:本轮同样**未跑**外部评审,状态:待复核。
+
+第 37 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
+
+| 变异 | 结果 |
+|---|---|
+| `importlib` 拿出 `CAPABILITY_MODULE_NAMES` | 红 |
+| 去掉 `import a.b as c` 的前缀回退核对 | 红 |
+| `sqlite3.connect` 从判定里拿掉 | 红 |
+| 清空 builtins 导入原语名单 | 红 |
+| 清空 `UNREACHABLE_ORIGINS` | 红 |
+| `armed` 黏住不清零 | 红 |
+| 去掉 argv 的 git 可执行文件核对 | 红 |
+| 锁:权限错误一律当被占用 | 红 |
+| 锁:未来 mtime 不算陈旧 | 红 |
+| 去掉 `_winapi.CreateFile` 规则 | 红 |
+| 去掉 winreg 事件拒绝 | 红 |
+
+均无等价变异。
