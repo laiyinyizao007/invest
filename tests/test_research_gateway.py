@@ -640,3 +640,40 @@ def test_duplicate_name_does_not_consume_quota(tmp_path):
     assert submit(app, "a.py")[0] == 200
     assert submit(app, "a.py")[0] == 409
     assert submit(app, "b.py")[0] == 200
+
+
+# ---------- 试验账本:每次成功提交计 1 次试验(DSR 去通胀用) ----------
+
+def _trial_total(tmp_path):
+    from risk.trial_ledger import total_trials
+    return total_trials(tmp_path / "data" / "research" / "trials.jsonl")
+
+
+def test_each_accepted_submission_counts_one_trial(tmp_path):
+    app = make_app(tmp_path)
+
+    call(app, "POST", "/research/candidates", {"name": "a.py", "source": GOOD})
+    call(app, "POST", "/research/candidates", {"name": "b.py", "source": GOOD})
+
+    assert _trial_total(tmp_path) == 2
+
+
+def test_rejected_submissions_do_not_count_as_trials(tmp_path):
+    app = make_app(tmp_path)
+    call(app, "POST", "/research/candidates", {"name": "a.py", "source": GOOD})
+
+    assert call(app, "POST", "/research/candidates", {"name": "a.py", "source": GOOD})[0] == 409      # 重名
+    assert call(app, "POST", "/research/candidates", {"name": "evil.py", "source": "import os\n"})[0] == 400
+    assert _trial_total(tmp_path) == 1
+
+
+def test_corrupt_trial_ledger_fails_closed_and_stores_nothing(tmp_path):
+    app = make_app(tmp_path)
+    (tmp_path / "data" / "research").mkdir(parents=True)
+    (tmp_path / "data" / "research" / "trials.jsonl").write_text("garbage\n", encoding="utf-8")
+
+    status, body = call(app, "POST", "/research/candidates", {"name": "a.py", "source": GOOD})
+
+    assert status == 500 and "试验账本" in body["error"]
+    assert not (tmp_path / "pending_strategies" / "a.py").exists()
+    assert not (tmp_path / "data" / "research" / "submissions.jsonl").exists()       # 迭代额度也没被占用

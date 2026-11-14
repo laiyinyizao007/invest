@@ -23,7 +23,25 @@ FIRST_VALIDATION_START = datetime(2022, 7, 1)
 AXES = 3
 MIN_AXIS_VALUES = 3
 MAX_AXIS_VALUES = 10
-FORBIDDEN_AXES = {"risk_budget", "max_daily_losses", "atr_window", "history_vt_symbol"}
+# 风控/固定参数:不得进入网格(风控底线永不优化)。取自不可变宪法清单,避免两处各写一份而漂移。
+# 清单不可用时退回内置集合:宁可少拦也不让优化器整体不可用(真正的兜底在 check_params 与运行时类校验)。
+#
+# 尺子必须与 `check_params` **同一把**:那一处查的是「成员 ∪ 参数」且大小写不敏感,
+# 这里原来只查 `protected_parameters` 且大小写敏感——同一把尺子两处量纲不同,
+# 候选把参数名写成 `Risk_Budget` 并把网格键拼出来,网格层就放行了(第 7 轮 codex 实测)。
+try:
+    from risk.constitution import load as _load_constitution
+    from risk.constitution import protected_lower_all as _protected_lower_all
+    _CONSTITUTION = _load_constitution()
+    FORBIDDEN_AXES = set(_CONSTITUTION.protected_parameters)
+    PROTECTED_LOWER = _protected_lower_all(_CONSTITUTION)
+except Exception:                                    # noqa: BLE001 - 清单缺失/非法时的兜底
+    # 兜底取内置集合本身(不是另抄一份):否则内置清单加了项而这里没同步,会静默少拦。
+    from risk.constitution import default as _default_constitution
+    from risk.constitution import protected_lower_all as _protected_lower_all
+    _CONSTITUTION = _default_constitution()
+    FORBIDDEN_AXES = set(_CONSTITUTION.protected_parameters)
+    PROTECTED_LOWER = _protected_lower_all(_CONSTITUTION)
 
 Runner = Callable[[type, dict, list, float], dict]
 
@@ -46,7 +64,7 @@ def validate_grid(grid: Any, candidate_cls: type, max_cells: int) -> list[tuple[
     for name, values in grid.items():
         if not isinstance(name, str) or not name.isidentifier():
             raise GridError(f"参数名非法: {name!r}")
-        if name in FORBIDDEN_AXES:
+        if name in FORBIDDEN_AXES or name.lower() in PROTECTED_LOWER:
             raise GridError(f"{name} 属于风控/固定参数,不得进入网格(风控底线永不优化)")
         if name not in allowed:
             raise GridError(f"{name} 不是策略参数:须出现在策略类的 parameters 列表里,否则引擎不会把它传给策略")

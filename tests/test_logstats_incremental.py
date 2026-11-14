@@ -59,13 +59,46 @@ def test_many_random_chunkings_agree(tmp_path):
         assert incremental(tmp_path, data, cuts) == expected, cuts
 
 
-def test_a_final_line_without_newline_is_held_back_until_it_completes(tmp_path):
-    """写了一半的行不能被当成完整行:既不能少数,也不能因为半行被数一次、补全后又数一次。"""
+def test_a_half_written_line_that_matches_nothing_yet_does_not_count_and_is_not_double_counted_when_completed(tmp_path):
+    """写了一半的行(标记还没写全)不匹配任何事件;补全后只数一次,不会『半行数一次、补全后又数一次』。"""
     parser = ls.DayLogParser("2026-11-12")
     parser.feed("2026-11-12 09:00:01.000 | INFO | r | 已启动\n2026-11-12 09:00:02.000 | WARNING | x | 连接断".encode("utf-8"))
     assert parser.snapshot("x").events == Counter()
     parser.feed("开 8193\n".encode("utf-8"))
     assert parser.snapshot("x").events == Counter({("警告", "连接断开"): 1})
+
+
+def test_a_complete_last_line_without_a_trailing_newline_is_visible_in_the_snapshot_immediately(tmp_path):
+    """G8 复核 #10:进程在写入严重事件后崩溃,最后一行没有换行——事件曾一直留在缓冲里,增量路径永远不显示它。
+    snapshot() 应在缓冲的副本上处理尾行:展示当前所有已知内容,又不破坏后续继续追加的状态。"""
+    data = "2026-11-12 09:00:01.000 | INFO | r | 已启动\n2026-11-12 09:00:02.000 | ERROR | g | [ERROR] 当日熔断: 权益下降 650".encode("utf-8")
+    parser = ls.DayLogParser("2026-11-12")
+    parser.feed(data)
+    assert parser.snapshot("x").events == Counter({("严重", "当日熔断"): 1})
+    assert key(parser.snapshot("x")) == full(tmp_path, data)
+
+
+def test_a_tail_line_shown_early_is_not_counted_twice_when_the_newline_finally_arrives(tmp_path):
+    parser = ls.DayLogParser("2026-11-12")
+    parser.feed("2026-11-12 09:00:02.000 | ERROR | g | [ERROR] 当日熔断: 权益下降 650".encode("utf-8"))
+    assert parser.snapshot("x").events == Counter({("严重", "当日熔断"): 1})
+    parser.feed(b"\n")
+    assert parser.snapshot("x").events == Counter({("严重", "当日熔断"): 1})            # 仍是 1,不是 2
+    parser.feed("2026-11-12 09:00:03.000 | WARNING | x | 行情停更\n".encode("utf-8"))
+    assert parser.snapshot("x").events == Counter({("严重", "当日熔断"): 1, ("警告", "行情停更"): 1})
+
+
+def test_taking_a_snapshot_never_changes_what_later_snapshots_see(tmp_path):
+    """快照是只读的:反复取快照、中间穿插追加,结果与从不取快照时相同。"""
+    data = "".join(f"2026-11-12 09:00:{i:02d}.000 | WARNING | x | 连接断开 {i}\n" for i in range(20)).encode("utf-8") + "2026-11-12 09:01:00.000 | WARNING | x | 行情停更".encode("utf-8")
+    quiet = ls.DayLogParser("2026-11-12")
+    noisy = ls.DayLogParser("2026-11-12")
+    for i in range(0, len(data), 37):
+        quiet.feed(data[i:i + 37])
+        noisy.feed(data[i:i + 37])
+        noisy.snapshot("x")
+        noisy.snapshot("x")
+    assert key(quiet.snapshot("x")) == key(noisy.snapshot("x")) == full(tmp_path, data)
 
 
 def test_started_uses_max_of_the_two_counters_not_their_sum(tmp_path):
@@ -107,6 +140,73 @@ def test_the_last_line_without_a_trailing_newline_is_counted_by_finish_like_the_
     data = "2026-11-12 09:00:01.000 | INFO | r | 已启动\n2026-11-12 09:00:02.000 | WARNING | x | 连接断开".encode()
     parser = ls.DayLogParser("2026-11-12")
     parser.feed(data)
-    assert parser.snapshot("x").events == Counter()              # feed 阶段半行不计
-    parser.finish()
-    assert key(parser.snapshot("x")) == full(tmp_path, data)     # 文件结束后与全量解析一致
+    assert key(parser.snapshot("x")) == full(tmp_path, data)     # 不必 finish():快照已包含尾行
+    parser.finish()                                              # finish() 之后仍然一致(不重复计数)
+    assert key(parser.snapshot("x")) == full(tmp_path, data)
+
+
+def test_equivalence_also_holds_for_data_that_does_not_end_with_a_newline(tmp_path):
+    """之前所有等价性测试的数据都以换行结尾,从未覆盖过『没有末尾换行』的尾行——正是 G8 复核发现的盲区。"""
+    data = ("\n".join(LINES)).encode("utf-8")                    # 注意:没有结尾换行
+    assert not data.endswith(b"\n")
+    expected = full(tmp_path, data)
+    for cut in range(len(data) + 1):
+        assert incremental(tmp_path, data, [cut]) == expected, cut
+
+
+def test_random_chunkings_agree_for_data_without_a_trailing_newline(tmp_path):
+    data = ("\n".join(LINES * 5)).encode("utf-8")
+    expected = full(tmp_path, data)
+    rnd = random.Random(99)
+    for _ in range(200):
+        cuts = sorted(rnd.sample(range(1, len(data)), rnd.randint(1, 12)))
+        assert incremental(tmp_path, data, cuts) == expected, cuts
+
+
+def test_a_severe_event_on_the_unterminated_last_line_is_reported(tmp_path):
+    data = ("2026-11-12 09:00:01.000 | INFO | r | 已启动\n" * 3 + "2026-11-12 09:05:00.000 | ERROR | g | [FATAL] 紧急平仓: 触发").encode("utf-8")
+    snap = incremental(tmp_path, data, [10, 77])
+    assert ("严重", "触发紧急平仓") in dict(snap[3])
+
+
+# ---- codex 第 3 轮复核 #7:日志不能用替换字符『修复』非法字节 ----
+HARD_LOCK_LINE = "2026-11-12 10:00:00.000 | ERROR | g | [ERROR] 当日熔断: 权益下降 650"
+
+
+def _with_bad_byte_inside(line: str, word: str) -> bytes:
+    raw = line.encode("utf-8")
+    pos = raw.index(word.encode("utf-8"))
+    return raw[: pos + 3] + bytes([0xFF]) + raw[pos + 3:]               # 在『当日熔断』的 UTF-8 字节中间插入 0xFF
+
+
+def test_invalid_utf8_inside_a_severe_keyword_makes_the_log_untrusted_not_clean():
+    """替换成 U+FFFD 后『当日熔断』匹配失败,但时间戳格式仍对:曾被判为可信且干净,严重事件被隐藏。"""
+    data = (LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n"
+    parser = ls.DayLogParser("2026-11-12")
+    parser.feed(data)
+    snap = parser.snapshot("x")
+    assert snap.trusted is False
+
+
+def test_invalid_utf8_makes_the_log_untrusted_whatever_the_chunking():
+    data = (LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n"
+    for cut in range(len(data) + 1):
+        parser = ls.DayLogParser("2026-11-12")
+        parser.feed(data[:cut])
+        parser.feed(data[cut:])
+        assert parser.snapshot("x").trusted is False, cut
+
+
+def test_a_crash_that_cuts_the_last_line_in_the_middle_of_a_character_is_untrusted_but_does_not_crash(tmp_path):
+    """进程崩溃时最后一行可能停在多字节字符中间。被截掉的字符可能正是严重事件关键字的一部分(codex 第 3 次复核),
+    所以不能把这一天算作『无异常』;但这不是永久坏编码——字符补全后重新解析即恢复(见 test_dashboard_review3)。"""
+    data = (LINES[0] + "\n").encode("utf-8") + "2026-11-12 10:00:00.000 | ERROR | g | [ERROR] 当日熔断".encode("utf-8")[:-2]
+    p = tmp_path / "vt_20261112.log"
+    p.write_bytes(data)
+    assert ls.parse_day_log(p).trusted is False
+
+
+def test_full_parse_of_a_file_with_invalid_utf8_is_untrusted(tmp_path):
+    p = tmp_path / "vt_20261112.log"
+    p.write_bytes((LINES[0] + "\n").encode("utf-8") + _with_bad_byte_inside(HARD_LOCK_LINE, "当日熔断") + b"\n")
+    assert ls.parse_day_log(p).trusted is False

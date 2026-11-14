@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from risk import constitution as const
+
 PENDING_DIR = "pending_strategies"
 SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
@@ -25,13 +27,89 @@ FORBIDDEN_MODULES = {
     "os", "sys", "subprocess", "socket", "ctypes", "shutil", "pathlib", "importlib", "pickle", "marshal",
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
+    "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
+    # 风控与框架包本身:候选拿到 `risk.risk_guard` 就等于拿到风控函数的**定义**,
+    # 改写它们(`rg.risk_per_trade = lambda ...: 0.0`)可以架空单笔预算,而静态层按
+    # "属性名"判断、只看得到 `rg.risk_per_trade` 这个**结果**,看不到它是谁。
+    # 第 9 轮 codex 实测:三行 monkey-patch 让四层防线全部放行。
+    # 候选没有任何正当理由 import 风控模块——风控由基类固定,候选只写信号逻辑。
+    # 注意**不能**把 `strategies` 一并禁掉:候选本来就要
+    # `from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 继承基类。
+    "risk",
 }
-FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input"}
-FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__"}
+# 这些名字**任何引用**都拦,不只直接调用:`s = setattr` 之后 `s(self, "risk_budget", 1e9)` 的调用点是裸名字,
+# AST 看不见被调的是谁。只拦调用等于给别名留了门。
+FORBIDDEN_CALLS = {"exec", "eval", "compile", "open", "__import__", "getattr", "setattr", "delattr", "globals", "locals", "vars", "input",
+                   "type"}      # type(self).__base__ 之类的反射入口
+FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__", "__dict__", "__code__", "__mro__", "__class__",
+                   # 函数对象的**状态**(第 10 轮 codex 实测的 Critical):
+                   # `within_budget.__defaults__ = (0.0,)` 把 volume 默认值改成 0,
+                   # 单笔风险金额恒为 0,300 元预算形同虚设——改的不是名字,是对象的状态。
+                   "__defaults__", "__kwdefaults__", "__annotations__", "__wrapped__",
+                   # 类型判定入口:改掉 `__instancecheck__` 之后 isinstance 一律返回 False,
+                   # 运行时第三层的家族判定直接失效。
+                   "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__"}
+
+# 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
+# `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,
+# 而调用点完全看不出被调的是谁(第 7 轮实测:静态层与沙盒层当时都返回空列表,
+# 底线由 300 变成 1e12,within_budget 随之放行)。
+# 名单只收两类:dunder 形状的名字(执行入口一定是这类),
+# 以及"按名字改写/反射"的内建名(getattr/setattr/eval/globals 之类)。
+# **不含** `open`/`type`:交易数据里 "status": "open" 这种字段名很常见,
+# 按字符串一律拦会把正常候选整片拒掉——误报面远大于收益。
+FORBIDDEN_STRINGS = FORBIDDEN_ATTRS | {
+    "__import__", "__getattribute__", "__setattr__", "__delattr__",
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "globals", "locals", "vars", "input",
+}
 
 ENV_ALLOW = ("PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA",
              "LOCALAPPDATA", "PROGRAMDATA", "COMSPEC", "PATHEXT", "LANG", "LC_ALL", "PYTHONIOENCODING", "TZ", "VIRTUAL_ENV",
              "INVEST_C15_DATA", "RESEARCH_SANDBOX_CONFIG")      # 数据路径与配置路径(均不含凭据)
+
+# 执行候选时**不给**的内建:属性改写、反射、动态执行、文件访问、类型系统入口。
+#
+# 为什么是"不给"而不是"再禁一批名字"(第 7 轮复核实测):
+# 静态层能封住**已知的写法**,封不住**能力**——
+#   e.__traceback__.tb_frame.f_builtins.setattr(self, 'risk_budget', 1e12)
+# 这条路径上的每个名字(回溯、帧、内建字典)都不在禁用名单里,静态层与沙盒层都返回空列表;
+# 而 `unittest.mock.patch.object(self, 'risk_budget', 1e12)` 只要能 import 就能改写实例属性。
+# 与其继续枚举反射路径(枚举不完,而且每加一批都要配测试),不如把能力本身收走:
+# 候选执行时的内建字典里**没有 setattr**,那么无论它怎么拿到内建字典都没用——
+# 连 `frame.f_builtins` 也只会拿到这份受限字典。
+#
+# 代价:候选用到这些名字会得到 NameError(而不是静默放行),由人在批准前看出来。
+UNSAFE_BUILTINS = frozenset({
+    "setattr", "delattr", "getattr", "eval", "exec", "compile", "open",
+    "globals", "locals", "vars", "breakpoint", "input",
+    "type", "object",                       # 类型系统入口:__mro__/__subclasses__ 是万能钥匙
+    "help", "exit", "quit", "license", "credits",
+})
+
+# 这些模块能改写任意对象的属性(`unittest.mock.patch.object`)或拿到内建本身,同样禁掉。
+EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
+
+
+def safe_builtins(forbidden_modules: Sequence[str] = ()) -> dict:
+    """候选执行时用的**最小内建集合**:去掉 `UNSAFE_BUILTINS`,并把 `__import__` 换成受限版。
+
+    受限导入器只放行不在禁用名单里的模块——候选必须能 import(模板与策略基类就是这么来的),
+    但 `import builtins` / `import unittest.mock` 这类"拿到内建或改写属性能力"的入口必须关上。
+    """
+    import builtins as _builtins
+
+    blocked = set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES) | set(forbidden_modules)
+    real_import = _builtins.__import__
+
+    def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = name.split(".")[0]
+        if root in blocked:
+            raise ImportError(f"禁止导入 {name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
+    safe["__import__"] = restricted_import
+    return safe
 
 
 class SandboxError(ValueError):
@@ -66,6 +144,11 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
     except SyntaxError as exc:
         return [f"语法错误: {exc.msg} (第 {exc.lineno} 行)"]
     findings: list[str] = []
+    try:
+        constitution = const.load()
+    except const.ConstitutionError as exc:
+        return [f"不可变宪法清单不可用(fail-closed): {exc}"]      # 清单坏了就不筛查,一律拒绝
+    findings.extend(const.screen_source(source, constitution))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
@@ -76,10 +159,20 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
         for name in names:
             if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
-            findings.append(f"第 {node.lineno} 行: 禁止调用 {node.func.id}()")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in forbidden_calls:
+                # 拦**引用**而不是拦调用:`s = setattr` 之后 `s(self, ...)` 的调用点看不出被调的是谁。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过属性改写与反射检查)")
+            elif node.id in FORBIDDEN_ATTRS:
+                # 受禁属性名同样要拦**裸名**:`__builtins__` 是 exec 注入到 globals 里的字典,
+                # 裸名就能拿到(`f = __builtins__['__import__']`),只拦 `x.__builtins__` 是不够的。
+                findings.append(f"第 {node.lineno} 行: 禁止引用 {node.id}(可绕过反射检查)")
         if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
             findings.append(f"第 {node.lineno} 行: 禁止访问 {node.attr}")
+        # 属性名当字符串用:operator.attrgetter('__dict__')(self) 能绕开"禁止访问 __dict__"的
+        # 属性写法(调用点看不出访问的是什么)。这些名字作为字符串出现时一律拒绝。
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in FORBIDDEN_STRINGS:
+            findings.append(f"第 {node.lineno} 行: 禁止引用 {node.value} 字符串")
     return findings
 
 
@@ -148,6 +241,15 @@ def _load_approvals(approvals_file: Path) -> dict:
 
 def is_approved(path: Path, approvals_file: Path) -> bool:
     return file_sha256(path) in _load_approvals(approvals_file)
+
+
+def is_approved_sha(sha256: str, approvals_file: Path) -> bool:
+    """按**哈希**查审批记录(不再读一次文件)。
+
+    隐藏子入口用它:子进程拿到的是父进程算好的哈希,而 `import_candidate` 会再读一次文件
+    并校验"当前内容 == 这个哈希"——所以被执行的字节一定是被批准的那一份,
+    不必为了查审批再读一遍文件(两处读之间文件若被改,查的就是另一个版本的内容)。"""
+    return sha256 in _load_approvals(approvals_file)
 
 
 def record_approval(path: Path, approvals_file: Path, now: datetime | None = None) -> str:

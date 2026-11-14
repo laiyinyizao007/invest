@@ -18,10 +18,10 @@ def write_log(directory: Path, name: str, lines: list[str]) -> Path:
 
 def test_a_normal_day_has_no_events(tmp_path):
     path = write_log(tmp_path, "vt_20261110.log", [
-        "2026-11-10 09:01:02.000 启动耗时(自发起连接): 行情登录=0.5s",
-        "2026-11-10 09:01:03.000 [INFO] 已启动: trend_atr 运行于 c2701.DCE,权益 20000000",
-        "2026-11-10 09:05:00.000 [INFO] 成交: c2701.DCE 多开 1@2400",
-        "2026-11-10 15:00:00.000 [INFO] 停止: 正常停止",
+        "2026-11-10 09:01:02.000 | INFO | Runtime | 启动耗时(自发起连接): 行情登录=0.5s",
+        "2026-11-10 09:01:03.000 | INFO | Runtime | [INFO] 已启动: trend_atr 运行于 c2701.DCE,权益 20000000",
+        "2026-11-10 09:05:00.000 | INFO | Runtime | [INFO] 成交: c2701.DCE 多开 1@2400",
+        "2026-11-10 15:00:00.000 | INFO | Runtime | [INFO] 停止: 正常停止",
     ])
     stats = u.parse_day_log(path)
     assert stats.day == "2026-11-10"
@@ -134,7 +134,7 @@ def test_the_clean_streak_counts_consecutive_days_not_the_total():
     """验收要求"连续 ≥ 5 个交易日",中间夹一个有异常的日子连续性就断了。"""
     days = [u.DayStats(day="2026-11-02"),
             u.DayStats(day="2026-11-03"),
-            u.DayStats(day="2026-11-04", events=Counter({("WARN", "网关连接失败"): 1})),
+            u.DayStats(day="2026-11-04", events=Counter({("严重", "网关连接失败"): 1})),      # 真实表里它是严重事件
             u.DayStats(day="2026-11-05"),
             u.DayStats(day="2026-11-06")]
     assert u.longest_clean_streak(days) == 2
@@ -185,7 +185,7 @@ def test_the_clean_streak_of_an_empty_run_is_zero():
 def test_the_checklist_reports_the_longest_clean_streak():
     days = [u.DayStats(day=f"2026-11-{d:02d}") for d in range(2, 7)]
     text = "\n".join(u.acceptance_checklist(days))
-    assert "最长连续无异常 5 天" in text
+    assert "最长连续无严重事件 5 天" in text
 
 
 def test_the_heartbeat_belongs_to_one_day_only(tmp_path):

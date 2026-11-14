@@ -62,6 +62,7 @@
 2. **未知取值按 unknown。** `state`/`level` 出现不认识的值 → 灰色『无法判断』。禁止 `default` 分支落到 ok。
 3. **年龄用 `age_seconds`。** 不用浏览器时钟减时间戳。两个例外:『距上次刷新』这种前端自己的计时。
 4. **`unknown` ≠ `ok`。** 总状态条、徽标都要有独立外观。
+   **`state` 与 `level` 各管一件事**:`state` 决定**内容能不能渲染**(missing/corrupt 时 data 为 null),`level` 决定**徽标长什么样**。所以 `state=ok` + `level=warn` 是常态(内容是好的,只是有些内容没列出/没检查),这时要正常渲染内容并加一个警示徽标,而不是当成异常。
 5. **空态 ≠ 缺失。** `state=ok` 且列表为空 → 『无』;`state=missing` → 『未找到数据来源』。
 6. **`null` 显示 `—`,不是 0。** 尤其是 `daily_pnl`、`peak_equity` 这类金额。
 7. **不重算服务器算好的值**:`level`、`reasons`、`daily_pnl`、`drawdown_from_peak`。
@@ -84,7 +85,18 @@ dashboard/
   static/                    # 构建产物(提交到仓库;后端托管)
 ```
 
-- 构建产物**提交进仓库**,这样部署机不需要 Node。需要一个 `npm run build` 把产物写到 `dashboard/static/` 并生成清单(文件名 + SHA-256),后端据此只托管清单内的文件。
+- 构建产物**提交进仓库**,这样部署机不需要 Node。`npm run build` 把产物写到 `dashboard/static/`,然后运行清单工具:
+
+  ```bash
+  python tools/build_static_manifest.py dashboard/static            # 生成 manifest.json
+  python tools/build_static_manifest.py dashboard/static --check    # 只校验(可放进前端 CI)
+  ```
+
+  清单格式是**前后端的硬约定**(不要自己手写):`{"files": {"index.html": "<sha256>", "assets/app-1a2b.js": "<sha256>", ...}}`,键是相对路径(正斜杠),值是文件内容的 SHA-256。
+  后端**只服务清单里的文件,而且每次请求都重新校验哈希**:清单之外的文件、构建后又被改动的文件、被换成符号链接的文件,一律 404。所以**改了任何产物文件都必须重新生成清单**,否则那个文件会 404。
+  工具会拒绝符号链接、空目录、没有 `index.html` 的目录。`tests/test_build_static_manifest.py` 断言后端接受这个工具写出的一切。
+  注意:它与 `docs/web/fixtures/manifest.json`(示例数据清单)同名但完全无关。
+- 前端路由(如 `/trading`、`/docs/unattended-log`)刷新时由后端回退到 `index.html`,但**只限白名单里的页面路径**(见 `dashboard/app.py::FRONTEND_ROUTES`)。新增页面路由时需要在那里登记,否则刷新会 404——请在需求里告诉后端同事。
 - 资源文件名带内容哈希;`index.html` 引用它们。
 - 构建要**可复现**:锁依赖版本,CI 里 `npm ci`。
 
@@ -146,6 +158,23 @@ flowchart LR
 | 修改/批准/下单类接口 | **不会提供**,见 ADR 的『明确不做』 |
 | 跨域(CORS) | 不提供;页面与 API 同源 |
 | 在页面里展示完整账号/路径 | 不会提供;服务器脱敏,前端不得尝试还原 |
+
+## 8b. 能力开关(`GET /api/meta` 的 `capabilities`)
+
+**哪些页面显示,由 `capabilities` 决定,不是由你猜**。启动时取一次 `/api/meta`,按下面的开关决定导航与入口:
+
+| 开关 | 为真时 | 现在 |
+|---|---|---|
+| `live` | 显示「实时」页(`/api/live`) | 假(阶段②未上线) |
+| `equity` | 显示「权益曲线」页(`/api/equity`) | 假 |
+| `control` | 显示「控制」页(`/api/control/*`);还需 `whoami.role` 为 `operator` 以上 | 假 |
+| `stream` | 允许用 WebSocket/SSE | **恒为假**:阶段①②只用轮询 |
+| `research_detail` | 可点进单次运行的详情(`/api/research/runs/{run_id}`) | 真 |
+| `data_views` | 显示候选审阅、运行列表、数据与演练、配置等阶段④页面 | 假 |
+| `nodes` | 显示「节点」页(`/api/nodes`) | 假 |
+| `evolution` | 显示进化引擎三视图(`/api/research/evolution*`) | 假(阶段④未上线;读取侧已就绪,等引擎侧产出数据) |
+
+**开关为假时**:不显示入口,也**不要**直接调那个接口——阶段②③④的接口在对应阶段上线前**不存在**,调用会得到 404。
 
 ## 9. 沟通与变更
 

@@ -22,8 +22,22 @@ def put(tmp_path, name, text):
     return p
 
 
+def sampled(seconds_ago=1.0):
+    """带时区的权益采样时间(风控进程写的就是这个形态)。"""
+    from datetime import datetime, timedelta, timezone
+    return datetime.fromtimestamp(NOW - seconds_ago, timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+def age_guard(path, seconds):
+    """把风控文件整体『变旧』:采样时间与 mtime 一起(两者本来就是一起前进的)。"""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["sampled_at"] = sampled(seconds)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    os.utime(path, (NOW - seconds, NOW - seconds))
+
+
 def guard(**over):
-    g = {"account_id": ACCOUNT, "last_equity": 9870.5, "peak_equity": 10120.0, "day": "2026-11-13",
+    g = {"sampled_at": sampled(), "account_id": ACCOUNT, "last_equity": 9870.5, "peak_equity": 10120.0, "day": "2026-11-13",
          "day_start_equity": 10000.0, "daily_locked_day": None, "hard_locked": False, "hard_reason": ""}
     g.update(over)
     return g
@@ -170,17 +184,17 @@ def test_a_stale_guard_file_is_stale_even_when_the_heartbeat_is_fresh(tmp_path):
     """风控状态运行时至少每 60 秒落盘一次(risk/account_guard.py);落后很多说明权益/盈亏/锁定状态不是当前值。"""
     put(tmp_path, "heartbeat", str(NOW - 2))
     g = put(tmp_path, "account_guard.json", guard())
-    os.utime(g, (NOW - 86400, NOW - 86400))
+    age_guard(g, 86400)
     r = run(tmp_path)
     assert r.section["state"] == "stale" and r.level == "unknown"
-    assert "风控状态" in r.section["message"] and r.section["data"]["guard"]["age_seconds"] >= 86000
+    assert "权益" in r.section["message"] and r.section["data"]["guard"]["age_seconds"] >= 86000
     assert r.section["data"]["heartbeat"]["process"] == "running"             # 进程在跑这个事实本身没错,错的是风控数字可能过期
 
 
 def test_a_fresh_guard_reports_its_own_age(tmp_path):
     put(tmp_path, "heartbeat", str(NOW - 2))
     g = put(tmp_path, "account_guard.json", guard())
-    os.utime(g, (NOW - 30, NOW - 30))
+    age_guard(g, 30)
     guard_data = run(tmp_path).section["data"]["guard"]
     assert guard_data["age_seconds"] == 30.0 and guard_data["as_of"].endswith("+08:00")
 
@@ -189,7 +203,7 @@ def test_a_hard_lock_is_still_critical_when_the_guard_file_is_stale(tmp_path):
     """陈旧的『已硬锁定』也必须报警:锁定状态不会因为文件旧了就失效。"""
     put(tmp_path, "heartbeat", str(NOW - 2))
     g = put(tmp_path, "account_guard.json", guard(hard_locked=True, hard_reason="累计回撤"))
-    os.utime(g, (NOW - 86400, NOW - 86400))
+    age_guard(g, 86400)
     r = run(tmp_path)
     assert r.level == "critical" and r.section["state"] == "stale"
 
@@ -213,3 +227,96 @@ def test_a_heartbeat_just_under_the_size_limit_is_still_accepted(tmp_path):
     put(tmp_path, "heartbeat", str(NOW - 2) + " " * 900)
     put(tmp_path, "account_guard.json", guard())
     assert run(tmp_path).section["state"] == "ok"
+
+
+# ---- G8 第 3 轮:严格解码与 JSON 非法常量 ----
+def test_invalid_utf8_inside_a_json_string_is_corrupt_not_silently_repaired(tmp_path):
+    """errors='replace' 会把非法字节变成 U+FFFD,文件被『修复』后仍是合法 JSON、被判 ok;非法编码本身就说明文件不可信。"""
+    healthy(tmp_path)
+    p = tmp_path / "data" / "state" / "account_guard.json"
+    p.write_bytes(json.dumps(guard(hard_reason="XX")).encode("utf-8").replace(b"XX", bytes([0xFF, 0xFE])))
+    os.utime(p, (NOW - 1, NOW - 1))
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level != "ok"
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_json_constants_nan_and_infinity_are_corrupt_even_in_unused_fields(tmp_path, bad):
+    healthy(tmp_path)
+    text = json.dumps(guard(extra="@@")).replace('"@@"', bad)
+    put(tmp_path, "account_guard.json", text)
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level != "ok"
+
+
+def test_heartbeat_with_invalid_utf8_is_corrupt(tmp_path):
+    healthy(tmp_path)
+    p = tmp_path / "data" / "state" / "heartbeat"
+    p.write_bytes(str(NOW - 4).encode() + bytes([0x0A, 0xFF]))
+    os.utime(p, (NOW - 1, NOW - 1))
+    assert run(tmp_path).section["state"] == "corrupt"
+
+
+def test_outbox_with_invalid_utf8_is_not_reported_as_empty(tmp_path):
+    healthy(tmp_path)
+    p = put(tmp_path, "webhook_outbox.jsonl", "")
+    p.write_bytes(b'{"time": "2027-01-15T00:00:00"}\n\xff\xfe\n')
+    os.utime(p, (NOW - 1, NOW - 1))
+    alerts = col.collect_alerts(settings(tmp_path), NOW)
+    assert alerts.section["state"] == "corrupt" or alerts.section["data"]["outbox"]["state"] == "corrupt"
+
+
+# ---- G8 第 3 轮 #4:年龄按权益采样时间算,不按文件写入时间 ----
+def test_a_freshly_written_file_with_an_old_sample_is_stale(tmp_path):
+    """网关断开后风控进程仍每分钟落盘:mtime 是新的,权益却是一小时前的。"""
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    put(tmp_path, "account_guard.json", guard(sampled_at=sampled(3600)))          # put 把 mtime 设为 NOW-1
+    r = run(tmp_path)
+    assert r.section["state"] == "stale" and r.level == "unknown"
+    g = r.section["data"]["guard"]
+    assert g["age_seconds"] >= 3600 and "_sampled_ts" not in g
+
+
+def test_a_guard_file_without_sampled_at_is_not_reported_fresh(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    g = guard()
+    del g["sampled_at"]
+    put(tmp_path, "account_guard.json", g)
+    r = run(tmp_path)
+    assert r.section["state"] == "stale" and "采样时间" in r.section["message"]
+    assert r.section["data"]["guard"]["as_of"] is None
+
+
+def test_sampled_at_null_is_also_unverifiable(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    put(tmp_path, "account_guard.json", guard(sampled_at=None))
+    assert run(tmp_path).section["state"] == "stale"
+
+
+@pytest.mark.parametrize("bad", ["2027-01-15T16:00:00", "not-a-time", 123, "", ["x"]])
+def test_a_malformed_or_timezone_less_sampled_at_is_corrupt(tmp_path, bad):
+    """无时区的字符串会被当成 UTC,而风控进程写本地时间,差 8 小时——不猜,直接 corrupt。"""
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    put(tmp_path, "account_guard.json", guard(sampled_at=bad))
+    r = run(tmp_path)
+    assert r.section["state"] == "corrupt" and r.level != "ok"
+
+
+def test_a_sample_time_in_the_future_is_not_fresh(tmp_path):
+    put(tmp_path, "heartbeat", str(NOW - 2))
+    put(tmp_path, "account_guard.json", guard(sampled_at=sampled(-9999)))
+    assert run(tmp_path).section["state"] == "stale"
+
+
+# ---- codex 第 3 轮复核 #7:JSON 浮点溢出与深层嵌套 ----
+def test_json_numbers_that_overflow_to_infinity_are_corrupt(tmp_path):
+    healthy(tmp_path)
+    put(tmp_path, "account_guard.json", json.dumps(guard(extra="@@")).replace('"@@"', "1e999"))
+    assert run(tmp_path).section["state"] == "corrupt"
+
+
+def test_deeply_nested_json_is_corrupt_not_a_500(tmp_path):
+    from dashboard import models
+    p = tmp_path / "deep.json"
+    p.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+    assert models.read_json(p, retries=0) == (None, "corrupt")

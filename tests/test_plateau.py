@@ -58,7 +58,8 @@ def test_feeds_the_promotion_gate_field():
 
     plateau = parameter_on_plateau(grid_scores(lambda c: -1.0), (2, 2, 2))
     m = CandidateMetrics(oos_sharpe=2.0, oos_years=5, max_drawdown_pct=5, max_drawdown_yuan=500, round_trips=200,
-                         random_entry_percentile=99, stress_sharpe=1.5, data_adjusted=True, parameter_on_plateau=plateau)
+                         random_entry_percentile=99, stress_sharpe=1.5, data_adjusted=True, parameter_on_plateau=plateau,
+                         dsr=0.99, n_trials=50)
 
     assert any("参数高原" in f for f in check_gate(m))
 

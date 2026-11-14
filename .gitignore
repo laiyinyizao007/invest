@@ -43,3 +43,9 @@ docker/research/wheelhouse/
 
 # 一次性探针脚本(临时用,不进版本库)
 _iso_test.py
+
+# 压缩包不入库:券商发来的 API 文件包、导出物都放本机。
+# (原先只有 `docs/API--*/` 匹配目录,不匹配文件,两个 .rar 因此被 `git add -A docs` 带进了提交。)
+*.rar
+*.7z
+*.zip

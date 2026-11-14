@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import re
 import time
@@ -21,7 +22,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from dashboard import auth, collectors as col, models as m
@@ -59,7 +60,7 @@ FRONTEND_ROUTES = (
     re.compile(r"^research/runs/[0-9]{8}-[0-9]{6}-[0-9]{6}$"),
     # 阶段②-⑤ 的页面:后端对应阶段上线前前端不显示入口,但直接访问深链接时仍应得到前端页面(由前端按 capabilities 处理)
     re.compile(r"^(live|equity|control|audit|nodes|data|drills|config)$"),
-    re.compile(r"^research/(runs|candidates/[a-z0-9_]{1,40}\.py)$"),
+    re.compile(r"^research/(runs|evolution|candidates/[a-z0-9_]{1,40}\.py)$"),
 )
 
 ERROR_CODES = {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found", 405: "bad_request",
@@ -72,29 +73,65 @@ def error_response(status: int, message: str, code: str | None = None, headers: 
 
 # ---------------------------------------------------------------- 静态托管:只服务构建清单内、哈希匹配的文件
 
+MAX_STATIC_BYTES = 20_000_000
+
+
 class StaticSite:
+    """只服务构建清单内的文件,而且**每次请求都重新校验哈希**。
+
+    G8 第 2 轮审查:曾经哈希只在创建应用时校验一次,之后文件被替换仍会未经鉴权公开返回,还带一年 immutable 缓存。
+    现在 read() 每次把文件读入内存、对这份字节算哈希、对上清单才返回——响应体就是被校验过的这份字节,
+    不存在『校验之后又被替换』的 check-then-use 竞态。不用 mtime/size 判断变化:『同长度改动并恢复 mtime』可以绕过它。
+    前端构建产物是几十到几百 KB 且被浏览器缓存,每次重算哈希的开销可以忽略。
+    """
+
     def __init__(self, static_dir: Path) -> None:
-        self.files: dict[str, Path] = {}
-        self.rejected: list[str] = []
-        manifest = static_dir / "manifest.json"
+        self.expected: dict[str, str] = {}              # 相对路径 -> 清单里的 SHA-256
+        self._paths: dict[str, Path] = {}
+        self.rejected: list[str] = []                   # 启动时就缺失/对不上的(用于启动告警)
+        self.root = static_dir.resolve()
         try:
-            listing = json.loads(manifest.read_text(encoding="utf-8")).get("files", {})
+            listing = json.loads((static_dir / "manifest.json").read_text(encoding="utf-8")).get("files", {})
         except (OSError, ValueError, AttributeError):
             listing = {}
-        root = static_dir.resolve()
+        if not isinstance(listing, dict):
+            listing = {}
         for rel, digest in listing.items():
-            path = (root / rel).resolve()
-            if path.is_file() and root in path.parents and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
-                self.files[rel.replace("\\", "/")] = path
+            key = str(rel).replace("\\", "/")
+            path = (self.root / key).resolve()
+            if isinstance(digest, str) and self.root in path.parents:
+                self.expected[key], self._paths[key] = digest.lower(), path
             else:
-                self.rejected.append(rel)            # 缺失或哈希对不上:不服务
+                self.rejected.append(str(rel))           # 路径越界或哈希格式不对:永不服务
+        for key in list(self.expected):
+            if self.read(key) is None:
+                self.rejected.append(key)
+
+    def read(self, rel: str) -> tuple[bytes, str] | None:
+        """返回 (已校验的字节, content-type);不在清单、读不了、哈希对不上都返回 None。"""
+        path = self._paths.get(rel)
+        if path is None:
+            return None
+        try:
+            if self.root not in path.resolve(strict=True).parents:
+                return None                              # 启动后被换成指向静态目录之外的符号链接/junction:不服务(目标内容可能被别人改)
+            with path.open("rb") as fh:
+                raw = fh.read(MAX_STATIC_BYTES + 1)
+        except OSError:
+            return None
+        if len(raw) > MAX_STATIC_BYTES or hashlib.sha256(raw).hexdigest() != self.expected[rel]:
+            return None
+        return raw, mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
     @property
     def has_index(self) -> bool:
-        return "index.html" in self.files
+        """index.html 当前是否可用(每次现查:被篡改或删除后回退到占位页)。"""
+        return self.read("index.html") is not None
 
-    def lookup(self, rel: str) -> Path | None:
-        return self.files.get(rel)
+    @property
+    def files(self) -> dict[str, Path]:
+        """启动时通过校验的文件(兼容旧属性,供测试断言)。"""
+        return {k: v for k, v in self._paths.items() if k not in self.rejected}
 
 
 # ---------------------------------------------------------------- 应用
@@ -137,6 +174,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
 
     @app.exception_handler(Exception)
     async def unexpected(request: Request, exc: Exception):
+        # 记堆栈:不外泄细节给客户端,但服务端必须留痕,否则半夜出问题无从查起
+        logging.exception("面板处理请求时发生未捕获异常:%s %s", request.method, request.url.path)
         return error_response(500, "服务器内部错误", code="internal")
 
     def require_token(request: Request) -> None:
@@ -153,9 +192,19 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
 
     app.state.require_token = require_token
 
+    def head_ok() -> Response:
+        return Response(status_code=200, headers={"Cache-Control": "no-store"})
+
     def get(path: str):
-        """API 路由:一律 GET/HEAD,且一律带鉴权依赖。"""
-        return app.api_route(path, methods=list(ALLOWED_METHODS), dependencies=[Depends(require_token)])
+        """API 路由:GET 执行处理函数;HEAD 只验证令牌与路由、不执行采集、没有 body。两者都带鉴权依赖。
+
+        G8 第 2 轮审查:曾让 HEAD 也走完整处理函数——/api/overview 的 HEAD 会跑全部文件采集,并在 ASGI 层发出完整 JSON body
+        (真实 uvicorn 会丢弃 body,但应用本身语义不对,HEAD 也不该是廉价探活之外的昂贵操作)。
+        HEAD 恒为 200(只表示『令牌有效且路由存在』),不反映数据是否存在;要看数据请用 GET。"""
+        def decorate(func):
+            app.api_route(path, methods=["HEAD"], dependencies=[Depends(require_token)], include_in_schema=False)(head_ok)
+            return app.api_route(path, methods=["GET"], dependencies=[Depends(require_token)])(func)
+        return decorate
 
     def get_public(path: str):
         """静态页与 SPA 回退:无数据,不需要令牌。"""
@@ -170,7 +219,8 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
             "server_timezone": str(now.tzinfo), "exchange_timezone": "Asia/Shanghai",
             "environment": settings.environment, "polling_hint_seconds": settings.raw["polling_hint_seconds"],
             "capabilities": {"live": False, "equity": False, "control": False, "stream": False,
-                             "research_detail": True, "data_views": False, "nodes": False},
+                             "research_detail": True, "data_views": False, "nodes": False,
+                             "evolution": bool(settings.raw.get("evolution", {}).get("enabled"))},
         })
 
     @get("/api/overview")
@@ -210,10 +260,55 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
         d = col.get_doc(settings, key)
         return respond(d) if d is not None else error_response(404, "不存在")
 
+    # ---- 阶段④:进化引擎的只读接口 ----
+    # 约定:阶段②–⑤ 的接口在契约里先存在,路由随该阶段上线才注册(阶段①只注册阶段①的接口,有测试守着)。
+    # 这里用配置开关实现同一件事:evolution.enabled 为真时才注册。读取侧已实现并有测试;
+    # 数据由引擎侧产出,没有数据时如实显示缺失。
+    if settings.raw.get("evolution", {}).get("enabled"):
+        @get("/api/research/evolution")
+        def evolution_list():
+            # **裸数据**(与 curve/log/heatmap 同族端点一致):state/level/message 放在数据里。
+            return respond(col.evolution_list_payload(settings, clock()))
+
+        @get("/api/research/evolution/{campaign_id}/curve")
+        def evolution_curve(campaign_id: str):
+            try:
+                payload = col.get_evolution_curve(settings, campaign_id)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"进化台账不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/evolution/{campaign_id}/log")
+        def evolution_log(campaign_id: str, cursor: str = "", limit: int = 50):
+            try:
+                payload = col.get_evolution_log(settings, campaign_id, cursor, limit)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"进化台账不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/runs/{run_id}/heatmap")
+        def run_heatmap(run_id: str):
+            try:
+                payload = col.get_heatmap(settings, run_id)
+            except col.EvolutionUnavailable as exc:
+                return error_response(503, f"热力图不可用:{exc}", code="unavailable")
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/candidates/{sha256}/code")
+        def candidate_code(sha256: str):
+            payload = col.get_candidate_code(settings, sha256)
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
+        @get("/api/research/candidates/{sha256}/diff")
+        def candidate_diff(sha256: str, parent: str = ""):
+            payload = col.get_candidate_diff(settings, sha256, parent)
+            return respond(payload) if payload is not None else error_response(404, "不存在")
+
     # ---- 静态页:不需要令牌;SPA 回退只对不含扩展名的路径生效,且永不接管 /api ----
     def index_response() -> Response:
-        if site.has_index:
-            return FileResponse(site.lookup("index.html"), media_type="text/html", headers={"Cache-Control": "no-cache"})
+        served = site.read("index.html")                      # 每次现读并校验;被篡改/删除就回退占位页,而不是发出被改过的页面
+        if served is not None:
+            return Response(content=served[0], media_type="text/html", headers={"Cache-Control": "no-cache"})
         return HTMLResponse(PLACEHOLDER, headers={"Cache-Control": "no-cache"})
 
     @get_public("/")
@@ -224,10 +319,10 @@ def create_app(settings: Settings, token: str, *, clock: Callable[[], float] = t
     def static_or_spa(rel_path: str):
         if rel_path == "api" or rel_path.startswith("api/") or rel_path.startswith("/") or "//" in rel_path:
             return error_response(404, "不存在")                                   # /api 一律不进前端;含双斜杠的歧义路径不进前端
-        path = site.lookup(rel_path)
-        if path is not None:
+        served = site.read(rel_path)
+        if served is not None:
             headers = {"Cache-Control": "public, max-age=31536000, immutable" if rel_path.startswith("assets/") else "no-cache"}
-            return FileResponse(path, media_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream", headers=headers)
+            return Response(content=served[0], media_type=served[1], headers=headers)
         if any(r.match(rel_path) for r in FRONTEND_ROUTES):                       # 前端路由(/trading 等)
             return index_response()
         return error_response(404, "不存在")

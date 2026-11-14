@@ -1,0 +1,104 @@
+{
+  "campaign_id": "camp-stalled",
+  "generations": 6,
+  "latest_generation": 6,
+  "points": [
+    {
+      "generation": 1,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    },
+    {
+      "generation": 2,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    },
+    {
+      "generation": 3,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    },
+    {
+      "generation": 4,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    },
+    {
+      "generation": 5,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    },
+    {
+      "generation": 6,
+      "count": 3,
+      "elite_sharpe": 1.2,
+      "mean_sharpe": 0.4,
+      "p25_sharpe": 0.1,
+      "p75_sharpe": 0.8,
+      "best_total_return": 0.09,
+      "worst_max_drawdown": 0.2,
+      "cells": [
+        "fast-mid"
+      ],
+      "mean_total_return": 0.0513,
+      "mean_max_drawdown": 0.144
+    }
+  ],
+  "flags": [
+    {
+      "kind": "stagnant",
+      "level": "warn",
+      "text": "连续 5 代精英夏普没有提升(最高 1.2)"
+    }
+  ]
+}

@@ -35,7 +35,7 @@ flowchart LR
 | C | 用 Lovable 的 GitHub 同步,把项目推到一个**你自己的、与 invest 仓库分开的**仓库 | Lovable 项目仓库 |
 | D | 本机克隆 Lovable 仓库,`npm ci` → `npm run build` | `dist/` |
 | E | `python tools/audit_frontend_export.py --dist dist --src src --strict` | 审计报告 |
-| F | 把 `dist/` 内容拷到 invest 仓库 `dashboard/static/`,源码放 `dashboard/frontend/` | 入库提交 |
+| F | 把 `dist/` 内容拷到 invest 仓库 `dashboard/static/`,源码放 `dashboard/frontend/`;然后运行 `python tools/build_static_manifest.py dashboard/static` 生成清单(**不生成清单页面会 404**:后端只托管清单里的文件) | 入库提交 |
 | G | 后端阶段①完成后,本机启动真实服务,浏览器访问回环地址 | 联调 |
 | H | 逐条过 `03-frontend-handoff.md` §7 | 验收 |
 

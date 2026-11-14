@@ -1,6 +1,6 @@
 {
   "state": "ok",
-  "as_of": "2026-11-13T08:30:00+08:00",
+  "as_of": "2026-11-13T08:29:56+08:00",
   "age_seconds": 4.0,
   "stale_after_seconds": 60.0,
   "message": null,
@@ -24,7 +24,9 @@
       "limits": {
         "daily_loss_yuan": 600.0,
         "hard_drawdown_yuan": 2000.0
-      }
+      },
+      "as_of": "2026-11-13T08:29:40+08:00",
+      "age_seconds": 20.0
     },
     "pause": {
       "paused": false,
@@ -33,5 +35,6 @@
     "live_admission": {
       "approved": false
     }
-  }
+  },
+  "level": "ok"
 }

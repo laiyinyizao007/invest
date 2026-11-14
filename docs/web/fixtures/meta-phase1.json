@@ -16,6 +16,7 @@
     "stream": false,
     "research_detail": true,
     "data_views": false,
-    "nodes": false
+    "nodes": false,
+    "evolution": false
   }
 }

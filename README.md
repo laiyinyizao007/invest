@@ -75,7 +75,7 @@ flowchart LR
 
 | 路径 | 内容 |
 |---|---|
-| `risk/` | 纯 Python 风控：`risk_guard.py`（单笔预算 / 移动止损 / 连亏熔断）、`account_guard.py`（账户级双层熔断状态机）、`order_policy.py`（废单分类、重试节奏）、`promotion_gate.py`（策略晋级门槛 8 条） |
+| `risk/` | 纯 Python 风控：`risk_guard.py`（单笔预算 / 移动止损 / 连亏熔断）、`account_guard.py`（账户级双层熔断状态机）、`order_policy.py`（废单分类、重试节奏）、`promotion_gate.py`（策略晋级门槛 9 条） |
 | `strategies/` | `trend_atr_strategy.py`（日线）、`trend_atr_15m_strategy.py`（15 分钟）、`random_entry_strategy.py`（随机入场对照组）、`instruments.py`（品种参数与成本假设） |
 | `trading/` | 运行时：`runtime.py`（引擎编排、对账、看门狗、退出语义）、`guard_rule.py`（vnpy_riskmanager 发单链上的账户风控规则）、`safe_risk.py`（让平仓单跳过计数类内置规则）、`events.py` |
 | `notify/` | `webhook.py`：非阻塞告警队列、重试退避、发送前脱敏、generic / 飞书 / Telegram 三种格式 |

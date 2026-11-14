@@ -8,8 +8,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("jsonschema", reason="契约测试需要 jsonschema(见 requirements.txt)")
-from jsonschema import Draft202012Validator  # noqa: E402
+# jsonschema 只在 requirements.txt 里,不在 requirements-dashboard.txt(状态页后端的依赖)里。
+# 所以**不要在模块级 importorskip** —— 那会让整个模块(包括与 jsonschema 无关的
+# 『种子与生成器逐字节一致』断言)在只装了面板依赖的环境里静默消失。
+# 需要 jsonschema 的用例各自跳过;其余用例照常跑。
+def _validator_class():
+    return pytest.importorskip("jsonschema", reason="这个用例需要 jsonschema(见 requirements.txt)").Draft202012Validator
 
 WEB = Path(__file__).resolve().parents[1] / "docs" / "web"
 SPEC = json.loads((WEB / "status-api.openapi.json").read_text(encoding="utf-8"))
@@ -30,9 +34,9 @@ def _schema_for(method: str, path: str, status: int) -> dict:
     return resp["content"]["application/json"]["schema"]
 
 
-def _validator(schema: dict) -> Draft202012Validator:
+def _validator(schema: dict):
     # $ref 形如 #/components/schemas/X,根文档需要有 components 键
-    return Draft202012Validator({**schema, "components": COMPONENTS})
+    return _validator_class()({**schema, "components": COMPONENTS})
 
 
 @pytest.mark.parametrize("entry", MANIFEST, ids=[m["fixture"] for m in MANIFEST])
@@ -81,7 +85,9 @@ def test_sections_never_hide_a_missing_state_behind_ok():
     for entry in MANIFEST:
         payload = json.loads((WEB / "fixtures" / f"{entry['fixture']}.json").read_text(encoding="utf-8"))
         if isinstance(payload, dict) and payload.get("state") in {"missing", "corrupt"}:
-            assert payload["data"] is None, entry["fixture"]
+            # 裸数据形态的样例(如进化战役列表)没有 data 字段,只有 Section 外壳的才有
+            if "data" in payload:
+                assert payload["data"] is None, entry["fixture"]
 
 
 def test_fixtures_contain_no_real_looking_secrets_or_absolute_paths():
@@ -116,3 +122,51 @@ def test_lovable_seed_files_are_in_sync_with_the_contract(tmp_path):
     covered = "".join((seed / n).read_text(encoding="utf-8") for n in on_disk)
     for n in names:
         assert f'"{n}":' in covered, f"{n} 没有出现在种子数据里"
+
+
+def test_every_query_parameter_the_implementation_accepts_is_declared_in_the_contract(tmp_path):
+    """实现里有、契约里没写的查询参数,前端按契约开发就会用不了(或用错名字)。
+
+    直接看 FastAPI 实际注册的路由(不是 grep 源码):把每个接口的 query 参数名与契约对照。
+    """
+    from fastapi.routing import APIRoute
+
+    from dashboard import app as appmod
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    (root / "config").mkdir(parents=True)
+    cfg_path = root / "config" / "status_dashboard.json"
+    cfg_path.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    settings = appconfig.load(path=cfg_path, root=root)
+    routes = {r.path: r for r in appmod.create_app(settings, "tok").routes if isinstance(r, APIRoute)}
+
+    for path, methods in SPEC["paths"].items():
+        route = routes.get(path)
+        if route is None:
+            continue                       # 该阶段尚未上线(路由按约定后注册)
+        declared = {p["name"] for p in methods["get"].get("parameters", []) if p["in"] == "query"}
+        actual = {p.name for p in route.dependant.query_params}
+        assert actual == declared, (path, "实现:", actual, "契约:", declared)
+
+
+def test_every_path_parameter_the_implementation_accepts_is_declared_in_the_contract(tmp_path):
+    from fastapi.routing import APIRoute
+
+    from dashboard import app as appmod
+    from dashboard import config as appconfig
+
+    root = tmp_path / "repo"
+    (root / "config").mkdir(parents=True)
+    cfg_path = root / "config" / "status_dashboard.json"
+    cfg_path.write_text(json.dumps({"environment": "simnow", "evolution": {"enabled": True}}), encoding="utf-8")
+    settings = appconfig.load(path=cfg_path, root=root)
+    routes = {r.path: r for r in appmod.create_app(settings, "tok").routes if isinstance(r, APIRoute)}
+
+    for path, methods in SPEC["paths"].items():
+        route = routes.get(path)
+        if route is None:
+            continue
+        declared = {p["name"] for p in methods["get"].get("parameters", []) if p["in"] == "path"}
+        actual = {p.name for p in route.dependant.path_params}
+        assert actual == declared, (path, "实现:", actual, "契约:", declared)

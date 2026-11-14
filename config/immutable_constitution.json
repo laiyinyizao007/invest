@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "template": "strategies.trend_atr_15m_strategy:TrendAtr15mStrategy",
+  "allowed_overrides": [],
+  "protected_names": [],
+  "protected_parameters": [],
+  "forbidden_order_calls": [],
+  "protected_module_attrs": [],
+  "protected_entry_points": [],
+  "protected_state_objects": [],
+  "protected_paths": []
+}

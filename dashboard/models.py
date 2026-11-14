@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+MAX_JSON_FILE_BYTES = 2_000_000          # 状态 JSON(风控状态、录制状态、批准记录、运行结果)的读取上限
 LEVELS = ("ok", "warn", "critical", "unknown")
 _RANK = {"ok": 0, "warn": 1, "unknown": 2, "critical": 3}     # unknown 比 warn 更糟:不知道比知道有点问题更危险
 
@@ -38,12 +40,21 @@ class Clock:
         return self.now
 
 
+# state 决定**内容能不能看**(missing/corrupt 时 data 为 null),level 决定**徽标长什么样**。
+# 两者分开,前端才能区分『数据是坏的』(state=unknown)和『有些内容没列出来/没检查』(state=ok + level=warn)。
+_STATE_LEVEL = {"ok": "ok", "stale": "warn", "missing": "unknown", "corrupt": "unknown", "unknown": "unknown"}
+
+
 def section(state: str, data: Any = None, *, as_of: float | None = None, now: float, stale_after: float | None = None,
-            message: str | None = None) -> dict:
-    """构造区块外壳。as_of / now 为 epoch 秒;age 由服务器计算。"""
+            message: str | None = None, level: str | None = None) -> dict:
+    """构造区块外壳。as_of / now 为 epoch 秒;age 由服务器计算。
+
+    `level` 缺省按 state 推导;需要区分『没检查/没列出』与『读不出来』时显式给。
+    """
     age = None if as_of is None else round(max(now - as_of, 0.0), 1)
     return {
         "state": state,
+        "level": level if level is not None else _STATE_LEVEL.get(state, "unknown"),
         "as_of": None if as_of is None else iso(as_of),
         "age_seconds": age,
         "stale_after_seconds": stale_after,
@@ -52,10 +63,23 @@ def section(state: str, data: Any = None, *, as_of: float | None = None, now: fl
     }
 
 
+CLOCK_SKEW_TOLERANCE = 60.0          # 允许文件时间戳比本机时钟超前这么多秒(两台机器/NTP 校时的正常误差)
+
+
+def is_future(ts: float | None, now: float) -> bool:
+    """时间戳超出时钟误差地在未来(时钟回拨或文件异常)——不能当作『刚更新』的证据。"""
+    return ts is not None and ts - now > CLOCK_SKEW_TOLERANCE
+
+
 def freshness(as_of: float | None, now: float, stale_after: float) -> str:
-    """按年龄判定 ok / stale;as_of 为空 -> unknown。未来时间戳(时钟回拨)按 0 岁算,但不视为更新鲜的证据。"""
+    """按年龄判定 ok / stale / corrupt / unknown。
+
+    as_of 为空 -> unknown;**在未来(超出时钟误差)-> corrupt**,而不是按 0 岁算『新鲜』
+    (G8 复核:日志文件的未来 mtime 曾被当成刚更新,可长期保持绿色)。未来检查放在这个共用函数里,新增数据来源不会漏。"""
     if as_of is None:
         return "unknown"
+    if is_future(as_of, now):
+        return "corrupt"
     return "ok" if max(now - as_of, 0.0) <= stale_after else "stale"
 
 
@@ -68,23 +92,51 @@ def read_json(path: Path, *, retries: int = 1, pause: float = 0.05) -> tuple[Any
     last_error = "corrupt"
     for attempt in range(retries + 1):
         try:
-            text = path.read_text(encoding="utf-8")
+            text = read_text_limited(path, MAX_JSON_FILE_BYTES)
         except FileNotFoundError:
             return None, "missing"
-        except (PermissionError, OSError):
+        except TooLarge:
+            return None, "corrupt"                   # 状态 JSON 都很小;异常增长的文件不读,也不重试
+        except (PermissionError, OSError, BadEncoding):          # 读写撞车可能读到被截断的多字节字符,所以重试一次
             last_error = "corrupt"
         else:
             try:
-                return json.loads(text), None
-            except ValueError:
+                return loads(text), None
+            except (ValueError, RecursionError):                 # 深层嵌套会触发 RecursionError(不是 ValueError)
                 last_error = "corrupt"
         if attempt < retries:
             time.sleep(pause)
     return None, last_error
 
 
-class TooLarge(Exception):
+class Untrusted(Exception):
+    """文件读到了,但内容不可信(过大、编码非法)。调用方一律按 corrupt 处理,不能『尽量读』后当作正常数据。"""
+
+
+class TooLarge(Untrusted):
     """文件超过读取上限。上限是防止异常增长的文件在单次请求里耗尽内存/CPU(面板与交易系统同机)。"""
+
+
+class BadEncoding(Untrusted):
+    """不是合法 UTF-8。曾用 errors='replace' 把非法字节换成 U+FFFD 继续解析,文件被『修复』后可能仍然合法并被判正常。"""
+
+
+def loads(text: str) -> Any:
+    """面板里所有 JSON 解析的唯一入口:拒绝 NaN/Infinity 常量与溢出为 inf 的数字。深层嵌套抛 RecursionError,由调用方按损坏处理。"""
+    return json.loads(text, parse_constant=_reject_constant, parse_float=_finite_float)
+
+
+def _finite_float(text: str) -> float:
+    """`1e999` 是合法数字语法,Python 把它解析成 inf,不经过 parse_constant。"""
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"数值溢出: {text[:20]}")
+    return value
+
+
+def _reject_constant(name: str):
+    """JSON 标准里没有 NaN / Infinity,Python 默认却接受。它们说明写入方出了问题,不能当作合法数据。"""
+    raise ValueError(f"JSON 不允许常量 {name}")
 
 
 def read_text_limited(path: Path, limit: int) -> str:
@@ -93,7 +145,10 @@ def read_text_limited(path: Path, limit: int) -> str:
         raw = fh.read(limit + 1)
     if len(raw) > limit:
         raise TooLarge(f"{path.name} 超过 {limit} 字节上限")
-    return raw.decode("utf-8", errors="replace")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BadEncoding(f"{path.name} 不是合法 UTF-8") from exc
 
 
 def mtime(path: Path) -> float | None:

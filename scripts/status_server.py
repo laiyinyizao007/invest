@@ -15,6 +15,9 @@ import argparse
 import sys
 from pathlib import Path
 
+# 面板『只读』:不能因为 import 就在 risk/、evidence/ 等交易侧包目录里写 __pycache__。必须在任何项目模块被 import 之前设置。
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -57,8 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        config.verify_token_location(settings)           # 配置加载之后目录可能被换成链接:创建令牌前再验一次
         token, created = auth.load_or_create_token(settings.paths["token_file"])
-    except auth.TokenError as exc:
+    except (auth.TokenError, config.ConfigError) as exc:
         print(f"令牌错误: {exc}", file=sys.stderr)
         return 2
     rel = settings.paths["token_file"].relative_to(settings.root)

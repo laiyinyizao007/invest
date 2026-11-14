@@ -1,13 +1,13 @@
 {
   "state": "stale",
-  "as_of": "2026-11-12T22:10:00+08:00",
+  "as_of": "2026-11-12T22:30:00+08:00",
   "age_seconds": 36000.0,
   "stale_after_seconds": 60.0,
   "message": "心跳已停 10.0 小时:交易进程可能已退出",
   "data": {
     "heartbeat": {
       "process": "stopped",
-      "last_beat_at": "2026-11-12T22:10:00+08:00",
+      "last_beat_at": "2026-11-12T22:30:00+08:00",
       "age_seconds": 36000.0
     },
     "guard": {
@@ -24,7 +24,9 @@
       "limits": {
         "daily_loss_yuan": 600.0,
         "hard_drawdown_yuan": 2000.0
-      }
+      },
+      "as_of": "2026-11-13T08:29:40+08:00",
+      "age_seconds": 20.0
     },
     "pause": {
       "paused": false,
@@ -33,5 +35,6 @@
     "live_admission": {
       "approved": false
     }
-  }
+  },
+  "level": "unknown"
 }

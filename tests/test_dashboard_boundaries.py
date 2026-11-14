@@ -295,3 +295,22 @@ def test_the_default_token_location_is_outside_every_directory_the_dashboard_rea
     read_dirs = [s.paths["state_dir"], s.paths["recording_dir"], *s.paths["log_dirs"], s.paths["research_config"].parent]
     for d in read_dirs:
         assert token_dir != d and d not in token_dir.parents and token_dir not in d.parents, (token_dir, d)
+
+
+def test_importing_and_checking_the_dashboard_writes_no_bytecode_anywhere(tmp_path):
+    """首次 import 会在被导入的包目录(包括交易侧的 risk/)写 __pycache__——面板必须不写。在一份干净副本里跑入口验证。"""
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1]
+    dst = tmp_path / "copy"
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    for pkg in ("dashboard", "risk", "evidence", "notify", "scripts"):
+        shutil.copytree(src / pkg, dst / pkg, ignore=ignore)
+    env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    proc = subprocess.run([sys.executable, str(dst / "scripts" / "status_server.py"), "--root", str(dst), "--check"],
+                          capture_output=True, text=True, env=env, cwd=str(tmp_path))
+    assert proc.returncode == 0, proc.stderr
+    assert list(dst.rglob("__pycache__")) == [] and list(dst.rglob("*.pyc")) == []

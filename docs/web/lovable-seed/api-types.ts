@@ -16,6 +16,7 @@ export interface SectionBase {
   age_seconds?: number | null;
   stale_after_seconds?: number | null;
   message?: string | null;
+  level: "ok" | "warn" | "critical" | "unknown";
 }
 
 export interface ApiError {
@@ -44,6 +45,7 @@ export interface Meta {
     research_detail: boolean;
     data_views: boolean;
     nodes: boolean;
+    evolution: boolean;
   };
 }
 
@@ -69,6 +71,7 @@ export interface Overview {
     days: Brief;
     recording: Brief;
     research: Brief;
+    evolution?: EvolutionSection;
   };
 }
 
@@ -93,6 +96,8 @@ export interface Guard {
     daily_loss_yuan: number | null;
     hard_drawdown_yuan: number | null;
   };
+  as_of: string | null;
+  age_seconds: number | null;
 }
 
 export interface TradingData {
@@ -136,6 +141,8 @@ export interface DayRow {
   first_ts: string | null;
   last_ts: string | null;
   heartbeat: string | null;
+  trusted: boolean;
+  tail_uncertain: boolean;
 }
 
 export interface DaysData {
@@ -147,6 +154,7 @@ export interface DaysData {
   longest_clean_streak: number;
   required_streak: number;
   missing_weekdays: Array<string>;
+  streak_warning_count: number;
 }
 
 export interface RecordingData {
@@ -202,12 +210,14 @@ export interface RunDetail {
   selection?: Record<string, unknown> | null;
   windows?: unknown[] | null;
   error?: Record<string, unknown> | null;
+  stats?: Record<string, unknown> | null;
 }
 
 export interface DocData {
   key: "unattended-log" | "simnow-drills";
   title: string;
   markdown: string;
+  truncated: boolean;
 }
 
 export interface LiveData {
@@ -383,6 +393,136 @@ export interface WhoAmI {
   role: "viewer" | "operator" | "admin";
 }
 
+/** 进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。 */
+export interface EvolutionList {
+  campaigns: Array<EvolutionCampaign>;
+  total: number;
+  checked: number;
+  unscanned: number;
+  state: "ok" | "missing" | "unknown";
+  level: "ok" | "warn" | "critical" | "unknown";
+  message: string | null;
+}
+
+export interface EvolutionCampaign {
+  campaign_id: string;
+  generations: number;
+  latest_generation: number | null;
+  records: number;
+  updated_at: string | null;
+  best_sharpe: number | null;
+  state: "ok" | "missing" | "corrupt" | "stale";
+  message: string | null;
+}
+
+/** 进化曲线:每代的种群统计。**由服务端算好,前端不要重算**。 */
+export interface EvolutionCurve {
+  campaign_id: string;
+  generations: number;
+  latest_generation: number | null;
+  points: Array<EvolutionPoint>;
+  flags: Array<EvolutionFlag>;
+}
+
+export interface EvolutionPoint {
+  generation: number;
+  count: number;
+  elite_sharpe: number | null;
+  mean_sharpe: number | null;
+  p25_sharpe: number | null;
+  p75_sharpe: number | null;
+  best_total_return: number | null;
+  worst_max_drawdown: number | null;
+  cells: Array<string>;
+  mean_total_return?: number | null;
+  mean_max_drawdown?: number | null;
+}
+
+/** 服务端的提示标志。**是提示,不是结论**;文案已写明依据。 */
+export interface EvolutionFlag {
+  kind: "stagnant" | "overfit_suspect";
+  level: "warn" | "info";
+  text: string;
+}
+
+/** 变异日志:每一代的记录。reflection 是大模型写的自由文本,**仅供审阅,没有进入模型输入**。 */
+export interface EvolutionLog {
+  campaign_id: string;
+  records: Array<EvolutionRecord>;
+  next_cursor: string | null;
+}
+
+export interface EvolutionRecord {
+  generation: number;
+  candidate_sha256: string;
+  parent_sha256: string | null;
+  run_id: string | null;
+  status: string | null;
+  sharpe: number | null;
+  total_return: number | null;
+  max_drawdown: number | null;
+  dsr: number | null;
+  n_trials: number | null;
+  fail_reason: string | null;
+  cell: string | null;
+  diagnosis: Record<string, unknown> | null;
+  reflection: string | null;
+  created_at: string | null;
+}
+
+/** 参数热力图(三维网格的二维切片)。分数来自**选参窗口**,不是样本外表现。 */
+export interface Heatmap {
+  run_id: string;
+  axes: {
+    x: {
+      name: string;
+      values: Array<number>;
+    };
+    y: {
+      name: string;
+      values: Array<number>;
+    };
+    z: {
+      name: string;
+      values: Array<number>;
+      selected: number;
+    };
+  };
+  grid: Array<Array<number | null>>;
+  best_cell: Array<number> | null;
+  on_plateau: boolean | null;
+  valid_cells: number;
+  n_cells: number;
+  source_window: Array<string> | null;
+  note: string | null;
+}
+
+/** 候选源码(只读)。按哈希找,不按名字。 */
+export interface CandidateCode {
+  sha256: string;
+  found: boolean;
+  language: string;
+  lines: Array<{
+    n: number;
+    text: string;
+  }>;
+}
+
+/** 两个候选之间的统一 diff(服务端算)。 */
+export interface CandidateDiff {
+  from_sha256: string;
+  to_sha256: string;
+  diff: string;
+  available: boolean;
+}
+
+/** 总览里的进化区块。**只有 evolution.enabled 为真时才出现**(阶段①默认关着)。 */
+export interface EvolutionSection {
+  state: string;
+  level: string;
+  headline: string;
+}
+
 /** 区块外壳:先看 state,再决定是否渲染 data。 */
 export type Section<T> = Omit<SectionBase, never> & { data: T | null };
 
@@ -410,5 +550,11 @@ export const ENDPOINTS = {
   getConfig: { method: "GET", path: "/api/config", phase: 4, role: "viewer" },
   getNodes: { method: "GET", path: "/api/nodes", phase: 5, role: "viewer" },
   whoami: { method: "GET", path: "/api/whoami", phase: 5, role: "viewer" },
+  listEvolution: { method: "GET", path: "/api/research/evolution", phase: 4, role: "viewer" },
+  getEvolutionCurve: { method: "GET", path: "/api/research/evolution/{campaign_id}/curve", phase: 4, role: "viewer" },
+  getEvolutionLog: { method: "GET", path: "/api/research/evolution/{campaign_id}/log", phase: 4, role: "viewer" },
+  getRunHeatmap: { method: "GET", path: "/api/research/runs/{run_id}/heatmap", phase: 4, role: "viewer" },
+  getCandidateCode: { method: "GET", path: "/api/research/candidates/{sha256}/code", phase: 4, role: "viewer" },
+  getCandidateDiff: { method: "GET", path: "/api/research/candidates/{sha256}/diff", phase: 4, role: "viewer" },
 } as const;
 export type EndpointName = keyof typeof ENDPOINTS;

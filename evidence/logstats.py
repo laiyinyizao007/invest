@@ -3,6 +3,7 @@
 从 `scripts/unattended_report.py` 抽出(2026-11-12),只依赖标准库:状态页(`dashboard/`)与该脚本共用同一份实现,
 状态页不能经 `scripts/bootstrap.py` 间接加载 vnpy。`unattended_report.py` 重新导出了这里的全部名字,既有调用与测试不受影响。
 """
+import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -66,10 +67,39 @@ class DayStats:
     first_ts: str = ""
     last_ts: str = ""
     log_path: str = ""
+    # 这份日志是否像一份真实的 vn.py 日志(状态页用它决定能不能把『没有事件』当成『这一天无异常』)。
+    # 默认 True:unattended_report 等既有使用者不关心这个,行为完全不变。判据见 DayLogParser.trusted。
+    trusted: bool = True
+    # 尾部不完整:最后一行没有换行结尾,且它有可能是某个事件关键字的前缀(『硬锁定』被截成『硬』)。
+    # 这与『日志损坏』不同:文件可能只是正在写。两者都要保守(不把这一天算作无异常),但提示文案要分开。
+    tail_uncertain: bool = False
 
     @property
     def clean(self) -> bool:
-        return not self.events
+        """这一天能不能算作『无异常』。
+
+        **必须同时可信**:日志内容不可信(损坏、日期对不上、尾部被截断而可能藏着严重事件)时,
+        『没看到事件』不等于『没有事件』。无人值守验收表与状态页都靠这个判断。
+        """
+        return not self.events and self.trusted
+
+    @property
+    def breaks_streak(self) -> bool:
+        """这一天会不会打断『连续无严重事件』的连续段(用户 2026-11-13 拍板的口径)。
+
+        **只有严重事件、或这一天无法判断,才打断**;警告(连接断开、行情停更、网关错误……)不打断。
+        验收要证明的是『无人值守也能运行』,不是『网络永不抖动』——夜盘一次重连就从头再数 5 天,
+        这个标准会逼着人去调标准,而不是去修问题。
+
+        不可信的日子仍然打断:日志损坏、日期对不上、尾部不完整时,『没看到事件』不等于『没有事件』。
+        警告不会被藏起来:见 streak_warning_count,它们和连续段一起被数出来。
+        """
+        return (not self.trusted) or self.has_severe
+
+    @property
+    def warning_count(self) -> int:
+        """这一天的警告级事件总次数(验收时要和连续段一起给出,不能让结论悄悄变宽)。"""
+        return sum(count for (level, _), count in self.events.items() if level == "警告")
 
     @property
     def has_severe(self) -> bool:
@@ -83,10 +113,28 @@ class DayStats:
     def as_row(self, heartbeat: str = "") -> str:
         if self.events:
             detail = "、".join(f"{name}×{count}" for (_, name), count in sorted(self.events.items()))
+        elif not self.trusted:
+            detail = "无法确认(日志不可信)"        # 不能写『无异常』:没看到事件 ≠ 没有事件
         else:
             detail = "无异常"
         trades = str(self.trades) if self.trades else "-"
         return (f"| {self.day} | {self.started} | {trades} | {detail} | {heartbeat or '-'} |")
+
+
+# 一条真实的日志记录:`日期 时间[.毫秒] | 级别 | 来源 | 内容`(取自 runtime/vntrader/log 的真实样子)。
+# 比 _parse_ts 严格得多:_parse_ts 只看前 19 个字符,『2026-11-12 09:00:00 加任意垃圾』也算有时间戳。
+# 状态页用它判断一份日志是否可信;_parse_ts 的行为不变(unattended_report 和它的 46 个测试依赖它)。
+RECORD = re.compile(r"^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}(?:\.\d+)? \| (DEBUG|INFO|WARNING|ERROR|CRITICAL|SUCCESS|TRACE) \| [^|]*\| ?")
+MIN_RECORD_RATIO = 0.2          # 记录至少占非空行的这个比例;容忍 traceback 续行,挡住『一行合规 + 大量垃圾』
+
+
+def _message_part(line: str) -> str:
+    """取记录的消息部分(『时间 | 级别 | 来源 | 内容』里的最后一段)。
+
+    前缀检测只看消息:时间戳与来源里出现的字不该被当成关键字的前缀。
+    """
+    parts = line.split("|")
+    return parts[-1] if len(parts) >= 4 else line
 
 
 def _parse_ts(line: str) -> str:
@@ -129,6 +177,12 @@ class DayLogParser:
         self._started_ok = 0          # 『已启动』与『启动耗时』各自计数,快照时取较大者——不能只存最终值,否则无法继续累加
         self._start_attempts = 0
         self._pending = b""           # 尚未遇到换行的残余字节(可能切在多字节字符中间,所以按字节缓冲)
+        self._lines = 0               # 非空行数
+        self._records = 0             # 其中形如『时间 | 级别 | 来源 | 内容』的真实日志记录数
+        self._first_record_day = ""   # 第一条记录的日期(应与文件名日期一致)
+        self._truncated_tail = False  # 文件末尾停在多字节字符中间(只在 finish() 处理尾行时才可能为真;追加后字符补全则不会再出现)
+        self._bad_encoding = False    # 出现过非法 UTF-8:日志不可信(曾用替换字符『修复』,坏字节落在关键字中间时严重事件会被藏起来)
+        self._tail_partial = ""       # 没有换行结尾的最后一行(可能只写了一半);用来判断它是否可能是某个关键字的前缀
 
     def feed(self, data: bytes) -> None:
         buf = self._pending + data
@@ -137,18 +191,38 @@ class DayLogParser:
             self._pending = buf
             return
         self._pending = buf[cut + 1:]
-        self._consume(buf[: cut + 1].decode("utf-8", errors="replace"))
+        self._consume(self._decode(buf[: cut + 1], tail=False))
 
     def finish(self) -> None:
         """文件到此为止:把没有换行结尾的最后一行也算进去(全量解析就是这个语义)。"""
         if self._pending:
-            text, self._pending = self._pending.decode("utf-8", errors="replace"), b""
+            text, self._pending = self._decode(self._pending, tail=True), b""
+            self._tail_partial = text
             self._consume(text)
+
+    def _decode(self, raw: bytes, *, tail: bool) -> str:
+        """严格解码。非法字节 → 标记不可信(仍用替换字符继续计数,供展示;可信度由 trusted() 否决)。
+        例外:没有换行的**最后一行**以『不完整的多字节字符』结尾——进程崩溃时写到一半,不是编码损坏。"""
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if tail and exc.reason == "unexpected end of data" and exc.end == len(raw):
+                # 崩溃时写到一半的最后一行。被截掉的字符可能正是『硬锁定』的最后一个字——无法证明它不是关键字的一部分,
+                # 所以这一天不能被算作『无异常』:标记不可信(不是永久坏编码,字符补全后重新解析即恢复)。
+                self._truncated_tail = True
+                return raw[: exc.start].decode("utf-8", errors="replace")
+            self._bad_encoding = True
+            return raw.decode("utf-8", errors="replace")
 
     def _consume(self, text: str) -> None:
         for line in text.splitlines():
             if not line.strip():
                 continue
+            self._lines += 1
+            record = RECORD.match(line)
+            if record:
+                self._records += 1
+                self._first_record_day = self._first_record_day or record.group(1)
             ts = _parse_ts(line)
             if ts:
                 if not self.first_ts:
@@ -165,9 +239,63 @@ class DayLogParser:
                 if marker in line:
                     self.events[(level, name)] += 1
 
+    def _clone(self) -> "DayLogParser":
+        c = DayLogParser(self.day)
+        c.trades, c.events = self.trades, Counter(self.events)
+        c.first_ts, c.last_ts = self.first_ts, self.last_ts
+        c._started_ok, c._start_attempts, c._pending = self._started_ok, self._start_attempts, self._pending
+        c._lines, c._records, c._first_record_day = self._lines, self._records, self._first_record_day
+        c._bad_encoding, c._truncated_tail = self._bad_encoding, self._truncated_tail
+        c._tail_partial = self._tail_partial
+        return c
+
+    def trusted(self) -> bool:
+        """这份日志像不像一份真实的 vn.py 日志。三条都要满足:
+        1. 至少有一条完整形状的记录(『时间 | 级别 | 来源 | 内容』,不只是以日期开头)。
+           (逻辑上被第 2 条隐含——没有记录时首条记录日期为空,必然不等于文件名日期。有意保留,把『必须有记录』这个意图写在代码里;
+           变异检查去掉它不会让测试失败,原因就在这里。)
+        2. 第一条记录的日期与文件名日期一致(被移植/重命名的日志不能当这一天的证据);
+        0. 没有出现过非法 UTF-8(codex 第 3 轮复核:坏字节落在『当日熔断』中间时,替换后关键字不匹配,日志却仍被判为干净)。
+        3. 记录占非空行的比例不低于 20%(容忍 traceback 续行,挡住『一行合规 + 大量垃圾』)。
+        不可信的日志不能被解读成『这一天无异常』(G8 复核:一行合规加任意垃圾曾被判为干净的一天)。"""
+        return (not self._bad_encoding and not self._truncated_tail and not self._tail_may_hide_event()
+                and self._records >= 1 and self._first_record_day == self.day
+                and self._records >= MIN_RECORD_RATIO * self._lines)
+
+    def _tail_may_hide_event(self) -> bool:
+        """没有换行结尾的最后一行,可能只写了一半。
+
+        **截断落在字符边界上**(更常见)不会有任何解码异常信号:『硬锁定』被截成『硬』时解码完全成功,
+        但关键字不匹配 → 这一行看起来『没有事件』。只要这行有可能是某个关键字的前缀,这一天就不能算作『无异常』。
+        与关键字完全无关的一行(比如正在写的普通 INFO 行)不受影响——否则正在写入的日志会一直显示未知。
+        关键字**已经完整出现**的行不算(事件已被识别并计入)。
+        """
+        if not self._tail_partial:
+            return False
+        # 消息部分与整行都看:消息里带竖线时(『见 a | b』),只取最后一段会丢掉前半段。
+        # 两处都用 **endswith**:截断只能发生在行尾,所以只看结尾就够;
+        # 而『整行任意位置搜索』会把普通消息(如『当前权益 10000』里的『当』)误判成不可信。
+        candidates = (_message_part(self._tail_partial), self._tail_partial)
+        for marker in EVENT_MARKERS:
+            if any(marker in text for text in candidates):
+                continue                      # 事件已完整出现并被计入,不是『被藏起来』
+            for cut in range(1, len(marker)):
+                if any(text.endswith(marker[:cut]) for text in candidates):
+                    return True
+        return False
+
     def snapshot(self, log_path: str = "") -> DayStats:
-        return DayStats(day=self.day, started=max(self._started_ok, self._start_attempts), trades=self.trades,
-                        events=Counter(self.events), first_ts=self.first_ts, last_ts=self.last_ts, log_path=log_path)
+        """当前已知的全部内容,**包括还没有换行结尾的最后一行**;不改变解析器自己的状态。
+
+        G8 复核 #10:进程在写入严重事件后崩溃、最后一行没有换行,这一行曾一直留在缓冲里,增量路径永远不显示它,
+        而全量解析会数它——两者不等价,严重事件被漏报。现在在**副本**上处理尾行:快照展示它,
+        解析器自己仍把它留在缓冲里,等真正的换行到来后再正式处理,所以不会数两次。"""
+        view = self._clone()
+        if view._pending:
+            view.finish()
+        return DayStats(day=view.day, started=max(view._started_ok, view._start_attempts), trades=view.trades,
+                        events=Counter(view.events), first_ts=view.first_ts, last_ts=view.last_ts, log_path=log_path,
+                        trusted=view.trusted(), tail_uncertain=view._tail_may_hide_event())
 
 
 def parse_day_log(path: Path) -> DayStats:
@@ -192,6 +320,8 @@ def collect_days(log_dirs: list[Path], day_filter: str = "") -> list[DayStats]:
             if day_filter and stats.day != day_filter:
                 continue
             target = merged.setdefault(stats.day, DayStats(day=stats.day))
+            target.trusted = target.trusted and stats.trusted        # 任一文件不可信 → 那天不可信
+            target.tail_uncertain = target.tail_uncertain or stats.tail_uncertain
             target.started += stats.started
             target.trades += stats.trades
             target.events.update(stats.events)
@@ -258,7 +388,10 @@ def render_table(days: list[DayStats], heartbeat: str = "", heartbeat_on: str = 
 
 
 def longest_clean_streak(days: list[DayStats]) -> int:
-    """最长的一段"连续无异常"**交易日**天数。
+    """最长的一段"连续无严重事件"**交易日**天数。
+
+    **判定口径(用户 2026-11-13 拍板)**:只有严重事件、或无法判断的日子才打断;警告不打断,
+    但会被 streak_warning_count 数出来。函数名里的 clean 是历史遗留——它从来指『验收意义上的干净』。
 
     验收要求的是"连续 ≥ 5 个交易日",所以必须算**连续**段,
     不能拿"总共干净了几天"顶替(中间夹一个有异常的日子,连续性就断了)。
@@ -277,38 +410,61 @@ def longest_clean_streak(days: list[DayStats]) -> int:
     节假日无法从本地数据判断 —— 法定假日会被当成"缺天",让连续段偏短。
     这是保守方向(宁可少报不可多报),符合"证据不足就不算数"的原则。
     """
+    return _scan_streak(days)[0]
+
+
+def streak_warning_count(days: list[DayStats]) -> int:
+    """最长连续段**里面**的警告次数。
+
+    放宽口径(警告不打断连续段)之后,必须把警告数出来和连续段一起给出,
+    否则验收结论会悄悄变宽:『连续 5 天』里可能夹着十几次连接断开。
+    多段并列最长时取**最近**的一段(与验收时最关心的『眼下这段』一致)。
+    """
+    return _scan_streak(days)[1]
+
+
+def _scan_streak(days: list[DayStats]) -> tuple[int, int]:
+    """(最长连续段天数, 该段里的警告次数)。按日历逐天走,缺天与不可信的天都打断。"""
     by_day = {d.day: d for d in days}
     if not by_day:
-        return 0
+        return 0, 0
     try:
         start = date.fromisoformat(min(by_day))
         end = date.fromisoformat(max(by_day))
     except ValueError:
         # 日期格式不是 ISO(理论上不会发生)→ 退回"只按日志里的天算"
-        best = current = 0
+        best = current = best_warn = warn = 0
         for day in days:
-            current = current + 1 if day.clean else 0
-            best = max(best, current)
-        return best
+            if day.breaks_streak:
+                current = warn = 0
+            else:
+                current, warn = current + 1, warn + day.warning_count
+            if current >= best:
+                best, best_warn = current, warn
+        return best, best_warn
 
-    best = current = 0
+    best = current = best_warn = warn = 0
     cursor = start
     while cursor <= end:
         stats = by_day.get(cursor.isoformat())
         if cursor.weekday() >= 5:
             # 周末不是交易日:既不计入也不打断(除非有严重事件)。
             if stats is not None and stats.has_severe:
-                current = 0
+                current = warn = 0
         elif stats is not None:
-            # 工作日有日志:干净就计入连续段,有异常就断
-            current = current + 1 if stats.clean else 0
+            # 工作日有日志:没有严重事件且可信就计入连续段;警告也一并数着
+            if stats.breaks_streak:
+                current = warn = 0
+            else:
+                current, warn = current + 1, warn + stats.warning_count
         else:
             # 工作日却没有任何日志 → 进程静默死亡(那天的日志文件根本没生成)。
             # 只按"日志里有的天"遍历会把这一天悄悄跳过,连续段被拉长,验收结论虚高。
-            current = 0
-        best = max(best, current)
+            current = warn = 0
+        if current >= best and current > 0:
+            best, best_warn = current, warn
         cursor += timedelta(days=1)
-    return best
+    return best, best_warn
 
 
 def missing_weekdays(days: list[DayStats]) -> list[str]:
@@ -338,11 +494,14 @@ def missing_weekdays(days: list[DayStats]) -> list[str]:
 def acceptance_checklist(days: list[DayStats]) -> list[str]:
     """按运行手册第 6 节列出验收项与当前状态。"""
     total = len(days)
+    untrusted = sum(1 for d in days if not d.trusted)
     streak = longest_clean_streak(days)
+    warnings = streak_warning_count(days)
     missing = missing_weekdays(days)
     checklist = [
         f"- [ ] 连续 ≥ 5 个交易日无人值守:已记录 {total} 天"
-        + (f"(最长连续无异常 {streak} 天)" if streak else ""),
+        + (f"(最长连续无严重事件 {streak} 天" + (f",期间 {warnings} 次警告" if warnings else "") + ")" if streak else "")
+        + (f"(**其中 {untrusted} 天的日志不可信,不能算作『无严重事件』,需人工核对**)" if untrusted else ""),
         f"- [ ] 告警全部到达手机:需配合 `--probe-webhook` 的自检结果",
         f"- [ ] 没有重复下单:成交笔数与委托笔数需人工抽查(日志里没有重复下单的直接证据)",
         f"- [ ] 没有止损未触发 / 持仓与策略不一致:见上表异常事件列",

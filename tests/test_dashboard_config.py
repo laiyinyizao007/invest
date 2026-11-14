@@ -95,3 +95,152 @@ def test_a_token_file_inside_a_directory_the_dashboard_reads_is_refused(tmp_path
 def test_the_default_token_file_is_in_its_own_directory(tmp_path):
     s = c.load(path=tmp_path / "none.json", root=tmp_path)
     assert s.paths["token_file"] == (tmp_path / "data" / "dashboard" / "status.token").resolve()
+
+
+def test_guard_staleness_threshold_stays_coupled_to_the_runtime_persistence_cadence():
+    """面板把『风控状态文件落后 >180 秒』判为陈旧,依据是运行时至少每 60 秒落盘一次。
+    面板不能 import trading/risk 之外的运行时代码,所以这里读源码文本守住这个耦合:
+    运行时改了落盘节奏(间隔变大、不再每秒调用 update)而面板阈值没跟着改,这条测试会提醒。"""
+    import re
+    from dashboard import collectors
+    root = c.ROOT
+    guard_src = (root / "risk" / "account_guard.py").read_text(encoding="utf-8")
+    m = re.search(r"_last_saved_at\)\.total_seconds\(\)\s*>=\s*(\d+)", guard_src)
+    assert m, "account_guard.update() 的『至少每 N 秒落盘』条件找不到了——请复核 GUARD_STALE_AFTER 的依据"
+    persist_every = float(m.group(1))
+    assert collectors.GUARD_STALE_AFTER >= 2 * persist_every, "面板的陈旧阈值应至少是运行时落盘间隔的 2 倍,否则会误报"
+    assert collectors.GUARD_STALE_AFTER <= 20 * persist_every, "阈值过大会让真正陈旧的风控状态长期显示为新鲜"
+    rule_src = (root / "trading" / "guard_rule.py").read_text(encoding="utf-8")
+    assert "def on_timer" in rule_src and "self.guard.update(" in rule_src, "update() 不再由 on_timer 驱动——落盘节奏的前提变了"
+
+
+@pytest.mark.parametrize("token_file", [".vntrader_drill/t", ".vntrader_brokertest/t", ".vntrader_probe/t", "risk/t", "data/other/t", "status.token",
+                                        "data/dashboard/../state/t", "data/t"])
+def test_the_token_file_is_allowed_only_inside_the_dashboard_own_directory(tmp_path, token_file):
+    """白名单而非拒绝名单:拒绝名单永远会漏掉新增的交易侧目录(.vntrader_drill 等)。令牌只能在 data/dashboard/ 下。"""
+    cfg = _write(tmp_path, {"token_file": token_file})
+    with pytest.raises(c.ConfigError, match="令牌"):
+        c.load(path=cfg, root=tmp_path)
+
+
+def test_a_token_file_in_a_subdirectory_of_the_dashboard_directory_is_fine(tmp_path):
+    cfg = _write(tmp_path, {"token_file": "data/dashboard/sub/t.token"})
+    assert c.load(path=cfg, root=tmp_path).paths["token_file"].name == "t.token"
+
+
+# ---- codex 第 3 轮复核 #6:白名单目录本身是 junction / 符号链接 ----
+def _make_dir_link(link, target):
+    """尽力创建目录链接(Windows junction 无需特权;POSIX 用符号链接)。创建不了就跳过。"""
+    import os
+    import subprocess
+    import sys
+    if sys.platform == "win32":
+        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if proc.returncode != 0:
+            pytest.skip("无法创建 junction")
+    else:
+        try:
+            os.symlink(target, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("无法创建符号链接")
+
+
+def _remove_dir_link(link):
+    import os
+    try:
+        os.rmdir(link)                    # junction 用 rmdir 只删链接本身;符号链接用 unlink
+    except OSError:
+        os.unlink(link)
+
+
+def test_a_dashboard_directory_that_links_into_the_trading_state_dir_is_refused(tmp_path):
+    """data/dashboard 若是指向 data/state 的 junction,解析后白名单与令牌都落在 data/state——白名单校验反而通过,令牌被写进交易状态目录。"""
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.load(path=tmp_path / "none.json", root=tmp_path)
+    finally:
+        _remove_dir_link(link)
+
+
+def test_a_linked_subdirectory_under_the_dashboard_directory_is_refused_too(tmp_path):
+    (tmp_path / "data" / "dashboard").mkdir(parents=True)
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard" / "sub"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        cfg = _write(tmp_path, {"token_file": "data/dashboard/sub/t.token"})
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.load(path=cfg, root=tmp_path)
+    finally:
+        _remove_dir_link(link)
+
+
+def test_the_token_location_is_verified_again_right_before_the_token_is_created(tmp_path):
+    """配置加载与创建令牌之间目录可能被换成链接(TOCTOU 窗口):创建前必须再验一次。"""
+    s = c.load(path=tmp_path / "none.json", root=tmp_path)
+    (tmp_path / "data" / "state").mkdir(parents=True)
+    link = tmp_path / "data" / "dashboard"
+    _make_dir_link(link, tmp_path / "data" / "state")
+    try:
+        with pytest.raises(c.ConfigError, match="令牌"):
+            c.verify_token_location(s)
+    finally:
+        _remove_dir_link(link)
+
+
+def test_the_junction_fallback_detects_a_reparse_point_without_path_is_junction(monkeypatch, tmp_path):
+    """旧 Python 没有 Path.is_junction():退回看 st_file_attributes 的 reparse point 位。
+    真实 junction 的属性是 0x410(含 0x400 = FILE_ATTRIBUTE_REPARSE_POINT)。
+
+    直接用一个**没有** is_junction 方法的路径对象走这条分支——在 Python 3.13 上
+    monkeypatch 删掉 Path.is_junction 并不能删掉底层 PathBase 的实现,那样测不到回退逻辑。
+    """
+    import os
+
+    from dashboard import config
+
+    class OldStylePath:
+        """没有 is_junction 方法的路径对象(模拟 Python 3.11)。"""
+
+        def __init__(self, real):
+            self._real = real
+
+        def is_symlink(self):
+            return False
+
+        def __fspath__(self):
+            return str(self._real)
+
+        def __str__(self):
+            return str(self._real)
+
+    class FakeStat:
+        st_file_attributes = 0x410              # 真实 junction 的属性值
+
+    real_lstat = os.lstat
+    monkeypatch.setattr(config.os, "lstat", lambda p, *a, **k: FakeStat()
+                        if str(p).endswith("junctionish") else real_lstat(p, *a, **k))
+    assert config._is_link(OldStylePath(tmp_path / "junctionish")) is True
+    assert config._is_link(OldStylePath(tmp_path / "plain")) is False
+
+
+@pytest.mark.parametrize("over", [
+    {"log_limit": "abc"}, {"log_limit": None}, {"log_limit": 0}, {"log_limit": -1}, {"log_limit": 1.5},
+    {"stagnant_generations": "abc"}, {"stagnant_generations": 0}, {"stagnant_generations": -3},
+    {"stagnant_epsilon": "abc"}, {"stagnant_epsilon": -1.0}, {"stagnant_epsilon": float("inf")},
+    {"overfit_mean_gap": "abc"}, {"overfit_mean_gap": -0.5}, {"enabled": "yes"},
+])
+def test_illegal_evolution_settings_are_refused_at_startup_not_at_request_time(tmp_path, over):
+    """非法配置要在启动时被拒(config.load 的既定约定),而不是让页面在半夜 500。"""
+    cfg = _write(tmp_path, {"evolution": over})
+    with pytest.raises(c.ConfigError, match="evolution"):
+        c.load(path=cfg, root=tmp_path)
+
+
+def test_legal_evolution_settings_are_accepted(tmp_path):
+    cfg = _write(tmp_path, {"evolution": {"enabled": True, "stagnant_generations": 3, "log_limit": 20,
+                                          "stagnant_epsilon": 0.1, "overfit_mean_gap": 1.0}})
+    assert c.load(path=cfg, root=tmp_path).raw["evolution"]["enabled"] is True

@@ -1,0 +1,20 @@
+{
+  "campaigns": [
+    {
+      "campaign_id": "camp-2026-11",
+      "generations": 4,
+      "latest_generation": 4,
+      "records": 4,
+      "updated_at": "2026-11-12T21:30:00",
+      "best_sharpe": 2.1,
+      "state": "ok",
+      "message": null
+    }
+  ],
+  "total": 1,
+  "checked": 1,
+  "unscanned": 0,
+  "state": "ok",
+  "level": "ok",
+  "message": null
+}

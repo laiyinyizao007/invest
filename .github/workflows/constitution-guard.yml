@@ -1,0 +1,32 @@
+name: Constitution Guard
+# 不可变宪法清单的"只能追加"靠版本控制保证:每次提交后的清单相对上一次只能增不能减。
+# 这个检查需要**完整历史**,所以必须 fetch-depth: 0——浅克隆下 git log 只看得到一个提交,
+# 检查会"看起来通过"实则根本没比对,所以守卫对浅克隆是 fail-closed(直接失败)。
+#
+# 守卫本体是 tools/check_constitution_history.py:只用标准库 + git,**不依赖 pytest,也不依赖 vnpy**。
+# 早先这里跑 pytest tests/test_constitution.py,但 pytest 的 conftest 会 import
+# segment_ledger → bootstrap → vnpy,在只装 pytest 的 CI 上直接收集失败(退出码 4)——
+# 守卫于是在 CI 上一次都没跑过,却看起来"配好了"(第 6 轮 codex 实测)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  constitution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 完整历史:否则"只能追加"的比对无从谈起
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 宪法层是纯标准库 + git:这里不需要装 pytest,更不需要装整个交易环境。
+      - name: Check the constitution is append-only
+        run: python tools/check_constitution_history.py

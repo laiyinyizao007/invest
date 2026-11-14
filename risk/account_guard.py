@@ -75,6 +75,9 @@ class AccountGuard:
         self.unlock_history: list[dict] = []   # 人工解锁记录:{at, locked_at, reason, forced}
         self.manual_orders: dict[str, int] = {}  # 交易日(ISO) -> 当日检测到的非策略委托笔数
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
+        # 该权益『被采样』的时刻(账户回报到达柜台网关的时间),不是文件写入时间。只供状态页判断权益是否新鲜:
+        # 网关断开后 vn.py 仍缓存着旧账户对象,定时器照常读到它并落盘,文件 mtime 因此一直是新的。纯可观测字段,不参与任何熔断判断。
+        self.last_sampled_at: datetime | None = None
         self.account_id: str = ""              # 状态所属的账户;换账户时权益基准必须重置(SimNow 2000 万 vs 实盘 1 万)
         self.save_error: str = ""
         self._last_saved_at: datetime | None = None
@@ -109,6 +112,7 @@ class AccountGuard:
             return None
         self.peak_equity = 0.0
         self.last_equity = 0.0
+        self.last_sampled_at = None           # 换了账户:旧账户的采样时间不属于新账户
         self.day = None
         self.day_start_equity = 0.0
         self.daily_locked_day = None
@@ -118,9 +122,13 @@ class AccountGuard:
 
     # ---------- 更新 ----------
 
-    def update(self, equity: float, now: datetime) -> list[LockEvent]:
+    def update(self, equity: float, now: datetime, sampled_at: datetime | None = None) -> list[LockEvent]:
+        """sampled_at:这笔权益的采样时刻(调用方知道账户回报何时到达)。**调用方没有就传 None,此时保持原值**——
+        绝不用 now 顶替:重启后 vn.py 可能仍返回缓存的旧账户对象,把它写成『刚采样』就是虚假的新鲜。"""
         if equity is None or math.isnan(equity) or equity <= 0:
             return []  # 无效采样
+        if sampled_at is not None:
+            self.last_sampled_at = sampled_at
         day = trading_day(now)
         events: list[LockEvent] = []
         changed = False
@@ -220,6 +228,7 @@ class AccountGuard:
         state = {
             "account_id": self.account_id,
             "last_equity": self.last_equity,
+            "sampled_at": self.last_sampled_at.astimezone().isoformat(timespec="seconds") if self.last_sampled_at else None,   # 带时区
             "peak_equity": self.peak_equity,
             "day": self.day.isoformat() if self.day else None,
             "day_start_equity": self.day_start_equity,
@@ -242,6 +251,17 @@ class AccountGuard:
         except OSError as exc:
             self.save_error = repr(exc)
 
+    @staticmethod
+    def _parse_sampled_at(raw) -> datetime | None:
+        """纯可观测字段:坏值只丢弃,**绝不能**因此触发『状态文件损坏→硬锁定』。要求带时区,否则无法与其他时刻比较。"""
+        if not isinstance(raw, str):
+            return None
+        try:
+            value = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        return value if value.tzinfo is not None else None
+
     def _load(self) -> None:
         if self.state_path is None or not self.state_path.exists():
             return
@@ -259,6 +279,7 @@ class AccountGuard:
             self.hard_locked_at = str(s.get("hard_locked_at", ""))
             self.unlock_history = [dict(h) for h in s.get("unlock_history", [])][-UNLOCK_HISTORY_LIMIT:]
             self.manual_orders = {str(k): int(v) for k, v in s.get("manual_orders", {}).items()}
+            self.last_sampled_at = self._parse_sampled_at(s.get("sampled_at"))
         except (ValueError, KeyError, TypeError, OSError) as exc:
             # 状态文件损坏:宁可保守地进入硬锁定,也不能当作"没有锁"继续交易
             self.hard_locked = True

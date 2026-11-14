@@ -20,7 +20,7 @@
 |---|---|---|
 | `/research/backtest` | 提交沙盒回测(策略文件须位于 pending 目录) | `scripts/backtest_lib.py::run_engine_bars` |
 | `/research/optimize` | 触发 walk-forward 滚动寻优(日期断言照常生效) | `scripts/walk_forward_optimizer.py` 公开函数 |
-| `/research/gate` | 查询候选的晋级 8 条结果 | `risk/promotion_gate.py::check_gate` |
+| `/research/gate` | 查询候选的晋级 9 条结果 | `risk/promotion_gate.py::check_gate` |
 | `/research/results` | 查询结果摘要与 Trace 式诊断书 | 结果文件读取 + 确定性诊断逻辑 |
 | `/research/data` | 列出可用数据段及其「测试段已消费」状态 | 数据清单 |
 
@@ -71,7 +71,7 @@ flowchart TB
     BL --> O15[scripts/optimize_15m.py 15m 三段基准]
     BL --> WFO[scripts/walk_forward_optimizer.py 滚动窗口+三层隔离]
     ST0[strategies/random_entry_strategy.py 随机对照] --> BL
-    PG[risk/promotion_gate.py 晋级 8 条·唯一闸门] -. 门槛检查 .-> OPT
+    PG[risk/promotion_gate.py 晋级 9 条·唯一闸门] -. 门槛检查 .-> OPT
     PG -.- O15
     PG -.- WFO
     PP[参数平原 已实现 risk/plateau.py;PBO/DSR 规划位→阶段三]
@@ -249,7 +249,7 @@ flowchart TB
 |---|---|---|---|
 | 月度滚动重估引擎 | `scripts/walk_forward_optimizer.py` 提升为 `optimizer/` 包 + 调度入口 + 新 ADR | 三条件同时满足:①≥2 品种复权连续数据;②实盘月度换参需求;③数据厚度支持新窗口 | 2026-11-10 共识 |
 | Optuna TPE 寻优 | 并入 `walk_forward_optimizer.py` 或其旁新脚本(不改 `optimize.py` 已定案口径) | 参数维度 >2 或组合空间 > 数百,网格不再可行 | 要点梳理 §3.5 |
-| 参数平原卷积 / PBO / DSR — **参数平原(3×3×3 邻域)已落地于 `risk/plateau.py` 与选参;PBO/DSR 仍规划位** | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
+| 参数平原卷积 / PBO / DSR — **参数平原(3×3×3 邻域)已落地于 `risk/plateau.py` 与选参;DSR 已采纳随进化引擎分期落地(ADR `20261113-evolution-engine`),PBO 延后** | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
 | 研究沙盒 API(CLI→HTTP) — **已落地(2026-11-12)** | `scripts/research_api.py`、`research_gateway.py`、`research_sandbox.py`、`research_gate.py`、`research_grid.py`、`research_config.py`;容器 `docker-compose.research.yml`;契约 `docs/research-gateway.openapi.json` | — | ADR bisheng-ai-researcher、`20261112-research-sandbox-*` |
 | 策略骨架模板 + pending/approved 沙盒 — **pending 已落地,approved/ 与骨架模板未做** | `strategies/` 内模板文件 + `pending_strategies/`/`approved/` 目录约定 + 新 ADR | 阶段四 4a 启动前 | 要点梳理 §6.3-① |
 | Bisheng 外层 — **已本机部署(2026-11-12),工作流 v3 已建,LLM 联调待额度** | 独立 compose 文件(与交易 compose 完全分离,不共享网络与 `.env`) | 阶段四 4b(前置 = 阶段三 API 固化);版本 ≥2.6.0、仅内网、禁用 Code 节点 | ADR bisheng-ai-researcher |
@@ -259,6 +259,7 @@ flowchart TB
 | Alpha Factory / Agent 工作流 | `scripts/` 新常驻脚本 + 沙盒目录约定 + 新 ADR;**不给时间承诺** | 阶段三引擎化稳定运行 + ≥2 品种/策略的验证管道复用经验 | 要点梳理 §6.1–6.4 |
 | 增量调度器 | DSH `@goodandready/dsh-cron` 短任务 `ensure`/`watchdog`，不写 Python 常驻调度器；生命周期边界见 `docs/adr/20261111-market-recording-and-dsh-orchestration.md` | 阶段一并行副线立即建设；先完成 dummy worker Windows 生命周期实测 | §4「缺自动化调度」/Issue #13 |
 | 只读状态页(Web 监控面板)——**后端 fork 自 `vnpy_webtrader` 1.1.0(MIT)并改造,委托类接口与 RPC 全部删除** | `dashboard/` 纯逻辑包 + `dashboard/app.py` + `scripts/status_server.py` + 静态单页 + `requirements-dashboard.txt`;只读文件、独立进程、仅监听 127.0.0.1;实时持仓/资金(阶段②)与「暂停开仓」(阶段③)另立 ADR | 阶段一并行副线;ADR 确认后开工,阶段①计划见 `docs/plans/20261112-status-dashboard-plan.md`;完整 Web 规划(五阶段、契约、前端交接)见 `docs/web/README.md`;前端用 React + Lovable 构建,计划见 `docs/plans/20261112-web-frontend-lovable-plan.md` | `docs/adr/20261112-status-dashboard.md` |
+| 进化引擎三视图(曲线/热力图/变异日志)——**只读展示,进化回路由毕昇工作流承载** | `dashboard/evolution.py` + 阶段④的 6 个只读接口 + `docs/web/08-evolution-views.md`;台账与热力图文件由引擎侧产出 | 引擎侧阶段 3 产出台账与热力图;前端按示例数据开发 | ADR `20261113-evolution-dashboard.md` |
 | 交易日历/节假日 | 独立小模块供 `trading/guard_rule.py` 查询;手维护交易所日历表,不引第三方库 | 进入实盘准备(D 段)前必须完成;SimNow 阶段优先级低 | §4「节假日不处理」 |
 | 主力换月自动化 | 扩展 `scripts/build_continuous.py` 的 rolls 派生逻辑(换月数据实际在这里生成,不在 `import_minute.py`)→ runtime 校验 `LIVE_VT_SYMBOL` 与 rolls 一致,不一致即拒绝启动(fail-closed) | 通过 SimNow 验收、进入实盘准备前 | §4「换月需人工」 |
 | CTP 行情自录 | 官方 `vnpy_datarecorder` 独立无头进程，数据写 `.vntrader_record/database.db`；由 wrapper + DSH 短任务 `ensure`/`watchdog` 管理，不挂交易 runtime | 阶段一并行副线；先完成生命周期实测，再做 SimNow/国信测试 profile 验收 | 要点梳理 §3.1 / Issue #13 |

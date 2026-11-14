@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,11 +39,15 @@ DEFAULTS: dict = {
     "log_dirs": ["runtime/vntrader/log"],
     "recording_dir": ".ops/recording",
     "research_config": "config/research_sandbox.json",
+    "evolution_dir": "data/research/evolution",     # 谱系台账(引擎侧写,面板只读)
+    "heatmap_dir": "data/research/heatmaps",         # 参数网格得分表(引擎侧写,面板只读)
     "static_dir": "dashboard/static",
     "token_file": "data/dashboard/status.token",           # 面板专属目录,不在任何交易侧目录树里(见 _check_token_location)
     "stale_after_seconds": {"trading": 60.0, "alerts": 300.0, "days": 600.0, "recording": 120.0, "research": 3600.0, "docs": 86400.0},
     "docs": {"unattended-log": "docs/unattended-log.md", "simnow-drills": "docs/simnow-drills.md"},
     "docs_titles": {"unattended-log": "无人值守运行记录", "simnow-drills": "SimNow 演练记录"},
+    "evolution": {"enabled": False, "stagnant_generations": 5, "stagnant_epsilon": 0.05, "overfit_mean_gap": 1.0, "log_limit": 50,
+                "summary_ttl": 30.0},   # 战役摘要缓存的秒数:总览每 8 秒轮询,不能每次都重读全部台账
     "days_default": 14,
     "recent_runs": 10,
     "limits": {"daily_loss_yuan": None, "hard_drawdown_yuan": None},      # None = 取风控默认值
@@ -84,6 +90,23 @@ class Settings:
         return float(self.raw["stale_after_seconds"][name])
 
 
+def _check_evolution(cfg: Any) -> None:
+    """进化面板的配置取值。**非法值在启动时就被拒**,而不是让页面在半夜 500
+    (config.load 的既定约定:非法即抛 ConfigError,由入口转为拒绝启动)。"""
+    if not isinstance(cfg, dict):
+        raise ConfigError("evolution 必须是对象")
+    if not isinstance(cfg.get("enabled"), bool):
+        raise ConfigError("evolution.enabled 必须是 true/false")
+    for key in ("stagnant_generations", "log_limit"):
+        value = cfg.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ConfigError(f"evolution.{key} 必须是正整数")
+    for key in ("stagnant_epsilon", "overfit_mean_gap", "summary_ttl"):
+        value = cfg.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+            raise ConfigError(f"evolution.{key} 必须是非负有限数")
+
+
 def _resolve(root: Path, rel: str, what: str) -> Path:
     path = (root / rel).resolve()
     if root != path and root not in path.parents:
@@ -119,11 +142,14 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
         v = raw["limits"][key]
         if v is not None and (not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0):
             raise ConfigError(f"limits.{key} 必须是正数或 null")
+    _check_evolution(raw.get("evolution"))
     root = root.resolve()
     paths = {
         "state_dir": _resolve(root, raw["state_dir"], "state_dir"),
         "recording_dir": _resolve(root, raw["recording_dir"], "recording_dir"),
         "research_config": _resolve(root, raw["research_config"], "research_config"),
+        "evolution_dir": _resolve(root, raw["evolution_dir"], "evolution_dir"),
+        "heatmap_dir": _resolve(root, raw["heatmap_dir"], "heatmap_dir"),
         "static_dir": _resolve(root, raw["static_dir"], "static_dir"),
         "token_file": _resolve(root, raw["token_file"], "token_file"),
         "log_dirs": [_resolve(root, d, "log_dirs") for d in raw["log_dirs"]],
@@ -131,28 +157,59 @@ def load(path: Path | None = None, root: Path = ROOT) -> Settings:
     }
     if set(raw["docs"]) != set(raw["docs_titles"]):
         raise ConfigError("docs 与 docs_titles 的键必须一致")
-    _check_token_location(paths, root)
+    _check_token_location(paths, root, raw["token_file"])
     return Settings(raw=raw, root=root, paths=paths)
 
 
-# 研究沙盒的目录(来自 config/research_sandbox.json 的默认值);面板会读取这些位置,令牌文件同样不能放进去
-_RESEARCH_DIRS = ("pending_strategies", "data/research", "data/research-control")
-# Docker 部署时状态目录挂载在这里;即使当前配置指向 data/state,令牌也不应落进任何一处交易侧目录树
-_TRADING_SIDE_DIRS = ("data/state", "runtime", ".ops", ".vntrader", ".vntrader_record")
+# 面板专属目录:令牌文件只许放在这里(白名单)。
+# 曾用拒绝名单列出交易侧目录,结果漏掉了 .vntrader_drill / .vntrader_brokertest / .vntrader_probe——拒绝名单永远追不上新增的目录。
+DASHBOARD_DIR = "data/dashboard"
 
 
-def _check_token_location(paths: dict, root: Path) -> None:
-    """令牌文件不能位于交易侧的目录树里。
+def _is_link(path: Path) -> bool:
+    """符号链接或 Windows junction(reparse point)。不存在的路径不算链接。"""
+    try:
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)         # Path.is_junction 是 Python 3.12 才有的
+        if is_junction is not None:
+            return bool(is_junction())
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)  # 旧版本 Windows:直接看 reparse point 属性
+        return bool(attrs & 0x400)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True                           # 无法判断就按有风险处理(fail-closed)
+
+
+def _check_token_location(paths: dict, root: Path, rel: str | None = None) -> None:
+    """令牌文件必须位于面板专属目录 data/dashboard/ 之下,其他位置一律拒绝。
 
     G8 第 2 轮审查(Critical):令牌曾默认写在 data/state/——交易系统的状态目录。创建文件会改变目录的 mtime、
     占用同一块磁盘空间,也可能触发交易侧对目录的扫描或备份,违反『面板绝不写入交易系统』。
-    面板自己的文件只许放在专属目录(默认 data/dashboard/)。
+    G8 第 3 轮(High):白名单根目录自己被 resolve() 之后再比较,若 data/dashboard 是指向 data/state 的 junction,
+    白名单与令牌会一起落到 data/state,校验反而通过。现在:① 按**字面路径**比较(不跟随链接);
+    ② 从 data/ 往下到令牌所在目录的每一级都不得是符号链接/junction;③ 解析后的位置仍须在专属目录内。
     """
     token_dir = paths["token_file"].parent
-    guarded = [paths["state_dir"], paths["recording_dir"], paths["research_config"].parent, *paths["log_dirs"],
-               *(root / d for d in _TRADING_SIDE_DIRS), *(root / d for d in _RESEARCH_DIRS)]
-    for d in guarded:
-        d = d.resolve()
-        if token_dir == d or d in token_dir.parents:
-            raise ConfigError(f"令牌文件不能放在交易侧目录 {d.relative_to(root) if root in d.parents else d} 里(创建它就是在写交易系统的目录);"
-                              "请放在面板专属目录,例如 data/dashboard/")
+    lexical = Path(os.path.abspath(root / rel)) if rel is not None else paths["token_file"]
+    lexical_allowed = Path(os.path.abspath(root / DASHBOARD_DIR))
+    lexical_dir = lexical.parent
+    if lexical_dir != lexical_allowed and lexical_allowed not in lexical_dir.parents:
+        raise ConfigError(f"令牌文件只能放在面板专属目录 {DASHBOARD_DIR}/ 之下(收到 {lexical.relative_to(root) if root in lexical.parents else lexical});"
+                          "放在别处就是在写交易系统或其他进程的目录")
+    node = lexical_dir
+    while node != root and root in node.parents:               # 从令牌目录一路检查到项目根之下第一级
+        if _is_link(node):
+            raise ConfigError(f"令牌文件所在路径里有符号链接或 junction({node.relative_to(root)}):它可能把令牌写进交易侧目录;请改用真实目录")
+        node = node.parent
+    resolved_allowed = (root / DASHBOARD_DIR).resolve()
+    if token_dir != resolved_allowed and resolved_allowed not in token_dir.parents:
+        raise ConfigError(f"令牌文件解析后不在面板专属目录 {DASHBOARD_DIR}/ 之内")
+    if resolved_allowed != lexical_allowed:                    # 白名单根自己被重定向
+        raise ConfigError(f"面板专属目录 {DASHBOARD_DIR}/ 被链接到别处,令牌可能写进交易侧目录")
+
+
+def verify_token_location(settings: "Settings") -> None:
+    """创建令牌前再验一次:配置加载与实际创建之间,目录可能被换成链接。"""
+    _check_token_location(settings.paths, settings.root, settings.raw["token_file"])

@@ -18,13 +18,14 @@ invest 是一套自动交易系统(vn.py + CTP)。交易、风控、录制、研
 | 2 | [`01-product-spec.md`](01-product-spec.md) | 前端、产品 | 信息架构、每个页面的内容、状态与交互、文案、视觉约束 |
 | 3 | [`02-api-contract.md`](02-api-contract.md) | 前端、后端 | 通用约定:鉴权、区块模型、错误、时间、轮询、写操作规则 |
 | 4 | [`status-api.openapi.json`](status-api.openapi.json) | 前端、后端 | **机器可读的契约**,22 个接口、37 个数据模型,每个接口标注阶段与角色 |
-| 5 | [`fixtures/`](fixtures/) | 前端 | 39 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)+ `manifest.json` |
+| 5 | [`fixtures/`](fixtures/) | 前端 | 40 个示例响应(含缺失、过期、损坏、硬锁定等异常状态)+ `manifest.json` |
 | 6 | [`03-frontend-handoff.md`](03-frontend-handoff.md) | 前端 | 技术约束、安全清单、目录与构建、联调流程、验收清单 |
 | 7 | [`04-phases.md`](04-phases.md) | 所有人 | 五个阶段各自的范围、前置条件、后端工作、风险 |
 | 8 | [`05-lovable-guide.md`](05-lovable-guide.md) | **用 Lovable 构建前端的人** | 风险(真实数据不能进 Lovable、导出物默认带外部依赖)、总流程、项目约束、导出审计、联调 |
 | 9 | [`06-design-system.md`](06-design-system.md) | 前端、设计 | 设计令牌(对比度实测)、玻璃拟态规则与降级、状态的视觉表达、Bento 布局、组件清单 |
 | 10 | [`07-lovable-prompts.md`](07-lovable-prompts.md) | 用 Lovable 的人 | P0–P14 提示词包,每步带验收点;偏离约束时的纠正话术 |
-| 11 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 严格模式编译通过) |
+| 11 | [`08-evolution-views.md`](08-evolution-views.md) | 前端 | **进化引擎三个视图**:进化曲线、参数热力图、代码与变异日志(数据来自毕昇工作流) |
+| 12 | [`lovable-seed/`](lovable-seed/) | 用 Lovable 的人 | 由契约生成的 `api-types.ts`、示例数据、示例清单(经 TypeScript 5.6 严格模式编译验证,2026-11-13;`tests/test_lovable_seed_typescript.py` 在装了 tsc 的环境里会再编译一遍) |
 
 契约由测试守住:`tests/test_web_contract.py` 校验每个示例都符合 OpenAPI 里的模型,并校验 `lovable-seed/` 与契约同步(不同步则失败,重新生成:`python tools/webgen/gen_lovable_seed.py`)。前端导出物入库前必须通过 `tools/audit_frontend_export.py`。**改接口先改 OpenAPI 和示例,测试通过再改实现。**
 
@@ -94,6 +95,18 @@ flowchart LR
 
 ## 现状
 
-- 契约、示例数据、契约测试已就绪,可以立即开始用示例数据做前端。
-- 后端实现尚未开始,等 ADR(`docs/adr/20261112-status-dashboard.md`)确认。
-- 阶段①的后端任务分解见 `docs/plans/20261112-status-dashboard-plan.md`。
+- 契约、示例数据(40 个)、契约测试、设计系统、Lovable 提示词包都已就绪,可以立即开始用示例数据做前端。
+- **阶段①后端已实现**(2026-11-12):`python scripts/status_server.py` 在本机 `127.0.0.1:8770` 提供全部阶段①接口,令牌自动生成在 `data/dashboard/status.token`(不入库,内容不打印)。
+  前端联调时让浏览器访问该地址,在令牌输入框里粘贴令牌。后端尚未对接前端构建产物,`/` 显示占位页。
+- 后端的真实行为比示例数据更严格,**前端要按下面几点处理**(都已写进契约 `02-api-contract.md` §10.1,并有对应示例):
+  - `state=corrupt` 的触发条件比想象的多:心跳内容非法或时间在未来、日志存在但读不懂、批准记录损坏、录制 `stopped` 却没有终态时间。
+  - **进程在跑不等于数据新鲜**:示例 `trading-guard-stale` 里 `heartbeat.process=running`,但风控状态文件已落后一天,区块是 `stale`——权益、盈亏不能当作当前值。先看区块 `state` 和各块自己的年龄,不要只看 `heartbeat.process`。
+  - `HEAD` 只验证令牌,恒 200,不反映数据是否存在;不要用它做健康检查。
+  - 总体级别里,录制与研究是可选子系统:未部署(`state=missing`)时不计入总体级别,但它们的卡片仍要显示『缺失』。
+- **后端的 G8 审查已过线,但联调时仍请把它当作『会出错的数据源』来写前端**:codex 十六轮复核的评分是 6.0/10 → 36.5/50 → 42.5/50 → 43.7/50 → 44.6/50 → 42.8/50 → 44.5/50 → 44.4/50 → 43.9/50 → 44.1/50 → 44.3/50 → 42.9/50 → 45.3/50 → 45.4 → 45.6 → **46.0/50**;Gemini 侧复核 **45/50**。两轮都已达到 ≥45 可发布档,发现的问题也都已修。前端的『状态语义』测试(未知取值回退 unknown、过期不显示绿色)不能因为『后端会保证』而省略。
+- **连续段的口径已定(用户 2026-11-13 拍板)**:只有严重事件才打断连续段,警告不打断,但 `streak_warning_count` 必须和连续段一起显示(如『连续无严重事件 2/5 天,期间 21 次警告』),不能把放宽的口径藏起来。
+- 后端任务分解、执行记录与未修问题清单见 `docs/plans/20261112-status-dashboard-plan.md`。
+- 阶段②–⑤ 的后端尚未开始。
+- **进化引擎的读取侧已就绪,数据还没有**(2026-11-13):新增 6 个只读接口(战役列表、进化曲线、变异日志、参数热力图、候选源码、候选差异,`x-phase: 4`),
+  契约、12 份示例数据与种子已同步;路由按仓库约定由配置开关 `evolution.enabled` 控制(阶段④上线才注册),`capabilities.evolution` 告诉前端是否显示入口。**引擎侧(毕昇工作流与研究网关)还没开工产生这些文件**,所以线上取不到数据——前端用示例数据开发即可。
+  三个视图的规格见 [`08-evolution-views.md`](08-evolution-views.md);边界见 ADR `docs/adr/20261113-evolution-dashboard.md`。

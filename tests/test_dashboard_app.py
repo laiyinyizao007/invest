@@ -29,7 +29,7 @@ def env(tmp_path):
     st.mkdir(parents=True)
     (st / "heartbeat").write_text(str(NOW - 4), encoding="utf-8")
     (st / "account_guard.json").write_text(json.dumps({
-        "account_id": ACCOUNT, "last_equity": 9870.5, "peak_equity": 10120.0, "day": "2026-11-13", "day_start_equity": 10000.0,
+        "sampled_at": "2027-01-15T16:00:00+08:00", "account_id": ACCOUNT, "last_equity": 9870.5, "peak_equity": 10120.0, "day": "2026-11-13", "day_start_equity": 10000.0,
         "daily_locked_day": None, "hard_locked": False, "hard_reason": ""}), encoding="utf-8")
     import os
     os.utime(st / "account_guard.json", (NOW - 3, NOW - 3))        # NOW 是虚构的 2027 年;真实 mtime 会被正确判为落后几个月
@@ -418,3 +418,115 @@ def test_every_api_route_declares_the_auth_dependency(env):
     for r in api_routes:
         deps = [d.call for d in r.dependant.dependencies]
         assert app.state.require_token in deps, r.path
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex #9 #11)
+
+def test_a_static_file_replaced_after_startup_is_no_longer_served(env):
+    """曾经:清单哈希只在创建应用时校验一次,之后文件被替换仍会未经鉴权公开返回(还带一年 immutable 缓存)。"""
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"console.log('SAFE')"})
+    c = client(settings)
+    assert c.get("/assets/app.js").status_code == 200
+    (d / "assets" / "app.js").write_bytes(b"SECRET C:\Users\alice\.env TOKEN=abc")             # 启动之后被替换
+    r = c.get("/assets/app.js")
+    assert r.status_code == 404 and "SECRET" not in r.text
+
+
+def test_a_static_file_replaced_by_same_size_content_with_restored_mtime_is_still_rejected(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"AAAA"})
+    c = client(settings)
+    st = (d / "assets" / "app.js").stat()
+    (d / "assets" / "app.js").write_bytes(b"BBBB")
+    import os
+    os.utime(d / "assets" / "app.js", ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert c.get("/assets/app.js").status_code == 404
+
+
+def test_a_deleted_static_file_is_a_404_not_a_500(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"1"})
+    c = client(settings)
+    (d / "assets" / "app.js").unlink()
+    assert c.get("/assets/app.js").status_code == 404
+
+
+def test_index_html_replaced_after_startup_falls_back_to_the_placeholder_not_the_tampered_page(env):
+    tmp, settings = env
+    d = build_static(tmp, {"index.html": b"<title>app</title>"})
+    c = client(settings)
+    (d / "index.html").write_bytes(b"<script>steal()</script>")
+    assert "steal()" not in c.get("/").text and "steal()" not in c.get("/trading").text
+
+
+def test_head_on_an_api_route_requires_auth_and_sends_no_body_at_the_asgi_level(env):
+    """曾经:HEAD 会执行完整采集,并在 ASGI 层发出完整 JSON body(真实 uvicorn 会丢弃,但应用本身语义不对)。"""
+    _, settings = env
+    app = appmodapp(settings)
+    status, _ = raw_method(app, "HEAD", "/api/overview")
+    assert status == 401                                                 # 无令牌:HEAD 同样要鉴权(错误响应可以带说明正文)
+    status, body = raw_method(app, "HEAD", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert status == 200 and body == ""                                  # 有令牌:成功的 HEAD 没有 body
+
+
+def test_head_does_not_run_the_expensive_collectors(env, monkeypatch):
+    _, settings = env
+    calls = []
+    monkeypatch.setattr(appmod.col, "collect_overview", lambda *a, **k: (calls.append(1), {})[1])
+    app = appmodapp(settings)
+    raw_method(app, "HEAD", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert calls == []
+    raw_method(app, "GET", "/api/overview", headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert calls == [1]
+
+
+def appmodapp(settings):
+    return appmod.create_app(settings, TOKEN, clock=lambda: NOW)
+
+
+def raw_method(app, method, path, headers=()):
+    import asyncio
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method, "scheme": "http", "path": path,
+             "raw_path": path.encode(), "query_string": b"", "headers": [(b"host", b"127.0.0.1")] + list(headers),
+             "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8770)}
+    out = {"status": None, "body": b""}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+
+    asyncio.run(app(scope, receive, send))
+    return out["status"], out["body"].decode("utf-8", "replace")
+
+
+def test_a_static_file_replaced_by_a_symlink_to_the_outside_after_startup_is_not_served(env):
+    """(c) 复核:启动时文件在静态目录里、哈希对得上;之后被换成指向目录外文件的符号链接——即使目标内容的哈希恰好相同,
+    也不能服务(符号链接的目标可能被别人改)。"""
+    import os
+    tmp, settings = env
+    body = b"console.log('same bytes')"
+    d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": body})
+    outside = tmp / "outside.js"
+    outside.write_bytes(body)                                          # 内容与清单里的哈希完全相同
+    c = client(settings)
+    assert c.get("/assets/app.js").status_code == 200
+    (d / "assets" / "app.js").unlink()
+    try:
+        os.symlink(outside, d / "assets" / "app.js")
+    except (OSError, NotImplementedError):
+        import pytest
+        pytest.skip("本机不允许创建符号链接")
+    assert c.get("/assets/app.js").status_code == 404
+
+
+def test_the_evolution_page_path_serves_the_frontend_page(env):
+    """进化视图的前端页面路径:后端阶段④的接口路由随阶段上线,但**页面路径**要能深链接(与 live/equity 等同样处理)。"""
+    _, settings = env
+    r = client(settings).get("/research/evolution")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]

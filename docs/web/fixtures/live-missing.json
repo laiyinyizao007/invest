@@ -4,5 +4,6 @@
   "age_seconds": null,
   "stale_after_seconds": 60.0,
   "message": "实时快照文件不存在(运行时未开启快照,或阶段②尚未启用)",
-  "data": null
+  "data": null,
+  "level": "unknown"
 }

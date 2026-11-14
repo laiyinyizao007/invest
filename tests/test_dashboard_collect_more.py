@@ -6,6 +6,7 @@ import os
 import pytest
 
 from dashboard import collectors as col, config
+from risk.report import backtest_stats_row
 
 NOW = 1_800_000_000.0
 
@@ -27,7 +28,8 @@ def rec(tmp_path, **over):
     d.mkdir(parents=True, exist_ok=True)
     from datetime import datetime, timezone
     hb = datetime.fromtimestamp(NOW - 5, timezone.utc).isoformat(timespec="seconds")
-    data = {"pid": 4242, "started_at": "2026-11-13T01:00:00+00:00", "status": "recording", "profile": "simnow",
+    # started_at 取很早的时间:用例会把 heartbeat_at 覆盖成各种较早的值,而『开始时间不得晚于心跳』是面板的一致性规则
+    data = {"pid": 4242, "started_at": "2020-01-01T00:00:00+00:00", "status": "recording", "profile": "simnow",
             "symbols": ["C2701.DCE", "MA701.CZCE"], "database_dir": r"C:\Dev\x\.vntrader_record", "last_tick": "2026-11-13T09:00:01",
             "last_bar": "2026-11-13T09:00:00", "last_error": None, "heartbeat_at": hb, "data_warning": None}
     data.update(over)
@@ -74,7 +76,10 @@ def test_recording_missing_and_corrupt(tmp_path):
 
 def test_recording_unknown_status_value_is_not_reported_as_healthy(tmp_path):
     rec(tmp_path, status="future_status")
-    assert col.collect_recording(S(tmp_path), NOW).level != "ok"
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.level != "ok"
+    # 契约规定前端『先看 state』:认不出来的状态 = 无法判断,区块状态不能是 ok(否则渲染成绿卡片)
+    assert r.section["state"] != "ok"
 
 
 # ---------------------------------------------------------------- 研究
@@ -83,6 +88,9 @@ def res(tmp_path, runs=(), ledger=(), pending=None, approvals=None):
     base = tmp_path / "data" / "research"
     base.mkdir(parents=True, exist_ok=True)
     for rid, body in runs:
+        if isinstance(body, dict) and "run_id" not in body and not body.get("_no_run_id"):
+            body = {**body, "run_id": rid}                       # 真实产出里 save_result 一定写入 run_id
+        body = {k: v for k, v in body.items() if k != "_no_run_id"} if isinstance(body, dict) else body
         (base / f"{rid}.json").write_text(json.dumps(body), encoding="utf-8")
     if ledger:
         (base / "submissions.jsonl").write_text("\n".join(json.dumps(x) if isinstance(x, dict) else x for x in ledger) + "\n", encoding="utf-8")
@@ -97,7 +105,7 @@ def res(tmp_path, runs=(), ledger=(), pending=None, approvals=None):
         (ctl / "approvals.json").write_text(json.dumps(approvals), encoding="utf-8")
 
 
-RUN = {"kind": "evaluate", "status": "ok", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64,
+RUN = {"kind": "evaluate", "passed": False, "strategy_file": "demo.py", "strategy_sha256": "a" * 64, "ran_at": "2026-11-12T21:00:00",
        "report": "候选评估\n结论: 未通过(3 项未过)\n样本外夏普 -1.84", "failures": ["f1", "f2"], "params": {"n": 72},
        "metrics": {"oos_sharpe": -1.84}, "diagnosis": {"weakest": "drawdown"}, "selection": None, "windows": None}
 RID = "20261112-210000-000000"
@@ -180,7 +188,9 @@ def write_guard(tmp_path, **over):
     """写风控状态文件,mtime 对齐到测试时钟(NOW 是虚构的 2027 年;真实 mtime 会被正确判为落后几个月)。"""
     st = tmp_path / "data" / "state"
     st.mkdir(parents=True, exist_ok=True)
-    data = {"account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d", "day_start_equity": 1.0, "hard_locked": False}
+    from datetime import datetime, timedelta, timezone
+    sampled_at = datetime.fromtimestamp(NOW - 2, timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    data = {"sampled_at": sampled_at, "account_id": "1", "last_equity": 1.0, "peak_equity": 1.0, "day": "d", "day_start_equity": 1.0, "hard_locked": False}
     data.update(over)
     p = st / "account_guard.json"
     p.write_text(json.dumps(data), encoding="utf-8")
@@ -205,6 +215,8 @@ def test_overview_is_ok_only_when_core_sections_are_ok_and_optional_ones_may_be_
     o = col.collect_overview(S(tmp_path), NOW)
     assert o["level"] == "ok" and o["reasons"] == []
     assert o["sections"]["recording"]["state"] == "missing" and o["sections"]["research"]["state"] == "missing"
+    assert o["level"] == "ok"
+    # evolution 由 evolution.enabled 门控:阶段①默认关着,总览里就不该出现它
     assert set(o["sections"]) == {"trading", "alerts", "days", "recording", "research"}
 
 
@@ -269,15 +281,17 @@ def test_a_run_file_that_is_a_symlink_pointing_outside_the_results_dir_is_not_re
     assert "OUTSIDE-SECRET" not in json.dumps(col.collect_research(S(tmp_path), NOW).section, ensure_ascii=False)
 
 
-def test_sha_cache_is_bounded(tmp_path):
-    col._SHA_CACHE.clear()
-    pend = tmp_path / "pending_strategies"
-    pend.mkdir()
-    for i in range(col.SHA_CACHE_MAX + 50):
-        f = pend / f"s{i}.py"
-        f.write_bytes(f"x = {i}\n".encode())
-        col._sha256(f)
-    assert len(col._SHA_CACHE) <= col.SHA_CACHE_MAX
+def test_candidate_hashes_are_never_cached_because_approved_is_a_security_relevant_status(tmp_path):
+    """G8 第 2 轮审查:曾按 (路径, mtime, size) 缓存哈希,同长度改动并恢复 mtime 后『已批准』会继续显示。
+    这条测试把『不缓存』的决定固化下来:同一个文件,内容变了(即使 mtime 与大小都没变),下一次读取必须反映新内容。"""
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x=1\n")
+    first = col._sha256(f)
+    st = f.stat()
+    f.write_bytes(b"x=2\n")
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert col._sha256(f) != first
+    assert not hasattr(col, "_SHA_CACHE")
 
 
 def test_alerts_with_an_outbox_but_no_logs_cannot_claim_there_are_no_new_alerts(tmp_path):
@@ -319,3 +333,184 @@ def test_legitimate_files_are_still_found_when_the_project_root_itself_is_reache
     d = col.collect_research(settings(link_root), NOW).section["data"]
     assert [r["run_id"] for r in d["recent_runs"]] == [RID] and [p["name"] for p in d["pending"]] == ["demo.py"]
     assert col.get_run(settings(link_root), RID)["run_id"] == RID
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex):录制 stopped / 研究完整性
+
+def test_stopped_without_any_timestamp_proves_nothing_and_is_not_ok(tmp_path):
+    """曾经:{"status": "stopped"} 单独一行就返回 state=ok、level=ok、as_of=null。"""
+    d = tmp_path / ".ops" / "recording"
+    d.mkdir(parents=True)
+    (d / "status.json").write_text(json.dumps({"status": "stopped"}), encoding="utf-8")
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.section["state"] != "ok" and r.level == "unknown"
+
+
+def test_stopped_with_a_valid_final_timestamp_is_a_normal_inactive_state_with_as_of(tmp_path):
+    rec(tmp_path, status="stopped", heartbeat_at="2026-11-12T00:00:00+00:00")
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.section["state"] == "ok" and r.level == "ok" and r.section["as_of"] is not None
+    assert r.section["data"]["wrapper_running"] is False
+
+
+def test_contradictory_timestamps_are_corrupt(tmp_path):
+    """started_at 晚于 heartbeat_at:文件内部矛盾。"""
+    rec(tmp_path, started_at="2026-11-13T05:00:00+00:00", heartbeat_at="2026-11-13T01:00:00+00:00")
+    assert col.collect_recording(S(tmp_path), NOW).section["state"] == "corrupt"
+
+
+def test_a_recording_heartbeat_far_in_the_future_is_not_fresh(tmp_path):
+    rec(tmp_path, heartbeat_at="2099-01-01T00:00:00+00:00")
+    r = col.collect_recording(S(tmp_path), NOW)
+    assert r.section["state"] in ("corrupt", "unknown") and r.level == "unknown"
+
+
+def test_corrupt_approvals_make_the_research_section_corrupt_not_zero_approvals(tmp_path):
+    """曾经:approvals.json 损坏被解释成『0 个批准』,section 仍是 ok。"""
+    res(tmp_path, pending={"demo.py": "x = 1\n"})
+    ctl = tmp_path / "data" / "research-control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    (ctl / "approvals.json").write_text("{broken", encoding="utf-8")
+    r = col.collect_research(S(tmp_path), NOW)
+    assert r.section["state"] == "corrupt" and r.section["data"] is None and r.level == "unknown"
+
+
+def test_missing_approvals_file_simply_means_nothing_is_approved(tmp_path):
+    res(tmp_path, pending={"demo.py": "x = 1\n"})
+    r = col.collect_research(S(tmp_path), NOW)
+    assert r.section["state"] == "ok" and r.section["data"]["pending"][0]["approved"] is False
+
+
+def test_unreadable_run_files_are_counted_and_surfaced_not_silently_dropped(tmp_path):
+    res(tmp_path, runs=[(RID, RUN)])
+    (tmp_path / "data" / "research" / "20261112-220000-000000.json").write_text("{bad", encoding="utf-8")
+    r = col.collect_research(S(tmp_path), NOW)
+    assert [x["run_id"] for x in r.section["data"]["recent_runs"]] == [RID]
+    assert r.level == "warn" and "1" in r.headline or any("损坏" in x["text"] for x in r.reasons)
+    assert "损坏" in (r.section["message"] or "")
+
+
+def test_unreadable_pending_candidates_are_surfaced(tmp_path):
+    res(tmp_path, pending={"ok.py": "x = 1\n"})
+    big = tmp_path / "pending_strategies" / "huge.py"
+    big.write_bytes(b"#" * (col.MAX_SOURCE_BYTES + 10))
+    r = col.collect_research(S(tmp_path), NOW)
+    assert [p["name"] for p in r.section["data"]["pending"]] == ["ok.py"]
+    assert r.level == "warn" and "huge.py" not in json.dumps(r.section, ensure_ascii=False)
+
+
+def test_an_edited_candidate_with_restored_mtime_and_same_size_is_no_longer_shown_as_approved(tmp_path):
+    """曾经:SHA 缓存按 (路径, mtime, size) 命中,同长度改动并恢复 mtime 后仍显示 approved=true。现在每次请求重新哈希。"""
+    import hashlib
+    res(tmp_path, pending={"a.py": "x=1\n"})
+    p = tmp_path / "pending_strategies" / "a.py"
+    sha = hashlib.sha256(p.read_bytes()).hexdigest()
+    ctl = tmp_path / "data" / "research-control"
+    ctl.mkdir(parents=True, exist_ok=True)
+    (ctl / "approvals.json").write_text(json.dumps({sha: {"name": "a.py"}}), encoding="utf-8")
+    assert col.collect_research(S(tmp_path), NOW).section["data"]["pending"][0]["approved"] is True
+    st = p.stat()
+    p.write_bytes(b"x=2\n")                                          # 同长度
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))                 # 恢复 mtime
+    assert col.collect_research(S(tmp_path), NOW).section["data"]["pending"][0]["approved"] is False
+
+
+# ---- G8 第 3 轮 #8:运行结果必须符合结构,不能把 {} 显示成正常的 backtest ----
+def _runs_of(tmp_path):
+    r = col.collect_research(S(tmp_path), NOW)
+    return r, r.section["data"]["recent_runs"]
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"kind": "mystery", "strategy_file": "d.py"}, {"kind": "gate"}, {"kind": "gate", "passed": "yes", "strategy_file": "d.py"},
+    {"kind": "evaluate", "strategy_file": "d.py"}, {"kind": "backtest", "strategy_file": "d.py"},
+    {"kind": "gate", "passed": True, "strategy_file": 7}, [], "text", {"kind": "gate", "passed": True, "strategy_file": "d.py", "run_id": "20200101-000000-000000"},
+])
+def test_a_run_result_that_does_not_match_the_schema_is_unreadable_not_a_normal_backtest(tmp_path, body):
+    res(tmp_path, runs=[(RID, body)])
+    r, runs = _runs_of(tmp_path)
+    assert runs == []
+    assert r.level == "warn" and "无法读取" in r.section["message"]
+    assert col.get_run(S(tmp_path), RID) is None
+
+
+def test_valid_runs_of_each_kind_are_accepted(tmp_path):
+    base = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00", "report": "结论: x"}
+    ok = [("20261112-210000-000001", {**base, "kind": "backtest", "stats": backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2, "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0, "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})}),
+          ("20261112-210000-000002", {**base, "kind": "backtest", "status": "strategy_error", "error": {"type": "X", "message": "m"}}),
+          ("20261112-210000-000003", {**base, "kind": "gate", "passed": False, "failures": ["f"]}),
+          ("20261112-210000-000005", {**base, "kind": "evaluate", "status": "strategy_error", "passed": False, "error": {"type": "X", "message": "m"}}),
+          ("20261112-210000-000004", RUN)]
+    res(tmp_path, runs=ok)
+    r, runs = _runs_of(tmp_path)
+    assert len(runs) == 5 and r.level == "ok"
+
+
+@pytest.mark.parametrize("patch", [
+    {"_no_run_id": True}, {"run_id": "20200101-000000-000000"}, {"strategy_file": ""}, {"strategy_file": "a/b.py"}, {"strategy_file": "x.txt"},
+    {"strategy_sha256": "xyz"}, {"strategy_sha256": None}, {"report": None}, {"report": ""}, {"failures": None}, {"failures": "f"},
+])
+def test_a_minimal_gate_result_missing_required_fields_is_not_accepted_as_a_pass(tmp_path, patch):
+    """codex 第 3 轮复核 #8:只有 kind/strategy_file/passed 的残缺文件曾显示成『通过』。"""
+    body = {"kind": "gate", "passed": True, "strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r", "failures": [], "ran_at": "x"}
+    body.update(patch)
+    res(tmp_path, runs=[(RID, body)])
+    r, runs = _runs_of(tmp_path)
+    assert runs == [] and r.level == "warn"
+
+
+@pytest.mark.parametrize("body", [
+    {"kind": "backtest", "stats": {}}, {"kind": "backtest", "stats": []}, {"kind": "backtest", "status": "strategy_error"},
+    {"kind": "evaluate", "status": "strategy_error", "passed": False},
+])
+def test_empty_stats_or_a_strategy_error_without_error_detail_is_not_accepted(tmp_path, body):
+    full = {"strategy_file": "d.py", "strategy_sha256": "b" * 64, "report": "r", "ran_at": "x", **body}
+    res(tmp_path, runs=[(RID, full)])
+    assert _runs_of(tmp_path)[1] == []
+
+
+def test_invalid_runs_older_than_the_displayed_window_are_still_counted(tmp_path):
+    """曾经只检查最近 N 个文件:更早的损坏文件永远不会被发现。"""
+    good = [(f"20261112-2100{i:02d}-000000", RUN) for i in range(12)]
+    bad = [("20261101-000000-000000", {})]
+    res(tmp_path, runs=good + bad)
+    r, runs = _runs_of(tmp_path)
+    assert len(runs) == 10 and r.level == "warn" and "1 个运行结果" in r.section["message"]
+
+
+def test_an_oversized_document_is_marked_as_truncated_not_silently_cut(tmp_path):
+    """运行手册被砍掉一半还显示成完整的一篇,人会照着缺步骤的操作——必须能看出来。"""
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("x" * (col.MAX_DOC_BYTES + 100), encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is True
+    assert len(d["markdown"]) == col.MAX_DOC_BYTES
+
+
+def test_a_document_within_the_limit_is_not_marked_truncated(tmp_path):
+    from dashboard import collectors as col
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "unattended-log.md").write_text("# 标题\n正文\n", encoding="utf-8")
+    s = config.load(path=tmp_path / "none.json", root=tmp_path)
+    s.raw["docs"]["unattended-log"] = docs / "unattended-log.md"
+    d = col.get_doc(s, "unattended-log")
+    assert d is not None and d["truncated"] is False and d["markdown"].startswith("# 标题")
+
+
+def test_the_run_detail_exposes_the_backtest_statistics(tmp_path):
+    """回测的数字在 stats 里(收益/夏普/往返笔数)。少了它,前端只能从报告文本里读,画不了图。"""
+    row = backtest_stats_row({"total_trade_count": 156, "end_balance": 20000.0, "sharpe_ratio": 1.2,
+                               "total_return": 0.1, "max_ddpercent": -12.5, "max_drawdown": -2500.0,
+                               "total_net_pnl": 200.0, "total_commission": 100.0, "total_slippage": 50.0})
+    res(tmp_path, runs=[(RID, {"kind": "backtest", "strategy_file": "d.py",
+                               "strategy_sha256": "b" * 64, "ran_at": "2026-11-12T21:00:00",
+                               "report": "沙盒回测", "stats": row})])
+    d = col.get_run(S(tmp_path), RID)
+    assert d is not None and d["stats"] is not None
+    assert d["stats"]["round_trips"] == 78 and d["stats"]["sharpe"] == 1.2
+    assert d["metrics"] is None

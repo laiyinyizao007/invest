@@ -72,7 +72,7 @@ flowchart TB
 | `ok` | 一切正常 | 所有区块新鲜且无异常 |
 | `warn` | 需要关注 | 有警告级事件、待补发告警、录制停滞等 |
 | `critical` | 严重 | 硬锁定、当日熔断、紧急平仓失败、对账失败等 |
-| `unknown` | 无法判断 | 关键数据缺失或过期(例如心跳文件不存在) |
+| `unknown` | 无法判断 | 关键数据缺失、过期,或**有内容读不出来**(例如心跳文件不存在、某天的日志读不懂) |
 
 **`unknown` 不能画成 `ok` 的变体。** 用独立的灰色 + 问号图标 + 文案『无法判断』。
 
@@ -123,8 +123,10 @@ flowchart TB
 - **数据**:`GET /api/overview`(+ `GET /api/meta`)。示例:`overview-ok`、`overview-warn-unknown`、`overview-critical`。
 - **内容**:
   1. 环境横幅 + 总状态条(见 §4)。
-  2. 五张摘要卡:交易与风控、告警、无人值守、行情录制、研究沙盒。每张显示 `headline`、区块状态徽标、右上『N 秒前』;点击进入对应页。
-  3. 卡片排序:`critical` → `warn` → `unknown` → `ok`;同级别按固定顺序。
+  2. 摘要卡:交易与风控、告警、无人值守、行情录制、研究沙盒(共五张);**`capabilities.evolution` 为真时多一张进化卡**(总览的 `sections` 里会多出 `evolution` 这一项,默认没有——前端要容忍它不存在)。每张显示 `headline`、区块状态徽标、右上『N 秒前』;点击进入对应页。
+     徽标用 `sections[n].level`(ok/warn/critical/unknown),不是 `state`——`state` 决定**内容能不能看**,`level` 决定**徽标**。例如『有些内容没列出来/没检查』是 `state=ok` + `level=warn`(内容照常显示,加警示徽标),而『有数据读不出来』是 `state=unknown`(内容仍给得出读得出来的部分,但要提示『部分数据无法读取』)。
+  3. 卡片排序:按 `sections[n].level` 的严重程度 `critical` → `unknown` → `warn` → `ok`;同级别按固定顺序。
+     **注意 `unknown` 比 `warn` 更严重**(服务器的口径:『不知道』比『知道有点问题』更危险,总状态条也是这么排的)。
 - **异常**:任一区块 `missing/corrupt` 时,该卡显示缺失/损坏态,且总状态条不得为 `ok`。
 - **交互**:自动刷新(间隔取 `meta.polling_hint_seconds`);标签页隐藏时暂停。
 
@@ -156,18 +158,25 @@ flowchart TB
 
 ### 6.4 无人值守 ①
 - **目的**:验收期每天看一眼:连续几天无异常?
-- **数据**:`GET /api/days?limit=14`。示例:`days-sample`。
+- **数据**:`GET /api/days?limit=14`。示例:`days-sample`(**含一天 `trusted=false` 的样例**,供前端看这种行怎么渲染)。
 - **内容**:
-  1. 顶部进度:`longest_clean_streak` / `required_streak`(如『1 / 5 天』)。
+  1. 顶部进度:`longest_clean_streak` / `required_streak`(如『1 / 5 天』)。**口径:只有严重事件才打断连续段,警告不打断**(用户 2026-11-13 拍板);但**必须同时显示 `streak_warning_count`**(如『期间 3 次警告』),不能让放宽的口径把警告藏起来。
   2. 每日表:日期、启动次数、成交笔数(0 显示 `—`)、事件(徽标列表,『无异常』用文字)、心跳。`has_severe` 的行整行加严重标记。
+     每行还有两个标记:`trusted`(false = 那天的日志不可信,**这一行不能显示成『无异常』**)与 `tail_uncertain`
+     (true = 只是最后一行还没写完,文件可能正在写)。不可信的行要给出提示(如『日志无法识别,这天无法判断』),
+     **不要**把它当成『无异常』,也不要当成『缺天』。
   3. 验收清单:`checklist[]`,`checked` 为 `true/false/null`,**`null` 显示『需人工核对』而不是未勾选**。
   4. `missing_weekdays`:『以下工作日没有日志:…』。
+     **口径**:按**实际存在的日志**算——某天有日志但内容不可信(损坏、尾部写到一半)时,它算『有日志但不可信』,
+     不算『缺天』。两种情况都不能被算作『无异常』,但文案不要混为一谈。
+- **每天的『无异常』**:只有当天**没有事件**、**且日志可信**才算无异常。日志不可信时(比如进程正好崩在写一半的行上),
+  那天不计入连续段,并在页面上说明原因——『没看到事件』不等于『没有事件』。
 - **提示**:本页是证据展示,不是证据生成;不提供导出以外的操作。
 
 ### 6.5 行情录制 ①
 - **目的**:录制进程是否在正常入库。
 - **数据**:`GET /api/recording`。示例:`recording-running`、`recording-stalled`、`recording-missing`。
-- **内容**:进程状态(`status`:running / stalled / starting …)、合约列表、最近 tick / bar 时间、最后错误、数据警告。
+- **内容**:进程状态(`status`:**starting / connecting / recording / connected / degraded / stalled / stopping / stopped**)、合约列表、最近 tick / bar 时间、最后错误、数据警告。**认不出的取值按 unknown 渲染**(服务端会把区块降级),不要为没出现过的取值写分支。
 - **异常**:`status=stalled` → 警告:『已连接但没有订阅到任何合约』;`missing` → 『录制未启动,或不在本机』。
 - **注意**:`last_tick` 为空是正常现象(非交易时段),不要标红;要结合 `status` 判断。
 
@@ -176,8 +185,10 @@ flowchart TB
 - **数据**:`GET /api/research`;点击某次运行 → `GET /api/research/runs/{run_id}`。示例:`research-sample`、`run-evaluate`。
 - **内容**:
   1. 迭代额度:`used / limit`(滚动 `window_hours` 小时),满额时显示『约 N 小时后释放』。
-  2. 待审候选:`pending[]` 名称、哈希前 8 位、是否已批准。**本页没有『批准』按钮**;批准只能在本机终端由人执行。
-  3. 最近运行:`recent_runs[]`,`passed` 为 `false` 用『未通过』、`null` 用『未判定』。
+  2. 待审候选:`pending[]` 名称、**完整哈希**(`sha256`,服务端给全的,显示时可只取前 8 位)、是否已批准。**按修改时间倒序**(最近的候选在最前,审阅新提交时最容易漏的就是它)。**本页没有『批准』按钮**;批准只能在本机终端由人执行。
+     候选超过显示上限时,区块的 `level` 是 `warn`、`message` 说明『有 N 个待审候选未列出』;真的有候选读不出来时 `state` 是 `unknown`。
+  3. 最近运行:`recent_runs[]`,**最近的 10 条**(按运行时间倒序)。`passed` 为 `false` 用『未通过』、`null` 用『未判定』(只有 backtest 没有『通过』这个概念,`passed` 恒为 `null`)。
+     服务端会校验最近 200 份结果文件;更早的没被校验时,区块 `level` 是 `warn` 并说明『有 N 个运行结果未检查』。
   4. 运行详情:`report` 是**确定性中文报告纯文本**,按原样显示(保留换行,等宽字体),下方列 `failures`。`metrics` / `diagnosis` 等对象阶段①只做键值表,不做图表(图表在阶段④)。
 - **安全**:`report` 中可能含策略报错信息,**按纯文本渲染**,不得解析为 HTML 或 Markdown 链接。
 
@@ -185,6 +196,7 @@ flowchart TB
 - **目的**:直接阅读 `unattended-log` 与 `simnow-drills` 两份验收证据。
 - **数据**:`GET /api/docs/{key}`。示例:`doc-unattended`。
 - **内容**:Markdown 渲染。**必须使用禁用原始 HTML 的渲染器**(如 markdown-it 的 `html:false`),并配单元测试:文档里的 `<script>` 必须显示为文字。链接一律不可点击出站(只允许站内锚点)。
+- **`truncated`**:文档超过大小上限会被截断。**为 `true` 时必须显示『已截断』提示**——半篇运行手册看起来是完整的一篇,人会照着缺步骤的操作。
 - **键白名单**:只有这两个 key;不提供任意文件浏览。
 
 ## 7. 页面规格:阶段②(实时数据)
@@ -238,6 +250,14 @@ flowchart TB
 ### 9.4 配置 ④
 - **数据**:`GET /api/config`。示例:`config-view`。
 - **内容**:生效的风控预算、合约、阈值。**只读展示,不是编辑器**;不含任何凭据、地址、路径。
+
+### 9.5 进化(曲线 / 热力图 / 变异日志) ④
+- **数据**:`GET /api/research/evolution`、`.../curve`、`.../log`、`GET /api/research/runs/{run_id}/heatmap`、`GET /api/research/candidates/{sha256}/code|diff`。
+  示例:`evolution-list`、`evolution-curve`、`evolution-curve-stagnant`、`evolution-log`、`evolution-heatmap`、`evolution-heatmap-plateau`、`candidate-code`、`candidate-diff`。
+- **内容**:三个视图合成一个页面(左上曲线、右上热力图、下方日志与代码)。
+- **谁在产生数据**:进化回路由**毕昇工作流**承载;面板只读,不驱动进化。
+- **写操作**:**没有**。页面上不得出现注入变异、淘汰、批准、回滚任何按钮。
+- **完整规格**见 [`08-evolution-views.md`](08-evolution-views.md)(含"怎么看好坏"与验收清单)。
 
 ## 10. 页面规格:阶段⑤(远程与多节点)
 

@@ -1,0 +1,59 @@
+{
+  "run_id": "20261112-210000-000003",
+  "axes": {
+    "x": {
+      "name": "breakout_n",
+      "values": [
+        48,
+        72,
+        96
+      ]
+    },
+    "y": {
+      "name": "atr_mult",
+      "values": [
+        1.5,
+        2.0,
+        2.5
+      ]
+    },
+    "z": {
+      "name": "slow_window",
+      "values": [
+        96,
+        192
+      ],
+      "selected": 0
+    }
+  },
+  "grid": [
+    [
+      1.12,
+      0.83,
+      0.21
+    ],
+    [
+      1.44,
+      1.06,
+      0.44
+    ],
+    [
+      null,
+      0.18,
+      null
+    ]
+  ],
+  "best_cell": [
+    0,
+    1,
+    0
+  ],
+  "on_plateau": false,
+  "valid_cells": 7,
+  "n_cells": 9,
+  "source_window": [
+    "2020-07-22",
+    "2022-06-30"
+  ],
+  "note": "分数来自选参窗口,不是样本外表现"
+}

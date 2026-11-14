@@ -733,3 +733,63 @@ def test_undirected_position_appearing_mid_flatten_cancels_the_resting_close_ord
     env.tick(seconds=1)
     assert env.gw.cancel_requests                               # 挂着的平仓单被撤
     assert "紧急平仓失败" in env.alert_titles()
+
+
+# ---------- G8 第 3 轮 #4:状态文件里的采样时间必须是『账户回报到达的时间』 ----------
+
+def _saved_sampled_at(env):
+    import json
+    raw = json.loads(env.state_file.read_text(encoding="utf-8"))["sampled_at"]
+    return datetime.fromisoformat(raw).replace(tzinfo=None) if raw else None
+
+
+def test_sampled_at_is_the_account_event_time_not_the_timer_time(env):
+    """网关断开后 vn.py 仍缓存着旧账户对象,定时器每秒照常读到它并落盘——文件在变新,权益却没有再被采样。"""
+    event_time = env.clock.dt
+    env.clock.dt = event_time.replace(minute=30)               # 此后再没有账户回报,只有定时器
+    env.tick(seconds=61)                                       # 超过 60 秒:会落盘
+    assert _saved_sampled_at(env) == event_time
+
+
+def test_a_new_account_event_advances_sampled_at(env):
+    env.clock.dt = env.clock.dt.replace(minute=30)
+    env.set_equity(10_010)
+    env.tick(seconds=61)
+    assert _saved_sampled_at(env) == env.clock.dt
+
+
+def test_account_events_for_other_accounts_do_not_count_as_a_sample(env):
+    from vnpy.trader.object import AccountData
+    t0 = env.clock.dt
+    env.rule.account_id = "SIM"
+    env.gw.on_account(AccountData(accountid="SIM", balance=10_000.0, frozen=0.0, gateway_name="FAKE"))
+    t0 = env.clock.dt
+    env.clock.dt = t0.replace(minute=45)
+    env.gw.on_account(AccountData(accountid="OTHER", balance=5.0, frozen=0.0, gateway_name="FAKE"))
+    env.tick(seconds=61)
+    assert _saved_sampled_at(env) == t0
+
+
+def test_another_accounts_events_never_refresh_the_displayed_accounts_sample_time(env):
+    """account_id 留空时规则取账户列表里第一个账户;别的账户的回报不能让它显得新鲜。"""
+    from vnpy.trader.object import AccountData
+    t0 = env.clock.dt
+    env.clock.dt = t0.replace(minute=45)
+    env.gw.on_account(AccountData(accountid="OTHER", balance=5.0, frozen=0.0, gateway_name="FAKE"))
+    env.tick(seconds=61)
+    assert _saved_sampled_at(env) == t0
+
+
+def test_cached_account_without_any_event_since_start_is_not_stamped_as_fresh(tmp_path):
+    """重启后没有收到任何账户回报,但 get_all_accounts 里已有缓存对象:采样时间不能是『现在』。"""
+    import json
+    e = Env(tmp_path)
+    try:
+        e.state_file.unlink(missing_ok=True)
+        e.rule._account_events.clear()
+        e.clock.dt = e.clock.dt.replace(minute=50)
+        e.tick(seconds=61)
+        saved = json.loads(e.state_file.read_text(encoding="utf-8")).get("sampled_at")
+        assert saved is None or datetime.fromisoformat(saved).replace(tzinfo=None) != e.clock.dt
+    finally:
+        e.main.close()

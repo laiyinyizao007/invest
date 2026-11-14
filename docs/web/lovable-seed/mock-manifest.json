@@ -49,6 +49,13 @@
     "note": "心跳已停 10 小时"
   },
   {
+    "fixture": "trading-guard-stale",
+    "method": "GET",
+    "path": "/api/trading",
+    "status": 200,
+    "note": "心跳新鲜(进程在跑)但风控状态文件已落后一天:权益数字不是当前值,区块 stale,前端不得显示『运行中』绿灯"
+  },
+  {
     "fixture": "trading-missing",
     "method": "GET",
     "path": "/api/trading",
@@ -271,5 +278,103 @@
     "path": "/api/whoami",
     "status": 200,
     "note": "阶段⑤ 当前用户"
+  },
+  {
+    "fixture": "evolution-list",
+    "method": "GET",
+    "path": "/api/research/evolution",
+    "status": 200,
+    "note": "有一个战役的进化列表"
+  },
+  {
+    "fixture": "evolution-list-empty",
+    "method": "GET",
+    "path": "/api/research/evolution",
+    "status": 200,
+    "note": "还没有任何战役(引擎侧还没跑)"
+  },
+  {
+    "fixture": "evolution-curve",
+    "method": "GET",
+    "path": "/api/research/evolution/{campaign_id}/curve",
+    "status": 200,
+    "note": "进化曲线:四代种群统计 + 过拟合提示"
+  },
+  {
+    "fixture": "evolution-curve-stagnant",
+    "method": "GET",
+    "path": "/api/research/evolution/{campaign_id}/curve",
+    "status": 200,
+    "note": "连续多代没有提升(停滞提示)"
+  },
+  {
+    "fixture": "evolution-log",
+    "method": "GET",
+    "path": "/api/research/evolution/{campaign_id}/log",
+    "status": 200,
+    "note": "变异日志:每一代的记录与反思"
+  },
+  {
+    "fixture": "evolution-log-page",
+    "method": "GET",
+    "path": "/api/research/evolution/{campaign_id}/log",
+    "status": 200,
+    "note": "变异日志的第一页(还有下一页)"
+  },
+  {
+    "fixture": "evolution-heatmap",
+    "method": "GET",
+    "path": "/api/research/runs/{run_id}/heatmap",
+    "status": 200,
+    "note": "参数热力图:有无效格子(null)"
+  },
+  {
+    "fixture": "evolution-heatmap-plateau",
+    "method": "GET",
+    "path": "/api/research/runs/{run_id}/heatmap",
+    "status": 200,
+    "note": "参数热力图:在参数高原上"
+  },
+  {
+    "fixture": "candidate-code",
+    "method": "GET",
+    "path": "/api/research/candidates/{sha256}/code",
+    "status": 200,
+    "note": "候选源码(带行号)"
+  },
+  {
+    "fixture": "candidate-code-missing",
+    "method": "GET",
+    "path": "/api/research/candidates/{sha256}/code",
+    "status": 200,
+    "note": "找不到该哈希的候选"
+  },
+  {
+    "fixture": "candidate-diff",
+    "method": "GET",
+    "path": "/api/research/candidates/{sha256}/diff",
+    "status": 200,
+    "note": "两个候选的差异"
+  },
+  {
+    "fixture": "candidate-diff-missing",
+    "method": "GET",
+    "path": "/api/research/candidates/{sha256}/diff",
+    "status": 200,
+    "note": "父代源码已不在,无法比较"
+  },
+  {
+    "fixture": "overview-with-evolution",
+    "method": "GET",
+    "path": "/api/overview",
+    "status": 200,
+    "note": "evolution.enabled 为真时的总览:多一段进化区块(默认关着时没有这一段)"
+  },
+  {
+    "fixture": "run-backtest",
+    "method": "GET",
+    "path": "/api/research/runs/{run_id}",
+    "status": 200,
+    "note": "一次回测的运行详情:回测的数字在 stats 里(不是 metrics)"
   }
 ]

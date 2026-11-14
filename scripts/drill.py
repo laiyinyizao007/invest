@@ -582,7 +582,11 @@ def _cancel_order(runtime, order_id: str, symbol: str, exchange: Exchange) -> No
     if not order_id:
         return
     try:
-        req = CancelRequest(orderid=order_id, symbol=symbol, exchange=exchange)
+        # send_order 返回的是 vt_orderid(`CTP.<前置>_<会话>_<序号>`),CancelRequest 要的是网关内的 orderid
+        # (`<前置>_<会话>_<序号>`);带着网关前缀去撤会在 vnpy_ctp 里 int() 解析失败,单子其实没撤掉
+        # (2026-11-13 SimNow 实测)。
+        raw_id = order_id.split(".", 1)[1] if order_id.startswith("CTP.") else order_id
+        req = CancelRequest(orderid=raw_id, symbol=symbol, exchange=exchange)
         runtime.main.cancel_order(req, "CTP")
     except Exception as exc:      # 撤单只是善后,失败不影响主结论
         print(f"撤单失败({order_id}): {exc!r}", file=sys.stderr)
