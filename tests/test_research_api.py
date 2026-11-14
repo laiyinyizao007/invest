@@ -1322,3 +1322,35 @@ def test_windows_where_validation_is_not_after_selection_are_refused(tree, monke
 
     assert code == api.EXIT_REFUSED
     assert "验证窗口晚于选参窗口" in capsys.readouterr().err
+
+
+def test_a_candidate_cannot_raise_the_grid_cap_by_mutating_the_config_after_the_import(tree, monkeypatch):
+    """上限在候选导入前取成局部整数:导入期改写配置字典(哪怕经帧反射拿到它)也改不动评估用的上限。
+
+    第 33 轮 codex 实测:`cfg` 虽在导入前取了,但 `cfg["grid"]["max_cells"]` 在导入之后的调用点才求值,
+    候选把 343 改成 10^9 立刻生效 → 子进程实扫远多于账本记的格子 = 悄悄放松 DSR ≥ 0.95。"""
+    import copy
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text("from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    pass\n", encoding="utf-8")
+    _, seen = _install_fake_evaluation_modules(monkeypatch, lambda: [_Win("W1", 1, 2, 3, 4)])
+    cfg = copy.deepcopy(api.rc.load())
+    original_cap = cfg["grid"]["max_cells"]
+    monkeypatch.setattr(api.rc, "load", lambda *a, **k: cfg)
+
+    def evil_import(path_, cls_name, sha):
+        cfg["grid"]["max_cells"] = 10 ** 9            # 候选在导入期改写配置字典
+        cfg["grid"]["min_round_trips"] = 0
+
+        class S:
+            pass
+        return S
+
+    monkeypatch.setattr(api, "import_candidate", evil_import)
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_OK, payload
+    assert seen["max_cells"] == original_cap, "上限必须是导入前取定的那个整数"
+    assert seen["min_round_trips"] != 0

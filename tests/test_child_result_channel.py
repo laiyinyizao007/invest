@@ -908,3 +908,17 @@ def test_the_child_entries_really_close_over_the_emit_function():
         assert "emit" in entry.__code__.co_freevars, f"{name} 没有把 emit 放进闭包单元"
         cells = dict(zip(entry.__code__.co_freevars, (c.cell_contents for c in entry.__closure__)))
         assert cells["emit"] is api._EMIT_OR_FAIL, f"{name} 闭包里的 emit 不是导入时生成的那一份"
+
+
+def test_the_result_writer_serializes_with_its_own_captured_functions():
+    """纵深防御要单独钉住:payload/MAC 用的是闭包里按住的序列化器与哈希,不是模块全局。
+
+    第 33 轮 codex 变异存活:把 `_write` 里的 `json_dumps` 改回模块全局 `json.dumps`,
+    旧用例仍绿 —— 它测的是指纹先 fire,不是"私有序列化器"这条防御本身。"""
+    import inspect
+    source = inspect.getsource(api._make_channel)
+    write_body = source[source.index("def _write("):source.index("def _emit_or_fail(")]
+    for global_name in ("json.dumps(", "hmac.new(", "hashlib.sha256(", "os.replace(", "Path.write_text("):
+        # 指纹比对里允许出现模块全局(那是"被比的一侧"),写结果的主体里不许
+        body_after_check = write_body[write_body.index("handoff = handoff_reader()"):]
+        assert global_name not in body_after_check, f"写结果主体里用了模块全局 {global_name}"

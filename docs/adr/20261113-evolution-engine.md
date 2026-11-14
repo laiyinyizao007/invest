@@ -855,7 +855,28 @@ DSR 的 N 偏小 = **悄悄放松**已锁定的 DSR ≥ 0.95(ADR 第 9 条),而�
 - **Low**:折行分隔符 `" / "` 会被路径脱敏正则吃成 `<路径>`,改 `" | "`。
 - **残余口径更正**:原写"候选可改写结果生产者(`research_gate.*`)",不够宽——codex 这一轮实测的是**序列化器**(`json.dumps`)与**评估输入**(`wf.*`)。准确说法:**候选可以产出假 body、可以影响框架算出的数字**;同进程内没有哪条通道能证明结果是真的。
 
-**变异验证**:M1–M25 逐条改回旧行为,对应用例均变红;**M20(目标名不递归取)现在是等价变异**——新的"出现次数"兜底把元组目标一并兜住,单独改回它不再变红,属纵深防御的冗余,保留用例但不再计作独立变异。M9 改为"指纹不再核对读交接单的入口"。M16 最初存活(只改了壳没改回传点),扩大变异范围后才变红;**用例绿不等于规则有判别力**。
+**变异验证**(M1–M20 见上表;第 32/33 轮新增,逐条改回旧行为 → 对应用例变红):
+
+| 变异 | 用例 |
+|---|---|
+| M21 读网格不再核对 `param_grid` 出现次数 | `test_any_other_mention_of_the_grid_makes_the_declared_size_unreadable` |
+| M22 指纹的期望值改回模块全局 | `test_a_candidate_that_hijacks_the_serializer_and_its_expected_value_cannot_forge_a_valid_mac` |
+| M23 评估输入改回导入后才读 | `test_a_candidate_cannot_change_the_validation_windows_by_rebinding_the_builder` |
+| M24 不再自查窗口不变量 | `test_windows_where_validation_is_not_after_selection_are_refused` |
+| M25 入口不再把 `emit` 放进闭包单元 | `test_the_child_entries_really_close_over_the_emit_function` |
+| M26 网格上限改回导入后才读 `cfg` | `test_a_candidate_cannot_raise_the_grid_cap_by_mutating_the_config_after_the_import` |
+| M27 payload 改回用模块全局 `json.dumps` | `test_the_result_writer_serializes_with_its_own_captured_functions` |
+
+M20(目标名不递归取)现为**等价变异**(出现次数兜底已包含它)。M27 最初**存活**:旧用例测的是"指纹先 fire",没钉住"私有序列化器"这条纵深防御本身,第 33 轮复审(codex)指出后补用例。
+
+#### 第 34 轮补记(codex 第 33 轮复审 34/50)—— **已修**与**未修(需裁决)**
+
+已修:`cfg["grid"]["max_cells"]` / `min_round_trips` 在候选导入前取成局部整数(此前 `cfg` 取了、但取值在导入后求值,帧反射可把 343 改成 10^9);补"私有序列化器"用例;残余口径加宽(见下)。
+
+**未修,需用户裁决或单独 Issue**(诚实登记,不假装已处理):
+1. **Critical:记账上界仍依赖候选可改写的模块**。候选改写 `research_grid.validate_grid` / `backtest_lib.run_engine_bars`(这些模块不在 `PROTECTED_RUNTIME_PACKAGES`)后,子进程可扫远多于账本记的格子(codex 实测实扫 5000 格、账本记 343)= DSR 的 N 偏小。codex 建议:父层"中途死掉"一律按 `max_cells` 记账 + `max_cells` 走命令行 + 扫描前核对函数身份 + 把这些模块纳入受保护包。**其中"一律按 `max_cells` 记账"与 M-1(崩溃轮被过记 12.7 倍,DSR(3.5) 在 N=344 时 0.8995 < 0.95,叠加已登记的 C3)直接冲突——这是记账口径的取舍,不由我单方面决定。**
+2. **Critical:模块黑名单被一行 `import logging` 绕过**(经它拿到 `os`/`sys`/`io`,可读整份行情含测试段、改价格文件、帧反射)。**同类漏洞在 `feat/26-helper-module-escape`(Issue #26,PR #27)已用 `ModuleView` + `DANGEROUS_MODULE_NAMES` 修好,本线没有这一层。**处理方式是合并顺序问题:先合 #27、再让本线 rebase——需用户授权合并,我不自行做。
+3. **根因**:候选与框架同进程。候选可改写框架的任何模块状态、任何输入数据、任何上界;父层不独立重算、也不验证子进程的自报。彻底闭合 = 候选独立进程执行(单独 Issue,待授权)。
 
 #### 本轮**没有**动的
 

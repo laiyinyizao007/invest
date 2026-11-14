@@ -1347,6 +1347,10 @@ def _handle_evaluate_child(args, emit) -> int:
     # 评估输入在**候选导入之前**取成不可变的局部值(见 _handle_gate_child 的说明)。
     data_file, symbol, key = wf.DATA_FILE, wf.SYMBOL, wf.KEY
     cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
+    # 上限要在导入前取成**局部整数**:`cfg` 是个可变字典,调用点若在导入之后才 `cfg["grid"][...]`,
+    # 候选改写它(codex 第 33 轮实测经帧反射把 343 改成 10^9)就立刻生效。
+    max_cells = int(cfg["grid"]["max_cells"])
+    min_round_trips = int(cfg["grid"]["min_round_trips"])
     windows = [(w.name, w.train_start, w.train_end, w.valid_start, w.valid_end) for w in wf.build_windows()]
     # 窗口不变量自己复查,不信任 `wf.Window.__post_init__`:验证窗口必须整体晚于选参窗口的结束。
     select_window = (windows[0][1], windows[0][2])
@@ -1364,8 +1368,8 @@ def _handle_evaluate_child(args, emit) -> int:
     try:
         result = run_evaluation(
             candidate_cls=candidate, bars=bars, runner=engine_runner(key), random_cls=RandomEntry15mStrategy,
-            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
-            min_round_trips=cfg["grid"]["min_round_trips"], select_window=select_window,
+            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=max_cells,
+            min_round_trips=min_round_trips, select_window=select_window,
             validation_windows=[(name, vs, ve) for name, _, _, vs, ve in windows], prior_trials=prior_trials,
             run_variances=run_variances)
     except Exception as exc:
