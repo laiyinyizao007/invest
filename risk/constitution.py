@@ -151,6 +151,13 @@ BUILTIN_PROTECTED_CONTAINER_SCOPE = BUILTIN_PROTECTED_CONTAINERS + (
     "bg",
 )
 
+# numpy 的**自由函数形态**写入口:第一个实参就是被写的目标数组
+# (`copyto(dst, src)`、`put(a, ind, v)`……)。变更型方法名单只覆盖 `接收者.方法()` 形态,
+# 这一形态原来漏掉了(第 4 轮 codex 复核的 Low-2)。
+# 名单里像 `append`/`sort` 这些**不是**自由函数:它们被写的是接收者,
+# 第一个实参是读,按第一个实参判会误伤 `x.append(self.am.close)` 这种正当写法。
+_MUTATING_FREE_FUNCTIONS = frozenset({"copyto", "put", "putmask", "place"})
+
 # 受保护容器上的**变更型方法**:对这些方法**调用**就等于原地改写容器里的东西。
 #
 # 为什么必须单列一份名单:容器规则原来只挡"写"(`arr = self.am.close` 后 `arr[0] = 999`)
@@ -181,6 +188,10 @@ BUILTIN_PROTECTED_CONTAINER_VIEWS = (
     "view", "reshape", "ravel", "squeeze", "transpose",
     # 第 13 轮 codex 的 Critical 1:这两个同样返回视图,第 12 轮漏登记
     "swapaxes", "diagonal",
+    # 第 4 轮 G8 复核的 F2:规则收窄到"写入"之后,视图型名字只剩下"当写入目标"这一种用法,
+    # 名单就得跟着改成"视图型方法 + 视图型属性"。
+    # `T` 是属性不是方法(`arr.T[0] = 9` 与 `arr.transpose()[0] = 9` 等价),此前没人管。
+    "T",
 )
 
 # 候选不得调用的下单/撤单接口
@@ -619,150 +630,221 @@ def _module_attr_owner_ok(name: str, path: list[str]) -> bool:
     return owner is None or owner in path
 
 
-def _subscript_makes_a_view(index: ast.AST) -> bool:
-    """这个下标会不会让 numpy 返回**视图**(与原数组共享内存)而不是一个数/副本。
+def _container_write_findings(tree: ast.AST) -> list[tuple[int, str]]:
+    """受保护容器(`am`/`bg`)上的**写入**(第 4 轮 G8 复核的 F2:外流规则从"读取"收窄到"写入")。
 
-    numpy 的**基本索引**返回视图:切片、`...`、`None`/`np.newaxis`,以及包含它们的元组。
-    第 13 轮 codex 的 Critical 1:第 12 轮只认 `ast.Slice`,于是
-    `self.am.close[:, None]` / `[...]` / `[None]` 都被放过,拿到视图写回就改了回测数据。
-    整数下标取到的是一个数(副本),高级索引(列表/数组)返回副本,都不是视图。
+    **这里曾经还有一条"读取外流"规则**:容器引用一旦"流出去"(存进名字 / 传参 / 装容器 / 返回)
+    就一律拒。理由是当时候选手里拿着的是**真实容器**,拿到别名就能原地改写回测数据。
+    但只读行情视图落地之后,`self.am.close`/`self.am.close_array`/指标结果返回的都是**拷贝**,
+    别名无害;而这条规则把仓库自己的 LLM 提示词写法
+    (`self.am.close[-2:]`、`np.mean(self.am.close)`、`self.am.count`、`self.am.close_array`)
+    整片拒掉——进化循环因此被闲置(第 4 轮 codex 实测)。
+    所以"读取"一律放行,**写入**仍然拒。
 
-    `slice(...)` 构造出来的切片对象同样产生视图,所以调用 `slice(...)` 也按视图算。
-    变量里存着的切片对象静态层看不见——那一条由运行期第五层逐根核对兜底。"""
-    if isinstance(index, ast.Slice):
-        return True
-    if isinstance(index, ast.Constant) and (index.value is None or index.value is Ellipsis):
-        return True
-    if isinstance(index, ast.Call) and isinstance(index.func, ast.Name) and index.func.id == "slice":
-        return True
-    if isinstance(index, ast.Tuple):
-        return any(_subscript_makes_a_view(element) for element in index.elts)
-    return False
+    写入的路径各有各的判据:
+    - 属性赋值 / 下标赋值 / 复合赋值:`_write_violation` 按整条属性路径判(路径里出现 `am`/`bg` 即命中);
+    - 变更型方法调用(`fill`/`update_bar`/`__setitem__`/…):`_container_mutator_call`;
+    - `del self.am.close`:**删除**既不是赋值也不是调用,前面两条都看不见它;
+    - **容器别名**上的写入与变更型调用(`a = self.am` 之后 `a.update_bar(fake)`):
+      别名让属性路径看不出是谁,`_write_violation`/`_container_mutator_call` 都看不见,
+      第 4 轮 codex 复核的 Medium-3 实测(旧规则能拦,收窄后 0 findings)——补上;
+    - **自由函数形态**的变更型函数(`np.copyto(self.am.close, x)`):名单里有 `copyto`,
+      但规则只匹配 `接收者.方法()` 形态——补上(第 4 轮 codex 复核的 Low-2);
+    - **下标删除**(`del self.am.close[0]`):删除的下标形式,属性子节点是 Load 上下文,
+      前面的删除规则看不见——补上(第 4 轮 codex 复核的 Low-1)。
+
+    残余(如实记录):静态层不再拦"先取**数组**别名再写"(`arr = self.am.close` 之后 `arr[0] = 1`)。
+    只读视图下这写的是拷贝,无害;万一视图被绕开,运行期第五层(逐根核对)仍然会抓到。"""
+    findings: list[tuple[int, str]] = []
+    aliases = _container_aliases(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Del):
+            path = _attr_path(node) or []
+            if any(segment in BUILTIN_PROTECTED_CONTAINER_SCOPE for segment in path[1:]):
+                findings.append((node.lineno, f"不得删除受保护容器上的属性 {'.'.join(path)}"))
+        if isinstance(node, ast.Call):
+            alias_hit = _alias_mutator_call(node, aliases)
+            if alias_hit:
+                findings.append((node.lineno, f"不得通过容器别名调用变更型方法 {alias_hit}"))
+            free_hit = _free_mutator_call(node)
+            if free_hit:
+                findings.append((node.lineno, f"不得把受保护容器交给变更型函数 {free_hit}"))
+        for target in _write_targets(node):
+            if _is_container_binding(node):
+                # 这一句**就是**别名的定义(`x = self.bg`),不是"通过别名写"。
+                break
+            hit = _container_view_write(target)
+            if hit:
+                findings.append((node.lineno, f"不得把受保护容器的视图型结果当写入目标 {hit}"))
+            alias_write = _alias_write(target, aliases)
+            if alias_write:
+                findings.append((node.lineno, f"不得通过容器别名写入受保护容器 {alias_write}"))
+            delete_hit = _container_element_delete(target)
+            if delete_hit:
+                findings.append((node.lineno, f"不得删除受保护容器上的元素 {delete_hit}"))
+    return findings
 
 
-def _container_reference(node: ast.AST) -> str | None:
-    """表达式是否**直接引用**受保护容器(`am`/`bg`)本身或它的某个属性。
+def _is_container_binding(node: ast.AST) -> bool:
+    """这个赋值语句是不是"把容器本身绑到名字上"(`x = self.am` / `x: Any = self.bg`)。
 
-    `am` 里装的是行情数组(close/open/high/low…),`bg` 里装的是日线/窗口线——
-    两者都能被**原地改写**,拿到别名之后改的就是**回测数据本身**
-    (伪造价格 → 伪造收益),而静态层按名字看,`arr` 只是个普通局部变量。
+    这**不是**写入——是别名的定义。别名定义里的目标名当然在别名集合里,
+    不把它排除掉,`x = self.bg` 这一句本身就会被当成"通过别名写入"而误报。"""
+    value = None
+    if isinstance(node, ast.Assign):
+        value = node.value
+    elif isinstance(node, ast.AnnAssign):
+        value = node.value
+    if value is None:
+        return False
+    return (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)
+            and value.value.id == "self"
+            and value.attr in BUILTIN_PROTECTED_CONTAINER_SCOPE)
 
-    范围比 `BUILTIN_PROTECTED_CONTAINERS` 宽:那条名单只列了 `am`,
-    而 `bg`(BarGenerator)是同一类容器——`self.bg.update_bar(fake_bar)`
-    往回测里插一根假 K 线,和 `self.am.update_bar(fake_bar)` 是一回事
-    (第 11 轮之后的自查实测:静态层两条都放过)。
 
-    只认**裸属性**(`arr = self.am.close`):带下标的(`x = self.am.close[-1]` 取到的是
-    一个数)与带调用的(`x = self.am.atr(14)`)都不算引用容器本身。"""
-    if isinstance(node, ast.Attribute):
-        path = _attr_path(node)
-        if not path:
+def _root_name(node: ast.AST) -> str | None:
+    """表达式最底部的名字(`a.close.reshape(-1)[0]` → `a`)。"""
+    current = node
+    for _ in range(32):                       # 防御:表达式再深也不会超过这个数
+        if isinstance(current, ast.Name):
+            return current.id
+        if isinstance(current, ast.Attribute):
+            current = current.value
+        elif isinstance(current, ast.Call):
+            current = current.func
+        elif isinstance(current, ast.Subscript):
+            current = current.value
+        else:
             return None
-        for index, segment in enumerate(path):
-            if index == 0:
-                # 裸名不算容器:`am`/`bg` 是 ArrayManager/BarGenerator 的常见缩写,
-                # 候选写 `am = []` 再 `am.append(x)` 是它自己的列表
-                # (第 12 轮 codex 的 Medium 1:按裸名一刀切是**误报**)。
-                continue
-            if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
-                return ".".join(path[index:])
-        return None
-    if isinstance(node, ast.Subscript):
-        # `self.am.close[:]` 切出来的是**视图**(不是副本):拿到就能原地改写。
-        # 第 12 轮 codex 的 High 1 变体①:视图把 ATR 从 40 压到 2.86,
-        # ¥300 单笔预算当场失效(诚实模板 0 成交,候选成交 2 笔),四层防线全绿。
-        # `self.am.close[-1]` 取到的是一个数(副本),不是视图,放行。
-        if _subscript_makes_a_view(node.slice):
-            return _container_reference(node.value)
-        return None
-    if isinstance(node, ast.Call):
-        # `self.am.close.reshape(-1)` 返回的也是**视图**(与原数组共享内存):
-        # 拿到它再 `arr[0] = 9`,改的还是回测数据本身。
-        func = node.func
-        if isinstance(func, ast.Attribute):
-            path = _attr_path(func)
-            if path and path[-1] in BUILTIN_PROTECTED_CONTAINER_VIEWS:
-                return _container_reference(func)
-        return None
     return None
 
 
-def _container_escape_findings(tree: ast.AST) -> list[tuple[int, str]]:
-    """受保护容器的引用**流出去**的地方(取别名 / 传参 / 装容器 / 返回)。
+def _container_aliases(tree: ast.AST) -> set[str]:
+    """绑定到容器**本身**的局部名(`a = self.am` / `b = self.bg` / `a: Any = self.am`)。
 
-    为什么必须按"流出去"判,而不是按"改写"判:改写点可以藏在任何地方,
-    而引用一旦离开原处,按名字的检查就再也看不见它——
-        g = self.bg            # 取别名
-        g.update_bar(fake_bar) # 这里看不出 g 是谁,四层防线全部放行
-    所以静态层封的是**交出引用**这个动作,而不是改写本身。
-
-    放行的正当用法(必须放行,否则正常候选会被整片拒掉):
-    - 就地读取:`self.am.close[-1]`(取到的是一个数)
-    - 只读方法的调用:`self.am.sma(5)`、`self.am.atr(14)`
-    """
-    findings: list[tuple[int, str]] = []
-
-    def escape(expr: ast.AST | None, why: str) -> None:
-        if expr is None:
-            return
-        ref = _container_reference(expr)
-        if ref:
-            findings.append((expr.lineno, f"不得把受保护容器 {ref} {why}"))
-
+    只认"直接绑定容器本身":`x = self.am.close` 绑的是**数组**(视图下是拷贝),
+    写它无害,不进这份名单(那是"如实记录"里的残余)。"""
+    aliases: set[str] = set()
     for node in ast.walk(tree):
+        value = None
+        targets: list[ast.AST] = []
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, (ast.Tuple, ast.List)) \
-                        and isinstance(node.value, (ast.Tuple, ast.List)):
-                    # `a, _ = self.am.close, 0`:按元素逐个查
-                    for element in node.value.elts:
-                        escape(element, "取出来另存")
-                else:
-                    escape(node.value, "取出来另存")
+            value = node.value
+            targets = list(node.targets)
         elif isinstance(node, ast.AnnAssign):
-            # `a: list = self.am.close`:带注解的赋值也是"另存"
-            escape(node.value, "取出来另存")
-        elif isinstance(node, ast.NamedExpr):
-            # `(a := self.am.close)`:海象表达式同样是"另存"
-            escape(node.value, "取出来另存")
-        elif isinstance(node, ast.Call):
-            # `helper(self.am)`:把容器交给别人,别人就能在里面改
-            for arg in node.args:
-                escape(arg, "传给出调用")
-            for keyword in node.keywords:
-                escape(keyword.value, "传给出调用")
-        elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
-            escape(node.value, "返回出去")
-        elif isinstance(node, (ast.List, ast.Set, ast.Tuple)):
-            for element in node.elts:
-                escape(element, "装进容器")
-        elif isinstance(node, ast.Dict):
-            for value in node.values:
-                escape(value, "装进容器")
-        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-            escape(node.elt, "装进容器")
-        elif isinstance(node, ast.DictComp):
-            escape(node.key, "装进容器")
-            escape(node.value, "装进容器")
-        elif isinstance(node, ast.Lambda):
-            escape(node.body, "从 lambda 里取出来")
-        elif isinstance(node, ast.IfExp):
-            escape(node.body, "取出来另存")
-            escape(node.orelse, "取出来另存")
-        elif isinstance(node, ast.BoolOp):
-            for value in node.values:
-                escape(value, "取出来另存")
-        elif isinstance(node, (ast.Starred, ast.Await)):
-            escape(node.value, "取出来另存")
-        elif isinstance(node, ast.arguments):
-            for default in list(node.defaults) + [d for d in node.kw_defaults if d is not None]:
-                escape(default, "作为默认参数传出去")
-        elif isinstance(node, ast.ClassDef):
-            for base in node.bases:
-                escape(base, "作为基类传出去")
-            for keyword in node.keywords:
-                escape(keyword.value, "传给出调用")
-    return findings
+            value = node.value
+            targets = [node.target]
+        else:
+            continue
+        if not (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)
+                and value.value.id == "self"
+                and value.attr in BUILTIN_PROTECTED_CONTAINER_SCOPE):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases.add(target.id)
+    return aliases
+
+
+def _alias_mutator_call(node: ast.Call, aliases: set[str]) -> str | None:
+    """对**容器别名**调用变更型方法(`a.update_bar(fake)`,`a` 是 `self.am` 的别名)。"""
+    if not aliases:
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr not in BUILTIN_PROTECTED_CONTAINER_MUTATORS:
+        return None
+    if isinstance(func.value, ast.Name) and func.value.id in aliases:
+        return f"{func.value.id}.{func.attr}"
+    return None
+
+
+def _alias_write(target: ast.AST, aliases: set[str]) -> str | None:
+    """写入目标是**容器别名**(`a.close[0] = 1` / `a.count = 5`,`a` 是 `self.am` 的别名)。"""
+    if not aliases:
+        return None
+    root = _root_name(target)
+    if root and root in aliases:
+        return root
+    return None
+
+
+def _free_mutator_call(node: ast.Call) -> str | None:
+    """把受保护容器交给**自由函数形态**的变更型函数(`np.copyto(self.am.close, x)`)。
+
+    numpy 的写入口里,这几个是**自由函数**(第一个实参就是被写的目标数组):
+    `copyto(dst, src)`、`put(a, ind, v)`、`putmask(a, mask, v)`、`place(a, mask, v)`。
+    变更型方法名单里本来就有 `copyto`,但规则只匹配 `接收者.方法()` 形态,
+    自由函数形态漏掉了(第 4 轮 codex 复核的 Low-2)。
+
+    **只认这几个**:名单里的 `append`/`extend`/`sort` 这些是**方法**,它们被写的是接收者,
+    第一个实参是**读**(`x.append(self.am.close)` 是把数组放进候选自己的列表,无害),
+    按第一个实参判会把这种正当写法误伤。"""
+    func = node.func
+    if isinstance(func, ast.Name):
+        name = func.id
+    elif isinstance(func, ast.Attribute):
+        name = func.attr
+    else:
+        return None
+    if name not in _MUTATING_FREE_FUNCTIONS:
+        return None
+    if not node.args:
+        return None
+    path = _attr_path(node.args[0]) or []
+    for index, segment in enumerate(path):
+        if index == 0:
+            continue
+        if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
+            return f"{name}({'.'.join(path)})"
+    return None
+
+
+def _container_element_delete(target: ast.AST) -> str | None:
+    """删除受保护容器上的**元素**(`del self.am.close[0]`)。"""
+    if not isinstance(target, ast.Subscript):
+        return None
+    path = _attr_path(target.value) or []
+    for index, segment in enumerate(path):
+        if index == 0:
+            continue
+        if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
+            return ".".join(path)
+    return None
+
+
+def _write_targets(node: ast.AST) -> list[ast.AST]:
+    """这个语句里的**写入目标**(赋值/复合赋值/注解赋值/删除的目标)。"""
+    targets: list[ast.AST] = []
+    if isinstance(node, ast.Assign):
+        targets.extend(node.targets)
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        targets.append(node.target)
+    elif isinstance(node, ast.Delete):
+        targets.extend(node.targets)
+    return targets
+
+
+def _container_view_write(target: ast.AST) -> str | None:
+    """写入目标里有没有"容器上的视图型方法/属性"(`reshape`/`view`/`swapaxes`/`T`…)。
+
+    第 4 轮 G8 复核的 F2 把"读取外流"规则收窄成"写入"之后,这条路径一度**没人管**:
+        self.am.close.reshape(-1)[0] = 9.0
+    读(`x = self.am.close.reshape(-1)`)是允许的——视图下 `self.am.close` 是拷贝;
+    但把它**当写入目标**就不该放行:静态层在这条上没有别的闸
+    (`_write_violation` 的属性路径断在调用表达式上,`_container_mutator_call` 只看变更型方法名)。
+
+    判据:写入目标里出现一个属性访问,它的名字在视图型名单里,而它的接收者路径上有 `am`/`bg`。"""
+    for node in ast.walk(target):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if node.attr not in BUILTIN_PROTECTED_CONTAINER_VIEWS:
+            continue
+        path = _attr_path(node) or []
+        if any(segment in BUILTIN_PROTECTED_CONTAINER_SCOPE for segment in path[1:]):
+            return ".".join(path)
+    return None
 
 
 def _container_mutator_call(node: ast.Call, c: Constitution) -> str | None:
@@ -806,6 +888,294 @@ def _path_violation(node: ast.AST, c: Constitution) -> str | None:
         if rest[:len(parts)] == parts:
             return path
     return None
+
+
+# ---------- 通配符导入(`from X import *`)的裁决 ----------
+#
+# 第 4 轮 G8 复核的 Critical:候选写 `from strategies.trend_atr_strategy import *`,
+# 静态筛查与沙盒筛查两层都是 **0 findings**,却把 `swap_in`/`swap_out`/`read_only_view`
+# (连同 `within_budget`/`DailyLossGuard` 等风控函数)一次性绑进候选的命名空间——
+# 只读视图的整个前提("候选碰不到换入换出")就这样被绕开。
+#
+# 为什么按名字逐个拦不住:通配符导入**不经过逐名裁决**。具名导入
+# (`from X import swap_out`)会被本文件的 ImportFrom 分支逐个名字判,
+# 通配符则是**导入机制自己**按被导入模块的公开名字列表绑定,
+# 静态层看不见候选最终拿到了哪些名字。
+# 所以这一层改成"先把被导入模块的名字集合解析出来,再决定放不放"。
+#
+# 判定口径(fail-closed,三条任一命中即拒):
+# ① 模块级名字里出现**受保护符号** → 拒,并指出是哪几个;
+# ② 模块有**模块级私有符号**(下划线开头) → 拒(模块内部的东西不该外流);
+# ③ 被导入模块**解析不出来**(不在仓库内 / 源码读不出来 / 相对导入) → 拒:
+#    查不了等于没查。
+#
+# 名字集合只从**源码**解析(不执行模块):在筛查阶段执行被导入的模块,
+# 等于在候选跑起来之前先跑一遍候选的代码。
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 模块名集合的缓存:键是 (路径, mtime_ns, 大小),文件一改就失效。
+_MODULE_NAMES_CACHE: dict[tuple[str, int, int], tuple[set[str], bool]] = {}
+# 缓存上限:文件一改就多一条,不清会一直涨(每条几十字节,但没有理由让它涨)。
+_MODULE_NAMES_CACHE_MAX = 128
+
+
+def _star_import_blocked_symbols() -> frozenset[str]:
+    """通配符导入不得暴露的符号:受保护的风控对象 + 只读视图的发放口 + 状态对象 + 风控执行点。
+
+    放在函数里而不是做成模块级常量:模块级的字符串集合常量受历史守卫的
+    "只增不减"比对约束(见 tools/check_constitution_history.py),而这份名单
+    是**派生**的(由已有清单算出),登记进去会让守卫把它当成一份要单独维护的历史事实。"""
+    return (frozenset(BUILTIN_PROTECTED_READ_ATTRS)
+            | frozenset(BUILTIN_PROTECTED_STATE_OBJECTS)
+            | frozenset(BUILTIN_PROTECTED_ENTRY_POINTS))
+
+
+def _module_source_file(module: str) -> Path | None:
+    """把模块名解析成**仓库内**的源码文件;解析不到返回 None(只找文件,不执行模块)。
+
+    **包优先**:Python 的 `FileFinder` 先找包(`X/__init__.py`)再找模块(`X.py`)。
+    顺序反了会核验**错的文件**——`pkg/__init__.py` 脏、`pkg.py` 干净时,
+    静态层按干净的那个放行,而运行时绑进来的是脏包里的名字
+    (第 4 轮 codex 复核的 Medium-1 实测)。"""
+    if not module:
+        return None
+    base = REPO_ROOT.joinpath(*module.split("."))
+    for path in (base / "__init__.py", base.with_suffix(".py")):
+        if path.is_file():
+            return path
+    return None
+
+
+def _module_export_info(path: Path) -> tuple[set[str], set[str], bool] | None:
+    """被导入模块**实际会被 `import *` 绑走**的名字集合、模块级私有符号,以及"是否不可证"。
+
+    返回 `(exported, private, dynamic)`;源码读不出来或解析失败返回 None。
+
+    - `private`:模块级**私有**符号(下划线开头)。`import *` 本来就不绑它们,
+      但"这个模块在藏东西"本身是个信号,所以照样拒(规则:通配符导入不得暴露模块级私有符号)。
+
+    - `names`:`import *` 实际绑定的名字。有 `__all__` 时以 `__all__` 为准
+      (Python 就是这么定的);没有 `__all__` 时是**公开**名字(下划线开头的本来就不绑)。
+    - `dynamic`:名字集合**不可证**(模块用了动态导出),此时必须 fail-closed 拒掉。
+      三种来源:①模块级 `__getattr__`(PEP 562,按需生成名字);
+      ②`__all__` 不是字面量列表(算出来的);③模块内部自己用了 `from ... import *`
+      (它绑进来的名字我们看不到)。
+
+    收进集合的绑定:模块级函数/类名、赋值目标、带注解的赋值、`import`/`from ... import`,
+    以及模块级 `if`/`try`/`for`/`with`/`match` 里的绑定
+    (第 4 轮 codex 复核的 Medium-2:漏掉 `for`/`with` 会让真实名字不可见)。
+
+    **带缓存**:筛查是批量跑的,同一个被导入模块的源码要被解析很多次。
+    缓存键带上 mtime 与大小,文件一改就重新解析。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _MODULE_NAMES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+        return None
+    names: set[str] = set()
+    dynamic = False
+    all_names: set[str] | None = None
+
+    def collect_bindings(body: list) -> None:
+        nonlocal dynamic, all_names
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+                if node.name == "__getattr__":
+                    dynamic = True            # ①PEP 562:按需生成名字,不可证
+            elif isinstance(node, ast.ClassDef):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                        if target.id == "__all__":
+                            all_names = _literal_string_set(node.value)
+                            if all_names is None:
+                                dynamic = True        # ②`__all__` 算出来的
+                    elif isinstance(target, (ast.Tuple, ast.List)):
+                        names.update(e.id for e in target.elts if isinstance(e, ast.Name))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+                if node.target.id == "__all__" and node.value is not None:
+                    all_names = _literal_string_set(node.value)
+                    if all_names is None:
+                        dynamic = True
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*":
+                        dynamic = True                # ③模块自己用了通配符:它绑了什么我们看不到
+                    else:
+                        names.add(alias.asname or alias.name)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                for target in ast.walk(node.target):
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                collect_bindings(node.body)
+                collect_bindings(node.orelse)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        for target in ast.walk(item.optional_vars):
+                            if isinstance(target, ast.Name):
+                                names.add(target.id)
+                collect_bindings(node.body)
+            elif isinstance(node, ast.Match):
+                for case in node.cases:
+                    for target in ast.walk(case.pattern):
+                        if isinstance(target, ast.Name):
+                            names.add(target.id)
+                    collect_bindings(case.body)
+            elif isinstance(node, ast.If):
+                collect_bindings(node.body)
+                collect_bindings(node.orelse)
+            elif isinstance(node, ast.Try):
+                collect_bindings(node.body)
+                collect_bindings(node.orelse)
+                collect_bindings(node.finalbody)
+                for handler in node.handlers:
+                    collect_bindings(handler.body)
+
+    collect_bindings(tree.body)
+    if all_names is not None:
+        exported = set(all_names)
+    else:
+        # 没有 `__all__`:`import *` 只绑**公开**名字(下划线开头的本来就不绑)。
+        exported = {n for n in names if not n.startswith("_")}
+    private = {n for n in names
+               if n.startswith("_") and not (n.startswith("__") and n.endswith("__"))}
+    result = (exported, private, dynamic)
+    if len(_MODULE_NAMES_CACHE) >= _MODULE_NAMES_CACHE_MAX:
+        _MODULE_NAMES_CACHE.clear()
+    _MODULE_NAMES_CACHE[key] = result
+    return result
+
+
+def _literal_string_set(node: ast.AST) -> set[str] | None:
+    """字面量列表/元组/集合里的字符串集合;不是字面量就返回 None(不可证)。"""
+    if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return None
+    values: set[str] = set()
+    for element in node.elts:
+        if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
+            return None
+        values.add(element.value)
+    return values
+
+
+def star_import_finding(module: str, level: int = 0) -> str | None:
+    """裁决 `from <module> import *`:该放行返回 None,否则返回拒绝理由(含规则名)。
+
+    相对导入(`from . import *`)一律拒:候选文件在仓库里的哪个位置,
+    静态层不知道(这里只看得到源码文本),解析不出被导入的模块。"""
+    if level or not module:
+        return ("通配符导入的模块无法确定(相对导入或缺少模块名):查不了等于没查,拒绝"
+                "(规则:通配符导入不得暴露受保护符号)")
+    path = _module_source_file(module)
+    if path is None:
+        return (f"通配符导入 `{module}` 的名字集合无法核验(模块不在仓库内或找不到源码):"
+                f"查不了等于没查,拒绝(规则:通配符导入不得暴露受保护符号)")
+    info = _module_export_info(path)
+    if info is None:
+        return (f"通配符导入 `{module}` 的名字集合无法解析:查不了等于没查,拒绝"
+                "(规则:通配符导入不得暴露受保护符号)")
+    names, private, dynamic = info
+    if dynamic:
+        return (f"通配符导入 `{module}` 的名字集合不可证(模块有动态导出或内部通配符):"
+                f"查不了等于没查,拒绝(规则:通配符导入不得暴露受保护符号)")
+    hits = sorted(names & _star_import_blocked_symbols())
+    if hits:
+        return (f"通配符导入 `{module}` 会把受保护符号 {'、'.join(hits)} 放进候选命名空间"
+                f"(拿到定义就能架空风控判定,只读视图的换入换出也会被绕开)"
+                f"(规则:通配符导入不得暴露受保护符号)")
+    if private:
+        return (f"通配符导入 `{module}` 会把模块级私有符号 {'、'.join(sorted(private))} 放进候选命名空间"
+                f"(模块内部符号不该外流)(规则:通配符导入不得暴露模块级私有符号)")
+    return None
+
+
+def _protected_runtime_objects() -> dict[int, str]:
+    """已加载的受保护模块里,受保护符号的**身份**(id -> 符号名)。
+
+    只看 `vars(mod)`(模块的 `__dict__`),不用 `getattr`:模块级 `__getattr__`(PEP 562)
+    会让 getattr 产生副作用,也可能凭空造出名字。
+
+    受保护的包:`risk`/`strategies`/`vnpy_ctastrategy`——与运行期第四层指纹的覆盖范围一致。
+    """
+    objects: dict[int, str] = {}
+    names = _star_import_blocked_symbols()
+    for modname, module in list(sys.modules.items()):
+        if module is None:
+            continue
+        if modname.split(".")[0] not in ("risk", "strategies", "vnpy_ctastrategy"):
+            continue
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict):
+            continue
+        for name in names:
+            obj = namespace.get(name)
+            if obj is not None:
+                objects.setdefault(id(obj), name)
+    return objects
+
+
+def _namespace_values(namespace: dict) -> list[tuple[str, object]]:
+    """命名空间里的值:**顶层**的,以及**一层**嵌套(列表/元组/集合/字典)里的。
+
+    一层就够挡住最常见的藏法(`_hoard = [swap_out]`);更深层的藏法由运行期第五层兜住
+    (它盯的是数据本身,不是名字)。"""
+    values: list[tuple[str, object]] = []
+    for name, value in namespace.items():
+        values.append((name, value))
+        if isinstance(value, (list, tuple, set, frozenset)):
+            values.extend((f"{name}[…]", item) for item in value)
+        elif isinstance(value, dict):
+            values.extend((f"{name}[…]", item) for item in value.values())
+    return values
+
+
+def check_candidate_namespace(namespace: dict) -> list[str]:
+    """运行期守卫:候选模块的命名空间里**不得持有受保护对象**。
+
+    通配符导入一次性把被导入模块的公开名字绑进候选命名空间,静态层看不见拿到了什么
+    (第 4 轮 G8 复核的 F1)。这一层在候选**导入之后**核对。
+
+    **按身份(值)核对,不按名字核对**——第 4 轮 codex 复核的 High-1 实测:
+    只查名字的话,候选 `_hoard = swap_out` 再 `del swap_out` 就把名字删干净了,
+    这一层放行而候选**手里仍然握着真的 `swap_out`**。
+    按身份核对则:
+    - 通配符导入 → 命名空间里那个值**就是**框架的 `swap_out` → 抓到;
+    - "改名 + 删除" → 值还在(`_hoard`)→ 抓到;
+    - 候选**自己**定义了一个叫 `trading_day` 的函数 → 值不是框架那个 → **放行**
+      (这正是 F2 要消灭的那类误伤:按名字核对会把诚实候选整片拒掉)。
+
+    残余(如实记录):藏在两层以上的嵌套里、或经 `functools.partial`/闭包间接持有的,
+    这一层看不见;框架对象本身由运行期第四层(身份指纹)与第五层(逐根核对)盯着。"""
+    protected = _protected_runtime_objects()
+    if not protected:
+        # 查不了等于没查:受保护模块还没被加载(正常流程里模板先导入,它们一定在),
+        # 这时无法按身份核对,只能按**名字**核对一遍(宁可多拒,不可漏放)。
+        blocked = _star_import_blocked_symbols()
+        return [f"候选命名空间里出现了受保护符号 {name}"
+                f"(规则:候选命名空间不得持有受保护对象)"
+                for name in sorted(set(namespace) & blocked)]
+    findings: list[str] = []
+    for holder, value in _namespace_values(namespace):
+        symbol = protected.get(id(value))
+        if symbol:
+            findings.append(f"候选命名空间里持有受保护对象 {symbol}(在 `{holder}` 下)"
+                            f"(规则:候选命名空间不得持有受保护对象)")
+    return findings
 
 
 def screen_source(source: str, c: Constitution | None = None) -> list[str]:
@@ -970,6 +1340,13 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             # (`from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 不受影响——
             #  模板基类不在这个名单里,候选本来就要继承它。)
             for alias in node.names:
+                if alias.name == "*":
+                    # 通配符导入:名字由导入机制自己绑定,逐名裁决看不到它拿到了什么。
+                    # 这一路改成"先解析被导入模块的名字集合,再决定放不放"(见 star_import_finding)。
+                    reason = star_import_finding(node.module or "", node.level)
+                    if reason:
+                        findings.append(f"第 {node.lineno} 行: {reason}")
+                    continue
                 if alias.name in BUILTIN_PROTECTED_READ_ATTRS:
                     findings.append(
                         f"第 {node.lineno} 行: 不得导入受保护的风控对象 {alias.name}(拿到定义就能架空风控判定)")
@@ -989,11 +1366,12 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                         findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}")
                     elif key.value.lower() in protected_lower:
                         findings.append(f"第 {node.lineno} 行: 字典字面量含受保护项 {key.value}(仅大小写不同)")
-    # 受保护容器的引用**流出去**的地方:取别名/传参/装容器/返回。
-    # 必须在最后统一判——它要看的是"这个引用落在什么位置上",
-    # 而位置信息只有走完整棵树才认得全(赋值、海象、调用实参、返回、字面量)。
-    for lineno, message in _container_escape_findings(tree):
-        findings.append(f"第 {lineno} 行: {message}(拿到之后可以原地改写它, 伪造回测结果)")
+    # 受保护容器上的**写入**:属性/下标/复合赋值由 `_write_violation` 按整条属性路径判,
+    # 变更型方法调用由 `_container_mutator_call` 判,删除由下面这条判。
+    # **读取**不再拒(第 4 轮 G8 复核的 F2):只读视图下读到的是拷贝,别名无害——
+    # 早先那条"引用流出去就拒"的规则把诚实候选整片拒掉,进化循环因此被闲置。
+    for lineno, message in _container_write_findings(tree):
+        findings.append(f"第 {lineno} 行: {message}(写入受保护容器, 伪造回测结果)")
     return findings
 
 

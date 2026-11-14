@@ -92,13 +92,34 @@ def test_the_static_layer_refuses_taking_the_bar_generator_itself():
 
     `x = self.bg` 之后 `x.update_bar(fake_bar)` 往回测里插一根假 K 线,
     而调用点已经看不出 x 是谁——所以容器**本身**也不许取出来另存。
-    (裸局部名 `bg = list(range(3))` 仍然放行:那是候选自己的列表。)"""
+    (裸局部名 `bg = list(range(3))` 仍然放行:那是候选自己的列表。)
+
+    **第 4 轮 G8 复核的更正(F2)**:只读行情视图落地后,`self.bg` 在 `entry_signal` 期间是
+    **禁止访问的哨兵**——`x.update_bar(fake_bar)` 在运行期抛 `ReadOnlyViewError`,
+    静态层不再需要拦"取别名"这一形态(它把诚实候选整片拒掉,进化循环因此被闲置)。
+    直接对容器路径调用变更型方法(`self.bg.update_bar(...)`)静态层仍然拒。
+
+    **第 4 轮 codex 复核的 Medium-3 再更正**:光"取别名"不拒,是因为**别名上的写入**
+    也一并丢了闸(`a = self.am` 之后 `a.update_bar(fake)` 这一形态原来能被拦,
+    收窄后 0 findings)。现在静态层认得**容器别名**:`x = self.bg` 之后
+    `x.update_bar(fake_bar)` 仍然拒——**只是"取别名"本身不拒**。"""
     findings = screen(
         "def entry_signal(self):\n"
         "    x = self.bg\n"
         "    x.update_bar(fake_bar)\n"
         "    return 1\n")
-    assert findings, "取走 BarGenerator 没被拦下"
+    assert findings, "通过容器别名调用变更型方法没被拦下"
+    assert any("容器别名" in f for f in findings), findings
+    # 只取别名、不写:放行(这是"读取",不是"写入")
+    assert screen(
+        "def entry_signal(self):\n"
+        "    x = self.bg\n"
+        "    return 1\n") == [], "只是取别名就被拒(读取被误伤)"
+    # 直接写在容器路径上的变更型调用仍然拒
+    assert screen(
+        "def entry_signal(self):\n"
+        "    self.bg.update_bar(fake_bar)\n"
+        "    return 1\n"), "对容器直接调用变更型方法没被拦下"
 
 
 def test_the_static_layer_still_refuses_a_class_attribute_named_am():

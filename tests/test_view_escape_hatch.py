@@ -36,13 +36,38 @@ def test_an_honest_candidate_is_still_accepted():
     assert not flagged(source)
 
 
+def test_the_wildcard_import_cannot_bring_the_dispenser_in():
+    """通配符导入(`from X import *`)把被导入模块的**全部公开名字**一次性绑进候选命名空间,
+    逐名裁决看不见它拿到了什么——第 4 轮 G8 复核的 Critical。整条规则的用例见
+    `tests/test_g8_round4.py`(那里有放行方向的对照用例)。"""
+    findings = const.screen_source("from strategies.trend_atr_strategy import *\n")
+    assert findings, "通配符导入没有被拦下"
+    assert any("通配符" in f for f in findings), findings
+    assert any("swap_out" in f for f in findings), findings
+
+
 @pytest.mark.parametrize("source", [
     "x = (lambda: self.am.close)()\n",
     "x = (lambda: self.bg)()\n",
     "y = 1 if True else self.am.high\n",
     "y = None or self.am.close\n",
 ])
-def test_a_container_reference_hidden_in_a_lambda_or_expression_is_an_escape(source):
+def test_reading_the_container_in_a_lambda_or_expression_is_allowed(source):
+    """第 4 轮 G8 复核的 F2:只读视图落地后,读取返回的是**拷贝**,别名无害。
+
+    早先这里是一条"引用流出去就拒"的规则,把仓库自己的 LLM 提示词写法
+    (`self.am.close[-2:]`、`np.mean(self.am.close)`、`self.am.count`)整片拒掉——
+    进化循环因此被闲置。现在读取一律放行,**写入**仍然拒(见下面那条)。"""
+    assert not flagged("def entry_signal(self):\n    " + source + "    return 0\n")
+
+
+@pytest.mark.parametrize("source", [
+    "x = (lambda: self.am.close.fill(0.0))()\n",
+    "x = 1 if True else self.am.close.__setitem__(0, 1.0)\n",
+    "x = None or self.am.update_bar(fake_bar)\n",
+])
+def test_writing_through_a_lambda_or_an_expression_is_still_refused(source):
+    """收窄的是"读取",不是"写入":变更型方法(写入口)照旧拒。"""
     assert flagged("def entry_signal(self):\n    " + source + "    return 0\n")
 
 

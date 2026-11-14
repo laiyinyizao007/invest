@@ -287,11 +287,31 @@ def test_the_codex_round_13_atr_collapse_attack_has_nothing_to_change(honest):
     "self.bg.daily_bar = None",
 ])
 def test_every_attempt_to_mutate_the_containers_is_refused_with_no_effect_on_the_data(body):
+    """第 4 轮 G8 复核的 F3:这里原来只断言"回测失败"——失败的原因可能是候选自己的 bug、
+    引擎的异常包装,或者**别的**错误类型。现在断言抛的是**只读视图的错**
+    (`ReadOnlyViewError`),也就是"确实是被只读视图挡下来的",不是碰巧失败。
+
+    (`ReadOnlyViewError` 是 `AttributeError` 的子类,回测引擎把它包成 RuntimeError,
+    所以断言落在回测引擎给出的那段文字上——那段文字里带着原始异常的类型名。)"""
     ns: dict = {}
     exec(f"def entry_signal(self):\n    {body}\n    return 0\n", {"FAKE_BAR": FAKE_BAR}, ns)                 # noqa: S102  (测试里造候选)
     Cand = type("Cand", (TrendAtr15mStrategy,), {"entry_signal": ns["entry_signal"]})
-    with pytest.raises(RuntimeError, match="回测中策略抛出异常"):
+    with pytest.raises(RuntimeError) as excinfo:
         run_candidate(Cand)
+    message = str(excinfo.value)
+    assert "回测中策略抛出异常" in message, message
+    assert "ReadOnlyViewError" in message, message
+
+
+def test_the_view_refuses_every_attribute_that_is_not_a_forwarded_read_only_interface():
+    """视图上**没有**的属性一律抛 `ReadOnlyViewError`(不是普通的 AttributeError):
+    变更入口(`update_bar` 等)刻意不转发,错误类型本身就说明了"这是只读视图在拒绝你"。"""
+    view = read_only_view(filled_am())
+    assert not hasattr(view, "update_bar")
+    with pytest.raises(ReadOnlyViewError):
+        view.update_bar(FAKE_BAR)
+    with pytest.raises(ReadOnlyViewError):
+        view.anything_at_all
 
 
 def test_the_candidate_cannot_reach_the_real_container_through_the_template_attributes(honest):

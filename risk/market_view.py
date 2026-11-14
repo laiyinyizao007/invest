@@ -81,6 +81,17 @@ def _deny(self, *args, **kwargs):                      # noqa: ANN001
     raise ReadOnlyViewError("行情视图是只读的:不能给它设置或删除任何属性")
 
 
+def _deny_attr(self, name: str):                       # noqa: ANN001
+    """视图上**没有**的属性一律按"试图使用变更入口"处理。
+
+    视图只转发显式白名单里的只读接口;其余公开对象(`update_bar` 等)刻意不转发。
+    早先这里抛的是普通的 AttributeError("对象没有这个属性"),候选与人都看不出
+    "这是只读视图在拒绝你";现在统一抛 `ReadOnlyViewError`,错误类型本身就说明了原因。
+    (`ReadOnlyViewError` 是 `AttributeError` 的子类,所以 `hasattr(view, "update_bar")`
+    仍然是 False——白名单之外的接口对候选一样不可见。)"""
+    raise ReadOnlyViewError(f"行情视图是只读的:{name} 不是视图转发的只读接口(变更入口一律不转发)")
+
+
 def read_only_view(am: Any) -> Any:
     """为一个 ArrayManager 造它的只读视图。每个 ArrayManager 造一次、反复使用(类的构造不便宜)。"""
     namespace: dict[str, Any] = {"__slots__": ("__weakref__",)}
@@ -95,6 +106,7 @@ def read_only_view(am: Any) -> Any:
             namespace[name] = _method(am, name)        # 指标方法(sma/atr/macd/…):结果一律拷贝
     namespace["__setattr__"] = _deny
     namespace["__delattr__"] = _deny
+    namespace["__getattr__"] = _deny_attr
     namespace["__repr__"] = lambda self: "<只读行情视图>"
     view = type("ReadOnlyMarketView", (), namespace)()
     _SOURCE[view] = am                                 # 登记"这个视图包着谁",换入时核对同源
