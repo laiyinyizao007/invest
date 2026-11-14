@@ -24,6 +24,10 @@
     系统性扫描 77 个白名单模块,修前 23 项再导出放行、修后 0(全表在 ADR);②sqlite3.connect 无 `open` 事件,按路径参数判(回测入口登记 vnpy 数据库);`_winapi.CreateFile` 写访问与 winreg 写事件同样处置,
     无法裁决的原语(mmap/os.write/POSIX mkfifo 等)列入 ADR;③账本锁区分"被占用"与"真权限错误",未来 mtime 视为陈旧;④豁免 `armed` 一次性、argv 须为 git;⑤`vnpy.trader.utility.Path` 登记。
     G8:待复核。
+  - **第 38 轮复审(codex 35/50)的补修**:①**Critical**:第 37 轮在回测窗口登记 vnpy 库的 sqlite 路径,自己引入了口子——候选 `get_database().db.execute_sql("ATTACH/VACUUM INTO …")` 在已打开的连接上落盘/改行情库(事件层判不了)。
+    修在能力层:`get_database`/`database`/`get_datafeed` 及其**再导出**(按来源模块.函数名)不可达,`peewee`/`vnpy_sqlite` 实例按来源挡;**撤销**窗口的 sqlite 路径登记,改为窗口前由框架建好连接;回测入口把 `load_data` 前置到候选 `__init__` 之前;
+    ②系统性扫描"调用后返回活动句柄"的公开函数/实例(14 命中、10 放行,全部拦下或审查登记),固化为可重复的回归用例(vnpy 升级后新增的未审查句柄型成员会让它变红);
+    ③ADR 明写 sqlite 事件层判不了 ATTACH/VACUUM INTO/已开连接复用;④对象层边界补残余栏(不判函数返回值/实例属性);⑤`utility.Path` 重复登记保留(宪法守卫只增不减)。G8:待复核。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

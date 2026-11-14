@@ -60,6 +60,11 @@ def run_engine(
         pricetick=inst.pricetick,
         capital=capital,
     )
+    # 行情在候选的 `__init__` 跑**之前**读成引擎里的局部数据(第 38 轮:与 gate/evaluate 入口的"先取定再让候选运行"同一模式)。
+    # `load_data` 只依赖 set_parameters 设好的区间/品种,不依赖策略实例,所以前置不改变回测语义。
+    engine.load_data()
+    if not engine.history_data:
+        raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
     # 第四层的"回测前"基准要在**构造实例之前**拍:
     # 实例构造(__init__)也是候选能碰到的时机,构造期改写的东西如果发生在拍快照之后,
     # 就成了"基线",指纹再也看不出来(第 10 轮 codex 的 Medium 3)。
@@ -67,9 +72,6 @@ def run_engine(
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
     _market = _install_market_baseline(engine)
-    engine.load_data()
-    if not engine.history_data:
-        raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)

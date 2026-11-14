@@ -1025,7 +1025,8 @@ def test_save_json_style_primitives_are_not_reachable_by_the_candidate(tmp_path)
     import vnpy.trader.utility as util
     rs.safe_builtins(())
     proxy = rs._proxy_for(util)
-    members = sorted(m.rsplit(".", 1)[1] for m in rs.UNREACHABLE_MEMBERS if not m.rsplit(".", 1)[1].startswith("_"))
+    members = sorted(m.rsplit(".", 1)[1] for m in rs.UNREACHABLE_MEMBERS
+                     if m.startswith("vnpy.trader.utility.") and not m.rsplit(".", 1)[1].startswith("_"))
     assert {"save_json", "load_json", "get_file_path", "get_folder_path", "TEMP_DIR"} <= set(members)
     for name in members:
         with pytest.raises(AttributeError, match="任意路径读写"):
@@ -1203,8 +1204,13 @@ def test_threads_processes_paths_reexported_by_whitelisted_modules_are_refused()
     for name in ("Thread", "current_thread"):
         with pytest.raises(AttributeError, match="规则:按来源不可达"):
             getattr(proxy, name)
-    with pytest.raises(AttributeError, match="任意路径读写原语"):       # `vnpy.trader.utility.Path`:成员级规则先拒
+    with pytest.raises(AttributeError, match="任意路径读写原语"):           # `vnpy.trader.utility.Path`:成员级规则先拒(与来源规则重复登记)
         rs._proxy_for(util).Path
+    import types
+    carrier = types.ModuleType("carrier_path")
+    carrier.P = util.Path                                              # 别的模块再导出 Path:按来源(pathlib)统一处置
+    with pytest.raises(AttributeError, match="规则:按来源不可达"):
+        rs._check_object_rules(carrier, "P", util.Path)
     assert rs._proxy_for(util).ArrayManager is util.ArrayManager       # 放行方向:模板要的成员照旧
     rs._PROXY_CACHE.clear()
 
@@ -1270,25 +1276,6 @@ def test_production_path_refuses_import_module_and_leaves_framework_modules_unto
 
 # ---- 没有 open 事件的写原语 ----
 
-def test_sqlite3_connect_is_judged_by_path_inside_the_window(tmp_path):
-    """第 37 轮唯一实测"钩子完全看不见"的写原语:sqlite3 只发 `sqlite3.connect`,没有 `open` 事件。
-    允许目录内放行、之外拒(并确认文件真的没建)、`:memory:` 放行、框架登记的库放行。"""
-    import sqlite3
-    outside = tmp_path / "outside.db"
-    registered = tmp_path / "vnpy_database.db"
-    registered.write_bytes(b"")
-    with rs.candidate_window(sqlite_paths=[registered]) as scratch:
-        con = sqlite3.connect(scratch / "inside.db")
-        con.execute("create table t(x)")
-        con.commit()
-        con.close()
-        sqlite3.connect(":memory:").close()
-        sqlite3.connect(str(registered)).close()                       # 框架登记的库(回测读 vnpy 数据库)
-        with _expect_rule("audit:sqlite3-connect"):
-            sqlite3.connect(str(outside))
-    assert not outside.exists()
-
-
 def test_sqlite3_backed_dbm_and_shelve_are_denied_outside_the_allowed_directory(tmp_path):
     import dbm
     import shelve
@@ -1332,13 +1319,6 @@ def test_registry_writes_are_denied_inside_the_window():
             winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\zz_research_probe_should_not_exist")
     with pytest.raises(FileNotFoundError):
         winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\zz_research_probe_should_not_exist")
-
-
-def test_the_run_child_window_registers_the_vnpy_database_for_sqlite():
-    """接线:回测入口的窗口登记 vnpy 数据库路径(否则回测读库会被自己的钩子拒)。"""
-    source = (ROOT / "scripts" / "research_api.py").read_text(encoding="utf-8")
-    assert "rs.candidate_window(sqlite_paths=database_paths)" in source
-    assert 'get_file_path(SETTINGS["database.database"])' in source
 
 
 # ---- 账本锁:被占用 vs 真权限错误 / 未来 mtime ----
@@ -1388,3 +1368,228 @@ def test_a_lockfile_with_a_future_mtime_is_treated_as_stale(tmp_path):
     with chain.file_lock(target, timeout=3):                              # 否则会阻塞到超时
         pass
     assert time.monotonic() - started < 2
+
+
+# ======================================================================
+# 第 38 轮复审:活动数据库句柄不可达 / 回测窗口不登记 sqlite
+# ======================================================================
+
+def test_sqlite3_connect_is_judged_by_path_inside_the_window(tmp_path):
+    """sqlite3 只发 `sqlite3.connect`,没有 `open` 事件。**新连接**按路径判:允许目录内放行、`:memory:` 放行、之外拒(文件没建出来)。
+    窗口**不再**登记任何框架 sqlite 路径(第 38 轮:登记既不必要也不解决问题)。"""
+    import inspect
+    import sqlite3
+    assert "sqlite_paths" not in inspect.signature(rs.candidate_window).parameters
+    registered = tmp_path / "vnpy_database.db"
+    registered.write_bytes(b"")
+    outside = tmp_path / "outside.db"
+    with rs.candidate_window() as scratch:
+        con = sqlite3.connect(scratch / "inside.db")
+        con.execute("create table t(x)")
+        con.commit()
+        con.close()
+        sqlite3.connect(":memory:").close()
+        with _expect_rule("audit:sqlite3-connect"):
+            sqlite3.connect(str(outside))
+        with _expect_rule("audit:sqlite3-connect"):
+            sqlite3.connect(str(registered))                 # 即使是"框架的库"也没有特例
+    assert not outside.exists()
+
+
+def test_event_layer_cannot_judge_vacuum_into_on_an_open_connection(tmp_path):
+    """如实钉住一个**限制**(第 38 轮,ADR 也写了):已打开连接上的 `ATTACH DATABASE` / `VACUUM INTO` 不发任何带路径的
+    审计事件,钩子判不了——不要再往事件名单里补名字。修法只能在**能力层**(不把句柄给候选)或 sqlite 层(只读打开)。
+    本用例在窗口内对一个**框架持有**的连接做 VACUUM INTO,证明钩子确实看不见;所以"句柄不可达"才是防线。"""
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "framework.db")           # 窗口外打开(框架)
+    con.execute("create table t(x)")
+    con.commit()
+    out = tmp_path / "vacuumed.db"
+    with rs.candidate_window():
+        con.execute("VACUUM INTO ?", (str(out),))
+        assert rs.window_denials() == ()
+    assert out.exists(), "若这条变红:说明钩子能看见 VACUUM INTO 了,请同步更新 ADR"
+    con.close()
+
+
+def test_run_child_opens_the_vnpy_database_before_the_window_and_registers_nothing():
+    """行为测试(**新进程里**跑——peewee 的库对象是进程级单例,同进程里别的用例建过连接会让"先建连接"无从区分):
+    回测入口在窗口之前建好 vnpy 数据库连接;窗口里 peewee 读库复用它(无新 connect 事件、无拒绝)。
+    拿掉"先建连接"→ 窗口里 get_database() 首次连接被拒 → 本用例变红。"""
+    script = textwrap.dedent(f"""
+        import sys, json
+        sys.path.insert(0, {str(ROOT / "scripts")!r}); sys.path.insert(0, {str(ROOT)!r})
+        import bootstrap
+        import research_api as api, research_sandbox as rs, backtest_lib
+        import vnpy.trader.database as vdb
+        from datetime import datetime
+        from vnpy.trader.constant import Exchange, Interval
+        seen = {{}}
+        def fake_run_backtest(*a, **k):
+            seen["active"] = rs._AUDIT.active
+            db = vdb.get_database()
+            seen["bars"] = len(db.load_bar_data("ZZNODATA", Exchange.DCE, Interval.DAILY, datetime(2020, 1, 1), datetime(2020, 2, 1)))
+            seen["denials"] = [list(d) for d in rs.window_denials()]
+            return {{}}, None, []
+        api.child_file = lambda p: p
+        api.child_approved = lambda sha: None
+        api.child_params = lambda a: {{}}
+        api.import_candidate = lambda *a, **k: type("S", (), {{}})
+        backtest_lib.run_backtest = fake_run_backtest
+        rs.round_trip_pnls = lambda *a, **k: []
+        api.backtest_stats_row = lambda s: {{}}
+        args = api.build_parser().parse_args(["_child", "--file", "x.py", "--cls", "S", "--key", "CADJ",
+                                              "--segment", "train", "--params", "{{}}", "--sha256", "0" * 64])
+        code = api.run_child(args)
+        print("SEEN" + json.dumps({{"code": code, **seen}}))
+    """)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=120, cwd=str(ROOT))
+    line = [x for x in proc.stdout.splitlines() if x.startswith("SEEN")]
+    assert line, (proc.stdout[-500:], proc.stderr[-500:])
+    seen = json.loads(line[-1][4:])
+    assert seen.get("active") is True and seen.get("bars") == 0 and seen.get("denials") == [], (seen, proc.stdout[-600:])
+
+
+def test_the_candidate_cannot_obtain_the_database_handle_through_any_reexport():
+    """对象层只判**模块成员**,不判函数返回值/实例属性:所以活动句柄必须在"拿到函数/实例"这一步拒。"""
+    import types
+    import vnpy.trader.database as vdb
+    import vnpy_ctastrategy.backtesting as bt
+    import vnpy_ctastrategy.engine as eng
+    vdb.get_database()                                             # 让模块级 `database` 变成带 `.db` 句柄的实例
+    rs.safe_builtins(())
+    for module, name, rule in ((vdb, "get_database", "任意路径读写原语"),
+                               (vdb, "database", "任意路径读写原语"),
+                               (bt, "get_database", "规则:返回活动句柄的函数"),
+                               (eng, "get_database", "规则:返回活动句柄的函数")):
+        with pytest.raises(AttributeError, match=rule):
+            rs._check_object_rules(module, name, getattr(module, name))
+    handle = vdb.database.db
+    assert handle.__class__.__module__.split(".")[0] in ("peewee", "playhouse")
+    carrier = types.ModuleType("carrier_db")
+    carrier.handle = handle
+    with pytest.raises(AttributeError, match="规则:按来源不可达"):
+        rs._check_object_rules(carrier, "handle", handle)
+    rs._PROXY_CACHE.clear()
+
+
+def test_production_path_candidate_cannot_vacuum_into_through_the_framework_database(repo, tmp_path, monkeypatch):
+    """端到端(生产 import_candidate,静态筛查开):候选经 `get_database().db.execute_sql("VACUUM INTO …")`
+    想在允许目录之外落盘——拿不到句柄,文件没出现。放行方向:同一候选里模板正常成员照常可用。"""
+    from vnpy.trader.database import get_database
+    get_database()                                                  # 框架先把连接建好(与回测入口同)
+    out = tmp_path / "attached_out.db"
+    attack = f"""
+        try:
+            {{imp}}
+            handle = g() if callable(g) else g
+            handle.db.execute_sql("VACUUM INTO ?", ({str(out)!r},))
+            RESULT[{{label!r}}] = "ATTACKED"
+        except Exception as exc:
+            RESULT[{{label!r}}] = "refused:" + str(exc)
+    """
+    imports = {
+        "backtesting": "from vnpy_ctastrategy.backtesting import get_database as g",
+        "engine": "from vnpy_ctastrategy.engine import get_database as g",
+        "database.get_database": "from vnpy.trader.database import get_database as g",
+        "database.database": "from vnpy.trader.database import database as g",
+    }
+    blocks = "\n".join(textwrap.dedent(attack.format(imp=imp, label=label)) for label, imp in imports.items())
+    source = ("RESULT = {}\n" + blocks + "\n"
+              "from vnpy.trader.utility import ArrayManager, BarGenerator\n"
+              "from vnpy_ctastrategy import CtaTemplate\n"
+              "class S(CtaTemplate):\n    pass\n"
+              "S.RESULT = RESULT\nS.OK = (ArrayManager, BarGenerator)\n")
+    cls = run_candidate(tmp_path, monkeypatch, source, static=True)
+    assert set(cls.RESULT) == set(imports)
+    for label, outcome in cls.RESULT.items():
+        assert outcome.startswith("refused:"), (label, outcome)
+    assert not out.exists()
+    assert [x.__name__ for x in cls.OK] == ["ArrayManager", "BarGenerator"]       # 放行方向
+
+
+def test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed():
+    """第 38 轮的系统性扫描(可重复):白名单模块里"调用后返回活动句柄/引擎/连接"的公开函数、以及带 db/connection/cursor/execute*
+    的模块级实例。判据与 `%TEMP%\\\\scan_handles.py` 同。**每个未被对象层挡住的命中必须出现在下面的已审查清单里**——
+    vnpy 升级带来新的再导出时,本用例变红,逼着人去审(这是"库自带重导出随升级变化"的重跑机制)。"""
+    import importlib
+    import inspect
+    import pkgutil
+    import re
+    import types
+    from vnpy.trader.database import get_database
+    get_database()
+    name_re = re.compile(r"^(get|create|open|connect|make|new|init)_|^(connect|database|engine)$", re.I)
+    ann_re = re.compile(r"Database|Engine|Connection|Cursor|Session|Handle|Socket|IO\b|File|Thread|Process|Manager|Client",
+                        re.I)
+    handle_attrs = ("db", "connection", "cursor", "execute", "execute_sql", "conn")
+    reviewed_harmless = {   # 成员 -> 为什么无害(纯计算/字符串/绘图布局,不持有句柄)
+        "get_digits": "纯计算", "get_localzone_name": "返回时区名字符串", "get_target_value": "回测里取指标数值",
+        "make_subplots": "plotly 布局对象(plotly 不可 import)",
+    }
+    modules = {}
+    for root in ("vnpy.trader", "vnpy.event", "vnpy_ctastrategy"):
+        pkg = importlib.import_module(root)
+        modules[root] = pkg
+        for info in pkgutil.walk_packages(getattr(pkg, "__path__", []), root + "."):
+            if any(x in info.name for x in (".gui", ".ui", "__main__", ".test", "ctp", "wechat")):
+                continue
+            try:
+                modules[info.name] = importlib.import_module(info.name)
+            except BaseException:       # noqa: BLE001 —— 导入不了的可选子模块(缺依赖)不在候选可达范围
+                pass
+    rs.safe_builtins(())
+    unreviewed = []
+    for mname, mod in modules.items():
+        for name, val in vars(mod).items():
+            if name.startswith("_"):
+                continue
+            flagged = False
+            if inspect.isfunction(val) or inspect.isbuiltin(val):
+                try:
+                    annotation = str(inspect.signature(val).return_annotation)
+                except (TypeError, ValueError):
+                    annotation = ""
+                flagged = bool(name_re.search(name)) or bool(annotation and ann_re.search(annotation))
+            elif not isinstance(val, (type, types.ModuleType, str, int, float, bool, bytes, tuple, list, dict, set,
+                                      frozenset, type(None))):
+                origin = (getattr(type(val), "__module__", "") or "").split(".")[0]
+                if origin not in ("builtins", "datetime", "enum", "typing", "pathlib", "zoneinfo", "collections", "re"):
+                    flagged = any(a in dir(val) for a in handle_attrs) or bool(name_re.search(name))
+            if not flagged:
+                continue
+            try:
+                rs._check_object_rules(mod, name, val)
+            except AttributeError:
+                continue
+            if name not in reviewed_harmless:
+                unreviewed.append(f"{mname}.{name}")
+    assert unreviewed == [], f"新的、未审查的句柄型成员(请审查后拦截或登记为无害): {unreviewed}"
+    rs._PROXY_CACHE.clear()
+
+
+def test_backtest_reads_market_data_before_the_candidate_is_constructed(monkeypatch):
+    """③ 回测入口:`engine.load_data()` 在 `add_strategy`(候选 `__init__` 在此跑)**之前**——
+    与 gate/evaluate 入口"先取定行情、再让候选运行"同一模式。改回旧顺序 → 本用例变红。"""
+    import backtest_lib
+    from vnpy_ctastrategy.backtesting import BacktestingEngine
+    order = []
+
+    def fake_load(self):
+        order.append("load_data")
+        self.history_data = [object()]
+
+    class Stop(Exception):
+        pass
+
+    def fake_add(self, strategy_class, setting):
+        order.append("add_strategy")
+        raise Stop()
+
+    monkeypatch.setattr(BacktestingEngine, "load_data", fake_load)
+    monkeypatch.setattr(BacktestingEngine, "add_strategy", fake_add)
+    start, end = rs.segment_window("CADJ", "train")
+    with pytest.raises(Stop):
+        backtest_lib.run_backtest(type("S", (), {}), {}, "CADJ", start, end)
+    assert order == ["load_data", "add_strategy"]

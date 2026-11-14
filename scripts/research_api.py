@@ -970,16 +970,16 @@ def run_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
-    # 回测经 peewee 读 vnpy 数据库(sqlite),会发 `sqlite3.connect` 审计事件:登记这个库的路径,窗口里只放行它。
-    # 取不到就登记空表(那时窗口里的回测读库会被自己的钩子拒——fail-closed,不是放开)。
+    # 回测要读 vnpy 数据库(sqlite)。**在窗口之前**由框架先把连接建好(`get_database()` 缓存在模块全局里),
+    # 窗口里的 `load_bar` 等只复用这条已有连接,不再发新的 `sqlite3.connect`——于是窗口里**不需要、也不登记任何 sqlite 路径**
+    # (第 38 轮:登记既不必要,也不解决问题;候选拿活动句柄的入口 `get_database`/`database` 在对象层已不可达)。
     try:
-        from vnpy.trader.setting import SETTINGS
-        from vnpy.trader.utility import get_file_path
-        database_paths = [get_file_path(SETTINGS["database.database"])]
-    except Exception:                                # noqa: BLE001
-        database_paths = []
+        from vnpy.trader.database import get_database
+        get_database()
+    except Exception:                                # noqa: BLE001 —— 建不起来就让回测自己报错
+        pass
     try:
-        with rs.candidate_window(sqlite_paths=database_paths):
+        with rs.candidate_window():
             stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))

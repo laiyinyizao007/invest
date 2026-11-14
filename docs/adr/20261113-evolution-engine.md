@@ -2024,7 +2024,7 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 
 **sqlite3 与"没有 `open` 事件的写原语"**(Windows 实测,探针 `%TEMP%\probe_prims.py`):
 - `sqlite3.connect`:建库/写库,只发 `sqlite3.connect`,**没有 `open` 事件**——钩子原先完全看不见(`window_denials` 为空)。现按路径参数判(允许目录内放行、`:memory:` 放行、之外拒);
-  回测经 peewee 读 vnpy 数据库会发同一个事件,所以回测入口的窗口登记该库路径(`vnpy_database_paths()`),仅放行那一个库。`dbm.sqlite3`/`shelve` 底层同走它,一并受判。
+  (第 37 轮曾让回测入口的窗口登记 vnpy 库路径放行——**第 38 轮已撤销**:登记既不必要也不解决问题,见本文末「第 38 轮」。)`dbm.sqlite3`/`shelve` 底层同走它,一并受判。
 - `_winapi.CreateFile`:带写访问位时按路径判(读放行);`winreg.CreateKey/SetValue/DeleteKey/DeleteValue/SaveKey/LoadKey/ConnectRegistry`:整族拒。
 - 经 `open` 事件判定的(已实测):`zipfile`、`tarfile`、`logging.FileHandler`、`dbm.dumb`、`shutil.copyfile`(另有 `shutil.copyfile` 事件)、`tempfile`(`os.open`/`os.mkdir`)、`pathlib.Path.write_*`。
 - **无法按路径裁决的(无事件或事件不带路径,即使今天不可达也列在这里)**:`mmap.__new__`(只带 fd,fd 来自已裁决的 open)、`os.write`/`os.pwrite`/`os.ftruncate`(无事件)、
@@ -2039,7 +2039,7 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 
 **新增残余**:① 对象层按 `__module__` 判来源,但**导入原语此前未被覆盖**——白名单加固可被白名单模块的再导出绕过(本轮的 Critical 即是);
 这类问题的根在"按成员枚举"的收敛性:扫描只覆盖已装版本的模块级公开成员,升级 vnpy 后须重跑 `%TEMP%\scan_reexports.py`(本 PR 把其核心判据固化为 `test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin`,只覆盖列出的 11 个模块)。
-② sqlite3 无 `open` 事件(已按 `sqlite3.connect` 单独处置)与上面列出的无法裁决的原语。③ 回测入口窗口里放行了 vnpy 数据库的 sqlite 连接——该库在窗口内可被写(sqlite3 本身候选不可达,但这是个有意留的口子)。
+② sqlite3 无 `open` 事件(已按 `sqlite3.connect` 单独处置)与上面列出的无法裁决的原语。③ (已更正,第 38 轮)第 37 轮曾在回测窗口放行 vnpy 数据库的 sqlite 连接,这反而是个口子;已撤销,改为窗口前由框架建好连接、窗口里不登记任何路径。
 **G8**:本轮同样**未跑**外部评审,状态:待复核。
 
 第 37 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
@@ -2059,3 +2059,50 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 | 去掉 winreg 事件拒绝 | 红 |
 
 均无等价变异。
+
+### 第 38 轮复审(codex 35/50)的补修:活动数据库句柄不可达
+**Critical(已复现并修复)**:第 37 轮在回测窗口里登记 vnpy 数据库的 sqlite 路径,**自己引入了更大的口子**——候选 `from vnpy.trader.database import get_database`
+可达(生产 `import_candidate`、静态筛查开),`db.db` 是 peewee `SqliteDatabase` 的原始句柄(**实例属性,不受对象层规则管**),
+`db.db.execute_sql("ATTACH DATABASE …")`/`VACUUM INTO` 在允许目录之外落盘(钩子看不见,`window_denials` 为空),
+`INSERT/UPDATE dbbardata` 改框架行情库——`backtest_lib` 里候选 `__init__`(`add_strategy`)先于 `engine.load_data()`,同一次回测就读到被改过的价格。
+**且不登记任何 sqlite 路径时攻击同样成功**:框架连接早在窗口外建好,`ATTACH`/`VACUUM INTO` 在已打开的连接上不发可判路径的事件(`connect` 事件只在新连接时发)。
+
+**修法(能力层,不是事件名单)**:
+1. **不给句柄**:`get_database`/`database`/`get_datafeed`/`datafeed`(`vnpy.trader.database`/`datafeed`)进 `UNREACHABLE_MEMBERS`;
+   再按"**来源模块.函数名**"登记 `UNREACHABLE_QUALIFIED`(`vnpy.trader.database.get_database`、`datafeed.get_datafeed`、`utility.get_folder_path/get_file_path/save_json/load_json`),
+   于是 `vnpy_ctastrategy.backtesting`/`engine` 里的**再导出**同样被挡(规则:返回活动句柄的函数);`peewee`/`playhouse`/`vnpy_sqlite`/`sqlite3` 进 `UNREACHABLE_ORIGINS`(实例按来源挡)。
+2. **撤销**回测窗口的 sqlite 路径登记(`candidate_window` 不再有 `sqlite_paths` 参数):回测入口在**窗口之前**调用 `get_database()` 把连接建好(缓存在 vnpy 模块全局),
+   窗口里的 `load_bar` 等复用这条已有连接,不发新 `connect`;窗口里**任何**新的 `sqlite3.connect` 按路径判(只放行允许目录与 `:memory:`),**对"框架的库"也没有特例**。
+   实测不需要 `file:…?mode=ro` 方案:此机无日线数据,真实回测只能走到"没有日线数据"这条报错,但窗口内读库(`load_bar_data`)无拒绝(用例在新进程里验证"先建连接"这一步,拿掉即红)。
+3. **③ 行情先取定**:`backtest_lib.run_engine` 把 `engine.load_data()` 前置到 `add_strategy` 之前(`load_data` 只依赖 `set_parameters`,不依赖策略实例;改动最小一刀,既有回测测试全绿)。
+   **如实**:这只保证"候选 `__init__` 之前行情已读入引擎";候选仍能经 `self.cta_engine.history_data` 在内存里改引擎已读入的列表——这是同进程残余(#29),由运行时第五层(行情容器基准)部分覆盖,不是本改动的能力。
+
+**sqlite 事件层的限制(明写,不要再补事件名)**:`sqlite3` 事件层**判不了** `ATTACH DATABASE`、`VACUUM INTO`、已打开连接上的任意 SQL——它们不发带路径的审计事件
+(`test_event_layer_cannot_judge_vacuum_into_on_an_open_connection` 钉住)。修法只能在**能力层**(不把句柄给候选)或 **sqlite 层**(只读打开 `file:…?mode=ro`),往事件名单里补名字**不收敛**。
+
+**对象层的边界(第三处同族盲区,残余清单新增一栏)**:对象层按 `__module__` 判**模块成员**的来源;**函数返回值、实例属性、调用后得到的对象不在判定范围内**。
+第 35 轮(函数级能力)、第 37 轮(导入原语)、第 38 轮(活动句柄)是同一族问题:凡"拿到函数再调用得到危险对象"的路径,只能在"拿到函数/实例"这一步拒。
+**系统性扫描(第 2 项)**:扫描脚本 `%TEMP%\scan_handles.py`——枚举 `vnpy.trader.*`/`vnpy.event.*`/`vnpy_ctastrategy.*`(排除 gui/ui/ctp/wechat)的公开函数
+(名字 `get_/create_/open_/connect/make_/new_/init_`、返回注解含 Database/Engine/Connection/Cursor/Session/Handle/Socket/IO/File/Thread/Process/Manager/Client)
+与模块级实例(类型来源非内置/数据类/枚举且带 `db/connection/cursor/execute*`,先调用一次 `get_database()` 让 `database` 变成实例)。
+修前 14 个命中,10 个放行;**已拦**:`get_database`(3 处:database、backtesting、engine)、`get_datafeed`(2 处)、`get_folder_path`(logger 再导出)、`database` 实例;
+**已审查为无害并登记**:`get_digits`(纯计算)、`get_localzone_name`(字符串)、`get_target_value`(取指标数值)、`make_subplots`(plotly 布局,plotly 不可 import)。
+**可重复**:同一判据已做成回归用例 `test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed`——升级 vnpy 后若出现新的、未被对象层挡住也未审查的句柄型成员,用例变红,逼着人去审。
+**局限**:判据是启发式(名字+注解+属性),不递归调用函数看返回值;覆盖面只到上述三个包;第三方 numpy/pandas 内部未扫。库自带的重导出会随 vnpy 升级变化——这是**持续**成本,不是一次性修复。
+
+**小项**:`vnpy.trader.utility.Path` 在 `UNREACHABLE_MEMBERS` 与 `UNREACHABLE_ORIGINS`(pathlib)里重复登记。**没有去重**:我先删了成员那条,宪法历史守卫立即报"内置保护只能增不能减"——按项目纪律,保留重复比放松守卫更对;别处再导出的 `Path` 由来源规则统一处置,用例两条路各测一遍;
+`_argv_matches` 的 docstring 写明实际判定范围:整条命令行逐项相等,且 `argv[0]` 的 basename(去扩展名、小写)为 `git`——只核名字,不核路径是不是真 git。
+**G8**:本轮同样**未跑**外部评审,状态:待复核。
+
+第 38 轮补修的变异验证:
+
+| 变异 | 结果 |
+|---|---|
+| 去掉按来源再导出的 qualified 规则 | 红 |
+| 去掉 peewee/vnpy_sqlite 实例来源 | 红 |
+| 只去掉 `UNREACHABLE_MEMBERS` 里的句柄登记 | 红,但**只因规则名断言**;攻击本身仍被 qualified+来源两层冗余挡住(纵深,不是等价变异也不是漏洞) |
+| 句柄三层防线全拿掉 | 红;端到端用例里候选 `VACUUM INTO` 真的成功(`ATTACKED`),证明探针不是空转 |
+| 回测入口不先建连接 | 红(新进程里的行为用例) |
+| 回测入口改回先 `add_strategy` 后 `load_data` | 红 |
+
+无等价变异。
