@@ -760,7 +760,8 @@ def test_reset_records_the_run_ids_it_orphans(tmp_path):
     ladder.submit(0.0, run_id="run-a")
     ladder.submit(0.0, run_id="run-b")
     out = ladder.reset("清空", force=True)
-    assert out["orphaned_run_ids"] == 2
+    assert out["orphaned_count"] == 2
+    assert set(out["orphaned_run_ids"]) == {"run-a", "run-b"}
     assert set(ladder.orphaned_run_ids()) == {"run-a", "run-b"}
 
 
@@ -919,12 +920,35 @@ def test_reset_records_every_orphaned_run_and_the_count_it_returns_matches(tmp_p
 
     out = ladder.reset("清空", force=True)
 
-    assert out["orphaned_run_ids"] == total                       # 返回值 = 落盘内容
+    assert out["orphaned_count"] == total                        # 返回值 = 落盘内容
+    assert len(out["orphaned_run_ids"]) == total
     assert len(ladder.orphaned_run_ids()) == total
     assert set(ladder.orphaned_run_ids()) == {f"run-{i:03d}" for i in range(total)}
     line = [json.loads(x) for x in (ladder.path.parent / "ladder.reset.log")
             .read_text(encoding="utf-8").splitlines() if x.strip()][0]
     assert line["orphaned_count"] == total and len(line["orphaned_run_ids"]) == total
+
+
+def test_the_reset_return_value_mirrors_the_audit_intent_line_key_for_key(tmp_path):
+    """第 20 轮自查更正:返回值与审计意图行**逐键一致**(键名、类型、值都一样)。
+
+    此前返回值里写的是 `"orphaned_run_ids": len(...)`——同一个键名在返回值里是**个数**、
+    在审计行里是**名单**,两边对不上:"这次重置孤立了哪些 run"于是有两个互相矛盾的说法,
+    而"返回值与落盘内容一致"这句话当时并不成立。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0, run_id="run-a")
+    ladder.submit(0.0, run_id="run-b")
+
+    out = ladder.reset("清空", force=True)
+    line = [json.loads(x) for x in (ladder.path.parent / "ladder.reset.log")
+            .read_text(encoding="utf-8").splitlines() if x.strip()][0]
+
+    assert line["event"] == "reset-intent"
+    for key in ("discarded_best", "discarded_queries", "orphaned_count", "orphaned_run_ids"):
+        assert key in out, f"返回值少了 {key}"
+        assert key in line, f"审计行少了 {key}"
+        assert out[key] == line[key], f"{key}: 返回值 {out[key]!r} 与审计行 {line[key]!r} 对不上"
+        assert type(out[key]) is type(line[key]), f"{key}: 两边类型不一致"
 
 
 def test_a_snapshot_taken_before_a_reset_does_not_replay_the_pre_reset_best(tmp_path):

@@ -734,8 +734,13 @@ class Ladder:
                 raise LadderError(f"reset 失败: {_why(exc)}") from exc
             self._append_reset_log(log_path, {"event": "reset-done", "archive": n,
                                               "files": moved, "reason": reason.strip()})
+        # 返回值与**审计意图行逐键一致**(第 20 轮自查更正):此前这里写的是
+        # `"orphaned_run_ids": len(...)`——同一个键名在返回值里是**个数**、在审计行里是**名单**,
+        # 两边对不上,而且"返回值与落盘内容一致"这句话当时并不成立。改为键名与类型都一致:
+        # `orphaned_count` 是个数,`orphaned_run_ids` 是名单。
         return {"archived": moved, "archive_number": n, "discarded_best": dropped["best"],
-                "discarded_queries": dropped["queries"], "orphaned_run_ids": len(dropped["run_ids"])}
+                "discarded_queries": dropped["queries"], "orphaned_count": len(dropped["run_ids"]),
+                "orphaned_run_ids": list(dropped["run_ids"])}
 
     @staticmethod
     def _append_reset_log(path: Path, entry: dict, *, required: bool = False) -> None:
