@@ -466,3 +466,156 @@ def test_deleting_an_element_of_the_container_is_refused():
     findings = const_findings(source)
     assert findings
     assert any("删除" in f for f in findings), findings
+
+
+# ---------- 第 6 轮 codex 的发现:候选自己的同名符号(H-1) ----------
+
+def test_a_candidate_may_define_its_own_trading_day():
+    """**放行方向**:候选自己写一个 `trading_day()`(LLM 候选极常见的辅助名;
+    本仓 `risk/account_guard.py` 就有同名函数)——它引用的是**自己**那个函数,
+    不是框架的风控函数。
+
+    第 6 轮 codex 的 High-1:静态层此前按**名字**一律拒,而运行期那一层已经改成
+    按**身份**核对(候选自己的同名符号放行)——两层口径相反,
+    静态筛查先执行,运行期那条"放行"在真实流水线里**永远走不到**。
+    这正是 F2 要消灭的那类误伤:把诚实候选整片拒掉,进化循环因此被闲置。"""
+    source = (
+        "def trading_day():\n    return 20261113\n\n\n"
+        "def entry_signal(self):\n    if trading_day() == 20261113:\n        return 1\n    return 0\n")
+    assert const_findings(source) == []
+
+
+def test_a_candidate_may_define_its_own_stop_distance_and_within_budget():
+    """**放行方向**同上:`stop_distance`/`within_budget` 也是候选可能自写的辅助名。"""
+    source = (
+        "def stop_distance(x):\n    return x\n\n\n"
+        "def within_budget(a, b):\n    return a < b\n\n\n"
+        "def entry_signal(self):\n    return 1 if stop_distance(1) and within_budget(1, 2) else 0\n")
+    assert const_findings(source) == []
+
+
+def test_importing_a_protected_object_is_still_refused():
+    """**拦截方向**:豁免只对**候选自己定义**的名字有效——
+    `from risk.market_view import swap_out` 绑的是框架那个,照旧拒。"""
+    findings = const_findings(
+        "from risk.market_view import swap_out\n\n\ndef entry_signal(self):\n    return 0\n")
+    assert findings, "从受保护模块导入受保护对象竟然放行"
+    assert any("不得导入受保护的风控对象" in f for f in findings), findings
+
+
+def test_taking_a_protected_object_by_attribute_is_still_refused():
+    """**拦截方向**:候选自己定义了同名函数,也不能顺带把框架那个取到手:
+    `x = risk.market_view.swap_out` 的属性那一路照旧拒。"""
+    findings = const_findings(
+        "def swap_out(x):\n    return x\n\n\n"
+        "x = risk.market_view.swap_out\n\n\ndef entry_signal(self):\n    return 0\n")
+    assert findings, "按属性取受保护对象竟然放行"
+    assert any("禁止引用受保护的风控对象 swap_out" in f for f in findings), findings
+
+
+def test_referencing_an_undefined_protected_name_is_still_refused():
+    """**拦截方向**:候选**没有**定义过这个名字 → 引用的是框架那个,照旧拒。"""
+    findings = const_findings(
+        "def entry_signal(self):\n    return 1 if trading_day() else 0\n")
+    assert findings, "引用未定义的受保护名字竟然放行"
+    assert any("禁止引用受保护的风控对象 trading_day" in f for f in findings), findings
+
+
+def test_the_candidates_own_trading_day_passes_the_real_screening_entry(tmp_path):
+    """**真实入口**:走 `research_api.screen`(网关与 CLI 走的那个)也必须放行——
+    静态层放行不等于流水线放行。"""
+    import research_api
+    import research_config as rc
+
+    cfg = rc.load()
+    pending = tmp_path / "pending_strategies"
+    pending.mkdir()
+    candidate = pending / "own_trading_day_candidate.py"
+    candidate.write_text(
+        "def trading_day():\n    return 20261113\n\n\n"
+        "class Cand:\n    def entry_signal(self):\n        return 1 if trading_day() else 0\n",
+        encoding="utf-8")
+    assert research_api.screen(candidate, cfg) == []
+
+
+# ---------- 第 6 轮 codex 的发现:关键字形态的自由函数(Medium-2) ----------
+
+def test_handing_the_container_to_a_mutating_function_by_keyword_is_refused():
+    """**关键字形态**的自由函数:`np.copyto(dst=self.am.close, src=x)`。
+
+    numpy 的 `copyto` 是 ufunc、`put` 是普通函数,两种都接受关键字;
+    规则原来只看位置实参,这一形态 0 findings(第 6 轮 codex 的 Medium-2)。"""
+    source = "def entry_signal(self):\n    np.copyto(dst=self.am.close, src=other)\n    return 0\n"
+    findings = const_findings(source)
+    assert findings, "关键字形态的变更型函数没有被拦下"
+    assert any("变更型函数" in f for f in findings), findings
+
+
+def test_handing_the_container_to_put_by_keyword_is_refused():
+    """`np.put(a=self.am.close, ind=[0], v=1.0)` 同理。"""
+    source = "def entry_signal(self):\n    np.put(a=self.am.close, ind=[0], v=1.0)\n    return 0\n"
+    findings = const_findings(source)
+    assert findings, "关键字形态的 np.put 没有被拦下"
+    assert any("变更型函数" in f for f in findings), findings
+
+
+def test_a_keyword_that_is_not_the_target_is_still_allowed():
+    """**放行方向**:关键字实参不是"被写的目标"时,不许误伤。"""
+    source = "def entry_signal(self):\n    np.copyto(dst=other, src=self.am.close)\n    return 0\n"
+    assert const_findings(source) == []
+
+
+# ---------- 第 6 轮 codex 的发现:文案必须说真话(Medium-3) ----------
+
+def test_the_private_symbol_finding_does_not_claim_a_false_binding(fake_repo):
+    """裁决文本必须**说真话**:没有 `__all__` 时,Python 的 `import *` 本来就**不绑**
+    下划线开头的名字——发现文本却说"会把它放进候选命名空间"(第 6 轮 codex 的 Medium-3)。
+
+    拒它的**理由**是"这个模块在藏东西"这个信号,所以行为不变,但文本要改准。
+
+    (这一条要**单独造**一个"有私有名、没有受保护名"的模块:直接拿 `risk.market_view` 试不行,
+    它命中的是"受保护符号"那一条,根本走不到私有符号这一条——那样这条用例就白写了。)"""
+    _write_module(fake_repo, "priv_text.py", "_secret = 1\n\n\ndef helper():\n    return 2\n")
+    findings = const_findings("from priv_text import *\n")
+    assert findings, "带模块级私有名字的模块竟然放行"
+    assert all("会把模块级私有符号" not in f for f in findings), findings
+    assert any("私有符号" in f for f in findings), findings
+
+
+def test_the_private_symbol_finding_still_names_the_symbol(fake_repo):
+    """改准之后仍要点名具体符号(复核者要能自证是哪一条规则、哪些符号)。"""
+    _write_module(fake_repo, "priv_mod.py", "_secret = 1\n\n\ndef helper():\n    return 2\n")
+    findings = const_findings("from priv_mod import *\n")
+    assert findings
+    assert any("私有符号" in f and "_secret" in f for f in findings), findings
+
+
+# ---------- 第 6 轮 codex 的发现:命名空间核对的边界(Low-3/Low-4) ----------
+
+def test_a_plain_integer_in_the_namespace_is_not_treated_as_a_protected_object():
+    """**放行方向**:身份核对按 `id` 记对象,标量(小整数)会被复用——
+    拿它当身份会让候选命名空间里任何一个同值整数都被误判成持有受保护对象,
+    **整个进化循环被闲置**(第 6 轮 codex 的 Low-3)。"""
+    assert const.check_candidate_namespace({"x": 1, "y": 2, "z": 0}) == []
+
+
+def test_a_protected_object_hidden_in_a_dict_key_is_still_caught():
+    """**拦截方向**:字典的**键**同样能把对象持在手里(`{swap_out: 1}`)。"""
+    from risk.market_view import swap_out
+
+    problems = const.check_candidate_namespace({"hoard": {swap_out: 1}})
+    assert problems, "藏在字典键里的受保护对象没有被抓到"
+    assert any("规则:候选命名空间不得持有受保护对象" in p for p in problems), problems
+
+
+def test_a_scalar_bound_to_a_protected_name_is_not_treated_as_a_protected_object(monkeypatch):
+    """**放行方向**(第 6 轮 codex 的 Low-3):身份核对用 `id` 当键,
+    而**标量**的 id 会被复用/撞上别的对象——拿它当"身份"会让候选命名空间里
+    任何一个同值的小整数都被误判成持有受保护对象,**整个进化循环被闲置**。
+
+    这里把受保护模块里的一个受保护名临时绑成整数(用完自动还原),
+    再看候选命名空间里同值的整数会不会被误判。"""
+    import risk.market_view as mv
+
+    monkeypatch.setattr(mv, "swap_out", 5)
+    assert const.check_candidate_namespace({"x": 5}) == []

@@ -158,6 +158,12 @@ BUILTIN_PROTECTED_CONTAINER_SCOPE = BUILTIN_PROTECTED_CONTAINERS + (
 # 第一个实参是读,按第一个实参判会误伤 `x.append(self.am.close)` 这种正当写法。
 _MUTATING_FREE_FUNCTIONS = frozenset({"copyto", "put", "putmask", "place"})
 
+# 这些自由函数里**被写的目标**的形参名(numpy 的惯例):`copyto(dst, src)`、
+# `put(a, ind, v)`、`putmask(a, mask, v)`、`place(a, mask, v)`。
+# 第 6 轮 codex 的 Medium-2:关键字形态(`np.copyto(dst=self.am.close, src=x)`)
+# 原来只看位置实参,漏掉了。
+_FREE_MUTATOR_TARGET_KEYWORDS = frozenset({"dst", "a", "arr", "array"})
+
 # 受保护容器上的**变更型方法**:对这些方法**调用**就等于原地改写容器里的东西。
 #
 # 为什么必须单列一份名单:容器规则原来只挡"写"(`arr = self.am.close` 后 `arr[0] = 999`)
@@ -491,6 +497,43 @@ def _class_body_target_ids(tree: ast.AST) -> set[int]:
     return ids
 
 
+def _bound_names(target: ast.AST) -> set[str]:
+    """赋值目标里绑定的**裸名字**(`x` / `a, b = ...` / `*rest`)。"""
+    names: set[str] = set()
+    if isinstance(target, ast.Name):
+        names.add(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            names.update(_bound_names(element))
+    elif isinstance(target, ast.Starred):
+        names.update(_bound_names(target.value))
+    return names
+
+
+def _module_defined_names(tree: ast.AST) -> set[str]:
+    """候选**自己**定义的名字(`def` / `class` / 赋值目标)。
+
+    第 6 轮 codex 的 High-1:静态层按**名字**拒受保护符号,候选自己写一个
+    `def trading_day()`(LLM 候选极常见的辅助名;本仓 `risk/account_guard.py` 就有同名函数)
+    就被拒——而运行期那一层已经改成按**身份**核对(候选自己的同名符号放行),
+    两层口径相反:静态筛查先执行,运行期那条"放行"在真实流水线里**永远走不到**。
+    这正是 F2 要消灭的那一类误伤(把诚实候选整片拒掉,进化循环因此被闲置)。
+
+    这里只收**候选自己定义**的名字,**不收 import 绑定的名字**:
+    `from risk.market_view import swap_out` 绑的是框架那个,必须照旧拒
+    (那一路由 `ImportFrom` 分支裁决,不受这里的豁免影响)。"""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_bound_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(_bound_names(node.target))
+    return names
+
+
 def _bare_local_allowed(name: str, node_id: int, class_body_targets: set[int]) -> bool:
     """裸局部变量用容器名(`am`/`bg`)是否放行。
 
@@ -790,14 +833,23 @@ def _free_mutator_call(node: ast.Call) -> str | None:
         return None
     if name not in _MUTATING_FREE_FUNCTIONS:
         return None
-    if not node.args:
-        return None
-    path = _attr_path(node.args[0]) or []
-    for index, segment in enumerate(path):
-        if index == 0:
-            continue
-        if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
-            return f"{name}({'.'.join(path)})"
+    # 被写的目标既可能是**位置**实参(`np.copyto(self.am.close, x)`),
+    # 也可能是**关键字**实参(`np.copyto(dst=self.am.close, src=x)`、`np.put(a=self.am.close, …)`)
+    # ——numpy 的 `copyto` 是 ufunc、`put` 是普通函数,两种都接受关键字。
+    # 第 6 轮 codex 的 Medium-2:只看位置实参时,关键字形态 0 findings。
+    targets: list[ast.AST] = []
+    if node.args:
+        targets.append(node.args[0])
+    for keyword in node.keywords:
+        if keyword.arg in _FREE_MUTATOR_TARGET_KEYWORDS:
+            targets.append(keyword.value)
+    for target in targets:
+        path = _attr_path(target) or []
+        for index, segment in enumerate(path):
+            if index == 0:
+                continue
+            if segment in BUILTIN_PROTECTED_CONTAINER_SCOPE:
+                return f"{name}({'.'.join(path)})"
     return None
 
 
@@ -914,7 +966,7 @@ def _path_violation(node: ast.AST, c: Constitution) -> str | None:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 模块名集合的缓存:键是 (路径, mtime_ns, 大小),文件一改就失效。
-_MODULE_NAMES_CACHE: dict[tuple[str, int, int], tuple[set[str], bool]] = {}
+_MODULE_NAMES_CACHE: dict[tuple[str, int, int], tuple[frozenset[str], frozenset[str], bool]] = {}
 # 缓存上限:文件一改就多一条,不清会一直涨(每条几十字节,但没有理由让它涨)。
 _MODULE_NAMES_CACHE_MAX = 128
 
@@ -946,7 +998,7 @@ def _module_source_file(module: str) -> Path | None:
     return None
 
 
-def _module_export_info(path: Path) -> tuple[set[str], set[str], bool] | None:
+def _module_export_info(path: Path) -> tuple[frozenset[str], frozenset[str], bool] | None:
     """被导入模块**实际会被 `import *` 绑走**的名字集合、模块级私有符号,以及"是否不可证"。
 
     返回 `(exported, private, dynamic)`;源码读不出来或解析失败返回 None。
@@ -1054,7 +1106,7 @@ def _module_export_info(path: Path) -> tuple[set[str], set[str], bool] | None:
         exported = {n for n in names if not n.startswith("_")}
     private = {n for n in names
                if n.startswith("_") and not (n.startswith("__") and n.endswith("__"))}
-    result = (exported, private, dynamic)
+    result = (frozenset(exported), frozenset(private), dynamic)
     if len(_MODULE_NAMES_CACHE) >= _MODULE_NAMES_CACHE_MAX:
         _MODULE_NAMES_CACHE.clear()
     _MODULE_NAMES_CACHE[key] = result
@@ -1099,8 +1151,13 @@ def star_import_finding(module: str, level: int = 0) -> str | None:
                 f"(拿到定义就能架空风控判定,只读视图的换入换出也会被绕开)"
                 f"(规则:通配符导入不得暴露受保护符号)")
     if private:
-        return (f"通配符导入 `{module}` 会把模块级私有符号 {'、'.join(sorted(private))} 放进候选命名空间"
-                f"(模块内部符号不该外流)(规则:通配符导入不得暴露模块级私有符号)")
+        # 第 6 轮 codex 的 Medium-3:**文案必须说真话**。没有 `__all__` 时,
+        # Python 的 `import *` 本来就**不绑**下划线开头的名字(实测绑定集里没有它);
+        # 只有模块自己把私有名写进 `__all__` 时它才会被绑。所以这里不说"会放进候选命名空间",
+        # 而说"这个模块在藏东西"——拒它的**理由**是信号,不是那个具体的绑定后果。
+        return (f"通配符导入 `{module}` 的模块含模块级私有符号 {'、'.join(sorted(private))}"
+                f"(import * 通常不绑下划线名,但该模块在藏东西;"
+                f"若它的 __all__ 点名了这些符号则会被绑进来)(规则:通配符导入不得暴露模块级私有符号)")
     return None
 
 
@@ -1110,22 +1167,32 @@ def _protected_runtime_objects() -> dict[int, str]:
     只看 `vars(mod)`(模块的 `__dict__`),不用 `getattr`:模块级 `__getattr__`(PEP 562)
     会让 getattr 产生副作用,也可能凭空造出名字。
 
-    受保护的包:`risk`/`strategies`/`vnpy_ctastrategy`——与运行期第四层指纹的覆盖范围一致。
+    受保护的包:**仓库自己的**三个包(`risk`/`strategies`/`vnpy_ctastrategy`)——
+    它们是 `PROTECTED_RUNTIME_PACKAGES` 里**不带点**的那几条(带点的是 vnpy 的第三方模块,
+    受保护对象不住在那儿)。从常量派生而不是另写一份,免得将来加包时两处静默分叉
+    (第 6 轮 codex 的 Low-2)。
     """
     objects: dict[int, str] = {}
     names = _star_import_blocked_symbols()
+    own_packages = {package for package in PROTECTED_RUNTIME_PACKAGES if "." not in package}
     for modname, module in list(sys.modules.items()):
         if module is None:
             continue
-        if modname.split(".")[0] not in ("risk", "strategies", "vnpy_ctastrategy"):
+        if modname.split(".")[0] not in own_packages:
             continue
         namespace = getattr(module, "__dict__", None)
         if not isinstance(namespace, dict):
             continue
         for name in names:
             obj = namespace.get(name)
-            if obj is not None:
-                objects.setdefault(id(obj), name)
+            if obj is None:
+                continue
+            # 只记**对象**的 id:标量(整数/字符串/布尔)的 id 会被复用或撞上别的对象,
+            # 拿它当"身份"会让候选命名空间里任何一个同值的小整数都被误判成持有受保护对象
+            # (第 6 轮 codex 的 Low-3:这种误判会让**整个进化循环被闲置**)。
+            if isinstance(obj, (bool, int, float, str, bytes, complex, type(None))):
+                continue
+            objects.setdefault(id(obj), name)
     return objects
 
 
@@ -1133,7 +1200,8 @@ def _namespace_values(namespace: dict) -> list[tuple[str, object]]:
     """命名空间里的值:**顶层**的,以及**一层**嵌套(列表/元组/集合/字典)里的。
 
     一层就够挡住最常见的藏法(`_hoard = [swap_out]`);更深层的藏法由运行期第五层兜住
-    (它盯的是数据本身,不是名字)。"""
+    (它盯的是数据本身,不是名字)。字典的**键**也要看:键同样能把对象持在手里
+    (`{swap_out: 1}`,第 6 轮 codex 的 Low-4)。"""
     values: list[tuple[str, object]] = []
     for name, value in namespace.items():
         values.append((name, value))
@@ -1141,6 +1209,7 @@ def _namespace_values(namespace: dict) -> list[tuple[str, object]]:
             values.extend((f"{name}[…]", item) for item in value)
         elif isinstance(value, dict):
             values.extend((f"{name}[…]", item) for item in value.values())
+            values.extend((f"{name}{{键}}", key) for key in value.keys())
     return values
 
 
@@ -1203,6 +1272,10 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     # 类体里的赋值目标:裸局部名豁免(`am`/`bg`)只对**函数体**生效,
     # 类体里定义 `am = ...` 仍然算"覆盖受保护成员"(见 _class_body_target_ids)。
     class_body_targets = _class_body_target_ids(tree)
+    # 候选**自己**定义的名字(def/class/赋值目标):裸名引用这些名字时,
+    # 指的是候选自己的对象,不是框架那个受保护对象(第 6 轮 codex 的 High-1)。
+    # 运行期那一层已经按**身份**核对(候选自己的同名符号放行),这里与它对齐。
+    defined_names = _module_defined_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
             for name in sorted(_class_body_names(node)):
@@ -1334,7 +1407,12 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
             elif node.id in c.protected_entry_points:
                 findings.append(f"第 {node.lineno} 行: 禁止引用风控执行点 {node.id}(调用它可绕开预算与熔断判定)")
             elif node.id in BUILTIN_PROTECTED_READ_ATTRS:
-                findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.id}(拿到定义就能架空风控判定)")
+                # 候选**自己**定义过这个名字 → 引用的是它自己的对象,不是框架那个:
+                # 放行(第 6 轮 codex 的 High-1)。注意豁免只对**裸名**有效:
+                # `from risk.market_view import swap_out` 绑的是框架那个,由 ImportFrom 分支照旧拒;
+                # `x = risk.market_view.swap_out` 的**属性**那一路也照旧拒。
+                if node.id not in defined_names:
+                    findings.append(f"第 {node.lineno} 行: 禁止引用受保护的风控对象 {node.id}(拿到定义就能架空风控判定)")
         elif isinstance(node, ast.ImportFrom):
             # 从受保护模块里**导入**风控对象:候选不需要它,拿到就多一条改写它的路。
             # (`from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy` 不受影响——

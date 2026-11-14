@@ -66,6 +66,41 @@
     静态层不再拦"先取数组别名再写"(视图下写的是拷贝);仓库外模块的 `import *` 一律按"无法核验"拒(有意的取舍);
     **辅助模块逃逸仍未关闭**(PR #27 的范围,合并顺序:**先合 #27 → 再 rebase #25 → 再重跑
     `tests/test_view_escape_hatch.py` 与 `tools/check_constitution_history.py`**)。
+- **第 6 轮 G8 复核(codex,40/50)的 9 条发现**(ADR `20261113-read-only-market-view` 新增「第 6 轮」小节):
+  - **两轮复核的结果仍然要分开说**:第一轮(`mcp__zen__codereview`)**再次**被 **Gemini 429** 挡住,
+    **未取得结果、不写分数**;第二轮(codex CLI)**40/50**(质量 8 / 安全 8 / 性能 9 / 架构 8 / 文档 7)。
+  - **HIGH-1 静态层仍按名字拒候选**自己**的同名符号**:候选写一个 `def trading_day()`
+    (LLM 候选极常见的辅助名,本仓 `risk/account_guard.py` 就有同名函数)就被拒,
+    而运行期已改成**按身份**核对(候选自己的同名符号放行)——两层口径相反,
+    静态筛查先执行,运行期那条"放行"在真实流水线里**永远走不到**。
+    **修法**:静态层引入"候选自己定义的名字"豁免(`def`/`class`/赋值目标)。
+    **豁免的边界**:只对**裸名**生效;**不收 import 绑定的名字**
+    (`from risk.market_view import swap_out` 照旧拒);**属性那一路照旧拒**
+    (`x = risk.market_view.swap_out` 照旧拒);候选没定义过的名字照旧拒。
+    **双向用例**:自己定义 `trading_day`/`stop_distance`/`within_budget` → 放行(含真实入口
+    `research_api.screen`);具名导入受保护对象 → 仍拒;按属性取受保护对象 → 仍拒;引用未定义的同名 → 仍拒。
+  - **MEDIUM-1 运行期命名空间核对不覆盖"持有整个模块对象"**(`import strategies.trend_atr_strategy as t`
+    → `t.swap_out` 一步可达)——**如实登记为残余**(本轮未修;今天不可利用:候选唯一的钩子是
+    `entry_signal`,那一段 `self.am` 是只读视图)。
+  - **MEDIUM-2 自由函数只看第一个位置实参**:`np.copyto(dst=self.am.close, src=x)`、
+    `np.put(a=self.am.close, …)` 原来 0 findings(numpy 的 `copyto` 是 ufunc、`put` 是普通函数,
+    都接受关键字)。**修法**:同时检查关键字实参里的目标形参(`dst`/`a`/`arr`/`array`);
+    **放行方向**:`np.copyto(dst=other, src=self.am.close)`(被写的是别的数组)放行。
+  - **MEDIUM-3 "模块级私有符号"规则的裁决文本不成立**:没有 `__all__` 时 Python 的 `import *`
+    本来就**不绑**下划线名,而文本说"会把它放进候选命名空间"——**按文本无法自证**。
+    **修法**:文本改成实话("该模块在藏东西"),**行为不变**,点名具体符号这一条保留。
+  - **LOW-1** 上一轮变异表把"撤销 F2 收窄"记成 4 条变红,codex 用**精确复原旧三条函数**的变体实测 **14 条**——
+    本轮按更精确的变体更正,并写明两次测的**不是同一个变体**。
+  - **LOW-2** 受保护包名不再写死,改为从 `PROTECTED_RUNTIME_PACKAGES` 派生;docstring 改成说真话。
+  - **LOW-3** 身份表**跳过标量**(`bool`/`int`/`float`/`str`/`bytes`/`complex`/`None`):
+    `id()` 对小整数会撞号,拿它当身份会让候选命名空间里任何一个同值整数被误判成持有受保护对象
+    ——**整个进化循环被闲置**。
+  - **LOW-4** 命名空间核对也扫字典的**键**(`{swap_out: 1}` 这种藏法原来漏放);**LOW-5** 缓存返回 `frozenset`。
+  - **本轮变异验证 5 条(M24–M28)全部变红**。
+  - **残余(如实记录)**:字符串间接引用(`getattr(sys.modules[...])`)静态层仍是 0 findings
+    (沙盒层与运行期身份核对兜住顶层形态,闭包内形态看不见,由第五层在数据真被改时兜底);
+    容器别名**两层以上**静态层 0 findings;命名空间核对不覆盖模块对象;
+    仓库外**以及仓库内带模块级私有名**的模块,`import *` 一律按"无法核验"/"在藏东西"拒(有意的取舍)。
 
 ### Added（新增）
 - **宪法加固:候选在 `entry_signal` 里只拿行情容器的只读副本视图(收能力)**(Issue [#23](https://github.com/laiyinyizao007/invest/issues/23),ADR `20261113-read-only-market-view`;**这是对模板与既有宪法决策的修订**,用户以 `/goal 剩下这些都要做完` 授权):
