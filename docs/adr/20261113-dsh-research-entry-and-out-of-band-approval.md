@@ -2,7 +2,7 @@
 
 - 状态:已采纳(2026-11-13,用户确认);**实现已完成**(2026-11-14,见第 6、7 条)——
   其中「开放 API 端到端」「带外批准」「工具目录」三项**已在本机实测**,其余部分仍是**代码层与契约测试层**的验证(逐条边界见第 8 条)。
-  - **G8 双轮评审进行中**:codex CLI 第 2~14 轮分数 33 → 39 → 36 → 40 → 39/37 → 38/33 → 37/36 → **32/35** → **33/38** → **36/36** → **40/40** → **38/38.5** → 见第 9 条,
+  - **G8 双轮评审进行中**:codex CLI 第 2~16 轮分数 33 → 39 → 36 → 40 → 39/37 → 38/33 → 37/36 → **32/35** → **33/38** → **36/36** → **40/40** → **38/38.5** → (第 15 轮中断)→ **38/40** → 见第 9 条,
     均未达 45 的发布线;每轮的 Critical/High/Medium 已逐条修复并写进契约测试(见第 9 条),评审仍在继续。
     第 13 轮的两份报告都是 **40/50**(本分支的**最高分**);第 14 轮 **A 38/50、B 38.5/50**(无 Critical / High),
     三条 Medium 均为「闸门漏判」与一条「文档与实测相反」——已逐条修好并写进契约测试(见第 9 条与「第 14 轮引入的边界收紧」)。
@@ -113,7 +113,7 @@
 | 带外批准进程 | `scripts/research_approval_server.py` | 只监听 `127.0.0.1` 的一次性网页;**批准记录的两个合法入口之一**(`approvals.json` 的低层写入者只有 `research_sandbox.record_approval`;另一个入口是等价 CLI `research_api.py review/approve`) |
 | DSH `research` Preset 模板 | `tools/research_mcp/dsh-research-preset.patch.yml` | 只挂 `persona` + `research-mcp`;不含任何文件读写/命令/网页/子 Agent 工具;Auto review 不启用 |
 | 依赖隔离 | `requirements-research.txt` | `mcp` SDK 会拖进 starlette/uvicorn/pydantic,**不进交易环境**;交易环境仍只装 `requirements.txt` |
-| 测试 | 研究侧九份测试文件共 **559 项**(`test_research_api` 98、`test_research_gateway` 87、`test_research_sandbox` 129、`test_research_config` 54、`test_research_approval_server` 34、`test_research_mcp` 29、`test_research_grid` 25、`test_research_gate` 21、`test_research_boundary` 82) | 工具枚举恰为三项、批准写入者唯一、负向路径、Preset 边界(结构级)、返回值不含 URL/哈希 |
+| 测试 | 研究侧九份测试文件共 **561 项**(`test_research_api` 98、`test_research_gateway` 87、`test_research_sandbox` 130、`test_research_config` 54、`test_research_approval_server` 34、`test_research_mcp` 29、`test_research_grid` 25、`test_research_gate` 21、`test_research_boundary` 83) | 工具枚举恰为三项、批准写入者唯一、负向路径、Preset 边界(结构级)、返回值不含 URL/哈希 |
 | 研究栈与交易栈解耦 | `scripts/segment_windows.py`(窗口常量,纯数据)、`scripts/segment_ledger.py`(不再 import bootstrap) | 研究侧 CI 闸门**不装交易环境**也能跑:窗口常量原先经 `optimize → bootstrap → vnpy` 拖进交易栈,现已抽成纯数据模块 |
 
 实测结论:
@@ -126,8 +126,8 @@
   返回**恰 3 个**工具:`start_research` / `research_status` / `request_approval`(名字与描述一并取回)。
   **仍未验证**:在**真实 DSH 会话**里模型侧看到的工具目录(要跑起 DSH 与模型会话才能确认 Preset 装配后的最终形态)。
 - **多轮研究的同名冲突已实测修好(2026-11-14 20:39)**:用新想法在真实开放 API 上跑了一轮——工作流的 `tool_feedback` 节点拿到了网关返回的 `pending_candidates`(三个已落盘的候选名),起名节点据此**起了一个新名字** `open30_atr_midline_trail`(不在列表里),**没有再撞 409**。该轮最终停在**静态筛查**(候选把受保护容器 `am.high`/`am.low` 传给了 `max()`/`min()`),这是宪法筛查在正常拦人(见下面的坑 2),不是本次改动的缺陷。
-- **断耦演练**:停掉毕昇全部容器后跑测试套件,**2736 项通过**(该数字是断耦演练当时的计数);本分支当前全量 **2879 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑),3 项失败 + 5 项 error 与本改动无关,**已取 `origin/main` 版本逐条比对确认完全相同**(状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`);交易与风控不受影响。
-  研究侧九份测试单独跑:**559 项全过**(本机,2026-11-13 重算);模拟 CI「无交易栈」时 **539 通过 + 20 跳过**(=559;跳过的 20 项是带 `requires_trading_stack` 标记的回测子进程用例)。
+- **断耦演练**:停掉毕昇全部容器后跑测试套件,**2736 项通过**(该数字是断耦演练当时的计数);本分支当前全量 **2881 项通过**(本机 Python 3.13.7 + pytest 8.4.2,2026-11-13 重跑),3 项失败 + 5 项 error 与本改动无关,**已取 `origin/main` 版本逐条比对确认完全相同**(状态页隔离子进程在本机 cp1252 控制台下解码失败、drill 缺 `.env` 的 `LIVE_VT_SYMBOL`);交易与风控不受影响。
+  研究侧九份测试单独跑:**561 项全过**(本机,2026-11-13 重算);模拟 CI「无交易栈」时 **541 通过 + 20 跳过**(=561;跳过的 20 项是带 `requires_trading_stack` 标记的回测子进程用例)。
 
 五个必须记下的坑:
 
@@ -156,7 +156,9 @@
 | 第 13 轮(B) | codex `exec` 并行两份之一(架构/文档/测试) | **40/50**(**未达 45**);两份报告**同为本分支最高分**,但文档与闸门仍有硬伤 | **High**:第 12 轮把 CI 依赖改成「从 `requirements-research.txt` 装」之后,研究侧闸门**每个 PR 都红**——该文件漏了测试真正需要的 numpy / pandas。**Medium**:①宪法守卫 `check_constitution_history.py` 用 git 视角取跟踪集时,取不到就**退化成扫全文件系统**,实测会 fail-open(扫不到文件 = 判定没问题),与它自己的 fail-closed 原则冲突;②六处文档的测试条数被并发改动作废(531 → 534),且 `CHANGELOG.md:311` 同一句里「518 项」与「511 通过 + 20 跳过」**互相矛盾**。**Low**:③契约测试的「vnpy 须在 bootstrap 之后」那半截**恒空转**,且只查存在性不查谓词(把 `is not None` 改成 `is None` 断言照样绿);④`_module_level_imports` 漏 `async with` / `match` / `except*`;⑤ADR 残留第 9 条称 tmp_path 的 PermissionError「未复现」,**该结论被实测推翻**(本机可原样复现);⑥`find_spec` 修法方向对但**爆炸半径过大**(交易栈装坏时 pytest 在收集阶段中止 → 整轮一个测试都不跑)。**已修**:High(补 numpy/pandas 并标注「仅测试期需要」)、Medium①(fail-open 修正)、Medium②(六处文档口径统一重算)、Low③(断言改查谓词 + 补对照)、Low④(补 `AsyncWith`/`Match`/`TryStar`)、Low⑤(残留第 9 条改写)、Low⑥(在 ADR 里如实登记其影响面)。**Low ⑦(共享 bootstrap helper)未做**,已如实登记为残留第 10 条。|
 | 第 14 轮(A) | codex `exec` 并行两份之一(安全/边界) | **38/50**(**未达 45**);无 Critical / High,三条 Medium 均为「闸门漏判」 | **Medium**:①`redact_paths` 对**正斜杠盘符路径的多词段**只盖掉前半段(`C:/Documents and Settings/x.txt` → `error at <路径> and Settings/x.txt later`,目录名与文件名残留——`Path.as_posix()` 是常见写法);②批准写入者判定器漏「**变量中转模块字典**」(`_D = rs.__dict__` 之后 `_D["record_approval"](…)`,实测闸门全绿);③**三条模型可见通道的「按值凭据清单」并不共享**——ADR 写「凭据清单也共享」,实现里只有 MCP 侧盖毕昇密钥,CLI 与网关只盖网关令牌。**Low**:④中文句末标点(`。！？；，、`)不进主扫描终止符集,`C:\Users\alice\.env。后面` 把整句吃掉;⑤`Users` 目录规则多吃一个散文词(`C:\Users\alice failed` → 吃掉 `failed`);⑥多词段前瞻上限 4 个词,5 词以上的路径尾部泄漏;⑦POSIX 绝对路径带空格时同样只盖前半段;⑧「直接写批准记录」判定器可被**两段式**拆开绕过(写操作与「提到 approvals」不在同一作用域);⑨`_folded_str` 仍有 `chr()` 分隔符 / 模块级常量分隔符 / 切片三种拼法折不出来;⑩网关与 CLI/MCP 的按值替换**长度门槛不一致**(网关无下限、CLI/MCP 是 ≥8)。**已修**:M1(正斜杠多词段)、M2(模块字典变量中转)、M3(按值凭据清单抽成 `research_config.known_secret_values()`,三侧共用)、L4(中文终止符)、L5(散文词判据)、L6(前瞻上限 8)、L7(POSIX 带空格)、L8(两段式改成**调用图口径**)、L9(f-string / `%` / `format` 三种拼法)、L10(网关改走 `rs.scrub_text`,门槛统一)。**未做并如实登记**:L9 剩下的三种折不出形态(纵深防御层,非可利用绕过)见残留第 11 条。|
 | 第 14 轮(B) | codex `exec` 并行两份之一(架构/文档/测试) | **38.5/50**(**未达 45**);无 Critical / High,一条 Medium 是**文档与实测相反** | **Medium**:残留第 9 条的结论**与实测相反**(它称「受限子进程里整批 setup ERROR」是确定现象、并给出「`--basetemp` 指向仓库内可列目录即可绕过」的绕法;而 pytest 对**给定的 `--basetemp` 同样执行 `mkdir(mode=0o700)`**(`_pytest/tmpdir.py:152`),那条绕法并不成立;本机直接跑 559 项全过)。**Low**:①`except*` / `match` 只补进了三个 walker 中的一个,`async with` 甚至在 `_module_level_imports` 里直接抛 `AttributeError`;②「仓库里」这个说法应当是「**入库集**(git 跟踪集)」,评审脚手架目录(`reviewtmp/` 等)已 gitignore、不在跟踪集里;③`scripts/segment_ledger.py` 不再 import bootstrap,顺带**取消了 bootstrap 的 `os.chdir(ROOT)` 副作用**,pytest 会话的 CWD 不再被强制切到仓库根;④`find_spec` 守卫的**爆炸半径**(交易栈装了但装坏 ⇒ 模块导入期抛错 ⇒ pytest 收集阶段中止 ⇒ 整轮一个用例都不跑)没有在正文登记。**已修**:Medium(残留第 9 条按实测重写,并说明「权限口径」与「pytest 的 mode 语义」两件事)、L1(四个 walker 语义统一,并补一条把 `except*` / `match` / `async with` 的 import 植入临时文件、断言四个 walker 都看得见的**对照用例**——这条用例当场逮住 `async with` 的 `AttributeError`)、L2(口径改成「入库集」)、L3(研究侧路径锚点必须 `.resolve()`,且研究栈里不许出现 `os.chdir` / `os.getcwd`,已钉成断言;CWD 行为变化写进本 ADR)、L4(爆炸半径登记进残留第 8 条)。|
-| 第 15 轮 | codex `exec` 并行两份(A 安全/边界、B 架构/文档/测试) | **未完成,无分数**:两份评审在中途被会话中断,**没有产出最终报告** | 中途探针(**仅为过程记录,不是报告结论**):A 在实测调用图判定器时发现同文件内的**四段式调用、`getattr` 取 helper、类方法、lambda 转发、参数默认值藏路径、`*args`/`**kwargs` 转发**不会命中;模块字典判定器不认 `object.__getattribute__` 与 `setattr` 存起来两种取法。这些**未修**,已登记为残留第 12、13 条。B 只确认了 559 项收集数与残留第 9 条的新表述一致。**如实说明**:第 15 轮没有分数,不得当作「通过」或「提分」。|
+| 第 15 轮 | codex `exec` 并行两份 | **未完成,无分数**:两份评审在中途被会话中断,**没有产出最终报告**;第 16 轮已重跑 | (中途探针见残留第 13 条;不是报告结论)|
+| 第 16 轮(A) | codex `exec` 并行两份之一(安全/边界) | **38/50**(**未达 45**);无 Critical,**1 条 High** | **High**:`_looks_like_repr_escape` 只看「主机名首字符是 n」,`nas`/`net` 开头的 UNC 在 repr/JSON 形态下**整条漏盖**(三条模型可见通道共用内核,同时中招)。**Medium**:研究侧与 `dashboard/safe.py` 的路径规则已漂移,研究侧漏编码/全角/零宽等 5 类形态;CWD 断言覆盖不足;残留第 8 条后半段过期;**提交 `ecb19ce` 误带入 512 个 pytest 临时产物**(`r15tmp/`,无凭据)。**Low**:`str.format` 关键字实参折不出、`FORBIDDEN_HOSTS` 漏 `::0`/`0`、多词段 8 词上限、路径后 ASCII 标点被一并吃掉、`_child_reason` 不带 secrets、`init-token` 往 stdout 打本机路径。**已修**:H1(按反斜杠个数区分,并补回归用例)、M3(`87ef82d` 移出入库集并补 `.gitignore`)。**未修**:研究侧/面板侧清洗内核漂移(M1)、其余 Low,留待下一轮。**第 14 轮七项修复全部实测有效。** |
+| 第 16 轮(B) | codex `exec` 并行两份之一(架构/文档/测试) | **40/50**(**未达 45**);无 Critical,**1 条 High** | **High**:`_module_level_imports` 在 module-level `with` 上仍抛 `AttributeError`(第 14 轮只拆了 `AsyncWith`),对照用例没覆盖 `with`。**Medium**:残留第 9 条 ③ 的机制结论与受限环境实测相反;调用图判定器误报「内容里提到 approval」;「四个 walker 语义一致」不成立(类体 import 一个看不到);CWD 断言锚点清单漏 `tools/research_mcp/server.py` 的 `ROOT`(无 `.resolve()`)、对 `chdir`/`getcwd` 只认一种形态、`server.py:607` 有一处随启动目录漂移的相对路径;六处条数过期一项(559→560);全量口径 2879+3+5≠collect 总数;`r15tmp/` 误入库(已被 `87ef82d` 修掉,历史里仍留着)。**已修**:H-1(`with` 并入 `AsyncWith` 分支 + 对照用例加 `with`)、M-2(残留 9 重写)、M-3(措辞收紧)、M-4/M-6(MCP 的 `ROOT` 加 `.resolve()`、兜底命令改绝对路径)、M-5(CWD 断言认任意接收者与裸名)、M-7/M-8(条数重算为 561,全量口径写全)。**未修**:M-1 误报(残留 14)、M-7 的自动化核对(残留 15)。|
 | 第 11 轮 | codex `exec` 并行两份(复核第 10 轮的修复) | A **33/50**、B **38/50**(**均未达 45**) | **A(安全/边界)**:**Critical** 候选能顺**异常回溯帧**拿回真 `os`(`e.__traceback__.tb_frame.f_globals` 指向 numpy 内部帧的真全局命名空间)→ 任意写文件(可伪造 `approvals.json`)、读 `.env`/令牌、执行命令,而两层静态筛查**零告警**;**High** 模块代理**不包裹**从模块取到的函数/类(`np.load.__globals__['os']` 运行期畅通);**Medium** 静态层只判「字符串常量**等于**禁用名」→ 模板字符串(`"{0.__globals__}".format(...)`)藏得住;`redact_paths` 对 JSON/repr 形态的 Windows 路径只做部分替换(泄露盘符 + 用户名 + 文件名);凭据**按值**脱敏只有网关有、MCP 通道没有;批准写入者判定器可被**非常量折叠**绕过(`chr()`/`join()`),同时把无关字典键/文档字符串误判成「持有写入函数」;**Low** `pandas.io` 被整个命名空间误伤;静态层不报**单下划线**私有属性(与运行期口径不一致);两处正则覆盖边界偏窄。**B(架构/文档/测试)**:**High** 「例外函数只被 `*_child` 调用」那条断言**空转**(`_call_sites` 对整个 `research_api.py` 返回 0 个调用点,`for` 循环体一次都没执行);**High** 交易栈 import 藏在 `if/for/try/with` 复合语句里就看不见(三个 walker 各有一套遍历语义);**Medium** 不变量只挡得住 `import` 语句(`importlib.import_module` / `__import__` / `exec` 隐形,而本仓库里已有这种写法);判定器把任何含 `record_approval` 的字符串常量都算成引用(假阳性);Preset 白名单的两个通用分支在仓库自带的测试里**一次都没被走到**;文档把一条空转断言写成了已生效的约束;**Low** 「全量测试」数字不可复现、基线日期自相矛盾、CI 第二步一份文件收集失败会废掉整步、宪法守卫扫的是整个文件系统而不是 git 跟踪集、ruff 清单漏 `dashboard/__init__.py`。|
 
 第 2 轮确认成立的部分:交易与风控路径未被触碰;DNS rebinding、点击劫持、路径穿越、符号链接、重放均不可利用;`approvals.json` 确实只有两个**合法入口**(带外批准进程与等价 CLI),二者的低层写入都是同一个 `research_sandbox.record_approval`。
@@ -530,7 +532,7 @@
 - **四个 import walker 的语义统一,并钉上对照用例**(第 14 轮 B 的 L1):
   上一轮只把 `except*` / `match` 补进了三个 walker,而 `async with` 在
   `_module_level_imports` 里会直接抛 `AttributeError`(`AsyncWith` 没有 `orelse` 分支)。
-  现在四个 walker 语义一致,并补一条**对照用例**:把 `except*` / `match` / `async with`
+  现在四个 walker 在**模块级复合语句**上语义一致(类体/函数体上刻意不同:`_module_level_imports` 不进类体与函数体;第 16 轮 B 的 M-3),并补一条**对照用例**:把 `except*` / `match` / `async with` / `with`
   的 import 植入一份临时文件,断言四个 walker 都看得见——这条用例当场逮住了上面那个
   `AttributeError`。
 - **研究侧不再依赖进程 CWD,并钉成断言**(第 14 轮 B 的 L3):
@@ -598,19 +600,25 @@
    「全量 N 项通过」这类数字离开环境就没有意义,**且合并前必须重算**——
    第 13 轮复核期间工作树被并发改动,文档里的九份测试条数当场从 531 变成 534,
    六处文档(ADR / CHANGELOG / PROJECTWIKI / roadmap / PR 正文 / 提交信息)因此全部作废。
-   现已统一重算为 **559 项**并在六处回填;**今后任何改动测试条数都要重跑一次 collect**。
+   现已统一重算为 **561 项**并在六处回填;**今后任何改动测试条数都要重跑一次 collect**。
    **第 14 轮 B 的 Medium:关于 `tmp_path` 的 PermissionError,原结论与实测相反,现更正为**:
    ①**现象不是确定的,而是环境相关**:本机直接跑 `python -m pytest tests/test_research_sandbox.py`
-   **129 项全过**(加 `--basetemp` 指向仓库内目录也一样全过);而**受限的评审子进程**里
+   **129 项全过**(非受限环境;受限子进程里 `--basetemp` 也不行,见下);而**受限的评审子进程**里
    才出现「整批 setup ERROR」——第 13 轮实测 119 项、第 14 轮 codex 实测 122 项,
    **两个数字不一样,因为测试文件在这两轮之间变长了**;所以「固定 N 项全 ERROR」是错的说法。
    ②**原先给的绕法(`用 --basetemp 指向仓库内可列目录即可绕过`)不成立**:
    pytest 8.4.2 对**你指定的那个 `--basetemp`** 同样执行 `mkdir(mode=0o700)`
-   (`_pytest/tmpdir.py:152`;默认路径在 `:133/162/166/191`)。真正决定成败的是**父目录可不可写**,
-   不是那个 mode。
-   ③**mode 本身在 Windows 上不是 DACL**:本机实测——以 `mode=0o700` 建的目录,创建者能正常列目录;
-   Python 在 Windows 上的 `mkdir(mode=…)` 只影响只读位。所以「mode 落成 DACL、连创建者都列不开」
-   这条机制解释**不成立**;受限子进程里真正的成因是**那套环境的临时目录权限**,与 mode 无关。
+   (`_pytest/tmpdir.py:152`;默认路径在 `:133/162/166/191`)。第 16 轮 B 在受限子进程里实测:
+   `--basetemp` 指到仓库内目录同样失败(`_pytest/pathlib.py:357 cleanup_dead_symlinks` 抛 `PermissionError`)。
+   ③**「mode 是否落成 DACL」两个环境的实测结果相反,不能下统一结论**:
+   本会话(非受限)里以 `mode=0o700` 建的目录,创建者能正常列;
+   第 16 轮 B 的**受限评审子进程**里,同样的 `os.mkdir(p, 0o700)` 建出来的目录**连创建者都列不开**
+   (`PermissionError [WinError 5]`,`chmod` 也修不回;`mkdir` 默认 mode / `0o755` / `0o500` 都可列,
+   且 `chmod(0o700)` 对已存在目录无影响 ⇒ 触发点在**创建时的 mode=0o700**)。
+   所以:受限环境里整批 setup ERROR 的成因**很可能就是 pytest 的 `mode=0o700`**;
+   非受限环境不复现。**机制到底是哪一层(沙箱的 ACL 继承?)本 ADR 没有查清**,只记现象与条件。
+   ADR 先前写的「与 mode 无关」「真正决定成败的是父目录可不可写」两句**已撤回**
+   (B 实测临时根可写、目录仍列不开)。
    **对本仓库的影响不变**:①研究侧九份测试在本机跑得通,但**评审子进程**里可能整批 ERROR
    (第 13、14 轮两份报告都撞上了这一点,读报告时须先分清「真失败」与「权限导致没跑起来」);
    ②CI 是 Linux,不受影响;③评审过程遗留的 `.tmpprobe/`、`.pytest_tmp/` 已加进 `.gitignore`。
@@ -696,9 +704,19 @@
 - MCP 条目放在 `research` Preset 内部还是 Profile 级:**已定**——Preset 内部(`--dump-config` 实测该段只挂 persona 与 MCP 两个条目)。
 - **`research` 会话里的模型侧工具目录尚未在真实会话里枚举**:已验证配置层面(Preset 段只有两个条目、全局层禁用清单齐),但还没在 DSH 会话里让模型列出自己的工具。这是第 3、4 条留下的最后一项未验证。
 - 毕昇工作流 v3 的提示词与宪法有冲突:提示词让 LLM 用 `self.am.close_array`,而宪法禁止把受保护容器取别名,LLM 照做就会被静态筛查拒。**已处理**:工作流提示词已改为就地取值(`self.am.close[-1]`)并明确禁止取别名,实测候选通过筛查;换工作流版本时要复查这条。
-13. **判定器的已知漏形态(第 15 轮中途探针,未修)**:①调用图判定器(残留 12)对同文件的
-    **四段式调用 / `getattr` 取 helper / 类方法 / lambda 转发 / 参数默认值藏路径 / `*args`、`**kwargs` 转发**
-    不命中(只覆盖「直接传参、深度 ≤2」);②模块字典判定器不认 `object.__getattribute__(rs, ...)` 与
-    「`setattr` 存起来再取」两种取法。**为什么不继续补**:这些判定器是纵深防御,
+13. **判定器的已知漏形态(第 15/16 轮探针,未修)**:①调用图判定器(残留 12)对同文件的
+    **四段式调用 / `getattr` 取 helper / 类方法 / 参数默认值藏路径**不命中(只覆盖「直接传参、深度 ≤2」);
+    第 16 轮 A 复测:`lambda` 转发与 `*args`/`**kwargs` 转发**其实已命中**,原先把它们列进漏形态是登记过头,已删;
+    ②模块字典判定器不认 `object.__getattribute__(rs, ...)` 与「`setattr` 存起来再取」两种取法。
+    **为什么不继续补**:这些判定器是纵深防御,
     真正的屏障是「完整 64 位哈希由人输入 + 一次性 URL 令牌 + 只有批准进程写账本」;
-    再往下补是在 AST 里追赶无穷多的写法,收益递减。**如实登记**,第 15 轮评审未跑完,不构成「已复核通过」。
+    再往下补是在 AST 里追赶无穷多的写法,收益递减。**如实登记**。
+14. **调用图判定器会误报「内容里提到 approval」**(第 16 轮 B 的 M-1,**未修**):
+    实参里只要含 `approval` 字样(哪怕是被写文件的**内容**而不是路径)就把被调函数的形参标成 tainted,
+    落点只要求污染名出现在写调用的**任意位置**。例:`_audit(paths["results_dir"], "approval granted")`
+    里 `Path(p).write_text(note)` 会被判违规。后果是有人想写审计日志时被迫改字符串——
+    这是**误报**而非漏报,方向偏安全,但守卫自己的注释警告过「误报一多,断言迟早被加白名单绕过」。
+    修法(实参须路径形态、落点须在接收者/第一个实参上 + 补对照用例)留待下一轮。
+15. **文档里的测试条数没有自动化核对**(第 16 轮 B 的 M-7/M-8,**未做**):六处口径靠人手同步,
+    数字随树变;全量口径是 通过 + 失败 + error + skip = collect 总数(第 16 轮后:2881 + 3 + 5 + 6 = 2895)。
+    彻底的做法是把九份测试的条数做成可执行断言,与本 ADR 的数字比对。

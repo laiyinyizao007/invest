@@ -39,7 +39,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 CODE_ROOT = Path(__file__).resolve().parents[2]          # 代码所在检出(批准脚本从这里找)
-ROOT = Path(os.environ.get("INVEST_ROOT") or CODE_ROOT)  # 数据根(候选目录/批准记录/网关挂载的那棵)
+ROOT = Path(os.environ.get("INVEST_ROOT") or CODE_ROOT).resolve()  # 数据根(候选目录/批准记录/网关挂载的那棵)
 # **代码一律从 CODE_ROOT 取**:ROOT 是**数据**根(候选目录/批准记录/配置/密钥),
 # 它的 scripts/ 目录未必与 CODE_ROOT 是同一份代码——worktree + INVEST_ROOT 就是这种情形
 # (worktree 的代码 + 主检出的数据)。从 ROOT/scripts 导入会执行**另一份**代码,
@@ -604,7 +604,7 @@ def _request_approval(strategy: str) -> str:
     # 地址不进 stdout(批准进程的 ready 事件里没有它),stderr 是人的通道,并且带警告
     # (第 7 轮 codex 的 F3)。
     print("[research-mcp] 浏览器未自动打开时的兜底命令:python "
-          f"{Path('scripts').joinpath('research_approval_server.py')} --strategy {ready.get('strategy')}",
+          f"{CODE_ROOT / 'scripts' / 'research_approval_server.py'} --strategy {ready.get('strategy')}",
           file=sys.stderr)
     if not ready.get("screening_passed"):
         lines.append("注意:静态筛查未通过:" + "; ".join(ready.get("findings") or []))

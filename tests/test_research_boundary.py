@@ -1135,6 +1135,7 @@ def _go(paths):
     'try:\n    pass\nexcept* ImportError:\n    import risk.constitution\n',
     'match "go":\n    case "go":\n        import risk.constitution\n',
     'async with open("x") as fh:\n    import risk.constitution\n',
+    'with open("x") as fh, open("y") as gh:\n    import risk.constitution\n',
 ])
 def test_every_import_walker_sees_imports_in_except_star_and_match(tmp_path, snippet):
     """四个 import walker 的语义必须一致(第 14 轮 codex 的 Low 1)。
@@ -1362,14 +1363,18 @@ def test_the_research_side_never_depends_on_the_process_working_directory():
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr in {"chdir", "getcwd"} \
-                    and isinstance(func.value, ast.Name) and func.value.id == "os":
-                raise AssertionError(f"{_rel(path)} 不许依赖进程 CWD:{func.attr}")
+            # 第 16 轮 B 的 M-5:不只认 `os.chdir`——任意接收者的 chdir/getcwd/cwd
+            # (`o.chdir` 别名、`os.path.getcwd`、`Path.cwd()`)与裸名(`from os import chdir`)都算。
+            name = func.attr if isinstance(func, ast.Attribute) else (
+                func.id if isinstance(func, ast.Name) else "")
+            if name in {"chdir", "getcwd", "cwd", "getcwdb"}:
+                raise AssertionError(f"{_rel(path)} 不许依赖进程 CWD:{name}")
 
     anchors = {
         "scripts/research_config.py": ("CODE_ROOT", "ROOT"),
         "scripts/research_sandbox.py": ("_CODE_ROOT", "_SCRIPT_ROOT"),
         "scripts/segment_ledger.py": ("ROOT",),
+        "tools/research_mcp/server.py": ("CODE_ROOT", "ROOT"),    # 第 16 轮 B 的 M-4
     }
     for rel, names in anchors.items():
         tree = ast.parse(_read_source(ROOT / rel))
@@ -2009,11 +2014,11 @@ def _module_level_imports(tree: ast.Module) -> list[ast.AST]:
                 walk_body(node.finalbody)
                 for handler in node.handlers:
                     walk_body(handler.body)
-            elif isinstance(node, ast.AsyncWith):
-                # `async with` 没有 orelse 分支(第 14 轮 codex 的 Low 1 顺带发现:
-                # 它原先与 If/For/While 混在一个分支里,一走进来就 AttributeError)。
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                # `with` / `async with` 都没有 orelse 分支(第 14 轮 Low 1 只拆了 AsyncWith,
+                # 第 16 轮 B 的 H-1:`with` 还留在带 orelse 的那一组里,一走进来就 AttributeError)。
                 walk_body(node.body)
-            elif isinstance(node, (ast.If, ast.With, ast.For, ast.AsyncFor, ast.While)):
+            elif isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
                 walk_body(node.body)
                 walk_body(node.orelse)
             elif isinstance(node, ast.Match):             # `match … case …:`
