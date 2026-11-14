@@ -1840,3 +1840,74 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 ## 未完成
 阶段 1 已实现(Issue #15);阶段 2 已实现(Issue #16,第 5–8 轮复核的阻塞项已修,第 8 轮结果与残余缺口见 `CHANGELOG.md`);
 阶段 3–4 未实现;阶段 4 另受 Bisheng 模型配额阻塞(见 `PROJECTWIKI.md`)。
+
+
+## 候选文件读写能力收口(Issue #31)
+
+**问题(第 35 轮 codex 实测,不是推理)**:白名单里的 numpy/pandas 给的是**函数级能力**——`np.memmap` 写出 pickle 字节、
+`pd.read_pickle` 反序列化即执行 `__reduce__` → `os.system`;`np.savetxt`/`DataFrame.to_csv` 可改任意文件。#27 拦的是"模块名",
+名字名单/受限内建/按路径裁决/模块视图四层对它零告警。同一个能力("候选能读写任意文件")的四个后果:改行情 CSV、
+读测试段外传、抹小 `trials.jsonl`(DSR 的 N:年化 Sharpe 3.5,N=1620 时 DSR 0.6397 不过,N=1 时 0.9999 过)、往 `approvals.json` 写自己的 sha。
+
+**裁决(2026-11-14)**:审计钩子与"numpy/pandas 移出默认白名单"都做;两本账本防篡改要做;行情在候选导入前取定。
+
+### A. 审计钩子(`scripts/research_sandbox.py::candidate_window`)
+- `sys.addaudithook` 的钩子不可移除,所以**永久装一次**,用模块级状态 `_AUDIT.active` 决定是否判定;只在候选运行窗口内为真:
+  导入期(`import_candidate` 里 `exec` 到类校验)与运行期(`run_gate`/`run_evaluation`/`run_backtest` 三个子进程入口)。窗口外框架照常读写。
+- 拒:`pickle.find_class`、`os.system`、`subprocess.Popen`、`os.exec`/`spawn`/`posix_spawn`/`fork*`、`ctypes.*`、`socket.*` 及常见网络事件、
+  **写模式 `open`**(mode 含 `w/a/x/+` **或** flags 含 `O_WRONLY/O_RDWR/O_CREAT/O_APPEND/O_TRUNC/O_EXCL`——io.open 给字符串 mode、os.open 给整数 flags,两个都看)
+  与 `os.remove/rename/mkdir`、`shutil.copy*/move/rmtree` 等落在**允许目录之外**的写。允许目录 = 窗口前创建的临时目录,窗口结束清理。
+- **不拦** `exec`/`compile`/`marshal.loads`/`import`:pandas 惰性子模块导入会触发,实测会打断正常候选。
+- 框架自己在候选导入期间要跑的动作(守卫跑只读 `git`、清 `.pyc`)走显式放行路径 `framework_privilege()`,接线只有两处(测试 grep 核对)。
+- 开关防篡改:状态在 `research_sandbox` 模块里;候选 import 不到它(按路径裁决 + 危险名单),代理/视图又不递出下划线名,
+  numpy 属性链(`np.os`/`np.sys`/`np.__dict__`/`np._core`…)也拿不到——**用探针验证**,不是推理。
+- 写 `__pycache__` 被拒时抛的是 `PermissionError` 子类,导入机制会静默放弃写缓存,不影响正常导入。
+- pandas 首次导入会 `ctypes.dlopen`(Windows 的 `tzres.dll`),所以 numpy/pandas 须在进入窗口前已导入(子进程入口导入 `backtest_lib` 时已加载)。
+
+### B. numpy/pandas 移出默认白名单
+- `ALLOWED_MODULE_ROOTS` 去掉两者;新增 `CAPABILITY_LIB_ROOTS`。需要的候选**只能经 `screening.allowed_modules` 追加**(照常过准入审计,实测 numpy/pandas 审计通过)。
+- 对象层补一条规则:没追加时,别的白名单模块(如 `vnpy.trader.utility.np`)属性里挂着的 numpy/pandas 也不递给候选(`函数级能力库未授权`)。
+- 影响盘点:`tools/bisheng`、`tools/research_mcp`、`strategies`、`config` 里没有要求候选 import numpy 的提示词/模板(测试 `test_prompts_and_templates_do_not_depend_on_numpy_in_candidates` 固定);
+  既有 6 个沙盒测试文件用 numpy 当**攻击载体**测更下层规则,改用 `numpy_on_allowlist`(模拟显式配置追加)与 `without_audit_window`(否则钩子抢先拒,测不到它们要测的规则)两个夹具。
+- **取舍与替代**:候选没有 numpy 时指标要用纯 Python(`statistics`/`math`/`itertools`)或模板基类自带的 `ArrayManager`(见下方残余)。需要 numpy 的由运维显式追加,并明知钩子仍是唯一的函数级约束。
+
+### C. 账本防篡改(`risk/ledger_chain.py`、`risk/ledger_admin.py`、`scripts/research_ledger.py`)
+- 口径与 `feat/21-stage3` 的 `risk/ladder.py` 一致(未另起第三套):每条记录含 `seq`/`prev`/`hash`,`hash = sha256(prev + "|" + 规范化 JSON)`,创世 64 个 0;
+  头指针 `<seq> <hash>` 存 `data/ledger_anchor/`(与 `data/research`、`data/research-control` 分离)。读侧发现链断/回滚/截断/整条被换/无链记录 → fail-closed,消息里带人工出路。
+- 试验账本:`record_trials` 在跨进程锁下先核链再追加再写锚点(有了链,两个写者读到同一尾巴会把链写成分叉,所以跨进程互斥不再可省;此前"跨进程漏记极少量"的限制随之取消)。
+  允许"账本比锚点多几条自洽记录"(崩在写锚点之前;多出的只会让 N 变大)。
+- 批准账本:格式仍是 `{sha: 记录}`(看板按此读),记录多带 `sha/seq/prev/hash`;**严格相等**(账本里多出一条自洽的批准正是要拦的攻击),`_load_approvals` 核链后才返回。
+  候选写进去的 sha 没有合法链字段/锚点,不被采信。
+- **旧账本迁移**:无链的旧账本**不会被静默采信**,也不会永远 fail-closed:`python scripts/research_ledger.py migrate trials|approvals`(原文件备份;已有锚点/链字段的拒绝"洗白";
+  批准账本迁移要 `--confirm-all-approved`,即人先核对过现有每个 sha)。链断后的出路:`reset`(保留有效前缀、重新定锚、备份;试验账本可 `--add-trials` 按估计补记,宁多勿少)。
+  每次迁移/重置写 `data/ledger_anchor/ledger.admin.log`。
+- **部署须知**:升级后第一次运行前须人工执行一次 `migrate`;否则读侧会 fail-closed 并提示该命令。
+
+### D. 行情在候选导入前取定
+`run_gate_child`/`run_evaluate_child` 里 `load_bars_csv`(与窗口、配置)挪到 `import_candidate` 之前,与评估输入同一模式。
+探针:导入期外部写把 CSV 改成 99999,框架拿到的仍是导入前读到的价格;生产入口里候选导入期 `np.savetxt` 改 CSV 被钩子拒。
+代价:数据文件缺失时现在先于候选错误报出(原先在导入之后才报)。
+
+### 残余与边界(如实写,不要读成"已闭合")
+1. **审计钩子是纵深防御,不是安全边界**。候选与框架同进程;能影响框架的问题由 **Issue #29(独立进程/容器)** 闭合。
+2. **只拦写与能力,不拦读**:候选照样能读任意本机文件(含测试段 CSV、`.env`)并经导入期异常文本外传;读侧需要 #29 的只读挂载。
+3. 候选可以 `try/except` 吞掉钩子的异常继续跑(被拒动作确实没发生,记录在 `window_denials()`,但**目前不会据此让作业失败**)。
+4. 不拦 `exec`/`compile`:窗口里仍能编译并执行新代码;其能力受上面的写/进程/网络事件约束,但这是取舍,不是证明。
+5. numpy 对象不只来自 import:候选拿到的 `ArrayManager` 数组(`self.am.close` 等)本身是 ndarray,`.tofile()`/`.dump()` 不依赖 import——所以"移出白名单"**不能替代**钩子,钩子才是函数级约束。
+6. 哈希链没有密钥:同时改账本与锚点的人骗得过读侧(`test_known_residual_forging_ledger_and_anchor_together_is_not_detected` 钉住);同时删除两者等于从未有过账本。外部锚点需要另一个信任域(#29)。
+   `dashboard/collectors.py` 仍按原样读 `approvals.json` 做**展示**(只计数,不据此放行),看板数字可能含被伪造的记录。
+7. 钩子里的路径判定对符号链接按 `realpath` 解析;`os.open` 打开目录、对 fd 的后续写不重复裁决(fd 来自此前已裁决过的 `open`)。
+8. 本轮**未跑** G8 外部评审(zen codereview + codex),状态:待复核。
+
+### 变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红)
+| 变异 | 结果 |
+|---|---|
+| 去掉 `pickle.find_class` | 红 |
+| `open` 判定忽略 flags(只看 mode) | 红(`os.open` 整数 flags 的探针) |
+| `open` 判定忽略 mode(只看 flags) | **绿 = 等价变异**:`io.open` 同时给 mode 与 flags,flags 已覆盖;mode 分支只是冗余 |
+| 允许目录判定恒真 | 红 |
+| 窗口永不激活 | 红 |
+| 导入期窗口去掉 / gate、evaluate、backtest 运行期窗口各去掉 | 各红 |
+| numpy/pandas 回到默认白名单 / 去掉对象层规则 | 各红 |
+| 链校验跳过锚点 / 跳过 seq-prev / 批准账本允许多出 / `_load_approvals` 不核链 / `record_trials` 不写锚点 | 各红 |
+| 行情读取挪回导入之后(gate 入口) | 红(evaluate 入口的同类变异**未单独跑**,其探针与 gate 同构) |

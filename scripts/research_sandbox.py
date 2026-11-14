@@ -39,6 +39,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_ROOT))
 
 from risk import constitution as const  # noqa: E402
+from risk import ledger_chain as chain  # noqa: E402
 
 PENDING_DIR = "pending_strategies"
 SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
@@ -256,6 +257,11 @@ def _git_run(args: list[str], cwd: Path | None = None, timeout: int = 30):
     """
     if not args or args[0] not in _GIT_READONLY_SUBCOMMANDS:
         raise ValueError(f"守卫只允许跑只读 git 子命令:{args[:1]}")
+    with framework_privilege():
+        return _git_run_unchecked(args, cwd, timeout)
+
+
+def _git_run_unchecked(args: list[str], cwd: Path | None, timeout: int):
     try:
         _GIT_HOME.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -763,6 +769,11 @@ def _check_object_rules(module, name, value) -> None:
             raise AttributeError(
                 f"禁止访问 {module.__name__}.{name}:模块视图不把危险模块"
                 f" {value.__name__} 交给候选(规则:模块视图)")
+        lib_root = _module_name(value).split(".")[0]
+        if lib_root in CAPABILITY_LIB_ROOTS and lib_root not in _ACTIVE_ALLOWED_ROOTS[0]:
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:{lib_root} 没有列入本次的导入白名单,"
+                f"不能经别的模块的属性绕进来(规则:函数级能力库未授权)")
         leak = _capability_leak(value)
         if leak:
             raise AttributeError(
@@ -1242,7 +1253,8 @@ class RepoImportGuard:
             # 源码核对过了,但**执行的**可能不是它:CPython 导入时优先用
             # `__pycache__/*.pyc`,而 .pyc 只校验头部里的 mtime+size(候选能伪造)。
             # 把可能伪造的 .pyc 删掉,导入机制就会从刚核对过的那份源码重新编译。
-            _purge_bytecode_cache(resolved, cached=cached)
+            with framework_privilege():
+                _purge_bytecode_cache(resolved, cached=cached)
         return None
 
     def _check_ancestor_packages(self, name: str) -> str | None:
@@ -1625,8 +1637,19 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
 ALLOWED_MODULE_ROOTS = frozenset({
     "math", "statistics", "collections", "datetime", "typing", "enum", "dataclasses",
     "itertools", "functools", "abc", "decimal", "fractions", "random", "copy", "re",
-    "string", "time", "json", "numpy", "pandas", "strategies", "vnpy", "vnpy_ctastrategy",
+    "string", "time", "json", "strategies", "vnpy", "vnpy_ctastrategy",
 })
+
+# **函数级能力库**(Issue #31):它们本身没有危险的"模块名",但 `np.memmap`/`np.savetxt`/`DataFrame.to_csv`/
+# `pd.read_pickle`/`np.load(allow_pickle=True)` 给的是任意文件读写与反序列化执行——第 35 轮 codex 实测
+# `np.memmap` 写 pickle + `pd.read_pickle` = 任意命令执行,名字层四道防线零告警。
+# 所以它们**不在候选的默认白名单里**:需要的候选只能经配置 `screening.allowed_modules` 显式追加
+# (追加的模块照常过准入审计),并且无论是否追加,**窗口里的审计钩子都照样判定**(见 candidate_window)。
+# 本名单还有第二个用途:对象层规则——候选不得经由别的白名单模块的属性(如 `vnpy.trader.utility.np`)
+# 绕开"没有追加就不给 numpy"这一条。少一项 = 多放开一个库,只增不减(宪法守卫登记)。
+CAPABILITY_LIB_ROOTS = frozenset({"numpy", "pandas"})
+# 最近一次 `safe_builtins` 生效的导入白名单根(对象层规则要用);只由框架写,候选碰不到本模块。
+_ACTIVE_ALLOWED_ROOTS: list = [ALLOWED_MODULE_ROOTS]
 
 # 候选**不得**从导入进来的模块上取这些属性:`X.os` / `X.shutil` / `X.subprocess` ……
 # 有些模块自己 import 了 os/sys 并挂在属性上(见上面的实测清单),静态层按
@@ -1806,6 +1829,7 @@ def safe_builtins(forbidden_modules: Sequence[str] = (), allowed_modules: Sequen
     # 白名单(main #22):内置白名单 + 配置追加。黑名单(blocked)先判,白名单后判——
     # 配置追加的名字不能把黑名单里的东西放出来。
     allowed = set(ALLOWED_MODULE_ROOTS) | set(allowed_modules)
+    _ACTIVE_ALLOWED_ROOTS[0] = frozenset(allowed)
     real_import = _builtins.__import__
 
     safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
@@ -1823,6 +1847,206 @@ def safe_builtins(forbidden_modules: Sequence[str] = (), allowed_modules: Sequen
 
 class SandboxError(ValueError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# 候选执行窗口的**审计钩子**(Issue #31)。
+#
+# 为什么要有它(第 35 轮 codex 实测,不是推理):白名单里的 numpy/pandas 给出的是**函数级能力**,
+# 名字名单/受限内建/按路径裁决/模块视图四层拦的都是"模块名",对它们零告警:
+#   np.memmap(w+) 写出 pickle 字节 -> pd.read_pickle -> __reduce__ -> os.system(任意命令);
+#   np.savetxt / DataFrame.to_csv / ndarray.tofile 改行情 CSV、抹小 trials.jsonl、往 approvals.json 写 sha。
+# 这些调用最终都落到解释器的 `open`/`os.*` 审计事件上,所以在**事件层**按能力拒:
+#   - pickle.find_class(反序列化执行入口);
+#   - 进程创建:os.system / subprocess.Popen / os.exec* / os.spawn* / os.posix_spawn / os.fork*;
+#   - ctypes.* / socket.* 及常见网络事件;
+#   - **写模式 open**(mode 含 w/a/x/+,或 flags 含 O_WRONLY/O_RDWR/O_CREAT/O_APPEND/O_TRUNC/O_EXCL),
+#     以及 os.remove/rename/mkdir/shutil.copy* 等会改文件系统的事件,目标落在**允许写入目录**之外一律拒。
+# **不拦** exec / compile / marshal.loads / import:pandas 的惰性子模块导入会触发它们,拦了会打断正常候选。
+#
+# 这**不是安全边界**(文件头已说明:本机同进程运行的候选无法被彻底隔离):
+#   - 同进程里候选与框架共享解释器,能影响框架的问题由 Issue #29(独立进程/容器)闭合;
+#   - 只拦写不拦读:候选照样能读任意本机文件(含测试段 CSV、.env),读侧由 #29 的只读挂载解决;
+#   - 候选可以 `try/except` 吞掉本钩子抛的异常继续跑(被拒的动作确实没发生,拒绝记录在 `window_denials()`);
+#   - 不拦 `exec`/`compile`,所以"在窗口里编译并执行一段新代码"仍可能;它能拿到的能力仍受上面的写/进程/网络事件约束。
+# 它的作用是把"白名单模块的函数级写文件/起进程"这条**最便宜**的攻击收掉,与对象层规则、账本哈希链并存。
+#
+# 实现要点:
+#   - `sys.addaudithook` 的钩子**不可移除**,所以钩子永久装一次,用模块级状态 `_AUDIT.active` 决定是否判定;
+#     窗口外(框架自己写结果文件、日志、账本)`active=False`,钩子第一行就返回。
+#   - 状态在**本模块**里;候选 import 不到 research_sandbox/scripts/risk(按路径裁决 + 危险名单),
+#     模块视图/代理又不递出下划线名,于是候选既拿不到本模块对象也改不了 `_AUDIT`(探针见 tests/test_fs_capability_closure.py)。
+#   - 允许写入目录 = 框架在窗口前创建的**临时目录**(`candidate_window()` 默认新建、退出时清理)。
+class AuditDenied(PermissionError):
+    """审计钩子拒绝了候选在执行窗口里的某个动作。继承 PermissionError(OSError):
+    导入机制写 .pyc 缓存时遇到 OSError 会静默放弃,所以"拒绝写缓存"不会打断正常导入。"""
+
+    def __init__(self, rule: str, event: str):
+        super().__init__(f"研究沙盒审计钩子拒绝了事件 {event}(规则:{rule})")
+        self.rule = rule
+        self.event = event
+
+
+# 按事件名**精确**拒绝(进程创建/反序列化)。少一项 = 多放开一种能力,只增不减(宪法守卫登记)。
+AUDIT_DENIED_EVENTS = frozenset({
+    "pickle.find_class",
+    "os.system", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.forkpty", "os.startfile",
+    "subprocess.Popen", "_winapi.CreateProcess", "webbrowser.open",
+})
+# 按事件名**前缀**拒绝(整族)。
+AUDIT_DENIED_EVENT_PREFIXES = frozenset({
+    "ctypes.", "socket.", "urllib.", "http.client.", "smtplib.", "ftplib.", "telnetlib.", "imaplib.", "poplib.",
+})
+# 会改文件系统的事件 -> 需要落在允许目录里的**参数下标**(源路径只读不算,所以 symlink/link/copy 只看目的端)。
+AUDIT_PATH_MUTATION_EVENTS = {
+    "os.remove": (0,), "os.rmdir": (0,), "os.mkdir": (0,), "os.truncate": (0,), "os.chmod": (0,), "os.chown": (0,),
+    "os.utime": (0,), "os.rename": (0, 1), "os.link": (1,), "os.symlink": (1,),
+    "shutil.copyfile": (1,), "shutil.copymode": (1,), "shutil.copystat": (1,), "shutil.copytree": (1,),
+    "shutil.move": (0, 1), "shutil.rmtree": (0,), "shutil.unpack_archive": (1,), "shutil.make_archive": (0,),
+}
+_WRITE_OPEN_FLAGS = (getattr(os, "O_WRONLY", 1) | getattr(os, "O_RDWR", 2) | getattr(os, "O_CREAT", 0)
+                     | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0) | getattr(os, "O_EXCL", 0))
+_AUDIT_NULL_DEVICES = frozenset({os.path.normcase(os.devnull), "nul", "/dev/null"})
+
+
+class _AuditState:
+    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed")
+
+    def __init__(self):
+        self.active = False
+        self.allowed: str | None = None
+        self.depth = 0
+        self.denials: list[tuple[str, str]] = []
+        self.busy = False          # 钩子自己在判定时不再递归判定
+        self.installed = False
+
+
+_AUDIT = _AuditState()
+
+
+def _audit_norm(path) -> str | None:
+    """路径 -> 规范化绝对路径(含符号链接解析、大小写折叠);fd/空 -> None;解析不了 -> 哨兵(按"在允许目录之外"处理)。"""
+    if isinstance(path, int) or path is None:
+        return None
+    try:
+        return os.path.normcase(os.path.realpath(os.fsdecode(path)))
+    except (TypeError, ValueError, OSError):
+        return "\0unresolvable"
+
+
+def _audit_inside_allowed(norm: str, allowed: str | None) -> bool:
+    if allowed is None:
+        return False
+    return norm == allowed or norm.startswith(allowed.rstrip("\\/") + os.sep)
+
+
+def _open_is_write(mode, flags) -> bool:
+    """`open` 审计事件的 (path, mode, flags):io.open 给字符串 mode,os.open 给 mode=None 与整数 flags。两个都看。"""
+    if isinstance(mode, str) and any(ch in mode for ch in "wax+"):
+        return True
+    return isinstance(flags, int) and not isinstance(flags, bool) and bool(flags & _WRITE_OPEN_FLAGS)
+
+
+def _audit_deny(rule: str, event: str, record: bool = True):
+    if record:
+        _AUDIT.denials.append((rule, event))
+    raise AuditDenied(rule, event)
+
+
+def _is_bytecode_cache(norm: str) -> bool:
+    return "__pycache__" in norm
+
+
+def _audit_hook(event, args):
+    state = _AUDIT
+    if not state.active or state.busy:
+        return
+    state.busy = True
+    try:
+        if event in AUDIT_DENIED_EVENTS:
+            _audit_deny("audit:" + event, event)
+        for prefix in AUDIT_DENIED_EVENT_PREFIXES:
+            if event.startswith(prefix):
+                _audit_deny("audit:" + prefix.rstrip("."), event)
+        if event == "open":
+            path, mode, flags = (tuple(args) + (None, None, None))[:3]
+            if _open_is_write(mode, flags):
+                if isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fsdecode(path)) in _AUDIT_NULL_DEVICES:
+                    return          # 写空设备没有副作用
+                norm = _audit_norm(path)
+                if norm is None:
+                    return          # 文件描述符:来自此前已裁决过的 open
+                if not _audit_inside_allowed(norm, state.allowed):
+                    # 写 __pycache__ 是导入机制的缓存动作:照样拒(OSError 会被导入机制吞掉),但不算"越权企图"
+                    _audit_deny("audit:open-write", event, record=not _is_bytecode_cache(norm))
+            return
+        indexes = AUDIT_PATH_MUTATION_EVENTS.get(event)
+        if indexes is not None:
+            for index in indexes:
+                if index < len(args):
+                    norm = _audit_norm(args[index])
+                    if norm is not None and not _audit_inside_allowed(norm, state.allowed):
+                        _audit_deny("audit:path-mutation", event, record=not _is_bytecode_cache(norm))
+    finally:
+        state.busy = False
+
+
+def install_audit_hook() -> None:
+    """装一次钩子(幂等)。钩子不可移除,所以只靠 `_AUDIT.active` 开关。"""
+    if not _AUDIT.installed:
+        sys.addaudithook(_audit_hook)
+        _AUDIT.installed = True
+
+
+def window_denials() -> tuple:
+    """当前/最近一次窗口里被拒的动作 [(规则, 事件)](供测试与诊断;候选取不到本函数)。"""
+    return tuple(_AUDIT.denials)
+
+
+@contextlib.contextmanager
+def candidate_window(scratch_dir: Path | None = None):
+    """候选代码运行窗口:窗口内审计钩子判定,窗口外不判定。可重入(内层窗口沿用外层的允许目录)。
+
+    `scratch_dir`:允许写入的目录;缺省新建一个临时目录,退出时清理。
+    **numpy/pandas 等要在进入窗口前已经 import 过**:pandas 首次导入会 `ctypes.dlopen`(Windows 上加载 tzres.dll),
+    窗口里第一次导入会被拒——research_api 的子进程入口在导入候选前已经加载了它们。"""
+    install_audit_hook()
+    if _AUDIT.active:
+        _AUDIT.depth += 1
+        try:
+            yield Path(_AUDIT.allowed) if _AUDIT.allowed else None
+        finally:
+            _AUDIT.depth -= 1
+        return
+    own = scratch_dir is None
+    scratch = Path(tempfile.mkdtemp(prefix="research-window-")) if own else Path(scratch_dir)
+    _AUDIT.denials = []
+    _AUDIT.allowed = _audit_norm(scratch)
+    _AUDIT.depth = 1
+    _AUDIT.active = True
+    try:
+        yield scratch
+    finally:
+        _AUDIT.active = False
+        _AUDIT.depth = 0
+        _AUDIT.allowed = None
+        if own:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def framework_privilege():
+    """框架自己的动作(守卫跑只读 git、清 .pyc 缓存)发生在候选导入期间,会被窗口拦下,所以给它们一个**显式放行路径**。
+
+    只有框架代码调用,参数都由框架决定,候选既拿不到本函数(同模块、候选 import 不到)也不能给它传参;
+    用法限于 `_git_run` 与 `_purge_bytecode_cache` 两处(见 tests/test_fs_capability_closure.py 的接线核对)。
+    进入时暂停判定、退出时恢复;单线程同步执行,期间不会有候选代码在跑。"""
+    was_active = _AUDIT.active
+    _AUDIT.active = False
+    try:
+        yield
+    finally:
+        _AUDIT.active = was_active
 
 
 # 本机路径不该出现在**会外发的文本**里(网关响应 → 毕昇工作流 → 模型)。
@@ -2641,16 +2865,48 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _load_approvals(approvals_file: Path) -> dict:
-    if not Path(approvals_file).exists():
-        return {}
+APPROVALS_TOOL_HINT = "python scripts/research_ledger.py"
+
+
+def _parse_approvals(approvals_file: Path) -> list[dict]:
+    """批准记录文件 -> 按 seq 升序的记录列表(只做语法校验,不核链)。文件格式仍是 {sha: 记录} 的对象
+    (看板与旧工具按这个形状读),每条记录除 name/at 外带 sha/seq/prev/hash 链字段。"""
+    approvals_file = Path(approvals_file)
+    if not approvals_file.exists():
+        return []
     try:
-        data = json.loads(Path(approvals_file).read_text(encoding="utf-8"))
+        data = json.loads(approvals_file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise SandboxError(f"批准记录无法读取,拒绝继续(fail-closed): {exc}") from exc
     if not isinstance(data, dict):
         raise SandboxError("批准记录格式错误(应为对象)")
-    return data
+    rows: list[dict] = []
+    for key, value in data.items():
+        if not isinstance(value, dict) or not isinstance(value.get("seq"), int) or isinstance(value.get("seq"), bool):
+            # 没有链字段的记录:旧账本,或者**候选/外部写进来的**——两者都不采信
+            raise SandboxError(f"批准记录 {str(key)[:12]}… 没有哈希链字段,拒绝采信(fail-closed):"
+                               f"旧账本请先迁移,被外部写入的请人工核对后重置({APPROVALS_TOOL_HINT} migrate/reset)")
+        if value.get("sha") != key:
+            raise SandboxError(f"批准记录 {str(key)[:12]}… 的键与记录内的 sha 不一致,拒绝采信(fail-closed)")
+        rows.append(value)
+    rows.sort(key=lambda r: r["seq"])
+    return rows
+
+
+def _verified_approval_rows(approvals_file: Path) -> list[dict]:
+    try:
+        return chain.read_verified(Path(approvals_file), _parse_approvals, what="批准记录",
+                                   allow_ahead=False, tool_hint=APPROVALS_TOOL_HINT)
+    except chain.LedgerChainError as exc:
+        raise SandboxError(f"批准记录的防篡改核对未通过,拒绝采信(fail-closed): {exc}") from exc
+
+
+def _load_approvals(approvals_file: Path) -> dict:
+    """读批准记录并**核链**:链断/回滚/多出未经合法路径的记录/无链记录 -> SandboxError(fail-closed)。
+
+    返回 {sha: 记录}。候选(或任何外部写入者)往 approvals.json 写进去的 sha 没有合法的链字段与锚点,
+    所以不会被采信——这是读侧的第二层;写侧的主防线是候选执行窗口里的审计钩子(见 candidate_window)。"""
+    return {row["sha"]: row for row in _verified_approval_rows(approvals_file)}
 
 
 def is_approved(path: Path, approvals_file: Path) -> bool:
@@ -2691,13 +2947,24 @@ def record_approval(path: Path, approvals_file: Path, now: datetime | None = Non
         raise SandboxError("批准记录的哈希与文件当前内容不一致,拒绝记录(文件可能已被改动)")
     approvals_file.parent.mkdir(parents=True, exist_ok=True)
     with _approvals_lock(approvals_file):
-        data = _load_approvals(approvals_file)
-        data.setdefault(sha, {"name": Path(path).name, "at": (now or datetime.now()).isoformat(timespec="seconds")})
+        rows = _verified_approval_rows(approvals_file)         # 先核链:链断就不在它上面继续追加
+        data = {row["sha"]: row for row in rows}
+        new_row = None
+        if sha not in data:
+            prev = rows[-1]["hash"] if rows else chain.GENESIS
+            new_row = chain.seal({"sha": sha, "name": Path(path).name,
+                                  "at": (now or datetime.now()).isoformat(timespec="seconds")}, prev, len(rows) + 1)
+            data[sha] = new_row
         tmp = approvals_file.with_name(
             f"{approvals_file.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         try:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
             _atomic_replace(tmp, approvals_file)
+            if new_row is not None:
+                # 锚点写在批准记录**之后**、放在另一个目录(见 risk/ledger_chain.py)。
+                chain.write_anchor(chain.anchor_path_for(approvals_file), new_row["seq"], new_row["hash"])
+        except chain.LedgerChainError as exc:
+            raise SandboxError(f"批准记录的锚点写入失败: {exc}") from exc
         except OSError as exc:
             # 写不进去必须变成"拒绝"而不是裸异常:调用方(批准页)只认 SandboxError,
             # 裸 OSError 会一路冒到 HTTP handler,浏览器只看到连接被重置(第 8 轮 codex 的 M2)。

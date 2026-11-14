@@ -71,6 +71,7 @@ jobs:
             scripts/research_gate.py \
             scripts/research_gateway.py \
             scripts/research_grid.py \
+            scripts/research_ledger.py \
             scripts/research_sandbox.py \
             scripts/segment_windows.py \
             scripts/segment_ledger.py \
@@ -87,6 +88,7 @@ jobs:
             tests/test_dashboard_collect_more.py \
             tests/test_constitution_round11.py \
             tests/test_constitution_round12.py \
+            tests/test_fs_capability_closure.py \
             tests/test_research_api.py \
             tests/test_research_approval_server.py \
             tests/test_research_boundary.py \

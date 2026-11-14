@@ -485,7 +485,10 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         # 候选执行期间,受限导入器把会漏的模块换成**代理**(危险属性取不到);
         # `guarded_scope` 退出时无条件还原:宿主机自己的代码不该看到代理
         # (第 10 轮 codex 的 Critical 修复)。
-        with rs.guarded_scope():
+        # `candidate_window`(Issue #31):导入期的审计钩子窗口——白名单里的 numpy/pandas 给出的是
+        # 函数级的写文件/反序列化/起进程能力(np.memmap 写 pickle + pd.read_pickle),名字层规则看不见它们,
+        # 所以在事件层按能力拒。窗口只罩住候选代码真正运行的这一段;框架自己的读写都在窗口外。
+        with rs.guarded_scope(), rs.candidate_window():
             exec(code, module.__dict__)                       # noqa: S102 —— 执行的就是上面校验过的那份字节
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
@@ -876,6 +879,11 @@ def run_gate_child(args) -> int:
     if args.on_plateau not in ("0", "1"):
         print("--on-plateau 只能是 0 或 1", file=sys.stderr)
         return EXIT_REFUSED
+    # 行情与窗口在候选**导入之前**取定成局部值(Issue #31 D):原先 `load_bars_csv` 在 `import_candidate` 之后,
+    # 候选在导入期若能改写 CSV,框架随后读到的就是被改过的价格("样本外由服务端保证"落空)。
+    # 与评估输入同一个模式:先取定,再让候选运行。
+    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -884,13 +892,12 @@ def run_gate_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
-        result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
-                          data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=prior_trials)
+        with rs.candidate_window():
+            result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
+                              runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
+                              data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
+                              prior_trials=prior_trials)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -912,6 +919,10 @@ def run_evaluate_child(args) -> int:
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    # 行情、窗口、配置在候选**导入之前**取定(Issue #31 D,理由见 run_gate_child)。
+    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    windows = wf.build_windows()
+    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -920,15 +931,13 @@ def run_evaluate_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = wf.build_windows()
-    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
-        result = run_evaluation(
-            candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
-            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
-            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
+        with rs.candidate_window():
+            result = run_evaluation(
+                candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
+                random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+                min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
+                validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -962,7 +971,8 @@ def run_child(args) -> int:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
     try:
-        stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
+        with rs.candidate_window():
+            stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK

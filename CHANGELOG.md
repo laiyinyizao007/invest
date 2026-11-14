@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **候选文件读写能力收口**(Issue [#31](https://github.com/laiyinyizao007/invest/issues/31);ADR `20261113-evolution-engine`「候选文件读写能力收口」一节)。
+  第 35 轮 codex 实测:白名单里的 numpy/pandas 可经 `np.memmap` 写 pickle + `pd.read_pickle` 任意命令执行,并能改行情 CSV、抹小 `trials.jsonl`、往 `approvals.json` 写自己的 sha。
+  - **审计钩子**(`research_sandbox.candidate_window`):候选导入期与运行期拒 `pickle.find_class`/进程创建/`ctypes.*`/`socket.*`/落在允许目录之外的写;不拦 `exec`/`compile`。**纵深防御,不是边界**;同进程根因由 #29 闭合。
+  - **numpy/pandas 移出默认白名单**,只能经 `screening.allowed_modules` 追加;对象层补"函数级能力库未授权"规则。
+  - **账本防篡改**:试验账本与批准账本加哈希链 + 外置锚点(`data/ledger_anchor/`,口径同梯子);读侧链断/回滚/截断/无链记录 fail-closed;
+    人工入口 `scripts/research_ledger.py status|migrate|reset`。**升级后须先 `migrate` 一次**(旧账本无链,不会被静默采信)。试验账本跨进程互斥。
+  - **行情在候选导入前取定**(gate/evaluate 两个子进程入口)。
+  - 测试:`tests/test_fs_capability_closure.py`(放行+拦截双向,断言规则);其余 6 个沙盒测试文件用 `numpy_on_allowlist`/`without_audit_window` 夹具保持原有探针对象。
+  - **残余**:只拦写不拦读;候选可吞掉钩子异常;哈希链无密钥(同时改账本与锚点骗得过);看板仍原样读 `approvals.json` 展示。G8 外部评审:待复核。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

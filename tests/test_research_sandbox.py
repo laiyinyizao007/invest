@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import research_sandbox as rs
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 # ---------- 路径:只认 pending_strategies/ ----------

@@ -536,7 +536,8 @@ def test_approval_state_requires_the_same_content_hash(clean_state, monkeypatch)
     cand.write_text("class C: pass\n", encoding="utf-8")
     sha_now = mcp_server.rs.file_sha256(cand)
     approvals = clean_state / "approvals.json"
-    approvals.write_text(json.dumps({sha_now: {"name": "cand_1.py", "at": "now"}}), encoding="utf-8")
+    # 批准记录现在带哈希链与锚点(Issue #31):手写的 {sha: ...} 不会被采信,走唯一的写入者
+    mcp_server.rs.record_approval(cand, approvals, sha256=sha_now)
     monkeypatch.setattr(mcp_server, "approvals_file", lambda: approvals)
 
     session = {"candidate": "cand_1.py", "candidate_sha": sha_now}

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import bootstrap  # noqa: E402,F401  必须先于 vnpy.trader.database 导入
 import research_api as api  # noqa: E402
 import research_sandbox as rs  # noqa: E402
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 # ---------------------------------------------------------------------------
