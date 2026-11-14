@@ -1,0 +1,16 @@
+{
+  "current": {
+    "session_id": "s1",
+    "workflow_id": "1194f8540b9944fea4353b07f0493cbf",
+    "idea": "换个思路",
+    "candidate": null,
+    "candidate_sha": null,
+    "waiting_node": "input_wait",
+    "waiting_message_id": 70,
+    "last_outputs": [
+      "候选已提交为 cand_2.py(提交结果:{...})"
+    ],
+    "failures": [],
+    "updated_at": "2026-11-13T23:40:26"
+  }
+}

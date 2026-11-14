@@ -1,12 +1,30 @@
 """研究沙盒 CLI:拒绝路径与输出契约(真实回测由人工在有数据的机器上验证)。"""
+import importlib.util
+import io
 import json
+import re
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-import optimize  # noqa: F401  预先导入,避免在补丁生效期间触发 vnpy 的惰性导入
 import research_api as api
+
+# 这些用例要**真的载入候选类**(候选继承 vnpy_ctastrategy 的 CtaTemplate)→ 需要交易栈。
+# CI 的研究侧闸门刻意不装交易环境(研究侧与交易栈必须解耦),所以那里**跳过**而不是失败:
+# 缺依赖不等于行为不对,红着反而会把闸门变成噪声。
+def _trading_stack_missing() -> bool:
+    try:
+        return importlib.util.find_spec("vnpy_ctastrategy") is None
+    except (ImportError, ValueError):
+        return True
+
+
+requires_trading_stack = pytest.mark.skipif(
+    _trading_stack_missing(),
+    reason="需要交易栈(vnpy_ctastrategy):CI 的研究侧闸门不装交易环境")
+
+
 
 
 def fake_subprocess(monkeypatch, popen):
@@ -18,7 +36,13 @@ def fake_subprocess(monkeypatch, popen):
 @pytest.fixture
 def tree(tmp_path, monkeypatch):
     (tmp_path / "pending_strategies").mkdir()
-    monkeypatch.setattr(api.bootstrap, "ROOT", tmp_path)
+    # 数据根(候选目录/批准记录)指到临时树:研究侧不再用 bootstrap.ROOT(那会拖进 vnpy 与 .env)。
+    monkeypatch.setattr(api.rc, "ROOT", tmp_path)
+    # 默认假装 stdin 是交互式终端:批准类动作要求「人在场」,pytest 里 stdin 是管道。
+    monkeypatch.setattr(api.sys, "stdin", _FakeTTY())
+    # `--confirm-reviewed` 现在也要**粘贴完整哈希**(TTY 只是「有个控制台」,不是「有人在」,
+    # 第 7 轮 codex 的 F7):测试里默认「人」把正确的哈希粘回来。
+    monkeypatch.setattr(api, "_prompt_hash", lambda sha: sha)
     return tmp_path
 
 
@@ -101,8 +125,12 @@ def test_backtest_success_writes_result_with_diagnosis_and_hash(tree, monkeypatc
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
     assert run("backtest", "--strategy", "s.py", "--class", "S", "--key", "CADJ", "--segment", "valid", "--confirm-reviewed") == api.EXIT_OK
-    out = json.loads(capsys.readouterr().out)
-    assert len(out["strategy_sha256"]) == 64 and out["segment"] == "valid"
+    raw = capsys.readouterr().out
+    out = json.loads(raw)
+    # CLI 的 stdout 是模型可见通道的候选:**哈希不进 stdout**(第 7 轮 codex 的 F2),
+    # 磁盘上的结果文件里仍然记着(那是内部账本)。
+    assert "strategy_sha256" not in out and out["segment"] == "valid"
+    assert not re.search(r"[0-9a-fA-F]{64}", raw)
     assert out["diagnosis"]["dimensions"]["sharpe"]["level"] == "ok"
     assert (tree / "data" / "research" / f"{out['run_id']}.json").exists()
     assert run("results", out["run_id"]) == api.EXIT_OK
@@ -179,7 +207,7 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
 
     assert run(*GT, "--random-runs", "20", "--confirm-reviewed") == api.EXIT_OK
     out = json.loads(capsys.readouterr().out)
-    assert out["kind"] == "gate" and out["passed"] is False and len(out["strategy_sha256"]) == 64
+    assert out["kind"] == "gate" and out["passed"] is False and "strategy_sha256" not in out
     assert out["plateau_note"].startswith("未提供")
     assert "没看过滚动验证窗口" in out["protocol_notice"]
     assert (tree / "data" / "research" / f"{out['run_id']}.json").exists()
@@ -209,11 +237,84 @@ def approve(path):
     api.rs.record_approval(path, api.settings()[1]["approvals_file"])
 
 
+class _FakeTTY:
+    """假装 stdin 是交互式终端。"""
+
+    def isatty(self):
+        return True
+
+    def readline(self):
+        return ""
+
+
+def approve_interactively(monkeypatch, path, digest=None):
+    """在交互式终端里「粘贴完整 sha256」完成一次人工批准。"""
+    sha = api.rs.file_sha256(path)
+    monkeypatch.setattr(api.sys, "stdin", _FakeTTY())
+    monkeypatch.setattr("builtins.input", lambda prompt="": digest if digest is not None else sha)
+    return sha
+
+
+def test_approve_requires_an_interactive_terminal(tree, monkeypatch, capsys):
+    """非交互(stdin 是管道)时 `approve` 必须拒绝:批准权在人手里,不在能喂字符串的程序手里。"""
+    make_strategy(tree)
+    monkeypatch.setattr(api.sys, "stdin", io.StringIO(""))      # 管道,不是终端
+
+    code = run("approve", "--strategy", "s.py")
+
+    assert code == api.EXIT_REFUSED
+    assert "交互式终端" in capsys.readouterr().err
+    assert not (tree / "data" / "research-control" / "approvals.json").exists()
+
+
+def test_approve_requires_the_full_sha256(tree, monkeypatch, capsys):
+    """哈希填错(哪怕只错一位)不批准。"""
+    path = make_strategy(tree)
+    approve_interactively(monkeypatch, path, digest="0" * 64)
+
+    code = run("approve", "--strategy", "s.py")
+
+    assert code == api.EXIT_OK
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert out["approved"] is False
+    # **stdout 里不能有哈希**(第 5 轮 codex 的 M6):CLI 的 stdout 是「模型可见通道」的候选,
+    # 哈希只留在 stderr(给人的通道)。
+    assert "sha256" not in out
+    assert api.rs.file_sha256(path) not in captured.out
+    assert api.rs.file_sha256(path) in captured.err
+    assert not (tree / "data" / "research-control" / "approvals.json").exists()
+
+
 def test_approve_records_hash_and_unlocks_backtest_without_confirm_flag(tree, monkeypatch, capsys):
     path = make_strategy(tree)
+    approve_interactively(monkeypatch, path)
     assert run("approve", "--strategy", "s.py") == api.EXIT_OK
-    out = json.loads(capsys.readouterr().out)
-    assert out["sha256"] == api.rs.file_sha256(path)
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    # stdout 不带哈希,哈希只在 stderr(见上一条测试的 M6 说明)。
+    assert "sha256" not in out
+    assert api.rs.file_sha256(path) not in captured.out
+    assert api.rs.file_sha256(path) in captured.err
+
+
+def test_approve_stdout_is_pure_json(tree, monkeypatch, capsys):
+    """stdout 必须能被 json.loads 整段解析。
+
+    `input(prompt)` 会把提示语写进 stdout,那样 stdout 就不是纯 JSON 了——
+    下游按行取 JSON 的调用方会被提示语卡住,而且提示语本身也是「给人看的东西」
+    混进了可能外发的通道。提示语一律走 stderr。
+    """
+    path = make_strategy(tree)
+    approve_interactively(monkeypatch, path)
+
+    assert run("approve", "--strategy", "s.py") == api.EXIT_OK
+    captured = capsys.readouterr()
+
+    # 整段 stdout 必须是一个 JSON 值(不是「JSON + 别的」)
+    json.loads(captured.out)
+    assert "粘贴" not in captured.out
+    assert "粘贴" in captured.err
 
     class FakeProc:
         returncode = 1
@@ -227,6 +328,7 @@ def test_approve_records_hash_and_unlocks_backtest_without_confirm_flag(tree, mo
 
 def test_edit_after_approval_requires_reapproval(tree, monkeypatch, capsys):
     path = make_strategy(tree)
+    approve_interactively(monkeypatch, path)
     run("approve", "--strategy", "s.py")
     capsys.readouterr()
     path.write_text("class S:\n    x = 1\n", encoding="utf-8")
@@ -255,6 +357,25 @@ def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
     run(*BT, "--confirm-reviewed")
 
     assert api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+def test_confirm_reviewed_is_refused_when_stdin_is_not_a_terminal(tree, monkeypatch, capsys):
+    """`--confirm-reviewed` 也要求人在场:非 TTY 时任何程序都能自己带上这个开关批准代码。"""
+    path = make_strategy(tree)
+    monkeypatch.setattr(api.sys, "stdin", io.StringIO(""))      # 管道,不是终端
+
+    class FakeProc:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return "", "x"
+
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
+    code = run(*BT, "--confirm-reviewed")
+
+    assert code == api.EXIT_REFUSED
+    assert "交互式终端" in capsys.readouterr().err
+    assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
 
 
 def test_defaults_come_from_config_and_cli_flags_override(tree, monkeypatch):
@@ -301,6 +422,7 @@ def test_invalid_config_refuses_every_command(tree, monkeypatch, capsys):
     assert run("results") == api.EXIT_REFUSED and "配置非法" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_child_refuses_when_file_changed_after_approval(tree):
     # 候选必须放在 pending_strategies/ 内:子入口自己会查这条,否则拒绝原因会变成"路径不对"
     f = tree / "pending_strategies" / "s.py"
@@ -430,6 +552,7 @@ def test_evaluate_cli_and_child_parsers():
     assert args.random_runs == 50 and child.random_runs == 50 and child.sha256 == "abc"
 
 
+@requires_trading_stack
 def test_evaluate_child_refuses_a_file_changed_after_approval(tree):
     f = tree / "pending_strategies" / "s.py"
     f.write_text("class S: pass\n", encoding="utf-8")
@@ -473,25 +596,40 @@ def test_gate_and_evaluate_results_carry_reports_including_strategy_errors(tree,
 
 # ---------- review:先看代码再批准 ----------
 
-def test_review_shows_numbered_source_and_approves_only_on_y(tree, capsys):
+def test_review_shows_numbered_source_and_approves_only_on_the_full_hash(tree, capsys):
+    """review 的确认方式是**粘贴完整 64 位 sha256**,不是敲个 y。"""
     path = make_strategy(tree, "class S:\n    x = 1\n")
     shown = []
+    sha = api.rs.file_sha256(path)
 
-    out = api.review_job("s.py", input_fn=lambda prompt: "y", write=shown.append)
+    out = api.review_job("s.py", input_fn=lambda prompt: sha, write=shown.append)
 
     text = "\n".join(shown)
-    assert "sha256" in text and api.rs.file_sha256(path) in text and "静态筛查: 通过" in text
+    assert "sha256" in text and sha in text and "静态筛查: 通过" in text
     assert "   1 | class S:" in text and "   2 |     x = 1" in text
     assert out["approved"] is True and api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
 
 
-@pytest.mark.parametrize("answer", ["", "n", "N", "yes please", " "])
-def test_review_does_not_approve_on_anything_but_y(tree, answer):
+@pytest.mark.parametrize("answer", ["", "n", "N", "y", "yes please", " ", "0" * 64])
+def test_review_does_not_approve_on_anything_but_the_full_hash(tree, answer):
+    """除了完整哈希,别的输入一律不批准(敲 y 也不行)。"""
     path = make_strategy(tree)
 
     out = api.review_job("s.py", input_fn=lambda prompt: answer, write=lambda *_: None)
 
     assert out["approved"] is False
+    assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
+
+
+def test_review_requires_an_interactive_terminal(tree, monkeypatch):
+    """非交互(stdin 是管道)时 `review` 必须拒绝:批准权在人手里,不在能喂字符串的程序手里。"""
+    path = make_strategy(tree)
+    monkeypatch.setattr(api.sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(api.JobError) as err:
+        api.review_job("s.py", input_fn=lambda prompt: api.rs.file_sha256(path), write=lambda *_: None)
+
+    assert "交互式终端" in err.value.message
     assert not api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
 
 
@@ -525,11 +663,13 @@ def test_review_on_already_approved_content_does_not_ask_again(tree):
 
 def test_review_cli_wires_through_builtin_input(tree, monkeypatch, capsys):
     path = make_strategy(tree)
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    sha = api.rs.file_sha256(path)
+    monkeypatch.setattr("builtins.input", lambda prompt="": sha)
 
     assert run("review", "--strategy", "s.py") == api.EXIT_OK
     assert api.rs.is_approved(path, tree / "data" / "research-control" / "approvals.json")
-    assert "已批准" in capsys.readouterr().out
+    # 人读的内容与结果走 stderr(留给人的通道),stdout 仍只出 JSON。
+    assert "已批准" in capsys.readouterr().err
 
 
 def test_review_refuses_paths_outside_pending(tree, capsys):
@@ -540,10 +680,11 @@ def test_review_refuses_paths_outside_pending(tree, capsys):
 
 def test_review_refuses_when_file_changes_while_user_is_reading(tree):
     path = make_strategy(tree, "class S:\n    x = 1\n")
+    seen = api.rs.file_sha256(path)          # 人读的是这一份
 
     def swap_then_say_yes(prompt):
         path.write_text("class S:\n    x = 2\n", encoding="utf-8")      # 阅读期间被换成没看过的内容
-        return "y"
+        return seen
 
     with pytest.raises(api.JobError):
         api.review_job("s.py", input_fn=swap_then_say_yes, write=lambda _: None)
@@ -743,6 +884,7 @@ def test_ordinary_params_are_accepted(tree, monkeypatch):
     assert result["kind"] == "backtest"
 
 
+@requires_trading_stack
 def test_child_refuses_a_candidate_that_overrides_a_protected_member(tree, monkeypatch):
     """候选在类体里改写风控底线:静态筛查在提交时就拒绝,这里守住第二道(文件被替换的 TOCTOU 情形)。"""
     path = tree / "pending_strategies" / "s.py"
@@ -756,6 +898,7 @@ def test_child_refuses_a_candidate_that_overrides_a_protected_member(tree, monke
 # ---- 回归:三个子进程入口必须走同一套三层校验 ----
 # 早先三个入口各复制一遍流程,gate 入口漏掉了运行时类校验,整条 gate 路径只剩静态筛查一层。
 
+@requires_trading_stack
 def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree, monkeypatch, capsys):
     """gate 子进程必须做运行时类校验:静态筛查放行的候选也要在这里被拒。"""
     body = (
@@ -790,6 +933,7 @@ def test_all_three_child_entrypoints_go_through_the_same_validation_function(tre
 
 # ---------- codex 第 4 轮:pyc 绕过、参数绕过、evaluate 回归 ----------
 
+@requires_trading_stack
 def test_a_stale_pyc_cannot_replace_the_hashed_source(tmp_path, monkeypatch):
     """预置一个"时间戳有效"的旧 .pyc:执行的必须是被哈希、被筛查的那份源码。
 
@@ -821,6 +965,7 @@ def test_a_stale_pyc_cannot_replace_the_hashed_source(tmp_path, monkeypatch):
     assert cls.VALUE == "GOOD", "执行的不是被哈希的那份源码"
 
 
+@requires_trading_stack
 def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tree):
     """子入口是独立的信任边界:绕过父入口直接传受保护参数,必须一样被拒。"""
     f = tree / "pending_strategies" / "s.py"
@@ -837,6 +982,7 @@ def test_child_entrypoints_refuse_protected_parameters_when_called_directly(tree
     assert api.run_gate_child(args) == api.EXIT_REFUSED
 
 
+@requires_trading_stack
 def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     """evaluate 子进程必须真的走到评估那一步。
 
@@ -912,6 +1058,7 @@ def test_the_saved_backtest_stats_are_exactly_what_the_dashboard_validates():
         assert key in row and isinstance(row[key], (int, float))
 # ---------- 第 6 轮:隐藏入口的信任边界要闭合(数值参数、路径、导入期错误) ----------
 
+@requires_trading_stack
 def test_child_entrypoints_refuse_a_negative_prior_trials(tree, capsys):
     """`--prior-trials` 为负必须被拒:evaluate 路径会先做 `prior + 格子数` 再算 DSR,
     负数让 N 变小,而 DSR 随 N 增大而变严——于是**晋级门槛被放松**。
@@ -928,6 +1075,7 @@ def test_child_entrypoints_refuse_a_negative_prior_trials(tree, capsys):
         assert "prior-trials" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_child_entrypoints_refuse_random_runs_out_of_bounds(tree, capsys):
     """`--random-runs` 越界必须被拒:子进程自身没有超时(超时只由父进程兜),
     直接调用即可拖资源。父入口本来就用同一把配置尺子量,子入口不能比父入口松。"""
@@ -940,6 +1088,7 @@ def test_child_entrypoints_refuse_random_runs_out_of_bounds(tree, capsys):
     assert "random-runs" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_child_entrypoints_refuse_a_file_outside_the_pending_directory(tree, capsys):
     """候选文件必须在 pending_strategies/ 内:子入口能被直接调用,
     不该假设 `--file` 是父进程给的——否则可以直接指向仓库里任何 .py。"""
@@ -952,6 +1101,7 @@ def test_child_entrypoints_refuse_a_file_outside_the_pending_directory(tree, cap
     assert "pending_strategies" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_child_refuses_an_unknown_segment_with_the_refusal_code(tree, capsys):
     """非法 --segment 的退出码必须是"拒绝"(2),不是未捕获异常的 1。
 
@@ -966,12 +1116,13 @@ def test_child_refuses_an_unknown_segment_with_the_refusal_code(tree, capsys):
     assert "测试段" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_an_import_time_error_comes_back_as_a_structured_error(tree, monkeypatch, capsys):
     """候选在**导入期**出错,要按结构化错误回传,而不是带 traceback 退出 1。
 
     契约:所有候选侧的失败都走 `{"error": ...}` 这条通道,LLM 才拿得到诊断信息;
     早先这类异常直接冒泡,父进程只报"回测失败(详情见本机日志)"。"""
-    path = make_strategy(tree, "import totally_missing_module_xyz\nclass S: pass\n")
+    path = make_strategy(tree, "import math\nraise ValueError('boom')\nclass S: pass\n")
     approve(path)
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
@@ -983,6 +1134,7 @@ def test_an_import_time_error_comes_back_as_a_structured_error(tree, monkeypatch
     assert "error" in payload, payload
 
 
+@requires_trading_stack
 def test_a_candidate_file_with_a_bom_still_loads(tree, monkeypatch):
     """带 BOM 的候选文件要能正常载入。
 
@@ -1031,7 +1183,6 @@ def test_a_child_refusal_reaches_the_caller_with_its_reason():
 
     早先一律压成"回测失败(退出码 3)",于是子入口里那些拒绝的原因只进了本机 stderr,
     永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。"""
-    import subprocess
     import sys
 
     with pytest.raises(api.JobError) as excinfo:
@@ -1040,6 +1191,7 @@ def test_a_child_refusal_reaches_the_caller_with_its_reason():
     assert "risk_budget" in excinfo.value.message
 
 
+@requires_trading_stack
 def test_a_child_entrypoint_refuses_a_candidate_that_was_never_approved(tree, capsys):
     """子入口必须自己查审批记录。
 
@@ -1053,6 +1205,7 @@ def test_a_child_entrypoint_refuses_a_candidate_that_was_never_approved(tree, ca
     assert "批准" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_a_missing_class_is_a_refusal_not_a_failure(tree, monkeypatch):
     """`--cls` 指向不存在的类是**参数错误**,退出码应为"拒绝"(2)而不是"失败"(3)。"""
     path = make_strategy(tree, "class S: pass" + chr(10))
@@ -1062,6 +1215,7 @@ def test_a_missing_class_is_a_refusal_not_a_failure(tree, monkeypatch):
     assert excinfo.value.code == api.EXIT_REFUSED
 
 
+@requires_trading_stack
 def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
     """子入口查审批记录要按**传进来的那个哈希**查,不是按文件当前内容。
 
@@ -1081,6 +1235,7 @@ def test_child_refuses_a_hash_that_was_never_approved(tree, capsys):
 
 # ---------- 第 9 轮 codex:模块级 monkey-patch(Critical 1)—— 运行期第四层 ----------
 
+@requires_trading_stack
 def test_a_candidate_that_rewrites_a_framework_object_at_import_time_is_refused(tree, monkeypatch, request):
     """候选在导入期改写框架对象必须被拒。
 
@@ -1157,3 +1312,96 @@ def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monk
     with pytest.raises(api.JobError) as exc:
         api.import_candidate(path, "S", api.rs.file_sha256(path))
     assert "静态筛查未通过" in str(exc.value)
+
+
+def test_a_hanging_child_is_killed_on_timeout():
+    """子进程不返回时必须超时终止,不能永远挂着(第 9 轮 codex 的 M4)。
+
+    超时这一路原来一条测试都没有:回测子进程卡死 → 网关那边一直等,
+    研究任务被无限期占住,而且没有任何日志说明它卡在哪。
+    """
+    import sys
+
+    with pytest.raises(api.JobError) as exc:
+        api.spawn_child([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1.0)
+    assert exc.value.code == api.EXIT_TIMEOUT
+    assert "已终止" in str(exc.value)
+
+
+# ---------- 第 12 轮 codex 的回归用例 ----------
+
+def test_the_cli_stdout_covers_secret_values_by_value(tmp_path, monkeypatch, capsys):
+    """CLI 的 stdout 是**模型可见通道的候选**,但原先只有「按名字」认凭据这一层
+    (第 12 轮 codex 的 M5):候选把令牌连名字一起塞进异常文本时,网关与 MCP 会被
+    按值盖掉,CLI 不会——三条通道口径不一致,漏的那一条就是漏的那一条。"""
+    token = "s3cr3t-value-1234567890"
+    token_file = tmp_path / "gateway.token"
+    token_file.write_text(token + "\n", encoding="utf-8")
+    monkeypatch.setattr(api.rc, "load", lambda: {})
+    monkeypatch.setattr(api.rc, "resolve_paths", lambda cfg, root: {"token_file": token_file})
+    monkeypatch.setattr(api.rc, "bisheng_openapi_key", lambda *a, **k: "")
+
+    assert api._model_visible_secrets() == (token,)
+
+    api.emit({"message": "候选把令牌 " + token + " 写进了异常文本"})
+    out = capsys.readouterr().out
+    assert token not in out, out
+    assert "<凭据已隐去>" in out, out
+
+
+def test_the_cli_stdout_still_works_without_a_token_file(tmp_path, monkeypatch, capsys):
+    """读不到令牌文件时**不能让整条脱敏失效**(按值那一层跳过,其余照旧)。"""
+    monkeypatch.setattr(api.rc, "load", lambda: {})
+    monkeypatch.setattr(api.rc, "resolve_paths",
+                        lambda cfg, root: {"token_file": tmp_path / "missing.token"})
+    monkeypatch.setattr(api.rc, "bisheng_openapi_key", lambda *a, **k: "")
+
+    assert api._model_visible_secrets() == ()
+
+    api.emit({"message": "普通消息"})
+    assert json.loads(capsys.readouterr().out) == {"message": "普通消息"}
+
+
+# ---------- 第 14 轮 codex 的回归用例:三条通道共用同一份「按值凭据清单」 ----------
+
+def test_the_cli_also_covers_the_bisheng_key_by_value(tmp_path, monkeypatch, capsys):
+    """CLI 的「按值」清单原先**只有网关令牌**,没有毕昇开放 API 密钥
+    (第 14 轮 codex 的 M3):候选把密钥写进异常文本,网关与 MCP 盖得住、CLI 盖不住。
+
+    现在三条通道共用 `research_config.known_secret_values`,这一条断言 CLI 侧也覆盖到了。"""
+    key = "bs-sak-cli-0123456789"
+    monkeypatch.setattr(api.rc, "load", lambda: {})
+    monkeypatch.setattr(api.rc, "resolve_paths",
+                        lambda cfg, root: {"token_file": tmp_path / "missing.token"})
+    monkeypatch.setattr(api.rc, "bisheng_openapi_key", lambda *a, **k: key)
+
+    assert key in api._model_visible_secrets()
+
+    api.emit({"message": "候选把密钥 " + key + " 写进了异常文本"})
+    out = capsys.readouterr().out
+    assert key not in out, out
+    assert "<凭据已隐去>" in out, out
+
+
+def test_the_three_model_visible_channels_share_one_secret_list(tmp_path, monkeypatch):
+    """**清单不共享 = 口径漂移 = 漏的那一条就是漏的那一条**(第 14 轮 codex 的 M3/L10)。
+
+    网关 / MCP / CLI 三条通道必须调同一个函数拿清单,而不是各自读一遍凭据:
+    各自读一遍,读到的内容就会不一样(有的读到令牌、有的读到密钥)。
+    """
+    import research_gateway as gw
+
+    key = "bs-sak-shared-0123456789"
+    token = "shared-gateway-token-0123456789"
+    monkeypatch.setattr(api.rc, "bisheng_openapi_key", lambda *a, **k: key)
+    monkeypatch.setattr(api.rc, "load", lambda: {})
+    monkeypatch.setattr(api.rc, "resolve_paths",
+                        lambda cfg, root: {"token_file": tmp_path / "missing.token"})
+
+    cli_list = api._model_visible_secrets()
+    gateway_list = api.rc.known_secret_values(label="research-gateway", token=token)
+
+    assert key in cli_list and key in gateway_list
+    assert token in gateway_list
+    # 同一份清单本体:函数是同一个,不是各写一份。
+    assert gw.rc.known_secret_values is api.rc.known_secret_values

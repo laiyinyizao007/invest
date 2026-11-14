@@ -26,8 +26,8 @@ import types
 from datetime import datetime
 from pathlib import Path
 
-import bootstrap
 import research_config as rc
+import research_console as rconsole
 import research_sandbox as rs
 from research_grid import MIN_AXIS_VALUES
 from risk import constitution as const
@@ -44,11 +44,39 @@ PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必�
 def settings() -> tuple[dict, dict]:
     """(配置, 解析后的路径)。每次调用现读,配置非法时抛 ConfigError(由 main 统一转为拒绝)。"""
     cfg = rc.load()
-    return cfg, rc.resolve_paths(cfg, bootstrap.ROOT)
+    return cfg, rc.resolve_paths(cfg, rc.ROOT)
+
+
+def _model_visible_secrets() -> tuple[str, ...]:
+    """CLI 这一条通道要**按值**盖掉的凭据(第 12 轮 codex 的 M5)。
+
+    清洗规则本来按**名字**认凭据(`CTP_PASSWORD=…`),可候选一旦把令牌**连名字一起**
+    写进异常文本(或者只写值),名字那一层就认不出来——按值替换是最后一道。
+    网关与 MCP 两条通道原先都有这一层,只有 CLI 没有,于是同一段文本在网关/MCP 被盖住、
+    在 CLI 的 stdout 上原样出去。
+
+    清单本体在 `research_config.known_secret_values`:三条模型可见通道(网关 / MCP / CLI)
+    **共用同一份**(第 14 轮 codex 的 M3/L10)——原先 CLI 与网关只有网关令牌、
+    没有毕昇开放 API 密钥,MCP 才有,于是「谁漏了就是谁漏了」。
+    读不到令牌时**在 stderr 留一行痕**(第 13 轮 codex 的 L2):静默降级会让人以为
+    「按值那一层还在」。stderr 不是模型可见通道(交互提示语与哈希只走 stderr),
+    所以这行不影响脱敏口径。
+    """
+    return rc.known_secret_values(label="research-api")
 
 
 def emit(obj) -> None:
-    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    """CLI 的**唯一 stdout 出口**:出去的 JSON 一律先过模型可见通道的清洗。
+
+    为什么 stdout 也要洗(第 7 轮 codex 的 F2):CLI 的 stdout 是「模型可见通道的候选」——
+    毕昇工作流将来完全可能直接调它。原先这里只做 `json.dumps`,于是
+    `strategy_sha256` 与结果文件里的哈希原样出去:模型拿到哈希就能在聊天里替人念哈希,
+    「人核对完整 64 位哈希」当场退化成橡皮章。
+
+    人要看的哈希与源码走 **stderr**(approve/review 已经这么做了),stdout 只留 JSON。
+    """
+    print(json.dumps(rs.scrub_model_visible(obj, secrets=_model_visible_secrets()),
+                     ensure_ascii=False, indent=2))
 
 
 def refuse(message: str) -> int:
@@ -65,14 +93,15 @@ def kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-_PATH_LIKE = re.compile(r"(?:[A-Za-z]:[\\/]|/(?:app|usr|home|tmp|root)/)[^\s\"')]*")
 _EXC_LINE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))\b:?\s*(.*)$")
 
 
 def describe_error(exc: BaseException) -> dict:
-    """把策略运行时异常压成 {type, message}:取 traceback 末尾的异常行,抹掉本机路径,截断到 200 字符。
+    """把策略运行时异常压成 {type, message}:取 traceback 末尾的异常行,洗掉敏感内容,截断到 200 字符。
 
-    注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,所以限长并只保留可打印字符。"""
+    注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,
+    所以限长并只保留可打印字符;清洗走共享口径 `rs.scrub_text`(本机路径、哈希、凭据、批准命令),
+    免得这里再有一套更弱的正则(第 7 轮 codex 的 F5)。"""
     text = str(exc)
     name, msg = type(exc).__name__, text
     for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
@@ -80,7 +109,7 @@ def describe_error(exc: BaseException) -> dict:
         if m:
             name, msg = m.group(1), m.group(2)
             break
-    msg = _PATH_LIKE.sub("<path>", msg)
+    msg = rs.scrub_text(msg)
     msg = "".join(ch for ch in msg if ch.isprintable())[:200]
     return {"type": name.split(".")[-1], "message": msg}
 
@@ -147,23 +176,23 @@ def _child_reason(stderr: str) -> str:
     于是子入口里那些拒绝(受保护参数、路径越界、审批缺失)的原因只进了本机 stderr,
     永远进不了返回给调用方/LLM 的结果里——而那条通道正是为"把诊断送回去"设计的。
 
-    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。"""
+    回传前走**唯一**的清洗口径 `rs.scrub_text`:本机路径、凭据、哈希、批准命令都盖掉。
+    早先这里自带三套正则(盘符/POSIX/引号),是第四套口径,迟早与主线漂移
+    (第 10 轮 codex 的 Low)。
+    语义变化(第 10 轮 codex 的 Low):旧实现会把引号里的**一切**整段替换成 `<路径>`;
+    现在统一走 `rs.scrub_text`,只认路径/哈希/凭据这些**形态**,引号里的普通文本不再被吞
+    (写在这里免得日后当成回归)。
+    """
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
     if not lines:
         return "子进程拒绝执行(原因见本机日志)"
-    reason = lines[-1]
-    # Windows 盘符路径(含带空格的目录)、POSIX 绝对路径、引号里的整段路径都要盖住:
-    # 早先只处理"不含空格的盘符路径",`C:\Program Files\...` 这类只替换掉前半段。
-    reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", reason)
-    reason = re.sub(r"(?<![\w.])/(?:[^\s\"']*/)*[^\s\"']*", "<路径>", reason)
-    reason = re.sub(r"\"[^\"]*\"|'[^']*'", "<路径>", reason)
-    return reason[:200]
+    return rs.scrub_text(lines[-1])[:200]
 
 
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", cwd=bootstrap.ROOT, env=rs.sandbox_env(os.environ))
+                            errors="replace", cwd=rc.CODE_ROOT, env=rs.sandbox_env(os.environ))
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -182,7 +211,30 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
     return json.loads(line[len(CHILD_MARK):])
 
 
-NEEDS_APPROVAL = "策略代码尚未批准:请先读代码并执行 research_api.py approve --strategy <文件>(或本次加 --confirm-reviewed)"
+# **这条消息会经网关回到模型**,所以里面不能有批准命令(第 6 轮 codex 的 M2/B 的 M):
+# 命令一旦交回模型,模型就能诱导人去跑终端里的批准流程——那条路上没有
+# 「只批本轮候选」的约束。人要看的命令另走 stderr(见 APPROVAL_HINT 与 run_cli_job)。
+NEEDS_APPROVAL = ("策略代码尚未批准:请让本机的人完成人工批准"
+                  "(带外批准页,或本机终端里的 approve 子命令);"
+                  "批准绑定代码哈希,代码改动后需重新批准;模型不能代替人批准。")
+
+# 人看的提示:只在**本机 stderr** 出(CLI 拒绝时),不进模型通道。
+APPROVAL_HINT = ("本机人工批准:在交互式终端里运行 "
+                 "python scripts/research_api.py approve --strategy <文件>"
+                 "(粘贴完整 sha256 确认;或本次加 --confirm-reviewed)")
+
+
+def _prompt_hash(sha: str) -> str:
+    """请人把完整哈希粘贴回来(提示语走 stderr,stdout 只出 JSON)。
+
+    单独抽出来是为了能单测:确认动作要能验「哈希不匹配就不批准」。
+    """
+    print(f"本次候选 sha256: {sha}", file=sys.stderr)
+    print("把上面的 sha256 完整粘贴回来以确认批准: ", end="", file=sys.stderr)
+    try:
+        return input("")
+    except (EOFError, OSError):
+        return ""
 
 
 def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = None) -> None:
@@ -193,7 +245,23 @@ def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = 
     否则"审批时看到的""筛查时看到的""执行时校验的""结果里记的"可能是四份不同的内容。"""
     try:
         if confirm:
-            rs.record_approval(path, paths["approvals_file"])
+            # `--confirm-reviewed` 是「人刚读过并批准」的快捷方式,只在**交互式终端**里有效:
+            # 非 TTY 时任何程序都能自己带上这个开关把批准做掉(第 8 轮 codex 的 H1)。
+            if not sys.stdin.isatty():
+                raise JobError(EXIT_REFUSED, "--confirm-reviewed 只能在交互式终端里使用"
+                                            "(自动化调用不得批准代码);"
+                                            "请改用 approve 子命令粘贴完整 sha256。")
+            # TTY 只是「有个控制台」,不是「有人在」:Windows 用 CREATE_NEW_CONSOLE、
+            # POSIX 用 pty.spawn 都能伪造出 isatty=True。
+            # 所以这里也要**粘贴完整哈希**——与 approve/review 同一条口径
+            # (第 7 轮 codex 的 F7)。
+            sha = str(sha256 or rs.file_sha256(path)).strip().lower()
+            answer = _prompt_hash(sha)
+            if answer.strip().lower() != sha:
+                raise JobError(EXIT_REFUSED, "哈希不匹配,未批准。")
+            # 记的是**已经读出来并核对过的那份**的哈希:不在这里重读文件,
+            # 免得"核对的内容"与"记下的内容"之间出现时间差(TOCTOU)。
+            rs.record_approval(path, paths["approvals_file"], sha256=sha)
         elif sha256 is not None:
             if sha256 not in rs._load_approvals(paths["approvals_file"]):
                 raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
@@ -226,7 +294,8 @@ def screen(path: Path, cfg: dict) -> list[str]:
     """静态筛查。与 `import_candidate` 共用同一个读取器,免得两处解码口径不一致。"""
     _, source = read_candidate(path)
     return rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                            cfg["screening"]["extra_forbidden_calls"])
+                            cfg["screening"]["extra_forbidden_calls"],
+                            cfg["screening"]["allowed_modules"])
 
 
 def check_params_allowed(params: dict) -> None:
@@ -285,7 +354,7 @@ def child_file(path: Path) -> Path:
     不该假设路径是父进程给的——否则可以直接把 `--file` 指到仓库里任何 .py。"""
     cfg = rc.load()
     try:
-        return rs.resolve_pending(str(path), bootstrap.ROOT, cfg["paths"]["pending_dir"])
+        return rs.resolve_pending(str(path), rc.ROOT, cfg["paths"]["pending_dir"])
     except rs.SandboxError:
         # 消息里不带路径:拒绝原因会回传给调用方,而回传的约定是不含本机路径
         raise JobError(EXIT_REFUSED, "策略文件不在 pending_strategies/ 目录内") from None
@@ -337,7 +406,8 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         raise JobError(EXIT_REFUSED, "策略文件在批准后被改动,拒绝运行")
     cfg = rc.load()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                                cfg["screening"]["extra_forbidden_calls"])
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     try:
@@ -363,7 +433,8 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 而 `unittest.mock.patch.object` 只要能 import 就能改写实例属性。
     # 把 setattr/getattr/eval/exec/open 这些**从内建里拿掉**,那些路径自然就不存在了
     # (连 frame.f_builtins 也只会拿到这份受限字典)。详见 scripts/research_sandbox.py::safe_builtins。
-    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"])
+    module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"],
+                                                      cfg["screening"]["allowed_modules"])
     # 运行期第四层:候选执行**前后**各拍一张"受保护对象身份指纹"。
     # 静态层按名字判断,拦不住"换个写法"改写框架对象——第 9 轮 codex 实测:
     # `import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`
@@ -371,7 +442,11 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 不管候选用哪种写法(rg 直接改、别名改、type(cls) 改),换了对象就对不上。
     protected_before = const.snapshot_protected_state()
     try:
-        exec(code, module.__dict__)                           # noqa: S102 —— 执行的就是上面校验过的那份字节
+        # 候选执行期间,受限导入器把会漏的模块换成**代理**(危险属性取不到);
+        # `guarded_scope` 退出时无条件还原:宿主机自己的代码不该看到代理
+        # (第 10 轮 codex 的 Critical 修复)。
+        with rs.guarded_scope():
+            exec(code, module.__dict__)                       # noqa: S102 —— 执行的就是上面校验过的那份字节
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
@@ -399,17 +474,17 @@ def require_clean(path: Path, cfg: dict) -> None:
 
 def resolve_strategy(strategy: str, cfg: dict) -> Path:
     try:
-        return rs.resolve_pending(strategy, bootstrap.ROOT, cfg["paths"]["pending_dir"])
+        return rs.resolve_pending(strategy, rc.ROOT, cfg["paths"]["pending_dir"])
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
 
 
 def data_report() -> list:
-    import optimize
     import segment_ledger
+    import segment_windows
     out = []
     for key in rs.KEYS:
-        windows = optimize.windows_for(key)
+        windows = segment_windows.windows_for(key)
         t_start, t_end = windows["test"]
         ledger_key = f"optimize:{key}:{t_start:%Y-%m-%d}~{t_end:%Y-%m-%d}"
         try:
@@ -426,56 +501,102 @@ def data_report() -> list:
     return out
 
 
-def approve_job(strategy: str) -> dict:
+def approve_job(strategy: str, input_fn=None, write=None) -> dict:
+    """人工批准:打印文件摘要与 sha256,要求人在**交互式终端**里把完整哈希粘贴回来。
+
+    为什么不是「敲个 y 就行」:
+      - 非交互(stdin 是管道)时,任何程序都能自己喂字符串把批准做掉——那就不是「人在场」了。
+        因此非 TTY 一律拒绝(与带外批准网页同一条口径:那边也要人输入完整 64 位哈希)。
+      - 要的是**人核对过的那份内容**:摘要与哈希打在 stderr 上(留给人的通道),
+        stdout 仍然只出 JSON,便于脚本解析。
+    """
     cfg, paths = settings()
     path = resolve_strategy(strategy, cfg)
-    findings = screen(path, cfg)
+    raw, source = read_candidate(path)
+    # 哈希与筛查都用**这一份**字节:分开读会出现"显示的大小/哈希"与"实际批准的"不是同一份内容。
+    sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
+    say = write or (lambda text: print(text, file=sys.stderr))
+    say(f"文件: {path.name}   大小: {len(raw)} 字节   sha256: {sha}")
+    say("⚠ 这行 sha256 只用在本机终端里核对,**不要抄进聊天窗口**(抄出去就等于把批准权交出去)。")
+    say("静态筛查: " + ("通过" if not findings else "未通过"))
+    for finding in findings:
+        say(f"  - {finding}")
     if findings:
         raise JobError(EXIT_REFUSED, "拒绝批准: 静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
+    if not sys.stdin.isatty():
+        raise JobError(EXIT_REFUSED, "approve 必须在交互式终端里执行(当前 stdin 不是终端);"
+                                    "自动化调用不得批准代码。")
     try:
-        sha = rs.record_approval(path, paths["approvals_file"])
+        # 提示语走 stderr,stdout 只出 JSON:`input(prompt)` 会把提示语写到 stdout,
+        # 那样 stdout 就不是纯 JSON 了(第 5 轮 codex 的 M6:stdout 是模型可见通道的候选)。
+        say("把上面的 sha256 完整粘贴回来以确认批准: ")
+        answer = (input_fn or input)("")
+    except (EOFError, OSError):
+        answer = ""
+    if answer.strip().lower() != sha:
+        say("哈希不匹配,未批准。")
+        return {"approved": False, "name": path.name}
+    try:
+        rs.record_approval(path, paths["approvals_file"], sha256=sha)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
-    return {"approved": path.name, "sha256": sha}
+    say("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")
+    return {"approved": True, "already": False, "name": path.name}
 
 
-def review_job(strategy: str, input_fn=None, write=print) -> dict:
-    """先看代码再批准:打印文件摘要、静态筛查结果和**带行号的完整源码**,再问一次 [y/N]。
-    只有明确输入 y 才记录批准(绑定代码哈希);空输入、其它输入、stdin 已关闭一律视为不批准。
-    静态筛查不过的直接拒绝,不提问。批准只能在本机由人触发,外层没有任何端点能调用它。"""
+def review_job(strategy: str, input_fn=None, write=None) -> dict:
+    """先看代码再批准:打印文件摘要、静态筛查结果和**带行号的完整源码**,再要求人粘贴完整 sha256。
+
+    与 `approve` 同一条口径(第 8 轮 codex 的 H1):`review` 曾是「敲个 y 就行」,而且没有 TTY 门——
+    `echo y | research_api.py review` 就能把批准做掉,等于把批准权交给了能喂字符串的程序。
+    现在:非交互终端一律拒绝;确认方式是**粘贴完整 64 位哈希**(人读过的那份内容的哈希);
+    stdout 仍只出 JSON,人读的内容走 stderr。
+    """
     cfg, paths = settings()
     path = resolve_strategy(strategy, cfg)
     raw, source = read_candidate(path)           # 字节数按原始字节算:换行转换后的长度不是文件真实大小
-    sha = rs.file_sha256(path)
-    findings = screen(path, cfg)
-    write(f"文件: {path.name}   大小: {len(raw)} 字节   sha256: {sha}")
-    write("静态筛查: " + ("通过" if not findings else "未通过"))
+    sha = hashlib.sha256(raw).hexdigest()
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
+    say = write or (lambda text: print(text, file=sys.stderr))
+    say(f"文件: {path.name}   大小: {len(raw)} 字节   sha256: {sha}")
+    say("⚠ 这行 sha256 只用在本机终端里核对,**不要抄进聊天窗口**(抄出去就等于把批准权交出去)。")
+    say("静态筛查: " + ("通过" if not findings else "未通过"))
     for finding in findings:
-        write(f"  - {finding}")
-    write("-" * 60)
+        say(f"  - {finding}")
+    say("-" * 60)
     for number, line in enumerate(source.splitlines(), 1):
-        write(f"{number:4d} | {line}")
-    write("-" * 60)
+        say(f"{number:4d} | {line}")
+    say("-" * 60)
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过,不予批准")
     try:
-        if rs.is_approved(path, paths["approvals_file"]):
-            write("该内容(同一哈希)已批准过。")
-            return {"approved": True, "already": True, "sha256": sha, "name": path.name}
+        if rs.is_approved_sha(sha, paths["approvals_file"]):
+            say("该内容(同一哈希)已批准过。")
+            return {"approved": True, "already": True, "name": path.name}
+        if not sys.stdin.isatty():
+            raise JobError(EXIT_REFUSED, "review 必须在交互式终端里执行(当前 stdin 不是终端);"
+                                        "自动化调用不得批准代码。")
         try:
-            answer = (input_fn or input)("读完以上代码,确认批准运行? [y/N] ")     # 调用时再取 input,便于替换
-        except EOFError:
+            # 提示语走 stderr,stdout 只出 JSON(同 approve_job)。
+            say("读完以上代码,把上面的 sha256 完整粘贴回来以确认批准: ")
+            answer = (input_fn or input)("")
+        except (EOFError, OSError):
             answer = ""
-        if answer.strip().lower() != "y":
-            write("未批准。")
-            return {"approved": False, "sha256": sha, "name": path.name}
+        if answer.strip().lower() != sha:
+            say("哈希不匹配,未批准。")
+            return {"approved": False, "name": path.name}
         if rs.file_sha256(path) != sha:                       # 批准必须绑定到用户刚读过的内容
             raise JobError(EXIT_REFUSED, "文件在阅读期间被改动,未批准;请重新运行 review")
-        rs.record_approval(path, paths["approvals_file"])
+        rs.record_approval(path, paths["approvals_file"], sha256=sha)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
-    write("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")
-    return {"approved": True, "already": False, "sha256": sha, "name": path.name}
+    say("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")
+    return {"approved": True, "already": False, "name": path.name}
 
 
 def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dict, timeout: float | None = None,
@@ -494,7 +615,8 @@ def backtest_job(*, strategy: str, cls: str, key: str, segment: str, params: dic
     raw, source = read_candidate(path)
     strategy_sha = hashlib.sha256(raw).hexdigest()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                                cfg["screening"]["extra_forbidden_calls"])
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
@@ -561,7 +683,8 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
     strategy_sha = hashlib.sha256(raw).hexdigest()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                                cfg["screening"]["extra_forbidden_calls"])
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
@@ -612,7 +735,8 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
     strategy_sha = hashlib.sha256(raw).hexdigest()
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                                cfg["screening"]["extra_forbidden_calls"])
+                                cfg["screening"]["extra_forbidden_calls"],
+                                cfg["screening"]["allowed_modules"])
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
@@ -644,16 +768,18 @@ def run_cli_job(func) -> int:
         code = getattr(exc, "code", EXIT_REFUSED)
         message = getattr(exc, "message", str(exc))
         print(("拒绝: " if code == EXIT_REFUSED else "") + message, file=sys.stderr)
+        if message == NEEDS_APPROVAL:
+            # 批准命令只给人看(stderr),不进模型通道:同一条消息经网关回到模型时
+            # 会把命令一起带出去(第 6 轮 codex 的 M2/B 的 M)。
+            print(APPROVAL_HINT, file=sys.stderr)
         return code
 
 
 def cmd_review(args) -> int:
-    try:
-        review_job(args.strategy)
-    except (JobError, rs.SandboxError) as exc:
-        print("拒绝: " + getattr(exc, "message", str(exc)), file=sys.stderr)
-        return getattr(exc, "code", EXIT_REFUSED)
-    return EXIT_OK
+    # 走 run_cli_job:stdout 出 JSON(与 approve/backtest 同一契约),人读的内容走 stderr。
+    # 原来直接丢掉 review_job 的返回值,脚本化调用既拿不到批准结果也拿不到「未批准」标志
+    # (第 6 轮 codex 的 M6)。
+    return run_cli_job(lambda: review_job(args.strategy))
 
 
 def cmd_data(_args) -> int:
@@ -846,7 +972,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds + grid.timeout_seconds")
     ev.add_argument("--confirm-reviewed", action="store_true")
     ev.set_defaults(func=cmd_evaluate)
-    rv = sub.add_parser("review", help="先看代码再批准:显示带行号的源码与静态筛查结果,输入 y 才批准")
+    rv = sub.add_parser("review", help="先看代码再批准:显示带行号的源码与静态筛查结果,"
+                                        "粘贴完整 64 位 sha256 才批准")
     rv.add_argument("--strategy", required=True)
     rv.set_defaults(func=cmd_review)
     ap = sub.add_parser("approve", help="人工批准:读过代码后执行,批准绑定到代码内容的 sha256")
@@ -887,4 +1014,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    rconsole.reconfigure_stdio()
     sys.exit(main())

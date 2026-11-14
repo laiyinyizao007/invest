@@ -1,0 +1,17 @@
+{
+  "current": {
+    "session_id": "s1",
+    "workflow_id": "1194f8540b9944fea4353b07f0493cbf",
+    "idea": "均线突破",
+    "candidate": "cand_1.py",
+    "candidate_sha": "089d0d04c2d02e614d24b0b9d12493d233f56570bd9260db810a9c1e421b2212",
+    "waiting_node": "input_wait",
+    "waiting_message_id": 12,
+    "last_outputs": [
+      "候选已提交为 cand_1.py,提交结果:{\"sha256\": \"<sha256 已隐去>\"}。",
+      "请执行:python <批准命令已隐去>"
+    ],
+    "failures": [],
+    "updated_at": "2026-11-13T23:40:26"
+  }
+}

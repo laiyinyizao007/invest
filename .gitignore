@@ -13,11 +13,25 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+# 评审/临时探针脚本的产物(不入库)
+.tmp_pytest/
+.bt_probe/
+.pytest_review_tmp/
+# 评审代理(例如 codex)的临时脚手架目录:不入库
+reviewtmp/
 .coverage
 data/
 
 # 研究沙盒:候选策略(含 LLM 产出)只在本机 pending 目录,绝不入库;批准后由人移入 strategies/
 pending_strategies/
+
+# 本机私有状态:毕昇开放 API 密钥、research-mcp 会话状态。含密钥,绝不入库。
+.local/
+
+# 毕昇工作流的本地产物(从毕昇前端源码抽取的模板、构建出的流程图与版本号):可重建,不入库
+tools/bisheng/templates.json
+tools/bisheng/v3_flow.json
+tools/bisheng/v3_ids.json
 
 # 容器运行时挂载目录(策略状态、日志、风控状态文件、心跳),不入库
 runtime/
@@ -37,3 +51,14 @@ docker/research/wheelhouse/
 *.rar
 *.7z
 *.zip
+
+.pytest_tmp_codex/
+
+# 评审/探针在本机留下的临时目录(第 12 轮 codex 探针建的),不入库
+probe*/
+tmpprobe*/
+tmproot/
+.tmp_pytest/
+# 评审/探针留下的另两种命名(第 13 轮 codex 实测:`tmpprobe*/` 匹配不到 `.tmpprobe`)
+.tmpprobe/
+.pytest_tmp/

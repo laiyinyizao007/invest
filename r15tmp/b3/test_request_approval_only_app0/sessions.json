@@ -1,0 +1,9 @@
+{
+  "current": {
+    "session_id": "s1",
+    "idea": "想法",
+    "candidate": "cand_1.py",
+    "waiting_node": "input_wait",
+    "waiting_message_id": 12
+  }
+}
