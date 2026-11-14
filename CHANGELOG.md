@@ -10,6 +10,7 @@
 - **梯子**(High):状态改为带哈希链的追加日志 + 头指针,手工编辑/回滚/截断按篡改 fail-closed;`submit` 按 `run_id` 幂等;写失败不留半行、不烧查询;人工续期只能走新增的 `scripts/research_ladder.py renew --reason`(留 `renew` 审计事件,`best` 保留)。
 - **经验方差 V**:改为"各次评估网格夏普方差的中位数"(≥3 次评估、每次 ≥5 格,最近 ≤200 次),仍与 `1/(T-1)` 取 max,只会更严。
 - **泄漏**:错误视图按阶段打标(声明/选参/验证),验证回放的报错不出站;异常类型限定在封闭集合;台账 `fail_reason` 改封闭文法,`reflection` 写端只接受 None。
+- **第 16 轮(35.5/50)**:H1 揭示存档回放前对账(此前改一个文件就能泄漏任意精度夏普与自由文本);H2 梯子加**锚点文件**发现一致回滚(**更正**此前"回滚 fail-closed"的过度声明;锚点不是信任边界,全删仍发现不了);M2 缺 metrics 的门槛结果 fail-closed;M3 `renew` 默认只在预算用尽后允许(`--force` 例外并标注);M4 台账 `dsr` 量化为三档;L1 回放给当前剩余查询数;L2 `status/has/preview` 不再写文件;L3 台账 run_id 上限统一 64;M1(V 可被多数派投毒)接受并登记为可用性问题。
 - **登记未解决**:ADR「C3」——已锁定的 `DSR ≥ 0.95` 与可疑夏普上限 3.0 在 T=367 下互斥(N=28 需年化夏普 ≈3.03),**未放宽任何阈值**,`tests/test_gate_reachability.py` 以 strict xfail 记录,待用户裁决。
 ### Added（新增）
 - **进化引擎阶段 3:梯子、经验方差 V、谱系台账、MAP-Elites、热力图、对外揭示层**(Issue [#21](https://github.com/laiyinyizao007/invest/issues/21),ADR `20261113-evolution-engine`「阶段 3 实现」):

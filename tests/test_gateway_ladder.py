@@ -13,7 +13,7 @@ from test_research_gateway import call, make_app, seed_result
 
 
 def ladder_of(app):
-    return Ladder(app.paths["results_dir"] / "ladder" / "ladder.json")
+    return app._ladder()                                  # 与网关同一个梯子(含锚点);另造一个不带锚点的会被读成"锚点被删过"
 
 
 def jobs_returning(result, **more):

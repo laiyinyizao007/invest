@@ -58,7 +58,7 @@ def test_a_campaign_run_writes_one_lineage_record_the_dashboard_can_read(tree, m
     assert row["status"] == "gate_failed" and row["generation"] == 0 and row["parent_sha256"] is None
     assert row["cell"] == "H1F1" and row["fitness"] == 0.8 and row["sharpe"] == 0.9
     assert row["total_return"] == 12.5 and row["max_drawdown"] == 6.0
-    assert row["dsr"] == 0.4 and row["n_trials"] == 37 and row["fail_reason"] == "sharpe_low"
+    assert row["dsr"] == 0.0 and row["n_trials"] == 37 and row["fail_reason"] == "sharpe_low"
     assert row["description"]["has_entry_signal"] in (True, False)
     assert read_campaign(directory, "camp1")[0].candidate_sha256 == row["candidate_sha256"]      # 读取侧读得进
 

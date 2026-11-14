@@ -19,11 +19,11 @@ from pathlib import Path
 
 import bootstrap  # noqa: F401  (必须先于 vnpy;这里不用 vnpy,但与同目录脚本保持同一入口约定)
 import research_api as api
-from risk.ladder import Ladder, LadderError
+from risk.ladder import Ladder, LadderError, anchor_path_for
 
 
 def ladder_for(paths: dict) -> Ladder:
-    return Ladder(Path(paths["results_dir"]) / "ladder" / "ladder.json")
+    return Ladder(Path(paths["results_dir"]) / "ladder" / "ladder.json", anchor=anchor_path_for(paths["results_dir"]))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,11 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="当前汇报值与剩余查询数(不消耗查询)")
     renew = sub.add_parser("renew", help="续期:queries 归零、保留 best,留审计记录")
     renew.add_argument("--reason", required=True, help="续期原因(必填,写进审计日志,至多 200 字符)")
+    renew.add_argument("--force", action="store_true", help="预算还没用尽也续期(审计日志里标注 [强制])")
     args = parser.parse_args(argv)
     _, paths = api.settings()
     ladder = ladder_for(paths)
     try:
-        out = ladder.status() if args.command == "status" else ladder.renew(args.reason)
+        out = ladder.status() if args.command == "status" else ladder.renew(args.reason, force=args.force)
     except LadderError as exc:
         print(f"拒绝: {exc}", file=sys.stderr)
         return 1

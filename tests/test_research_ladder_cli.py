@@ -30,11 +30,30 @@ def test_renew_keeps_best_resets_queries_and_leaves_an_audit_record(paths, capsy
     ladder = cli.ladder_for(paths)
     ladder.submit(5.5)
     ladder.submit(0.0)
-    assert run("renew", "--reason", "第 1 批候选已复核") == 0
+    assert run("renew", "--reason", "第 1 批候选已复核", "--force") == 0
     out = json.loads(capsys.readouterr().out)
     assert out["reported"] == 5.5 and out["queries_left"] == 60
     log = (paths["results_dir"] / "ladder" / "ladder.jsonl").read_text(encoding="utf-8")
-    assert "第 1 批候选已复核" in log and '"event":"renew"' in log
+    assert "[强制] 第 1 批候选已复核" in log and '"event":"renew"' in log
+
+
+def test_renew_is_refused_while_budget_remains_unless_forced(paths, capsys):
+    """第 16 轮 M3:\"总预算\"不能随时重置。"""
+    ladder = cli.ladder_for(paths)
+    ladder.submit(5.5)
+    before = (paths["results_dir"] / "ladder" / "ladder.jsonl").read_text(encoding="utf-8")
+    assert run("renew", "--reason", "想多要点查询") == 1 and "没用尽" in capsys.readouterr().err
+    assert (paths["results_dir"] / "ladder" / "ladder.jsonl").read_text(encoding="utf-8") == before
+
+
+def test_renew_works_without_force_once_the_budget_is_exhausted(paths, capsys):
+    ladder = cli.ladder_for(paths)
+    while ladder.status()["queries_left"] > 0:
+        ladder.submit(0.0)
+    capsys.readouterr()
+    assert run("renew", "--reason", "第 1 批候选已复核") == 0
+    log = (paths["results_dir"] / "ladder" / "ladder.jsonl").read_text(encoding="utf-8")
+    assert "[强制]" not in log
 
 
 def test_renew_without_a_reason_is_refused(paths):

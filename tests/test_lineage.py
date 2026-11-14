@@ -10,7 +10,7 @@ from dashboard.evolution import EvolutionError, curve, read_campaign
 from risk import describe, lineage, map_elites
 from risk.behavior import ALL_CELLS
 from risk.diagnosis import diagnose
-from risk.lineage import LineageError, append_record, read_records, validate_record
+from risk.lineage import LineageError, append_record, dsr_level, read_records, validate_record
 from risk.structured_diagnosis import structure
 
 
@@ -21,7 +21,7 @@ def sha(n):
 def rec(n, generation=0, parent=None, **kw):
     base = {"generation": generation, "candidate_sha256": sha(n), "parent_sha256": None if parent is None else sha(parent),
             "run_id": f"run{n}", "status": "gate_failed", "sharpe": 0.8, "total_return": 12.5, "max_drawdown": 6.0,
-            "dsr": 0.4, "n_trials": 100, "fail_reason": "dsr_low", "cell": "H1F1", "fitness": 0.5,
+            "dsr": 0.5, "n_trials": 100, "fail_reason": "dsr_low", "cell": "H1F1", "fitness": 0.5,
             "created_at": f"2026-11-13T10:{n % 60:02d}:00"}
     base.update(kw)
     return base
@@ -82,7 +82,7 @@ def test_unknown_fields_are_rejected_because_they_would_be_a_free_text_back_door
     {"generation": -1}, {"generation": True}, {"generation": 10**7}, {"generation": "1"},
     {"candidate_sha256": "abc"}, {"candidate_sha256": "G" * 64}, {"candidate_sha256": sha(10).upper()},   # 大写十六进制
     {"parent_sha256": "abc"}, {"parent_sha256": sha(2)},                                # 自己做自己的父代(本条候选是 sha(2))
-    {"run_id": "../x"}, {"run_id": "x" * 33},
+    {"run_id": "../x"}, {"run_id": "x" * 65},
     {"status": "great"}, {"status": None},
     {"sharpe": float("nan")}, {"sharpe": float("inf")}, {"sharpe": True}, {"sharpe": "1.0"},
     {"dsr": 1.5}, {"dsr": -0.1}, {"dsr": float("nan")},
@@ -129,6 +129,30 @@ def test_reflection_is_a_human_only_field_so_the_writer_accepts_only_none(tmp_pa
 def test_the_dashboard_reader_still_reads_a_record_without_a_reflection(tmp_path):
     append_record(tmp_path, "c", rec(1))
     assert read_campaign(tmp_path, "c")[0].reflection is None
+
+
+# ---------- 第 16 轮 codex 的 M4:DSR 是验证窗口夏普的无损编码,台账只收档位 ----------
+
+@pytest.mark.parametrize("value", [0.123456, 0.7615, 0.94999, 0.9500001, 0.2])
+def test_an_exact_dsr_is_refused_by_the_schema(tmp_path, value):
+    with pytest.raises(LineageError, match="档位"):
+        append_record(tmp_path, "c", rec(1, dsr=value))
+
+
+@pytest.mark.parametrize("value", [None, 0.0, 0.5, 0.95])
+def test_the_three_dsr_levels_are_accepted(tmp_path, value):
+    assert append_record(tmp_path, "c", rec(1, dsr=value))["dsr"] == value
+
+
+@pytest.mark.parametrize("raw,level", [(0.95, 0.95), (0.99, 0.95), (0.94999, 0.5), (0.5, 0.5), (0.4999, 0.0), (0.0, 0.0),
+                                       (None, None), (float("nan"), None), (True, None), ("0.9", None)])
+def test_dsr_level_quantizes_so_the_exact_value_cannot_be_recovered(raw, level):
+    assert dsr_level(raw) == level
+
+
+def test_a_33_to_64_character_run_id_no_longer_fails_the_lineage_append(tmp_path):
+    run_id = "20261113-123456-" + "a" * 40
+    assert append_record(tmp_path, "c", rec(1, run_id=run_id))["run_id"] == run_id
 
 
 def test_a_non_object_record_is_refused():
@@ -304,11 +328,11 @@ def _scrambled(rows, mode):
         r = dict(r)
         if shuffler is None:
             inverse = 1.0 - min(1.0, max(0.0, r["fitness"] / 1.2))             # 适应度越高,这些字段越"差"
-            r["dsr"], r["n_trials"], r["sharpe"] = inverse, int(inverse * 10**6), -10.0 * r["fitness"]
+            r["dsr"], r["n_trials"], r["sharpe"] = dsr_level(inverse), int(inverse * 10**6), -10.0 * r["fitness"]
             r["status"] = "gate_passed" if r["fitness"] < 0.3 else "gate_failed"
             r["total_return"], r["max_drawdown"] = -100.0 * r["fitness"], 100.0 * r["fitness"]
         else:
-            r["dsr"], r["n_trials"], r["sharpe"] = shuffler.random(), shuffler.randint(0, 10**6), shuffler.uniform(-5, 5)
+            r["dsr"], r["n_trials"], r["sharpe"] = dsr_level(shuffler.random()), shuffler.randint(0, 10**6), shuffler.uniform(-5, 5)
             r["status"] = shuffler.choice(["gate_passed", "gate_failed", "selection_failed"])
             r["total_return"], r["max_drawdown"] = shuffler.random() * 100, shuffler.random() * 50
         out.append(r)

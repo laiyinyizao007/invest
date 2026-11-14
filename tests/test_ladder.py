@@ -299,15 +299,19 @@ def test_a_head_that_lags_by_one_row_is_repaired_from_the_log(tmp_path):
     h = head(ladder)
     h.update(seq=1, hash=rows[0]["hash"], queries=1, best=rows[0]["best"])
     ladder.path.write_text(json.dumps(h), encoding="utf-8")
-    assert ladder.status()["queries_used"] == 2
-    assert head(ladder)["seq"] == 2
+    assert ladder.status()["queries_used"] == 2                       # 只读入口读得到真实状态……
+    assert head(ladder)["seq"] == 1                                   # ……但**不写文件**(第 16 轮 L2)
+    ladder.submit(0.0)                                                # 写入口才修复
+    assert head(ladder)["seq"] == 3
 
 
 def test_a_crash_after_the_very_first_log_row_is_repaired_too(tmp_path):
     ladder = Ladder(tmp_path / "l.json")
     ladder.submit(2.0)
     ladder.path.unlink()
-    assert ladder.status()["queries_used"] == 1 and ladder.path.exists()
+    assert ladder.status()["queries_used"] == 1 and not ladder.path.exists()     # 只读入口不改状态
+    ladder.submit(0.0)
+    assert ladder.path.exists()
 
 
 @pytest.mark.parametrize("content", ["not json", "[]", "{}", '{"seq": 1}'])
@@ -395,3 +399,104 @@ def test_the_files_never_contain_non_finite_numbers(ladder):
         assert "NaN" not in text and "Infinity" not in text
         for line in text.splitlines():
             json.loads(line)
+
+
+# ---------- 第 16 轮 codex 的 H2:一致回滚必须被锚点发现 ----------
+
+def anchored(tmp_path):
+    return Ladder(tmp_path / "state" / "l.json", anchor=tmp_path / "elsewhere" / "l.anchor")
+
+
+def consistent_truncate(ladder, keep):
+    """截断日志到前 keep 行,并把头指针同步改成与第 keep 行一致、哈希链完全合法的状态——只靠链检测不到的回滚。"""
+    lines = ladder.log_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    ladder.log_path.write_text("".join(lines[:keep]), encoding="utf-8")
+    last = json.loads(lines[keep - 1])
+    ladder.path.write_text(json.dumps({"version": 2, "seq": last["seq"], "hash": last["hash"], "queries": last["queries"],
+                                       "best": last["best"], "budget": last["budget"], "eta": 1.1}), encoding="utf-8")
+
+
+def test_without_an_anchor_a_consistent_truncation_is_NOT_detected_which_is_why_the_anchor_exists(tmp_path):
+    """如实记录:没有锚点时,这类回滚检测不到(上一版文档的\\"回滚 fail-closed\\"是过度声明)。"""
+    ladder = Ladder(tmp_path / "l.json")
+    for _ in range(5):
+        ladder.submit(0.0)
+    consistent_truncate(ladder, 2)
+    assert ladder.status()["queries_used"] == 2                       # 被接受:退回了 3 次查询
+
+
+def test_with_an_anchor_a_consistent_truncation_fails_closed(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(5):
+        ladder.submit(0.0)
+    consistent_truncate(ladder, 2)
+    for call in (ladder.status, lambda: ladder.submit(0.0), lambda: ladder.has("x")):
+        with pytest.raises(LadderError, match="锚点"):
+            call()
+
+
+def test_with_an_anchor_replacing_the_whole_chain_with_another_valid_chain_fails_closed(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    other = Ladder(tmp_path / "o" / "l.json")                         # 另一条同样合法、但不是这条的链
+    for _ in range(3):
+        other.submit(3.0)                                             # best 不同 → 哈希不同(内容相同的链哈希是确定的)
+    ladder.log_path.write_text(other.log_path.read_text(encoding="utf-8"), encoding="utf-8")
+    ladder.path.write_text(other.path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(LadderError, match="锚点"):
+        ladder.status()
+
+
+def test_with_an_anchor_deleting_only_the_anchor_or_only_the_log_fails_closed(tmp_path):
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    ladder.anchor.unlink()
+    with pytest.raises(LadderError, match="锚点"):
+        ladder.status()
+    ladder2 = anchored(tmp_path / "b")
+    for _ in range(3):
+        ladder2.submit(0.0)
+    ladder2.log_path.unlink()
+    ladder2.path.unlink()
+    with pytest.raises(LadderError, match="锚点"):
+        ladder2.status()
+
+
+def test_a_crash_before_the_anchor_is_written_is_not_a_false_alarm(tmp_path):
+    """锚点只会落后:崩在写锚点之前,下一次读取是正常的(锚点不超前)。"""
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    lines = ladder.anchor.read_text(encoding="utf-8").splitlines(keepends=True)
+    ladder.anchor.write_text("".join(lines[:-1]), encoding="utf-8")
+    assert ladder.status()["queries_used"] == 3
+    ladder.submit(0.0)
+    assert ladder.status()["queries_used"] == 4
+
+
+def test_a_garbled_anchor_fails_closed(tmp_path):
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    ladder.anchor.write_text("garbage", encoding="utf-8")
+    with pytest.raises(LadderError, match="锚点"):
+        ladder.status()
+
+
+def test_deleting_everything_including_the_anchor_is_still_undetectable_and_that_is_documented(tmp_path):
+    """如实记录的边界:能同时改三处/全删的人,梯子拦不住。"""
+    ladder = anchored(tmp_path)
+    for _ in range(3):
+        ladder.submit(0.0)
+    for f in (ladder.path, ladder.log_path, ladder.anchor):
+        f.unlink()
+    assert ladder.status()["queries_used"] == 0
+
+
+def test_status_has_and_preview_never_write(tmp_path):
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    before = {f: f.read_bytes() for f in (ladder.path, ladder.log_path, ladder.anchor)}
+    ladder.status(), ladder.has("x"), ladder.preview(2.0)
+    assert before == {f: f.read_bytes() for f in before}

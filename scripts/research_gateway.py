@@ -30,7 +30,7 @@ from typing import Callable
 import bootstrap
 import research_config as rc
 import research_sandbox as rs
-from risk.ladder import Ladder, LadderError, LadderExhausted
+from risk.ladder import Ladder, LadderError, LadderExhausted, anchor_path_for
 from risk.outward import OutwardError, RevealStore, reveal
 from risk.trial_ledger import TrialLedgerError, record_trials
 
@@ -340,7 +340,8 @@ class GatewayApp:
     # ---- 对外揭示(risk/outward.py):外层看到的一切都从这里过 ----
     def _ladder(self) -> Ladder:
         # 放进子目录:`list_results` 按 `*.json` 列 run,梯子状态与结果混放会被当成一个"结果"(自查发现)
-        return Ladder(Path(self.paths["results_dir"]) / "ladder" / "ladder.json")
+        return Ladder(Path(self.paths["results_dir"]) / "ladder" / "ladder.json",
+                      anchor=anchor_path_for(self.paths["results_dir"]))
 
     def _reveal_store(self) -> RevealStore:
         return RevealStore(Path(self.paths["results_dir"]) / "outward")

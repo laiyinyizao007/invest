@@ -40,7 +40,7 @@ from risk.promotion_gate import CHECK_IDS
 
 CAMPAIGN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")      # 与读取侧一致
 SHA256 = re.compile(r"[0-9a-f]{64}")
-RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,32}")
+RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 STATUSES = ("gate_passed", "gate_failed", "selection_failed", "strategy_error")
 MAX_LEDGER_BYTES = 8 * 1024 * 1024                                  # 与读取侧一致:超过它读取侧会拒绝
 MAX_LEDGER_LINES = 20_000
@@ -95,6 +95,25 @@ def _valid_fail_reason(text: str) -> bool:
     return bool(ids) and all(i in CHECK_IDS for i in ids)
 
 
+# DSR 对验证窗口夏普**严格单调**(给定试验数时可二分还原,第 16 轮 codex 的 M4):台账是"给人看的",但"只给人看"
+# 不能靠约定,所以写端只收三个档位——与 `fail_reason` 的封闭文法同一手法。
+DSR_LEVELS = (0.0, 0.5, 0.95)
+
+
+def dsr_level(value) -> float | None:
+    """把精确的 DSR 量化成档位:≥0.95(过门槛)/ ≥0.5 / 其余;非数字为 None。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return 0.95 if value >= 0.95 else 0.5 if value >= 0.5 else 0.0
+
+
+def _dsr_level(record: dict):
+    value = _opt_number(record, "dsr", 0.0, 1.0)
+    if value is not None and value not in DSR_LEVELS:
+        raise LineageError(f"dsr 只接受档位 {DSR_LEVELS}(精确的 DSR 可还原验证窗口夏普,台账不收)")
+    return value
+
+
 def validate_record(record: Any) -> dict:
     """校验一条记录并返回规整后的副本(缺省字段补 None)。不合法抛 LineageError。"""
     if not isinstance(record, dict):
@@ -145,7 +164,7 @@ def validate_record(record: Any) -> dict:
         "generation": generation, "candidate_sha256": sha, "parent_sha256": parent, "run_id": run_id,
         "status": record["status"], "sharpe": _opt_number(record, "sharpe"),
         "total_return": _opt_number(record, "total_return"), "max_drawdown": _opt_number(record, "max_drawdown"),
-        "dsr": _opt_number(record, "dsr", 0.0, 1.0), "n_trials": n_trials,
+        "dsr": _dsr_level(record), "n_trials": n_trials,
         "fail_reason": fail_reason, "reflection": None, "created_at": created_at,
         "cell": cell, "diagnosis": diagnosis, "fitness": _opt_number(record, "fitness"),
         "description": description,
@@ -187,7 +206,7 @@ def record_from_result(result: dict, source: str, *, parent_sha256: str | None, 
         "generation": generation, "candidate_sha256": result.get("strategy_sha256"), "parent_sha256": parent_sha256,
         "run_id": result.get("run_id"), "status": status, "sharpe": selection.get("best_sharpe"),
         "total_return": chosen.get("total_return"), "max_drawdown": chosen.get("max_drawdown"),
-        "dsr": metrics.get("dsr"), "n_trials": n_trials if isinstance(n_trials, int) and not isinstance(n_trials, bool) and n_trials >= 0 else None,
+        "dsr": dsr_level(metrics.get("dsr")), "n_trials": n_trials if isinstance(n_trials, int) and not isinstance(n_trials, bool) and n_trials >= 0 else None,
         "fail_reason": _short_reason(result), "cell": result.get("cell"),
         "diagnosis": result.get("selection_diagnosis"), "fitness": result.get("fitness"),
         "description": describe_mod.describe_candidate(source),

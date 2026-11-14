@@ -27,8 +27,16 @@ DSR 只惩罚试验次数、不惩罚每次试验带回的信息量,而测试段
 - **同一个 `run_id` 的提交是幂等的**:已经提交过的 run 只回放当时的汇报值,不再扣查询。这让"揭示存档写失败后重试"安全
   (不会重复扣查询、也没有新的信息泄漏——重试本来就拿得到同样的值),见 risk/outward.py。
 
-诚实的边界:拥有文件系统写权限的人**同时**改写日志与头指针、或整个删掉,是发现不了的——这里防的是部分篡改与误操作,
-不是同权限的恶意。候选代码碰不到这些文件(沙盒里没有 `open`、没有文件系统模块,见 ADR)。
+**锚点(第 16 轮 codex 的 H2)**:哈希链**没有密钥**,头指针与日志又在同一目录——"截断日志并同步改写头指针"得到的是一条
+完全合法的更短的链,链内的所有不变式(`queries` +1、`best` 只升)它都满足,所以只靠链**检测不到一致回滚**(上一版注释与 ADR
+说"回滚/截断 fail-closed"是过度声明)。现在可以给梯子配一个**锚点文件**(`anchor`,放在另一个目录,每次追加写一行
+`<seq> <hash>`):读取时要求日志里第 `seq` 行的哈希恰好是锚点记下的那个——日志被截到锚点之前、或整条链被换成另一条,
+都会对不上。锚点只会**落后**日志(崩溃在写锚点之前),不会超前,所以"锚点超前"就是回滚。
+
+诚实的边界:锚点不是信任边界——它只是把"一致回滚"从**改两个文件**变成**改三个、其中一个在别的目录**,并让部分篡改与
+误操作被发现。拥有文件系统写权限的人**同时**改写日志、头指针与锚点、或把三者全部删掉(整条梯子从头开始),**仍然发现不了**;
+真正的外部锚点需要另一个信任域(密钥不在候选与网关可写的位置,或把头指针镜像到只增的外部存储),这里没有。
+候选代码碰不到这些文件(沙盒里没有 `open`、没有文件系统模块,见 ADR)。
 
 并发:同一进程内用锁串行;跨进程不加锁。网关用 `_busy` 锁串行执行作业,CLI 与网关并发才可能漏记查询(偏向少记),
 与试验账本同一口径,列入 ADR 已知限制。
@@ -53,6 +61,11 @@ _EPS = 1e-9
 _RECORD_KEYS = {"seq", "event", "run_id", "queries", "best", "budget", "note", "prev", "hash"}
 _HEAD_KEYS = {"version", "seq", "hash", "queries", "best", "budget", "eta"}
 _lock = threading.Lock()
+
+
+def anchor_path_for(results_dir) -> Path:
+    """网关与命令行共用的锚点位置:与结果目录**不同**的目录(`data/ladder_anchor/`),候选与结果读写路径都碰不到。"""
+    return Path(results_dir).parent / "ladder_anchor" / "ladder.anchor"
 
 
 class LadderError(Exception):
@@ -89,13 +102,15 @@ def _body(record: dict) -> dict:
 class Ladder:
     """持久化的梯子。`path` 是头指针文件;日志在同目录同名的 `.jsonl`。"""
 
-    def __init__(self, path: Path, *, eta: float = LADDER_ETA, budget: int = DEFAULT_QUERY_BUDGET) -> None:
+    def __init__(self, path: Path, *, eta: float = LADDER_ETA, budget: int = DEFAULT_QUERY_BUDGET,
+                 anchor: Path | None = None) -> None:
         if isinstance(eta, bool) or not isinstance(eta, (int, float)) or not math.isclose(eta, LADDER_ETA, abs_tol=1e-12):
             raise LadderError(f"η 已登记为 {LADDER_ETA},不得更改(看到候选之后改它等于放宽阈值)")
         if isinstance(budget, bool) or not isinstance(budget, int) or not 1 <= budget <= DEFAULT_QUERY_BUDGET:
             raise LadderError(f"总查询预算必须是 1..{DEFAULT_QUERY_BUDGET} 的整数(上限已登记,不得放宽)")
         self.path = Path(path)
         self.log_path = self.path.with_suffix(".jsonl")
+        self.anchor = Path(anchor) if anchor is not None else None
         self.eta = float(eta)
         self.budget = budget
 
@@ -166,15 +181,61 @@ class Ladder:
             raise LadderError("梯子头指针不合法(fail-closed)")
         return head
 
-    def _load(self) -> list[dict]:
-        """读日志并与头指针对账。两者都不存在 = 全新的梯子;任何对不上 = 损坏/篡改/回滚,抛 LadderError。"""
+    def _read_anchor(self) -> tuple[int, str] | None:
+        if self.anchor is None or not self.anchor.exists():
+            return None
+        try:
+            lines = [line for line in self.anchor.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, ValueError) as exc:
+            raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
+        if not lines:
+            return None
+        parts = lines[-1].split(" ")
+        if len(parts) != 2 or not parts[0].isdigit() or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+            raise LadderError("梯子锚点格式不合法(fail-closed)")
+        return int(parts[0]), parts[1]
+
+    def _check_anchor(self, rows: list[dict], repair: bool) -> None:
+        if self.anchor is None:
+            return
+        anchored = self._read_anchor()
+        if anchored is None:
+            if not rows:
+                return
+            if len(rows) == 1:                          # 第一条日志已追加、锚点还没写完就崩了
+                if repair:
+                    self._write_anchor(rows[0])
+                return
+            raise LadderError("梯子有日志却没有锚点(fail-closed):锚点被删过,或日志是被换进来的")
+        seq, digest = anchored
+        if len(rows) < seq or rows[seq - 1]["hash"] != digest:
+            raise LadderError("梯子日志与锚点对不上(fail-closed):日志被回滚、截断或整条换掉")
+
+    def _write_anchor(self, record: dict) -> None:
+        if self.anchor is None:
+            return
+        try:
+            self.anchor.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.anchor, "a", encoding="utf-8", newline="") as stream:
+                stream.write(f"{record['seq']} {record['hash']}" + chr(10))
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            raise LadderError(f"梯子锚点写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
+
+    def _load(self, repair: bool = True) -> list[dict]:
+        """读日志并与头指针、锚点对账。两者都不存在 = 全新的梯子;任何对不上 = 损坏/篡改/回滚,抛 LadderError。
+
+        `repair=False` 用于只读入口(status/has/preview):它们**不写任何文件**(第 16 轮 L2:"只读"的命令不该改状态)。"""
         rows = self._read_log()
+        self._check_anchor(rows, repair)
         head = self._head()
         if not rows and head is None:
             return []
         if head is None:
             if len(rows) == 1:                          # 第一条日志已追加、头指针还没写完就崩了:按日志修复
-                self._write_head(rows[0])
+                if repair:
+                    self._write_head(rows[0])
                 return rows
             raise LadderError("梯子有日志却没有头指针(fail-closed):状态被删改过")
         if not rows:
@@ -184,7 +245,8 @@ class Ladder:
                 head["queries"] == last["queries"] and head["best"] == last["best"] and head["budget"] == last["budget"]):
             raise LadderError("梯子头指针里的 queries/best/budget 与日志最后一行对不上(fail-closed):头指针被单独改写过")
         if head["seq"] == last["seq"] - 1 and len(rows) >= 2 and head["hash"] == rows[-2]["hash"]:
-            self._write_head(last)                      # 头指针只落后一行:日志已追加、头指针还没写完——按日志修复
+            if repair:
+                self._write_head(last)                  # 头指针只落后一行:日志已追加、头指针还没写完——按日志修复
         elif head["seq"] != last["seq"] or head["hash"] != last["hash"]:
             raise LadderError("梯子头指针与日志对不上(fail-closed):被回滚、截断或单独改写过")
         return rows
@@ -227,6 +289,7 @@ class Ladder:
                 pass                                    # 截不回去也不能假装成功:下面照样抛错;同一个 run 重试按 run_id 幂等回放
             raise LadderError(f"梯子日志写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
         self._write_head(record)
+        self._write_anchor(record)
         return record
 
     # ---------- 状态与提交 ----------
@@ -254,19 +317,19 @@ class Ladder:
     def status(self) -> dict:
         """当前状态(只读,**不消耗查询**):汇报值、已用/剩余查询数。"""
         with _lock:
-            state = self._state(self._load(), self.budget)
+            state = self._state(self._load(repair=False), self.budget)
         return {"reported": state["best"], "step": self.eta, "queries_used": state["queries"],
                 "queries_left": state["budget"] - state["queries"], "budget": state["budget"]}
 
     def has(self, run_id: str) -> bool:
         """这个 run 是否已经提交过(只读,不消耗查询)。"""
         with _lock:
-            return any(r["run_id"] == run_id for r in self._load())
+            return any(r["run_id"] == run_id for r in self._load(repair=False))
 
     def preview(self, sharpe, run_id: str | None = None) -> dict:
         """`submit` 会返回什么——但**不写任何东西、不消耗查询**。预算用尽(且这个 run 没提交过)抛 LadderExhausted。"""
         with _lock:
-            rows = self._load()
+            rows = self._load(repair=False)
             return self._plan(rows, sharpe, run_id)
 
     def _plan(self, rows: list[dict], sharpe, run_id: str | None) -> dict:
@@ -297,13 +360,21 @@ class Ladder:
             self._append(rows, "submit", run_id=run_id, queries=plan["queries_used"], best=plan["reported"], note=None)
             return plan
 
-    def renew(self, note: str) -> dict:
-        """人工续期:`queries` 归零、**保留 `best`**,必须给出非空原因,留一条审计记录。"""
+    def renew(self, note: str, *, force: bool = False) -> dict:
+        """人工续期:`queries` 归零、**保留 `best`**,必须给出非空原因,留一条审计记录。
+
+        默认**只在预算用尽之后**才允许(第 16 轮 M3:否则"总预算"其实是"每次续期的量",随时可以重置);
+        `force=True` 强制续期,审计记录里带"[强制]"前缀。"""
         if not isinstance(note, str) or not note.strip() or len(note) > MAX_NOTE:
             raise LadderError(f"续期必须给出 1..{MAX_NOTE} 字符的原因")
         with _lock:
             rows = self._load()
             state = self._state(rows, self.budget)
-            record = self._append(rows, "renew", run_id=None, queries=0, best=state["best"], note=note.strip())
+            if not force and state["queries"] < state["budget"]:
+                raise LadderError(f"预算还没用尽({state['queries']}/{state['budget']}),不得续期;确需提前续期请显式 force(审计里会标注)")
+            text = note.strip() if not force else "[强制] " + note.strip()
+            if len(text) > MAX_NOTE:
+                raise LadderError(f"续期原因加前缀后超过 {MAX_NOTE} 字符")
+            record = self._append(rows, "renew", run_id=None, queries=0, best=state["best"], note=text)
             return {"reported": float(record["best"]), "step": self.eta, "queries_used": 0,
                     "queries_left": record["budget"], "budget": record["budget"]}
