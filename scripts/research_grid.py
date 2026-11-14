@@ -23,6 +23,9 @@ FIRST_VALIDATION_START = datetime(2022, 7, 1)
 AXES = 3
 MIN_AXIS_VALUES = 3
 MAX_AXIS_VALUES = 10
+# 合法网格的**最小**格子数(3 个参数 × 每个至少 3 个取值):evaluate 作业启动前按这个数预扣试验,
+# 实际扫过的格子更多时再补记差额。两处要用同一把尺子,定义放在这里。
+MIN_GRID_CELLS = MIN_AXIS_VALUES ** AXES
 # 风控/固定参数:不得进入网格(风控底线永不优化)。取自不可变宪法清单,避免两处各写一份而漂移。
 # 清单不可用时退回内置集合:宁可少拦也不让优化器整体不可用(真正的兜底在 check_params 与运行时类校验)。
 #

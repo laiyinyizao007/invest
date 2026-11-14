@@ -1,6 +1,9 @@
 """研究沙盒 CLI:拒绝路径与输出契约(真实回测由人工在有数据的机器上验证)。"""
+import hashlib
+import hmac
 import json
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,50 @@ def fake_subprocess(monkeypatch, popen):
     # 只替换 research_api 看到的 subprocess,不碰全局模块(vnpy/asyncio 导入期间也会用到 Popen)
     monkeypatch.setattr(api, "subprocess", SimpleNamespace(
         Popen=popen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired, run=subprocess.run))
+
+
+def write_child_result(handoff_line: str, body: dict) -> None:
+    """模拟子进程:把结果写进父进程给的随机文件,并附上**正确**的 MAC。"""
+    handoff = json.loads(handoff_line)
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    mac = hmac.new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    path = Path(handoff["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mac": mac, "body": payload}, ensure_ascii=False), encoding="utf-8")
+
+
+class FakeChild:
+    """假子进程:按父进程交给它的交接单把结果写回去(带正确的 MAC)。
+
+    `stdout` 里的内容**只是日志**——父进程不再从 stdout 里取结果,这一点由用例断言。"""
+
+    def __init__(self, body=None, returncode=0, stdout="", stderr="", tamper=None):
+        self.body = body
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.tamper = tamper          # 可选:收到交接单后回调(handoff),用来伪造/篡改结果文件
+
+    def communicate(self, timeout=None, input=None):
+        if self.body is not None and input:
+            write_child_result(input, self.body)
+            if self.tamper is not None:
+                self.tamper(json.loads(input))
+        return self.stdout, self.stderr
+
+
+def child_capture(monkeypatch, tmp_path, func, args):
+    """在进程内跑一个子入口:给它一份交接单,再把写回的结果读出来。
+
+    返回 (退出码, 结果字典)。子入口现在把结果写进**父进程建的随机文件**,不再打 stdout。"""
+    handoff = {"path": str(tmp_path / "child_result.json"), "key": "k" * 64, "dir": str(tmp_path)}
+    monkeypatch.setattr(api, "_child_handoff", lambda: handoff)
+    code = func(args)
+    payload = {}
+    path = Path(handoff["path"])
+    if path.exists():
+        payload = json.loads(json.loads(path.read_text(encoding="utf-8"))["body"])
+    return code, payload
 
 
 @pytest.fixture
@@ -74,7 +121,7 @@ def test_backtest_child_gets_scrubbed_environment(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "boom"
 
     def fake_popen(cmd, **kw):
@@ -95,8 +142,9 @@ def test_backtest_success_writes_result_with_diagnosis_and_hash(tree, monkeypatc
     class FakeProc:
         returncode = 0
 
-        def communicate(self, timeout=None):
-            return "noise\n" + api.CHILD_MARK + json.dumps({"stats": stats, "pnls": [1, -1, 1]}) + "\n", ""
+        def communicate(self, timeout=None, input=None):
+            write_child_result(input, {"stats": stats, "pnls": [1, -1, 1]})
+            return "noise\n", ""
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
@@ -172,8 +220,9 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
     class FakeProc:
         returncode = 0
 
-        def communicate(self, timeout=None):
-            return api.CHILD_MARK + json.dumps(body) + "\n", ""
+        def communicate(self, timeout=None, input=None):
+            write_child_result(input, body)
+            return "", ""
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
@@ -218,7 +267,7 @@ def test_approve_records_hash_and_unlocks_backtest_without_confirm_flag(tree, mo
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "boom"
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
@@ -248,7 +297,7 @@ def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "x"
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
@@ -268,7 +317,7 @@ def test_defaults_come_from_config_and_cli_flags_override(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             seen["timeout"] = timeout
             return "", "x"
 
@@ -321,7 +370,7 @@ def test_parent_passes_the_approved_hash_to_children(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "x"
 
     def popen(cmd, **kw):
@@ -340,15 +389,15 @@ def test_describe_error_keeps_type_and_message_but_drops_paths_and_truncates():
     text = ("回测中策略抛出异常:" + chr(10) + "Traceback (most recent call last):" + chr(10) + "  File \"/app/pending_strategies/x.py\", line 9" + chr(10)
             + "ValueError: too many values to unpack (expected 3) in C:/Users/me/secret/x.py")
 
-    out = api.describe_error(RuntimeError(text))
+    out = api.describe_error(RuntimeError(text), api.PHASE_VALIDATION)
 
     assert out["type"] == "ValueError" and "too many values to unpack" in out["message"]
     assert "C:" not in out["message"] and "/app/" not in out["message"] and len(out["message"]) <= 200
 
 
 def test_describe_error_falls_back_to_exception_type_for_plain_errors():
-    assert api.describe_error(KeyError("boom"))["type"] == "KeyError"
-    long = api.describe_error(RuntimeError("x" * 1000))
+    assert api.describe_error(KeyError("boom"), api.PHASE_VALIDATION)["type"] == "KeyError"
+    long = api.describe_error(RuntimeError("x" * 1000), api.PHASE_VALIDATION)
     assert len(long["message"]) <= 200
 
 
@@ -884,11 +933,9 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     approve(path)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
-    code = api.run_evaluate_child(args)
-    out = capsys.readouterr().out
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
 
     assert code == api.EXIT_OK
-    payload = json.loads(out.split(api.CHILD_MARK)[-1])
     assert "error" not in payload, payload
     assert payload["passed"] is True
     assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]
@@ -976,10 +1023,8 @@ def test_an_import_time_error_comes_back_as_a_structured_error(tree, monkeypatch
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
-    code = api.run_evaluate_child(args)
-    out = capsys.readouterr().out
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
     assert code == api.EXIT_OK
-    payload = json.loads(out.split(api.CHILD_MARK)[-1])
     assert "error" in payload, payload
 
 

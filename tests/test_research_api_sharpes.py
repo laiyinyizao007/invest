@@ -143,17 +143,18 @@ def test_describe_error_never_reads_the_phase_off_the_exception_object():
 
     旧实现从异常对象上读阶段,而打标记的逻辑"只补不改"——候选自己挂的 `"selection"` 会被保留,
     于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
-    (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。"""
+    (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。
+    现在阶段是**调用点必须显式传**的必填参数:候选挂什么属性都不影响结果。"""
     exc = ValueError("close=2728.0")
-    exc.invest_phase = "validation"
-    out = api.describe_error(exc)
-    assert out["phase"] is None and out["type"] == "ValueError"
+    exc.invest_phase = "selection"
+    out = api.describe_error(exc, api.PHASE_VALIDATION)
+    assert out["phase"] == "validation" and out["type"] == "ValueError"
 
 
 def test_a_candidate_cannot_forge_the_phase_by_tagging_its_own_exception():
     exc = ValueError("close=2728.0")
     exc.invest_phase = "selection"
-    assert api.describe_error(exc)["phase"] is None
+    assert api.describe_error(exc, api.PHASE_VALIDATION)["phase"] == "validation"
 
 
 def test_the_explicit_phase_is_the_only_way_to_declare_one():
@@ -162,10 +163,20 @@ def test_the_explicit_phase_is_the_only_way_to_declare_one():
     assert api.describe_error(exc, "declaration")["phase"] == "declaration"
 
 
-def test_a_grid_error_is_a_declaration_error_even_without_a_tag():
+def test_the_exception_class_name_no_longer_decides_the_phase():
+    """异常**类名**不再决定阶段(第 27 轮 codex 的 Medium-2)。
+
+    旧实现有 `name == "GridError" ⇒ declaration` 这条兜底,而类名是**候选自己起的名字**:
+    候选只要在验证窗口回放里 `raise GridError("close=2728.0")`,验证窗口的数字就被当成
+    "我们自己写的声明期消息"放了出去(实测 view.error.phase == "declaration")。
+    框架自己的 GridError 由 research_gate 的调用点**显式**传 declaration。"""
     from research_grid import GridError
-    assert api.describe_error(GridError("param_grid 必须恰好 3 个参数"))["phase"] == "declaration"
+    exc = GridError("close=2728.0")
+    assert api.describe_error(exc, api.PHASE_VALIDATION)["phase"] == "validation"
+    assert api.describe_error(exc, api.PHASE_DECLARATION)["phase"] == "declaration"
 
 
-def test_an_untagged_error_has_no_phase_and_is_therefore_treated_as_validation_downstream():
-    assert api.describe_error(ValueError("x"))["phase"] is None
+def test_an_unknown_phase_is_treated_as_validation_downstream():
+    """阶段不在 PHASES 里(调用点写错了)→ 按验证窗口处理(fail-closed:原文不放行)。"""
+    assert api.describe_error(ValueError("x"), "whatever")["phase"] == "validation"
+    assert api.describe_error(ValueError("x"), None)["phase"] == "validation"

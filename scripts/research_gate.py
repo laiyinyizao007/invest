@@ -12,7 +12,7 @@ import math
 from datetime import datetime
 from typing import Callable, Sequence
 
-from research_grid import GridError, select_params
+from research_grid import GridError, select_params, MIN_GRID_CELLS
 from risk import candidate_eval as ce
 from risk.heatmap import build_heatmap
 from risk.dsr import MAX_TRIAL_SHARPE, run_variance
@@ -41,7 +41,7 @@ PHASE_SELECTION = "selection"
 PHASE_VALIDATION = "validation"
 
 
-def _error_result(phase: str, exc: BaseException) -> dict:
+def _error_result(phase: str, exc: BaseException, trials: dict | None = None) -> dict:
     """把异常变成一份**框架写的**错误结果:阶段由调用点(框架自己)决定,写进结果字典。
 
     这里**不碰异常对象**:以前是把阶段挂在异常的 `invest_phase` 属性上,而那个属性候选自己也能挂——
@@ -50,7 +50,12 @@ def _error_result(phase: str, exc: BaseException) -> dict:
     (第 22 轮 codex 的 High,实测:消息里带出了验证窗口的收盘价)。
     阶段现在只存在于**框架自己写的这份结果字典**里,候选没有通道能改它。"""
     from research_api import describe_error          # 延迟导入:research_api 与本模块互相引用
-    return {"error": describe_error(exc, phase)}
+    result = {"error": describe_error(exc, phase)}
+    if trials is not None:
+        # 失败的一轮也要**记账**:DSR 的试验次数按 prior + 扫过的格子数算,
+        # 失败的一轮少记格子数 = 悄悄放松 DSR(ADR 第 9 条:漏记格子数会放松已锁定的 DSR ≥ 0.95)。
+        result["trials"] = trials
+    return result
 
 
 def _phase_result(phase: str):
@@ -169,6 +174,29 @@ def selection_facts(selection: dict) -> dict:
                                   "max_drawdown": abs(drawdown) if isinstance(drawdown, (int, float)) else None}}
 
 
+def _declared_grid_cells(grid: Any) -> int:
+    """网格**声明**的格子数(拿不到就当 0)。
+
+    失败的一轮也可能已经扫过这么多格子,所以失败记账按这个数取最坏情况——
+    少记格子数会悄悄放松已锁定的 DSR(ADR 第 9 条)。"""
+    if not isinstance(grid, dict):
+        return 0
+    total = 1
+    for values in grid.values():
+        if not isinstance(values, list):
+            return 0
+        total *= len(values)
+    return total
+
+
+def _failed_trials(prior_trials: int | None, cells: int) -> dict | None:
+    """失败的一轮的试验记账:格子数取最坏情况,至少不低于预扣的最小网格数。"""
+    if prior_trials is None:
+        return None
+    charged = max(MIN_GRID_CELLS, int(cells))
+    return {"prior": prior_trials, "grid_cells": charged, "total": prior_trials + charged, "cell_sharpes": []}
+
+
 def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, random_cls: type, random_runs: int, capital: float,
                    max_cells: int, min_round_trips: int, select_window: tuple[datetime, datetime],
                    validation_windows: Sequence[Window], data_adjusted: bool = True, prior_trials: int | None = None,
@@ -181,16 +209,20 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     试验记账:结果的 `trials` = {prior, grid_cells, total}。本次扫过的格子数无论成败都在 `grid_cells` 里,
     调用方须据此写账本(失败的轮次同样消耗试验)。DSR 用 total = prior + grid_cells。"""
     grid = getattr(candidate_cls, "param_grid", None)
+    declared_cells = _declared_grid_cells(grid)
     if grid is None:
         missing = GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
-        return _error_result(PHASE_DECLARATION, missing)
+        return _error_result(PHASE_DECLARATION, missing, _failed_trials(prior_trials, 0))
     try:
         selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
                                   max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
     except GridError as exc:
-        return _error_result(PHASE_DECLARATION, exc)      # 网格声明有问题:我们自己写的消息
+        # 网格声明有问题:我们自己写的消息,一个格子都没扫
+        return _error_result(PHASE_DECLARATION, exc, _failed_trials(prior_trials, 0))
     except Exception as exc:
-        return _error_result(PHASE_SELECTION, exc)        # 选参窗口回放里的错:进化回路放开的那一层
+        # 选参窗口回放里的错:进化回路放开的那一层。
+        # 可能已经扫过一部分格子 → 按**声明的格子数**记(最坏情况,只会更严不会更松)
+        return _error_result(PHASE_SELECTION, exc, _failed_trials(prior_trials, declared_cells))
     summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes", "best_detail")}   # 完整得分表留在服务端,不回传给外层
     engine_side = selection_facts(selection)           # 选参窗口的行为描述符/结构化诊断/适应度(进化回路放开的那一层)
     # 本次扫过的每个有效格子的**日**夏普(= 年化 / √240,与 DSR 同一口径):入账本,并并入本次 DSR 的经验方差
@@ -213,6 +245,10 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
                       on_plateau=selection["on_plateau"], capital=capital,
                       prior_trials=None if trials is None else trials["total"], run_variances=merged_variances)
     if "error" in result:                                # 验证期出错:run_gate 自己写的错误结果(阶段=validation)
+        if trials is not None:
+            # 选参阶段的格子数**照样记账**:验证期失败不代表那些格子没扫过,
+            # 少记格子数会让后续的 DSR 少算试验次数 = 悄悄放松已锁定的 DSR 门槛(ADR 第 9 条)
+            result["trials"] = trials
         return result
     result["trials"] = trials
     result["params"] = selection["best_params"]

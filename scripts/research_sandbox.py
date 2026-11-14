@@ -283,7 +283,13 @@ def load_result(run_id: str, directory: Path) -> dict:
     path = directory / f"{run_id}.json"
     if not path.is_file():
         raise SandboxError(f"没有这条结果: {run_id}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError) as exc:
+        # 损坏的结果文件是**这一条读不出来**,不是整个接口炸掉:
+        # 此前这里直接抛 json.JSONDecodeError(不是 SandboxError),网关那层只 except SandboxError,
+        # 于是坏文件把整个 /feedback 打成 500「内部错误」,而不是"跳过一条读不出来的结果"。
+        raise SandboxError(f"结果文件读不出来(损坏或不可读): {run_id}") from exc
 
 
 def list_results(directory: Path) -> list[str]:

@@ -143,6 +143,7 @@ flowchart LR
 | **`parameter_on_plateau` 无计算来源** | 晋级门槛第 8 条由调用方传入布尔值,仓库内没有代码计算它;计算落地前该项靠人工判断(见 `docs/roadmap.md` §2.6) | 高 |
 | **非策略委托检测的前提未实测** | 假设"外部终端下的单会以 reference 为空的回报出现";codex 审阅源码认为外部会话的委托可能收不到事件。须按 runbook 第 5 节第 11 项在 SimNow 实测,两种结果都要记录(`docs/adr/20261111-discipline-enforcement.md`) | **高** |
 | 实盘准入批准文件可被手写 | 它是防误操作的闸门,不防有写权限的人 | 低 |
+| **候选与框架跑在同一个子进程里** | 第 27 轮把结果通道从 stdout 挪到"父进程建的随机文件 + 随机密钥 + HMAC"(stdout 只算日志),**盲签名伪造已堵死且伪造必被检测**;但候选代码与框架代码仍在同一进程,候选若能顺着运行时摸到 `sys`/帧局部变量,理论上可以抢在框架之前截下交接单并写一份"签名正确"的结果。要彻底闭合需把候选放到**独立进程**执行,尚未做(ADR 第 27 轮补记·残余风险) | **高** |
 
 ## 5. 模块索引
 > 每个模块一行;详细职责、约束与修复经过见 [`docs/modules.md`](docs/modules.md)(按下列路径查找小节)。纪律机制与穿透式监管工具的决策见 `docs/adr/20261111-*.md`。
@@ -159,7 +160,7 @@ flowchart LR
 **策略与研究**
 - `strategies/trend_atr_strategy.py`:日线趋势 + ATR 止损策略,含实盘模式(Tick→日线合成、信号次日发单、状态持久化)。
 - `strategies/trend_atr_15m_strategy.py`、`intraday_demo_strategy.py`、`random_entry_strategy.py`、`instruments.py`:15 分钟基准、日内演示(仅研究/回测)、随机入场对照、品种参数。
-- 研究沙盒(阶段四 4a/4b 的内层部分):`scripts/research_api.py`(CLI:`data`/`approve`/`review`/`backtest`/`gate`/`evaluate`/`results`)、`scripts/research_sandbox.py`(路径限制、静态筛查、环境白名单、批准账本)、`scripts/research_gate.py`(门槛评估与选参编排)、`scripts/research_grid.py`(候选参数网格寻优)、`scripts/research_config.py` + `config/research_sandbox.json`(全部可调参数,严格校验)、`scripts/research_gateway.py`(HTTP 网关,标准库实现;容器见 `docker-compose.research.yml`、`docker/research/`);纯逻辑:`risk/diagnosis.py`、`risk/plateau.py`、`risk/candidate_eval.py`、`risk/report.py`。威胁模型与限制见文件头及 ADR `20261112-research-sandbox-*`。毕昇工作流脚本在 `tools/bisheng/`。
+- 研究沙盒(阶段四 4a/4b 的内层部分):`scripts/research_api.py`(CLI:`data`/`approve`/`review`/`backtest`/`gate`/`evaluate`/`results`)、`scripts/research_sandbox.py`(路径限制、静态筛查、环境白名单、批准账本)、`scripts/research_gate.py`(门槛评估与选参编排)、`scripts/research_grid.py`(候选参数网格寻优)、`scripts/research_config.py` + `config/research_sandbox.json`(全部可调参数,严格校验)、`scripts/research_gateway.py`(HTTP 网关,标准库实现;容器见 `docker-compose.research.yml`、`docker/research/`);纯逻辑:`risk/diagnosis.py`、`risk/plateau.py`、`risk/candidate_eval.py`、`risk/report.py`。威胁模型与限制见文件头及 ADR `20261112-research-sandbox-*`。毕昇工作流脚本在 `tools/bisheng/`。**结果通道与阶段归属(第 27 轮)**:子进程结果**不走 stdout**——父进程建一次性随机目录与随机文件、经 **stdin** 把交接单(路径 + 随机密钥)交给子进程,子进程写 `{mac, body}`,父进程用 `hmac.compare_digest` 校验,**不符即拒绝采信**(stdout 降级为日志);写结果前清掉 atexit 钩子,写入路径受运行时指纹核对,结果里的夏普有合理性上界。**阶段只由框架拥有**:`describe_error(exc, phase)` 的 `phase` 为必填,不再按**异常类名**推断(类名是候选自己起的)。见 ADR `20261113-evolution-engine` 第 27 轮补记。
 - `notify/webhook.py`:非阻塞、带重试、去重、脱敏的 Webhook 通知(generic/feishu/telegram);**落盘待补发队列**(`WEBHOOK_OUTBOX`,默认 `data/state/webhook_outbox.jsonl`):发送最终失败的告警写入 JSONL,网络恢复后补发(【补发】前缀、保留原始时间、积压 INFO 合并成摘要),进程重启后继续。
 - `scripts/segment_ledger.py`、`config/test_segment_usage.json`:测试段使用登记，`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记，重复使用即拒绝（无强制开关）。
 - `scripts/backtest_lib.py`:回测公共库(统一成本、内存 K 线回放、异常哨兵)。
