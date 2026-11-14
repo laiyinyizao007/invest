@@ -353,3 +353,31 @@ def test_the_validation_failure_path_still_reports_the_cells():
 
     assert "error" in result
     assert result["trials"]["grid_cells"] == 27
+
+
+def test_an_out_of_range_sharpe_in_a_backtest_result_is_refused(tree, monkeypatch, capsys):
+    """回测作业的结果把夏普放在 `stats.sharpe`(第 27 轮 Critical 伪造的正是这个形状)——
+    合理性上界不能只查 `metrics.oos_sharpe` 那一支,否则回测这条路留着一个口子。"""
+    make_strategy(tree)
+    body = {"stats": {"sharpe": 1e9, "round_trips": 3}, "pnls": [1, -1, 1]}
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=body))
+
+    code = api.main(["backtest", "--strategy", "s.py", "--class", "S", "--key", "CADJ",
+                     "--segment", "train", "--confirm-reviewed"])
+
+    err = capsys.readouterr().err
+    assert code == api.EXIT_FAILED
+    assert "超出合理范围" in err
+
+
+def test_a_normal_backtest_sharpe_still_passes(tree, monkeypatch, capsys):
+    """双向:回测结果的正常夏普照常采信(别把门槛外的正常值也拒了)。"""
+    make_strategy(tree)
+    body = {"stats": {"sharpe": 1.2, "round_trips": 3}, "pnls": [1, -1, 1]}
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=body))
+
+    code = api.main(["backtest", "--strategy", "s.py", "--class", "S", "--key", "CADJ",
+                     "--segment", "train", "--confirm-reviewed"])
+
+    out = json.loads(capsys.readouterr().out)
+    assert code == api.EXIT_OK and out["stats"]["sharpe"] == 1.2

@@ -299,17 +299,26 @@ def check_result_bounds(body: dict) -> None:
     """结果里的数字必须站得住:验证窗口的夏普超出合理上界 → 拒绝采信(伪造的兜底)。
 
     验签挡的是"结果被人换过";这里挡的是"结果里的数字本身不合理"(例如被编排成 oos_sharpe=1e9)。
-    策略门槛(夏普上界、DSR)一律不放宽——这里只是把明显不成立的结果挡在门外。"""
-    metrics = body.get("metrics")
-    if not isinstance(metrics, dict):
-        return
-    for key in ("oos_sharpe", "stress_sharpe"):
-        value = metrics.get(key)
-        if value is None:
-            continue
+    策略门槛(夏普上界、DSR)一律不放宽——这里只是把明显不成立的结果挡在门外。
+
+    **两种结果形状都要查**:门槛/评估作业的结果把夏普放在 `metrics.oos_sharpe` / `metrics.stress_sharpe`,
+    而**回测**作业的结果放在 `stats.sharpe`(第 27 轮 codex 的 Critical 伪造的正是这个形状)。
+    只查一种形状 = 给另一种形状留了一个"数字明显不成立却照样被采信"的口子。"""
+    def out_of_range(label: str, value) -> None:
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or abs(value) > MAX_ABS_OOS_SHARPE):
-            raise JobError(EXIT_FAILED, f"子进程回传的 {key} 超出合理范围,已拒绝采信")
+            raise JobError(EXIT_FAILED, f"子进程回传的 {label} 超出合理范围,已拒绝采信")
+
+    metrics = body.get("metrics")
+    if isinstance(metrics, dict):
+        for key in ("oos_sharpe", "stress_sharpe"):
+            value = metrics.get(key)
+            if value is None:
+                continue
+            out_of_range(key, value)
+    stats = body.get("stats")
+    if isinstance(stats, dict) and stats.get("sharpe") is not None:
+        out_of_range("stats.sharpe", stats["sharpe"])
 
 
 def _read_child_result(handoff: dict) -> dict:

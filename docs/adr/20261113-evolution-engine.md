@@ -644,6 +644,28 @@ Windows 上"文件正被替换"造成的 `PermissionError`。改成"**先读见�
 - 交叉进程竞态那条**真进程**用例仍然保留(它是经验证据),但本轮补的是**确定性**的顺序断言
   (见证必须先于日志被读)与"锚点不被重读"断言——它们不依赖时钟,也不会因为机器慢而空转。
 
+### 第 29 轮补记:合理性上界必须覆盖**两种**结果形状
+
+第 27 轮 codex 的 Critical 伪造的是 `{"stats": {"sharpe": 999.0}}`——**回测**作业的结果形状。
+但随后补上的 `check_result_bounds` 只查了 `metrics.oos_sharpe` / `metrics.stress_sharpe`,
+也就是**门槛/评估**作业的形状。**被攻击的那个形状反而没有上界**:
+回测结果里的 `stats.sharpe` 可以是任意大,照样被采信。
+
+这与"验签挡的是'结果被人换过'、上界挡的是'数字本身不合理'"是两件事:
+验签通过只说明文件没被换过,不说明**里面的数字站得住**。两种形状都得查。
+
+现在 `check_result_bounds` 对两种形状统一走一个 `out_of_range(label, value)`:
+`metrics.oos_sharpe`、`metrics.stress_sharpe`、`stats.sharpe`,上限同为 `MAX_ABS_OOS_SHARPE = 50.0`。
+
+**`MAX_ABS_OOS_SHARPE` 是什么、不是什么**:它是**结果合理性上界**(用于识别明显不成立的结果),
+**不是**策略门槛里的"可疑夏普上限 3.0"。后者是登记在案的晋级门槛,一条都没动。
+
+变异验证(改回旧行为 → 对应用例变红;还原后全绿):
+| 变异 | 用例 |
+|---|---|
+| 合理性上界整个不查 | `test_an_out_of_range_sharpe_in_the_result_is_refused` |
+| 只查 `metrics`、不查 `stats.sharpe` | `test_an_out_of_range_sharpe_in_a_backtest_result_is_refused` |
+
 ## 阶段 2:不可变宪法(Issue #16)
 
 清单文件 `config/immutable_constitution.json`,内置清单在 `risk/constitution.py`。**清单只能追加,不能删减内置项**;
