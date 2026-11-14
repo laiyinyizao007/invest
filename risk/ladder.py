@@ -39,8 +39,11 @@ DSR 只惩罚试验次数、不惩罚每次试验带回的信息量,而测试段
 真正的外部锚点需要另一个信任域(密钥不在候选与网关可写的位置,或把头指针镜像到只增的外部存储),这里没有。
 候选代码碰不到这些文件(沙盒里没有 `open`、没有文件系统模块,见 ADR)。
 
-并发:同一进程内用锁串行;跨进程不加锁。网关用 `_busy` 锁串行执行作业,CLI 与网关并发才可能漏记查询(偏向少记),
-与试验账本同一口径,列入 ADR 已知限制。
+并发:同一进程内用锁串行;**跨进程**也有互斥(第 19 轮加的 `_file_lock`,`submit`/`renew`/`reset` 互斥,
+Windows `msvcrt.locking` / POSIX `fcntl.flock`;写入前还会重读磁盘核对尾部哈希),所以此前"reset 与 submit 并发
+能把日志写成断链、梯子永久报废"的问题已解。剩下的窄口:网关用 `_busy` 锁串行作业,而**试验账本
+`risk/trial_ledger.py` 仍是同进程内加锁、跨进程不加锁**——CLI 与网关并发可能漏记极少量试验(偏向少记),
+列入 ADR 已知限制。
 """
 from __future__ import annotations
 
@@ -626,6 +629,16 @@ class Ladder:
             except LadderError:
                 healthy = False                          # 已经坏了:reset 正是这时候的出路
             if healthy and not force:
+                # 拒绝也要留痕(第 19 轮 codex 的 MEDIUM):有人试图重置一件状态正常的梯子,
+                # 这本身就是"动过手"的证据——不记下来,事后只看归档文件是看不出有人试过的。
+                log_path = self.path.parent / "ladder.reset.log"
+                try:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    self._append_reset_log(log_path, {"event": "reset-refused", "archive": None,
+                                                      "reason": reason.strip(),
+                                                      "note": "梯子状态正常,未显式 force,已拒绝"})
+                except OSError:
+                    pass                                # 连审计都写不下去时,拒绝本身仍然生效
                 raise LadderError("梯子状态正常,不得重置;确需从头开始请显式 force"
                                   "(重置会清零 best 与查询数,并作废全部历史揭示存档)")
             moved = []
@@ -642,7 +655,9 @@ class Ladder:
             intent = {"event": "reset-intent", "archive": n, "reason": reason.strip(),
                       "discarded_best": dropped["best"], "discarded_queries": dropped["queries"],
                       "orphaned_run_ids": dropped["run_ids"][:MAX_ORPHANS]}
-            self._append_reset_log(log_path, intent)
+            # **意图行写不进去就不许动东西**(第 19 轮 codex 的 MEDIUM):审计先落盘是这次排序的全部意义,
+            # 意图行静默丢失之后照样挪文件,等于"审计先落盘"名存实亡——事后只剩归档文件,看不出谁动过手。
+            self._append_reset_log(log_path, intent, required=True)
             try:
                 for f in files:
                     if f.exists():
@@ -661,14 +676,20 @@ class Ladder:
                 "discarded_queries": dropped["queries"], "orphaned_run_ids": len(dropped["run_ids"])}
 
     @staticmethod
-    def _append_reset_log(path: Path, entry: dict) -> None:
-        """审计日志的每一次追加都 fsync——它就是"动过手"的唯一证据,不能自己先丢。"""
+    def _append_reset_log(path: Path, entry: dict, *, required: bool = False) -> None:
+        """审计日志的每一次追加都 fsync——它就是"动过手"的唯一证据,不能自己先丢。
+
+        `required=True` 用于**动手之前**的那一行(意图行):写不进去就抛错停手,
+        因为"审计先落盘"是这套排序的全部意义,意图行丢了还照样挪文件等于名存实亡。
+        动手之后的行(archived/done)写不进去不该把已经完成的操作变成失败,继续吞掉。"""
         try:
             with open(path, "a", encoding="utf-8", newline="") as stream:
                 stream.write(json.dumps(entry, ensure_ascii=False, allow_nan=False) + chr(10))
                 stream.flush()
                 os.fsync(stream.fileno())
-        except OSError:
+        except OSError as exc:
+            if required:
+                raise LadderError(f"梯子重置审计无法写入(fail-closed,未做任何修改): {_why(exc)}") from exc
             pass                                    # 审计写不进去不该把已经完成的操作变成失败
 
     def renew(self, note: str, *, force: bool = False) -> dict:

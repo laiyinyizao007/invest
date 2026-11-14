@@ -773,6 +773,42 @@ def test_reset_refuses_a_healthy_ladder_unless_forced(tmp_path):
     assert ladder.status()["queries_used"] == 1                                # 什么都没动
 
 
+def test_a_refused_reset_leaves_a_trace(tmp_path):
+    """第 19 轮 codex 的 MEDIUM:有人试图重置一件状态正常的梯子,这本身就是"动过手"的证据。
+
+    不记的话,事后只看归档文件根本看不出有人试过——被拒绝的尝试与从未发生过无法区分。"""
+    ladder = anchored(tmp_path)
+    ladder.submit(0.0)
+    with pytest.raises(LadderError, match="force"):
+        ladder.reset("手滑")
+    log = ladder.path.parent / "ladder.reset.log"
+    lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["event"] == "reset-refused"
+    assert lines[0]["reason"] == "手滑"
+    assert not any(p.name.startswith("ladder.json.bak") for p in tmp_path.iterdir())   # 确实什么都没挪
+
+
+def test_a_reset_whose_audit_cannot_be_written_stops_before_it_moves_anything(tmp_path):
+    """第 19 轮 codex 的 MEDIUM:意图行写不进去就**不许动东西**。
+
+    "审计先落盘"是这套排序的全部意义:意图行静默丢失之后照样挪文件,
+    事后只剩归档文件、看不出谁动过手,等于名存实亡。
+
+    这里走**真实**路径:把 `ladder.reset.log` 做成一个目录,让审计追加真的写不进去,
+    于是 `_append_reset_log` 拿到的是真 OSError——正好验证 `required=True` 的 fail-closed 接线。"""
+    ladder = anchored(tmp_path)
+    reported = ladder.submit(3.0)["reported"]
+    (ladder.path.parent / "ladder.reset.log").mkdir()          # 审计路径不可写(目录占了同名路径)
+
+    with pytest.raises(LadderError, match="fail-closed"):
+        ladder.reset("手滑", force=True)
+
+    # 梯子原封不动:状态还在,归档文件一个都没多
+    assert ladder.status()["queries_used"] == 1
+    assert ladder.status()["reported"] == reported
+    assert not any(".bak-" in p.name for p in tmp_path.iterdir())
+
+
 def test_reset_of_a_damaged_ladder_needs_no_force(tmp_path):
     """已经坏了的时候 reset 正是出路,不能被护栏挡住。"""
     ladder = anchored(tmp_path)
