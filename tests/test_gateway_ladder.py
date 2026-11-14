@@ -119,7 +119,9 @@ def test_an_exhausted_ladder_still_replays_runs_that_were_already_revealed(tmp_p
     exhaust(app)
     assert ladder_of(app).status()["queries_left"] == 0
     status, again = call(app, "GET", "/research/results/run42")
-    assert status == 200 and again == first
+    assert status == 200 and again["ladder"]["reported_sharpe"] == first["ladder"]["reported_sharpe"]
+    assert again["ladder"]["queries_left"] == 0                       # 回放给的是**当前**剩余查询数(第 16 轮 L1)
+    assert {k: v for k, v in again.items() if k not in ("ladder", "report")} == {k: v for k, v in first.items() if k not in ("ladder", "report")}
     seed(app, full_result(run_id="run43"))
     assert call(app, "GET", "/research/results/run43")[0] == 429                    # 没揭示过的才被拒
 

@@ -274,7 +274,7 @@ class Ladder:
             for row in rows:
                 if row["run_id"] == run_id:                      # 幂等:同一个 run 只回放当时的汇报值,不再扣查询
                     state = self._state(rows, self.budget)
-                    return self._result(state, float(row["best"]), False, row["queries"], replay=True)
+                    return self._result(state, float(row["best"]), False, state["queries"], replay=True)
         state = self._state(rows, self.budget)
         if state["queries"] >= state["budget"]:
             raise LadderExhausted(f"梯子的总查询预算({state['budget']} 次)已用尽,需要人工续期(renew,会留痕)")

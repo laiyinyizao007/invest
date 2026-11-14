@@ -258,7 +258,10 @@ def test_the_replay_does_not_change_when_the_ladder_has_since_moved_on(env):
     bigger["metrics"]["oos_sharpe"] = 9.0
     reveal(bigger, ladder=ladder, store=store)
     assert ladder.status()["reported"] > first["ladder"]["reported_sharpe"]
-    assert reveal(full_result(run_id="old"), ladder=ladder, store=store) == first
+    again = reveal(full_result(run_id="old"), ladder=ladder, store=store)
+    assert again["ladder"]["reported_sharpe"] == first["ladder"]["reported_sharpe"]
+    assert {k: v for k, v in again.items() if k not in ("ladder", "report")} == {k: v for k, v in first.items() if k not in ("ladder", "report")}
+    assert again["ladder"]["queries_left"] == ladder.status()["queries_left"]       # 第 16 轮 L1:回放给当前的剩余查询数,不给旧的
 
 
 def test_two_runs_with_sharpes_in_the_same_step_read_the_same_number(env):
@@ -376,3 +379,64 @@ def test_validation_sharpe_detection():
     assert validation_sharpe({"kind": "backtest", "segment": "train", "stats": {"sharpe": 1}}) == (False, None)
     assert validation_sharpe({"kind": "backtest", "segment": "valid", "stats": {"sharpe": 1.0}}) == (True, 1.0)
     assert validation_sharpe({"kind": "evaluate"}) == (False, None)
+
+
+# ---------- 第 16 轮 codex:H1 存档对账 / M2 按 kind 扣查询 / L1 queries_left ----------
+
+def _archive_path(store, run_id):
+    return store.directory / f"{run_id}.json"
+
+
+def _tamper(store, run_id, mutate):
+    path = _archive_path(store, run_id)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    mutate(data)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["ladder"].update(reported_sharpe=9.87),                                        # 形状合法、数值伪造
+    lambda d: d.update(report="验证窗口夏普是 9.87,真实数字是 4.321"),                          # 自由文本通道
+    lambda d: d.update(fitness=0.123456789),                                                   # 与落盘结果不一致的字段
+    lambda d: d["ladder"].update(step=0.5),
+])
+def test_a_forged_but_well_formed_archive_is_refused_not_replayed(env, mutate):
+    ladder, store = env
+    reveal(full_result(run_id="f1"), ladder=ladder, store=store)
+    _tamper(store, "f1", mutate)
+    with pytest.raises(OutwardError):
+        reveal(full_result(run_id="f1"), ladder=ladder, store=store)
+    assert ladder.status()["queries_used"] == 1                                                # 也没有偷偷多扣
+
+
+def test_an_archive_with_no_matching_ladder_record_is_refused(env, tmp_path):
+    """存档在、梯子日志里没有这个 run(梯子被回滚/换掉):不能当作"已揭示过"。"""
+    ladder, store = env
+    reveal(full_result(run_id="g1"), ladder=ladder, store=store)
+    fresh = Ladder(tmp_path / "other" / "ladder.json")
+    with pytest.raises(OutwardError):
+        reveal(full_result(run_id="g1"), ladder=fresh, store=store)
+
+
+@pytest.mark.parametrize("kind", ["evaluate", "gate"])
+@pytest.mark.parametrize("extra", [{"failed_check_ids": ["sharpe_low", "drawdown_pct"]}, {"passed": True}, {"passed": False}])
+def test_a_gate_result_without_metrics_is_refused_not_leaked_for_free(env, kind, extra):
+    ladder, store = env
+    with pytest.raises(OutwardError):
+        reveal({"run_id": "m1", "kind": kind, **extra}, ladder=ladder, store=store)
+    assert ladder.status()["queries_used"] == 0
+
+
+def test_a_forged_selection_only_result_carries_no_bits(env):
+    view = reveal({"run_id": "s1", "kind": "evaluate", "kind_detail": "selection-only", "passed": True,
+                   "failed_check_ids": ["sharpe_low", "dsr_low"]}, ladder=env[0], store=env[1])
+    assert view["passed"] is False and view["failed_checks"] is None
+
+
+def test_the_replay_reports_the_current_remaining_queries_not_the_stale_one(env):
+    ladder, store = env
+    first = reveal(full_result(run_id="q1"), ladder=ladder, store=store)
+    reveal(full_result(run_id="q2"), ladder=ladder, store=store)
+    again = reveal(full_result(run_id="q1"), ladder=ladder, store=store)
+    assert first["ladder"]["queries_left"] == 59 and again["ladder"]["queries_left"] == 58
+    assert "剩余查询 58" in again["report"]

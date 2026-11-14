@@ -150,9 +150,14 @@ def build_outward(result: dict) -> dict:
                          "phase": phase,
                          "message": message[:MAX_ERROR_MESSAGE] if message_is_open and isinstance(message, str) else None}
     if kind in ("evaluate", "gate"):
-        view["passed"] = result.get("passed") is True
-        ids = result.get("failed_check_ids")
-        view["failed_checks"] = ([i for i in ids if i in CHECK_IDS] if isinstance(ids, list) else None)
+        if result.get("kind_detail") == "selection-only":
+            # 只做了选参、没有跑验证窗口:这时的"通过/失败项"不含验证窗口的任何信息,统一成固定值
+            # (伪造的 selection-only 结果也带不出比特:第 16 轮 codex 的 M2)
+            view["passed"], view["failed_checks"] = False, None
+        else:
+            view["passed"] = result.get("passed") is True
+            ids = result.get("failed_check_ids")
+            view["failed_checks"] = ([i for i in ids if i in CHECK_IDS] if isinstance(ids, list) else None)
     if kind == "evaluate":
         view["selection"] = _selection_view(result.get("selection"))
         view["behavior"] = _behavior_view(result.get("behavior"))
@@ -276,6 +281,30 @@ class RevealStore:
             raise OutwardError(f"揭示存档写入失败: {type(exc).__name__ if isinstance(exc, OSError) else exc}") from exc
 
 
+def _replay(stored: dict, view: dict, result: dict, sharpe: Any, run_id: str, ladder: Ladder) -> dict:
+    """回放存档前先**对账**(第 16 轮 codex 的 H1:存档只校验形状,改一个文件就能让外层读到任意精度的数字与自由文本)。
+
+    存档必须同时满足:梯子日志里有这个 run;汇报值与梯子(带哈希链)回放的一致;除梯子块与报告外,与由落盘结果
+    重新生成的视图逐字段相等;报告就是视图的确定性重推导。任何一条对不上都当作被改过 fail-closed。
+    返回的是**当前**的剩余查询数(第 16 轮 L1:不回放旧的 `queries_left`)。"""
+    if not ladder.has(run_id):
+        raise OutwardError("揭示存档在梯子日志里没有对应的查询记录(fail-closed):存档被伪造或梯子被回滚")
+    plan = ladder.preview(sharpe, run_id=run_id)
+    block = stored.get("ladder")
+    if not isinstance(block, dict) or block.get("reported_sharpe") != plan["reported"] or block.get("step") != plan["step"]:
+        raise OutwardError("揭示存档的汇报值与梯子对不上(fail-closed)")
+    body = {k: v for k, v in stored.items() if k not in ("ladder", "report")}
+    expected = {k: v for k, v in view.items() if k not in ("ladder", "report")}
+    if body != expected:
+        raise OutwardError("揭示存档与落盘结果对不上(fail-closed)")
+    if stored.get("report") != outward_report(stored):
+        raise OutwardError("揭示存档的报告不是视图的确定性推导(fail-closed)")
+    fresh = dict(stored)
+    fresh["ladder"] = {"reported_sharpe": plan["reported"], "step": plan["step"], "queries_left": plan["queries_left"]}
+    fresh["report"] = outward_report(fresh)
+    return fresh
+
+
 def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: bool = True) -> dict | None:
     """把一个落盘结果揭示给外层,返回净化视图。
 
@@ -286,6 +315,11 @@ def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: boo
     view = build_outward(result)
     has, sharpe = validation_sharpe(result)
     if not has:
+        # 第 16 轮 codex 的 M2:是否扣查询由 **kind** 决定,不由"metrics 是否存在"决定。
+        # evaluate/gate 的 `passed` 与失败检查项本身就是验证窗口的比特;缺 metrics 却带着它们的结果是伪造/损坏,fail-closed。
+        if (result.get("kind") in ("evaluate", "gate") and result.get("status") != "strategy_error"
+                and result.get("kind_detail") != "selection-only"):
+            raise OutwardError("门槛结果缺少 metrics 却带着通过/失败信息(fail-closed:不放出,也不绕过梯子)")
         return view
     run_id = view["run_id"]
     if run_id is None:
@@ -293,7 +327,7 @@ def reveal(result: dict, *, ladder: Ladder, store: RevealStore, allow_query: boo
     with _lock:
         stored = store.get(run_id)
         if stored is not None:
-            return stored
+            return _replay(stored, view, result, sharpe, run_id, ladder)
         # 没有存档,但梯子日志里有这个 run:上一次揭示在"扣了查询、存档没写成"处失败了(第 15 轮 codex 的 High)。
         # 它已经被扣过一次查询,重建视图只是回放当时的汇报值——不是"偷偷揭示",也不会再扣。
         if not allow_query and not ladder.has(run_id):
