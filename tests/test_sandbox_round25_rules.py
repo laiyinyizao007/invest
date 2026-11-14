@@ -59,13 +59,24 @@ def repo(tmp_path, monkeypatch):
     (root / "strategies" / "__init__.py").write_text("", encoding="utf-8")
     (root / "strategies" / "base.py").write_text("VALUE = 1\n", encoding="utf-8")
     git_commit_all(root)
-    for name in [n for n in list(sys.modules)
-                 if n == "strategies" or n.startswith("strategies.")]:
-        monkeypatch.delitem(sys.modules, name, raising=False)
+    # 测试里走生产入口会把**临时仓库里的** `strategies.*` 真的导入进 sys.modules;
+    # monkeypatch.delitem 只会还原"删除时存在的"那几项,测试期间新导入的不会被清掉 →
+    # 后面的测试(例如 test_research_api 里 `import strategies.instruments`)拿到的是
+    # 指向临时仓库的残缺包,表现为按文件顺序才出现的 ModuleNotFoundError。
+    # 所以这里自己保存、测完整体还原(合并 main #22 之后才暴露:这两条用例开始走生产入口)。
+    def is_strategies(name: str) -> bool:
+        return name == "strategies" or name.startswith("strategies.")
+
+    saved = {n: m for n, m in sys.modules.items() if is_strategies(n)}
+    for name in saved:
+        del sys.modules[name]
     monkeypatch.syspath_prepend(str(root))
     monkeypatch.setattr(api.rc, "CODE_ROOT", root)
     monkeypatch.chdir(root)
-    return root
+    yield root
+    for name in [n for n in list(sys.modules) if is_strategies(n)]:
+        del sys.modules[name]
+    sys.modules.update(saved)
 
 
 def guard_for(root: Path, **kwargs):

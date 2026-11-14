@@ -307,6 +307,12 @@ def test_the_wildcard_scan_sees_a_sourceless_pyc_in_a_site_package(tmp_path, mon
                       verify_trusted_against_git=False)
     # 候选在运行期间往站点包里写一个无源码模块:
     _write_pyc(pkg / "helper.pyc", "VALUE = 666\n")
+    # 文件系统的时间戳粒度(Windows 上可达十几毫秒)会让"刚写的文件"的 mtime 落在守卫启动时刻
+    # 之前,于是这条用例按机器负载随机红绿。用例要表达的是"候选在运行之后写了它",
+    # 所以把 mtime 明确设到守卫启动之后。
+    import os
+    later = guard.started_at_ns + 5_000_000_000
+    os.utime(pkg / "helper.pyc", ns=(later, later))
     reason = guard.check_package_wildcard("extpkg")
     assert reason, "站点包里的无源码 .pyc 竟然不在通配符清单里"
     assert "helper.pyc" in reason, f"拒绝理由没有点名那个 .pyc:{reason}"
@@ -319,3 +325,24 @@ def test_the_wildcard_scan_still_allows_an_ordinary_site_package(tmp_path, monke
     guard = guard_for(repo_root, allowed_dirs=("strategies",),
                       verify_trusted_against_git=False)
     assert guard.check_package_wildcard("extpkg") is None
+
+
+# 这些用例会走生产入口、把**临时仓库里的**包真的导入进 sys.modules。monkeypatch.delitem 只还原
+# "删除时存在的"几项,测试期间新导入的不会被清掉,于是后面的测试(例如 test_research_api 里的
+# `import strategies.instruments`)拿到指向临时仓库的残缺包 —— 表现为"按文件顺序才出现"的
+# ModuleNotFoundError(合并 main #22 之后暴露)。每个用例前后自己保存/还原这几个前缀。
+_SANDBOX_TEST_PREFIXES = ("strategies", "pkgx", "pkgrel", "pkgok", "leaky_union_pkg")
+
+
+@pytest.fixture(autouse=True)
+def _restore_modules_touched_by_sandbox_tests():
+    import sys as _sys
+
+    def touched(name):
+        return name.split(".")[0] in _SANDBOX_TEST_PREFIXES
+
+    saved = {n: m for n, m in _sys.modules.items() if touched(n)}
+    yield
+    for name in [n for n in list(_sys.modules) if touched(n)]:
+        del _sys.modules[name]
+    _sys.modules.update(saved)

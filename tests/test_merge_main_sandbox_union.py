@@ -371,3 +371,24 @@ def test_the_production_path_wires_both_defences_into_one_call():
     assert 'cfg["screening"]["allowed_modules"]' in call, call
     assert "repo_guard=repo_guard" in call, call
     assert src.index("verify_trusted_tree") < src.index("protected_before = const.snapshot_protected_state()")
+
+
+# 这些用例会走生产入口、把**临时仓库里的**包真的导入进 sys.modules。monkeypatch.delitem 只还原
+# "删除时存在的"几项,测试期间新导入的不会被清掉,于是后面的测试(例如 test_research_api 里的
+# `import strategies.instruments`)拿到指向临时仓库的残缺包 —— 表现为"按文件顺序才出现"的
+# ModuleNotFoundError(合并 main #22 之后暴露)。每个用例前后自己保存/还原这几个前缀。
+_SANDBOX_TEST_PREFIXES = ("strategies", "pkgx", "pkgrel", "pkgok", "leaky_union_pkg")
+
+
+@pytest.fixture(autouse=True)
+def _restore_modules_touched_by_sandbox_tests():
+    import sys as _sys
+
+    def touched(name):
+        return name.split(".")[0] in _SANDBOX_TEST_PREFIXES
+
+    saved = {n: m for n, m in _sys.modules.items() if touched(n)}
+    yield
+    for name in [n for n in list(_sys.modules) if touched(n)]:
+        del _sys.modules[name]
+    _sys.modules.update(saved)

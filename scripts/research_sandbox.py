@@ -1180,7 +1180,7 @@ class RepoImportGuard:
             return None                                        # 同上(内建/冻结/命名空间包:没有文件可查)
         try:
             resolved = Path(origin).resolve()
-            stat = resolved.stat()
+            resolved.stat()                                  # 只为"查不了就 fail-closed"
         except OSError:
             # **查不了等于没查(fail-closed)**。第 24 轮 codex 实测:zip 里的成员 origin 形如
             # "...\evil.zip\mod.py",stat 必然失败,而这一支原先直接放行——
@@ -1308,8 +1308,8 @@ class RepoImportGuard:
             return "该文件的状态查不到(查不了等于没查,fail-closed)"
         granularity = _timestamp_granularity(stat.st_mtime_ns)
         if stat.st_mtime_ns >= _floor_to_granularity(self.started_at_ns, granularity):
-            return (f"该文件在候选开始运行之后才出现"
-                    f"(候选运行期间写出的文件一律不得被导入)")
+            return ("该文件在候选开始运行之后才出现"
+                    "(候选运行期间写出的文件一律不得被导入)")
         return None
 
     def _rel(self, path: Path) -> str:
