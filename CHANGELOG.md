@@ -40,6 +40,106 @@
     不存在"为了凑一个数去调阈值"的情况。
 
 ### Fixed（修复）
+- **提交基准不许再用 `git status`(第 26 轮 codex 的 Critical 1)**:第 25 轮把"跨轮次逃逸"的基准
+  定成"仓库提交里的那份",实现上用的是 `git status --porcelain` + `git ls-tree`。
+  **但 `git status` 会应用 filter**:filter 的 `clean=` 是一条**命令**,由 git 自己去执行,
+  而候选能写 `.git/config` 与受信目录下的 `.gitattributes` —— 于是候选只要写下一条 filter 命令,
+  **守卫自己跑的那次 `git status` 就替候选执行了它**(实测:标记文件被写了出来,
+  静态筛查 **0 findings**——那条命令是 git 执行的,不是候选执行的)。
+  守卫从"检查者"变成了"执行面"。
+  - 改成三条硬规矩:①**只用不应用 filter 的读法**(`git ls-tree` 读树、`git cat-file` 读对象,
+    两者只读对象库、不碰工作区文件);②**调用时关掉一切能执行命令的配置**
+    (`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` 指向空设备、
+    `HOME`/`XDG_CONFIG_HOME`/`USERPROFILE` 重定向到临时空目录、`-c core.fsmonitor=false`、
+    `-c core.pager=cat`、`GIT_OPTIONAL_LOCKS=0`);③**不用 git 去比内容**——
+    取**提交里那份 blob**,与工作区内容只比"**去掉 CRLF 之后**是不是一样"
+    (第 25 轮自己算 blob 哈希曾把 CRLF/LF 误判成"被改写过",那次的教训是"内容基准要交给内容的主人";
+    现在两边都不自己复刻,只比换行,换行之外的任何差异仍判不一致——**不放宽任何已锁定的阈值**)。
+  - 守卫在**构造时**(候选运行之前)记下仓库元数据的内容指纹,`check()` 时核一遍,
+    **不一致就 fail-closed**(候选改写仓库元数据这件事本身被管住)。
+    记哪几份见下面「第 26 轮第二轮 codex 复核之后补修的那几条」(config/HEAD 在哪、第 26 轮 codex
+    第二轮实测出 linked worktree 的坑之后又改过一次)。
+- **通配符导入(`from 包 import *`)补上提交基准(第 26 轮 Critical 2)**:这一路原来**只有**"快照"这一关,
+  没有提交基准 → 第 25 轮堵掉的那条跨轮次逃逸在通配符这条路上**原样可用**
+  (上一轮改写 `strategies/base.py`、这一轮 `from strategies import *`)。
+  现在通配符路径上的**每一个 `.py`** 都套上与 `check()` 同一把尺子的提交基准核对。
+- **相对导入上,视图的"拒绝"被 CPython 的回退绕过 → 拿到真 ctypes(第 26 轮 Critical 3)**:
+  CPython 的 `IMPORT_FROM` 回退键是 `<返回模块的 __name__>.<名字>`(绝对名),
+  而查表用的是**原始名**——相对导入时原始名是 `""`(`from . import x`)→ **查表永远落空**
+  → 视图拒绝之后回退把**真模块**交给候选 → 那个模块 `import ctypes` → `CDLL` 成功(实测)。
+  改用**返回模块的 `__name__`** 查表;静态层同时按 `__package__` 把相对 from-import 还原成绝对名再筛。
+- **危险名单补漏(第 26 轮 High 1/2)**:`_winapi`(Windows,`CreateProcess` 可达——**实测**)、
+  `_ctypes`(**推理**)、`_posixsubprocess`(Linux 对偶,**推理**,本机无法实测)、
+  `codeop`(`compile_command` 把字符串编译成代码)、`types`(`FunctionType` 能用真内建造函数)、
+  `posixpath`/`ntpath`/`genericpath`(报出那条向量时用的杠杆:`posixpath.join.__globals__` 里
+  既有真内建也有 `os`)——全部进 `DANGEROUS_MODULE_NAMES`,导入门与属性层同时生效。
+- **提交基准的路径基准统一(第 26 轮 Medium 1)**:原来提交基准是 repo_root 口径、调用方按 toplevel 口径比,
+  `repo_root ≠ toplevel` 时**受信导入被整片误杀**(埋着的误杀)。现在统一到 **toplevel 口径**
+  (`git ls-tree --full-tree` 从 toplevel 跑),并补了"代码在仓库子目录里"的回归用例。
+- **两处 fail-open 改 fail-closed(第 26 轮 Medium 2 / 静态层)**:`check_package_wildcard` 的
+  `except OSError: continue` 改成拒;静态层现在与运行期**共用同一份危险名单**
+  (`import ssl/codecs/mmap` 原先静态 0 findings,只在运行期才拒——而运行期的拒绝发生在 import **之后**)。
+- **静态层筛相对导入(第 26 轮 Low 3)**:按 `__package__` 还原绝对名;还原不出来就**拒**(fail-closed)。
+  口径说明:`screen_source()` 新增的 `package` 参数**没有生产调用点传值**(候选永远是不在包里的单文件模块),
+  所以生产里的实际行为是"还原不出绝对名 → 直接拒";按 `__package__` 还原这条能力目前只有用例在用。
+- **两处缓存(第 26 轮 Low 1/Low 2)**:`git status` 换成 ls-tree/cat-file(内容按 sha 寻址、不可变 → 缓存永远有效),
+  gitdir 路径进程内缓存;能力泄漏缓存原来用 `len(vars(module))` 判失效,
+  **等量替换**成员会用到旧判定(实测:应为 `ctypes`,实得 `None`)——现在缓存"成员名 → 成员对象",
+  复用前逐个用 `is` 核对。
+  (目录扫描按 mtime 的那处缓存**后来撤掉了**——见下面「第 26 轮第二轮 codex 复核之后补修的那几条」。)
+- **第 26 轮第二轮 codex 复核(34/50)之后补修的那几条**(codex CLI,`mcp__zen__clink`;
+  它的两条 HIGH 都自己做了端到端实测,成立):
+  - **linked worktree 下 `.git/config` 根本没进指纹(实测)**:指纹原来按
+    `git rev-parse --absolute-git-dir` 找,而 linked worktree 里那是 **per-worktree** 的 gitdir,
+    `.git/config` 在 **common dir** 里 → 指纹键只有 `['HEAD','index']`,**没有 config**,
+    候选改写共用 config 完全不被发现。**本仓库自己就是这个形态**(`invest-26` 是 `invest` 的
+    linked worktree)。现在 `config` 与 `info/attributes` 用 `--git-common-dir` 解析,
+    `HEAD` 仍取 per-worktree gitdir;回归用例用**真的 linked worktree**(`git worktree add`)来测。
+  - **`__pycache__/*.pyc` 盖过已核对过的源码(实测)**:提交基准核对的是源码,而 CPython 导入时
+    **优先用 `.pyc`**,`.pyc` 只校验头部里的 mtime+size(候选能伪造)→ 实测守卫放行、导入机制执行的
+    是**伪造字节码**(候选代码在真内建下跑出标记文件)。现在核对完源码就把该 `.pyc` **删掉**,
+    让导入机制从刚核对过的那份源码重新编译(残余:删除与导入之间的极小窗口、只读挂载那一支不清理)。
+  - **`.git/index` 不再进指纹**:提交基准走 `ls-tree HEAD` + `cat-file`,**从不读 index**;
+    而 index 会被任何一次 `git add`/`commit` 改写 → 记它只换来"别人提交了一次就全部误杀"。
+  - **git 二进制钉死 + 子命令白名单**:git 的绝对路径第一次用到时钉死(`shutil.which`),
+    且 `_git_run` **只允许** `rev-parse`/`ls-tree`/`cat-file` 三条只读子命令,别的直接抛错——
+    把"守卫永不执行候选写的东西"从**约定**变成**机制**(以后有人加回 `git status` 就复发不了)。
+  - **目录扫描的 mtime 缓存撤掉**:粗粒度文件系统(1~2 秒一档)上同一秒内新增的文件会看不见,
+    而受信目录只有个位数文件——不值得拿安全换性能。
+  - **口径纠正**:"静态层与运行期共用同一份名单"改成"静态层认 `FORBIDDEN_MODULES ∪ DANGEROUS_MODULE_NAMES`,
+    运行期再多一份配置追加的名单";ADR 里"容器隔离"从**既有边界**改回**阶段四 4b 的前置(尚未实现)**——
+    目前**只有人工审批**这一道闸。
+  - **这一轮补修的验证**:用例 33 条 → **37 条**;**变异验证 15 处全部变红**(比上一轮多 3 处:
+    linked worktree 指纹、`.pyc` 清理、git 子命令白名单)。
+  - **补修时自己写错的一处(如实记录)**:那条"即使指纹不报警也不能跑会应用 filter 的 git 命令"的用例,
+    第一版把 filter 写在守卫**构造之后** → 指纹先报警、守卫根本没跑 git → 用例**测不到命令选择**,
+    "把提交基准改回 `git status`"的变异因此抓不住。改成"把 filter 写在守卫构造**之前**"之后,
+    守卫真的会去跑 git,这时标记文件不出现才说明得了问题。
+  - **分数口径**:codex 给的 **34/50** 是**补修之前**的分数;两条 HIGH 与三条 Medium 在这次补修里改了,
+    但**补修之后没有再跑一轮 codex** → "补修之后的分数未知",不替它加分也不替它扣分。
+- **第 26 轮的验证**:新增 `tests/test_sandbox_round26_rules.py`(先 33 条,补修后 **37 条**),
+  每条规则都有**双向**探针
+  (放行 + 拦截)并断言"**是哪一条规则**拒的";**变异验证**把这一轮的修复逐一改回旧行为
+  (先 12 处,补修后 **15 处**),实测**全部变红**(逐处结果见下)。探针与变异脚本都放在 `%TEMP%`,跑完即删,不进仓库。
+  - **本轮自己写错的五处(如实记录)**:①在受限导入器里用了 `getattr`——那个函数的 `f_globals` 是干净的
+    (只有受限内建)→ `NameError`,是回归用例立刻变红才发现的,改用闭包里的 `object.__getattribute__`;
+    ②元数据指纹拍晚了(先改配置再构造守卫 → 指纹记的是已被改过的配置,测不出东西),
+    改成"先构造守卫、再让候选改写";③目录扫描缓存第一版写成"内容哈希"——那等于每次全扫,缓存没有意义;
+    ④filter 对照探针第一版"整份套件一起跑时必失败":靶子文件内容没真的改动 → git 走 stat 快路径,
+    根本不比对内容、也就不会用 clean filter(单跑时能触发靠的是 git racy-clean 的巧合);
+    改成"靶子文件内容真的改掉"+ 命令用"脚本文件 + `sh <脚本>`"(不用 `touch`——
+    filter 是 git 交给 sh 执行的,没装 Git Bash 的机器上 `touch` 根本不存在);
+    ⑤(第二轮复核补修时)"即使指纹不报警也不能跑会应用 filter 的 git 命令"那条用例第一版把 filter
+    写在守卫**构造之后** → 指纹先报警、守卫根本没跑 git → 用例测不到**命令选择**这条规则,
+    "把提交基准改回 `git status`"的变异因此抓不住;改成"把 filter 写在守卫构造**之前**"。
+  - **改了一处既有测试**:`tests/test_candidate_escape_production_path.py` 的 loader 探针原来用 `import types`
+    造模块对象;`types` 进名单后它在静态层就被拒(变成空断言)。已改写成不依赖 `types` 的写法,
+    并让它比原来**更强**(原来 `__loader__` 根本不存在,探针恒为 False)。
+  - **没有修的一半(如实登记)**:视图仍会递出带 `__globals__`/`__code__` 的 python 函数与类
+    (实测 `posixpath.join.__globals__['os']` 可达)。泛化修法(把函数复制成"净化版")会**打断正当用法**:
+    `dataclasses` 处理每个字段都要读 `sys.modules`,`enum`/`typing` 的 globals 里也有 `sys`——
+    净化掉 `sys` → `@dataclass` 当场失效;保留 `sys` → 那条链原样敞着。
+    报出那条向量的杠杆已进名单堵掉,但**泛化问题未修**,真正的边界仍是人工审批 + 容器隔离。
 - **跨轮次沙盒逃逸(第 25 轮 codex 第二轮的 Critical 1)**:受信目录(`strategies/`)的完整性基准
   改成**仓库提交里的那份**,不再是"每次运行重拍"的快照(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
   ADR `20261113-evolution-engine`「第 25 轮补记」)。

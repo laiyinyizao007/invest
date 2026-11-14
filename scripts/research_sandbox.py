@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import weakref
 from datetime import datetime
@@ -107,6 +110,21 @@ DANGEROUS_MODULE_NAMES = {
     # 而静态层只拦**字符串字面量**里的 "open",`codecs.open` 是 ast.Attribute,
     # 于是"从内建里拿掉 open"根本没封住写能力;`ssl`/`httpx`/`urllib3` 则是外传通道):
     "codecs", "mmap", "sqlite3", "ssl", "bz2", "lzma",
+    # **原生调用的后门**(第 26 轮 codex 的 High 1,实测+推理各一半):
+    # - `_winapi`(Windows):`CreateProcess`/`CreateFile` 都在里面——实测可达;
+    # - `_ctypes`:ctypes 的**真模块**(不是 `ctypes` 那个包)——与 `_ctypes` 同源;
+    # - `_posixsubprocess`(Linux 对偶):`fork_exec` 在里面。
+    #   本机是 Windows,`_posixsubprocess` **无法实测**,按推理登记(与 `_winapi` 对偶)。
+    "_winapi", "_ctypes", "_posixsubprocess",
+    # **执行原语与"真内建"的钥匙**(第 26 轮 codex 的 High 2,实测):
+    # `codeop.compile_command` 把字符串编译成可执行代码对象;
+    # `types.FunctionType` 能用**真内建**造函数(它的 `__builtins__` 是真的);
+    # 两者合起来 = 任意代码执行(实测标记文件被写出)。
+    # `posixpath`/`ntpath`/`genericpath` 则是报出那条向量时用的**杠杆**:
+    # `posixpath.join.__globals__` 里就是**真内建**与 `os`(实测)。
+    # 这三个是路径处理模块,候选正当用途基本靠 `os.path`(而 `os` 本身早已禁掉),
+    # 禁掉它们的误伤面接近零。
+    "codeop", "types", "posixpath", "ntpath", "genericpath",
 }
 
 # 出现这两个 = 那个模块能把"执行任意代码 / 调原生代码"直接递出来,整块不给。
@@ -137,21 +155,143 @@ _VIEW_FORWARDED = frozenset({"__all__", "__name__", "__doc__", "__package__", "_
 # 所以规则按"那个目录能不能写"分岔:
 #   能写 -> 必须有提交基准,取不到基准就**拒绝**(查不了等于没查,fail-closed);
 #   不能写 -> 不需要基准(写不了就没有篡改)。
-def _git_toplevel(repo_root: Path) -> str | None:
-    """这个目录所在的 git 仓库顶层(取不到就不是 git 仓库)。"""
+# ---------------------------------------------------------------------------
+# git 调用层(第 26 轮 codex 的 Critical 1):**只读对象库,不碰工作区**
+#
+# 为什么不能用 `git status`(第 26 轮 codex 实测,不是推理):
+# `git status` 会**应用 filter**——它按 `core.autocrlf`/`.gitattributes` 归一化工作区文件,
+# 而 filter 的 `clean=` 是一条**命令**。候选能写 `.git/config` 与受信目录下的
+# `.gitattributes`(两者都在候选的可写范围内),于是候选写
+#   [filter "pwn"] clean = <任意命令>
+# 之后,守卫自己跑的那次 `git status` 就**替候选执行了那条命令**——
+# 守卫从"检查者"变成了"执行器"(实测:标记文件被写了出来,而静态筛查 0 findings)。
+#
+# 所以这里改成三条硬规矩:
+# 1. **只用不应用 filter 的读法**:`git ls-tree`(读树)与 `git cat-file`(读对象)。
+#    两者都只读对象库,不读工作区文件,于是 filter 根本没有机会被应用。
+# 2. **调用时关掉一切能执行命令的配置**:
+#    `GIT_CONFIG_NOSYSTEM=1` + `GIT_CONFIG_GLOBAL/SYSTEM` 指向空设备 +
+#    `HOME`/`XDG_CONFIG_HOME` 重定向到临时空目录 + `-c core.fsmonitor=false`
+#    (fsmonitor 本身就是"一条命令",由 git 去执行)。
+# 3. **不用 git 去比内容**:改成取**提交里那份 blob**(`git cat-file blob <sha>`),
+#    与工作区内容按"只差换行"的口径比(见 `_same_content`)。
+#
+# 代价与取舍(第 25 轮踩过的坑,别退回去):
+# 第 25 轮曾经自己算 git 的 blob 哈希(sha1("blob <长度>\0" + 内容)),
+# 在 Windows 上把"工作区 CRLF / 提交里 LF"这种**内容其实一致**的情况
+# 误判成"被改写过"——受信目录里的正常模块一律被拒。
+# 现在既不自己算哈希,也不让 git 去碰工作区,而是**只比换行**:
+# 两份内容去掉 CRLF 之后一样,就当它们一致(Windows 上仓库默认就长这样)。
+#
+# 换行之外的差异(真改写)一律判"不一致"——**不放宽任何已锁定的阈值**。
+
+_GIT_HOME = Path(tempfile.gettempdir()) / "research-sandbox-git-home"
+
+# 守卫**只允许**跑的 git 子命令:三条都只读对象库/读树,**都不读工作区**,
+# 所以 filter(clean/smudge 那条命令)根本没有机会被应用。
+# `git status` / `git diff` / `git hash-object` **不在**名单里——它们会碰工作区。
+_GIT_READONLY_SUBCOMMANDS = frozenset({"rev-parse", "ls-tree", "cat-file"})
+
+# git 可执行文件的**绝对路径**(第一次用到时钉死)。
+# 为什么要钉死:守卫的 git 调用原本从继承来的 PATH 里解析"git",
+# 而 PATH 里可能有**候选可写**的目录(第 26 轮 codex 第二轮实测:
+# 本机 PATH 前面就有几个用户可写的临时目录)。钉死绝对路径 =
+# 把 git 二进制算进"可信计算基",不再随环境漂移。
+_GIT_BIN: str | None = None
+
+
+def _git_binary() -> str:
+    global _GIT_BIN
+    if _GIT_BIN is None:
+        found = shutil.which("git")
+        _GIT_BIN = found or "git"
+    return _GIT_BIN
+
+
+def _git_env() -> dict:
+    """git 调用的环境:**关掉一切能执行命令的配置来源**。"""
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "SystemRoot": os.environ.get("SystemRoot", ""),
+        "SYSTEMDRIVE": os.environ.get("SYSTEMDRIVE", ""),
+        "COMSPEC": os.environ.get("COMSPEC", ""),
+        "PATHEXT": os.environ.get("PATHEXT", ""),
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "HOME": str(_GIT_HOME),
+        "XDG_CONFIG_HOME": str(_GIT_HOME),
+        "USERPROFILE": str(_GIT_HOME),
+    }
+    return env
+
+
+def _git_run(args: list[str], cwd: Path | None = None, timeout: int = 30):
+    """跑一条 git 命令(只读),返回 CompletedProcess;失败返回 None。
+
+    **子命令白名单**(第 26 轮 codex 第二轮的架构意见):
+    这条函数是本轮新立的那个不变量的执行点——"守卫永不执行候选写的东西"。
+    光靠"这次没写 git status"是**约定**,不是机制:以后有人加回 `git status`
+    (它会应用 filter)或 `git hash-object`(它会读工作区)就复发。
+    所以这里**只允许三条读对象库/读树的子命令**,别的直接抛错(响亮地失败)。
+    """
+    if not args or args[0] not in _GIT_READONLY_SUBCOMMANDS:
+        raise ValueError(f"守卫只允许跑只读 git 子命令:{args[:1]}")
     try:
-        proc = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
-                              capture_output=True, timeout=20)
+        _GIT_HOME.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    cmd = [_git_binary(), "-c", "core.fsmonitor=false", "-c", "core.pager=cat",
+           "-c", "core.untrackedCache=false"]
+    if cwd is not None:
+        cmd += ["-C", str(cwd)]
+    cmd += args
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=_git_env())
     except (OSError, subprocess.SubprocessError):
         return None
-    if proc.returncode != 0:
+    return proc if proc.returncode == 0 else None
+
+
+def _git_toplevel(repo_root: Path) -> str | None:
+    """这个目录所在的 git 仓库顶层(取不到就不是 git 仓库)。"""
+    proc = _git_run(["rev-parse", "--show-toplevel"], cwd=repo_root, timeout=20)
+    if proc is None:
         return None
     top = proc.stdout.decode("utf-8", "replace").strip()
     return top or None
 
 
-def git_committed_paths(repo_root: Path, rel_dirs) -> tuple[str, set] | None:
+_GIT_DIR_CACHE: dict = {}
+_GIT_COMMON_DIR_CACHE: dict = {}
+
+
+def _git_gitdir(repo_root: Path) -> Path | None:
+    """这个仓库的 .git 目录(工作树里 .git 可能是文件,指向真正的 gitdir)。
+
+    进程内缓存:这个路径在一次运行里不会变,而每次查它都要起一个 git 进程
+    (第 26 轮 codex 的 Low 1)。
+    """
+    key = str(repo_root)
+    if key in _GIT_DIR_CACHE:
+        return _GIT_DIR_CACHE[key]
+    proc = _git_run(["rev-parse", "--absolute-git-dir"], cwd=repo_root, timeout=20)
+    result = None
+    if proc is not None:
+        raw = proc.stdout.decode("utf-8", "replace").strip()
+        result = Path(raw) if raw else None
+    _GIT_DIR_CACHE[key] = result
+    return result
+
+
+def git_committed_paths(repo_root: Path, rel_dirs) -> tuple[str, dict] | None:
     """(仓库顶层目录, HEAD 里这些目录下的**已提交**文件)——路径相对顶层目录。
+
+    值是 blob 的 sha(取内容用 `git cat-file blob`,**不应用任何 filter**)。
 
     返回 None = 这台机器上取不到基准(不是 git 仓库 / 没装 git / HEAD 不存在)——
     调用方按"查不了等于没查"处理(fail-closed),**不**当作"没有基准、随便放行"。
@@ -159,43 +299,188 @@ def git_committed_paths(repo_root: Path, rel_dirs) -> tuple[str, set] | None:
     top = _git_toplevel(repo_root)
     if top is None:
         return None
+    top_path = Path(top)
+    # 路径统一到**仓库顶层**口径(第 26 轮 codex 的 Medium 1):
+    # 原来这里按 repo_root 拼 pathspec、却按 toplevel 解释输出,
+    # repo_root != toplevel 时两边对不上 → 受信导入被**整片误杀**。
+    dirs: list[str] = []
+    for name in rel_dirs:
+        base = Path(repo_root).resolve() / name
+        try:
+            rel = os.path.relpath(str(base), str(top_path)).replace("\\", "/")
+        except ValueError:
+            continue
+        if rel.startswith(".."):
+            continue                       # 不在这个仓库里 → 提交里不会有它
+        dirs.append(rel)
+    if not dirs:
+        return top, {}
+    proc = _git_run(["ls-tree", "-r", "--full-tree", "HEAD", "--", *dirs],
+                    cwd=top_path, timeout=20)
+    if proc is None:
+        return None
+    committed: dict[str, str] = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) < 3 or parts[1] != "blob":
+            continue
+        committed[path.strip().replace("\\", "/")] = parts[2]
+    return top, committed
+
+
+# 提交里那份 blob 的内容缓存:键 = (仓库顶层, blob sha)。
+# blob 内容按 sha 寻址,**不可变**,所以缓存永远不会过期(不像工作区文件)。
+_GIT_BLOB_CACHE: dict = {}
+
+
+def git_committed_blob(top: str, sha: str) -> bytes | None:
+    """取提交里某个 blob 的**原始字节**(不应用 filter,不做换行归一化)。"""
+    key = (str(top), sha)
+    if key in _GIT_BLOB_CACHE:
+        return _GIT_BLOB_CACHE[key]
+    proc = _git_run(["cat-file", "blob", sha], cwd=Path(top), timeout=20)
+    if proc is None:
+        return None
+    data = proc.stdout
+    _GIT_BLOB_CACHE[key] = data
+    return data
+
+
+def _same_content(committed: bytes, worktree: bytes) -> bool:
+    """两份内容是不是"实质一致"(只差换行)。
+
+    第 25 轮的错误教训:自己算 git 的 blob 哈希会在 CRLF/LF 上误判。
+    这里不比哈希,只比"去掉 CRLF 之后"的内容——换行之外的任何差异都算不一致。
+    """
+    if committed == worktree:
+        return True
+    return committed.replace(b"\r\n", b"\n") == worktree.replace(b"\r\n", b"\n")
+
+
+def _git_common_dir(repo_root: Path) -> Path | None:
+    """仓库的**共用** git 目录(`.git/config` 与 `.git/info/attributes` 在这儿)。
+
+    第 26 轮 codex 第二轮实测出来的坑(High 1):
+    **linked worktree** 里 `git rev-parse --absolute-git-dir` 指的是
+    **per-worktree** 的 gitdir(`.git/worktrees/<名字>`),而 `.git/config`
+    在 **common dir** 里。只按 per-worktree gitdir 取指纹 → **config 根本没被记下来**。
+    本仓库自己就是这个形态(`invest-26` 是 `invest` 的 linked worktree),
+    也就是说"守卫记下了 .git/config 的指纹"这条承诺在实际部署形态里只兑现了一部分。
+    """
+    key = str(repo_root)
+    if key in _GIT_COMMON_DIR_CACHE:
+        return _GIT_COMMON_DIR_CACHE[key]
+    proc = _git_run(["rev-parse", "--git-common-dir"], cwd=repo_root, timeout=20)
+    result = None
+    if proc is not None:
+        raw = proc.stdout.decode("utf-8", "replace").strip()
+        if raw:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = Path(repo_root).resolve() / candidate
+            result = candidate
+    _GIT_COMMON_DIR_CACHE[key] = result
+    return result
+
+
+def git_metadata_fingerprints(repo_root: Path) -> dict:
+    """仓库元数据的指纹。
+
+    为什么要在**构造守卫时**就记下来(第 26 轮 codex 的 Critical 1):
+    `.git/config` 与 `.git/HEAD` 都在候选的可写范围内,候选可以改它们
+    (`.git/config` 里塞 `core.fsmonitor=<命令>` 就是"让 git 替候选执行命令";
+    `.git/HEAD` 指向另一个提交就能让提交基准看到候选挑过的那份树)。
+    所以 check() 时要核一遍:**候选运行期间仓库元数据被动过 → fail-closed**。
+
+    记哪几份(第 26 轮 codex 第二轮修过两次):
+    - `config` 与 `info/attributes` 在 **common dir**(linked worktree 里不在 per-worktree gitdir);
+    - `HEAD` 在 **per-worktree gitdir**(linked worktree 每个工作树各有一份);
+    - **`.git/index` 不再记**(第 26 轮 codex 第二轮的 Medium):提交基准走的是
+      `ls-tree HEAD` + `git cat-file`,**从不读 index**;而 index 会被**任何**一次
+      `git add`/`commit`/`stash` 改写 → 把它算进指纹等于"别人提交了一次就把
+      全部受信导入拒掉"(实测误杀)。不记它不损失任何检查能力。
+
+    取不到 gitdir(不是 git 仓库)返回空表——那一层由"取不到提交基准就拒"兜着。
+    """
+    prints: dict = {}
+    common = _git_common_dir(repo_root)
+    if common is not None:
+        for name in ("config", "info/attributes"):
+            digest = _file_digest(common / name)
+            if digest is not None:
+                prints[f"common:{name}"] = digest
+    gitdir = _git_gitdir(repo_root)
+    if gitdir is not None:
+        digest = _file_digest(gitdir / "HEAD")
+        if digest is not None:
+            prints["HEAD"] = digest
+    return prints
+
+
+def _file_digest(path: Path) -> str | None:
+    """文件内容的 sha256;读不到返回 None(那一项就不记)。"""
     try:
-        proc = subprocess.run(["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only",
-                               "HEAD", "--", *rel_dirs],
-                              capture_output=True, timeout=20)
-    except (OSError, subprocess.SubprocessError):
+        data = path.read_bytes()
+    except OSError:
         return None
-    if proc.returncode != 0:
-        return None
-    paths = {line.strip().replace("\\", "/")
-             for line in proc.stdout.decode("utf-8", "replace").splitlines() if line.strip()}
-    return top, paths
+    return hashlib.sha256(data).hexdigest()
 
 
-def git_dirty_paths(repo_root: Path, rel_dirs) -> set | None:
-    """这些目录里**与 HEAD 不一致**的文件(相对仓库顶层目录)。
+# 目录扫描:**不缓存**(第 26 轮 codex 第二轮的 Medium 3 的处置)。
+# 第 26 轮第一版这里有个"按目录 mtime 失效"的缓存,后来实测出它在
+# **粗粒度文件系统**(1~2 秒一档的网络盘/exFAT)上会漏:
+# 同一秒内新增的文件与上一次扫描共享同一个 mtime 档 → 缓存命中 → 新文件不进清单
+# → 通配符裁决看不见它 → 候选写进受信包的辅助模块仍会被通配符导入执行。
+# 受信目录只有**个位数**文件,这个缓存几乎不省什么,却拿安全换性能——**撤掉**。
+def _scan_dir(directory: Path) -> tuple[list, list]:
+    """(目录下的 .py 文件, 子目录)。"""
+    files: list = []
+    dirs: list = []
+    for entry in sorted(directory.iterdir()):
+        try:
+            if entry.is_dir():
+                dirs.append(entry)
+            elif entry.is_file() and entry.suffix == ".py":
+                files.append(entry)
+        except OSError:
+            continue
+    return files, dirs
 
-    用 git 自己的比较口径,而不是我们自己算哈希:git 会按 `core.autocrlf`
-    与 `.gitattributes` 归一化换行后再比。自己按字节算哈希会把
-    "工作区 CRLF / 提交里 LF"这种**内容其实一致**的情况误判成"被改写过"
-    (Windows 上仓库默认就长这样)——那会让受信目录里的正常模块一律被拒。
 
-    None = 查不到(不是 git 仓库 / git 报错)→ 调用方 fail-closed。
+def _purge_bytecode_cache(source: Path) -> None:
+    """删掉某个源文件对应的字节码缓存(`__pycache__/*.pyc`)。
+
+    为什么(第 26 轮 codex 第二轮实测的 High 2):
+    提交基准核对的是**源码**,而 CPython 导入时**优先用 `.pyc`**——
+    `.pyc` 的有效性只校验头部里的 mtime+size(候选能伪造)。
+    于是"受信目录必须与仓库提交一致"这条规则对**实际执行的产物**并不成立:
+    候选伪造一个 `.pyc` 就能让导入机制执行自己的字节码(实测:真内建下跑出标记文件)。
+    处置:核对完源码之后把可能伪造的 `.pyc` **删掉**,
+    导入机制于是从**已核对过的那份源码**重新编译。
+    (代价:每个受信模块每个候选重编译一次——毫秒级,换来的是"执行的一定是核对过的那份"。)
     """
     try:
-        proc = subprocess.run(["git", "-C", str(repo_root), "status", "--porcelain", "-z",
-                               "--no-renames", "-uall", "--", *rel_dirs],
-                              capture_output=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    out: set = set()
-    for record in proc.stdout.decode("utf-8", "replace").split("\0"):
-        # porcelain -z 的记录是 "XY <路径>";重命名已用 --no-renames 关掉,不会多出第二条。
-        if len(record) < 4:
-            continue
-        out.add(record[3:].replace("\\", "/"))
+        cache = Path(importlib.util.cache_from_source(str(source)))
+    except (NotImplementedError, ValueError):
+        return
+    try:
+        cache.unlink()
+    except OSError:
+        pass                    # 没有就没有(不是错误)
+
+
+def _rglob_py(directory: Path) -> list:
+    """目录下**递归**的全部 .py(查不到就抛 OSError,由调用方 fail-closed)。"""
+    out: list = []
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        files, dirs = _scan_dir(current)
+        out.extend(files)
+        stack.extend(dirs)
     return out
 
 
@@ -235,6 +520,7 @@ def _capability_source(value) -> str | None:
 
 
 _LEAK_CACHE: "weakref.WeakKeyDictionary[ModuleType, tuple]" = weakref.WeakKeyDictionary()
+# 缓存条目 = (成员数量, {成员名: 成员对象}, 判定结果)——见 `_capability_leak` 的失效判据。
 
 
 def _capability_leak(value) -> str | None:
@@ -246,30 +532,43 @@ def _capability_leak(value) -> str | None:
     **按模块缓存**(第 25 轮 codex 的 Medium 7):原来每次属性访问都要全量扫 `vars(module)`,
     实测视图取一个属性 14.7µs、候选热点循环慢 19 倍(20000 次 `np.random.normal()`:
     沙盒 0.327s vs 普通 0.017s)。研究侧是"多候选 × 多 bar × 多参数"的放大场景,
-    这一项能吃掉整轮预算。缓存键是模块本身(弱引用,回收即消失),
-    失效条件用 `len(vars(module))`:模块成员变了,长度多半也变了;真变了长度却不变的情况
-    (换了一个成员但数量不变)会用到旧判定——登记为已知残余。
+    这一项能吃掉整轮预算。缓存键是模块本身(弱引用,回收即消失)。
+
+    **失效判据**(第 26 轮 codex 的 Low 2 修正):原来只看 `len(vars(module))`,
+    于是"**等量替换**成员"(换掉一个成员、成员数量不变)会用到旧判定——
+    实测把 `ctypes` 换进去、长度不变,判定却还是"没有泄漏"。
+    现在缓存里存的是**成员名 → 对象身份**的对照,复用前逐个核对:
+    长度不变且每个已缓存的名字仍指向**同一个对象** ⇒ 模块成员集合没变 ⇒ 判定有效;
+    只要有一个名字不见了或换了对象(哪怕数量不变)就重算。
+    代价是每次访问 O(n) 次字典查找(比原来 O(n) 次 `getattr` 便宜得多)。
     """
     if not isinstance(value, ModuleType):
         return None
     try:
-        size = len(vars(value))
+        members_dict = vars(value)
+        size = len(members_dict)
     except TypeError:                                    # 理论上模块都有 __dict__
         return None
     cached = _LEAK_CACHE.get(value)
     if cached is not None and cached[0] == size:
-        return cached[1]
+        known = cached[1]
+        for name, obj in known.items():
+            current = members_dict.get(name)
+            if current is not obj:      # 用 `is` 比对象本身,不用 id(避免地址复用的假相等)
+                break
+        else:
+            return cached[2]
     try:
-        members = list(vars(value).values())
+        items = list(members_dict.items())
     except TypeError:
         return None
     found = None
-    for item in members:
+    for _, item in items:
         source = _capability_source(item)
         if source:
             found = source
             break
-    _LEAK_CACHE[value] = (size, found)
+    _LEAK_CACHE[value] = (size, {name: obj for name, obj in items}, found)
     return found
 
 
@@ -581,8 +880,14 @@ class RepoImportGuard:
         # 默认开(查不了等于没查,fail-closed);单元测试用临时目录模拟仓库,那里没有 git 基准,
         # 所以测试显式关掉这条(另有一条用真 git 夹具的用例专门盯它)。
         self.verify_trusted_against_git = verify_trusted_against_git
+        # 仓库元数据的指纹(第 26 轮 codex 的 Critical 1):
+        # **候选运行前**记下 .git/config / .git/HEAD / .git/index,
+        # check() 时核一遍——候选改了它们(fail-closed),而不是让守卫拿着
+        # 被改过的配置去跑 git(那等于替候选执行候选写的命令)。
+        self._metadata_fingerprints = git_metadata_fingerprints(self.repo_root) \
+            if verify_trusted_against_git else {}
 
-    def _git_baseline(self) -> tuple[str, set] | None:
+    def _git_baseline(self) -> tuple[str, dict] | None:
         """受信目录的**提交基准**(进程内缓存:起一次 git 就够,不必每个候选重起一次)。
 
         None = 取不到基准(不是 git 仓库 / 没装 git / HEAD 不存在)→ 调用方 fail-closed。
@@ -591,6 +896,52 @@ class RepoImportGuard:
         if key not in _GIT_BASELINE_CACHE:
             _GIT_BASELINE_CACHE[key] = git_committed_paths(self.repo_root, list(self.allowed_dirs))
         return _GIT_BASELINE_CACHE[key]
+
+    def _metadata_changed(self) -> bool:
+        """仓库元数据(.git/config / .git/HEAD / .git/index)是不是被候选动过了。"""
+        if not self._metadata_fingerprints:
+            return False
+        current = git_metadata_fingerprints(self.repo_root)
+        for name, digest in self._metadata_fingerprints.items():
+            if current.get(name) != digest:
+                return True
+        return False
+
+    def _committed_content_problem(self, resolved: Path) -> str | None:
+        """这个受信文件是不是与**仓库提交里那份**不一致(返回拒绝理由,None 表示一致)。
+
+        口径(第 26 轮 codex 的 Critical 1 与 Medium 1):
+        - 路径一律相对**仓库顶层**(与 `git_committed_paths` 的口径一致);
+        - 内容取**提交里那份 blob**(`git cat-file`,不应用 filter),
+          与工作区内容只比"去掉 CRLF 之后"是否一样;
+        - 文件不在提交里 → 拒绝(那是候选写出来的)。
+        """
+        baseline = self._git_baseline()
+        if baseline is None:
+            return ("无法验证受信目录的完整性"
+                    "(取不到仓库提交基准,查不了等于没查,fail-closed)")
+        top, committed = baseline
+        try:
+            rel = os.path.relpath(str(resolved), top).replace("\\", "/")
+        except ValueError:                        # 不在同一个盘上(理论上不可能)
+            rel = self._rel(resolved).replace("\\", "/")
+        sha = committed.get(rel)
+        if sha is None:
+            return ("该文件不在仓库提交里"
+                    "(候选运行期间写出的文件一律不得被导入)")
+        blob = git_committed_blob(top, sha)
+        if blob is None:
+            return ("无法验证受信目录的完整性"
+                    "(读不到提交里的内容,查不了等于没查,fail-closed)")
+        try:
+            worktree = resolved.read_bytes()
+        except OSError:
+            return ("该文件的内容读不到"
+                    "(查不了等于没查,fail-closed)")
+        if not _same_content(blob, worktree):
+            return ("该文件与仓库提交的内容不一致"
+                    "(候选运行期间被改动过)")
+        return None
 
     def _trusted_dir_writable(self, resolved: Path) -> bool:
         """受信目录**能不能被写**。
@@ -656,26 +1007,23 @@ class RepoImportGuard:
         # 挡不住"上一轮写、这一轮导"(上一轮被改写的文件,这一轮的快照已经收进去了)。
         # 受信目录必须与**仓库提交**一致:要么这个文件根本不在提交里(候选写的),
         # 要么内容与提交不一致(候选改写的)——两种都拒绝导入。
+        #
+        # 第 26 轮 codex 的 Critical 1 补记:这里**不再用 `git status`**。
+        # `git status` 会应用 filter,候选在 `.git/config` 里写一条 filter 命令,
+        # 守卫就替候选执行了它(实测标记文件被写出)。现在改成
+        # "取提交里那份 blob + 只比换行",git 全程不碰工作区文件。
         if self.verify_trusted_against_git and self._trusted_dir_writable(resolved):
-            baseline = self._git_baseline()
-            if baseline is None:
-                return (f"禁止导入 {name}:无法验证受信目录的完整性"
-                        f"(取不到仓库提交基准,查不了等于没查,fail-closed)")
-            top, committed = baseline
-            try:
-                rel = os.path.relpath(str(resolved), top).replace("\\", "/")
-            except ValueError:                        # 不在同一个盘上(理论上不可能)
-                rel = self._rel(resolved).replace("\\", "/")
-            if rel not in committed:
-                return (f"禁止导入 {name}:该文件不在仓库提交里"
-                        f"(候选运行期间写出的文件一律不得被导入)")
-            dirty = git_dirty_paths(self.repo_root, list(self.allowed_dirs))
-            if dirty is None:
-                return (f"禁止导入 {name}:无法验证受信目录的完整性"
-                        f"(查不到仓库状态,查不了等于没查,fail-closed)")
-            if rel in dirty:
-                return (f"禁止导入 {name}:该文件与仓库提交的内容不一致"
-                        f"(候选运行期间被改动过)")
+            if self._metadata_changed():
+                return (f"禁止导入 {name}:仓库元数据(.git/config/.git/HEAD)"
+                        f"在候选运行期间被改动过"
+                        f"(查不了等于没查,fail-closed)")
+            problem = self._committed_content_problem(resolved)
+            if problem:
+                return f"禁止导入 {name}:{problem}"
+            # 源码核对过了,但**执行的**可能不是它:CPython 导入时优先用
+            # `__pycache__/*.pyc`,而 .pyc 只校验头部里的 mtime+size(候选能伪造)。
+            # 把可能伪造的 .pyc 删掉,导入机制就会从刚核对过的那份源码重新编译。
+            _purge_bytecode_cache(resolved)
         return None
 
     @staticmethod
@@ -752,6 +1100,17 @@ class RepoImportGuard:
                         f"{list(self.allowed_dirs)} 内(候选不得导入框架、风控或回测模块)")
         return None
 
+    def _package_py_files(self, name: str, resolved: Path) -> tuple[list, str | None]:
+        """包里(递归)的全部 .py;(列表, 拒绝理由)。
+
+        列不出来 = 查不了 = 拒(fail-closed),与本文件其它地方同一口径。
+        """
+        try:
+            return sorted(_rglob_py(resolved)), None
+        except OSError:
+            return [], (f"禁止从 {name} 导入 *:无法列出包内的文件"
+                        f"(查不了等于没查,fail-closed)")
+
     def check_package_wildcard(self, name: str) -> str | None:
         """裁决 `from <包> import *`(通配符)。
 
@@ -767,18 +1126,28 @@ class RepoImportGuard:
 
         修法:通配符这一路改成"扫目录"——包内(仓库侧)的每个 `.py` 都必须在快照里、
         且此后没被改过;只要多出一个文件(候选写的)就拒。
+
+        第 26 轮 codex 的 Critical 2:这里原来**只有**"快照"这一关,没有**提交基准**这一关——
+        于是"上一轮候选改写了包里的 .py、这一轮 `from 包 import *`"这条跨轮次逃逸原样可用。
+        现在**每一个 .py 都要过提交基准**(与 `check()` 同一把尺子)。
         """
         for loc in module_locations(name):
             try:
                 resolved = Path(loc).resolve()
             except OSError:
-                continue
+                # 第 26 轮 codex 的 Medium 2:原来这里 continue(跳过)——
+                # "查不出来"被当成了"没问题",与同文件 `check_package` 的 fail-closed 口径相反。
+                return (f"禁止从 {name} 导入 *:无法确认包位置的状态"
+                        f"(查不了等于没查,fail-closed)")
             if self.repo_root != resolved and self.repo_root not in resolved.parents:
                 # 仓库之外(站点包):**同样**要过"运行之前就存在"这一关。
                 # 站点包在宿主机上通常可写,候选往里面写一个模块,
                 # 而包自己的 `__all__` 正好列着那个名字——通配符导入会由
                 # **导入机制**去 import 它,整条路不经过守卫(与仓库内同一条洞)。
-                for path in sorted(resolved.rglob("*.py")):
+                files, problem = self._package_py_files(name, resolved)
+                if problem:
+                    return problem
+                for path in files:
                     reason = self._written_during_run(path)
                     if reason:
                         return f"禁止从 {name} 导入 *:包内 {path.name} {reason}"
@@ -786,7 +1155,10 @@ class RepoImportGuard:
             if not self._under_allowed_dir(resolved):
                 return (f"禁止从 {name} 导入 *:包位置 {self._rel(resolved)} 不在允许的目录 "
                         f"{list(self.allowed_dirs)} 内(候选不得导入框架、风控或回测模块)")
-            for path in sorted(resolved.rglob("*.py")):
+            files, problem = self._package_py_files(name, resolved)
+            if problem:
+                return problem
+            for path in files:
                 try:
                     key = str(path.resolve())
                     stat = path.stat()
@@ -801,6 +1173,17 @@ class RepoImportGuard:
                             f"(候选运行期间写出的文件一律不得被导入)")
                 if self._changed(known, path, stat):
                     return f"禁止从 {name} 导入 *:包内 {path.name} 在候选运行期间被改动过"
+                # **提交基准**(第 26 轮 codex 的 Critical 2):通配符路径上的每个 .py
+                # 都要与**仓库提交里那份**一致——否则"上一轮改写、这一轮通配符导入"可用。
+                if self.verify_trusted_against_git and self._trusted_dir_writable(path):
+                    if self._metadata_changed():
+                        return (f"禁止从 {name} 导入 *:仓库元数据(.git/config/.git/HEAD)"
+                                f"在候选运行期间被改动过"
+                                f"(查不了等于没查,fail-closed)")
+                    problem = self._committed_content_problem(path)
+                    if problem:
+                        return f"禁止从 {name} 导入 *:包内 {path.name} {problem}"
+                    _purge_bytecode_cache(path)
         return None
 
 
@@ -921,7 +1304,19 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard):
             # 构造一个 `__init__.py` 里 `del sys.modules['pkgx'].sub` 的包,
             # `from pkgx import sub` 拿到的就是**真模块**(isinstance(view) 为 False)。
             # 所以这里显式查一次 sys.modules:命中的是真模块,就按真模块的规矩裁决。
-            real = _modules.get(f"{name}.{item}")
+            #
+            # **第 26 轮 codex 的 Critical 3**:回退键必须是**解析后的绝对名**。
+            # CPython 的回退键是 `<返回模块>.__name__ + "." + item`——返回模块的
+            # `__name__` 永远是**绝对**名(相对导入时是包名,不是 "")。
+            # 原来这里用原始的 `name`:相对导入时 `name` 可能是 ""(from . import x),
+            # 于是查表永远落空 → 视图拒绝之后回退把**真模块**交给候选 → 真 ctypes。
+            # 现在按**返回模块的 __name__** 查(它就是绝对名)。
+            pkg_name = name
+            try:
+                pkg_name = _get(module, "__name__") or name
+            except Exception:                # noqa: BLE001 —— 取不到就退回原始名
+                pkg_name = name
+            real = _modules.get(f"{pkg_name}.{item}")
             if real is not None and isinstance(real, _mt):
                 if _danger(real):
                     raise ImportError(f"禁止导入 {name}.{item}:模块视图不把危险模块 "
@@ -1005,11 +1400,17 @@ def resolve_pending(arg: str, root: Path, pending_dir: str = PENDING_DIR) -> Pat
     return resolved
 
 
-def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: Sequence[str] = ()) -> list[str]:
+def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: Sequence[str] = (),
+                  package: str = "") -> list[str]:
     """静态筛查:返回发现的可疑构造(中文说明);空列表表示未发现。**不是安全保证。**
 
-    extra_* 来自配置,只能在内置禁用清单之上追加,不能删减。"""
-    forbidden_modules = FORBIDDEN_MODULES | set(extra_modules)
+    extra_* 来自配置,只能在内置禁用清单之上追加,不能删减。
+
+    package = 候选源码所在包的**绝对**名(空串 = 不在任何包内)。相对导入
+    (`from . import x`)要靠它还原成绝对名再筛(第 26 轮 codex 的 Low 3):
+    原来相对导入在静态层**整个被跳过**(`node.module` 是 None),
+    于是 `from . import os` 这种写法连"名字"都没进筛查。"""
+    forbidden_modules = FORBIDDEN_MODULES | DANGEROUS_MODULE_NAMES | set(extra_modules)
     forbidden_calls = FORBIDDEN_CALLS | set(extra_calls)
     try:
         tree = ast.parse(source)
@@ -1029,13 +1430,35 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
             # 但原实现只看 `node.module`(numpy),看不见 names 里的 ctypeslib,
             # 于是这条写法**放行**(第 25 轮 codex 的 Medium 6 实测)。
             # 而运行期的拒绝发生在 import **之后**——模块已经在导入机制里以真实内建执行过,副作用已经发生。
-            names = [node.module or ""]
-            for alias in node.names:
-                if node.module and alias.name != "*":
-                    names.append(f"{node.module}.{alias.name}")
+            if node.level and node.level > 0:
+                # **相对导入**(第 26 轮 codex 的 Low 3):按 `__package__` 还原成绝对名。
+                # 还原不出来(不在任何包内)就**拒**——候选文件是单文件模块,
+                # 相对导入在运行期本来就是 ImportError,静态层提前拒掉口径一致。
+                base = package.split(".") if package else []
+                if node.level > 1:
+                    base = base[: -(node.level - 1)]
+                module = ".".join([p for p in base if p] + ([node.module] if node.module else []))
+                if not module:
+                    findings.append(f"第 {node.lineno} 行: 禁止相对导入"
+                                    f"(from {'.' * node.level}"
+                                    f"{node.module or ''} import ...)"
+                                    f"(无法确定它指向哪个绝对模块,查不了等于没查,fail-closed)")
+                    names = []
+                else:
+                    names = [module]
+                    for alias in node.names:
+                        if alias.name != "*":
+                            names.append(f"{module}.{alias.name}")
+            else:
+                names = [node.module or ""]
+                for alias in node.names:
+                    if node.module and alias.name != "*":
+                        names.append(f"{node.module}.{alias.name}")
         else:
             names = []
         for name in names:
+            if not name:
+                continue
             if name.split(".")[0] in forbidden_modules:
                 findings.append(f"第 {node.lineno} 行: 禁止导入 {name}")
             elif any(name == path or name.startswith(path + ".") for path in FORBIDDEN_MODULE_PATHS):

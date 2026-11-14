@@ -115,12 +115,16 @@ BASE = """
 
 PROBE_LOADER = """
     try:
-        import types
-        m = types.ModuleType("pending_strategy")
-        __loader__.exec_module(m)
-        LEAK["loader"] = hasattr(m, "S")
-    except Exception:
+        loader = __loader__
+    except NameError:
         LEAK["loader"] = False
+    else:
+        try:
+            m = loader.module_from_spec(__spec__)
+            loader.exec_module(m)
+            LEAK["loader"] = hasattr(m, "S")
+        except Exception:
+            LEAK["loader"] = False
 """
 
 # 顺着异常链(含 __context__)找真实内建:
