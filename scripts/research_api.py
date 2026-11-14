@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import hmac
 import importlib.util
@@ -56,6 +57,11 @@ PHASES = (PHASE_DECLARATION, PHASE_SELECTION, PHASE_VALIDATION)
 # 子进程结果的年化夏普合理上界:超过它的结果一律拒绝采信(伪造的兜底,不是策略门槛)。
 # 真实策略的年化夏普在个位数;50 已经宽松到不可能是误伤。
 MAX_ABS_OOS_SHARPE = 50.0
+# 子进程结果文件的大小上限:父进程读它之前先看大小。
+# 候选能回传任意长的数组(比如百万条 pnl),没有上限时父进程会把它整个读进内存——
+# 沙盒不给子进程设资源上限,所以这条是父进程侧唯一的兜底(fail-closed:超限即拒绝采信)。
+# 4 MB 对真实结果绰绰有余:回测结果只有 trade 级 pnl 与一行 stats,门槛结果只有汇总指标。
+MAX_RESULT_BYTES = 4 * 1024 * 1024
 # gate 无法验证候选参数是怎么选出来的,只能提醒:参数若参考过验证窗口(2022-07 ~ 2023-12)的表现,该窗口就不再是样本外
 PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必须在没看过滚动验证窗口(2022-07-01 ~ 2023-12-31)的情况下选定;"
                    "optimize_15m.py 默认的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠;请用 optimize_15m.py --select-only(训练段止于 2022-06-30)选参。")
@@ -279,6 +285,7 @@ _HMAC_NEW = hmac.new
 _SHA256 = hashlib.sha256
 _OS_REPLACE = os.replace
 _PATH_WRITE_TEXT = Path.write_text
+_ATEXIT_CLEAR = atexit._clear
 
 
 def _make_handoff() -> dict:
@@ -324,6 +331,12 @@ def check_result_bounds(body: dict) -> None:
 def _read_child_result(handoff: dict) -> dict:
     """读回子进程写的结果并**验签**。签名对不上 = 结果被换过 → 拒绝采信(fail-closed)。"""
     path = Path(handoff["path"])
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise JobError(EXIT_FAILED, "子进程没有回传结果(结果文件缺失)")
+    if size > MAX_RESULT_BYTES:
+        raise JobError(EXIT_FAILED, "子进程结果文件过大,已拒绝采信")
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -983,10 +996,12 @@ def _clear_atexit() -> None:
     """清掉候选注册的 atexit 钩子。
 
     结果写完就退出:钩子若还能跑,就只剩"事后篡改"的机会(候选可以顺手把结果文件改掉)。
-    框架自己在这条路径上没有必须执行的 atexit,所以整体清空是安全的。"""
+    框架自己在这条路径上没有必须执行的 atexit,所以整体清空是安全的。
+
+    用**导入时按住的那个** `atexit._clear`:候选若把 `atexit._clear` 换成空函数,
+    这里调用的就还是原版(否则"清空"这一步会被候选自己取消)。"""
     try:
-        import atexit
-        atexit._clear()                                   # noqa: SLF001 - 唯一能整体清空的办法
+        _ATEXIT_CLEAR()
     except Exception:                                    # noqa: BLE001 - 清不掉就清不掉,验签照样兜着
         pass
 
@@ -995,9 +1010,13 @@ def emit_result(body: dict) -> None:
     """把结果写进父进程建的随机文件,并附上 MAC。stdout 只是日志,不是结果通道。"""
     if (json.dumps is not _JSON_DUMPS or json.loads is not _JSON_LOADS or hmac.new is not _HMAC_NEW
             or hashlib.sha256 is not _SHA256 or os.replace is not _OS_REPLACE
-            or Path.write_text is not _PATH_WRITE_TEXT):
+            or Path.write_text is not _PATH_WRITE_TEXT or atexit._clear is not _ATEXIT_CLEAR):
         raise JobError(EXIT_REFUSED, "写结果前发现运行时对象被改写,拒绝回传结果")
     handoff = _child_handoff()
+    # 真结果已经算好了,现在把候选注册的 atexit 钩子清掉:钩子是在进程退出时跑的,
+    # 不清掉的话它能在**结果写完之后**再改一次那个文件(改坏了会被父进程验签拒掉,
+    # 但那是一次"结果明明跑完了却被判失败"的响亮失败)。清空只影响这一个子进程。
+    _clear_atexit()
     payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
     mac = hmac.new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     path = Path(handoff["path"])

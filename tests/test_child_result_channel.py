@@ -381,3 +381,78 @@ def test_a_normal_backtest_sharpe_still_passes(tree, monkeypatch, capsys):
 
     out = json.loads(capsys.readouterr().out)
     assert code == api.EXIT_OK and out["stats"]["sharpe"] == 1.2
+
+
+# ---------------- 第 30 轮:钩子清空要真的接上,结果文件要有大小上限 ----------------
+
+def test_the_candidate_atexit_hook_cannot_rewrite_the_result_after_it_was_written(tmp_path):
+    """候选注册的 atexit 钩子不许在**结果写完之后**再改那个文件。
+
+    第 27 轮订的规矩是"写结果前清掉候选注册的 atexit 钩子",但那条规矩**只在文档里**:
+    `_clear_atexit()` 定义了却从来没被调用过(死代码)。候选的钩子是在进程退出时跑的,
+    于是它能在框架写完结果之后再改一次那个文件——改坏了会被父进程验签拒掉(fail-closed),
+    但那是一次"结果明明跑完了却被判失败"的响亮失败,不是设计里说的那样。
+
+    这条用例在**真子进程**里跑:在 pytest 进程里调 emit_result 会把 pytest 自己的
+    atexit 钩子一起清掉(覆盖率统计等),那是副作用不是被测行为。"""
+    scripts_dir = str(Path(api.__file__).resolve().parent)
+    result_path = tmp_path / "child_result.json"
+    script = tmp_path / "child.py"
+    script.write_text(
+        "import atexit, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {scripts_dir!r})\n"
+        "import research_api as api\n"
+        f"handoff = {{'path': {str(result_path)!r}, 'key': 'k' * 64, 'dir': {str(tmp_path)!r}}}\n"
+        "api._child_handoff = lambda: handoff\n"
+        "def sabotage():\n"
+        f"    Path(handoff['path']).write_text('FORGED', encoding='utf-8')\n"
+        "atexit.register(sabotage)\n"
+        "api.emit_result({'stats': {'sharpe': 1.0}})\n",
+        encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, proc.stderr
+
+    envelope = json.loads(result_path.read_text(encoding="utf-8"))
+    assert json.loads(envelope["body"]) == {"stats": {"sharpe": 1.0}}
+
+
+def test_an_oversized_result_file_is_refused(tree, monkeypatch, capsys):
+    """候选回传一个超大的结果文件(比如百万条 pnl)→ 父进程**不把它整个读进内存**。
+
+    沙盒不给子进程设资源上限,所以父进程侧必须有一道大小兜底:先看文件多大,超了直接拒。"""
+    make_strategy(tree)
+    monkeypatch.setattr(api, "MAX_RESULT_BYTES", 1024)
+
+    def on_handoff(handoff):
+        write_child_result(handoff, {"stats": {"sharpe": 1.0}, "pnls": ["x" * 64] * 100})
+
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=None, returncode=0, on_handoff=on_handoff))
+
+    code = api.main(["backtest", "--strategy", "s.py", "--class", "S", "--key", "CADJ",
+                     "--segment", "train", "--confirm-reviewed"])
+
+    err = capsys.readouterr().err
+    assert code == api.EXIT_FAILED
+    assert "过大" in err
+
+
+def test_the_result_size_cap_is_a_sane_number():
+    """双向:上限本身得是个像样的数(别写成 0 或几十字节,把正常结果也拒了)。"""
+    assert 1024 * 1024 <= api.MAX_RESULT_BYTES <= 64 * 1024 * 1024
+
+
+def test_a_result_file_just_under_the_cap_is_still_read(tree, monkeypatch, capsys):
+    """双向:没超上限的结果照常采信(别把正常结果也拒了)。"""
+    make_strategy(tree)
+    monkeypatch.setattr(api, "MAX_RESULT_BYTES", 1024)
+    body = {"stats": {"sharpe": 1.2, "round_trips": 3}, "pnls": [1, -1, 1]}
+    fake_subprocess(monkeypatch, lambda *a, **k: FakeChild(body=body))
+
+    code = api.main(["backtest", "--strategy", "s.py", "--class", "S", "--key", "CADJ",
+                     "--segment", "train", "--confirm-reviewed"])
+
+    out = json.loads(capsys.readouterr().out)
+    assert code == api.EXIT_OK and out["stats"]["sharpe"] == 1.2
