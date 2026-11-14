@@ -1019,17 +1019,19 @@ def test_a_concurrent_writer_is_not_mistaken_for_a_tampering_attack(tmp_path):
     import time
     from pathlib import Path
 
-    from risk.ladder import anchor_path_for
-
     repo = Path(__file__).resolve().parents[1]
-    ladder = Ladder(tmp_path / "ladder.json", anchor=anchor_path_for(tmp_path))
+    # 锚点必须落在 **tmp_path 之内**:anchor_path_for() 是 results_dir 的**兄弟**目录,
+    # 直接拿 tmp_path 当 results_dir 会把锚点写到 pytest 的会话级临时根目录里——
+    # 那条路径被同一个会话里的别的用例共用(一个用例的锚点会出现在另一个用例的梯子旁边)。
+    anchor = tmp_path / "elsewhere" / "ladder.anchor"
+    ladder = Ladder(tmp_path / "ladder.json", anchor=anchor)
     ladder.submit(1.0, run_id="seed")
     script = textwrap.dedent(f"""
         import sys, time
         sys.path.insert(0, {str(repo)!r})
         from pathlib import Path
-        from risk.ladder import Ladder, LadderExhausted, anchor_path_for
-        ladder = Ladder(Path({str(tmp_path / "ladder.json")!r}), anchor=anchor_path_for({str(tmp_path)!r}))
+        from risk.ladder import Ladder, LadderExhausted
+        ladder = Ladder(Path({str(tmp_path / "ladder.json")!r}), anchor=Path({str(anchor)!r}))
         deadline = time.monotonic() + 6.0
         i = 0
         while time.monotonic() < deadline:
@@ -1113,3 +1115,160 @@ def test_a_head_that_rolled_back_to_genesis_is_detected(tmp_path):
     ladder.path.write_text(json.dumps(h), encoding="utf-8")
     with pytest.raises(LadderError):
         ladder.status()
+
+
+# ---------- 第 27 轮 codex:头指针的**类型与范围**必须校验(Medium-1) ----------
+#
+# 此前头指针只校验"键齐全 + version 对",字段的形状没人管。于是被改过的头指针
+# 要么在别处炸出与篡改无关的 TypeError(一路冒到接口层变成 500),
+# 要么**静悄悄地通过**(seq 为负 → rows[seq-1] 取到倒数第二条)。
+# 口径与日志侧 `_check_record` 一致。
+
+def _head_with(ladder, **changes):
+    h = head(ladder)
+    h.update(changes)
+    ladder.path.write_text(json.dumps(h), encoding="utf-8")
+    return h
+
+
+def test_a_head_whose_seq_is_a_string_fails_closed_instead_of_crashing(tmp_path):
+    """`seq` 是字符串 → 此前 `head["seq"] > last["seq"]` 抛 TypeError(500「内部错误」),
+    现在必须是 fail-closed 的 LadderError。"""
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, seq="2")
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_whose_seq_is_negative_fails_closed(tmp_path):
+    """`seq` 为负 → `rows[seq-1]` 变成 `rows[-2]`,拿**另一条**记录去比对,可能碰巧对上。"""
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, seq=-1)
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_whose_best_is_not_a_multiple_of_the_step_fails_closed(tmp_path):
+    """汇报值必须是 η 的倍数——头指针上也要有这条保证。"""
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, best=5.5 + 0.05)
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_whose_budget_is_above_the_registered_cap_fails_closed(tmp_path):
+    """预算上限已登记(60),头指针不得放宽。"""
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, budget=DEFAULT_QUERY_BUDGET + 1)
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_whose_eta_was_rewritten_fails_closed(tmp_path):
+    """η 是登记在 ADR 里的汇报阈值,头指针里改它即 fail-closed。"""
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, eta=0.5)
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_with_a_malformed_hash_fails_closed(tmp_path):
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, hash="not-a-hash")
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_with_negative_queries_fails_closed(tmp_path):
+    ladder = two_steps(tmp_path)
+    _head_with(ladder, queries=-1)
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_that_is_a_valid_head_is_still_accepted(tmp_path):
+    """双向:正常的头指针不许被"更严"误伤。"""
+    ladder = two_steps(tmp_path)
+    assert ladder.status()["queries_used"] == 2
+
+
+# ---------- 第 27 轮 codex:读取顺序与"不再重读" ----------
+
+def test_the_witness_is_read_before_the_log(tmp_path):
+    """见证(头指针/锚点)必须**先于**日志被读取(第 22 轮修的就是这个顺序)。
+
+    写者的顺序是 日志 → 头指针 → 锚点;读者的顺序必须反过来,否则一次正常的并发写
+    会被读成篡改。这条断言是**确定性**的:不依赖时钟、不依赖真进程。"""
+    ladder = Ladder(tmp_path / "l.json", anchor=tmp_path / "elsewhere" / "l.anchor")
+    ladder.submit(1.0, run_id="a")
+    order = []
+    real_head, real_anchor, real_log = Ladder._head, Ladder._read_anchor, Ladder._read_log
+
+    def spy(name, fn):
+        def wrapper(self, *args, **kwargs):
+            order.append(name)
+            return fn(self, *args, **kwargs)
+        return wrapper
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(type(ladder), "_head", spy("head", real_head))
+    monkey.setattr(type(ladder), "_read_anchor", spy("anchor", real_anchor))
+    monkey.setattr(type(ladder), "_read_log", spy("log", real_log))
+    try:
+        ladder.status()
+    finally:
+        monkey.undo()
+    assert order.index("anchor") < order.index("log")
+    assert order.index("head") < order.index("log")
+
+
+def test_the_anchor_is_not_read_a_second_time_when_it_was_missing_at_the_first_read(tmp_path):
+    """调用方**已经**按顺序读过一遍锚点,核对时就**不许再读一次**。
+
+    此前"没传"与"传了 None"是同一件事,于是锚点文件当时不存在时会在**日志读完之后**再读一次——
+    顺序被倒回去,并发的写者这时写完锚点,一次正常的并发写就被判成"日志被回滚、截断或整条换掉"
+    (处方是破坏性的 `reset`)。
+
+    这条用例是**确定性**的:第一次读锚点返回"文件当时不存在",第二次读(只有旧实现才会发生)
+    返回一个**看起来合法**的见证——如果实现退回了旧行为,第二次读就会把那条合法的见证带进来,
+    于是"日志有两条、锚点缺失"这个本该 fail-closed 的状态被**放过去**(用例变红)。"""
+    ladder = Ladder(tmp_path / "l.json", anchor=tmp_path / "elsewhere" / "l.anchor")
+    ladder.submit(1.0, run_id="a")
+    ladder.submit(1.0, run_id="b")
+    rows = log_rows(ladder)
+    calls = {"n": 0}
+
+    def fake(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, None                  # 第一次读:锚点文件当时还不存在
+        return (1, rows[0]["hash"]), None     # 第二次读(旧实现):并发写者这时写好了锚点
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(type(ladder), "_read_anchor", fake)
+    try:
+        with pytest.raises(LadderError):
+            ladder.status()
+    finally:
+        monkey.undo()
+    assert calls["n"] == 1, "锚点被读了第二次:读取顺序被倒回去了"
+
+
+def test_the_anchor_is_read_exactly_once_per_load_in_the_normal_case(tmp_path):
+    """双向:正常路径(锚点存在)下,一次读取只读一遍锚点。"""
+    ladder = Ladder(tmp_path / "l.json", anchor=tmp_path / "elsewhere" / "l.anchor")
+    ladder.submit(1.0, run_id="a")
+    calls = {"n": 0}
+    real = Ladder._read_anchor
+
+    def counting(self, *args, **kwargs):
+        calls["n"] += 1
+        return real(self, *args, **kwargs)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(type(ladder), "_read_anchor", counting)
+    try:
+        ladder.status()
+    finally:
+        monkey.undo()
+    assert calls["n"] == 1

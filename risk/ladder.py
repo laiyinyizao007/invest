@@ -21,7 +21,10 @@ DSR 只惩罚试验次数、不惩罚每次试验带回的信息量,而测试段
 - `ladder.jsonl`:**只追加、带哈希链**的日志,每次提交/续期追加一行(`seq`、`event`、`run_id`、`queries`、`best`、`budget`、`note`、
   `prev`、`hash`);读取时逐行核对哈希链与状态转移(`queries` 每次恰好 +1、`best` 只升且每次至少一个台阶、续期不改 `best`);
 - `ladder.json`:头指针(`seq` 与最后一行的哈希),必须与日志对得上——改了其中一个就对不上;日志被截断(头指针超前)同样被发现;
-- 头指针只**落后一行**(日志已追加、头指针还没写完就崩了)时按日志修复头指针——日志是事实来源;
+- 头指针**落后任意行数**都算良性(日志已追加、头指针还没写完就崩了;读者读到的是那一刻的快照,
+  期间写者可能又写了好几轮)——这时按日志修复头指针,日志是事实来源;
+  但头指针**指向的那条记录**必须与日志逐项对得上(哈希 + queries/best/budget),对不上、头指针比日志新、
+  头指针被回滚到创世,都仍然 fail-closed(第 22、27 轮);
 - **续期是显式的**:`renew(note)` 追加一条 `renew` 事件,重置 `queries`、**保留 `best`**(已经泄漏的信息收不回来),
   必须给出非空的原因——"人工续期没有审计钩子"这条残余因此关掉了。
 - **同一个 `run_id` 的提交是幂等的**:已经提交过的 run 只回放当时的汇报值,不再扣查询。这让"揭示存档写失败后重试"安全
@@ -64,6 +67,9 @@ GENESIS = "0" * 64
 MAX_NOTE = 200
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _EPS = 1e-9
+# 哨兵:区分"调用方**没给**这个参数"与"调用方明确给了 None"。
+# 头指针/锚点的读取顺序是"先见证、后日志"(第 22 轮),重读一次就把顺序倒回去了(第 27 轮 High-2)。
+_NOT_PROVIDED = object()
 _RECORD_KEYS = {"seq", "event", "run_id", "queries", "best", "budget", "note", "prev", "hash"}
 _HEAD_KEYS = {"version", "seq", "hash", "queries", "best", "budget", "eta"}
 _lock = threading.Lock()
@@ -359,7 +365,48 @@ class Ladder:
             raise LadderError(f"梯子头指针损坏或无法读取(fail-closed): {_why(exc)}") from exc
         if not isinstance(head, dict) or set(head) != _HEAD_KEYS or head["version"] != STATE_VERSION:
             raise LadderError("梯子头指针不合法(fail-closed)")
+        self._check_head(head)
         return head
+
+    def _check_head(self, head: dict) -> None:
+        """头指针的**类型与范围**校验(第 27 轮 codex 的 Medium-1)。
+
+        此前头指针只校验"键齐全 + version 对",**字段的形状没人管**。于是被改过的头指针会
+        在**别的**地方炸出与"篡改"无关的异常,或者更糟——**静悄悄地通过**:
+
+        - `seq` 是字符串 `"2"` → `_load` 里 `head["seq"] > last["seq"]` 抛 `TypeError`
+          (不是 `LadderError`,一路冒到接口层变成 500「内部错误」,而不是 fail-closed);
+        - `seq` 是负数 → `rows[head["seq"] - 1]` 变成 `rows[-2]`,**负索引**取到的是倒数第二条:
+          比对的是另一条记录,可能**碰巧对上**而把被改过的头指针当成合法的;
+        - `best` 不是 η 的倍数 → 与日志里的 `best` 比不相等(还好),但"汇报值取整到 η 的倍数"
+          这条不变式在头指针上没有任何保证;
+        - `budget`/`queries` 越界 → 预算被放宽或查询数被改成负数,没有任何一处拦。
+
+        校验口径与日志侧 `_check_record` 一致(同样的 η 倍数、同样的预算上限),fail-closed。"""
+        def bad(reason: str):
+            raise LadderError(f"梯子头指针不合法(fail-closed): {reason}")
+
+        if isinstance(head["version"], bool) or not isinstance(head["version"], int):
+            bad("version 不是整数")
+        for name in ("seq", "queries", "budget"):
+            if isinstance(head[name], bool) or not isinstance(head[name], int):
+                bad(f"{name} 不是整数")
+        if head["seq"] < 0:
+            bad("seq 不能为负数(否则会按负索引取到另一条记录)")
+        if head["queries"] < 0:
+            bad("queries 不能为负数")
+        if not 1 <= head["budget"] <= DEFAULT_QUERY_BUDGET:
+            bad(f"预算必须在 1..{DEFAULT_QUERY_BUDGET} 之间(上限已登记,不得放宽)")
+        if not isinstance(head["hash"], str) or not re.fullmatch(r"[0-9a-f]{64}", head["hash"]):
+            bad("hash 不是 64 位十六进制")
+        best = head["best"]
+        if isinstance(best, bool) or not isinstance(best, (int, float)) or not math.isfinite(best) or best < 0 \
+                or not _is_multiple(best, LADDER_ETA):
+            bad("best 必须是 η 的非负整数倍")
+        eta = head["eta"]
+        if isinstance(eta, bool) or not isinstance(eta, (int, float)) or not math.isfinite(eta) \
+                or not math.isclose(eta, LADDER_ETA, abs_tol=1e-12):
+            bad(f"η 已登记为 {LADDER_ETA},头指针不得改写")
 
     def _read_anchor(self) -> tuple[tuple[int, str] | None, str | None]:
         """返回 ((seq, hash) 或 None, 撕裂的末行碎片原文 或 None)。
@@ -391,15 +438,24 @@ class Ladder:
             last_seq, last = seq, digest
         return (None if last is None else (last_seq, last)), torn
 
-    def _check_anchor(self, rows: list[dict], repair: bool, anchored=None, torn=None) -> None:
+    def _check_anchor(self, rows: list[dict], repair: bool, anchored=_NOT_PROVIDED, torn=_NOT_PROVIDED) -> None:
         """核对锚点见证的记录。
 
         `anchored`/`torn` 由调用方传入(读路径已经先读过一次锚点,见 `_load` 的顺序说明);
-        不传时这里自己读一次(保持函数自足)。"""
+        不传时这里自己读一次(保持函数自足)。
+
+        **哨兵(第 27 轮 codex 的 High-2)**:以前"没传"和"传了 None"是同一件事(默认参数就是 None),
+        于是调用方明明**已经**按顺序读过一遍锚点(拿到 `(None, None)`,比如锚点文件当时不存在),
+        这里还会**再读一次**——而这一次发生在**日志读完之后**,顺序又被倒回去了:
+        并发的写者这时正好写完锚点,读者就会看到"锚点比日志新",把一次**正常的并发写**
+        判成"日志被回滚、截断或整条换掉"(同第 22 轮那条误报,处方还是破坏性的 `reset`)。
+        用哨兵区分"没给"与"明确给了 None",调用方给了就**不再重读**。"""
         if self.anchor is None:
             return
-        if anchored is None and torn is None:
+        if anchored is _NOT_PROVIDED:
             anchored, torn = self._read_anchor()
+        elif torn is _NOT_PROVIDED:
+            torn = None
         if anchored is None:
             if not rows:
                 return
