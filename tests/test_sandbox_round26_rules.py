@@ -544,6 +544,10 @@ def test_the_committed_blob_is_fetched_once_and_reused(repo, monkeypatch):
 
     第 26 轮 codex 的 Low 1:`git status` 每次受信导入都跑一遍(实测 ≈39ms)。
     现在改成"取提交里那份 blob",内容按 sha 寻址、**不可变**,所以缓存永远有效。
+
+    这里数的是 **cat-file**(取内容)那几条:仓库**元数据**的指纹必须每次重新读
+    (候选在运行期间改了 `.git/config`/HEAD 就是要当场发现的),
+    那几次 `rev-parse` 是设计如此,不是浪费。
     """
     calls: list = []
     original = rs._git_run
@@ -556,11 +560,12 @@ def test_the_committed_blob_is_fetched_once_and_reused(repo, monkeypatch):
     guard = guard_for(repo)
 
     guard.check("strategies.base")
-    first = len(calls)
+    first = len([c for c in calls if c and c[0] == "cat-file"])
     guard.check("strategies.base")
     guard.check("strategies.base")
+    again = len([c for c in calls if c and c[0] == "cat-file"])
 
-    assert len(calls) == first, f"重复核对又起了 git 进程:{calls[first:]}"
+    assert again == first, f"重复核对又起了 git 进程取内容:{calls}"
 
 
 # ------------------------------------------- Low 2:能力泄漏缓存的失效判据

@@ -389,6 +389,19 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
                                     started_at_ns=started_at_ns)
     module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"],
                                                       repo_guard=repo_guard)
+    # **启动期核对**(第 26 轮 codex 第二轮复核的 Critical 1,实测):
+    # 框架自己在跑候选**之前**就要预加载受保护的模块
+    # (`risk/constitution.py::_preload_protected_modules` → `import strategies.…`),
+    # 而导入机制导入子模块**之前必定先执行父包的 `__init__.py`**。
+    # 于是"上一轮候选改了 `strategies/__init__.py`"的载荷,会在本轮**预加载阶段**就
+    # 被执行——那时守卫还没构造,用的是**真内建**,在沙盒**之外**
+    # (实测:候选还没跑起来,标记文件就已经被写出来了)。
+    # 守卫那一侧只能拦"候选自己 import",拦不住"框架自己 import",
+    # 所以这里在**预加载之前**先把受信目录整体与仓库提交核对一遍,不一致就拒绝运行。
+    trusted_problems = rs.verify_trusted_tree(bootstrap.ROOT, rs.ALLOWED_REPO_IMPORT_DIRS)
+    if trusted_problems:
+        raise JobError(EXIT_REFUSED, "受信目录与仓库提交不一致,拒绝运行:"
+                       + chr(10) + "  " + (chr(10) + "  ").join(trusted_problems))
     # 运行期第四层:候选执行**前后**各拍一张"受保护对象身份指纹"。
     # 静态层按名字判断,拦不住"换个写法"改写框架对象——第 9 轮 codex 实测:
     # `import risk.risk_guard as rg; rg.risk_per_trade = lambda ...: 0.0`

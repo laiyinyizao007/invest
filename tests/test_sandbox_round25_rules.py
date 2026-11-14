@@ -149,12 +149,17 @@ def test_the_candidate_cannot_tamper_with_a_trusted_module_in_one_round_and_impo
     拿到真实内建,等于任意命令执行。
     """
     # 第 1 轮:改写受信模块。
+    # 被改写的内容里带一句"写标记文件"——一旦它被导入机制执行,
+    # 标记文件就会出现,于是"没被执行"这件事是可断言的,不是推理出来的。
     round1 = "\n".join(textwrap.dedent(part) for part in (
         BASE,
         """
         try:
             import numpy as np
-            np.savetxt("strategies/base.py", np.array(["import os"]), fmt="%s")
+            np.savetxt("strategies/base.py",
+                      np.array(["import os",
+                                "open('MARKER', 'w').write('x')"]),
+                      fmt="%s")
             LEAK["wrote"] = True
         except Exception:
             LEAK["wrote"] = False
@@ -165,6 +170,7 @@ def test_the_candidate_cannot_tamper_with_a_trusted_module_in_one_round_and_impo
     assert cls1.PASS["wrote"] is True, "候选没能改写受信模块(这条用例的前提没成立)"
     assert (repo / "strategies" / "base.py").read_text(encoding="utf-8") != "VALUE = 1\n", (
         "受信模块的内容没变,后面那句拒绝就说明不了任何东西")
+    assert not (repo / "MARKER").exists(), "改写本身不该触发执行(还没到导入那一轮)"
 
     # 第 2 轮:导入那个被改写过的模块 —— 必须被拒。
     round2 = "\n".join(textwrap.dedent(part) for part in (
@@ -179,11 +185,24 @@ def test_the_candidate_cannot_tamper_with_a_trusted_module_in_one_round_and_impo
         """,
         TAIL,
     ))
-    cls2 = run_candidate(tmp_path, monkeypatch, round2)
+    # 第 26 轮补修之后,这条拒绝**提前到入口**:受信目录与仓库提交不一致时,
+    # 整轮根本不跑(候选连运行的机会都没有)——比"候选跑起来再被拒"更强。
+    # 两种形态都算通过,但必须说清是哪一条规则拒的。
+    try:
+        cls2 = run_candidate(tmp_path, monkeypatch, round2)
+    except api.JobError as exc:
+        assert "受信目录与仓库提交不一致" in str(exc), (
+            f"入口拒绝的理由不是受信目录核对那条:{exc}")
+        assert "与仓库提交的内容不一致" in str(exc), (
+            f"入口拒绝没有点名提交基准那条:{exc}")
+    else:
+        assert cls2.PASS["imported"] is False, "候选导入了自己上一轮改写过的受信模块"
+        assert "与仓库提交的内容不一致" in cls2.PASS.get("reason", ""), (
+            f"拒绝理由不是提交基准那条:{cls2.PASS.get('reason')}")
 
-    assert cls2.PASS["imported"] is False, "候选导入了自己上一轮改写过的受信模块"
-    assert "与仓库提交的内容不一致" in cls2.PASS.get("reason", ""), (
-        f"拒绝理由不是提交基准那条:{cls2.PASS.get('reason')}")
+    # 关键断言:那个被改写过的模块**没有被导入机制执行过**。
+    assert not (repo / "MARKER").exists(), (
+        "被改写过的受信模块被执行了(标记文件被写出来)——这是真正的逃逸")
 
 
 def test_an_untouched_trusted_module_is_still_importable_through_the_production_path(

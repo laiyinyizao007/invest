@@ -360,6 +360,92 @@ def _same_content(committed: bytes, worktree: bytes) -> bool:
     return committed.replace(b"\r\n", b"\n") == worktree.replace(b"\r\n", b"\n")
 
 
+def committed_content_problem(repo_root: Path, baseline, resolved: Path) -> str | None:
+    """这个受信文件是不是与**仓库提交里那份**不一致(返回拒绝理由,None 表示一致)。
+
+    口径(第 26 轮 codex 的 Critical 1 与 Medium 1):
+    - 路径一律相对**仓库顶层**(与 `git_committed_paths` 的口径一致);
+    - 内容取**提交里那份 blob**(`git cat-file`,不应用 filter),
+      与工作区内容只比"去掉 CRLF 之后"是否一样;
+    - 文件不在提交里 → 拒绝(那是候选写出来的)。
+
+    做成**模块级函数**(不是方法):启动期那道"受信目录整体核对"
+    (`verify_trusted_tree`)要用同一把尺子,不能另起一套口径。
+    """
+    if baseline is None:
+        return ("无法验证受信目录的完整性"
+                "(取不到仓库提交基准,查不了等于没查,fail-closed)")
+    top, committed = baseline
+    try:
+        rel = os.path.relpath(str(resolved), top).replace("\\", "/")
+    except ValueError:                        # 不在同一个盘上(理论上不可能)
+        try:
+            rel = str(Path(resolved).resolve().relative_to(Path(repo_root).resolve()))
+        except ValueError:
+            rel = Path(resolved).name
+        rel = rel.replace("\\", "/")
+    sha = committed.get(rel)
+    if sha is None:
+        return ("不在仓库提交里"
+                "(候选运行期间写出的文件一律不得被导入)")
+    blob = git_committed_blob(top, sha)
+    if blob is None:
+        return ("无法验证受信目录的完整性"
+                "(读不到提交里的内容,查不了等于没查,fail-closed)")
+    try:
+        worktree = Path(resolved).read_bytes()
+    except OSError:
+        return ("内容读不到"
+                "(查不了等于没查,fail-closed)")
+    if not _same_content(blob, worktree):
+        return ("与仓库提交的内容不一致"
+                "(候选运行期间被改动过)")
+    return None
+
+
+def verify_trusted_tree(repo_root: Path,
+                        allowed_dirs: Sequence[str] | None = None) -> list:
+    """受信目录里的每个文件都要与**仓库提交**一致;返回问题清单(空 = 没问题)。
+
+    为什么要有这道"启动期"核对(第 26 轮 codex 第二轮复核的 Critical 1,实测):
+    框架自己在跑候选**之前**就会预加载受保护的模块
+    (`risk/constitution.py::_preload_protected_modules` → `import strategies.…`),
+    而导入机制导入子模块**之前必定先执行父包的 `__init__.py`**。
+    于是"上一轮候选改了 `strategies/__init__.py`"这个载荷,会在**本轮框架预加载阶段**
+    就被执行——那时候守卫**还没构造**,用的是**真内建**,在沙盒**之外**
+    (实测:标记文件在候选还没跑起来的时候就被写出来了)。
+    守卫那一侧只能拦"候选自己 import",拦不住"框架自己 import"。
+
+    口径与守卫一致:
+    - 目录**不可写** → 篡改压根不可能(容器里 /app 是只读的)→ 跳过,不需要基准;
+    - 目录可写 → 必须与提交一致;取不到基准 → fail-closed(列为问题)。
+    """
+    problems: list = []
+    if allowed_dirs is None:
+        allowed_dirs = ALLOWED_REPO_IMPORT_DIRS
+    root = Path(repo_root).resolve()
+    baseline = None
+    baseline_taken = False
+    for name in allowed_dirs:
+        base = root / name
+        if not base.is_dir():
+            continue
+        if not os.access(base, os.W_OK):
+            continue                       # 写不了 → 篡改不可能 → 不需要基准
+        if not baseline_taken:            # 基准**按需**取(目录都不可写时连 git 都不用起)
+            baseline = git_committed_paths(root, list(allowed_dirs))
+            baseline_taken = True
+        if baseline is None:
+            problems.append(f"{name}:取不到仓库提交基准"
+                            "(查不了等于没查,fail-closed)")
+            continue
+        for path in sorted(base.rglob("*.py")):
+            problem = committed_content_problem(root, baseline, path)
+            if problem:
+                problems.append(f"{name}/{path.name}:{problem}")
+    return problems
+
+
 def _git_common_dir(repo_root: Path) -> Path | None:
     """仓库的**共用** git 目录(`.git/config` 与 `.git/info/attributes` 在这儿)。
 
@@ -417,7 +503,24 @@ def git_metadata_fingerprints(repo_root: Path) -> dict:
         digest = _file_digest(gitdir / "HEAD")
         if digest is not None:
             prints["HEAD"] = digest
+    # **HEAD 解析到的提交**(第 26 轮 codex 第二轮复核的 High 1):
+    # `.git/HEAD` 这个文件的内容通常是 `ref: refs/heads/main`——候选把
+    # `refs/heads/main` 指到别的提交时,这个文件**一个字都不变**,指纹不响;
+    # 而"提交基准"若还是懒取的,就会按候选挑过的那棵树算 → 篡改被放行。
+    # 记下解析后的 sha,ref 一动就看得出来。
+    sha = git_head_sha(repo_root)
+    if sha:
+        prints["HEAD_SHA"] = sha
     return prints
+
+
+def git_head_sha(repo_root: Path) -> str | None:
+    """HEAD **解析到的**提交 sha(取不到返回 None)。"""
+    proc = _git_run(["rev-parse", "HEAD"], cwd=repo_root, timeout=20)
+    if proc is None:
+        return None
+    sha = proc.stdout.decode("ascii", "replace").strip()
+    return sha or None
 
 
 def _file_digest(path: Path) -> str | None:
@@ -436,21 +539,31 @@ def _file_digest(path: Path) -> str | None:
 # → 通配符裁决看不见它 → 候选写进受信包的辅助模块仍会被通配符导入执行。
 # 受信目录只有**个位数**文件,这个缓存几乎不省什么,却拿安全换性能——**撤掉**。
 def _scan_dir(directory: Path) -> tuple[list, list]:
-    """(目录下的 .py 文件, 子目录)。"""
+    """(目录下的 .py 文件与"无源码"的 .pyc, 子目录)。
+
+    `.pyc` 只收**不在 `__pycache__` 里**的那些(第 26 轮 codex 第二轮复核的 Medium 1):
+    与源码并列的 `helper.pyc` 是**无源码模块**(sourceless),导入机制会直接执行它,
+    而通配符裁决此前只 glob `.py` → 候选写进站点包的 `.pyc` 辅助模块根本不在清单里
+    (实测:`extpkg/helper.pyc` 被导入机制执行)。
+    `__pycache__` 里的那些是导入机制**自己**编译出来的(正常行为),
+    把它们算进来会把"本次运行刚编译出来的"误判成"候选写的",所以不收。
+    """
     files: list = []
     dirs: list = []
+    in_pycache = directory.name == "__pycache__"
     for entry in sorted(directory.iterdir()):
         try:
             if entry.is_dir():
                 dirs.append(entry)
-            elif entry.is_file() and entry.suffix == ".py":
+            elif entry.is_file() and (entry.suffix == ".py"
+                                      or (entry.suffix == ".pyc" and not in_pycache)):
                 files.append(entry)
         except OSError:
             continue
     return files, dirs
 
 
-def _purge_bytecode_cache(source: Path) -> None:
+def _purge_bytecode_cache(source: Path, cached: Path | None = None) -> None:
     """删掉某个源文件对应的字节码缓存(`__pycache__/*.pyc`)。
 
     为什么(第 26 轮 codex 第二轮实测的 High 2):
@@ -461,19 +574,25 @@ def _purge_bytecode_cache(source: Path) -> None:
     处置:核对完源码之后把可能伪造的 `.pyc` **删掉**,
     导入机制于是从**已核对过的那份源码**重新编译。
     (代价:每个受信模块每个候选重编译一次——毫秒级,换来的是"执行的一定是核对过的那份"。)
+
+    `cached` 是导入机制自己算出来的缓存路径(spec.cached):
+    **优先用它**——自己按 resolve 之后的路径算,遇到符号链接就会打空
+    (导入机制按 finder 给的**未 resolve** 路径定位缓存,第 26 轮 codex 第二轮复核的 Medium 2)。
     """
+    target = cached
+    if target is None:
+        try:
+            target = Path(importlib.util.cache_from_source(str(source)))
+        except (NotImplementedError, ValueError):
+            return
     try:
-        cache = Path(importlib.util.cache_from_source(str(source)))
-    except (NotImplementedError, ValueError):
-        return
-    try:
-        cache.unlink()
+        Path(target).unlink()
     except OSError:
         pass                    # 没有就没有(不是错误)
 
 
 def _rglob_py(directory: Path) -> list:
-    """目录下**递归**的全部 .py(查不到就抛 OSError,由调用方 fail-closed)。"""
+    """目录下**递归**的全部 .py 与无源码 .pyc(查不到就抛 OSError,由调用方 fail-closed)。"""
     out: list = []
     stack = [directory]
     while stack:
@@ -796,6 +915,48 @@ def _spec_chain(name: str):
     return None, None
 
 
+def _ancestor_packages(name: str) -> list:
+    """这个模块名上的每一级**祖先包**:[(包名, spec)]。
+
+    为什么需要它(第 26 轮 codex 第二轮复核的 Critical 1,实测):
+    导入机制导入子模块**之前必定先执行父包的 `__init__.py`**,
+    而守卫只裁决**被解析出的那一个**文件 → 父包的 `__init__.py` 从来没被核对过。
+    候选在"上一轮"改了 `strategies/__init__.py`,这一轮 `from strategies.base import X`
+    就把改过的那份执行了(实测:标记文件被写出来),而守卫全程放行
+    ("strategies.base" 本身与提交一致,核对通过)。
+
+    同样用底层的 `PathFinder.find_spec`:**不执行**任何东西。
+    """
+    import importlib.machinery as _machinery
+
+    parts = name.split(".")
+    out: list = []
+    path = None
+    for index, part in enumerate(parts[:-1]):
+        try:
+            spec = _machinery.PathFinder.find_spec(part, path)
+        except Exception:                                       # noqa: BLE001 - 探测失败按"查不到"处理
+            break
+        if spec is None:
+            break
+        locations = spec.submodule_search_locations
+        if locations is None:
+            break                                               # 不是包,更深的导入本来也不成立
+        out.append((".".join(parts[: index + 1]), spec))
+        path = list(locations)
+    return out
+
+
+def _spec_cached(spec) -> Path | None:
+    """spec 自己算出来的字节码缓存路径(没有就 None)。
+
+    用它而不是自己按源码路径算:导入机制按 finder 给的**未 resolve** 路径定位缓存,
+    自己按 resolve 之后的路径算,遇到符号链接就会打空(清不到要清的那一份)。
+    """
+    cached = getattr(spec, "cached", None)
+    return Path(cached) if cached else None
+
+
 def module_origin(name: str) -> str | None:
     """解析一个模块的来源文件路径;解析不出来返回 None(命名空间包没有文件,也是 None)。"""
     spec, _ = _spec_chain(name)
@@ -855,7 +1016,6 @@ def _floor_to_granularity(value_ns: int, granularity: int) -> int:
 
 
 # 受信目录的提交基准缓存:键 = (仓库根, 允许目录),值 = (仓库顶层, 已提交文件集合) 或 None(取不到)。
-_GIT_BASELINE_CACHE: dict = {}
 
 
 class RepoImportGuard:
@@ -886,16 +1046,28 @@ class RepoImportGuard:
         # 被改过的配置去跑 git(那等于替候选执行候选写的命令)。
         self._metadata_fingerprints = git_metadata_fingerprints(self.repo_root) \
             if verify_trusted_against_git else {}
+        # **提交基准在构造时就取好**(第 26 轮 codex 第二轮复核的 High 1):
+        # 原来它是**懒取**的(第一次 check() 时才算)——而第一次 check() 发生在
+        # **候选运行期间**。候选若在运行期间提交一次(`.git/HEAD` 的内容一个字没变,
+        # 只是 `refs/heads/main` 指到了别处,指纹不响),懒取到的基准就是
+        # **候选自己挑过的那棵树** → 篡改过的模块被放行(实测:VALUE=666 被执行)。
+        # 现在:构造时取一次(候选还没跑),之后一直用这一份;
+        # 候选在运行期间动 ref → 指纹里的 `HEAD_SHA` 变了 → fail-closed。
+        #
+        # 顺带修掉另一个缺口(第 26 轮 codex 第二轮复核的 Medium 3):
+        # 原来这份基准放在**进程级**缓存里(键只有仓库路径),不随 HEAD 变——
+        # 开发者正常提交一次之后,同一个进程里新建的守卫会拿**旧**基准,
+        # 把没被篡改的受信模块误杀(理由文案还误导)。现在基准是**每个守卫一份**,
+        # 构造时取,天然与当时的 HEAD 对应。
+        self._baseline = (git_committed_paths(self.repo_root, list(self.allowed_dirs))
+                          if verify_trusted_against_git else None)
 
     def _git_baseline(self) -> tuple[str, dict] | None:
-        """受信目录的**提交基准**(进程内缓存:起一次 git 就够,不必每个候选重起一次)。
+        """受信目录的**提交基准**(= 构造守卫时取的那一份)。
 
         None = 取不到基准(不是 git 仓库 / 没装 git / HEAD 不存在)→ 调用方 fail-closed。
         """
-        key = (str(self.repo_root), self.allowed_dirs)
-        if key not in _GIT_BASELINE_CACHE:
-            _GIT_BASELINE_CACHE[key] = git_committed_paths(self.repo_root, list(self.allowed_dirs))
-        return _GIT_BASELINE_CACHE[key]
+        return self._baseline
 
     def _metadata_changed(self) -> bool:
         """仓库元数据(.git/config / .git/HEAD / .git/index)是不是被候选动过了。"""
@@ -910,38 +1082,10 @@ class RepoImportGuard:
     def _committed_content_problem(self, resolved: Path) -> str | None:
         """这个受信文件是不是与**仓库提交里那份**不一致(返回拒绝理由,None 表示一致)。
 
-        口径(第 26 轮 codex 的 Critical 1 与 Medium 1):
-        - 路径一律相对**仓库顶层**(与 `git_committed_paths` 的口径一致);
-        - 内容取**提交里那份 blob**(`git cat-file`,不应用 filter),
-          与工作区内容只比"去掉 CRLF 之后"是否一样;
-        - 文件不在提交里 → 拒绝(那是候选写出来的)。
+        口径见模块级实现 `committed_content_problem`——守卫这一侧与启动期那道
+        "受信目录整体核对"(`verify_trusted_tree`)共用同一把尺子,不能各写一套。
         """
-        baseline = self._git_baseline()
-        if baseline is None:
-            return ("无法验证受信目录的完整性"
-                    "(取不到仓库提交基准,查不了等于没查,fail-closed)")
-        top, committed = baseline
-        try:
-            rel = os.path.relpath(str(resolved), top).replace("\\", "/")
-        except ValueError:                        # 不在同一个盘上(理论上不可能)
-            rel = self._rel(resolved).replace("\\", "/")
-        sha = committed.get(rel)
-        if sha is None:
-            return ("该文件不在仓库提交里"
-                    "(候选运行期间写出的文件一律不得被导入)")
-        blob = git_committed_blob(top, sha)
-        if blob is None:
-            return ("无法验证受信目录的完整性"
-                    "(读不到提交里的内容,查不了等于没查,fail-closed)")
-        try:
-            worktree = resolved.read_bytes()
-        except OSError:
-            return ("该文件的内容读不到"
-                    "(查不了等于没查,fail-closed)")
-        if not _same_content(blob, worktree):
-            return ("该文件与仓库提交的内容不一致"
-                    "(候选运行期间被改动过)")
-        return None
+        return committed_content_problem(self.repo_root, self._git_baseline(), resolved)
 
     def _trusted_dir_writable(self, resolved: Path) -> bool:
         """受信目录**能不能被写**。
@@ -964,7 +1108,9 @@ class RepoImportGuard:
 
     def check(self, name: str) -> str | None:
         """返回拒绝理由(None 表示放行)。"""
-        origin = module_origin(name)
+        spec, _ = _spec_chain(name)
+        origin = spec.origin if spec is not None else None
+        cached = _spec_cached(spec) if spec is not None else None
         if not origin:
             # 解析不到磁盘文件(命名空间包、zip 成员、动态模块……)。
             # 第 25 轮 codex 的 Medium 9:原来这里直接放行——"查不到来源"被当成了"没有来源问题"。
@@ -992,17 +1138,10 @@ class RepoImportGuard:
             reason = self._written_during_run(resolved)
             if reason:
                 return f"禁止导入 {name}:{reason}"
-            return None
+            return self._check_ancestor_packages(name)
         if not self._under_allowed_dir(resolved):
             return (f"禁止导入仓库内模块 {name}:它不在允许的目录 {list(self.allowed_dirs)} 内"
                     f"(候选不得导入框架、风控或回测模块)")
-        key = str(resolved)
-        known = self.snapshot.get(key)
-        if known is None:
-            return (f"禁止导入 {name}:该文件在候选开始运行之前并不存在"
-                    f"(候选运行期间写出的文件一律不得被导入)")
-        if self._changed(known, resolved, stat):
-            return f"禁止导入 {name}:该文件在候选运行期间被改动过"
         # **跨轮次**(第 25 轮 codex 的 Critical 1):快照是每次导入重拍的,
         # 挡不住"上一轮写、这一轮导"(上一轮被改写的文件,这一轮的快照已经收进去了)。
         # 受信目录必须与**仓库提交**一致:要么这个文件根本不在提交里(候选写的),
@@ -1012,18 +1151,78 @@ class RepoImportGuard:
         # `git status` 会应用 filter,候选在 `.git/config` 里写一条 filter 命令,
         # 守卫就替候选执行了它(实测标记文件被写出)。现在改成
         # "取提交里那份 blob + 只比换行",git 全程不碰工作区文件。
+        reason = self._check_trusted_file(resolved, "该文件", cached=cached)
+        if reason:
+            return f"禁止导入 {name}:{reason}"
+        # **祖先包**(第 26 轮 codex 第二轮复核的 Critical 1):
+        # 导入机制导入子模块**之前必定先执行父包的 `__init__.py`**,
+        # 而上面只核对了**被解析出的那一个**文件 → 父包的 `__init__.py` 从来没被核对过。
+        return self._check_ancestor_packages(name)
+
+    def _check_trusted_file(self, resolved: Path, label: str,
+                            cached: Path | None = None) -> str | None:
+        """受信目录里的**一个文件**是否合规:快照里有、没被改过、与提交一致。
+
+        口径集中在这里,`check()`、通配符裁决与祖先包裁决**共用同一把尺子**
+        (第 26 轮 codex 第二轮复核的 Critical 1:三处各写一套,父包那处就漏了)。
+        """
+        key = str(Path(resolved).resolve())
+        known = self.snapshot.get(key)
+        if known is None:
+            return (f"{label}:在候选开始运行之前并不存在"
+                    f"(候选运行期间写出的文件一律不得被导入)")
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return f"{label}:状态查不到(查不了等于没查,fail-closed)"
+        if self._changed(known, resolved, stat):
+            return f"{label}:在候选运行期间被改动过"
         if self.verify_trusted_against_git and self._trusted_dir_writable(resolved):
             if self._metadata_changed():
-                return (f"禁止导入 {name}:仓库元数据(.git/config/.git/HEAD)"
-                        f"在候选运行期间被改动过"
-                        f"(查不了等于没查,fail-closed)")
+                return ("仓库元数据(.git/config/.git/HEAD)在候选运行期间被改动过"
+                        "(查不了等于没查,fail-closed)")
             problem = self._committed_content_problem(resolved)
             if problem:
-                return f"禁止导入 {name}:{problem}"
+                return f"{label}:{problem}"
             # 源码核对过了,但**执行的**可能不是它:CPython 导入时优先用
             # `__pycache__/*.pyc`,而 .pyc 只校验头部里的 mtime+size(候选能伪造)。
             # 把可能伪造的 .pyc 删掉,导入机制就会从刚核对过的那份源码重新编译。
-            _purge_bytecode_cache(resolved)
+            _purge_bytecode_cache(resolved, cached=cached)
+        return None
+
+    def _check_ancestor_packages(self, name: str) -> str | None:
+        """祖先包的 `__init__.py` 也要过同一把尺子。
+
+        为什么(第 26 轮 codex 第二轮复核的 Critical 1,实测):
+        导入机制导入子模块**之前必定先执行父包的 `__init__.py`**。
+        守卫只裁决被解析出的那**一个**文件 → 候选在"上一轮"改了
+        `strategies/__init__.py`,这一轮 `from strategies.base import X`
+        就把改过的那一份执行了(实测:标记文件被写出来),
+        而守卫全程放行("strategies.base" 本身与提交一致)。
+        """
+        for pkg_name, spec in _ancestor_packages(name):
+            origin = spec.origin
+            if not origin or origin in ("built-in", "frozen", "namespace"):
+                continue
+            try:
+                resolved = Path(origin).resolve()
+            except OSError:
+                return (f"禁止导入 {name}:祖先包 {pkg_name} 的来源文件无法确认"
+                        f"(查不了等于没查,fail-closed)")
+            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+                # 仓库之外的祖先包(站点包):口径同仓库外那一支。
+                reason = self._written_during_run(resolved)
+                if reason:
+                    return f"禁止导入 {name}:祖先包 {pkg_name} {reason}"
+                continue
+            if not self._under_allowed_dir(resolved):
+                return (f"禁止导入 {name}:祖先包 {pkg_name} 不在允许的目录 "
+                        f"{list(self.allowed_dirs)} 内"
+                        f"(候选不得导入框架、风控或回测模块)")
+            reason = self._check_trusted_file(resolved, f"祖先包 {pkg_name}",
+                                              cached=_spec_cached(spec))
+            if reason:
+                return f"禁止导入 {name}:{reason}"
         return None
 
     @staticmethod
@@ -1085,6 +1284,11 @@ class RepoImportGuard:
         候选 `from <包> import <某个常量>`(不是模块)时逐项裁决看不见任何东西,
         只有这一条能把那个包整个挡在门外。
         """
+        # 祖先包先核(与 `check()` 同一口径):导入机制执行的是**父包的 __init__.py**,
+        # 哪怕目标本身不是包(`from 某个模块 import *` 也会先执行父包的 __init__.py)。
+        reason = self._check_ancestor_packages(name)
+        if reason:
+            return reason
         for loc in module_locations(name):
             try:
                 resolved = Path(loc).resolve()
@@ -1130,7 +1334,13 @@ class RepoImportGuard:
         第 26 轮 codex 的 Critical 2:这里原来**只有**"快照"这一关,没有**提交基准**这一关——
         于是"上一轮候选改写了包里的 .py、这一轮 `from 包 import *`"这条跨轮次逃逸原样可用。
         现在**每一个 .py 都要过提交基准**(与 `check()` 同一把尺子)。
+
+        祖先包也在这一路核(第 26 轮 codex 第二轮复核的 Critical 1):
+        导入机制执行的是**父包的 `__init__.py`**,哪怕目标本身不是包。
         """
+        reason = self._check_ancestor_packages(name)
+        if reason:
+            return reason
         for loc in module_locations(name):
             try:
                 resolved = Path(loc).resolve()
@@ -1159,31 +1369,12 @@ class RepoImportGuard:
             if problem:
                 return problem
             for path in files:
-                try:
-                    key = str(path.resolve())
-                    stat = path.stat()
-                except OSError:
-                    # 第 25 轮 codex 的 Medium 9:stat 不出来的文件原来被**跳过**,
-                    # 而 `check()` 那一侧是"查不到就拒"——两处口径相反。
-                    return (f"禁止从 {name} 导入 *:包内 {path.name} 的状态查不到"
-                            f"(查不了等于没查,fail-closed)")
-                known = self.snapshot.get(key)
-                if known is None:
-                    return (f"禁止从 {name} 导入 *:包内 {path.name} 在候选开始运行之前并不存在"
-                            f"(候选运行期间写出的文件一律不得被导入)")
-                if self._changed(known, path, stat):
-                    return f"禁止从 {name} 导入 *:包内 {path.name} 在候选运行期间被改动过"
-                # **提交基准**(第 26 轮 codex 的 Critical 2):通配符路径上的每个 .py
-                # 都要与**仓库提交里那份**一致——否则"上一轮改写、这一轮通配符导入"可用。
-                if self.verify_trusted_against_git and self._trusted_dir_writable(path):
-                    if self._metadata_changed():
-                        return (f"禁止从 {name} 导入 *:仓库元数据(.git/config/.git/HEAD)"
-                                f"在候选运行期间被改动过"
-                                f"(查不了等于没查,fail-closed)")
-                    problem = self._committed_content_problem(path)
-                    if problem:
-                        return f"禁止从 {name} 导入 *:包内 {path.name} {problem}"
-                    _purge_bytecode_cache(path)
+                # **同一把尺子**(第 26 轮 codex 第二轮复核的 Critical 1):
+                # 通配符这一路与 `check()` 共用 `_check_trusted_file`,
+                # 免得两处口径漂移(上一轮就是两处各写一套,父包那处整个漏了)。
+                reason = self._check_trusted_file(path, f"包内 {path.name}")
+                if reason:
+                    return f"禁止从 {name} 导入 *:{reason}"
         return None
 
 
