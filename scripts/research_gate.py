@@ -29,28 +29,44 @@ Window = tuple[str, datetime, datetime]
 Runner = Callable[[type, dict, list, float], dict]
 
 
-def _tag_phase(phase: str):
-    """给从被装饰函数里抛出的异常打上**阶段**标记(不改变异常类型)。最内层的标记优先。
+# 阶段决定外层(进化回路)能不能看到报错原文——见 risk/outward.py:
+# - `declaration`:声明期(网格声明、类校验)——我们自己写的消息,放开;
+# - `selection`:选参窗口回放——进化回路放开的那一层,放开;
+# - `validation`:验证窗口回放——**原文不出去**。候选的普通 bug(`assert pnl > 0, f"pnl {pnl}"`、
+#   `raise ValueError(f"bad price {close}")`)就会把验证窗口的原始数字塞进消息,而梯子一次都不扣
+#   (第 15 轮 codex 的 Critical,端到端复现:消息里带出了验证窗口首日的收盘价)。
+# 没有阶段的错误按验证窗口处理(fail-closed:phase 不在 OPEN_PHASES 里,原文不放行)。
+PHASE_DECLARATION = "declaration"
+PHASE_SELECTION = "selection"
+PHASE_VALIDATION = "validation"
 
-    阶段决定外层(进化回路)能不能看到报错原文——见 risk/outward.py:
-    - `declaration`:声明期(网格声明、类校验)——我们自己写的消息,放开;
-    - `selection`:选参窗口回放——进化回路放开的那一层,放开;
-    - `validation`:验证窗口回放——**原文不出去**。候选的普通 bug(`assert pnl > 0, f"pnl {pnl}"`、
-      `raise ValueError(f"bad price {close}")`)就会把验证窗口的原始数字塞进消息,而梯子一次都不扣
-      (第 15 轮 codex 的 Critical,端到端复现:消息里带出了验证窗口首日的收盘价)。
-    没有标记的错误按验证窗口处理(fail-closed)。"""
+
+def _error_result(phase: str, exc: BaseException) -> dict:
+    """把异常变成一份**框架写的**错误结果:阶段由调用点(框架自己)决定,写进结果字典。
+
+    这里**不碰异常对象**:以前是把阶段挂在异常的 `invest_phase` 属性上,而那个属性候选自己也能挂——
+    候选只要 `e.invest_phase = "selection"`,框架"只补不改"的打标记逻辑就会保留它,
+    于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+    (第 22 轮 codex 的 High,实测:消息里带出了验证窗口的收盘价)。
+    阶段现在只存在于**框架自己写的这份结果字典**里,候选没有通道能改它。"""
+    from research_api import describe_error          # 延迟导入:research_api 与本模块互相引用
+    return {"error": describe_error(exc, phase)}
+
+
+def _phase_result(phase: str):
+    """把阶段内抛出的异常变成**框架写的**错误结果(阶段由装饰器决定,候选碰不到)。
+
+    与旧的 `_tag_phase` 的区别只有一处,但那处是致命的:旧的往**异常对象**上打标记(候选能自己挂),
+    新的直接产出结果字典(候选碰不到)。最内层优先:内层已经变成结果字典了,外层就不会再改它。"""
     def decorate(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
+            except GateFrameworkError:
+                raise                                    # 框架自己的错:响亮地抛出去,不当成"候选失败了"
             except Exception as exc:
-                if not hasattr(exc, "invest_phase"):
-                    try:
-                        exc.invest_phase = phase
-                    except AttributeError:                      # 个别内建异常不允许挂属性:没有标记 = 按验证窗口处理
-                        pass
-                raise
+                return _error_result(phase, exc)
         return wrapper
     return decorate
 
@@ -62,10 +78,18 @@ def entry_prob(trips: int, n_bars: int) -> float:
     return min(MAX_ENTRY_PROB, max(MIN_ENTRY_PROB, trips / n_bars))
 
 
+class GateFrameworkError(ValueError):
+    """框架自己的不变量被破坏(窗口里混进了测试段 K 线、验证窗口没有 K 线……)。
+
+    与候选的错**分开**:候选的错变成一条框架写的错误结果(阶段由框架决定);
+    框架的错照旧抛出来——那不是候选的问题,必须让人看见,不能被当成"候选失败了"吞掉。
+    继承 ValueError 是为了不改变既有调用方与用例的预期类型。"""
+
+
 def slice_bars(bars: Sequence, start: datetime, end: datetime) -> list:
     chosen = [b for b in bars if start <= b.datetime <= end]
     if chosen and max(b.datetime for b in chosen) >= TEST_SEGMENT_START:
-        raise ValueError("窗口包含测试段 K 线:门槛评估不得触碰测试段")
+        raise GateFrameworkError("窗口包含测试段 K 线:门槛评估不得触碰测试段")
     return chosen
 
 
@@ -74,7 +98,7 @@ def _random_params(random_cls: type, params: dict) -> dict:
     return {k: v for k, v in params.items() if k in allowed and k not in ("entry_prob", "seed")}
 
 
-@_tag_phase("validation")
+@_phase_result(PHASE_VALIDATION)
 def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], bars: Sequence, runner: Runner,
              random_cls: type, random_runs: int = ce.DEFAULT_RANDOM_RUNS, data_adjusted: bool, on_plateau: bool,
              capital: float, prior_trials: int | None = None,
@@ -83,7 +107,7 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
     不提供时 DSR 记为未计算,门槛按未通过处理(fail-closed)。"""
     slices = [(name, slice_bars(bars, start, end)) for name, start, end in windows]
     if any(not chunk for _, chunk in slices):
-        raise ValueError("存在没有 K 线的验证窗口")
+        raise GateFrameworkError("存在没有 K 线的验证窗口")
 
     base = [runner(candidate_cls, dict(params), chunk, 1.0) for _, chunk in slices]
     stress = [runner(candidate_cls, dict(params), chunk, STRESS_COST_MULTIPLIER) for _, chunk in slices]
@@ -159,18 +183,14 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
     grid = getattr(candidate_cls, "param_grid", None)
     if grid is None:
         missing = GridError("候选类缺少 param_grid 属性:须声明三个参数及各自至少 3 个递增取值")
-        missing.invest_phase = "declaration"
-        raise missing
+        return _error_result(PHASE_DECLARATION, missing)
     try:
         selection = select_params(candidate_cls=candidate_cls, grid=grid, bars=bars, runner=runner, capital=capital,
                                   max_cells=max_cells, min_round_trips=min_round_trips, window=select_window)
     except GridError as exc:
-        exc.invest_phase = "declaration"                  # 网格声明有问题:我们自己写的消息
-        raise
+        return _error_result(PHASE_DECLARATION, exc)      # 网格声明有问题:我们自己写的消息
     except Exception as exc:
-        if not hasattr(exc, "invest_phase"):
-            exc.invest_phase = "selection"                # 选参窗口回放里的错:进化回路放开的那一层
-        raise
+        return _error_result(PHASE_SELECTION, exc)        # 选参窗口回放里的错:进化回路放开的那一层
     summary = {k: v for k, v in selection.items() if k not in ("plateau", "cell_sharpes", "best_detail")}   # 完整得分表留在服务端,不回传给外层
     engine_side = selection_facts(selection)           # 选参窗口的行为描述符/结构化诊断/适应度(进化回路放开的那一层)
     # 本次扫过的每个有效格子的**日**夏普(= 年化 / √240,与 DSR 同一口径):入账本,并并入本次 DSR 的经验方差
@@ -192,6 +212,8 @@ def run_evaluation(*, candidate_cls: type, bars: Sequence, runner: Runner, rando
                       runner=runner, random_cls=random_cls, random_runs=random_runs, data_adjusted=data_adjusted,
                       on_plateau=selection["on_plateau"], capital=capital,
                       prior_trials=None if trials is None else trials["total"], run_variances=merged_variances)
+    if "error" in result:                                # 验证期出错:run_gate 自己写的错误结果(阶段=validation)
+        return result
     result["trials"] = trials
     result["params"] = selection["best_params"]
     result["selection"] = summary

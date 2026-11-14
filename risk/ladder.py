@@ -152,6 +152,50 @@ def _why(exc: BaseException) -> str:
     return type(exc).__name__ if isinstance(exc, OSError) else str(exc)
 
 
+# Windows 上"别的进程正打开着这个文件"是**瞬时**竞争,不是权限问题:
+# 写者的 `os.replace` 会 PermissionError,替换进行中的读者打开也会 PermissionError。
+# 两边都短重试一下就好;真的没权限/文件损坏,重试完照样 fail-closed。
+_TRANSIENT_ATTEMPTS = 10
+_TRANSIENT_DELAY = 0.02
+
+
+def _replace_atomic(src: Path, dst: Path) -> None:
+    """原子替换,顺带把 Windows 的瞬时占用重试掉(见上面的说明)。"""
+    last: OSError | None = None
+    for _ in range(_TRANSIENT_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:            # Windows:目标文件正被别的进程打开
+            last = exc
+            time.sleep(_TRANSIENT_DELAY)
+    raise last if last is not None else OSError("原子替换失败")
+
+
+def _read_bytes_retry(path: Path) -> bytes:
+    """读文件,顺带把 Windows 的瞬时占用重试掉(见上面的说明)。"""
+    last: OSError | None = None
+    for _ in range(_TRANSIENT_ATTEMPTS):
+        try:
+            return path.read_bytes()
+        except PermissionError as exc:            # Windows:文件正被替换
+            last = exc
+            time.sleep(_TRANSIENT_DELAY)
+    raise last if last is not None else OSError("读取失败")
+
+
+def _read_text_retry(path: Path) -> str:
+    """读文本文件,顺带把 Windows 的瞬时占用重试掉(见上面的说明)。"""
+    last: OSError | None = None
+    for _ in range(_TRANSIENT_ATTEMPTS):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError as exc:            # Windows:文件正被替换
+            last = exc
+            time.sleep(_TRANSIENT_DELAY)
+    raise last if last is not None else OSError("读取失败")
+
+
 def _is_multiple(value: float, eta: float) -> bool:
     steps = value / eta
     return abs(steps - round(steps)) < 1e-6
@@ -237,7 +281,7 @@ class Ladder:
         if not self.log_path.exists():
             return []
         try:
-            raw, ended = _split_lines(self.log_path.read_bytes())
+            raw, ended = _split_lines(_read_bytes_retry(self.log_path))
             lines = [line for line in raw if line.strip()]
             rows: list[dict] = []
             for index, line in enumerate(lines):
@@ -310,7 +354,7 @@ class Ladder:
         if not self.path.exists():
             return None
         try:
-            head = json.loads(self.path.read_text(encoding="utf-8"))
+            head = json.loads(_read_text_retry(self.path))
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子头指针损坏或无法读取(fail-closed): {_why(exc)}") from exc
         if not isinstance(head, dict) or set(head) != _HEAD_KEYS or head["version"] != STATE_VERSION:
@@ -326,7 +370,7 @@ class Ladder:
         if self.anchor is None or not self.anchor.exists():
             return None, None
         try:
-            raw, ended = _split_lines(self.anchor.read_bytes())
+            raw, ended = _split_lines(_read_bytes_retry(self.anchor))
         except (OSError, ValueError) as exc:
             raise LadderError(f"梯子锚点无法读取(fail-closed): {_why(exc)}") from exc
         last_seq, last = 0, None
@@ -347,10 +391,15 @@ class Ladder:
             last_seq, last = seq, digest
         return (None if last is None else (last_seq, last)), torn
 
-    def _check_anchor(self, rows: list[dict], repair: bool) -> None:
+    def _check_anchor(self, rows: list[dict], repair: bool, anchored=None, torn=None) -> None:
+        """核对锚点见证的记录。
+
+        `anchored`/`torn` 由调用方传入(读路径已经先读过一次锚点,见 `_load` 的顺序说明);
+        不传时这里自己读一次(保持函数自足)。"""
         if self.anchor is None:
             return
-        anchored, torn = self._read_anchor()
+        if anchored is None and torn is None:
+            anchored, torn = self._read_anchor()
         if anchored is None:
             if not rows:
                 return
@@ -443,9 +492,18 @@ class Ladder:
         """读日志并与头指针、锚点对账。两者都不存在 = 全新的梯子;任何对不上 = 损坏/篡改/回滚,抛 LadderError。
 
         `repair=False` 用于只读入口(status/has/preview):它们**不写任何文件**(第 16 轮 L2:"只读"的命令不该改状态)。"""
-        rows = self._read_log()
-        self._check_anchor(rows, repair)
+        # **先读"见证",再读日志**(第 22 轮 codex 的 High 2):写者的顺序是 日志 → 头指针 → 锚点,
+        # 读者的顺序必须反过来。否则一次**正常**的并发写会被读成篡改:读者先读到旧日志,
+        # 写者这时追加并写了锚点,读者再读锚点就看到"锚点比日志新",`_check_anchor` 判成
+        # "日志被回滚、截断或整条换掉"——而那条错误消息会把运维指向 `research_ladder.py reset`,
+        # 也就是把 best 归零、把全部历史揭示存档归档作废(可用性故障被误判成安全事件,处方还是破坏性的)。
+        # 实测:两个真进程,读者循环 11 秒 767 次读里有 21 次报错(锚点超前/头指针超前/Windows 上的 PermissionError)。
+        # 顺序反过来之后,见证永远**不晚于**它见证的那条日志,良性并发不再误报;
+        # 而"日志被截断或被换掉"仍然被抓住(见证比日志新 → 对不上,照旧 fail-closed)。
         head = self._head()
+        anchored, torn = self._read_anchor()
+        rows = self._read_log()
+        self._check_anchor(rows, repair, anchored=anchored, torn=torn)
         if not rows and head is None:
             return []
         if head is None:
@@ -457,14 +515,26 @@ class Ladder:
         if not rows:
             raise LadderError("梯子有头指针却没有日志(fail-closed):日志被删除或截断")
         last = rows[-1]
-        if head["seq"] == last["seq"] and head["hash"] == last["hash"] and not (
-                head["queries"] == last["queries"] and head["best"] == last["best"] and head["budget"] == last["budget"]):
-            raise LadderError("梯子头指针里的 queries/best/budget 与日志最后一行对不上(fail-closed):头指针被单独改写过")
-        if head["seq"] == last["seq"] - 1 and len(rows) >= 2 and head["hash"] == rows[-2]["hash"]:
-            if repair:
-                self._write_head(last)                  # 头指针只落后一行:日志已追加、头指针还没写完——按日志修复
-        elif head["seq"] != last["seq"] or head["hash"] != last["hash"]:
+        # 头指针是**缓存**,日志才是事实来源。读者先读见证、再读日志,于是头指针可能**落后**日志:
+        # 那是写者正在写的正常中间态(写者顺序:日志 → 头指针 → 锚点),不是损坏,更不是篡改。
+        # 早先这里只容忍"落后一行",落后两行就 fail-closed——可写者在这两次读之间完全可能
+        # 写完好几轮,于是**正常**的并发写被报成"头指针被回滚、截断或单独改写过"。
+        # 只有"头指针指向的东西与日志对不上"才是篡改:
+        #  - 头指针比日志**新** → 日志被截断/回滚(fail-closed,这条不能放宽);
+        #  - 头指针指向的那条记录的哈希或数值与日志对不上 → 头指针被单独改写过(fail-closed);
+        #  - 头指针落在创世(seq=0)而日志里已有记录 → 头指针被回滚到创世(fail-closed)。
+        if head["seq"] > last["seq"]:
             raise LadderError("梯子头指针与日志对不上(fail-closed):被回滚、截断或单独改写过")
+        if head["seq"] == 0:
+            raise LadderError("梯子头指针与日志对不上(fail-closed):头指针被回滚到了创世状态")
+        witnessed = rows[head["seq"] - 1]
+        if head["hash"] != witnessed["hash"]:
+            raise LadderError("梯子头指针与日志对不上(fail-closed):被回滚、截断或单独改写过")
+        if not (head["queries"] == witnessed["queries"] and head["best"] == witnessed["best"]
+                and head["budget"] == witnessed["budget"]):
+            raise LadderError("梯子头指针里的 queries/best/budget 与它见证的那条日志对不上(fail-closed):头指针被单独改写过")
+        if head["seq"] != last["seq"] and repair:
+            self._write_head(last)                      # 头指针落后:按日志修复(写者还没来得及更新它)
         return rows
 
     # ---------- 写 ----------
@@ -479,7 +549,7 @@ class Ladder:
                 stream.write(json.dumps(head, ensure_ascii=False, allow_nan=False))
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(tmp, self.path)
+            _replace_atomic(tmp, self.path)
         except OSError as exc:
             raise LadderError(f"梯子头指针写入失败(fail-closed,不放出汇报值): {_why(exc)}") from exc
 
@@ -778,7 +848,7 @@ class Ladder:
                 for f in files:
                     if f.exists():
                         target = Path(str(f) + f".bak-{n}")
-                        os.replace(f, target)
+                        _replace_atomic(f, target)   # Windows 瞬时占用重试(见 _replace_atomic 说明)
                         moved.append(target.name)
                         self._append_reset_log(log_path, {"event": "reset-archived", "archive": n,
                                                           "name": target.name, "reason": reason.strip()})

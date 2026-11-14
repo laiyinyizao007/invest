@@ -167,11 +167,13 @@ def test_evaluation_passes_the_plateau_verdict_into_the_gate():
 
 
 def test_evaluation_requires_a_declared_grid():
+    """没有声明 param_grid 是**声明期**的问题:结果里带阶段=声明期,原文可见。"""
     class NoGrid:
         parameters = ["a"]
 
-    with pytest.raises(rg.GridError, match="param_grid"):
-        evaluate(candidate_cls=NoGrid)
+    result = evaluate(candidate_cls=NoGrid)
+    assert result["error"]["phase"] == "declaration"
+    assert "param_grid" in result["error"]["message"]
 
 
 def test_evaluation_result_trims_the_score_table_but_keeps_the_verdict():
@@ -404,42 +406,68 @@ def _raising_runner(where, message="close=2728.0"):
     return runner
 
 
-def test_an_error_in_the_selection_window_is_tagged_selection():
-    with pytest.raises(ValueError) as exc:
-        evaluate(prior_trials=10, runner=_raising_runner("select"))
-    assert exc.value.invest_phase == "selection"
+def test_an_error_in_the_selection_window_is_reported_as_selection():
+    """选参窗口里的错:阶段=选参期(进化回路放开的那一层)。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("select"))
+    assert result["error"]["phase"] == "selection"
+    assert result["error"]["type"] == "ValueError"
 
 
-def test_an_error_while_replaying_the_validation_windows_is_tagged_validation():
-    with pytest.raises(ValueError) as exc:
-        evaluate(prior_trials=10, runner=_raising_runner("validate"))
-    assert exc.value.invest_phase == "validation"
+def test_an_error_while_replaying_the_validation_windows_is_reported_as_validation():
+    """验证窗口里的错:阶段=验证期(原文不外放)。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["phase"] == "validation"
 
 
-def test_a_grid_declaration_error_is_tagged_declaration():
+def test_a_grid_declaration_error_is_reported_as_declaration():
     class NoGrid:
         parameters = ["a", "b", "c"]
 
-    with pytest.raises(rg.GridError) as exc:
-        rg.run_evaluation(candidate_cls=NoGrid, bars=EVAL_BARS, runner=make_runner(), random_cls=Rand, random_runs=3,
-                          capital=10_000, max_cells=100, min_round_trips=10, select_window=SELECT,
-                          validation_windows=[W1, W2], prior_trials=1)
-    assert getattr(exc.value, "invest_phase", None) == "declaration"
+    result = rg.run_evaluation(candidate_cls=NoGrid, bars=EVAL_BARS, runner=make_runner(), random_cls=Rand, random_runs=3,
+                               capital=10_000, max_cells=100, min_round_trips=10, select_window=SELECT,
+                               validation_windows=[W1, W2], prior_trials=1)
+    assert result["error"]["phase"] == "declaration"
 
 
-def test_run_gate_alone_tags_its_errors_validation_because_its_whole_run_is_the_validation_window():
-    with pytest.raises(ValueError) as exc:
-        run(runner=_raising_runner("validate"), prior_trials=5)
-    assert exc.value.invest_phase == "validation"
+def test_run_gate_alone_reports_its_errors_as_validation_because_its_whole_run_is_the_validation_window():
+    result = run(runner=_raising_runner("validate"), prior_trials=5)
+    assert result["error"]["phase"] == "validation"
 
 
-def test_the_innermost_tag_wins():
-    """从 run_gate 里抛出的错标 validation,不会被外层的 run_evaluation 改标成 selection。"""
-    with pytest.raises(ValueError) as exc:
-        evaluate(prior_trials=10, runner=_raising_runner("validate"))
-    assert exc.value.invest_phase == "validation"
+def test_the_innermost_phase_wins():
+    """从 run_gate 里抛出的错是验证期,不会被外层的 run_evaluation 改标成选参期。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["phase"] == "validation"
 
 
-def test_tagging_does_not_change_the_exception_type_or_message():
-    with pytest.raises(ValueError, match="close=2728.0"):
-        evaluate(prior_trials=10, runner=_raising_runner("validate"))
+def test_reporting_the_phase_does_not_change_the_error_type_or_message():
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["type"] == "ValueError"
+    assert "close=2728.0" in result["error"]["message"]
+
+
+def test_a_candidate_cannot_forge_the_phase_by_tagging_its_own_exception():
+    """**伪造阶段**无效:候选给异常挂 `invest_phase="selection"`,阶段仍由框架决定。
+
+    旧协议把阶段挂在异常对象上,而打标记的逻辑"只补不改",候选自己挂的标记会被保留——
+    于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+    (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。"""
+    base = make_runner()
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        if len(bars) != 3 and strategy_class.__name__ == "GridCand":
+            exc = ValueError("close=2728.0")
+            exc.invest_phase = "selection"              # 候选伪造:把自己说成选参期
+            raise exc
+        return base(strategy_class, setting, bars, cost_multiplier)
+
+    result = evaluate(prior_trials=10, runner=runner)
+    assert result["error"]["phase"] == "validation"    # 框架说了算,不是候选
+    assert result["error"]["message"].startswith("close=")
+
+
+def test_the_framework_own_invariant_failures_are_still_raised_loudly():
+    """框架自己的错(窗口混进测试段 K 线)照旧抛异常——那不是候选的问题,不能被吞成"候选失败了"。"""
+    leaked = BARS + [bar(datetime(2024, 1, 2, 9, 0))]
+    with pytest.raises(ValueError, match="测试段"):
+        run(bars=leaked, windows=[("W9", datetime(2023, 7, 1), datetime(2024, 3, 1))])

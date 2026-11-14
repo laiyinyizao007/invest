@@ -138,14 +138,25 @@ def test_the_prior_history_comes_from_the_ledger(paths):
 
 # ---------- describe_error 带阶段(第 15 轮 codex 的 Critical) ----------
 
-def test_describe_error_carries_the_phase_the_orchestrator_tagged():
+def test_describe_error_never_reads_the_phase_off_the_exception_object():
+    """阶段**只由框架决定**:候选可以给自己的异常挂 `invest_phase`,但那不管用。
+
+    旧实现从异常对象上读阶段,而打标记的逻辑"只补不改"——候选自己挂的 `"selection"` 会被保留,
+    于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+    (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。"""
     exc = ValueError("close=2728.0")
     exc.invest_phase = "validation"
     out = api.describe_error(exc)
-    assert out["phase"] == "validation" and out["type"] == "ValueError"
+    assert out["phase"] is None and out["type"] == "ValueError"
 
 
-def test_an_explicit_phase_wins_over_the_tag():
+def test_a_candidate_cannot_forge_the_phase_by_tagging_its_own_exception():
+    exc = ValueError("close=2728.0")
+    exc.invest_phase = "selection"
+    assert api.describe_error(exc)["phase"] is None
+
+
+def test_the_explicit_phase_is_the_only_way_to_declare_one():
     exc = ValueError("x")
     exc.invest_phase = "validation"
     assert api.describe_error(exc, "declaration")["phase"] == "declaration"

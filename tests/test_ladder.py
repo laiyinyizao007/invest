@@ -997,3 +997,119 @@ def test_a_snapshot_answers_has_and_preview_without_rereading_the_log(tmp_path):
     assert snap.has("run-a") and not snap.has("run-b")
     assert snap.preview(0.0, run_id="run-a")["replay"] is True
     assert ladder.status()["queries_used"] == 1                                # 快照没有消耗查询
+
+
+def test_a_concurrent_writer_is_not_mistaken_for_a_tampering_attack(tmp_path):
+    """CLI 与网关是两个进程:一次正常的并发写**不得**被读成篡改。
+
+    旧实现先读日志、后读锚点:写者在这两步之间落地时,读者会看到"锚点比日志新",
+    `_check_anchor` 判成"日志被回滚、截断或整条换掉",而那条错误消息把运维指向
+    `research_ladder.py reset`——把 best 归零 + 历史揭示存档全部作废,
+    可用性故障被误判成安全事件,处方还是破坏性的。
+    实测:两个真进程,读者循环 11 秒 767 次读里有 21 次误报。
+
+    写者按**时间**跑满 6 秒,并且每写一次都要真落地;写者写够一定条数才算数——
+    否则"写者一启动就崩了"会让这条用例变成**永远通过**的空用例
+    (早先的版本正是这样:写 40 次不到 1 秒,预算耗尽后写者抛 LadderExhausted 退出,
+    读者只读到一份静止的文件,于是把读顺序改回旧样子这条用例照样通过)。
+    """
+    import subprocess
+    import sys
+    import textwrap
+    import time
+    from pathlib import Path
+
+    from risk.ladder import anchor_path_for
+
+    repo = Path(__file__).resolve().parents[1]
+    ladder = Ladder(tmp_path / "ladder.json", anchor=anchor_path_for(tmp_path))
+    ladder.submit(1.0, run_id="seed")
+    script = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(repo)!r})
+        from pathlib import Path
+        from risk.ladder import Ladder, LadderExhausted, anchor_path_for
+        ladder = Ladder(Path({str(tmp_path / "ladder.json")!r}), anchor=anchor_path_for({str(tmp_path)!r}))
+        deadline = time.monotonic() + 6.0
+        i = 0
+        while time.monotonic() < deadline:
+            try:
+                ladder.submit(1.0, run_id=f"writer-{{i}}")
+            except LadderExhausted:
+                ladder.renew("并发写回归用例:预算用尽,续期继续写")
+            i += 1
+        print(i, flush=True)
+    """)
+    proc = subprocess.Popen([sys.executable, "-c", script], cwd=str(repo),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8")
+    errors = []
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            try:
+                ladder.status()
+            except LadderError as exc:
+                errors.append(str(exc))
+            if proc.poll() is not None:
+                break
+            time.sleep(0.005)
+    finally:
+        out, err = proc.communicate(timeout=60)
+    # 写者必须**真的写了足够多**次:否则读者根本没和写者重叠,这条用例等于没测
+    written = int(out.strip().splitlines()[-1]) if out.strip() else 0
+    assert proc.returncode == 0, f"写者崩了: {err[:500]}"
+    assert written >= 30, f"写者只写了 {written} 次,读者没和写者重叠,这条用例等于没测"
+    # 再读几次:写者刚退出时的状态也必须读得出来
+    for _ in range(5):
+        try:
+            ladder.status()
+        except LadderError as exc:
+            errors.append(str(exc))
+    assert not errors, errors[:3]
+
+
+def test_a_head_that_lags_by_several_rows_is_not_a_tamper_signal(tmp_path):
+    """头指针落后**多行**也是良性的:读者读头指针的那一刻,写者可能已经又写了好几轮。
+
+    写者每写一行日志就同步一次头指针,但**读者读到的头指针是那一刻的快照**——
+    读到旧头指针、再读到新日志,中间隔了几轮,于是头指针落后好几行。
+    早先这里只容忍"落后一行",落后两行就报"被回滚、截断或单独改写过":
+    可用性故障被误报成安全事件,而那条消息把运维指向 `research_ladder.py reset`
+    (best 归零 + 历史揭示存档全部作废)。
+
+    注意:这**不**放松篡改检测——头指针比日志新(日志被截断)、头指针指向的那条
+    记录与日志对不上(头指针被单独改写),都仍然 fail-closed。
+    """
+    ladder = two_steps(tmp_path)
+    ladder.submit(0.0)
+    ladder.submit(0.0)
+    rows = log_rows(ladder)
+    h = head(ladder)
+    h.update(seq=1, hash=rows[0]["hash"], queries=1, best=rows[0]["best"], budget=rows[0]["budget"])
+    ladder.path.write_text(json.dumps(h), encoding="utf-8")
+    assert ladder.status()["queries_used"] == 4          # 良性落后:读得到真实状态
+    assert head(ladder)["seq"] == 1                       # 只读入口不写文件
+    ladder.submit(0.0)                                    # 写入口按日志修复
+    assert head(ladder)["seq"] == 5
+
+
+def test_a_head_that_does_not_witness_the_row_it_points_at_is_detected(tmp_path):
+    """头指针落后是良性的,但它**指向的那条记录**必须与日志对得上:对不上就是头指针被单独改写过。"""
+    ladder = two_steps(tmp_path)
+    rows = log_rows(ladder)
+    h = head(ladder)
+    h.update(seq=1, hash=rows[1]["hash"], queries=1, best=rows[0]["best"])   # seq 说的是第 1 条,哈希却取自第 2 条
+    ladder.path.write_text(json.dumps(h), encoding="utf-8")
+    with pytest.raises(LadderError):
+        ladder.status()
+
+
+def test_a_head_that_rolled_back_to_genesis_is_detected(tmp_path):
+    """头指针被回滚到创世(seq=0)而日志里已有记录:fail-closed。"""
+    ladder = two_steps(tmp_path)
+    h = head(ladder)
+    h.update(seq=0, hash="0" * 64, queries=0, best=0.0)
+    ladder.path.write_text(json.dumps(h), encoding="utf-8")
+    with pytest.raises(LadderError):
+        ladder.status()

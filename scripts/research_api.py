@@ -88,8 +88,13 @@ def describe_error(exc: BaseException, phase: str | None = None) -> dict:
             break
     msg = _PATH_LIKE.sub("<path>", msg)
     msg = "".join(ch for ch in msg if ch.isprintable())[:200]
-    # 阶段:调用方显式给的优先;其次是编排代码打在异常上的标记(research_gate._tag_phase);声明错误(GridError)是声明期。
-    phase = phase or getattr(exc, "invest_phase", None) or ("declaration" if name.split(".")[-1] == "GridError" else None)
+    # 阶段**只由框架决定**:调用点显式传入。
+    # 这里**绝不**从异常对象上读阶段标记:候选可以给自己的异常挂 `invest_phase="selection"`,
+    # 旧实现"只补不改"就会保留它,于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+    # (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。
+    # 阶段现在由编排代码在**自己知道阶段**的 except 块里写进结果字典,候选没有通道能改它。
+    if phase is None and name.split(".")[-1] == "GridError":
+        phase = "declaration"                            # 声明错误(网格声明)是我们自己写的消息
     return {"type": name.split(".")[-1], "message": msg, "phase": phase}
 
 
