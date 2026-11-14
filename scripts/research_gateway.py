@@ -507,13 +507,18 @@ class GatewayApp:
         # 外层与运维分不清"没有失败"和"失败被藏了"。现在计数并分类上报(只给计数与分类,不给内容)。
         skipped = {"tampered": 0, "invalid_result": 0, "unreadable": 0, "orphaned_by_reset": 0, "unavailable": 0}
         # 一次只读一次梯子(第 19 轮 L3):此前每扫一个结果就重读并重校验整条日志。
+        # 更正口径(第 21 轮 codex 的 M3):**梯子日志**仍然只读一次,但变更令牌
+        # 每条结果要读一次**头指针**(独立的小文件),所以"一次只读一次梯子"不准确。
+        # 同一次请求只用**一个**梯子实例(第 21 轮 codex 的 L4):此前为读孤立名单
+        # 又 new 了一个 Ladder,等于每请求多解析一次重置日志,且与快照不是同一时刻。
         try:
-            ladder = self._ladder().snapshot()
+            real_ladder = self._ladder()
+            ladder = real_ladder.snapshot()
         except LadderError:
             return 500, {"error": LADDER_UNAVAILABLE}
         store = self._reveal_store()
         try:
-            orphaned = set(self._ladder().orphaned_run_ids())
+            orphaned = real_ladder.orphaned_run_id_set()
         except LadderError:
             orphaned = set()
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
@@ -533,10 +538,16 @@ class GatewayApp:
                 # 历史 run 因此永远读不出来(回放时梯子里查无此 run,若当成篡改就是**误报**)。
                 # 这三种情况必须分开计数,否则 reset 一执行,诊断通道就静默变空,
                 # 或者一次正常的人工重置就被记成安全事件(第 19 轮 codex 的 H1)。
-                if run_id in orphaned:
-                    skipped["orphaned_by_reset"] += 1
-                elif reason is not None:
+                #
+                # **异常自己的判定排在名单前面**(第 21 轮 codex 的 Medium-1):
+                # 孤立名单是无哈希链的普通文本,可以伪造。此前先查名单,
+                # 于是一条伪造的 reset 记录就能把真正的篡改计数器压成 0——
+                # 数据确实不放行,但 `skipped.tampered` 是运维面板上**唯一的**篡改信号。
+                # 名单只用于"异常没给出判定"时的兜底分类。
+                if reason is not None:
                     skipped[reason] += 1
+                elif run_id in orphaned:
+                    skipped["orphaned_by_reset"] += 1
                 continue
             error = view.get("error") if isinstance(view.get("error"), dict) else None
             if view.get("status") == "strategy_error" and error:

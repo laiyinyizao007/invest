@@ -281,11 +281,19 @@ class RevealStore:
         try:
             if path.stat().st_size > MAX_STORED_BYTES:
                 raise OutwardTampered("揭示存档超过大小上限")
-            raw = path.read_text(encoding="utf-8")
+            data = path.read_bytes()
         except OSError as exc:
             # 读不到(权限、共享冲突、路径被换成目录……)是**可用性**故障,不是篡改证据:
             # 文件根本没被读到,凭什么说它被改过?(第 20 轮 codex 的 M2)
             raise OutwardUnavailable(f"揭示存档暂时读不到: {type(exc).__name__}") from exc
+        try:
+            raw = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # 解码失败是**存档损坏**,不是"读不到"(第 21 轮 codex 的 High-1):
+            # UnicodeDecodeError 是 ValueError 的子类,此前这段用 `read_text` 直接抛,
+            # 而两个 except 一个接 OSError、一个接解析期的 ValueError,谁也没接住它——
+            # 于是一份坏存档把整个 /feedback 打成 500「内部错误」(基线是 200 + 计一条篡改)。
+            raise OutwardTampered(f"揭示存档损坏(fail-closed): {exc}") from exc
         try:
             view = json.loads(raw)
         except ValueError as exc:
@@ -323,11 +331,15 @@ def _is_orphaned(ladder: Ladder, run_id: str) -> bool:
     名单只用于**分类**:被孤立的 run 一样读不出数据,区别只在于跳过时说的是
     "被人工重置孤立"还是"被篡改"——一次正常的人工重置不该被记成安全事件。
 
-    名单读不出来时一律当作"不是孤立"(fail-closed):读不到名单就没有理由去原谅任何一条记录。"""
+    **名单读不出来时不再装作"不是孤立"**(第 21 轮 codex 的 L1):
+    此前把读不到名单当成"没有孤立项",于是可读性故障又被说成篡改——
+    第 20 轮刚建立的分类原则(不可用 ≠ 篡改)在梯子这条路径上没有覆盖到。
+    现在报 `OutwardUnavailable`:仍然 fail-closed(一样读不出数据),但运维看到的是
+    "去查磁盘/权限",而不是"去查安全事件"。"""
     try:
-        return run_id in set(ladder.orphaned_run_ids())
-    except (OSError, LadderError):
-        return False
+        return run_id in ladder.orphaned_run_id_set()
+    except (OSError, LadderError) as exc:
+        raise OutwardUnavailable(f"无法确认该 run 是否被人工重置孤立: {type(exc).__name__}") from exc
 
 
 def _replay(stored: dict, view: dict, result: dict, sharpe: Any, run_id: str, ladder: Ladder) -> dict:

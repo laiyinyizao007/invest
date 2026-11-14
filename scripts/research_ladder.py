@@ -33,7 +33,8 @@ def ladder_for(paths: dict) -> Ladder:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="梯子的人工入口(只读 status;显式 renew,留痕)")
+    parser = argparse.ArgumentParser(
+        description="梯子的人工入口(只读 status;显式 renew,留痕;reset 从头开始——最重的一项,只留给人)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="当前汇报值与剩余查询数(不消耗查询)")
     renew = sub.add_parser("renew", help="续期:queries 归零、保留 best,留审计记录")

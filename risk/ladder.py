@@ -577,9 +577,18 @@ class Ladder:
         if cached is not None and cached[0] == token:
             return list(cached[1])               # 名单只增不减:文件没变就直接用缓存
         try:
-            text = log_path.read_text(encoding="utf-8")
-        except OSError:
-            return []
+            data = log_path.read_bytes()
+        except OSError as exc:
+            # 读不到名单是**可用性**故障,不是"没有孤立项"(第 21 轮 codex 的 M2/L1):
+            # 此前这里返回 [],于是"名单读不出来"与"确实没有孤立项"长得一样——
+            # 外层会把一次合法的人工重置记成篡改(第 20 轮刚修好的分类又被绕回去)。
+            raise LadderError(f"重置日志暂时读不到: {type(exc).__name__}") from exc
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # 名单文件损坏:同样分不清"有孤立项"与"没有",按 fail-closed 报不可用,
+            # 绝不把损坏当成"不是孤立"去原谅任何一条记录。
+            raise LadderError("重置日志损坏(fail-closed,不当作孤立)") from exc
         names: list[str] = []
         seen: set[str] = set()
         for line in text.splitlines():
@@ -594,8 +603,47 @@ class Ladder:
                     if isinstance(run_id, str) and run_id not in seen:
                         seen.add(run_id)
                         names.append(run_id)
-        self._orphans_cache = (token, list(names))
+        self._orphans_cache = (token, list(names), set(names))
         return list(names)
+
+    def orphaned_run_id_set(self) -> set[str]:
+        """孤立名单的**集合**形式(带缓存,只读):按 run 查"是不是被孤立"是热路径上的高频操作,
+        每次重建一个 set 是 O(结果数 × 名单长)(第 21 轮 codex 的 L3)。
+
+        返回的是缓存里的那一个 set,**调用方不得改动它**。"""
+        self.orphaned_run_ids()                     # 读一次并刷新缓存(读不到会抛 LadderError)
+        cached = getattr(self, "_orphans_cache", None)
+        if not cached or len(cached) < 3:
+            return set()
+        return cached[2]
+
+    def _run_ids_best_effort(self) -> list[str]:
+        """尽力从**原始日志**里捞出 run_id(第 21 轮 codex 的 High-2)。
+
+        对账失败不等于 run_id 读不出来:日志行本身是 JSON,即便哈希链或锚点对不上,
+        逐行 `json.loads` 仍能取到 `run_id`。读不懂的行直接跳过(不猜、不补)。
+        这条只在 `reset` 的"梯子已经坏了"分支上用到——那里 `_load()` 必然抛错。
+        """
+        try:
+            raw, _ended = _split_lines(self.log_path.read_bytes())
+        except OSError:
+            return []
+        names: list[str] = []
+        seen: set[str] = set()
+        for line in raw:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            run_id = row.get("run_id")
+            if isinstance(run_id, str) and run_id not in seen:
+                seen.add(run_id)
+                names.append(run_id)
+        return names
 
     def snapshot(self) -> "LadderSnapshot":
         """一次读入的只读快照(第 19 轮 codex 的 L3)。
@@ -685,6 +733,12 @@ class Ladder:
                     healthy = False                     # 空的梯子:重置不损失任何东西,放行
             except LadderError:
                 healthy = False                          # 已经坏了:reset 正是这时候的出路
+                # 但**名单照样要捞出来**(第 21 轮 codex 的 High-2):
+                # "对账失败"不等于"run_id 读不出来"。此前这条分支里名单恒为空——
+                # 而"梯子已经坏了"恰恰是 `reset` 的用武之地(docstring 就这么写的),
+                # 于是 H-2 那条"合法人工重置不算篡改"只在"梯子健康 + --force"
+                # 这条被劝阻的路径上生效,在正经路径上原样未修。
+                dropped["run_ids"] = self._run_ids_best_effort()
             if healthy and not force:
                 # 拒绝也要留痕(第 19 轮 codex 的 MEDIUM):有人试图重置一件状态正常的梯子,
                 # 这本身就是"动过手"的证据——不记下来,事后只看归档文件是看不出有人试过的。
@@ -821,6 +875,10 @@ class LadderSnapshot:
     def orphaned_run_ids(self) -> list[str]:
         """被人工 `reset` 孤立的 run 名单:读**真梯子**的(名单只增不减,快照里的行会过期)。"""
         return self._ladder.orphaned_run_ids()
+
+    def orphaned_run_id_set(self) -> set[str]:
+        """孤立名单的集合形式(只读):转交真梯子的缓存,不在快照里另存一份。"""
+        return self._ladder.orphaned_run_id_set()
 
     def submit(self, sharpe, run_id: str | None = None) -> dict:
         """消耗查询的写操作**不走快照**,回真梯子(它要写日志、头指针与锚点)。
