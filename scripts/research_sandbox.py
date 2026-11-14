@@ -771,6 +771,11 @@ def _looks_like_repr_escape(text: str, start: int, host_start: int) -> bool:
         return False
     if text[start - 1] not in "\"'":
         return False
+    # repr/JSON 里的换行转义只有**两个**反斜杠;UNC 的 repr/JSON 形态
+    # 是四个反斜杠 + 主机名。不按个数区分,主机名以 n 开头的 UNC
+    # (nas / net …)就整条漏盖(第 16 轮 codex 的 H1)。
+    if host_start - start > 2:
+        return False
     return host_start < len(text) and text[host_start] == "n"
 
 

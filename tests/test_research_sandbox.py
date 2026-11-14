@@ -829,6 +829,18 @@ def test_redact_paths_does_not_treat_a_repr_newline_as_a_path():
     assert rs.redact_paths(text) == text
 
 
+def test_scrub_covers_the_repr_and_json_form_of_a_unc_path_with_an_n_host():
+    """repr/JSON 里的 UNC 是四个反斜杠 + 主机名;主机名以 n 开头(nas/net)
+    不能被当成换行转义放过(第 16 轮 codex 的 H1)。"""
+    import json
+    bs = chr(92)
+    for host in ("nas", "net", "srv"):
+        raw = bs * 2 + host + bs + "share" + bs + "secret.txt"
+        for form in (repr(raw), json.dumps(raw)):
+            cleaned = rs.scrub_text(form)
+            assert host + "\\\\" not in cleaned and "secret.txt" not in cleaned, cleaned
+
+
 def test_redact_digests_covers_a_digest_inside_a_longer_hex_string():
     """64 位摘要**藏在更长的十六进制串里**时原先原样出去(第 12 轮 codex 的 L2)——
     而「前面拼一段前缀、后面拼一段后缀」正是最常见的拼接形态。"""
