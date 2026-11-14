@@ -247,6 +247,13 @@ class RepoImportGuard:
             return f"禁止导入 {name}:该文件在候选运行期间被改动过"
         return None
 
+    def _rel(self, path: Path) -> str:
+        """给拒绝理由用的**相对**路径(不把本机绝对路径泄给候选)。"""
+        try:
+            return str(path.resolve().relative_to(self.repo_root))
+        except (ValueError, OSError):
+            return path.name
+
     def check_package(self, name: str) -> str | None:
         """裁决"从一个**包**里 import 子模块"这种写法;返回拒绝理由(None 表示放行)。
 
@@ -262,6 +269,10 @@ class RepoImportGuard:
           拿到真实内建——"按路径裁决"整条规则被绕开。
 
         修法:包的**名字空间位置**只要落在仓库内、且不在允许目录里,就拒绝这种导入。
+
+        这条与"逐项裁决"是**互补**而不是重复:逐项裁决只管**模块**,
+        候选 `from <包> import <某个常量>`(不是模块)时逐项裁决看不见任何东西,
+        只有这一条能把那个包整个挡在门外。
         """
         for loc in module_locations(name):
             try:
@@ -271,8 +282,48 @@ class RepoImportGuard:
             if self.repo_root != resolved and self.repo_root not in resolved.parents:
                 continue                                        # 仓库之外(站点包)照旧放行
             if not self._under_allowed_dir(resolved):
-                return (f"禁止从 {name} 导入:包位置 {loc} 不在允许的目录 {list(self.allowed_dirs)} 内"
-                        f"(候选不得导入框架、风控或回测模块)")
+                return (f"禁止从 {name} 导入:包位置 {self._rel(resolved)} 不在允许的目录 "
+                        f"{list(self.allowed_dirs)} 内(候选不得导入框架、风控或回测模块)")
+        return None
+
+    def check_package_wildcard(self, name: str) -> str | None:
+        """裁决 `from <包> import *`(通配符)。
+
+        为什么这条必须**独立**存在(第 22 轮用探针实测出来的,不是推理):
+        通配符形式不会把 fromlist 里的名字逐个交给我们裁决——**导入机制自己**
+        按包的 `__all__`(有的话)去 import 那些子模块,整个过程**不经过守卫**。
+        于是只要包里有 `__all__`,候选把一个同名模块写进这个包,
+        `from 包 import *` 就会把它**在导入机制里执行**(拿到真实内建),
+        而逐项裁决对 `"*"` 一无所知。
+
+        探针实证:辅助模块里只有一行 `open(...).write("x")`——`open` 在候选自己的帧里
+        是被收走的,只有**在导入机制里执行**才拿得到真内建,标记文件因此被写了出来。
+
+        修法:通配符这一路改成"扫目录"——包内(仓库侧)的每个 `.py` 都必须在快照里、
+        且此后没被改过;只要多出一个文件(候选写的)就拒。
+        """
+        for loc in module_locations(name):
+            try:
+                resolved = Path(loc).resolve()
+            except OSError:
+                continue
+            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+                continue                                        # 仓库之外(站点包)照旧放行
+            if not self._under_allowed_dir(resolved):
+                return (f"禁止从 {name} 导入 *:包位置 {self._rel(resolved)} 不在允许的目录 "
+                        f"{list(self.allowed_dirs)} 内(候选不得导入框架、风控或回测模块)")
+            for path in sorted(resolved.rglob("*.py")):
+                try:
+                    key = str(path.resolve())
+                    stat = path.stat()
+                except OSError:
+                    continue
+                known = self.snapshot.get(key)
+                if known is None:
+                    return (f"禁止从 {name} 导入 *:包内 {path.name} 在候选开始运行之前并不存在"
+                            f"(候选运行期间写出的文件一律不得被导入)")
+                if stat.st_mtime_ns != known:
+                    return f"禁止从 {name} 导入 *:包内 {path.name} 在候选运行期间被改动过"
         return None
 
 
@@ -317,9 +368,16 @@ def safe_builtins(forbidden_modules: Sequence[str] = (), repo_guard: "RepoImport
                 reason = repo_guard.check_package(target)
                 if reason:
                     raise ImportError(reason)
+                if "*" in fromlist:
+                    # 通配符:`"*"` 不是一个模块名,逐项裁决对它无能为力——
+                    # 导入机制按包的 `__all__` 自己 import 子模块,整条路都不经过守卫。
+                    # 所以这一路改成"扫包目录":多出一个文件就拒(第 22 轮探针实证)。
+                    reason = repo_guard.check_package_wildcard(target)
+                    if reason:
+                        raise ImportError(reason)
                 for item in fromlist:
                     if item == "*":
-                        continue            # 通配符:子模块全部来自包位置,上面已经裁过
+                        continue            # 通配符:上面已经按目录整体裁过
                     reason = repo_guard.check(f"{target}.{item}")
                     if reason:
                         raise ImportError(reason)

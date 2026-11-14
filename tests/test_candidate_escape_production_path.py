@@ -256,6 +256,87 @@ def test_the_candidate_cannot_use_a_wildcard_from_import_to_run_its_own_helper(t
     assert cls.PASS["helper_executed"] == "denied", "候选用通配符 from-import 跑起了自己的辅助模块"
 
 
+def test_the_candidate_cannot_run_a_helper_module_through_a_wildcard_import(tmp_path, monkeypatch, repo):
+    """通配符 `from <包> import *`:逐个子模块的裁决对它**无能为力**。
+
+    导入机制按包的 `__all__`(有的话)自己 import 那些子模块,整个过程**不经过守卫**。
+    于是只要包里有 `__all__`,候选把一个同名模块写进这个包,通配符导入就会把它
+    **在导入机制里执行**——拿到真实内建,而逐项裁决对 `"*"` 一无所知。
+
+    仓库里的 `strategies/__init__.py` 目前是空的(没有 `__all__`),所以这条路是**潜伏**的:
+    等哪天有人给包加了 `__all__`,这条洞就会自己打开。这里用一个**自造的包**把它逼出来,
+    免得"等出事再补"。
+
+    探针里辅助模块只有一行 `open(...).write("x")`:`open` 在候选自己的帧里是被收走的,
+    只有**在导入机制里执行**才拿得到真内建——所以标记文件被写出来就等于"确实被执行了"。
+    """
+    monkeypatch.syspath_prepend(str(repo))
+    purge_modules(monkeypatch, "strategies")
+    # 给包装上 `__all__`:导入机制据此自己去 import 子模块。
+    (repo / "strategies" / "__init__.py").write_text('__all__ = ["evil"]\n', encoding="utf-8")
+    marker = tmp_path / "executed.txt"
+    helper = 'open(r"%s","w").write("x")' % str(marker).replace("\\", "/")
+    target = str(repo / "strategies" / "evil.py").replace("\\", "/")
+    source = build(
+        BASE,
+        f"""
+        try:
+            import numpy as np
+            np.savetxt("{target}", np.array([{helper!r}]), fmt="%s")
+            from strategies import *
+            LEAK["helper_executed"] = "evil" in dir()
+        except Exception as exc:
+            LEAK["helper_executed"] = "denied"
+            LEAK["reason"] = repr(exc)
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["helper_executed"] == "denied", "候选用通配符 from-import 跑起了自己的辅助模块"
+    assert not marker.exists(), "辅助模块被执行了(它用真实内建写出了标记文件)"
+    # 还必须确认是**哪一条规则**拒的:只断言"被拒了"的话,换个理由拒也照样绿。
+    assert "包内" in cls.PASS.get("reason", ""), (
+        f"拒绝理由不对,看不出是'通配符扫目录'那条规则拒的:{cls.PASS.get('reason')}"
+    )
+
+
+def test_the_package_position_rule_denies_a_name_that_is_not_a_module(tmp_path, monkeypatch, repo):
+    """包位置裁决这条规则的**专属**探针(逐项裁决看不见它)。
+
+    逐项裁决只管**模块**:候选 `from <包> import <某个不是模块的名字>` 时,
+    那一项在文件系统上查不到来源,逐项裁决无从拒绝——只有"包位置"那条规则
+    (包落在仓库内、但不在允许目录里)能把整个包挡在门外。
+
+    所以这条用例断言的不只是"被拒了",而是**拒绝理由里含"包位置"**:
+    否则把它换成别的理由拒,用例照样绿(守住的东西就变了)。
+    """
+    pkg = repo / "framepkg"          # 命名空间包(没有 __init__.py`)
+    pkg.mkdir()
+    monkeypatch.syspath_prepend(str(repo))
+    purge_modules(monkeypatch, "framepkg")
+    source = build(
+        BASE,
+        """
+        try:
+            from framepkg import NOT_A_MODULE_NAME
+            LEAK["outcome"] = "allowed"
+        except Exception as exc:
+            LEAK["outcome"] = "denied"
+            LEAK["reason"] = repr(exc)
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["outcome"] == "denied", "候选从仓库内非允许目录的包里导入出了东西"
+    assert "包位置" in cls.PASS.get("reason", ""), (
+        f"拒绝理由不对,不是'包位置'那条规则拒的:{cls.PASS.get('reason')}"
+    )
+
+
 def test_the_traceback_of_our_own_frames_does_not_expose_the_real_builtins(tmp_path, monkeypatch, repo):
     """逃逸三:候选触发一次运行期被拒绝的 import,再顺着异常链找真实内建——找不到。
 
