@@ -1011,11 +1011,13 @@ G8 要求双轮都 ≥45 才算发布档;第 12/13/14 轮 codex 为 **38.5 / 38.
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
-| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__` | `research_sandbox.FORBIDDEN_ATTRS` |
-| 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__` | `research_sandbox.FORBIDDEN_STRINGS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__`、**走栈**(第 24 轮新增):`__traceback__`、`__context__`、`__cause__`、`__suppress_context__`、`tb_frame`、`tb_next`、`tb_lasti`、`tb_lineno`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`f_back`、`f_lineno`、`gi_frame`、`gi_code`、`cr_frame`、`cr_code`、`ag_frame`、`ag_code`、`__getattribute__`、`__closure__`、`cell_contents` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__`,**危险模块名当钥匙**(第 24 轮新增):`subprocess`、`ctypes`、`_os`、`real_import` | `research_sandbox.FORBIDDEN_STRINGS` |
+| 禁用字符串·**按键取语境**(危险模块的**短名**:当键取时拒,当普通词时放行——第 24 轮自查修,见下) | `os`、`sys`、`posix`、`nt` | `research_sandbox.FORBIDDEN_KEY_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
 | 执行时**禁止导入**的模块(除上面那组外) | `unittest`、`unittest.mock`、`mock` | `research_sandbox.EXTRA_FORBIDDEN_MODULES` |
-| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator`、`risk` | `research_sandbox.FORBIDDEN_MODULES` |
+| 按**全名**禁用的子模块(根名字不禁,但这几个角落不禁不行) | `numpy.ctypeslib`、`numpy.f2py`、`numpy.distutils` | `research_sandbox.FORBIDDEN_MODULE_PATHS` |
+| 禁用模块(不得 import) | `os`、`sys`、`subprocess`、`socket`、`ctypes`、`shutil`、`pathlib`、`importlib`、`pickle`、`marshal`、`requests`、`urllib`、`http`、`ftplib`、`smtplib`、`asyncio`、`multiprocessing`、`threading`、`signal`、`builtins`、`inspect`、`gc`、`tempfile`、`glob`、`io`、`operator`、`risk`,**执行原语**(第 23 轮新增):`runpy`、`code`、`pkgutil`、`zipimport`、`pty`、`platform`、`webbrowser`,**其余能力入口**(第 24 轮新增):`bdb`、`cProfile`、`concurrent`、`distutils`、`doctest`、`ensurepip`、`pdb`、`pip`、`profile`、`setuptools`、`shelve`、`socketserver`、`telnetlib`、`timeit`、`trace`、`venv`、`xmlrpc` | `research_sandbox.FORBIDDEN_MODULES` |
 
 ### 哈希、筛查、编译、执行必须是同一份字节
 早先 `import_candidate` 用 `spec.loader.exec_module()` 载入候选:Python 默认的 `.pyc` 只比对源文件的 mtime 与大小,不确认字节码对应当前内容,于"人工批准的、算过哈希的、过了静态筛查的源码"和"实际执行的字节码"可以不是一回事;分开打开文件还留下 TOCTOU 窗口。现在只读一次字节,对同一份内容做完哈希、筛查、编译、执行(不再走 `SourceFileLoader`),`__pycache__` 里的旧字节码没有机会生效。
@@ -1167,6 +1169,169 @@ import 它。所以仓库之外的包同样要过"运行之前就存在"这一�
    根本不存在,于是 import 因为“找不到模块”而失败,断言照样通过。
    **教训**:断言“被拒绝了”不够,还要断言“**是被哪一条规则拒绝的**”;
    否则用例可能在守卫失灵时靠巧合保持绿色。修好之后 9 个变异全部变红。
+
+### 第 23 轮补记(Issue #26):第六类逃逸——**执行原语**不经过 `__import__`,按路径裁决对它无效
+
+第 22 轮把五条"真实内建"逃逸都堵上之后,第 23 轮外部复核时又用**动态探针**实测出**第六类**:
+**执行原语**(execution primitive)——`runpy`、`code`、`pkgutil`、`zipimport` 这一类模块
+能把"执行任意代码"这项能力送回给候选,而且**根本不经过 `__import__`**。
+
+关键在于:第 22 轮那套"按路径裁决导入"(`RepoImportGuard`)**只在候选调用 import 的那条路上生效**。
+执行原语不走那条路,于是整套路径规则对它们**完全无效**。
+
+对照实验(同一个"候选在运行期间写出来的模块",同一次运行,两条路):
+
+| 走法 | 结果 |
+|---|---|
+| `import 它` | **被拒**:"该文件在候选开始运行之后才出现" |
+| `runpy.run_path(它)` | **执行成功**:辅助模块在**真实内建**下跑起来 |
+
+探针做法:辅助模块只有一行 `open('leaked_marker.txt','w').write('x')`。
+`open` 在候选自己那些帧里是被收走的(受限内建),**只有被导入机制执行**才拿得到真内建,
+所以标记文件一旦出现,就说明辅助模块**在真实内建下执行了**。
+
+其它实测成立的执行原语:
+
+- `code.InteractiveInterpreter().runsource(...)`:直接执行字符串,连文件都不用;
+- `zipimport.zipimporter(候选自己造的 zip).exec_module(...)`:从 zip 里执行模块;
+- `pkgutil.get_loader(...)`:拿到 loader,而 loader 的 `exec_module` 同样能执行任意文件。
+
+**处置**:这一类**不能**再加一条路径规则(它们不走那条路),只能按**名字**堵——
+`runpy`/`code`/`pkgutil`/`zipimport`/`pty`/`platform`/`webbrowser` 进禁用名单
+(`FORBIDDEN_MODULES`),静态层与运行期层**两道独立的闸**同时生效。
+误伤面为零:仓库里的策略模板只 import `random`/`dataclasses`/`datetime`/`vnpy`/`strategies`。
+
+**但名单式封堵不收敛**——这是本轮最重要的结论,不能含糊:
+能力会从**别的模块再导出**。实测:`numpy.ctypeslib` 把 `ctypes` 整个又导出了一次,
+而 `numpy` 是候选正当需要的包,于是候选可以
+`numpy.ctypeslib.ctypes.CDLL("kernel32").GetCurrentProcessId()`
+直接调原生代码(实测返回 81160)——按路径的导入裁决、内建限制、受保护对象指纹**全都管不着**。
+这条路**堵不住**,也不该假装堵得住。
+
+因此本轮把边界说得更硬:**"进程内执行不受信代码"做不到安全**;
+名单只能拿掉便宜的胜利(把一眼能看见的写法和能力堵掉),拿不掉"能力再导出"这一类。
+真正的边界仍然是**人工审批 + 容器隔离**。
+
+新增一条纪律:**"规则管得到的那条路"不等于"只有那条路"**。
+第 22 轮的规则全都挂在 `__import__` 上,于是"绕开 `__import__`"就是一条没人看过的路。
+每加一条规则都要问一句:**还有哪些执行路径不经过它?**
+
+#### 第 23 轮之后仍然存在的残余缺口(如实记录)
+
+1. **能力再导出**(最重要):见上——`numpy.ctypeslib` → `ctypes` → `CDLL` → 任意原生代码。
+   堵不住,因为 `numpy` 必须允许。**只有容器隔离 + 人工审批**是边界。
+2. 第三方模块的帧里仍然是真实内建(第 22 轮第 1 条,继续成立)。
+3. 名单式封堵不收敛:任何"由名字决定"的黑名单都会有下一个名字。
+   本轮把已知的执行原语补齐了,但**不能**据此宣称"这条路已经关死"。
+4. 新增用例 `test_the_candidate_cannot_reach_a_native_library_through_an_allowed_package`:
+   它断言的是"**确实漏着**"(`LEAK["native"] is True`),
+   目的是把这个事实钉在测试里——哪天架构变了(候选不再能 import `numpy`),它会变红,
+   提醒人把这里的残余登记一并更新,而不是让残余悄悄变成"没人知道的洞"。
+
+### 第 24 轮补记(Issue #26):守卫自己那一帧、模块视图,以及"能力按对象来源判定"
+
+第 23 轮之后 codex 的第二轮复核给出 32/50。自查把它的每一条发现**用动态探针重测**一遍——
+不是照单全收,也不是照单全拒——结论分三类:成立的、成立的但**结论要改**的、
+以及**它没提、而探针逼出来**的。第三类里有一条是 Critical。
+
+#### 一、守卫自己那一帧也是攻击面(新发现,Critical)
+
+第 21 轮把"受限导入器"做成 `types.FunctionType` 重建的函数,把它的 `f_builtins`
+换成受限字典——可它的 **`f_globals` 里还放着 `real_import`**。
+候选顺着 ImportError 的异常链走到守卫那一帧,一句
+`tb_frame.f_globals["real_import"]` 就把**真导入器**拿走,接着
+`real_import("os").system(...)` = **任意命令执行**。探针实测:标记文件被写出来。
+
+| 走法 | 结果 |
+|---|---|
+| `tb_frame.f_builtins["setattr"]` | 拿到**受限**字典(第 21 轮封的) |
+| `tb_frame.f_globals["real_import"]` | 拿到**真导入器** -> `import os` -> 任意命令执行(第 24 轮才封) |
+
+**处置**:
+- 真导入器、禁用名单、路径规则一律搬进**闭包单元**(不再是帧里的名字);
+- 守卫那一帧的 `f_globals` 换成一份**干净的新字典**:
+  `types.FunctionType(code, {"__builtins__": 受限内建}, name, defaults, closure)`
+  —— 候选再摸 `f_globals` 也只能拿到受限内建。
+
+踩过的坑(留给下一个改这里的人):**嵌套函数的 `__globals__` 是"定义它的模块"的全局字典**,
+不是外层帧的 locals。想"清空外层那一帧"是清不掉的——直接 `__globals__.clear()`
+会把整个模块的命名空间抹掉(实测:模块级类全丢,`module_origin` 之类的名字直接 NameError)。
+所以只能走 `types.FunctionType` 重造一份。
+
+**新纪律**:**守卫自己那一帧也是攻击面**。凡是准备放进守卫帧里的值,都要问一句:
+"候选摸到这一帧,能不能拿到它?"
+
+#### 二、模块视图:候选拿到的不是模块,是**视图**
+
+codex 实测:`import logging` 之后 `logging.sys.modules["os"].system(...)` = 任意命令执行,
+而**四层防线全绿**——因为它们全都只看"名字",而这一条走的是"别的模块把危险模块当属性递出来"。
+
+**处置**:候选拿到的模块是 `ModuleView`,规矩是:
+- 属性值是危险模块(`os`/`sys`/`subprocess`/`ctypes`…) -> 不给(`AttributeError`,并写明是哪一条规则);
+- 属性值是会递出能力的模块 -> 那个模块整个不给;
+- 属性值是别的模块 -> 给一份**视图**(递归生效),不给模块本身;
+- 下划线属性(`__class__`/`__dict__`/`_view_module`…)一律不给,否则候选能从视图摸回真模块。
+
+#### 三、"名单式封堵不收敛"要更正一半:能力按**对象来源**判定
+
+第 23 轮的结论是"名单式封堵不收敛"(`numpy.ctypeslib` 把 `ctypes` 整个递出来,
+换个名字还能再递一次)。这个结论对"按名字判定"成立,但判据本身可以换:
+
+判据从"这个名字像不像危险模块"改成"**这个对象是从哪儿定义的**"(`__module__`):
+凡是定义在 `ctypes`/`subprocess` 里的对象——模块、类、函数都算——一律不给。
+于是 `subprocess.Popen`、`ctypes.CDLL` 这种"只递出类不递出模块"的形态也堵住了,
+而"换个名字再递一次"骗不过它(`__module__` 不是名字)。
+
+`numpy` 本身照常放行(候选正当需要);它的三个危险角落按**全名**禁:
+`numpy.ctypeslib`(递出 `ctypes`)、`numpy.f2py`(**import 它就会跑 f2py 的主程序**,实测)、
+`numpy.distutils`。
+
+#### 四、几处 fail-closed 与快照加严(codex 指出的中危项)
+
+- `stat` 失败一律按"**查不了等于没查**"拒。原先有一支直接放行,等于给"从 zip 里执行模块"留了后门;
+- 快照加 **sha256**:只比 mtime 会被"改写内容再把 mtime 还原"骗过(粗粒度文件系统上同秒改写,mtime 根本不变),现在比 mtime + size + sha256 三项;
+- 调用点**显式**传允许目录白名单:靠默认值的话,将来有人把默认值改成 `("strategies","scripts")` 就能放开整个 `scripts/`,而登记在宪法历史守卫里的那个常量根本不会被改动;
+- 守卫自己的调用一律包 try/except 换成"干净的" ImportError:**守卫的帧不进候选看得见的 traceback**。
+
+#### 五、静态层新增"走栈"禁令
+
+`__traceback__`、`tb_frame`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`__closure__`、
+`cell_contents`、`__getattribute__` 一律不得引用(裸名、属性名、字符串三种写法都拒)。
+理由:第三方模块的帧里就是真实内建——实测 numpy 自己的 traceback 里印着
+`numpy/lib/_npyio_impl.py` 第 454 行的 `open(os.fspath(file), "rb")`。
+我们管不了第三方帧的 globals,于是禁掉"顺着异常链走栈"这个**能力本身**。
+
+#### 第 24 轮之后仍然存在的残余缺口(如实记录)
+
+1. **能读 `f_locals` 的候选仍能拿到闭包单元**(实测:Python 3.13 的 `f_locals` 里看得见 `real_import`)。
+   运行期这一层**只**保证 `f_globals` 干净。原因是纯 Python 的死结:
+   凡是这一帧能拿到的对象,候选拿到这一帧就能拿到它——闭包单元、默认参数、代码常量、
+   塞进容器,全都从这一帧可达。挡住它的是**静态层的走栈禁令 + 人工审批 + 容器隔离**。
+2. **第三方模块的帧里仍然是真实内建**(第 22 轮第 1 条,继续成立;第 24 轮又实测了一次)。
+3. **进程内执行不受信代码做不到安全**:真正的边界仍然是**人工审批 + 容器隔离**。
+4. **能绕过静态层的候选**(动态拼名字等)仍然能走到第 1、2 条。
+5. 新增用例 `test_the_runtime_layer_still_exposes_the_closure_cells_through_f_locals`:
+   它断言的是"**确实漏着**"(`LEAK["found_locals"] is True`),把上面第 1 条钉在测试里。
+
+### 第 24 轮自查修(G8 第一轮自查带出的两处小修)
+
+G8 第一轮自查逐行读代码时,自己找出了两处**不是漏洞、但该改**的地方,都在本轮一并修掉:
+
+1. **模块视图缓存原来永不回收**(`_VIEW_CACHE`):它用的是 `WeakKeyDictionary`,
+   可视图对象**强引用**着模块,value→key 的强引用把弱键托住,条目永不消失——
+   每个被导入过的模块都会永久驻留,属于无界增长。现在视图改用**弱引用**持有模块
+   (`ModuleView._view_module_ref`),模块本身由 `sys.modules` 持有,视图照常可用,
+   而缓存条目可以被回收。**教训**:用弱引用做缓存时,value 里不能有指向 key 的强引用——
+   否则"弱"是假的。
+2. **危险模块短名原本是"全局禁字符串",误伤面没列出来**:`FORBIDDEN_STRINGS` 里放了
+   `os`/`sys`/`nt`/`posix`,于是策略里只要出现一个**恰好等于**这些词的字符串字面量
+   (状态名、列名、打印内容)就被拒——拿一条本该封死的洞换了一大片误伤面。
+   现在把这四个短名挪进 `FORBIDDEN_KEY_STRINGS`,**只按语境拦"按键取"这个动作**:
+   下标键(`d["os"]`)、字典取值方法的参数(`d.get("os")`)、关键字参数名(`dict(os=...)`)。
+   要封的洞(`tb_frame.f_globals["os"]`)正是"按键取",而不是这些字符本身。
+   注:字符串匹配一直是**精确相等**(`ast.Constant` 且 `value in 集合`),不是子串匹配——
+   所以 `"close"`/`"cost"` 这类普通词从来没被误伤过,误伤面只落在"恰好等于这四个短名"上。
+
 
 ## 隐藏子入口的信任模型
 

@@ -380,7 +380,11 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     # 拿到的是真实内建,静态层与受限内建对它都不生效。
     # 快照必须在**候选开始运行之前**拍:文件必须早就存在,否则拒绝导入。
     started_at_ns = time.time_ns()
+    # 白名单**显式**传:靠默认参数的话,将来有人把默认值改成
+    # ("strategies","scripts") 就能放开整个 scripts/,而登记在宪法历史守卫里的
+    # 那个常量根本不会被改动(第 24 轮 codex Medium 2)。
     repo_guard = rs.RepoImportGuard(bootstrap.ROOT,
+                                    allowed_dirs=rs.ALLOWED_REPO_IMPORT_DIRS,
                                     snapshot=rs.snapshot_allowed_files(bootstrap.ROOT),
                                     started_at_ns=started_at_ns)
     module.__dict__["__builtins__"] = rs.safe_builtins(cfg["screening"]["extra_forbidden_modules"],

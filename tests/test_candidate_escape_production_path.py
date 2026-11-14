@@ -65,6 +65,23 @@ def run_candidate(tmp_path, monkeypatch, source, cls_name="S"):
     return api.import_candidate(path, cls_name, api.rs.file_sha256(path))
 
 
+def run_probe_at_runtime_layer(source):
+    """只在**运行期**那一层跑探针(绕开静态筛查),返回探针的执行命名空间。
+
+    为什么需要这个入口(第 24 轮):
+    静态层现在会**直接拒掉**"顺着异常链走栈"这类源码(走栈属性一律不得引用),
+    所以再用生产入口跑这类探针,测到的其实是**静态层**,运行期坏了也看不出来——
+    这正是第 22 轮踩过的坑(规则失灵时用例照样绿)。
+    于是分成两处测:
+    - 这里:运行期那一层到底怎么样(允许源码长什么样,只测行为);
+    - 生产入口那条用例:静态层把这类源码**整个拒掉**。
+    """
+    safe = api.rs.safe_builtins(())
+    namespace = {"__name__": "probe", "__builtins__": safe}
+    exec(compile(source, "probe.py", "exec"), namespace)      # noqa: S102 —— 这就是要测的那条路
+    return namespace
+
+
 # 候选自己执行的探针代码。三段都写成"尝试 → 记录成功与否",这样源码本身不会抛异常,
 # 生产入口能正常跑完,断言才落在"到底漏没漏"这件事上。
 #
@@ -111,8 +128,12 @@ PROBE_HELPER = """
         np.savetxt("evil_helper.py", np.array(["import" + " os"]), fmt="%s")
         import evil_helper
         LEAK["helper"] = True
-    except Exception:
+        LEAK["helper_reason"] = "imported"
+    except Exception as exc:
         LEAK["helper"] = False
+        # 把拒绝理由也带出来:断言"被拒绝了"不够,还得确认**是哪一条规则**拒的
+        # (第 22 轮踩过的坑:规则失灵时用例照样绿)。
+        LEAK["helper_reason"] = str(exc)
 """
 
 # 候选必须继承 CtaTemplate(生产入口的第三层校验),所以每段探针后面都接这一段。
@@ -149,7 +170,7 @@ def test_the_candidate_cannot_reach_a_framework_module_through_a_from_import(tmp
         """
         try:
             from scripts import research_api as fw
-            LEAK["got_framework"] = hasattr(fw, "subprocess")
+            LEAK["got_framework"] = hasattr(fw, "sub" + "process")
         except Exception:
             LEAK["got_framework"] = False
         """,
@@ -381,12 +402,102 @@ def test_the_traceback_of_our_own_frames_does_not_expose_the_real_builtins(tmp_p
 
     这条特意挑"我们自己抛异常"的场景:如果受限导入器是用模块级函数实现的,
     它的帧的 f_builtins 就是**真实内建**;必须给它单独造一个受限的帧环境。
+
+    第 24 轮补一条更狠的:受限导入器那一帧的 **f_globals** 里原先放着 `real_import`
+    (第 21 轮只换了 f_builtins,没换 f_globals)。候选一句
+    `tb_frame.f_globals["real_import"]` 就把真导入器拿走,接着 `real_import("os")`
+    就是任意命令执行(实测标记文件被写出来)。
+    现在这一帧的 f_globals 是**干净的新字典**(只有受限内建),真导入器在**闭包单元**里,
+    闭包单元不在 f_locals 里,只有 `__closure__` 能摸到——而那个名字静态层已禁。
+    """
+    source = build(BASE, PROBE_TRACEBACK)
+
+    namespace = run_probe_at_runtime_layer(source)
+
+    assert namespace["LEAK"]["traceback"] is False, "候选从异常链上拿到了真实内建"
+
+
+def test_the_guard_frame_does_not_hand_out_the_real_importer():
+    """第 24 轮的 Critical:候选不能从守卫自己那一帧的 f_globals 里摸到真导入器。
+
+    探针做的事就是当年击穿沙盒的那件事:顺着 ImportError 的异常链走遍每一帧,
+    看有没有哪一帧的 f_globals 里放着 `real_import`。
+
+    第 21 轮只把那一帧的 **f_builtins** 换成受限字典,f_globals 里还放着真导入器,
+    候选一句 `tb_frame.f_globals["real_import"]` 就拿到任意命令执行(实测标记文件被写出)。
+    现在那一帧的 f_globals 是**干净的新字典**(只有受限内建),真导入器在**闭包单元**里。
+    """
+    source = textwrap.dedent("""
+        LEAK = {"found_globals": False}
+        try:
+            import os
+        except Exception as exc:
+            tb = exc.__traceback__
+            while tb is not None:
+                if "real_import" in tb.tb_frame.f_globals:
+                    LEAK["found_globals"] = True
+                tb = tb.tb_next
+        else:
+            LEAK["found_globals"] = "os-imported"
+    """)
+
+    namespace = run_probe_at_runtime_layer(source)
+
+    assert namespace["LEAK"]["found_globals"] is False, (
+        "守卫那一帧的 f_globals 里还放着真导入器——候选顺着异常链就能拿到任意命令执行")
+
+
+def test_the_runtime_layer_still_exposes_the_closure_cells_through_f_locals():
+    """**如实记账的残余**:运行期那一层挡不住"能读 f_locals 的候选"。
+
+    第 24 轮实测:真导入器搬进了**闭包单元**,f_globals 里没有了——
+    但闭包单元在 Python 3.13 的 `f_locals` 里**看得见**(实测:`real_import` 出现在
+    守卫那一帧的 f_locals 键里)。
+
+    为什么这条**改不了**:凡是这一帧能拿到的对象,候选拿到这一帧就能拿到它。
+    Python 层面没有"藏起来但仍能使用"的存放处(闭包单元、默认参数、代码常量、
+    放进容器——全都从这一帧可达)。所以运行期这一层**只能**保证 f_globals 干净。
+
+    挡住它的是另外两层,各有各的用例钉着:
+    - 静态层:走栈属性(`__traceback__`/`tb_frame`/`f_globals`/`f_locals`/`__closure__`)
+      一个都不许引用(见 `test_the_production_path_refuses_to_walk_the_stack`);
+    - 人工审批 + 容器隔离(见 ADR 残余风险一节)。
+    """
+    source = textwrap.dedent("""
+        LEAK = {"found_locals": False}
+        try:
+            import os
+        except Exception as exc:
+            tb = exc.__traceback__
+            while tb is not None:
+                if "real_import" in tb.tb_frame.f_locals:
+                    LEAK["found_locals"] = True
+                tb = tb.tb_next
+    """)
+
+    namespace = run_probe_at_runtime_layer(source)
+
+    assert namespace["LEAK"]["found_locals"] is True, (
+        "守卫那一帧的 f_locals 里已经看不到真导入器了——那说明实现变了,"
+        "本用例与 ADR 的残余风险登记都要一并更新(别只是把断言删掉)")
+
+
+def test_the_production_path_refuses_to_walk_the_stack(tmp_path, monkeypatch, repo):
+    """走栈这条路在**静态层**就被拒:属性名一个都不许出现。
+
+    这一条与上面两条是分工:上面两条测"运行期那一层我们自己那一帧干不干净",
+    这一条测"候选根本写不出这种源码"。
+    断言的是**哪一条规则**拒的(走栈属性名),不是笼统的"被拒了"。
     """
     source = build(BASE, PROBE_TRACEBACK, TAIL)
 
-    cls = run_candidate(tmp_path, monkeypatch, source)
+    with pytest.raises(api.JobError) as exc:
+        run_candidate(tmp_path, monkeypatch, source)
 
-    assert cls.PASS["traceback"] is False, "候选从异常链上拿到了真实内建"
+    message = str(exc.value)
+    assert "静态筛查未通过" in message, message
+    assert "禁止访问 __traceback__" in message or "禁止引用 __traceback__" in message, (
+        f"拒绝理由里没提走栈属性,规则可能不是那一条:{message}")
 
 
 def test_a_helper_module_written_inside_the_repository_cannot_be_imported(tmp_path, monkeypatch, repo):
@@ -394,12 +505,20 @@ def test_a_helper_module_written_inside_the_repository_cannot_be_imported(tmp_pa
 
     文件写在仓库根目录下——它在仓库内、但不在允许目录 `strategies/` 里,
     按路径规则直接拒绝(这条与时间无关,判定是确定的)。
+
+    **必须把假仓库插到 sys.path 最前面**(第 24 轮 codex 指出的假绿):
+    否则 `import evil_helper` 根本找不到模块,失败原因是 ModuleNotFoundError,
+    用例照样绿——但绿得毫无意义:把逐项裁决整个去掉,它照样绿。
+    插进去之后,模块**找得到**,被拒的必须是守卫规则本身。
     """
+    monkeypatch.syspath_prepend(str(repo))
     source = build(BASE, PROBE_HELPER, TAIL)
 
     cls = run_candidate(tmp_path, monkeypatch, source)
 
     assert cls.PASS["helper"] is False, "候选自己写的辅助模块被导入成功了"
+    assert "禁止导入" in cls.PASS["helper_reason"], (
+        f"辅助模块不是被守卫规则拒的(可能是根本没找到模块):{cls.PASS['helper_reason']}")
 
 
 def test_a_helper_module_written_outside_the_repository_cannot_be_imported(tmp_path, monkeypatch, repo):
@@ -432,11 +551,20 @@ def test_a_helper_module_written_outside_the_repository_cannot_be_imported(tmp_p
 
 
 def test_the_real_builtins_are_reachable_from_a_third_party_module(tmp_path, monkeypatch, repo):
-    """**已知敞口**:第三方模块的模块字典里就是真实内建。
+    """**已知敞口**:第三方模块的帧里就是真实内建。
 
     这条用例**断言敞口确实存在**,不是断言它被封住了——
     把它写成"应当被封住"就会变成一句空话,让人以为这条路也堵上了。
     真正的边界是人工审批 + 容器隔离,见 ADR 的残余风险一节。
+
+    第 24 轮实测补了一脚:这个敞口**不是假设**——numpy 自己的 traceback 里就印着
+    `numpy/lib/_npyio_impl.py` 第 454 行的 `open(os.fspath(file), "rb")`,
+    也就是说 numpy 的帧的 f_globals 里就有 `os`。
+
+    但这条敞口**在生产入口上够不着**:静态层把走栈属性(`__traceback__`/`tb_frame`/
+    `f_globals`/`f_builtins`)一律拒掉(见 `test_the_production_path_refuses_to_walk_the_stack`),
+    候选连这种源码都写不出来。写这条用例是为了**如实记账**:
+    运行期这一层挡不住,挡它的是静态层 + 人工审批 + 容器隔离。
     """
     source = build(
         BASE,
@@ -452,12 +580,11 @@ def test_the_real_builtins_are_reachable_from_a_third_party_module(tmp_path, mon
                     LEAK["numpy"] = True
                 tb = tb.tb_next
         """,
-        TAIL,
     )
 
-    cls = run_candidate(tmp_path, monkeypatch, source)
+    namespace = run_probe_at_runtime_layer(source)
 
-    assert cls.PASS["numpy"] is True, (
+    assert namespace["LEAK"]["numpy"] is True, (
         "第三方模块里已经拿不到真实内建了——那说明能力防火墙有进展,"
         "ADR 的残余风险一节需要同步更新(别只是把断言删掉)"
     )
@@ -483,7 +610,9 @@ def test_the_candidate_still_gets_the_legitimate_imports(tmp_path, monkeypatch, 
     assert cls.PASS["ok"] is True
 
 
-@pytest.mark.parametrize("name", ["os", "sys", "subprocess", "importlib", "unittest"])
+@pytest.mark.parametrize("name", ["os", "sys", "subprocess", "importlib", "unittest",
+                                   "runpy", "code", "pkgutil", "zipimport", "pty", "platform",
+                                   "webbrowser"])
 def test_the_name_blocklist_still_holds_on_the_production_path(tmp_path, monkeypatch, repo, name):
     """回归:名字那一层在生产入口上依然有效(路径规则没把它顶掉)。
 
@@ -515,11 +644,168 @@ def test_the_candidate_cannot_reach_the_real_builtins_through_any_of_the_three_r
 
     合在一处是有意的——分开写三个用例时,某个用例的失败可能只是"探针自己写错了",
     合起来断言"一个都没漏",失败时更容易看出是哪一条。
+
+    这一条只测**运行期**那一层,所以把静态筛查**故意**放行(第 23 轮起就这么干):
+    静态层本来就该拦下"顺着异常链走栈"这种源码,留着它就永远测不到运行期了
+    (第 22 轮踩过的坑:规则失灵时用例照样绿)。
     """
+    monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
+    monkeypatch.syspath_prepend(str(repo))
     source = build(BASE, PROBE_LOADER, PROBE_TRACEBACK, PROBE_HELPER, TAIL)
 
     cls = run_candidate(tmp_path, monkeypatch, source)
 
-    assert cls.PASS == {"loader": False, "traceback": False, "helper": False}, (
-        f"有逃逸漏了:{cls.PASS}"
+    assert cls.PASS["loader"] is False, "候选拿到了能执行代码的 loader"
+    assert cls.PASS["traceback"] is False, "候选从异常链上拿到了真实内建"
+    assert cls.PASS["helper"] is False, "候选自己写的辅助模块被导入成功了"
+    assert "禁止导入" in cls.PASS["helper_reason"], (
+        f"辅助模块不是被守卫规则拒的:{cls.PASS['helper_reason']}")
+
+
+# ---------------------------------------------------------------------------
+# 第 6 类逃逸(第 23 轮外部复核时才发现):**执行原语**。
+#
+# 前面五条逃逸全都在"候选调用 import"这条路上,而按路径的导入裁决(RepoImportGuard)
+# 也只在这条路上生效。但 `runpy.run_path(文件)` / `code.InteractiveInterpreter.runsource(...)`
+# / `zipimport.zipimporter(...).exec_module(...)` 这些**执行原语**根本不经过 `__import__`,
+# 于是路径规则对它们**完全无效**。对照实验(同一个"运行期间写出来的模块"):
+#
+#   `import 它`          -> 路径规则拒绝:"该文件在候选开始运行之后才出现";
+#   `runpy.run_path(它)` -> 直接执行,辅助模块在**真实内建**下跑起来(标记文件被写出)。
+#
+# 所以这一类不是"再加一条路径规则"能解决的,只能靠**名字**堵:把执行原语列进禁用名单。
+EXECUTION_PRIMITIVES = ("runpy", "code", "pkgutil", "zipimport", "pty", "platform", "webbrowser")
+
+
+@pytest.mark.parametrize("name", EXECUTION_PRIMITIVES)
+def test_the_runtime_layer_refuses_the_execution_primitives(name):
+    """运行期那一层必须拒掉执行原语。
+
+    这一层要**单独**测:静态层会先按 `import` 语句把候选拦下来,那样这条用例
+    永远走不到运行期,就成了"绿得毫无意义"(第 22 轮踩过的坑:规则失灵时用例照样绿)。
+    """
+    safe = api.rs.safe_builtins(())
+
+    with pytest.raises(ImportError) as exc:
+        safe["__import__"](name)
+
+    assert name in str(exc.value)
+
+
+def test_the_candidate_cannot_run_its_own_module_through_an_execution_primitive(
+        tmp_path, monkeypatch, repo):
+    """不变式:候选**不得**让"运行期间写出来的模块"被执行,走哪条路都不行。
+
+    这一条把静态层**故意**放行(只留下运行期那一层):静态层本来就该拦下这种源码,
+    留着它就永远测不到运行期了。
+
+    探针里的辅助模块只做一件事——写一个标记文件。它**必须**在真实内建下才写得出来
+    (候选自己那些帧里 `open` 是被收走的),所以标记文件一旦出现,就说明
+    "辅助模块在真实内建下执行了"。
+    """
+    monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
+    source = build(
+        BASE,
+        """
+        try:
+            import numpy as np
+            np.savetxt("evil_helper.py",
+                       np.array(["open('leaked_marker.txt','w').write('x')"]), fmt="%s")
+            import runpy
+            runpy.run_path("evil_helper.py")
+            LEAK["primitive"] = True
+        except Exception:
+            LEAK["primitive"] = False
+        """,
+        TAIL,
     )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["primitive"] is False, "候选用执行原语跑起了自己写的模块"
+    assert not (repo / "leaked_marker.txt").exists(), (
+        "辅助模块在真实内建下执行了(标记文件被写出来)")
+
+
+def test_the_runtime_layer_refuses_the_dangerous_submodule_paths():
+    """第 24 轮:`numpy.ctypeslib` 这类"把执行能力递出来"的角落按**全名**禁掉。
+
+    `numpy` 本身是候选正当需要的包,所以不能整包禁;
+    但 `numpy.ctypeslib`(递出 `ctypes`)、`numpy.f2py`(**import 它就会跑 f2py 的主程序**)
+    这几个角落必须单独禁。这一层要**单独**测:静态层会先按 import 语句拦掉候选源码,
+    那样这条用例永远走不到运行期(第 22 轮踩过的坑)。
+    """
+    safe = api.rs.safe_builtins(())
+
+    for name in ("numpy.ctypeslib", "numpy.f2py", "numpy.distutils"):
+        with pytest.raises(ImportError) as exc:
+            safe["__import__"](name)
+        assert "按全名禁用" in str(exc.value), f"{name} 的拒绝理由不对:{exc.value}"
+
+
+def test_the_module_view_refuses_a_module_that_hands_out_a_capability_object():
+    """判据是"对象**从哪儿定义**",不是"名字像不像"——所以这一条是收敛的。
+
+    第 23 轮的结论"名单式封堵不收敛"(`numpy.ctypeslib` 换个名字也能递出 ctypes),
+    第 24 轮换了判据:凡是**定义在** ctypes/subprocess 里的对象(类、函数),
+    一律不给。这里用一个自造的模块递出 `ctypes.CDLL`(**类**,不是模块)来验证。
+    """
+    import ctypes
+    import types as pytypes
+
+    fake = pytypes.ModuleType("fake_pkg")
+    fake.CDLL = ctypes.CDLL                       # 只递出类,不递出 ctypes 模块
+    view = api.rs._view_for(fake)
+
+    with pytest.raises(AttributeError) as exc:
+        view.CDLL
+
+    assert "能力泄漏" in str(exc.value), f"拒绝理由不对:{exc.value}"
+
+
+def test_the_candidate_cannot_reach_a_native_library_through_an_allowed_package(tmp_path, monkeypatch, repo):
+    """第 24 轮:`numpy.ctypeslib` -> `ctypes` -> `CDLL` 这条路已经堵上了。
+
+    第 23 轮实测它**还漏着**(所以当时如实登记成残余风险)。
+    第 24 轮从两头堵:
+    - 静态层:`numpy.ctypeslib` 按全名拒;
+    - 运行期:按全名拒(路径规则)+ 模块视图按"对象来源"拒。
+
+    真正剩下的边界不是这一条,而是"进程内执行不受信代码"本身:
+    候选自己写的类、第三方模块的帧里仍然是真实内建(另有用例钉着),
+    真正的边界是**人工审批 + 容器隔离**(见 ADR 残余风险)。
+    """
+    # 1) 静态层:整条 import 语句被拒。
+    source = build(
+        BASE,
+        """
+        try:
+            import numpy.ctypeslib as C
+            lib = C.ctypes.CDLL("kernel32")
+            LEAK["native"] = lib.GetCurrentProcessId() > 0
+        except Exception:
+            LEAK["native"] = False
+        """,
+        TAIL,
+    )
+
+    with pytest.raises(api.JobError) as exc:
+        run_candidate(tmp_path, monkeypatch, source)
+
+    assert "静态筛查未通过" in str(exc.value), str(exc.value)
+
+    # 2) 运行期:即使静态层被放行(只留运行期那一层),按全名的规则也把它拒了。
+    monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
+    safe = api.rs.safe_builtins(())
+    with pytest.raises(ImportError) as exc:
+        safe["__import__"]("numpy.ctypeslib")
+    assert "按全名禁用" in str(exc.value), str(exc.value)
+
+    # 3) 模块视图:即便候选 import 的是 numpy(正当需求),numpy 的角落里那个
+    #    递出 ctypes 的子模块也不给。
+    import numpy
+
+    view = api.rs._view_for(numpy)
+    with pytest.raises(AttributeError) as exc:
+        view.ctypeslib
+    assert "规则:模块视图" in str(exc.value) or "能力泄漏" in str(exc.value), str(exc.value)

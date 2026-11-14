@@ -384,6 +384,7 @@ def test_the_reserved_word_table_matches_the_code():
     listed(*rs.FORBIDDEN_CALLS)
     listed(*rs.FORBIDDEN_ATTRS)
     listed(*rs.FORBIDDEN_STRINGS)
+    listed(*rs.FORBIDDEN_KEY_STRINGS)
     listed(*rs.UNSAFE_BUILTINS)
     listed(*rs.EXTRA_FORBIDDEN_MODULES)
     # 宪法层的名单
