@@ -11,12 +11,31 @@
 - Low 1:裸局部变量名 `am` / `bg` 被拒;
 - Low 3:第三层只查实例字典,看不见运行期给类打的补丁。
 """
-import textwrap
 from pathlib import Path
 
 import pytest
 
 from risk import constitution as const
+
+# 交易栈侧:**必须先于 vnpy.trader.database 导入**(固定时区)。
+# 本文件的指纹用例会经 `const.snapshot_protected_state()` 预加载
+# `vnpy_ctastrategy.backtesting`,那会连带加载 `vnpy.trader.database`;
+# 若此时 bootstrap 还没导入,后面 `import backtest_lib` 里的
+# `import bootstrap` 会因导入顺序检查而抛 RuntimeError。
+# (以前这段顺序是靠 `conftest → segment_ledger → bootstrap` 兜住的,
+#  登记文件与交易栈解耦后那层兜底没了,这里显式补上。)
+# 放在 `from risk import constitution` 之后是安全的:宪法模块在**导入期**
+# 不碰 vnpy(它只在自己的函数里按需 import)。
+#
+# **只判断「交易栈在不在」,不吞异常**(第 12 轮 codex 的 M1):
+# 用 `try/except ImportError: pass` 的话,「装了但装坏了」的 vnpy
+# (缺 vnpy.trader.setting / bootstrap 自身有语法错误)会被**静默吞掉**,
+# bootstrap 于是从没被导入,后面报的是「导入顺序错了」,
+# 真实原因(交易栈没装好)反而看不见——排查方向被带偏。
+import importlib.util
+
+if importlib.util.find_spec("vnpy") is not None:
+    import bootstrap  # noqa: F401
 
 ROOT = Path(const.CONSTITUTION_FILE.parent.parent)
 

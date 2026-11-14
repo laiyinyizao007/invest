@@ -290,6 +290,15 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     #    运行时第三层的"家族判定"直接判成"不适用"而放行(第 10 轮 codex 实测)。
     #    第三层已改成按 MRO 判定(结构判定,没有可改写的入口),这里再加一道静态保险。
     "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__",
+    # ⑥ 异常回溯帧(第 11 轮 codex 实测的 Critical):候选在自己代码里
+    # `except BaseException as e:` 中顺着 `e.__traceback__.tb_frame.f_globals`
+    # 拿回**真 os**(numpy 内部帧的全局命名空间里有 os),于是任意写文件
+    # (可伪造 approvals.json)、读文件(.env、网关令牌)、执行命令,
+    # 而**两层静态筛查零告警**——这条路上一个禁用名都不出现。
+    # 拿到帧**必经**这几个名字,它们是必经之路而不是可选路径。
+    "__traceback__", "__context__", "__cause__",
+    "tb_frame", "tb_next", "tb_lasti",
+    "f_globals", "f_locals", "f_builtins", "f_back", "f_code", "f_lineno",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -308,6 +317,10 @@ BUILTIN_FORBIDDEN_DUNDERS = (
 # (第 7 轮实测:经异常回溯拿到 frame.f_builtins 里的 setattr;以及 unittest.mock.patch.object)。
 # 真正把能力收走的是**执行时不给这些内建**(scripts/research_sandbox.py::safe_builtins):
 # 候选的内建字典里没有 setattr,那些路径就都不成立。
+#
+# **准确口径**(第 22 轮补记,Issue #26):收走的是**候选自己那些帧**里的能力。
+# 别人的帧(导入机制、第三方库)里仍然是真实内建——所以这一层是纵深防御,不是边界;
+# 真正的边界是人工审批 + 容器隔离。
 BUILTIN_FORBIDDEN_BY_NAME_SETTERS = ("update_setting",)
 
 # 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。
@@ -1400,6 +1413,25 @@ def _protected_runtime_objects() -> dict[int, str]:
     return objects
 
 
+def _safe_getattr(value, name: str):
+    """读候选命名空间里某个值的属性,**任何异常都当成"读不到"**。
+
+    合并 main #26 的模块代理(`_GuardedModule`)之后:候选命名空间里的值可能是代理,
+    它对 `__class__`/`__module__`/`__name__` 这类 dunder 一律抛 `ImportError`(不是 AttributeError)——
+    `isinstance(代理, X)` 的回退路径会读 `__class__`,`getattr(代理, "__module__", None)` 也只吞
+    AttributeError,于是本层(运行期第四层之后的命名空间核对)自己被代理炸掉、整个导入被拒。
+    所以这里一律用 `type(value)` 判类型、用本函数读属性,不碰对象自己的 `__class__`。"""
+    try:
+        return getattr(value, name, None)
+    except Exception:                                     # noqa: BLE001 - 代理对 dunder 抛 ImportError
+        return None
+
+
+def _is_kind(value, kinds) -> bool:
+    """`isinstance` 的不碰 `__class__` 的版本(只看 `type(value)`)。"""
+    return issubclass(type(value), kinds)
+
+
 def _namespace_values(namespace: dict) -> list[tuple[str, object]]:
     """命名空间里的值:**顶层**的,以及**一层**嵌套(列表/元组/集合/字典)里的。
 
@@ -1409,9 +1441,9 @@ def _namespace_values(namespace: dict) -> list[tuple[str, object]]:
     values: list[tuple[str, object]] = []
     for name, value in namespace.items():
         values.append((name, value))
-        if isinstance(value, (list, tuple, set, frozenset)):
+        if _is_kind(value, (list, tuple, set, frozenset)):
             values.extend((f"{name}[…]", item) for item in value)
-        elif isinstance(value, dict):
+        elif _is_kind(value, dict):
             values.extend((f"{name}[…]", item) for item in value.values())
             values.extend((f"{name}{{键}}", key) for key in value.keys())
     return values
@@ -1449,11 +1481,11 @@ def check_candidate_namespace(namespace: dict) -> list[str]:
         findings: list[str] = []
         for name in sorted(set(namespace) & blocked):
             value = namespace.get(name)
-            if isinstance(value, (bool, int, float, str, bytes, complex, type(None))):
+            if _is_kind(value, (bool, int, float, str, bytes, complex, type(None))):
                 continue                # 标量:与身份表同一口径,不算受保护对象
-            origin = getattr(value, "__module__", None)
+            origin = _safe_getattr(value, "__module__")
             if not isinstance(origin, str):
-                origin = getattr(value, "__name__", None)        # 模块对象
+                origin = _safe_getattr(value, "__name__")        # 模块对象
             if isinstance(origin, str) and origin.split(".")[0] not in _OWN_PROTECTED_PACKAGES:
                 continue                # 候选自己的同名符号:不是框架那个,放行
             findings.append(f"候选命名空间里出现了受保护符号 {name}"
@@ -1846,7 +1878,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # 候选目录不得落在这些仓库目录里。与 `scripts/research_config.py` 的 `RESERVED_DIRS` **必须一致**
 # (宪法模块不能 import 它:它依赖 bootstrap/vnpy;一致性由
 # `tests/test_constitution_round12.py::test_the_pending_dir_reserved_names_match_the_sandbox_config` 守)。
-_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config"})
+# `.git` 也在内:候选目录指到版本库里,等于让受保护对象躲进"没人会去看的目录"。
+_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config", ".git"})
 _DEFAULT_PENDING_DIR = "pending_strategies"
 
 

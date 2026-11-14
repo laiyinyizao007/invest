@@ -9,7 +9,6 @@ import bootstrap  # noqa: F401
 import research_sandbox as rs
 from risk import constitution as const
 from risk.market_view import ReadOnlyViewError, read_only_view, swap_in, swap_out
-from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 from test_market_view import filled_am
 
 
@@ -135,3 +134,23 @@ def test_a_callable_that_is_not_a_known_indicator_is_not_forwarded():
     assert view.sma(3) == 1.0
     with pytest.raises(AttributeError):
         view.reset_everything
+
+
+def test_the_namespace_check_survives_a_guarded_module_proxy_in_the_candidate_namespace():
+    """合并 main #26 的模块代理之后:候选命名空间里持有代理时,命名空间核对不得被代理自己炸掉。
+
+    代理对 `__class__`/`__module__`/`__name__` 这类 dunder 一律抛 `ImportError`(不是 AttributeError);
+    `isinstance(代理, list)` 的回退路径会读 `__class__`,`getattr(代理, "__module__", None)` 只吞
+    AttributeError → 此前整个导入被拒(生产路径上每个 `import numpy` 的候选都会中招)。
+    放行:代理在命名空间里,核对不抛;拦截:同一命名空间里真持有受保护对象时仍然报。"""
+    from risk import constitution as const
+    from risk import market_view
+
+    class Boom:
+        def __getattribute__(self, name):
+            raise ImportError(f"研究沙盒:模块属性 {name} 不可用")
+
+    proxy = Boom()
+    assert const.check_candidate_namespace({"np": proxy}) == []
+    findings = const.check_candidate_namespace({"np": proxy, "_hoard": [market_view.swap_out]})
+    assert any("swap_out" in f for f in findings), findings

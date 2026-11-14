@@ -1,0 +1,34 @@
+# 研究入口(research-mcp / tools/research_mcp)的依赖,与**交易环境隔离**:
+# 交易机的 venv 与交易镜像不装这些。mcp SDK 会拖进 starlette/uvicorn/pydantic/anyio
+# 等一堆 Web 框架依赖,放到交易环境里只是徒增攻击面与启动时间。
+# 许可证(2026-11-13 核对):mcp MIT;协议版本 2025-06-18,与 DSH 的
+# @deepseek-ai/dsh-mcp-client 0.2.0-rc.2(底层 @modelcontextprotocol/client 2.0.0)兼容。
+mcp==1.19.0
+# 【仅测试期需要】Preset 的**结构**断言要解析 YAML(!!js 是 DSH 的自定义标签,
+# 解析时保留表达式原文)。研究侧的**运行时**用不到它——Preset 是给 DSH(Node)读的,
+# Python 这边只在测试里断言它的结构。
+# 许可证(2026-11-13 核对):PyYAML MIT。
+pyyaml==6.0.3
+# 【仅测试期需要】numpy / pandas:研究侧的沙盒要在**运行期**确认
+# 「numpy / pandas 穿过模块代理仍然可用」——代理不能把候选最常用的两个计算库弄坏;
+# 而候选源码里 `import numpy as np` / `import pandas as pd` 是最常见的形态。
+# 这两条依赖原先**不在**这里,于是第 12 轮把 CI 的依赖改成「从本文件装」之后,
+# 研究侧闸门**每个 PR 都红**(那几条用例会 ModuleNotFoundError)——
+# 第 13 轮 codex 的 High:「从文件装依赖」把研究依赖的**完整性**变成了新的责任。
+# 许可证(2026-11-13 核对):numpy BSD-3-Clause;pandas BSD-3-Clause。
+numpy==2.3.3
+pandas==2.3.2
+
+# 【本文件不是完整的运行环境】研究侧的**运行时**只要标准库
+# (+ 本文件的 mcp;pyyaml / numpy / pandas 只在测试期用);
+# `requirements.txt` 是**交易环境**依赖(vnpy / akshare 那套),研究侧**不需要**它。
+#
+# 依赖 vnpy 的**只有回测子进程**:回测要 import strategies.* 才能跑策略,
+# 那一步需要 vnpy。其余研究侧进程(筛查 / 批准 / 编排 / 网关 / MCP)**不需要** vnpy:
+# 静态筛查走 risk/constitution.py 的 const.load() 与 const.screen_source(),
+# 两者是纯 AST 分析,不 import 策略模块(2026-11-13 实测:五个研究模块
+# import 之后 sys.modules 里 vnpy-family 一个都没有)。
+#
+# 隔离的**真正含义**是「mcp 不装进交易 venv / 交易镜像」,而不是「研究环境不需要仓库依赖」。
+# 遗留项:回测子进程仍然带 vnpy,见
+# docs/adr/20261113-dsh-research-entry-and-out-of-band-approval.md 的遗留项。

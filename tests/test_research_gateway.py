@@ -7,6 +7,7 @@ import pytest
 import research_api as api
 import research_config as rc
 import research_gateway as gw
+import research_sandbox as rs
 
 TOKEN = "t" * 40
 
@@ -103,12 +104,15 @@ def test_oversized_body_is_413_and_bad_json_is_400(tmp_path):
 GOOD = "class S:\n    pass\n"
 
 
-def test_submit_writes_only_into_pending_and_returns_hash(tmp_path):
+def test_submit_writes_only_into_pending_and_returns_no_hash(tmp_path):
+    """提交的响应**不带 sha256**:网关响应会进工作流输出再回到模型,
+    哈希进了模型通道,「人核对完整哈希」就退化成橡皮章(第 8 轮 codex 的 C1)。"""
     app = make_app(tmp_path)
 
     status, body = call(app, "POST", "/research/candidates", {"name": "alpha_1.py", "source": GOOD})
 
-    assert status == 200 and len(body["sha256"]) == 64
+    assert status == 200 and body["name"] == "alpha_1.py"
+    assert "sha256" not in body
     assert (tmp_path / "pending_strategies" / "alpha_1.py").read_text(encoding="utf-8") == GOOD
     assert not (tmp_path / "data" / "research" / "approvals.json").exists()      # 提交不等于批准
 
@@ -136,6 +140,68 @@ def test_submit_rejects_non_string_fields(tmp_path):
 
     assert call(app, "POST", "/research/candidates", {"name": 1, "source": GOOD})[0] == 400
     assert call(app, "POST", "/research/candidates", {"name": "a.py", "source": ["x"]})[0] == 400
+
+
+# ---------- 模型可见通道:按值盖掉凭据 ----------
+
+def test_the_gateway_scrubs_its_own_token_by_value(tmp_path):
+    """网关自己的鉴权令牌按**值**盖掉(第 10 轮 codex 的 Medium 5)。
+
+    清洗规则是按**名字**认凭据的(`CTP_PASSWORD` / `Authorization: Bearer` 之类),
+    令牌一旦被读成原文再塞进作业消息,名字那一层就认不出来——按值盖掉是兜底。
+    """
+    def backtest_job(**kw):
+        return {"note": "令牌是 " + TOKEN}
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=backtest_job))
+
+    status, body = call(app, "POST", "/research/backtest",
+                        {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train", "params": {}})
+
+    assert status == 200
+    assert TOKEN not in json.dumps(body, ensure_ascii=False)
+
+
+def test_the_gateway_scrubs_the_shared_known_secrets_by_value(tmp_path):
+    """网关按值盖掉的不只是自己的令牌,还有**共享清单**里的其它凭据
+    (第 14 轮 codex 的 M3):原先网关只盖令牌,候选把毕昇开放 API 密钥写进
+    异常文本就原样出去了——「网关盖住、MCP 盖住、网关的密钥不盖」= 一条漏的通道。
+
+    这里用构造参数注入清单:单测不该去读真机上那份密钥文件。
+    """
+    key = "bs-sak-gateway-0123456789"
+
+    def backtest_job(**kw):
+        return {"note": "密钥是 " + key}
+
+    app = gw.GatewayApp(rc.load(), {"pending_dir": tmp_path, "results_dir": tmp_path,
+                                    "approvals_file": tmp_path / "a.json", "token_file": tmp_path / "tok"},
+                        TOKEN, jobs=SimpleNamespace(backtest_job=backtest_job),
+                        clock=(lambda: 0.0), wall=(lambda: 1_000_000.0), secrets=(key,))
+
+    status, body = call(app, "POST", "/research/backtest",
+                        {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train", "params": {}})
+
+    assert status == 200
+    assert key not in json.dumps(body, ensure_ascii=False)
+
+
+def test_the_gateway_always_scrubs_its_own_token_even_with_an_injected_list(tmp_path):
+    """注入的清单是**补充**,不能把网关自己的令牌挤掉
+    (否则「补清单」这个动作反而开出了一条漏的通道)。"""
+    def backtest_job(**kw):
+        return {"note": "令牌是 " + TOKEN}
+
+    app = gw.GatewayApp(rc.load(), {"pending_dir": tmp_path, "results_dir": tmp_path,
+                                    "approvals_file": tmp_path / "a.json", "token_file": tmp_path / "tok"},
+                        TOKEN, jobs=SimpleNamespace(backtest_job=backtest_job),
+                        clock=(lambda: 0.0), wall=(lambda: 1_000_000.0), secrets=("别的凭据",))
+
+    status, body = call(app, "POST", "/research/backtest",
+                        {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train", "params": {}})
+
+    assert status == 200
+    assert TOKEN not in json.dumps(body, ensure_ascii=False)
 
 
 # ---------- 回测 / 门槛 ----------
@@ -198,6 +264,47 @@ def test_job_errors_map_to_http_codes_without_leaking_details(tmp_path):
     assert call(app2, "POST", "/research/backtest", base)[0] == 504
 
 
+def test_job_error_messages_never_leak_local_paths(tmp_path):
+    """作业消息里的本机绝对路径要盖掉再出去(第 5 轮 codex 的 Low)。
+
+    网关响应会经毕昇工作流回到模型:本机目录结构对模型没有用处,
+    却是一条可用于指纹识别的信息。
+    """
+    def boom(**kw):
+        raise api.JobError(api.EXIT_REFUSED,
+                           r"拒绝: 批准记录被其他进程占用,拒绝写入: "
+                           r"C:\Example\research\data\research-control\approvals.json")
+
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=boom))
+    base = {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train"}
+
+    status, body = call(app, "POST", "/research/backtest", base)
+
+    assert status == 400
+    text = json.dumps(body, ensure_ascii=False)
+    assert "research-control" not in text
+    assert "Dev" not in text
+    assert "<路径>" in text
+
+
+def test_sandbox_error_messages_never_leak_local_paths(tmp_path):
+    """沙盒层的拒绝消息同样要脱敏。"""
+    app = make_app(tmp_path)
+
+    def raising(**kw):
+        raise rs.SandboxError(r"策略文件必须位于 pending_strategies/ 内: "
+                               r"'C:\Example\research\evil.py'")
+
+    app.jobs.backtest_job = raising
+    base = {"strategy": "a.py", "class": "S", "key": "CADJ", "segment": "train"}
+
+    status, body = call(app, "POST", "/research/backtest", base)
+
+    assert status == 400
+    text = json.dumps(body, ensure_ascii=False)
+    assert "Dev" not in text
+
+
 def test_heavy_jobs_are_serialised_and_busy_returns_409(tmp_path):
     app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=lambda **kw: {"ok": 1}))
     assert app._busy.acquire(blocking=False)
@@ -224,6 +331,160 @@ def test_results_endpoint_returns_saved_result_and_rejects_unsafe_ids(tmp_path):
     assert call(app, "GET", "/research/results/20261112-210000-000001")[1]["kind"] == "backtest"
     assert call(app, "GET", "/research/results/nope")[0] == 404
     assert call(app, "GET", "/research/results/..%2F..%2Fx")[0] in (400, 404)
+
+
+# ---------- 哈希不进模型可见的响应(第 5 轮 codex 的 M3) ----------
+
+def test_strip_digests_removes_every_hash_shaped_key():
+    """任何名字里带 sha256 的键都要被去掉,不管它在第几层。"""
+    payload = {"sha256": "a" * 64, "nested": {"candidate_sha256": "b" * 64, "ok": 1},
+               "list": [{"SHA256": "c" * 64}, {"keep": "yes"}], "run_id": "r1"}
+
+    out = gw._strip_digests(payload)
+
+    def keys(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                yield k
+                yield from keys(v)
+        elif isinstance(node, list):
+            for item in node:
+                yield from keys(item)
+
+    assert not any("sha256" in k.lower() for k in keys(out))
+    assert out["run_id"] == "r1"
+    assert out["nested"]["ok"] == 1
+    assert out["list"][1] == {"keep": "yes"}
+
+
+def test_results_endpoint_never_returns_a_hash(tmp_path):
+    """结果文件里的哈希不出网关:网关响应会进毕昇工作流输出,再回到模型。"""
+    app = make_app(tmp_path)
+    seed_result(app, "20261112-210000-000001", kind="backtest", **{"class": "S", "sha256": "d" * 64})
+
+    status, body = call(app, "GET", "/research/results/20261112-210000-000001")
+
+    assert status == 200
+    assert "sha256" not in body
+    assert "d" * 64 not in json.dumps(body)
+
+
+def test_job_responses_never_return_a_hash(tmp_path):
+    """作业类路由(backtest/gate/evaluate)的默认视图也不带哈希。"""
+    app = make_app(tmp_path)
+
+    def fake_backtest(**kwargs):
+        return {"run_id": "r1", "passed": True, "sha256": "e" * 64, "status": "ok"}
+
+    app.jobs.backtest_job = fake_backtest
+    status, body = call(app, "POST", "/research/backtest",
+                        {"strategy": "alpha_1.py", "class": "S", "key": "CADJ", "segment": "train",
+                         "params": {}})
+
+    assert status == 200
+    assert "sha256" not in body
+    assert "e" * 64 not in json.dumps(body)
+
+
+def test_scrub_covers_every_model_visible_exit(tmp_path):
+    """**每一条模型可见的出口都要过清洗**:清洗散落在各端点就会漏。
+
+    漏一条 = 边界没守住。结果文件里的 `error.message`、失败 Trace 的 `failures`、
+    作业的 `report` 都可能夹着本机路径(策略 raise 的文本、vnpy 异常的 detail)。
+    清洗收在 `handle` 的**唯一出口**,所以这里逐条出口验证一遍。
+    """
+    app = make_app(tmp_path)
+    path = r"C:\Example\research\data\research-control\approvals.json"
+
+    # 1) 数据端点
+    app.jobs.data_report = lambda: [{"key": "CADJ", "note": f"数据在 {path}"}]
+    # 2) 结果端点
+    seed_result(app, "20261112-210000-000002", kind="backtest", **{"class": "S", "error": {"type": "IOError", "message": f"打不开 {path}"}})
+    # 3) 反馈端点
+    seed_result(app, "20261112-210000-000003", kind="gate", **{"class": "S", "failures": [f"读取 {path} 失败"]})
+    # 4) 作业默认视图
+    app.jobs.backtest_job = lambda **kw: {"run_id": "r1", "passed": False, "report": f"报告提到 {path}"}
+    # 5) 作业 report 视图
+    app.jobs.gate_job = lambda **kw: {"run_id": "r2", "passed": False, "report": f"报告提到 {path}"}
+
+    # **先证明注入真的进了源数据**:否则「响应里没有路径」可能只是因为注入没生效
+    # (第 6 轮 codex 的 B/M:别让这条用例因为无关原因变红,或者反过来白绿)。
+    for raw in (app.jobs.data_report(),
+                rs.load_result("20261112-210000-000002", app.paths["results_dir"]),
+                rs.load_result("20261112-210000-000003", app.paths["results_dir"]),
+                app.jobs.backtest_job(strategy="x", cls="S", key="CADJ", segment="train", params={}),
+                app.jobs.gate_job(strategy="x", cls="S", params={})):
+        # 用「片段」而不是整条路径:repr/json 都会把反斜杠转义,整条路径比不上。
+        assert "research-control" in str(raw), f"注入没生效: {raw}"
+
+    bodies = [
+        call(app, "GET", "/research/data")[1],
+        call(app, "GET", "/research/results/20261112-210000-000002")[1],
+        call(app, "GET", "/research/feedback")[1],
+        call(app, "POST", "/research/backtest",
+             {"strategy": "alpha_1.py", "class": "S", "key": "CADJ", "segment": "train", "params": {}})[1],
+        call(app, "POST", "/research/gate", {"strategy": "alpha_1.py", "class": "S", "params": {}, "view": "report"})[1],
+    ]
+
+    for body in bodies:
+        text = json.dumps(body, ensure_ascii=False)
+        assert "research-control" not in text, text
+        assert "Dev" not in text, text
+        assert "<路径>" in text, text
+
+
+def test_no_response_body_ever_contains_a_64_hex_digest(tmp_path):
+    """**字符串里**夹着的 64 位十六进制也要盖掉:键名是 "digest"/"hash" 时按键名剥不掉,
+    失败 Trace 的自由文本、错误消息、作业报告里都可能夹着候选自己的哈希
+    (第 6 轮 codex 的 A/H1)。"""
+    app = make_app(tmp_path)
+    digest = "f" * 64
+    seed_result(app, "20261112-210000-000004", kind="gate", **{"class": "S", "failures": [f"哈希是 {digest}"]})
+
+    body = call(app, "GET", "/research/feedback")[1]
+
+    assert digest not in json.dumps(body, ensure_ascii=False)
+    assert "<sha256 已隐去>" in json.dumps(body, ensure_ascii=False)
+
+
+def test_no_response_body_ever_contains_an_approve_command(tmp_path):
+    """批准命令不进模型通道:命令一旦交回模型,模型就能诱导人去跑终端里的批准流程
+    (那条路上没有「只批本轮候选」的约束)(第 6 轮 codex 的 A/M2、B/M)。"""
+    app = make_app(tmp_path)
+    command = "python scripts/research_api.py approve --strategy alpha_1.py"
+    seed_result(app, "20261112-210000-000005", kind="gate", **{"class": "S", "failures": [f"请运行 {command}"]})
+
+    body = call(app, "GET", "/research/feedback")[1]
+
+    assert command not in json.dumps(body, ensure_ascii=False)
+    assert "research_api.py approve" not in json.dumps(body, ensure_ascii=False)
+
+
+def test_scrub_redacts_digests_and_approve_commands_in_any_string():
+    """清洗口径的单元断言:哈希与批准命令在任何字符串位置都要盖掉。"""
+    digest = "a" * 64
+    text = f"前缀 {digest} 后缀 python scripts/research_api.py approve --strategy x.py 结尾"
+
+    out = gw._scrub(text)
+
+    assert digest not in out
+    assert "research_api.py approve" not in out
+    assert "<sha256 已隐去>" in out and "<批准命令已隐去>" in out
+
+
+def test_the_text_view_stays_plain_text_after_scrubbing(tmp_path):
+    """清洗不能把 `view=text` 的纯文本响应退化成 JSON(换行会变成 \\n,人就没法读了)。"""
+    app = make_app(tmp_path)
+    app.jobs.backtest_job = lambda **kw: {"run_id": "r1", "passed": False,
+                                          "report": "结论: 未通过\n理由: 样本不足"}
+
+    status, payload = call(app, "POST", "/research/backtest",
+                            {"strategy": "alpha_1.py", "class": "S", "key": "CADJ", "segment": "train",
+                             "params": {}, "view": "text"})
+
+    assert status == 200
+    assert isinstance(payload, gw.PlainText)
+    assert "\n" in str(payload)
 
 
 def test_feedback_returns_at_most_configured_number_of_latest_failures(tmp_path):
@@ -256,6 +517,84 @@ def test_feedback_never_echoes_free_text_fields_other_than_known_ones(tmp_path):
     dumped = json.dumps(call(app, "GET", "/research/feedback")[1], ensure_ascii=False)
 
     assert "IGNORE PREVIOUS" not in dumped and "secret.py" not in dumped and "C:/" not in dumped
+
+
+# ---------- 起名要避开已用名(否则重名 409 → 整条工作流中止) ----------
+
+def test_feedback_lists_the_names_of_pending_candidates(tmp_path):
+    """反馈里必须带已有候选的**文件名**,起名那一步才可能避开重名。"""
+    app = make_app(tmp_path)
+    for name in ("ma_first.py", "ma_second.py"):
+        (tmp_path / "pending_strategies" / name).write_text("x = 1\n", encoding="utf-8")
+
+    status, body = call(app, "GET", "/research/feedback")
+
+    assert status == 200
+    assert set(body["pending_candidates"]) == {"ma_first.py", "ma_second.py"}
+
+
+def test_pending_names_carry_no_path_and_no_source(tmp_path):
+    """名单里只有文件名:不带目录、不带源码内容。"""
+    app = make_app(tmp_path)
+    (tmp_path / "pending_strategies" / "ma_first.py").write_text("SECRET_SOURCE_LINE = 1\n", encoding="utf-8")
+
+    dumped = json.dumps(call(app, "GET", "/research/feedback")[1], ensure_ascii=False)
+
+    assert "SECRET_SOURCE_LINE" not in dumped
+    assert "pending_strategies" not in dumped
+    assert str(tmp_path) not in dumped
+
+
+def test_pending_names_skip_files_that_do_not_match_the_name_rule(tmp_path):
+    """目录里别的文件(不符合命名规则)不进名单:名单会进模型通道,不能让调用方自由文本混进来。"""
+    app = make_app(tmp_path)
+    pending = tmp_path / "pending_strategies"
+    (pending / "ok_name.py").write_text("x = 1\n", encoding="utf-8")
+    (pending / "not allowed.py").write_text("x = 1\n", encoding="utf-8")
+    (pending / "notes.txt").write_text("x = 1\n", encoding="utf-8")
+
+    body = call(app, "GET", "/research/feedback")[1]
+
+    assert body["pending_candidates"] == ["ok_name.py"]
+
+
+def test_pending_names_are_listed_newest_first_and_capped(tmp_path):
+    app = make_app(tmp_path)
+    pending = tmp_path / "pending_strategies"
+    for i in range(5):
+        path = pending / f"ma_cand_{i}.py"
+        path.write_text("x = 1\n", encoding="utf-8")
+        import os
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+
+    body = call(app, "GET", "/research/feedback")[1]
+
+    assert body["pending_candidates"][0] == "ma_cand_4.py"
+    assert len(body["pending_candidates"]) <= gw.MAX_PENDING_NAMES
+
+
+def test_a_repeated_research_idea_stops_colliding_with_the_same_name(tmp_path):
+    """端到端复现第 6 轮实测的故障:同一个想法重跑 → 同名 → 409 → 工作流中止。
+
+    修法不是「网关给改名」(改名会让模型手里的名字与落盘的文件名对不上,批准会指错文件),
+    而是**把已用名告诉起名那一步**,让它起个新名字;网关的 409 只作为兜底。
+    """
+    app = make_app(tmp_path)
+    # 第一轮:提交成功
+    status, _ = call(app, "POST", "/research/candidates",
+                     {"name": "ma_breakout.py", "source": "class Candidate:\n    pass\n"})
+    assert status == 200
+
+    # 重跑时,起名助手能从反馈里看到已用名
+    names = call(app, "GET", "/research/feedback")[1]["pending_candidates"]
+    assert "ma_breakout.py" in names
+
+    # 仍然硬撞名时,网关拒绝(不覆盖已有文件),错误信息要能指导改名
+    status, body = call(app, "POST", "/research/candidates",
+                        {"name": "ma_breakout.py", "source": "class Candidate:\n    pass\n"})
+    assert status == 409 and "换名" in body["error"]
+    # 已有文件没被覆盖
+    assert (tmp_path / "pending_strategies" / "ma_breakout.py").read_text(encoding="utf-8") == "class Candidate:\n    pass\n"
 
 
 # ---------- 环境自检与令牌 ----------
@@ -517,7 +856,7 @@ def test_ledger_keeps_only_entries_inside_the_window(tmp_path):
     now[0] += 7200
     submit(app, "new.py")
 
-    rows = [json.loads(l) for l in (app.paths["results_dir"] / "submissions.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    rows = [json.loads(line) for line in (app.paths["results_dir"] / "submissions.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
 
     assert [r["name"] for r in rows] == ["new.py"] and len(rows[0]["sha256"]) == 64
 

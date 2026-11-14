@@ -4,7 +4,8 @@
 - 文件缺失 -> 用 DEFAULTS;文件存在但内容非法(未知键、类型错、越界)-> 抛 ConfigError 拒绝启动,绝不悄悄回退成默认值。
 - 安全相关的数值有硬边界(例如 feedback.limit 不得为 0 或超过 10、gateway.host 不得是 0.0.0.0),
   配置能调参,但不能把边界调没。
-- screening 的两个列表只能**追加**禁用项,不能删减内置的禁用清单(内置清单在 research_sandbox.py)。
+- screening 的三个列表(extra_forbidden_modules / extra_forbidden_calls / allowed_modules)
+  只能**追加**:禁用项只能加,白名单也只能加,不能删减内置的禁用清单(内置清单在 research_sandbox.py)。
 - 配置文件不含任何密钥;令牌只记录**文件路径**,令牌本身存放在该路径下(已被 .gitignore 的 data/ 覆盖)。
 决议见 docs/adr/20261112-research-sandbox-config-and-approval.md。
 """
@@ -14,12 +15,22 @@ import copy
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
-import bootstrap
+# 项目根:**不 import bootstrap**。
+# bootstrap 会 `from vnpy.trader.setting import SETTINGS` 并 `load_dotenv(.env)`——
+# 那是**交易栈**:研究侧一旦 import 它,就把 vnpy 与 .env 里的交易凭据拖了进来
+# (研究进程的内存里就有了 CTP 账号),与「研究侧不碰 .env 交易段」的边界声明冲突。
+# 这里按本文件位置推断代码根,并把代码根放进 sys.path(risk/strategies 才可导入)。
+CODE_ROOT = Path(__file__).resolve().parents[1]
+# 数据根:默认与代码根相同;可用 INVEST_ROOT 指到网关实际挂载的那棵目录树。
+ROOT = Path(os.environ.get("INVEST_ROOT") or CODE_ROOT).resolve()
+if str(CODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(CODE_ROOT))
 
-CONFIG_PATH = bootstrap.ROOT / "config" / "research_sandbox.json"
+CONFIG_PATH = CODE_ROOT / "config" / "research_sandbox.json"
 
 DEFAULTS: dict[str, dict[str, Any]] = {
     "iteration": {"max_iterations": 5, "window_hours": 24},
@@ -32,7 +43,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                 "rate_limit_per_minute": 30, "max_body_bytes": 131072},
     "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
               "approvals_file": "data/research-control/approvals.json"},
-    "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": []},
+    "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": [], "allowed_modules": []},
 }
 
 # (最小, 最大);bool 不算整数
@@ -51,10 +62,17 @@ INT_BOUNDS = {
     ("gateway", "rate_limit_per_minute"): (1, 6_000),
     ("gateway", "max_body_bytes"): (1, 4_194_304),
 }
-FORBIDDEN_HOSTS = {"0.0.0.0", "::", "", "*"}
+FORBIDDEN_HOSTS = {"0.0.0.0", "::", "", "*", "0", "::0"}
 # 候选策略目录不得指向这些(正式策略、批准目录),凭据文件也不得被借用为令牌文件
-RESERVED_DIRS = {"strategies", "approved", "risk", "trading", "scripts", "tests", "config"}
+RESERVED_DIRS = {"strategies", "approved", "risk", "trading", "scripts", "tests", "config", ".git"}
 RESERVED_FILES = {".env", ".env.simnow.bak"}
+# 批准记录与网关令牌**固定**放在这个目录下(第 7 轮 codex 的 F8):
+# 之前只按「文件名不在黑名单里」判断,于是 `approvals_file="data/research-control/.env.simnow"`
+# 能借走凭据文件、`token_file="data/creds.env"` 能把凭据内容当成网关令牌。
+# 改成**结构约束**:目录固定、文件名固定,没有借名的余地。
+CONTROL_DIR = ("data", "research-control")
+APPROVALS_FILE_NAME = "approvals.json"
+TOKEN_FILE_NAME = "gateway.token"
 SAFE_NAME_PATTERNS_MUST_REJECT = ("../x.py", "a/b.py", "a\\b.py", ".py", "x.txt")
 
 
@@ -85,6 +103,16 @@ def _relative_inside(value: Any, name: str) -> Path:
     return path
 
 
+def _is_unspecified_address(host: str) -> bool:
+    """`0.0.0.0` / `::` 的任意等价写法(`::0`、`0:0:0:0:0:0:0:0`、`[::]`)都是「所有网卡」
+    (第 16 轮 A 的 L3:原先只枚举了字面量)。"""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host.strip().strip("[]")).is_unspecified
+    except ValueError:
+        return False
+
+
 def _validate(cfg: dict) -> None:
     for (section, key), (low, high) in INT_BOUNDS.items():
         value = cfg[section][key]
@@ -94,7 +122,7 @@ def _validate(cfg: dict) -> None:
             raise ConfigError(f"{section}.{key}={value} 超出允许范围 [{low}, {high}]")
 
     host = cfg["gateway"]["host"]
-    if not isinstance(host, str) or host.strip() in FORBIDDEN_HOSTS:
+    if not isinstance(host, str) or host.strip() in FORBIDDEN_HOSTS or _is_unspecified_address(host):
         raise ConfigError(f"gateway.host={host!r} 不允许:网关不得监听所有网卡")
 
     pattern = cfg["candidates"]["name_pattern"]
@@ -106,16 +134,29 @@ def _validate(cfg: dict) -> None:
         if compiled.fullmatch(bad):
             raise ConfigError(f"candidates.name_pattern 过宽:不应匹配 {bad!r}")
 
+    # 大小写不敏感:`Strategies` 在不分大小写的文件系统上就是真正的 `strategies/`
+    # (第 6 轮 codex 的 M3:这条规则原来只加在 pending_dir 上,token_file / results_dir /
+    #  approvals_file 还能被指到受保护目录或凭据文件上——比如 token_file="data/.ENV"
+    #  会把网关令牌直接写进 CTP 凭据文件)。
+    reserved_dirs = {d.lower() for d in RESERVED_DIRS}
+    reserved_files = {f.lower() for f in RESERVED_FILES}
     for key in ("pending_dir", "results_dir", "approvals_file"):
         path = _relative_inside(cfg["paths"][key], f"paths.{key}")
-        # 大小写不敏感:`Strategies` 在不分大小写的文件系统上就是真正的 `strategies/`
-        if key == "pending_dir" and path.parts[0].lower() in {d.lower() for d in RESERVED_DIRS}:
-            raise ConfigError(f"paths.pending_dir 不得指向受保护目录 {path.parts[0]!r}")
+        if path.parts[0].lower() in reserved_dirs:
+            raise ConfigError(f"paths.{key} 不得指向受保护目录 {path.parts[0]!r}")
+        if key == "approvals_file" and path.name.lower() in reserved_files:
+            raise ConfigError(f"paths.approvals_file 不得借用凭据文件 {path.name!r}")
+    # 结构约束:批准记录固定在 data/research-control/approvals.json(第 7 轮 codex 的 F8)
+    approvals = _relative_inside(cfg["paths"]["approvals_file"], "paths.approvals_file")
+    if approvals.parts != CONTROL_DIR + (APPROVALS_FILE_NAME,):
+        raise ConfigError(f"paths.approvals_file 必须固定为 {'/'.join(CONTROL_DIR)}/{APPROVALS_FILE_NAME}")
     token = _relative_inside(cfg["gateway"]["token_file"], "gateway.token_file")
-    if token.name in RESERVED_FILES or token.parts[0] in RESERVED_DIRS:
+    if token.name.lower() in reserved_files or token.parts[0].lower() in reserved_dirs:
         raise ConfigError("gateway.token_file 不得借用凭据文件或源码目录")
+    if token.parts != CONTROL_DIR + (TOKEN_FILE_NAME,):
+        raise ConfigError(f"gateway.token_file 必须固定为 {'/'.join(CONTROL_DIR)}/{TOKEN_FILE_NAME}")
 
-    for key in ("extra_forbidden_modules", "extra_forbidden_calls"):
+    for key in ("extra_forbidden_modules", "extra_forbidden_calls", "allowed_modules"):
         value = cfg["screening"][key]
         if not isinstance(value, list) or not all(isinstance(x, str) and x for x in value):
             raise ConfigError(f"screening.{key} 必须是非空字符串列表")
@@ -152,3 +193,60 @@ def resolve_paths(cfg: dict, root: Path) -> dict[str, Path]:
             raise ConfigError(f"{key} 解析后越出项目根目录: {rel!r}")
         resolved[key] = path
     return resolved
+
+
+# ---------- 已知凭据值(按值脱敏用) ----------
+
+# 毕昇开放 API 密钥文件(相对**数据根**):环境变量优先,其次这个文件。
+# 与 `tools/research_mcp/server.py` 的 `KEY_FILE` 同一处约定。
+BISHENG_KEY_RELATIVE = Path(".local") / "bisheng-openapi.key"
+
+
+def bisheng_openapi_key(root: Path | None = None, key_file: Path | None = None) -> str:
+    """毕昇开放 API 密钥:环境变量 `BISHENG_OPENAPI_KEY` 优先,其次密钥文件。
+
+    `key_file` 显式给路径(MCP 侧有自己的一份常量);不给就用数据根下的默认位置。
+
+    读不到就返回空串——**不让整条脱敏失效**(第 11 轮 codex 的 F6)。
+    """
+    env = (os.environ.get("BISHENG_OPENAPI_KEY") or "").strip()
+    if env and env.lower() not in ("undefined", "null"):
+        return env
+    base = Path(root) if root is not None else ROOT
+    path = Path(key_file) if key_file is not None else base / BISHENG_KEY_RELATIVE
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def known_secret_values(cfg: dict | None = None, root: Path | None = None,
+                        label: str = "research", token: str | None = None,
+                        key_file: Path | None = None) -> tuple[str, ...]:
+    """**按值**要盖掉的已知凭据清单:毕昇开放 API 密钥 + 网关鉴权令牌。
+
+    三条模型可见通道(网关 / MCP / CLI)共用这一份清单(第 14 轮 codex 的 M3/L10):
+    清单不共享 = 口径漂移 = 漏的那一条就是漏的那一条。原先 MCP 有「密钥 + 令牌」,
+    CLI 与网关只有令牌——候选一旦把毕昇密钥写进异常文本,MCP 盖住、CLI/网关不盖。
+
+    `token` 给了就用给的(网关手里已经握着令牌,不必再读一次文件);
+    没给就从配置里的令牌文件读。令牌读不到时**在 stderr 留痕**(第 13 轮 codex 的 L2):
+    静默降级会让人以为「按值那一层还在」。stderr 不是模型可见通道,不影响脱敏口径。
+    """
+    base = Path(root) if root is not None else ROOT
+    values: list[str] = []
+    key = bisheng_openapi_key(base, key_file)
+    if key:
+        values.append(key)
+    if token is None:
+        token = ""
+        try:
+            cfg = cfg if cfg is not None else load()
+            token = resolve_paths(cfg, base)["token_file"].read_text(encoding="utf-8").strip()
+        except (OSError, ValueError, ConfigError, KeyError) as exc:
+            print(f"[{label}] 读不到网关令牌,按值脱敏这一层降级: {exc}", file=sys.stderr)
+            token = ""
+    token = (token or "").strip()
+    if token:
+        values.append(token)
+    return tuple(values)

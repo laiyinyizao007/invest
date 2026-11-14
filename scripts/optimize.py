@@ -14,8 +14,6 @@
 import argparse
 import itertools
 import math
-from datetime import datetime
-from pathlib import Path
 
 import sys
 from pathlib import Path
@@ -30,28 +28,11 @@ import segment_ledger
 from backtest_lib import run_backtest
 from strategies.trend_atr_strategy import TrendAtrStrategy
 
-WINDOWS = {
-    "train": (datetime(2005, 1, 1), datetime(2018, 12, 31)),
-    "valid": (datetime(2019, 1, 1), datetime(2022, 12, 31)),
-    "test": (datetime(2023, 1, 1), datetime(2026, 11, 9)),
-}
-# 复权连续合约(CADJ/MAADJ)只有 2018-05 之后的数据,不能使用上面的切分。以下切分在看到任何复权数据上的结果之前就已确定
-# (见 docs/adr/20261109-negative-backtest-result.md),测试段此前从未被查看。
-WINDOWS_ADJ = {
-    "train": (datetime(2018, 5, 1), datetime(2021, 12, 31)),
-    "valid": (datetime(2022, 1, 1), datetime(2023, 12, 31)),
-    "test": (datetime(2024, 1, 1), datetime(2026, 11, 9)),
-}
-
-
-def segment_key(key: str) -> str:
-    start, end = windows_for(key)["test"]
-    return f"optimize:{key}:{start:%Y-%m-%d}~{end:%Y-%m-%d}"
-
-
-def windows_for(key: str) -> dict:
-    return WINDOWS_ADJ if key.endswith("ADJ") else WINDOWS
-
+# 窗口常量放在 segment_windows.py:那里是纯数据,不 import bootstrap/vnpy。
+# 研究侧(沙盒、网关)只需要窗口,不该为了查一段日期把整个交易栈拖进来
+# (第 7 轮 codex 的 C1/H1:CI 的研究侧闸门不装交易环境,拖进来就收集失败)。
+# 这里仍然导出同名常量,别处的引用(`optimize.WINDOWS` 等)不受影响。
+from segment_windows import WINDOWS, WINDOWS_ADJ, segment_key, windows_for  # noqa: E402,F401
 
 FAST = [5, 8, 10, 13, 16, 20]
 SLOW = [30, 40, 60, 80, 100, 120]

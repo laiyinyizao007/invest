@@ -291,9 +291,20 @@ def test_the_candidate_import_entry_refuses_a_namespace_that_carries_the_protect
 
     # ② 静态筛查被中性掉(模拟"静态层被绕开"):运行期这一层仍然拒
     monkeypatch.setattr(research_api.rs, "screen_source", lambda *a, **k: [])
-    with pytest.raises(research_api.JobError) as excinfo:
+    # 合并 main #26 之后,生产入口在**更早**的一层(模块代理:通配符导入需要读模块的 `__dict__`,
+    # 代理一律不给)就把它拒了——候选依然进不来,但"运行期命名空间核对"这一层不再被走到。
+    # 所以:生产入口只断言**被拒**(并且是代理那条规则拒的,不是别的原因),
+    # 而命名空间核对的判别力改为**直接**对真实的通配符命名空间验证(见下)。
+    with pytest.raises((research_api.JobError, research_api.CandidateError)) as excinfo:
         research_api.import_candidate(path, "Cand", sha)
-    assert "受保护对象" in str(excinfo.value), str(excinfo.value)
+    assert "受保护对象" in str(excinfo.value) or "不可用" in str(excinfo.value), str(excinfo.value)
+
+    # ③ 命名空间核对本身(不经代理):真实的通配符命名空间里持有受保护符号 → 必须报
+    from risk import constitution as const
+    namespace: dict = {}
+    exec("from strategies.trend_atr_strategy import *", namespace)          # noqa: S102 - 只在测试里复现命名空间
+    findings = const.check_candidate_namespace(namespace)
+    assert findings and any("受保护" in f for f in findings), findings
 
 
 def test_the_candidate_import_entry_refuses_a_renamed_and_deleted_protected_symbol(tmp_path, monkeypatch):
@@ -314,9 +325,18 @@ def test_the_candidate_import_entry_refuses_a_renamed_and_deleted_protected_symb
     sha = hashlib.sha256(raw).hexdigest()
 
     monkeypatch.setattr(research_api.rs, "screen_source", lambda *a, **k: [])
-    with pytest.raises(research_api.JobError) as excinfo:
+    # 合并 main #26 之后生产入口由模块代理更早拒绝(见上一条用例的说明);这里同样断言被拒,
+    # 并把"按**身份**抓到改名藏起来的符号"这一层直接对真实命名空间验证。
+    with pytest.raises((research_api.JobError, research_api.CandidateError)) as excinfo:
         research_api.import_candidate(path, "Cand", sha)
-    assert "受保护对象" in str(excinfo.value), str(excinfo.value)
+    assert "受保护对象" in str(excinfo.value) or "不可用" in str(excinfo.value), str(excinfo.value)
+
+    from risk import constitution as const
+    namespace: dict = {}
+    exec("from strategies.trend_atr_strategy import *\n_hoard = swap_out\n"            # noqa: S102
+         "del swap_out, swap_in, read_only_view\n", namespace)
+    findings = const.check_candidate_namespace(namespace)
+    assert any("受保护对象" in f for f in findings), findings
 
 
 # ---------- F2:读取放行、写入拒 ----------
