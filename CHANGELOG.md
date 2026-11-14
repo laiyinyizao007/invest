@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### Fixed（第 2 轮 G8 复核后,只读行情视图 / Issue #23)
+- **第 3 轮 G8 复核(34/50)**:第 2 轮修复经 40 种绕过实测有效;新发现**辅助模块逃逸**(候选用文本写出能力在 cwd 写辅助 `.py` 再导入,跑在完整 Python 下)是沙盒的结构性缺口、早于本 PR,如实登记进 ADR,不在本 PR 修(需改 `bootstrap.py` 的 cwd/`sys.path`,另开 Issue)。
 - **Critical**:候选可经 `strategies.trend_atr_strategy` 导入 `swap_out/swap_in` 拿到真容器(静态层零发现,关第五层时 ATR 40.0→2.9、预算闸门被架空)。这些名字进 `BUILTIN_PROTECTED_READ_ATTRS`;`swap_in` 拒重入/陈旧视图,`swap_out` 无记录时不抛;外流规则补 lambda/条件表达式/`or`/`*x`/`await`;视图只转发显式白名单指标。ADR 先前"拿不到真实容器"的结论已更正。
 ### Added（新增）
 - **宪法加固:候选在 `entry_signal` 里只拿行情容器的只读副本视图(收能力)**(Issue [#23](https://github.com/laiyinyizao007/invest/issues/23),ADR `20261113-read-only-market-view`;**这是对模板与既有宪法决策的修订**,用户以 `/goal 剩下这些都要做完` 授权):
