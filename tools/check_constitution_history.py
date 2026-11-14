@@ -437,9 +437,6 @@ def check_constitution_file(root: Path) -> list[str]:
     # "当前"取**工作区**的状态(而不是最近一次改动清单的那个提交):
     # 白名单可能是在另一个提交里改的(那个提交没碰清单),拿工作区的白名单比才说得通。
     current = json.loads((root / CONSTITUTION_REL).read_text(encoding="utf-8"))
-    current_source = (root / CONSTITUTION_SOURCE_REL).read_text(encoding="utf-8")
-    current_templates = const_string_set(current_source, ("BUILTIN_ALLOWED_TEMPLATES",)).get(
-        "BUILTIN_ALLOWED_TEMPLATES", set())
 
     problems: list[str] = []
     for rev in commits[1:]:
@@ -939,10 +936,73 @@ _EXECUTOR_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv",
 _EXECUTOR_SKIP_FILES = ("risk/constitution.py",)
 
 
-def _repo_python_files(root: Path) -> list[Path]:
-    """仓库里的 Python 文件(排除测试与临时目录)。"""
+def _git_python_files(root: Path) -> list[Path] | None:
+    """**git 视角**的 Python 文件清单;不是 git 仓库(或 git 不可用)时返回 None。
+
+    `git ls-files --cached` = 已入库的文件;
+    `git ls-files --others --exclude-standard` = 尚未入库但**没有被 gitignore**的文件。
+    合起来既不会漏掉「刚写好还没提交」的新执行入口,
+    又不会把评审脚手架、临时目录里的半成品 `.py` 当成仓库代码
+    (第 11 轮 codex 的 F10:原先按 `rglob` 扫整个文件系统,开发者随手落在仓库里的
+    临时 `.py` 会把守卫弄红,而报错完全指不到「你的临时文件」)。
+
+    **根目录下以 `.` 开头的未入库目录不算仓库代码**(第 14 轮 codex 的 L2):
+    评审脚手架目录(`.codex_tmp_r14/`、`.reviewtmp2/` 之类)**不保证被 .gitignore 覆盖**,
+    一旦某个评审代理在里面写了 `exec(`/`eval(`,守卫就会红,报错指向一个临时路径——
+    正是第 11 轮 F10 想根治的现象,只修了一半。
+    判据是「**未入库**且**顶层目录名以 `.` 开头**且该顶层目录里没有任何入库文件」:
+    这样 `.github/scripts/dedup.py`(已入库)照常被扫,而 `.codex_tmp_r14/x.py` 不被扫。
+    """
+    listed = git(root, "ls-files", "--cached", "--", "*.py")
+    others = git(root, "ls-files", "--others", "--exclude-standard", "--", "*.py")
+    if listed.returncode != 0 or others.returncode != 0:
+        return None
+    tracked: list[str] = []
+    for line in listed.stdout.splitlines():
+        rel = line.strip()
+        if rel:
+            tracked.append(rel)
+    tracked_top = {rel.split("/", 1)[0] for rel in tracked}
     files: list[Path] = []
-    for path in sorted(root.rglob("*.py")):
+    seen: set[str] = set()
+    for rel in tracked:
+        path = root / rel
+        if path.is_file():
+            files.append(path)
+            seen.add(rel)
+    for line in others.stdout.splitlines():
+        rel = line.strip()
+        if not rel or rel in seen:
+            continue
+        top = rel.split("/", 1)[0]
+        if top.startswith(".") and top not in tracked_top:
+            continue                      # 未入库的隐藏目录:评审脚手架,不是仓库代码
+        path = root / rel
+        if path.is_file():
+            files.append(path)
+    return sorted(files)
+
+
+def _repo_python_files(root: Path) -> list[Path]:
+    """仓库里的 Python 文件(排除测试与临时目录)。
+
+    优先用 git 的跟踪集(见 `_git_python_files`);不在 git 仓库里(测试用的临时目录)
+    时退回按目录遍历,否则测试就没法造场景了。
+
+    第 13 轮 codex 的 Medium:**git 列表为空时也要退回目录遍历**。
+    原先的判据是「git 用不了才退回」(`tracked is not None`),可是当被扫目录**位于
+    git 工作树内、而其中的 .py 既没被跟踪又被 gitignore 忽略**时,
+    `git ls-files` **返回码是 0、输出却是空的** → 守卫一个文件都不扫 →
+    报「没有问题」——**fail-open**,与本文件「查不了等于没查、必须 fail-closed」
+    的原则正好相反。实测:守卫自己的 6 条回归用例在「basetemp 落在仓库内」时
+    全部失败(失败的正是「新执行入口不得裸奔」那几条)。
+    现在空列表也退回 `rglob`:仓库根目录的 git 列表不可能为空(有的是被跟踪的 .py),
+    所以这一改动只影响「扫一个 git 看不见的子目录」这一种场景。
+    """
+    tracked = _git_python_files(root)
+    source = tracked if tracked else sorted(root.rglob("*.py"))
+    files: list[Path] = []
+    for path in source:
         rel = path.relative_to(root)
         if any(part in _EXECUTOR_SKIP_DIRS or part.startswith("_probe") for part in rel.parts):
             continue
@@ -1082,9 +1142,6 @@ def check_executor_completeness(root: Path) -> list[str]:
             if not any(c.lineno > call.lineno for c in in_scope_check):
                 problems.append(
                     f"{rel} 第 {call.lineno} 行执行代码之后,{scope.name} 里没有指纹比对")
-
-    # 模块名 → 文件路径(`scripts.research_api` → `scripts/research_api.py`)
-    module_to_rel = {rel[:-3].replace("/", "."): rel for rel in sources}
 
     # **不**做跨模块的传递闭包:执行入口必须自己走第四层。
     # `import scripts.backtest_lib` 只是把模块拉进来,不代表这个入口自己比对了指纹

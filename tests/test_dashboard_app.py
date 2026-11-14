@@ -428,7 +428,7 @@ def test_a_static_file_replaced_after_startup_is_no_longer_served(env):
     d = build_static(tmp, {"index.html": b"<title>app</title>", "assets/app.js": b"console.log('SAFE')"})
     c = client(settings)
     assert c.get("/assets/app.js").status_code == 200
-    (d / "assets" / "app.js").write_bytes(b"SECRET C:\Users\alice\.env TOKEN=abc")             # 启动之后被替换
+    (d / "assets" / "app.js").write_bytes(rb"SECRET C:\Users\alice\.env TOKEN=abc")            # 启动之后被替换
     r = c.get("/assets/app.js")
     assert r.status_code == 404 and "SECRET" not in r.text
 

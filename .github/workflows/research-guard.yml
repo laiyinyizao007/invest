@@ -1,0 +1,135 @@
+name: Research Guard
+# 研究侧(毕昇工作流 / DSH Preset / research-mcp / 带外批准进程)的**语法、静态检查与边界测试**关卡。
+#
+# 为什么要有这个 job:第 8 轮 codex 复核期间,tools/research_mcp/server.py 带着一处
+# SyntaxError(`except/elif` 写在 try 里)进了工作树,整个 MCP 模块 import 不了,
+# 而当时仓库里**没有任何 job 会跑 ruff 或 compileall**——ruff 本身能报它,只是没人跑。
+#
+# 为什么不直接跑 `pytest tests/`:整套测试里有大量用例要交易栈(vnpy)。
+# 研究侧那几份已经与交易栈解耦(见下面「边界闸门」步骤的说明),只跑它们——跑得轻、失败得准。
+# 需要交易栈的用例会**跳过**,所以这一步在只装 pytest + mcp SDK 的 runner 上也是绿的。
+#
+# 第 7 轮 codex 的 High:边界不变量(批准记录只有一个写入者 / Preset 不挂危险工具 /
+# 工具目录恰为三项 / 研究栈不 import vnpy)**写成了测试却没有任何 job 会跑它**,
+# 于是"看起来有防线、实际随时能改坏"。这里把它们纳入闸门。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 连续推送时只跑最新一次:闸门是"有没有坏"的判据,不是"跑了几次"的账本
+# (第 10 轮 codex 的 Low)。
+concurrency:
+  group: research-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 起「无效转义」才是 SyntaxWarning;3.11 上它只是 DeprecationWarning,
+          # `-W error::SyntaxWarning` 在 3.11 上是空操作(第 10 轮 codex 的 High:
+          # 闸门注释承诺的检查在 CI 上根本没生效)。
+          python-version: '3.12'
+
+      # 语法关卡:整个仓库都要能编译。-W error::SyntaxWarning 让无效转义也算失败
+      # (无效转义是「这行字面量其实不是你以为的那个」的常见来源)。
+      # 路径清单要覆盖**研究闭包**里的全部目录:研究侧会 import dashboard/safe.py、
+      # notify/redact.py、risk/constitution.py,它们不在 scripts/tools/tests 之下
+      # (第 10 轮 codex 的 Medium)。
+      #
+      # 这是**预防网**,不是保证:它只保证「现在这个提交里的这些文件能编译」。
+      # 别把它当成「已经修好的缺陷」的证明——它拦的是**下一次**同类问题。
+      # -f:强制重编译,不复用上一次的 .pyc(缓存命中时坏文件可能蒙混过关)。
+      # `.github` 也在清单里(仓库自带两个脚本):第 12 轮 codex 的 L4——
+      # 注释承诺的是「整个仓库都要能编译」,清单却漏了这一处。
+      - name: 语法编译(研究闭包全部目录,含告警即失败)
+        run: python -W error::SyntaxWarning -m compileall -qf scripts tools tests dashboard risk notify strategies trading ctp_tools evidence .github
+
+      # ruff 的**清单是显式的**,不是 `ruff check .`:仓库里还留着大量与本研究侧
+      # 无关的历史脚本(penetration_check / collect_reject_texts / unattended_report …),
+      # 它们各有 3~25 条存量风格债,一次性清理会把本 issue 的改动撑大好几倍。
+      # 清单覆盖:研究侧全部模块、本 issue 改过的文件、宪法守卫工具本身,
+      # 以及研究闭包里的 risk/ 与 notify/(第 10 轮 codex 的 Medium:清单漏了它们)。
+      # dashboard/ 只有 safe.py 与 __init__.py 进了 ruff(其余文件各有 5 条与本研究无关的
+      # 存量风格债 F841/E741/F541,清债不属于本 issue);evidence/ 只进了 compileall。
+      - name: 静态检查(研究侧与本 issue 涉及的文件)
+        run: |
+          python -m pip install --quiet ruff==0.14.8
+          python -m ruff check \
+            scripts/research_api.py \
+            scripts/research_approval_server.py \
+            scripts/research_config.py \
+            scripts/research_console.py \
+            scripts/research_gate.py \
+            scripts/research_gateway.py \
+            scripts/research_grid.py \
+            scripts/research_sandbox.py \
+            scripts/segment_windows.py \
+            scripts/segment_ledger.py \
+            scripts/optimize.py \
+            tools/research_mcp \
+            tools/bisheng/build_v3.py \
+            tools/bisheng/bs.py \
+            tools/check_constitution_history.py \
+            dashboard/__init__.py \
+            dashboard/safe.py \
+            notify \
+            risk \
+            tests/test_dashboard_app.py \
+            tests/test_dashboard_collect_more.py \
+            tests/test_constitution_round11.py \
+            tests/test_constitution_round12.py \
+            tests/test_research_api.py \
+            tests/test_research_approval_server.py \
+            tests/test_research_boundary.py \
+            tests/test_research_config.py \
+            tests/test_research_gate.py \
+            tests/test_research_gateway.py \
+            tests/test_research_grid.py \
+            tests/test_research_mcp.py \
+            tests/test_research_sandbox.py \
+            tests/test_segment_ledger.py
+
+      # 边界闸门(第 7 轮 codex 的 C1/H1):**先单跑边界不变量那一份**,再跑其余研究侧测试。
+      #
+      # 为什么要拆成两步:同一个 pytest 调用里只要有一个文件在**收集阶段**报错
+      # (比如模块级 import 了交易栈),整轮 session 就中止、**一个测试都不会跑**——
+      # 闸门看上去配好了,实际一次都没执行过(仓库里 constitution-guard.yml 的注释
+      # 已经记过同一个教训,这里不重犯)。拆开之后,边界不变量那一层永远先跑。
+      #
+      # 为什么这里能跑研究侧测试:研究侧与交易栈已经解耦——
+      #   - scripts/segment_windows.py:窗口常量(纯数据),不再经 optimize → bootstrap → vnpy;
+      #   - scripts/segment_ledger.py:不再 import bootstrap,于是全局 conftest 也不碰 vnpy
+      #     (**不用** --noconftest:那样会丢掉 conftest 里隔离测试段登记文件的夹具,
+      #     本地按这条命令跑就会污染仓库真实的 config/test_segment_usage.json);
+      #   - 需要交易栈的用例(vnpy_ctastrategy 等)在没有交易栈时**跳过**,不是失败。
+      - name: 研究侧边界不变量(批准唯一写入者 / Preset 边界 / 工具目录 / 不 import vnpy)
+        run: |
+          # 依赖**从 requirements-research.txt 装**,不在这儿重复写一遍 pin
+          # (第 12 轮 codex 的 L5:声明的依赖与被测的依赖长期不一致,
+          #  改了这个文件 CI 却不会发现)。pytest 单独钉版本(它不在那个文件里)。
+          python -m pip install --quiet -r requirements-research.txt pytest==8.3.4
+          python -m pytest -p no:cacheprovider -q tests/test_research_boundary.py
+
+      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
+        run: |
+          # `--continue-on-collection-errors`:某个文件在**收集阶段**报错时,pytest 会以退出码 4 结束,
+          # 但**其余文件仍然要跑**(第 11 轮 codex 的 F9)。不加这个开关,一个文件坏掉就把这一整步的
+          # 研究侧测试全废掉——闸门看上去配好了,实际没跑几个。
+          python -m pytest -p no:cacheprovider --continue-on-collection-errors -q \
+            tests/test_research_config.py \
+            tests/test_research_sandbox.py \
+            tests/test_research_gateway.py \
+            tests/test_research_approval_server.py \
+            tests/test_research_api.py \
+            tests/test_research_mcp.py \
+            tests/test_research_gate.py \
+            tests/test_research_grid.py

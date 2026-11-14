@@ -12,9 +12,14 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-import bootstrap
+# **不 import bootstrap**:bootstrap 会把 vnpy 交易栈与 .env 拖进来,
+# 于是连 pytest 的全局 conftest(它 import 本模块)都要求装交易环境——
+# CI 上的守卫因此在**收集阶段**就中止,一次都没跑过(见 docs/adr 与
+# tools/check_constitution_history.py 的注释)。这里自己算仓库根:
+# 与 bootstrap.ROOT 同一个目录(scripts/ 的上一级)。
+ROOT = Path(__file__).resolve().parent.parent
 
-LEDGER = bootstrap.ROOT / "config" / "test_segment_usage.json"
+LEDGER = ROOT / "config" / "test_segment_usage.json"
 
 
 class SegmentAlreadyUsed(RuntimeError):

@@ -4,7 +4,8 @@
 因为这是仅本机可达、低并发的薄网关;依赖越少,供应链与攻击面越小。
 
 端点即白名单(ROUTES);其余一律 404/405。**不存在**:下单、查账户、改风控、连 CTP、访问测试段、
-批准(approve)、写 approved/。批准只能由本机 CLI 触发(research_api.py approve),请求体里的 confirm 字段会被忽略。
+批准(approve)、写 approved/。批准只能由本机人工触发——带外批准页(`scripts/research_approval_server.py`)
+或本机 CLI(`research_api.py approve`);请求体里的 confirm 字段会被忽略。
 启动前自检:进程环境里不得有任何 CTP_* 变量(部署层 fail-closed,见 ADR bisheng-ai-researcher 安全约束 5)。
 令牌:独立文件(路径来自配置,默认 data/research/gateway.token),`init-token` 生成,永不覆盖。
 决议见 docs/adr/20261112-research-sandbox-config-and-approval.md 与 docs/plans/20261112-bisheng-integration-spec.md。
@@ -27,8 +28,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
-import bootstrap
 import research_config as rc
+import research_console as rconsole
 import research_sandbox as rs
 from risk.trial_ledger import TrialLedgerError, record_trials
 
@@ -45,6 +46,7 @@ CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 MIN_TOKEN_LENGTH = 32
 MAX_TRACE_FAILURES = 8
 MAX_TRACE_TEXT = 300
+MAX_PENDING_NAMES = 50
 
 
 class GatewayError(RuntimeError):
@@ -134,6 +136,57 @@ def _compact(result: dict) -> dict:
     return {k: result[k] for k in ("run_id", "passed", "status", "report") if k in result}
 
 
+def _strip_digests(payload):
+    """把响应里的**内容哈希**去掉:网关的响应会进毕昇工作流的输出,再由工作流回给模型。
+
+    候选哈希一旦进了模型通道,「人核对完整 64 位哈希」这道仪式就退化成橡皮章
+    (模型可以在聊天里替人念哈希)。所以哈希压根不进模型可见的响应——
+    正则脱敏只是兜底,不是承重墙(第 5 轮 codex 的 M3)。
+    磁盘上的结果文件不受影响:那里留的是**内部账本**,人要核对时去批准页看。
+    """
+    if isinstance(payload, dict):
+        return {k: _strip_digests(v) for k, v in payload.items() if "sha256" not in k.lower()}
+    if isinstance(payload, list):
+        return [_strip_digests(v) for v in payload]
+    return payload
+
+
+def _scrub(payload, secrets: tuple[str, ...] = ()):
+    """**模型可见通道的统一清洗**:剥哈希键 + 盖掉字符串里的本机绝对路径与 64 位哈希。
+
+    `secrets` 是**按值**盖掉的凭据(网关自己的鉴权令牌 + 毕昇开放 API 密钥):
+    清洗规则是按**名字**认的(`CTP_PASSWORD` / `Authorization: Bearer` 之类),
+    凭据一旦被候选读了原文再塞进异常文本,名字那一层就认不出来——按值盖掉这一条
+    是兜底,不是替代(第 10 轮 codex 的 Medium 5)。
+
+    「按值」这一层**委托给 `rs.scrub_text`**:网关原先自己手写了一遍替换循环,
+    **没有长度阈值**,而共享内核有(`len(secret) >= 8`)——两条通道对「多短的串才算
+    凭据」的口径不一样,漂移的那一条就是漏的那一条(第 14 轮 codex 的 L10)。
+
+    为什么要有「统一」这一层,以及为什么放在 `handle` 的**唯一出口**:
+    清洗散落在各端点就会漏。网关有五条模型可见的出口(`_data` / `_candidates` /
+    `_shape` 的三种 view / `_results` / `_feedback`),漏一条就等于边界没守住——
+    结果文件里的 `error.message`、失败 Trace 的 `failures`、作业的 `report` 里
+    都可能夹着本机路径(策略 raise 出来的文本、vnpy 异常的 detail)或候选自己的哈希。
+    收在 `handle` 出口就没有「漏掉某个端点」这回事了。
+
+    哈希的脱敏口径与 MCP 侧共用 `rs.redact_digests`:两边规则不一样,
+    等于「哪条通道漏了就是漏了」(第 6 轮 codex 的 H1)。
+    """
+    if isinstance(payload, PlainText):
+        # PlainText 是 str 的子类:保住这个标记,否则响应会退化成 JSON(换行变成 \n),
+        # 毕昇工具节点里人就没法读了。
+        return PlainText(_scrub(str(payload), secrets))
+    payload = _strip_digests(payload)
+    if isinstance(payload, dict):
+        return {k: _scrub(v, secrets) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_scrub(v, secrets) for v in payload]
+    if isinstance(payload, str):
+        return rs.scrub_text(payload, secrets=secrets)
+    return payload
+
+
 def _default_jobs() -> SimpleNamespace:
     import research_api as api
     return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job, evaluate_job=api.evaluate_job,
@@ -144,11 +197,20 @@ class GatewayApp:
     """纯逻辑的请求处理(不涉及 socket),便于单测。"""
 
     def __init__(self, cfg: dict, paths: dict, token: str, jobs=None, clock: Callable[[], float] = time.monotonic,
-                 wall: Callable[[], float] = time.time):
+                 wall: Callable[[], float] = time.time, secrets: tuple[str, ...] = ()):
         self.cfg, self.paths, self.token = cfg, paths, token
         self.jobs = jobs if jobs is not None else _default_jobs()
         self.clock = clock
         self.wall = wall                      # 挂钟时间(秒):迭代上限的滚动窗口用它;clock 是单调钟,只用于限流
+        # **按值**要盖掉的凭据清单:与 MCP / CLI 两条通道共用同一份
+        # (`research_config.known_secret_values`,第 14 轮 codex 的 M3/L10)。
+        # 网关手里已经握着鉴权令牌,不必再读一次令牌文件——但**毕昇开放 API 密钥**
+        # 也要在这一层盖掉:原先网关只盖令牌,候选把密钥写进异常文本就原样出去了。
+        # 清单由 `main()` 传入(读真机上那份密钥文件只该在真机做一次);
+        # 单测可以直接传自己的清单,不去读真机的密钥文件。
+        # 网关自己的鉴权令牌**永远**在清单里(它就是这条通道的凭据);
+        # 外部传进来的清单只是补充,不能把它挤掉。
+        self.secrets = tuple(dict.fromkeys((token,) + tuple(secrets)))
         self._ledger_lock = threading.Lock()
         self._hits: deque[float] = deque()
         self._busy = threading.Lock()
@@ -193,12 +255,19 @@ class GatewayApp:
             if not isinstance(data, dict):
                 return 400, {"error": "请求体必须是 JSON 对象"}
         try:
-            return getattr(self, "_" + route)(data, params)
+            status, payload = getattr(self, "_" + route)(data, params)
         except rs.SandboxError as exc:
-            return 400, {"error": str(exc)}
+            # 错误消息会经毕昇工作流回到模型:**走统一清洗**再出去
+            # (模型看到本机目录结构没有用处,却多了一条指纹识别信息)。
+            # 这条分支曾经只做 redact_paths,哈希/批准命令/凭据都漏——清洗必须只有一个出口
+            # (第 7 轮 codex 的 F4)。
+            return 400, _scrub({"error": str(exc)}, self.secrets)
         except Exception as exc:                                    # 兜底:不回传异常细节(可能含本机路径)
             print(f"网关内部错误: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 500, {"error": "内部错误"}
+        # **模型可见通道的唯一出口**:剥哈希键 + 盖掉本机绝对路径。
+        # 收在这里而不是散在各端点:散着就会漏(网关有五条模型可见的出口)。
+        return status, _scrub(payload, self.secrets)
 
     @staticmethod
     def _match(method: str, path: str):
@@ -275,7 +344,8 @@ class GatewayApp:
         if len(raw) > self.cfg["candidates"]["max_source_bytes"]:
             return 400, {"error": f"源码超过大小上限 {self.cfg['candidates']['max_source_bytes']} 字节"}
         screening = self.cfg["screening"]
-        findings = rs.screen_source(source, screening["extra_forbidden_modules"], screening["extra_forbidden_calls"])
+        findings = rs.screen_source(source, screening["extra_forbidden_modules"], screening["extra_forbidden_calls"],
+                                    screening.get("allowed_modules", ()))
         if findings:
             return 400, {"error": "静态筛查未通过: " + "; ".join(findings)}
         target = self.paths["pending_dir"] / name
@@ -315,7 +385,10 @@ class GatewayApp:
                 if isinstance(exc, FileExistsError):
                     return 409, {"error": "同名候选已存在,请换名"}
                 return 500, {"error": f"候选文件写入失败: {exc}"}
-        return 200, {"name": name, "sha256": sha}
+        # **响应里不带 sha256**:网关的响应会进毕昇工作流的输出,再由工作流回给模型。
+        # 候选哈希进了模型通道,「人核对完整 64 位哈希」这道仪式就退化成橡皮章
+        # (第 8 轮 codex 的 C1)。哈希记在账本里(内部用),不对外。
+        return 200, {"name": name}
 
     @staticmethod
     def _shape(outcome: tuple, view: str | None) -> tuple:
@@ -326,7 +399,7 @@ class GatewayApp:
             return status, _compact(payload)
         if view == "text":
             return status, PlainText(f"{payload.get('report', '')}\n\n(run_id: {payload.get('run_id', '?')})")
-        return outcome
+        return status, payload
 
     def _run_job(self, func, **kwargs):
         import research_api as api
@@ -335,11 +408,13 @@ class GatewayApp:
         try:
             return 200, func(**kwargs)
         except api.JobError as exc:
+            # 作业消息也可能带本机路径(批准记录位置之类),同样盖掉再出去。
+            message = rs.redact_paths(exc.message)
             if exc.code == api.EXIT_TIMEOUT:
-                return 504, {"error": exc.message}
+                return 504, {"error": message}
             if exc.code == api.EXIT_FAILED:
-                return 500, {"error": exc.message}
-            return (403 if exc.message == api.NEEDS_APPROVAL else 400), {"error": exc.message}
+                return 500, {"error": message}
+            return (403 if exc.message == api.NEEDS_APPROVAL else 400), {"error": message}
         finally:
             self._busy.release()
 
@@ -388,7 +463,12 @@ class GatewayApp:
             return 404, {"error": "没有这条结果"}
 
     def _feedback(self, _data, _params):
-        """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。"""
+        """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
+
+        另外回一份**已有候选的文件名**:起名那一步要避开它们。
+        少了这一段,同一个研究想法重跑会撞名 → 网关 409 → 整条工作流中止,
+        「多轮研究循环」实际退化成单轮(第 6 轮实测:同一个想法第二跑死在 409 上)。
+        只给文件名(且只给符合命名规则的),不给路径、不给源码、不给内容。"""
         limit = self.cfg["feedback"]["limit"]
         traces = []
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
@@ -414,7 +494,29 @@ class GatewayApp:
             })
             if len(traces) >= limit:
                 break
-        return 200, {"limit": limit, "traces": traces}
+        return 200, {"limit": limit, "pending_candidates": self._pending_names(), "traces": traces}
+
+    def _pending_names(self) -> list[str]:
+        """已有候选的文件名(新到旧)。只回文件名,且只回符合命名规则的那些。
+
+        名字本身不是秘密(工作流本来就把候选名告诉模型),但它是**调用方自由文本**:
+        所以按命名规则过滤一遍,免得目录里别的文件混进来。"""
+        pattern = self.cfg["candidates"]["name_pattern"]
+        pending = self.paths["pending_dir"]
+        try:
+            files = list(pending.glob("*.py"))
+        except OSError:
+            return []
+        stamped = []
+        for path in files:
+            if not re.fullmatch(pattern, path.name):
+                continue
+            try:                                    # 逐个取时间戳:中途有文件被删不该让整份名单作废
+                stamped.append((path.stat().st_mtime, path.name))
+            except OSError:
+                continue
+        stamped.sort(reverse=True)                # 新到旧
+        return [name for _, name in stamped[:MAX_PENDING_NAMES]]
 
 
 def build_server(app: GatewayApp, host: str, port: int) -> ThreadingHTTPServer:
@@ -436,7 +538,13 @@ def build_server(app: GatewayApp, host: str, port: int) -> ThreadingHTTPServer:
             self.send_header("Content-Type", ("text/plain" if is_text else "application/json") + "; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
-            self.wfile.write(raw)
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                # 调用方(毕昇工具节点)超时或提前断开:这是**正常的**收尾,
+                # 不是网关故障。不接住的话 socketserver 会把整段 traceback 打进日志,
+                # 真正的错误反而被淹没(实测本机日志里就有这么一大段)。
+                self.close_connection = True
 
         def do_GET(self):
             self._serve("GET")
@@ -462,7 +570,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         cfg = rc.load()
-        paths = rc.resolve_paths(cfg, bootstrap.ROOT)
+        paths = rc.resolve_paths(cfg, rc.ROOT)
         if args.command == "init-token":
             init_token(paths["token_file"])
             print(f"令牌已生成: {paths['token_file']}(内容不在此打印;把它配置到毕昇工具的鉴权头里)")
@@ -472,7 +580,8 @@ def main(argv: list[str] | None = None) -> int:
     except (rc.ConfigError, GatewayError) as exc:
         print(f"拒绝: {exc}", file=sys.stderr)
         return 2
-    app = GatewayApp(cfg, paths, token)
+    app = GatewayApp(cfg, paths, token, secrets=rc.known_secret_values(
+        cfg=cfg, root=rc.ROOT, label="research-gateway", token=token))
     server = build_server(app, cfg["gateway"]["host"], cfg["gateway"]["port"])
     print(f"研究沙盒网关监听 {cfg['gateway']['host']}:{cfg['gateway']['port']}", file=sys.stderr)
     try:
@@ -485,4 +594,5 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    rconsole.reconfigure_stdio()
     sys.exit(main())
