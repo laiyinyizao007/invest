@@ -229,11 +229,9 @@ class RepoImportGuard:
         if self.repo_root != resolved and self.repo_root not in resolved.parents:
             # 仓库之外(标准库/站点包):仍要求"候选开始运行之前就存在"。
             # 站点包在宿主机上通常可写,候选往里写一个辅助模块就能绕开仓库内的规则。
-            # 比较前按文件系统粒度取整,否则会漏掉"刚写出来就被取整到开始时刻之前"的文件。
-            granularity = _timestamp_granularity(stat.st_mtime_ns)
-            if stat.st_mtime_ns >= _floor_to_granularity(self.started_at_ns, granularity):
-                return (f"禁止导入 {name}:该文件在候选开始运行之后才出现"
-                        f"(候选运行期间写出的文件一律不得被导入)")
+            reason = self._written_during_run(resolved)
+            if reason:
+                return f"禁止导入 {name}:{reason}"
             return None
         if not self._under_allowed_dir(resolved):
             return (f"禁止导入仓库内模块 {name}:它不在允许的目录 {list(self.allowed_dirs)} 内"
@@ -245,6 +243,22 @@ class RepoImportGuard:
                     f"(候选运行期间写出的文件一律不得被导入)")
         if stat.st_mtime_ns != known:
             return f"禁止导入 {name}:该文件在候选运行期间被改动过"
+        return None
+
+    def _written_during_run(self, path: Path) -> str | None:
+        """这个文件是不是候选运行期间才出现的(仓库之外那套口径)。
+
+        比较前按文件系统粒度取整,否则会漏掉"刚写出来就被取整到开始时刻之前"的文件
+        (文件系统写时间戳时向下取整:NTFS 100ns,有些网络盘 1ms 甚至 1s)。
+        """
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        granularity = _timestamp_granularity(stat.st_mtime_ns)
+        if stat.st_mtime_ns >= _floor_to_granularity(self.started_at_ns, granularity):
+            return (f"该文件在候选开始运行之后才出现"
+                    f"(候选运行期间写出的文件一律不得被导入)")
         return None
 
     def _rel(self, path: Path) -> str:
@@ -308,7 +322,15 @@ class RepoImportGuard:
             except OSError:
                 continue
             if self.repo_root != resolved and self.repo_root not in resolved.parents:
-                continue                                        # 仓库之外(站点包)照旧放行
+                # 仓库之外(站点包):**同样**要过"运行之前就存在"这一关。
+                # 站点包在宿主机上通常可写,候选往里面写一个模块,
+                # 而包自己的 `__all__` 正好列着那个名字——通配符导入会由
+                # **导入机制**去 import 它,整条路不经过守卫(与仓库内同一条洞)。
+                for path in sorted(resolved.rglob("*.py")):
+                    reason = self._written_during_run(path)
+                    if reason:
+                        return f"禁止从 {name} 导入 *:包内 {path.name} {reason}"
+                continue
             if not self._under_allowed_dir(resolved):
                 return (f"禁止从 {name} 导入 *:包位置 {self._rel(resolved)} 不在允许的目录 "
                         f"{list(self.allowed_dirs)} 内(候选不得导入框架、风控或回测模块)")

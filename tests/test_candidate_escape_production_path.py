@@ -302,6 +302,45 @@ def test_the_candidate_cannot_run_a_helper_module_through_a_wildcard_import(tmp_
     )
 
 
+def test_the_candidate_cannot_run_a_helper_module_through_a_wildcard_import_outside_the_repository(
+        tmp_path, monkeypatch, repo):
+    """仓库**之外**也一样:站点包在宿主机上通常可写,通配符导入会由导入机制去 import 它。
+
+    同一个洞的另一个方向:包是**早就存在**的(所以"运行之前就存在"这条对它无效),
+    但候选往包里写了一个**新模块**,而包自己的 `__all__` 正好列着那个名字——
+    `from 包 import *` 由导入机制去 import 它,整条路不经过守卫。
+
+    这里用一个自造的"站点包"(在仓库之外)把它逼出来。
+    """
+    lib = tmp_path / "fakelib"
+    lib.mkdir()
+    (lib / "__init__.py").write_text('__all__ = ["evil"]\n', encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    purge_modules(monkeypatch, "fakelib")
+    marker = tmp_path / "executed.txt"
+    helper = 'open(r"%s","w").write("x")' % str(marker).replace("\\", "/")
+    target = str(lib / "evil.py").replace("\\", "/")
+    source = build(
+        BASE,
+        f"""
+        try:
+            import numpy as np
+            np.savetxt("{target}", np.array([{helper!r}]), fmt="%s")
+            from fakelib import *
+            LEAK["helper_executed"] = "evil" in dir()
+        except Exception as exc:
+            LEAK["helper_executed"] = "denied"
+            LEAK["reason"] = repr(exc)
+        """,
+        TAIL,
+    )
+
+    cls = run_candidate(tmp_path, monkeypatch, source)
+
+    assert cls.PASS["helper_executed"] == "denied", "候选用通配符 from-import 跑起了自己在仓库外写的辅助模块"
+    assert not marker.exists(), "辅助模块被执行了(它用真实内建写出了标记文件)"
+
+
 def test_the_package_position_rule_denies_a_name_that_is_not_a_module(tmp_path, monkeypatch, repo):
     """包位置裁决这条规则的**专属**探针(逐项裁决看不见它)。
 
