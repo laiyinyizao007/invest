@@ -51,6 +51,9 @@ def fake_repo(tmp_path, monkeypatch):
 
 
 def guard_for(root, **kwargs):
+    # 假仓库是临时目录,没有 git 提交基准 -> 显式关掉"与提交核对"这条
+    # (那条规则由 tests/test_trusted_dir_git_baseline.py 用真 git 夹具专门盯)。
+    kwargs.setdefault("verify_trusted_against_git", False)
     return rs.RepoImportGuard(root, snapshot=rs.snapshot_allowed_files(root), **kwargs)
 
 

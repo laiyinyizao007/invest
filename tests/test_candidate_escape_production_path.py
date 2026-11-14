@@ -46,12 +46,32 @@ def purge_modules(monkeypatch, *prefixes):
         monkeypatch.delitem(sys.modules, name, raising=False)
 
 
+def git_commit_all(root):
+    """把假仓库变成一个**真的 git 仓库**(并提交一次)。
+
+    第 25 轮 codex 的 Critical 1:受信目录的完整性基准是**仓库提交里的那份**
+    (快照是每次导入重拍的,挡不住"上一轮写、这一轮导")。生产入口按这条核对,
+    所以假仓库也必须像个真仓库,否则这条规则在测试里永远是"取不到基准"的另一条路径。
+    """
+    import subprocess
+
+    def run(*args):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+    run("init", "-q")
+    run("config", "user.email", "sandbox-test@example.invalid")
+    run("config", "user.name", "sandbox-test")
+    run("add", "-A")
+    run("commit", "-q", "-m", "init")
+
+
 @pytest.fixture()
 def repo(tmp_path, monkeypatch):
     """一个假仓库:候选跑在它里面,`bootstrap.ROOT` 指向它。"""
     root = tmp_path / "repo"
     (root / "strategies").mkdir(parents=True)
     (root / "strategies" / "__init__.py").write_text("", encoding="utf-8")
+    git_commit_all(root)
     monkeypatch.setattr(api.bootstrap, "ROOT", root)
     monkeypatch.chdir(root)
     return root
@@ -295,6 +315,9 @@ def test_the_candidate_cannot_run_a_helper_module_through_a_wildcard_import(tmp_
     purge_modules(monkeypatch, "strategies")
     # 给包装上 `__all__`:导入机制据此自己去 import 子模块。
     (repo / "strategies" / "__init__.py").write_text('__all__ = ["evil"]\n', encoding="utf-8")
+    # 受信目录必须与**仓库提交**一致(第 25 轮 codex 的 Critical 1)——
+    # 改完模板要提交,否则那条规则先拒(候选改写了受信模块时走的也是同一条路)。
+    git_commit_all(repo)
     marker = tmp_path / "executed.txt"
     helper = 'open(r"%s","w").write("x")' % str(marker).replace("\\", "/")
     target = str(repo / "strategies" / "evil.py").replace("\\", "/")

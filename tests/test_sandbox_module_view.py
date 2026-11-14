@@ -170,7 +170,8 @@ def test_the_snapshot_notices_a_content_change_even_when_the_mtime_is_restored(t
     root, target = _make_importable_repo(tmp_path, monkeypatch)
 
     snapshot = rs.snapshot_allowed_files(root)
-    guard = rs.RepoImportGuard(root, snapshot=snapshot, started_at_ns=time.time_ns())
+    guard = rs.RepoImportGuard(root, snapshot=snapshot, started_at_ns=time.time_ns(),
+                              verify_trusted_against_git=False)
     assert guard.check("strategies.mod") is None, "前提不成立:守卫一开始就没放行这个模块"
 
     # 改写内容,并把 mtime 还原成原值
@@ -191,7 +192,8 @@ def test_the_guard_refuses_when_the_state_of_the_file_cannot_be_checked(tmp_path
     root, _target = _make_importable_repo(tmp_path, monkeypatch)
 
     snapshot = rs.snapshot_allowed_files(root)
-    guard = rs.RepoImportGuard(root, snapshot=snapshot, started_at_ns=time.time_ns())
+    guard = rs.RepoImportGuard(root, snapshot=snapshot, started_at_ns=time.time_ns(),
+                              verify_trusted_against_git=False)
     assert guard.check("strategies.mod") is None, "前提不成立:守卫一开始就没放行这个模块"
 
     real_stat = Path.stat

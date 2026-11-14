@@ -40,6 +40,48 @@
     不存在"为了凑一个数去调阈值"的情况。
 
 ### Fixed（修复）
+- **跨轮次沙盒逃逸(第 25 轮 codex 第二轮的 Critical 1)**:受信目录(`strategies/`)的完整性基准
+  改成**仓库提交里的那份**,不再是"每次运行重拍"的快照(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
+  ADR `20261113-evolution-engine`「第 25 轮补记」)。
+  - **为什么必须换**:快照是每次导入重拍的,挡得住"同一次运行里现写现导",挡不住**"上一轮写、这一轮导"**——
+    候选用 `numpy.savetxt` 改写了受信模块,第 1 轮导入被正确拒绝,第 2 轮**重拍**的快照却已经收进了被篡改的文件 →
+    放行 → 那个模块在**导入机制**里执行(拿到真实内建)→ 任意命令执行(codex 端到端复现,标记文件确实被写了出来)。
+  - **基准取不到就拒**(fail-closed,查不了等于没查);规则按"那个目录**能不能写**"分岔:
+    **容器里 `/app` 是只读的**(rootfs `read_only: true`,`strategies/` 烤进镜像)→ 写能力不存在,不需要基准;
+    **宿主机跑 CLI** → 目录可写,必须用提交基准核对。
+  - **一处自曝的误判(如实记录)**:基准最初是"自己算 git 的 blob 哈希",在 Windows 上会把
+    **没被改过**的文件判成"被改写过"(工作区 CRLF vs 提交 LF,`core.autocrlf` 归一化后其实一致)——
+    受信目录里的正常模块一律被拒。改用 **git 自己的比较口径**(`git status` + `git ls-tree`)后消失。
+    教训:内容基准要交给内容的主人,自己复刻哈希算法只会在换行/编码/过滤器这些细节上出错。
+- **视图的"拒绝"被 CPython 的 `import_from` 回退绕过(第 25 轮 High 2)**:视图用"抛 `AttributeError`"表示不给,
+  而 `IMPORT_FROM` 在 `getattr` 失败时会**清掉异常、回退到 `sys.modules["pkg.name"]`**——"拒绝"恰好触发了"交出真模块"。
+  实测 `from pkgx import sub` 拿到的是**真模块**(候选手里就有一份带 `ctypes` 的真模块)。
+  受限导入器现在在 fromlist 这一路**显式查一次 `sys.modules`**,命中真模块就按真模块的规矩裁决。
+- **危险名单两层口径不一致(第 25 轮 High 4)**:危险名单原先**只在属性层**生效,导入门放行了一大片——
+  实测 `httpx`/`urllib3`/`ssl`/`codecs`/`gzip`/`tarfile`/`zipfile`/`sqlite3`/`mmap`/`atexit` 全部放行,
+  网络外传(`httpx.get(...)`)与文件写(`codecs.open(...)`)的能力都还在。导入门现在**复用同一份名单**;
+  名单同时补齐了写能力与外传通道(`codecs`/`mmap`/`sqlite3`/`ssl`/`bz2`/`lzma`)——
+  静态层只拦**字符串字面量**里的 `"open"`,而 `codecs.open` 是 `ast.Attribute`,"从内建里拿掉 open"没封住写能力。
+- **一处误伤,已回退(第 25 轮 High 3)**:导入门曾整块拒绝"会把能力递出来的模块",于是
+  `import matplotlib` 直接 `ImportError`(matplotlib 建字体缓存要用 `subprocess`)、`psutil` 同理——
+  候选只想画个图却整个模块都用不了。**误伤比漏检更糟**:能力交付改由属性层的模块视图负责,
+  导入门只管"危险模块按名单拒"。
+- **静态层看不见 fromlist(第 25 轮 Medium 6)**:`from numpy import ctypeslib` 与 `import numpy.ctypeslib`
+  是同一件事,但原来只看 `node.module`(numpy)→ 这条写法**放行**;而运行期的拒绝发生在 import **之后**
+  (模块已经在导入机制里以真实内建执行过,副作用已经发生)。现在逐个检查 names。
+- **四处 fail-open 改成 fail-closed(第 25 轮 Medium 9)**:解析不到来源文件、包位置 `stat` 不出来、
+  包内文件 `stat` 不出来、能力来源取不到——原先都是"拿不准就放行",与本文件其它地方的口径相反。
+- **能力泄漏判定按模块缓存(第 25 轮 Medium 7)**:原来每次属性访问都全量扫 `vars(module)`
+  (实测视图取一个属性 14.7µs、候选热点循环慢 19 倍:20000 次 `np.random.normal()` 沙盒 0.327s vs 普通 0.017s)。
+- **视图透传 `__version__`(第 25 轮 Low 11)**:原先只透传 `__all__`/`__name__`/`__doc__`/`__package__`,
+  `np.__version__` 直接 `AttributeError`——连"记录本次评估用了哪个库版本"这种正当需求都做不到。
+- **宪法守卫对三份新的 deny 名单是空的(第 25 轮 Medium 8)**:提取器**不认 `frozenset({...})` 写法**,
+  `DANGEROUS_MODULE_NAMES`/`FORBIDDEN_MODULE_PATHS`/`CAPABILITY_MODULE_NAMES`(=外加 `FORBIDDEN_KEY_STRINGS`)
+  既没被解析、也没登记进注册表——两头一凑:从危险名单里删掉 `"ssl"`,守卫照样全绿。
+  现在提取器认 `frozenset`/`set` 调用,四份名单登记进注册表;守卫本体已跑通(退出码 0)。
+- **本轮的验证方式(新增 26 条用例)**:`tests/test_sandbox_round25_rules.py`(17 条)与
+  `tests/test_constitution_round25.py`(9 条),每条规则都有**双向**探针(放行 + 拦截),
+  并断言"**是哪一条规则**拒的";**变异验证**把第 25 轮的 6 处修复逐一拿掉,6 处全部被抓到(用例变红)。
 - **候选"写辅助模块再 import"这条逃逸,以及另外四条已封的逃逸(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),
   ADR `20261113-evolution-engine`「第 22 轮补记」):本轮全部结论来自**动态探针**(真的写文件、真的 import、真的看结果),
   不是静态推理——静态推理一定漏(见 memory `static-ban-rules-need-dynamic-probes`)。

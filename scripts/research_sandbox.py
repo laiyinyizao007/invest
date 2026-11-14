@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 import weakref
 from datetime import datetime
@@ -102,13 +103,100 @@ DANGEROUS_MODULE_NAMES = {
     # 其它能力入口
     "unittest", "mock", "pty", "platform", "webbrowser", "distutils",
     "setuptools", "pip", "venv", "ensurepip",
+    # **写能力与外传通道**(第 25 轮 codex 实测:`codecs.open` 仍能写文件,
+    # 而静态层只拦**字符串字面量**里的 "open",`codecs.open` 是 ast.Attribute,
+    # 于是"从内建里拿掉 open"根本没封住写能力;`ssl`/`httpx`/`urllib3` 则是外传通道):
+    "codecs", "mmap", "sqlite3", "ssl", "bz2", "lzma",
 }
 
 # 出现这两个 = 那个模块能把"执行任意代码 / 调原生代码"直接递出来,整块不给。
 CAPABILITY_MODULE_NAMES = frozenset({"ctypes", "subprocess"})
 
 # 视图上唯一透传的下划线名字(其余下划线属性一律不给,包括 `__class__`/`__dict__`)。
-_VIEW_FORWARDED = frozenset({"__all__", "__name__", "__doc__", "__package__"})
+# `__version__` 也在内(第 25 轮 codex 的 Low 11):只透传四个名字会让
+# "记录库版本的候选"直接崩掉(np.__version__ -> AttributeError)。
+_VIEW_FORWARDED = frozenset({"__all__", "__name__", "__doc__", "__package__", "__version__"})
+
+
+# ---------------------------------------------------------------------------
+# 受信目录的完整性基准 = **仓库提交里的那份**(第 25 轮 codex 的 Critical 1)
+#
+# 为什么必须是提交而不是"每次导入重拍的快照":
+# 快照是**每次导入重拍**的,它挡得住"同一次运行里现写现导",挡不住
+# "上一轮写、这一轮导":候选用 `codecs.open('strategies/base.py', 'w')` 改写了一个
+# **受信**模块;第 1 轮里 import 它会被快照正确拒绝(文件是运行期间写出来的),
+# 但第 2 轮重拍的快照**已经把被篡改的文件收进去了** → 放行 → 那个模块在
+# **导入机制**里执行(拿到真实内建)→ 任意命令执行(第 25 轮 codex 端到端复现,
+# 标记文件确实被写了出来)。
+#
+# 基准只有一个够硬:**仓库提交里的那份**。候选拿不到 subprocess,
+# 伪造一个内容哈希等于伪造 SHA-1 原像——不现实。
+#
+# 而"只读部署"里根本不需要它:容器里 /app 是**只读**的(rootfs read_only),
+# 候选**写不了**那个目录,篡改压根不可能发生(写能力不存在,不是"被挡住了")。
+# 所以规则按"那个目录能不能写"分岔:
+#   能写 -> 必须有提交基准,取不到基准就**拒绝**(查不了等于没查,fail-closed);
+#   不能写 -> 不需要基准(写不了就没有篡改)。
+def _git_toplevel(repo_root: Path) -> str | None:
+    """这个目录所在的 git 仓库顶层(取不到就不是 git 仓库)。"""
+    try:
+        proc = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+                              capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    top = proc.stdout.decode("utf-8", "replace").strip()
+    return top or None
+
+
+def git_committed_paths(repo_root: Path, rel_dirs) -> tuple[str, set] | None:
+    """(仓库顶层目录, HEAD 里这些目录下的**已提交**文件)——路径相对顶层目录。
+
+    返回 None = 这台机器上取不到基准(不是 git 仓库 / 没装 git / HEAD 不存在)——
+    调用方按"查不了等于没查"处理(fail-closed),**不**当作"没有基准、随便放行"。
+    """
+    top = _git_toplevel(repo_root)
+    if top is None:
+        return None
+    try:
+        proc = subprocess.run(["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only",
+                               "HEAD", "--", *rel_dirs],
+                              capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    paths = {line.strip().replace("\\", "/")
+             for line in proc.stdout.decode("utf-8", "replace").splitlines() if line.strip()}
+    return top, paths
+
+
+def git_dirty_paths(repo_root: Path, rel_dirs) -> set | None:
+    """这些目录里**与 HEAD 不一致**的文件(相对仓库顶层目录)。
+
+    用 git 自己的比较口径,而不是我们自己算哈希:git 会按 `core.autocrlf`
+    与 `.gitattributes` 归一化换行后再比。自己按字节算哈希会把
+    "工作区 CRLF / 提交里 LF"这种**内容其实一致**的情况误判成"被改写过"
+    (Windows 上仓库默认就长这样)——那会让受信目录里的正常模块一律被拒。
+
+    None = 查不到(不是 git 仓库 / git 报错)→ 调用方 fail-closed。
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo_root), "status", "--porcelain", "-z",
+                               "--no-renames", "-uall", "--", *rel_dirs],
+                              capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out: set = set()
+    for record in proc.stdout.decode("utf-8", "replace").split("\0"):
+        # porcelain -z 的记录是 "XY <路径>";重命名已用 --no-renames 关掉,不会多出第二条。
+        if len(record) < 4:
+            continue
+        out.add(record[3:].replace("\\", "/"))
+    return out
 
 
 def _module_name(value) -> str:
@@ -139,9 +227,14 @@ def _capability_source(value) -> str | None:
         return name if name in CAPABILITY_MODULE_NAMES else None
     try:
         origin = getattr(value, "__module__", "") or ""
-    except Exception:                                    # noqa: BLE001 —— 属性取值不该影响裁决
-        return None
+    except Exception:                                    # noqa: BLE001 —— 取不到来源 = 认不准 = 当成"能执行"
+        # 第 25 轮 codex 的 Medium 9:原来这里返回 None(判成"无害")。
+        # "取不到来源"不等于"无害"——认不准就按**有能力**处理(拒绝交付)。
+        return "未知来源"
     return origin if origin in CAPABILITY_MODULE_NAMES else None
+
+
+_LEAK_CACHE: "weakref.WeakKeyDictionary[ModuleType, tuple]" = weakref.WeakKeyDictionary()
 
 
 def _capability_leak(value) -> str | None:
@@ -149,18 +242,35 @@ def _capability_leak(value) -> str | None:
 
     判据:它自己有没有一个属性是 `ctypes`/`subprocess` 的模块**或**它们定义出来的对象。
     实测:`numpy.ctypeslib` 递出 `ctypes`、`numpy.f2py` 递出 `subprocess`。
+
+    **按模块缓存**(第 25 轮 codex 的 Medium 7):原来每次属性访问都要全量扫 `vars(module)`,
+    实测视图取一个属性 14.7µs、候选热点循环慢 19 倍(20000 次 `np.random.normal()`:
+    沙盒 0.327s vs 普通 0.017s)。研究侧是"多候选 × 多 bar × 多参数"的放大场景,
+    这一项能吃掉整轮预算。缓存键是模块本身(弱引用,回收即消失),
+    失效条件用 `len(vars(module))`:模块成员变了,长度多半也变了;真变了长度却不变的情况
+    (换了一个成员但数量不变)会用到旧判定——登记为已知残余。
     """
     if not isinstance(value, ModuleType):
         return None
     try:
-        members = list(vars(value).values())
+        size = len(vars(value))
     except TypeError:                                    # 理论上模块都有 __dict__
         return None
+    cached = _LEAK_CACHE.get(value)
+    if cached is not None and cached[0] == size:
+        return cached[1]
+    try:
+        members = list(vars(value).values())
+    except TypeError:
+        return None
+    found = None
     for item in members:
         source = _capability_source(item)
         if source:
-            return source
-    return None
+            found = source
+            break
+    _LEAK_CACHE[value] = (size, found)
+    return found
 
 
 class ModuleView:
@@ -445,6 +555,10 @@ def _floor_to_granularity(value_ns: int, granularity: int) -> int:
     return value_ns - (value_ns % granularity) if granularity > 1 else value_ns
 
 
+# 受信目录的提交基准缓存:键 = (仓库根, 允许目录),值 = (仓库顶层, 已提交文件集合) 或 None(取不到)。
+_GIT_BASELINE_CACHE: dict = {}
+
+
 class RepoImportGuard:
     """按**路径**裁决候选能不能导入某个模块。
 
@@ -457,11 +571,38 @@ class RepoImportGuard:
     """
 
     def __init__(self, repo_root: Path, allowed_dirs: Sequence[str] = ALLOWED_REPO_IMPORT_DIRS,
-                 snapshot: Mapping[str, int] | None = None, started_at_ns: int | None = None):
+                 snapshot: Mapping[str, int] | None = None, started_at_ns: int | None = None,
+                 verify_trusted_against_git: bool = True):
         self.repo_root = Path(repo_root).resolve()
         self.allowed_dirs = tuple(allowed_dirs)
         self.snapshot = dict(snapshot or {})
         self.started_at_ns = started_at_ns if started_at_ns is not None else time.time_ns()
+        # 受信目录要不要与**仓库提交**核对(第 25 轮 codex 的 Critical 1)。
+        # 默认开(查不了等于没查,fail-closed);单元测试用临时目录模拟仓库,那里没有 git 基准,
+        # 所以测试显式关掉这条(另有一条用真 git 夹具的用例专门盯它)。
+        self.verify_trusted_against_git = verify_trusted_against_git
+
+    def _git_baseline(self) -> tuple[str, set] | None:
+        """受信目录的**提交基准**(进程内缓存:起一次 git 就够,不必每个候选重起一次)。
+
+        None = 取不到基准(不是 git 仓库 / 没装 git / HEAD 不存在)→ 调用方 fail-closed。
+        """
+        key = (str(self.repo_root), self.allowed_dirs)
+        if key not in _GIT_BASELINE_CACHE:
+            _GIT_BASELINE_CACHE[key] = git_committed_paths(self.repo_root, list(self.allowed_dirs))
+        return _GIT_BASELINE_CACHE[key]
+
+    def _trusted_dir_writable(self, resolved: Path) -> bool:
+        """受信目录**能不能被写**。
+
+        写不了 -> 篡改压根不可能发生(容器里 /app 是只读的),不需要提交基准;
+        能写   -> 必须用提交基准核对(宿主机上跑 CLI 的情形)。
+        """
+        for name in self.allowed_dirs:
+            base = self.repo_root / name
+            if base == resolved or base in resolved.parents:
+                return os.access(base, os.W_OK)
+        return False
 
     def _under_allowed_dir(self, resolved: Path) -> bool:
         for name in self.allowed_dirs:
@@ -474,7 +615,15 @@ class RepoImportGuard:
         """返回拒绝理由(None 表示放行)。"""
         origin = module_origin(name)
         if not origin:
-            return None                                        # 不是磁盘上的文件,不由路径规则裁决
+            # 解析不到磁盘文件(命名空间包、zip 成员、动态模块……)。
+            # 第 25 轮 codex 的 Medium 9:原来这里直接放行——"查不到来源"被当成了"没有来源问题"。
+            # 但命名空间包**有**来源(它是一串目录),只是没有单文件;仓库内的命名空间包
+            # (比如没有 __init__.py 的 pending_strategies/)正是候选写辅助模块的地方。
+            # 判据:这个包的名字空间位置落在仓库内、且不在允许目录里 -> 拒。
+            reason = self.check_package(name)
+            if reason:
+                return reason
+            return None                                        # 仓库外的命名空间包(站点包等)照旧放行
         if origin in ("built-in", "frozen", "namespace"):
             return None                                        # 同上(内建/冻结/命名空间包:没有文件可查)
         try:
@@ -503,6 +652,30 @@ class RepoImportGuard:
                     f"(候选运行期间写出的文件一律不得被导入)")
         if self._changed(known, resolved, stat):
             return f"禁止导入 {name}:该文件在候选运行期间被改动过"
+        # **跨轮次**(第 25 轮 codex 的 Critical 1):快照是每次导入重拍的,
+        # 挡不住"上一轮写、这一轮导"(上一轮被改写的文件,这一轮的快照已经收进去了)。
+        # 受信目录必须与**仓库提交**一致:要么这个文件根本不在提交里(候选写的),
+        # 要么内容与提交不一致(候选改写的)——两种都拒绝导入。
+        if self.verify_trusted_against_git and self._trusted_dir_writable(resolved):
+            baseline = self._git_baseline()
+            if baseline is None:
+                return (f"禁止导入 {name}:无法验证受信目录的完整性"
+                        f"(取不到仓库提交基准,查不了等于没查,fail-closed)")
+            top, committed = baseline
+            try:
+                rel = os.path.relpath(str(resolved), top).replace("\\", "/")
+            except ValueError:                        # 不在同一个盘上(理论上不可能)
+                rel = self._rel(resolved).replace("\\", "/")
+            if rel not in committed:
+                return (f"禁止导入 {name}:该文件不在仓库提交里"
+                        f"(候选运行期间写出的文件一律不得被导入)")
+            dirty = git_dirty_paths(self.repo_root, list(self.allowed_dirs))
+            if dirty is None:
+                return (f"禁止导入 {name}:无法验证受信目录的完整性"
+                        f"(查不到仓库状态,查不了等于没查,fail-closed)")
+            if rel in dirty:
+                return (f"禁止导入 {name}:该文件与仓库提交的内容不一致"
+                        f"(候选运行期间被改动过)")
         return None
 
     @staticmethod
@@ -568,7 +741,10 @@ class RepoImportGuard:
             try:
                 resolved = Path(loc).resolve()
             except OSError:
-                continue
+                # 第 25 轮 codex 的 Medium 9:原来这里 continue(跳过)——
+                # "查不出来"被当成了"没问题"。与本文件其它地方的 fail-closed 口径相反。
+                return (f"禁止从 {name} 导入:无法确认包位置的状态"
+                        f"(查不了等于没查,fail-closed)")
             if self.repo_root != resolved and self.repo_root not in resolved.parents:
                 continue                                        # 仓库之外(站点包)照旧放行
             if not self._under_allowed_dir(resolved):
@@ -615,7 +791,10 @@ class RepoImportGuard:
                     key = str(path.resolve())
                     stat = path.stat()
                 except OSError:
-                    continue
+                    # 第 25 轮 codex 的 Medium 9:stat 不出来的文件原来被**跳过**,
+                    # 而 `check()` 那一侧是"查不到就拒"——两处口径相反。
+                    return (f"禁止从 {name} 导入 *:包内 {path.name} 的状态查不到"
+                            f"(查不了等于没查,fail-closed)")
                 known = self.snapshot.get(key)
                 if known is None:
                     return (f"禁止从 {name} 导入 *:包内 {path.name} 在候选开始运行之前并不存在"
@@ -637,6 +816,8 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard):
     _leak = _capability_leak
     _danger = _is_dangerous_module
     _view = _view_for
+    import sys as _sys
+    _modules = _sys.modules                 # 真模块表:导入机制回退时会从这里取"真模块"
     # 这一帧的 globals 是**干净的**(只剩受限内建),里面没有 `object`——
     # 所以属性读取走闭包单元,不走全局名。
     _get = object.__getattribute__
@@ -714,12 +895,13 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard):
             # 帧的内建都是受限的那一份。
             reason = f"导入 {name} 失败"
             raise ImportError(reason) from None
-        # 导入的东西自己会不会把执行能力递出来(实测 `numpy.ctypeslib` 把 `ctypes` 递出来):
-        # 这种模块整块不给,连"import 它"都不给。
-        leak = _leak(module)
-        if leak:
-            raise ImportError(f"禁止导入 {name}:它把 {leak} 递出来,"
-                              f"等于把执行能力递给候选(规则:能力泄漏)")
+        # **不**在这里整块拒绝"会把能力递出来的模块"(第 25 轮 codex 的 High 3):
+        # 能力交付是由**属性层的模块视图**负责的(危险属性不给、会递出 ctypes/subprocess 的模块整个不给)。
+        # 导入门那一层再拒一遍,口径就比视图层**更严**,于是合法的候选直接跑不起来:
+        # `matplotlib` 与 `psutil` 的命名空间里都有 `subprocess`(matplotlib 建字体缓存要用),
+        # 实测 `import matplotlib` -> ImportError:禁止导入 matplotlib:它把 subprocess 递出来。
+        # 候选只想画个图,却整个模块都用不了——误伤比漏检更糟(它让人以为"沙盒更严了")。
+        #
         # fromlist 里的子模块:导入机制自己 import 的,不看它的属性就会漏。
         for item in fromlist:
             if item == "*":
@@ -727,12 +909,24 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard):
             try:
                 sub = _get(module, item)
             except AttributeError:
-                continue
+                sub = None
             if isinstance(sub, _mt):
                 if _danger(sub):
                     raise ImportError(f"禁止导入 {name}.{item}:模块视图不把危险模块 "
                                       f"{sub.__name__} 交给候选(规则:模块视图)")
-                leak = _leak(sub)
+            # **High 2(视图的"拒绝"会被导入机制的回退绕过)**:
+            # 视图用"抛 AttributeError"表示不给,而 CPython 的 `import_from` 在
+            # `getattr(v, name)` 失败时会**清掉异常并回退到 `sys.modules["pkg.name"]`**——
+            # 于是"拒绝"恰好触发了"交出真模块"。第 25 轮 codex 实测:
+            # 构造一个 `__init__.py` 里 `del sys.modules['pkgx'].sub` 的包,
+            # `from pkgx import sub` 拿到的就是**真模块**(isinstance(view) 为 False)。
+            # 所以这里显式查一次 sys.modules:命中的是真模块,就按真模块的规矩裁决。
+            real = _modules.get(f"{name}.{item}")
+            if real is not None and isinstance(real, _mt):
+                if _danger(real):
+                    raise ImportError(f"禁止导入 {name}.{item}:模块视图不把危险模块 "
+                                      f"{real.__name__} 交给候选(规则:模块视图)")
+                leak = _leak(real)
                 if leak:
                     raise ImportError(f"禁止导入 {name}.{item}:它把 {leak} 递出来,"
                                       f"等于把执行能力递给候选(规则:能力泄漏)")
@@ -770,7 +964,12 @@ def safe_builtins(forbidden_modules: Sequence[str] = (), repo_guard: "RepoImport
     import builtins as _builtins
     import types as _types
 
-    blocked = set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES) | set(forbidden_modules)
+    # **High 4**:危险名单原先只在**属性层**生效,导入门放行了一大片
+    # (实测 httpx / urllib3 / ssl / codecs / gzip / tarfile / zipfile / sqlite3 / mmap / atexit 全部放行):
+    # 网络外传(`httpx.get(...)`)与文件写(`codecs.open`)的能力都还在。
+    # 现在导入门复用**同一份**危险名单——两层口径必须一致,否则"名单"只是名字上的说法。
+    blocked = (set(FORBIDDEN_MODULES) | set(EXTRA_FORBIDDEN_MODULES)
+               | set(DANGEROUS_MODULE_NAMES) | set(forbidden_modules))
     real_import = _builtins.__import__
 
     safe = {k: v for k, v in _builtins.__dict__.items() if k not in UNSAFE_BUILTINS}
@@ -826,7 +1025,14 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
+            # `from numpy import ctypeslib` 与 `import numpy.ctypeslib` 是**同一件事**,
+            # 但原实现只看 `node.module`(numpy),看不见 names 里的 ctypeslib,
+            # 于是这条写法**放行**(第 25 轮 codex 的 Medium 6 实测)。
+            # 而运行期的拒绝发生在 import **之后**——模块已经在导入机制里以真实内建执行过,副作用已经发生。
             names = [node.module or ""]
+            for alias in node.names:
+                if node.module and alias.name != "*":
+                    names.append(f"{node.module}.{alias.name}")
         else:
             names = []
         for name in names:
