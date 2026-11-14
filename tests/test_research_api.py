@@ -833,10 +833,20 @@ def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree,
 
 
 def test_all_three_child_entrypoints_go_through_the_same_validation_function(tree, monkeypatch):
-    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。"""
+    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。
+
+    第 32 轮:入口改成"闭包包一层"(回传走闭包单元里的 emit,候选改模块属性骗不过它),
+    于是入口本身只是一层壳 —— 壳里**真的**执行的处理函数要能被静态核对到,
+    而且要能证明"壳委派的就是被核对的那个函数"(否则核对的是一个没人执行的副本)。"""
     import inspect
     for name in ("run_child", "run_evaluate_child", "run_gate_child"):
-        source = inspect.getsource(getattr(api, name))
+        entry = getattr(api, name)
+        handler = getattr(entry, "handler", None)
+        assert handler is not None, f"{name} 没有暴露处理函数,静态核对失效"
+        # 壳必须真的委派给被核对的那个处理函数
+        closed = [cell.cell_contents for cell in (entry.__closure__ or ())]
+        assert handler in closed, f"{name} 委派的不是被核对的那个处理函数"
+        source = inspect.getsource(handler)
         assert "import_candidate(" in source, f"{name} 没走统一入口"
         assert "check_candidate_class(" not in source, f"{name} 仍在自己做校验,会漏"
 

@@ -628,6 +628,19 @@ def test_the_declared_grid_is_read_statically_from_the_source():
     assert api.declared_grid_cells("param_grid = {'a': [1, 2, 3]}\n") is None   # 类外的网格读不准 → 保守
 
 
+def test_an_annotated_grid_is_read_the_same_way_as_a_plain_one():
+    """带注解的写法 `param_grid: dict = {...}` 也要读得出格子数。
+
+    读不出 → 当成"没有网格" → 只记预扣的 27 格 → 少记试验次数 →
+    DSR 的 N 偏小 = 悄悄放松已锁定的 DSR ≥ 0.95。"""
+    assert api.declared_grid_cells("class S:\n    param_grid: dict = {'a': [1, 2, 3], 'b': [1, 2]}\n") == 6
+    # 类外的带注解网格同样读不准 → 保守
+    assert api.declared_grid_cells("param_grid: dict = {'a': [1, 2, 3]}\n") is None
+    # 保守记账:带注解的 60 格 → 60(不是预扣的 27,也不是配置上限 343)
+    assert api.conservative_grid_cells(
+        "class S:\n    param_grid: dict = {'a': [1, 2, 3, 4], 'b': [1, 2, 3], 'c': [1, 2, 3, 4, 5]}\n", 343) == 60
+
+
 def test_the_conservative_charge_never_goes_below_the_precharged_minimum():
     """双向:保守值不得低于预扣的最小网格(否则等于退还试验次数)。"""
     assert api.conservative_grid_cells("class S:\n    pass\n", 343) == 27
@@ -717,3 +730,109 @@ def test_a_non_finite_or_over_long_pnl_list_is_refused():
     with pytest.raises(api.JobError):
         api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": {"a": 1}})
     api.check_result_bounds({"stats": {"sharpe": 1.0}, "pnls": [1.0, -2.5, 0.0]})
+
+
+def test_a_child_that_refused_before_scanning_is_not_charged_for_cells_it_never_scanned(tree, monkeypatch):
+    """双向:子进程**拒绝**(退出码 2)时它一个格子都没扫 → 不按网格补记。
+
+    拒绝发生在子进程自己的检查点(路径/审批/参数/导入)上,那时网格还没开始扫。
+    按网格补记就是凭空多记试验次数 —— DSR 被算得更严,严到把正常候选也挡掉。
+    但预扣的那 27 格**不退**:失败不变成免费探索(ADR 第 9 条)。"""
+    make_strategy(tree, "class S:\n"
+                        "    param_grid = {'a': [1, 2, 3, 4], 'b': [1, 2, 3, 4], 'c': [1, 2, 3, 4]}\n")
+
+    def refuse(cmd, timeout):
+        raise api.JobError(api.EXIT_REFUSED, "策略代码尚未批准")
+
+    monkeypatch.setattr(api, "spawn_child", refuse)
+
+    with pytest.raises(api.JobError):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+
+    from risk.trial_ledger import total_trials
+    assert total_trials(api.trials_path(api.settings()[1])) == 27      # 只剩预扣的那份
+
+
+# ---------------- 第 32 轮:入口自身可被改写、拒绝原因的来源与完整性 ----------------
+
+def test_a_candidate_that_replaces_the_emit_entry_point_cannot_skip_the_fingerprint(tree, monkeypatch, capsys):
+    """候选把**调用点真正用的那个名字**换掉 → 指纹检查必须照样执行(响亮地失败)。
+
+    第 32 轮 codex 实测:此前子进程入口的调用点查的是**模块全局** `_EMIT_OR_FAIL`,
+    候选 `api._EMIT_OR_FAIL = 假函数` 之后:
+      - 整段指纹检查**根本不执行**(指纹在 writer 体内,假函数压根不调它);
+      - 父进程照常采信假结果,退出码 0。
+    现在调用点走**闭包单元**里导入时捕获的那一份 → 指纹照跑 → 退出码 2,不写结果。"""
+    body = ("import research_api\n"
+            "research_api._EMIT_OR_FAIL = lambda body: 0\n"
+            "from vnpy_ctastrategy import CtaTemplate\n"
+            "class S(CtaTemplate):\n"
+            "    pass\n")
+    path = make_strategy(tree, body)
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    approve(path)
+
+    handoff = {"path": str(tree / "child_result.json"), "key": "k" * 64, "dir": str(tree)}
+    import io
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(handoff) + "\n"))
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    # 候选在**本进程**里改写了框架模块的属性(子进程里改的是它自己那份)——
+    # 测完必须还原,否则后面的用例全被这一次改写污染。
+    original = api._EMIT_OR_FAIL
+    try:
+        code = api.run_evaluate_child(args)
+    finally:
+        api._EMIT_OR_FAIL = original
+
+    assert code == api.EXIT_REFUSED, "候选换掉入口之后必须响亮地失败,而不是照常回传结果"
+    assert not (tree / "child_result.json").exists(), "被改写时不得写出任何结果"
+    # 必须是**指纹**逮到的(不是别的拒绝理由):否则这条用例会因为"别的原因也退出 2"而空转
+    err = capsys.readouterr().err
+    assert "运行时对象被改写" in err, err
+
+
+def test_the_frameworks_own_reason_wins_over_a_candidate_line_printed_at_exit():
+    """候选在**进程退出时**(框架写完原因之后)打一行带同样标记的文本 → 框架那行赢。
+
+    此前父层取的是**最后**一行带标记的行,候选的 atexit 钩子排在后面 → 候选那行被回传,
+    顶掉了框架自己的结论。atexit 不在沙盒的禁用名单里,这条路径是通的。"""
+    stderr = ("[框架] NoSuchClass 不存在或不是 CtaTemplate 子类\n"
+              "[框架] close=2728.0 是验证窗口的收盘价\n")
+    reason = api._child_reason(stderr)
+    assert "NoSuchClass" in reason
+    assert "2728.0" not in reason, "候选在退出时打的那一行不得顶替框架的结论"
+
+
+def test_a_multiline_refusal_reason_is_relayed_in_full(capsys):
+    """多行的拒绝原因**每一行都要带标记**,否则细节(是哪一条)全丢。
+
+    此前只给第一行加标记:框架写"静态筛查未通过:\n  第 1 行: 禁止导入 os",
+    父层只回传'静态筛查未通过:'——被丢掉的正是**是哪一条**。"""
+    api.say_refusal("静态筛查未通过:\n  第 1 行: 禁止导入 os\n  第 2 行: 禁止导入 sys")
+    err = capsys.readouterr().err
+    reason = api._child_reason(err)
+    assert "静态筛查未通过" in reason
+    assert "禁止导入 os" in reason
+    assert "禁止导入 sys" in reason
+
+
+def test_a_refusal_written_by_the_refuse_helper_is_relayed_too(capsys):
+    """`refuse()` 此前写的是**无标记**的"拒绝: ..." → 父层只认带标记的行 → 诊断全丢。
+
+    子进程侧会走到它(配置非法 → main() 的 ConfigError 分支),实测回传退化成
+    "子进程拒绝执行(原因见本机日志)"。"""
+    api.refuse("配置非法,拒绝运行: grid.max_cells=0 超出允许范围")
+    err = capsys.readouterr().err
+    assert api.FRAMEWORK_TAG in err, "拒绝原因必须带框架标记,否则父层不认"
+    reason = api._child_reason(err)
+    assert "配置非法" in reason
+
+
+def test_a_grid_declared_with_a_tuple_target_is_not_treated_as_no_grid():
+    """`param_grid, x = {...}, 1` 里的 param_grid 也是网格声明。
+
+    目标名要递归取:只看最外层会以为"没有 param_grid" → 当成没网格 → 只记 27 格
+    → 少记试验次数 = 悄悄放松已锁定的 DSR ≥ 0.95(第 32 轮 codex 的 Low-2)。"""
+    assert api.declared_grid_cells("class S:\n    param_grid, x = {'a': [1, 2]}, 1\n") is None
+    assert api.conservative_grid_cells("class S:\n    param_grid, x = {'a': [1, 2]}, 1\n", 343) == 343

@@ -82,7 +82,12 @@ def emit(obj) -> None:
 
 
 def refuse(message: str) -> int:
-    print(f"拒绝: {message}", file=sys.stderr)
+    """拒绝并给出原因。
+
+    走 `say_refusal`(带 `[框架]` 标记):子进程侧的这个函数也会被用到
+    (例如配置非法 → `main()` 的 ConfigError 分支),此前那里写的是**无标记**的
+    "拒绝: ..." → 父层只认带标记的行 → 回传退化成"原因见本机日志",诊断全丢。"""
+    say_refusal(f"拒绝: {message}")
     return EXIT_REFUSED
 
 
@@ -247,11 +252,19 @@ def declared_grid_cells(source: str) -> int | None:
     sizes: list[int] = []
     unknown = False
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):          # 带注解的写法: param_grid: dict = {...}
+            targets = [node.target]
+            value = node.value
+        else:
             continue
-        if not any(isinstance(t, ast.Name) and t.id == "param_grid" for t in node.targets):
+        # 目标名要**递归**取:`param_grid, x = {...}, 1` 的目标是一个 ast.Tuple,
+        # 只看最外层会以为"没有 param_grid" → 当成没网格 → 只记 27 格 → 少记试验次数。
+        target_names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        if "param_grid" not in target_names:
             continue
-        value = node.value
         if id(node) not in class_body_ids or not isinstance(value, ast.Dict) or not value.keys:
             unknown = True                      # 类外的、或不是字面量 dict → 读不准
             continue
@@ -324,8 +337,15 @@ def say_refusal(message: str) -> None:
 
     这层的**真实边界**(别把它当成安全边界):候选与框架同进程,它完全可以自己打一行
     带同样标记的文本 —— 标记挡的是"误顶替"(候选随口打印与候选蓄意伪造是两回事)。
-    真正挡得住"候选伪造框架结论"的是候选独立进程化(已登记为后续工作)。"""
-    print(f"{FRAMEWORK_TAG} {message}", file=sys.stderr)
+    真正挡得住"候选伪造框架结论"的是候选独立进程化(已登记为后续工作)。
+
+    **整条原因写成一行**(第 32 轮):此前逐行打标记,父层取"第一段连续带标记的行" ——
+    但候选的 atexit 钩子紧跟在框架那行后面(同样是带标记的行、同样连续),于是**整段**被回传,
+    候选那行照样顶掉框架的结论。
+    现在:换行折成" / "写成**一行**,父层只取**第一行**带标记的行 → 框架那行赢。
+    细节不丢(都折在这一行里),候选在退出时打的那行排在后面 → 不采信。"""
+    text = " / ".join(part.strip() for part in str(message).splitlines() if part.strip())
+    print(f"{FRAMEWORK_TAG} {text}", file=sys.stderr)
 
 
 def _child_reason(stderr: str) -> str:
@@ -338,13 +358,24 @@ def _child_reason(stderr: str) -> str:
     只认带 `[框架]` 标记的行(见 `say_refusal`):候选与框架同进程,它自己 print 的内容
     一律不当作框架的结论 —— 既顶替不了,也借这条通道把验证窗口的数字传出去。
 
-    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。"""
-    tagged = [line.strip()[len(FRAMEWORK_TAG):].strip()
-              for line in (stderr or "").splitlines()
-              if line.strip().startswith(FRAMEWORK_TAG)]
+    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。
+
+    **取第一行带标记的行**(第 32 轮):此前取的是**最后**一行带标记的行 ——
+    候选可以注册 atexit 钩子(atexit 不在禁用名单里),在**框架写完原因之后**再打一行
+    带同样标记的文本,于是候选那行**排到最后**、被优先回传。
+    改成"第一行"之后,框架自己那行(先写的)赢。
+    (框架自己把多行原因折成一行写,见 `say_refusal` —— 细节在这一行里,不会因为取一行而丢。
+    仍取不到的情形:候选在**框架拒绝之前**就打了一行带标记的文本 ——
+    同进程内无法区分谁写的,已登记为残余。)"""
+    tagged: list[str] = []
+    for line in (stderr or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(FRAMEWORK_TAG):
+            tagged.append(stripped[len(FRAMEWORK_TAG):].strip())
+            break
     if not tagged:
         return "子进程拒绝执行(原因见本机日志)"
-    reason = tagged[-1]
+    reason = tagged[0]
     # Windows 盘符路径(含带空格的目录)、POSIX 绝对路径、引号里的整段路径都要盖住:
     # 早先只处理"不含空格的盘符路径",`C:\Program Files\...` 这类只替换掉前半段。
     reason = re.sub(r"[A-Za-z]:[\\/][^\s\"']*", "<路径>", reason)
@@ -1017,12 +1048,17 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
            *run_variances_argv(variances)]
     try:
         body = spawn_child(cmd, timeout)
-    except JobError:
+    except JobError as exc:
         # 子进程**中途死掉**(超时/崩溃/被杀):没人回报它扫过了多少格子。
         # 此前这条路上补记完全不发生 → 账本只留预扣的 27 格,而那一轮最多已扫 max_cells 格,
         # 少记最多 316 次试验 → DSR 的 N 偏小 = 悄悄放松已锁定的 DSR ≥ 0.95(ADR 第 9 条)。
         # 现在按**保守值**补记:宁可多记(更严),不可少记。
-        top_up_grid_trials(paths, {"trials": {"grid_cells": conservative_grid_cells(source, cfg["grid"]["max_cells"])}})
+        #
+        # 但"**拒绝**"(退出码 2)不算死掉:子进程是在自己的检查点(路径/审批/参数/导入)
+        # 上拒的,**一个格子都没扫**。那种情况下按网格补记就是凭空多记试验次数
+        # (DSR 被算得更严,严到把正常候选也挡掉)——不补记,但预扣的那 27 格也不退。
+        if exc.code != EXIT_REFUSED:
+            top_up_grid_trials(paths, {"trials": {"grid_cells": conservative_grid_cells(source, cfg["grid"]["max_cells"])}})
         raise
     heatmap, heatmap_note = None, None
     # 格子数补记**不论成败**:失败的一轮同样消耗了试验(ADR 第 9 条)。
@@ -1211,13 +1247,34 @@ _emit_or_fail = _make_emit_or_fail(_EMIT_RESULT)
 _EMIT_OR_FAIL = _emit_or_fail
 
 
-def run_gate_child(args) -> int:
+def _make_child_entry(handler, emit):
+    """把子进程入口包一层:`emit` 进闭包单元 —— 入口内部用的始终是**导入时捕获的那一份**。
+
+    第 32 轮 codex 实测:此前调用点查的是**模块全局** `_EMIT_OR_FAIL`,
+    候选 `api._EMIT_OR_FAIL = 假函数` 之后:
+      - 整段指纹检查**根本不执行**(指纹在 writer 体内,假函数压根不调它);
+      - 父进程照常采信假结果,退出码 0。
+    改成闭包单元之后:候选改模块属性 → 指纹检查照样会跑 → **响亮地失败**(退出码 2),
+    写结果的去向也不受它摆布。
+
+    `handler` 的签名是 `handler(args, emit)`:回传一律走传进来的 `emit`,
+    不再查模块全局。"""
+    def _entry(args):
+        return handler(args, emit)
+    _entry.handler = handler       # 静态核对用:入口真正执行的是哪个处理函数
+    return _entry
+
+
+def _handle_gate_child(args, emit) -> int:
     """子进程:在 15 分钟玉米数据的滚动验证段上做门槛评估。测试段不可达(research_gate 内断言)。"""
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_gate
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入之后才用到的框架函数,先绑成局部名(见 _handle_backtest_child 的说明)
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
@@ -1225,18 +1282,18 @@ def run_gate_child(args) -> int:
         random_runs, prior_trials = child_int_args(args)
         run_variances = child_run_variances(args)
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     if args.on_plateau not in ("0", "1"):
-        say_refusal("--on-plateau 只能是 0 或 1")
+        say("--on-plateau 只能是 0 或 1")
         return EXIT_REFUSED
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        return _EMIT_OR_FAIL({"error": exc.detail})
+        return emit({"error": exc.detail})
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
@@ -1246,32 +1303,35 @@ def run_gate_child(args) -> int:
                           prior_trials=prior_trials, run_variances=run_variances)
     except Exception as exc:
         # 门槛评估跑在滚动**验证窗口**上:这一层的报错原文不外传(阶段=validation)
-        return _EMIT_OR_FAIL({"error": describe_error(exc, PHASE_VALIDATION)})
-    return _EMIT_OR_FAIL(result)
+        return emit({"error": describe(exc, PHASE_VALIDATION)})
+    return emit(result)
 
 
-def run_evaluate_child(args) -> int:
+def _handle_evaluate_child(args, emit) -> int:
     """子进程：加载候选，读取其 param_grid，在选参窗口选参，再在滚动验证窗口做门槛评估。测试段不可达。"""
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_evaluation
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入之后才用到的框架函数,先绑成局部名(见 _handle_backtest_child 的说明)
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
         run_variances = child_run_variances(args)
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        return _EMIT_OR_FAIL({"error": exc.detail})
+        return emit({"error": exc.detail})
     bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
     windows = wf.build_windows()
     cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
@@ -1285,43 +1345,56 @@ def run_evaluate_child(args) -> int:
     except Exception as exc:
         # 评估跑在**验证窗口**上(选参窗口里的错由 research_gate 自己分段并显式给阶段);
         # 这里兜住的是框架侧的意外异常,按验证窗口处理(fail-closed:原文不外传)
-        return _EMIT_OR_FAIL({"error": describe_error(exc, PHASE_VALIDATION)})
-    return _EMIT_OR_FAIL(result)
+        return emit({"error": describe(exc, PHASE_VALIDATION)})
+    return emit(result)
 
 
-def run_child(args) -> int:
+def _handle_backtest_child(args, emit) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入**之后**才用到的框架函数,先绑成局部名:候选改模块属性
+    # (`api.backtest_stats_row = 假函数`)改不到局部名 —— 结果的"生产者"不能由候选摆布。
+    # (第 32 轮 codex 指出:本轮按住的只是"写出去向"与"检查本身",没按住"内容")
+    stats_row = backtest_stats_row
+    round_trip_pnls = rs.round_trip_pnls
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     try:
         start, end = rs.segment_window(args.key, args.segment)
     except rs.SandboxError as exc:
         # 测试段/未知品种在这里被拒:退出码必须是"拒绝"(2),不能是未捕获异常的 1
-        say_refusal(str(exc))
+        say(str(exc))
         return EXIT_REFUSED
     try:
         strategy_class = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        say_refusal(exc.message)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        return _EMIT_OR_FAIL({"error": exc.detail})
+        return emit({"error": exc.detail})
     try:
         stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         # 阶段由**段**决定:训练段就是选参窗口那一层(放开),验证段按验证窗口处理(原文不外传)
         phase = PHASE_SELECTION if args.segment == "train" else PHASE_VALIDATION
-        return _EMIT_OR_FAIL({"error": describe_error(exc, phase)})
-    row = backtest_stats_row(stats)          # 投影规则见 risk/report.py:面板校验用的是同一份
-    pnls = rs.round_trip_pnls(trades, INSTRUMENTS[args.key].size)
-    return _EMIT_OR_FAIL({"stats": row, "pnls": pnls})
+        return emit({"error": describe(exc, phase)})
+    row = stats_row(stats)                  # 投影规则见 risk/report.py:面板校验用的是同一份
+    pnls = round_trip_pnls(trades, INSTRUMENTS[args.key].size)
+    return emit({"stats": row, "pnls": pnls})
+
+
+# 三个子进程入口:回传走**闭包单元**里的那份 emit,候选改模块属性骗不过它(见 _make_child_entry)。
+run_gate_child = _make_child_entry(_handle_gate_child, _EMIT_OR_FAIL)
+run_evaluate_child = _make_child_entry(_handle_evaluate_child, _EMIT_OR_FAIL)
+run_child = _make_child_entry(_handle_backtest_child, _EMIT_OR_FAIL)
 
 
 # ---------- results ----------

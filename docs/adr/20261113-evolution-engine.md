@@ -774,6 +774,15 @@ DSR 的 N 偏小 = **悄悄放松**已锁定的 DSR ≥ 0.95(ADR 第 9 条),而�
 | 有 `param_grid` 但读不出(动态算的) | 用配置上限 `max_cells` |
 | 没有 `param_grid`(只跑单一配置) | `MIN_GRID_CELLS`(预扣的那份已经覆盖,不补记) |
 
+静态读网格时**两种赋值写法都要认**:`param_grid = {...}` 与 `param_grid: dict = {...}`(`ast.AnnAssign`)。
+只认前者的话,带注解的候选会被当成"没有网格"→ 只记预扣的 27 格 → **少记试验次数** → DSR 的 N 偏小
+= 悄悄放松已锁定的 DSR ≥ 0.95(同 M-3 的方向,只是更隐蔽)。
+
+**"死掉"与"拒绝"要分开**:子进程**拒绝**(退出码 2)是在它自己的检查点(路径/审批/参数/导入)上拒的,
+**一个格子都没扫** —— 那种情况下按网格补记就是凭空多记试验次数(DSR 被算得更严,严到把正常候选也挡掉),
+所以拒绝**不补记**;但预扣的那 27 格**不退**(失败不变成免费探索)。
+只有超时/崩溃/被杀这类"中途死掉"才按保守值补记。
+
 父进程**不导入候选代码**(导入本身就是被审的对象),所以只能静态地看;读不出就说读不出,不猜。
 
 #### L-1 —— 该有上界的数字都要有上界
@@ -800,6 +809,42 @@ DSR 的 N 偏小 = **悄悄放松**已锁定的 DSR ≥ 0.95(ADR 第 9 条),而�
 
 ⚠️ **这一层的真实边界**:候选完全可以自己打一行带同样标记的文本 —— 标记挡的是"误顶替"
 (候选随口打印),不是"蓄意伪造"。**同进程内没有哪条通道能证明这句话是框架说的**,真正的边界仍是候选独立进程化。
+
+#### 变异验证(改回旧行为 → 对应用例变红;还原后全绿;共 20 项)
+
+| 变异 | 用例 |
+|---|---|
+| M1 结果通道改回从 stdout 取最后一行 | `test_a_forged_result_line_on_stdout_is_never_taken_as_the_result` |
+| M2 恢复按异常类名推断阶段 | `test_a_candidate_named_grid_error_in_the_validation_window_keeps_the_message_closed` |
+| M3 失败的一轮不再补记格子数 | `test_a_failed_evaluation_still_charges_the_cells_it_scanned` |
+| M4 不再校验结果里的夏普上界 | `test_an_out_of_range_sharpe_in_the_result_is_refused` |
+| M5 合理性上界不查回测形状的 `stats.sharpe` | `test_an_out_of_range_sharpe_in_a_backtest_result_is_refused` |
+| M6 写结果前不再清候选注册的 atexit 钩子 | `test_the_candidate_atexit_hook_cannot_rewrite_the_result_after_it_was_written` |
+| M7 读结果前不再看文件大小 | `test_an_oversized_result_file_is_refused` |
+| M8 回传那一侧改为查模块属性 | `test_a_candidate_that_replaces_the_result_entry_point_cannot_hide_the_result` |
+| M9 写结果那一侧改为查模块属性 | `test_a_candidate_that_bypasses_the_fingerprint_still_cannot_redirect_the_write` |
+| M10 子进程中途死掉不再按保守值补记格子数 | `test_a_child_that_dies_mid_way_still_charges_the_declared_grid` 等 3 条 |
+| M11 父层不再只认带标记的行 | `test_only_the_frameworks_own_lines_are_relayed_back_as_the_reason` 等 2 条 |
+| M12 `selection.best_sharpe` 不再卡上界 | `test_an_out_of_range_sharpe_in_the_selection_summary_is_refused` |
+| M13 `pnls` 不再查有限性/条数 | `test_a_non_finite_or_over_long_pnl_list_is_refused` |
+| M14 子进程**拒绝**(退出码 2)也按网格补记 | `test_a_child_that_refused_before_scanning_is_not_charged_for_cells_it_never_scanned` |
+| M15 带注解的 `param_grid` 不再被静态读出 | `test_an_annotated_grid_is_read_the_same_way_as_a_plain_one` |
+| M16 回传点改回查模块全局 `_EMIT_OR_FAIL` | `test_a_candidate_that_replaces_the_emit_entry_point_cannot_skip_the_fingerprint` |
+| M17 回传理由改回取最后一行带标记的行 | `test_the_frameworks_own_reason_wins_over_a_candidate_line_printed_at_exit` |
+| M18 拒绝原因不再折成一行 | `test_a_multiline_refusal_reason_is_relayed_in_full` |
+| M19 `refuse()` 不再走 `say_refusal` | `test_a_refusal_written_by_the_refuse_helper_is_relayed_too` |
+| M20 静态读网格不再递归取目标名(元组目标) | `test_a_grid_declared_with_a_tuple_target_is_not_treated_as_no_grid` |
+
+(M16 最初只改了入口壳、没改回传点,变异存活 —— 用例没有判别力;改为替换全部回传点后才变红。**用例绿不等于规则有判别力。**)
+
+#### 第 32 轮补记(codex 第 31 轮复核 35/50)
+
+- **Critical:带注解的 `param_grid: dict = {...}` 被读成"没有网格"→ 只记 27 格 → DSR 的 N 偏小**:已修(认 `AnnAssign`,目标名递归取,元组目标 `param_grid, x = ...` 同源);122 条旧用例当时分辨不出有洞无洞,现各配用例与变异。
+- **High-1:调用点查模块全局 `_EMIT_OR_FAIL`,候选改写它则整段指纹检查不执行**:三个子进程入口改由 `_make_child_entry` 生成,`emit` 进闭包单元;处理函数里框架函数(`describe_error`、`say_refusal`、统计投影)先绑成局部名。
+- **High-2(登记,未修)**:候选可改写结果的**生产者**(如 `research_gate.run_evaluation`),框架会用正确 MAC 写出假 body,**连交接单都不用偷**。这是同进程残余,指纹只按住了"写的去向"与"检查本身",**没按住内容**;闭合仍靠候选独立进程化。
+- **Medium**:多行原因折成一行写、`refuse()` 改走 `say_refusal`;父层取**第一行**带标记的行(候选 atexit 钩子排在后面顶不掉)。残余:候选在**框架拒绝之前**就打带标记的行时,同进程内无法区分。
+- **Low-1(未改)**:`selection.best_sharpe` 上界 50 理论上低于选参窗口夏普的数学上限,失败形态是父侧硬失败;实际触发概率低。
+- 另记:"拒绝时一个格子都没扫"的结论已由 codex 复核认可方向;codex 同时指出拒绝路径(无标记)的诊断退化,即本轮 Medium 所修。
 
 #### 本轮**没有**动的
 
