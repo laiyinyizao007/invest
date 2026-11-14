@@ -103,3 +103,17 @@
 4. 视图只覆盖 `entry_signal` 这一个时机。模板自己的代码路径(`on_bar`、`_process_daily_bar` 等)仍直接用真实容器——
    它们是受保护成员,候选改不了;但它们若将来新增"调用候选代码"的入口,必须同样走视图(AST 用例守着 `entry_signal` 的唯一调用点)。
 5. 候选仍可以通过 `entry_signal` 的返回值与自己的实例属性影响行为——那是它的正当用途,不是漏洞。
+
+## 第 2 轮 G8 复核(codex,29/50)与更正
+
+**更正本文先前的结论**:上文"候选拿不到真实容器""攻击面收窄成取闭包"**不成立**。复核实测:候选 `from strategies.trend_atr_strategy import swap_out`(静态层零发现,沙盒导入器放行 `strategies`)后 `swap_out(self)`,`self.am` 就是真 `ArrayManager`;关掉第五层时 ATR 40.0000→2.9036、`skipped_by_budget` 2→0,¥300 单笔预算闸门被架空。开着第五层才被拒——当时兜住它的是第五层,不是这一层。
+
+已修(均有回归用例,`tests/test_view_escape_hatch.py`):
+- **Critical 1**:`swap_in/swap_out/read_only_view/_REAL/_SOURCE` 进 `BUILTIN_PROTECTED_READ_ATTRS`(导入、模块属性、裸名、`something.<name>` 全拦)。
+- **High 1/Medium 3**:`swap_in` 拒绝重入与"陈旧视图"(当前 `am` 不是视图所包的容器),不再把视图写进注册表。
+- **High 2**:`swap_out` 没有换入记录时什么都不做,`finally` 里不再抛 KeyError 顶掉候选自己的异常。
+- **Medium 1**:外流规则补上 lambda 体、条件表达式、`or/and`、`*x`、`await`。
+- **Medium 2**:视图只转发**显式白名单**里的指标方法(`_INDICATORS`),其余公开可调用对象一律不转发;`test_every_indicator_…` 在 vnpy 升级新增方法时变红,提醒人工评审。
+
+**如实记录**:静态层仍是**名字**判定(本文一贯的残余);这一层的价值是"诚实候选拿不到可写容器 + 帧内省被拦",**不是**沙盒。Low 项未做:`_detached` 只拷贝 ndarray/tuple/list;每次访问拷贝整个窗口(热循环可放大成本,研究循环有超时);`_REAL` 强引用在进程被杀时才释放;`NO_ACCESS` 的"拒绝一切访问"不含 `bool()`/`copy`。
+

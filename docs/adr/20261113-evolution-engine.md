@@ -996,7 +996,7 @@ G8 要求双轮都 ≥45 才算发布档;第 12/13/14 轮 codex 为 **38.5 / 38.
 | 受保护的**风控状态对象**(不得引用,连读都不许) | `guard`、`trail`、`cta_engine` | `BUILTIN_PROTECTED_STATE_OBJECTS` |
 | 受保护的**属性路径**(整条路径不得出现在源码里) | `am.array` | `BUILTIN_PROTECTED_PATHS` |
 | 受保护的**模块级成员**(不得引用:改写它们等于改掉风控计算本身) | `within_budget`、`stop_distance`、`risk_per_trade`、`ceil_to`、`floor_to`、`DailyLossGuard`、`TrailingStop`、`can_open`、`on_trade_closed`、`reset`、`trading_day` | `BUILTIN_PROTECTED_MODULE_ATTRS` |
-| 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day` | `BUILTIN_PROTECTED_READ_ATTRS` |
+| 受保护的**风控对象**(不得**读**:拿到定义就多一条改写它的路) | `within_budget`、`stop_distance`、`risk_per_trade`、`DailyLossGuard`、`TrailingStop`、`trading_day`、`swap_in`、`swap_out`、`read_only_view`、`_REAL`、`_SOURCE`(只读视图的真容器发放口,见只读行情视图 ADR 的「第 2 轮 G8 复核」) | `BUILTIN_PROTECTED_READ_ATTRS` |
 | 受保护的**容器**(不得取别名另存) | `am` | `BUILTIN_PROTECTED_CONTAINERS` |
 | 受保护容器的**范围**(这些名字上的容器受保护) | `am`、`bg` | `BUILTIN_PROTECTED_CONTAINER_SCOPE` |
 | 受保护容器上的**变更型方法**(不得调用:改行情 = 伪造收益) | `update_bar`、`update_tick`、`append`、`extend`、`insert`、`remove`、`pop`、`popitem`、`clear`、`update`、`setdefault`、`sort`、`reverse`、`discard`、`fill`、`itemset`、`put`、`resize`、`copyto`、`setfield`、`setflags`、`byteswap`、`__setitem__`、`__delitem__`、`__iadd__`、`__imul__`、`__ior__` | `BUILTIN_PROTECTED_CONTAINER_MUTATORS` |

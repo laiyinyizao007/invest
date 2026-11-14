@@ -229,6 +229,9 @@ BUILTIN_MODULE_ATTR_OWNERS = {
 BUILTIN_PROTECTED_READ_ATTRS = (
     "within_budget", "stop_distance", "risk_per_trade",
     "DailyLossGuard", "TrailingStop", "trading_day",
+    # 只读行情视图的"真容器发放口"(第 2 轮 G8 复核的 Critical 1:候选 `from strategies.trend_atr_strategy import swap_out`
+    # 静态层零发现、运行期拿到真 ArrayManager,把 ATR 40.0 压成 2.9,单笔预算闸门被架空)
+    "swap_in", "swap_out", "read_only_view", "_REAL", "_SOURCE",
 )
 
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
@@ -741,6 +744,16 @@ def _container_escape_findings(tree: ast.AST) -> list[tuple[int, str]]:
         elif isinstance(node, ast.DictComp):
             escape(node.key, "装进容器")
             escape(node.value, "装进容器")
+        elif isinstance(node, ast.Lambda):
+            escape(node.body, "从 lambda 里取出来")
+        elif isinstance(node, ast.IfExp):
+            escape(node.body, "取出来另存")
+            escape(node.orelse, "取出来另存")
+        elif isinstance(node, ast.BoolOp):
+            for value in node.values:
+                escape(value, "取出来另存")
+        elif isinstance(node, (ast.Starred, ast.Await)):
+            escape(node.value, "取出来另存")
         elif isinstance(node, ast.arguments):
             for default in list(node.defaults) + [d for d in node.kw_defaults if d is not None]:
                 escape(default, "作为默认参数传出去")

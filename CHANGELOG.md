@@ -5,6 +5,9 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+
+### Fixed（第 2 轮 G8 复核后,只读行情视图 / Issue #23)
+- **Critical**:候选可经 `strategies.trend_atr_strategy` 导入 `swap_out/swap_in` 拿到真容器(静态层零发现,关第五层时 ATR 40.0→2.9、预算闸门被架空)。这些名字进 `BUILTIN_PROTECTED_READ_ATTRS`;`swap_in` 拒重入/陈旧视图,`swap_out` 无记录时不抛;外流规则补 lambda/条件表达式/`or`/`*x`/`await`;视图只转发显式白名单指标。ADR 先前"拿不到真实容器"的结论已更正。
 ### Added（新增）
 - **宪法加固:候选在 `entry_signal` 里只拿行情容器的只读副本视图(收能力)**(Issue [#23](https://github.com/laiyinyizao007/invest/issues/23),ADR `20261113-read-only-market-view`;**这是对模板与既有宪法决策的修订**,用户以 `/goal 剩下这些都要做完` 授权):
 G8 第 12/13/14 轮 codex 为 38.5 / 38.0 / 38.5,逐条堵"改写行情容器"的**写法**没有收敛(视图、dunder、别名、`[:, None]`、改 `count`/`size`、预热期塞假 K 线、跨 K 线改后还原……),因为这些攻击共同的前提是候选手里拿着**真实容器**。现在模板在调用 `entry_signal()` 的那一刻(`_call_entry_signal`,候选碰得到容器的唯一时机)把 `self.am` 换成只读视图、`self.bg` 换成禁止访问的哨兵,调用结束(含异常)立刻还原。视图没有 `update_bar` 等变更入口、所有数组与指标结果都是**拷贝**、视图本身不可变、真实容器只在方法闭包里。
