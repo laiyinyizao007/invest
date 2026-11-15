@@ -1445,6 +1445,7 @@ def _allow_test_only_imports(monkeypatch, *modules):
     monkeypatch.setattr(api.rc, "load", load)
 
 
+@requires_trading_stack
 def test_a_candidate_cannot_change_the_validation_windows_by_rebinding_the_builder(tree, monkeypatch):
     """候选在导入期改写 `wf.build_windows`,想让"样本外"变成选参窗口(样本内)→ 框架用的仍是导入前取定的窗口。
 
@@ -1503,6 +1504,7 @@ def test_candidate_cannot_import_walk_forward_directly(tree, monkeypatch):
     assert "walk_forward_optimizer" in str(exc.value)
 
 
+@requires_trading_stack
 def test_windows_where_validation_is_not_after_selection_are_refused(tree, monkeypatch, capsys):
     """窗口不变量自己复查(不信任 `wf.Window.__post_init__`):验证窗口必须晚于选参窗口的结束。"""
     path = tree / "pending_strategies" / "s.py"
@@ -1519,6 +1521,7 @@ def test_windows_where_validation_is_not_after_selection_are_refused(tree, monke
     assert "验证窗口晚于选参窗口" in capsys.readouterr().err
 
 
+@requires_trading_stack
 def test_a_candidate_cannot_raise_the_grid_cap_by_mutating_the_config_after_the_import(tree, monkeypatch):
     """上限在候选导入前取成局部整数:导入期改写配置字典(哪怕经帧反射拿到它)也改不动评估用的上限。
 
