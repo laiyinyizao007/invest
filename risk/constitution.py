@@ -229,6 +229,19 @@ BUILTIN_PROTECTED_READ_ATTRS = (
     "DailyLossGuard", "TrailingStop", "trading_day",
 )
 
+# **闸门函数**:它们是「拒绝」这件事的执行者。
+# 改写它们 = 把筛查/比对换成一个听话的版本,于是「静态筛查: 通过」「没有改写受保护对象」
+# 这两个**给人看的信号**都能变成谎言(第 3 轮 codex 实测:候选把 `check_protected_state`
+# 换成「调用时把原函数装回去并返回 []」的假函数,指纹结论恒为空,事后身份核对也看不出)。
+# 所以这类名字:**写**它要拒,`setattr(obj, "名字", ...)` 这种按字符串写的也要拒。
+BUILTIN_PROTECTED_GATE_ATTRS = (
+    "check_protected_state", "snapshot_protected_state",
+    "screen_source", "check_class", "check_params", "load_template",
+    "safe_builtins", "record_approval",
+    "is_approved", "is_approved_sha", "file_sha256", "load_approvals",
+    "BUILTIN_ALLOWED_TEMPLATES", "BUILTIN_PROTECTED_NAMES", "BUILTIN_PROTECTED_PARAMETERS",
+)
+
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
 BUILTIN_ALLOWED_OVERRIDES = (
     "entry_signal", "param_grid", "parameters", "fast_window", "slow_window", "atr_mult", "take_profit_r",
@@ -571,6 +584,28 @@ def _self_instance_attr(node: ast.AST) -> bool:
     return bool(path) and len(path) == 2 and path[0] == "self"
 
 
+def _setattr_protected_name(node: ast.Call, c: Constitution) -> str | None:
+    """`setattr(obj, "名字", 值)` 里的「名字」是不是受保护成员。
+
+    名字是**字符串**,按属性名查黑名单看不见它——第 3 轮 codex 实测:
+    候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)` 把 300 元
+    单笔预算换成一个恒 0 的函数,静态层对那条载荷返回 []。
+    """
+    if not (isinstance(node.func, ast.Name) and node.func.id == "setattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    name_node = node.args[1]
+    if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+        return None
+    name = name_node.value
+    if name in BUILTIN_PROTECTED_GATE_ATTRS:
+        return name
+    if name in c.protected_module_attrs and _module_attr_owner_ok(name, []):
+        return name
+    return None
+
+
 def _write_violation(target: ast.AST, c: Constitution) -> str | None:
     """写入受保护成员(或受保护对象的内部状态)时返回路径说明,否则 None。
 
@@ -891,6 +926,10 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     violation = _write_violation(target, c)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+                    elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(
+                            f"第 {node.lineno} 行: 改写了闸门函数 {target.attr}"
+                            "(把「拒绝」这件事的执行者换掉)")
                     elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
                             target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
@@ -912,6 +951,14 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
         elif isinstance(node, ast.Call):
+            # `setattr(对象, "名字", 值)`:名字是**字符串**,按属性名查黑名单看不见它。
+            # 第 3 轮 codex 实测:候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)`
+            # 把 300 元预算换掉,静态层对这条载荷返回 []。
+            setattr_name = _setattr_protected_name(node, c)
+            if setattr_name:
+                findings.append(
+                    f"第 {node.lineno} 行: 按名改写了受保护成员 {setattr_name}"
+                    "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
             # 对受保护容器调用**变更型方法**:`self.am.update_bar(fake_bar)` 会往回测里
             # 插一根假 K 线,而它既不是属性赋值也不是取别名(第 11 轮 codex 的 High 1)。
             violation = _container_mutator_call(node, c)

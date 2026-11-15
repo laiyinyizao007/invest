@@ -54,6 +54,10 @@ BUILTIN_SETS = (
     "BUILTIN_PROTECTED_STATE_OBJECTS",
     "BUILTIN_PROTECTED_PATHS",
     "BUILTIN_PROTECTED_CONTAINERS",
+    # 闸门函数名:改写它们 = 把「拒绝」这件事的执行者换掉(第 3 轮 codex 实测:
+    # 候选把 `check_protected_state` 换成「调用时把原函数装回去」的假函数,
+    # 指纹结论恒为空、事后身份核对也看不出来)。
+    "BUILTIN_PROTECTED_GATE_ATTRS",
     # 容器上的变更型方法:第 11 轮 codex 的 High 1(`self.am.update_bar(fake_bar)`
     # 注入假 K 线,四层防线全绿)——这份名单是"容器只挡写、不挡调用"的补丁。
     "BUILTIN_PROTECTED_CONTAINER_SCOPE",

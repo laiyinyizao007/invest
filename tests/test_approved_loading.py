@@ -512,3 +512,106 @@ sys.exit(1)
                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
     assert proc.returncode == 0, proc.returncode
+
+
+def _probe_load(approved_dir, ledger, source: str, extra: str = "") -> str:
+    """在**子进程**里跑一次装载,返回它的 stdout。
+
+    子进程是必须的:候选载荷会把闸门换掉,而那**留在进程里**(拒绝发生在比对之后)。
+    """
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+%s
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+except BaseException as exc:
+    print('CRASH:' + repr(exc))
+    sys.exit(2)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger), extra)
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    return proc.stdout
+
+
+def test_the_restore_style_bypass_is_refused(approved):
+    """「换属性 → 调用 → 复原」式绕过必须被拒(第 3 轮 codex 实测的 N1)。
+
+    候选把 `check_protected_state` 换成**调用时把原函数装回去**并返回 `[]` 的假函数:
+    指纹结论恒为空,而事后身份核对看到的是「真函数」——两条检查同时被骗过。
+    装载器现在用的是**exec 之前绑好的局部引用**,候选换不掉它。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_orig = _c.check_protected_state\n"
+        "def _fake(before, after):\n"
+        "    _c.check_protected_state = _orig\n"
+        "    return []\n"
+        "_c.check_protected_state = _fake\n"
+        "import sys\n"
+        "setattr(sys.modules['risk.risk_guard'], 'within_budget', lambda *a, **k: 0.0)\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    out = _probe_load(approved_dir, ledger, "")
+    assert "REFUSED" in out, out
+    assert "NOT_REFUSED" not in out
+
+
+def test_a_deleted_or_emptied_gate_does_not_crash_the_loader(approved):
+    """闸门被 `del` 或被置 None 时,装载器必须**干净拒绝**,不是裸异常。
+
+    裸 AttributeError/TypeError 会逃出装载器:调用方只认 `ApprovedLoadError`,
+    于是「拒绝」被降级成「崩溃」(第 3 轮 codex 实测的 N2)。
+    """
+    approved_dir, ledger = approved
+    for payload in ("import risk.constitution as _c\ndel _c.check_protected_state\n",
+                    "import risk.constitution as _c\n_c.check_protected_state = None\n"):
+        _install(approved_dir, ledger, source=(
+            payload
+            + "\nfrom strategies.trend_atr_strategy import TrendAtrStrategy\n"
+              "\nclass Candidate(TrendAtrStrategy):\n    pass\n"))
+        out = _probe_load(approved_dir, ledger, "")
+        assert "CRASH" not in out, out
+        assert "REFUSED" in out, out
+
+
+def test_a_replaced_constitution_loader_is_refused(approved):
+    """`const.load` 被换掉 → 必须拒绝(换掉它 = 下一份候选的静态筛查被清空)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.load = lambda *a, **k: None\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    out = _probe_load(approved_dir, ledger, "")
+    assert "REFUSED" in out, out
+    assert "NOT_REFUSED" not in out
+
+
+def test_two_clean_loads_are_allowed(approved):
+    """没有投毒时,多次装载仍然允许(被投毒才禁)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    out = _probe_load(approved_dir, ledger, "")
+    # 注意 "NOT_REFUSED" 里也含 "REFUSED",所以要断言的是「没被拒」的那一边
+    assert "NOT_REFUSED" in out, out
