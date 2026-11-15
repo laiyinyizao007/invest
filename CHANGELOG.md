@@ -6,6 +6,44 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
+  ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
+  却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
+  双轮 codex、文档原子提交),而它的产物**可以重跑、失败只影响结论、不动钱**。
+  本次新增仓库根 `CLAUDE.md`,按**后果域**分档,而不是按改动规模分档:
+  - **研究域**(只影响研究产物):跳过 P2 plan.md 与 plan-down、结构化确认块、6/6 清单、
+    Issue + worktree;G8 只省第二轮(第一轮照做);G1 降级为 CHANGELOG 记一笔;
+    G9 沿用最低 70%;G14 只登记越出研究域的部分。**ADR 记录与相关既有测试照做。**
+  - **执行域**(可能影响真实委托/持仓/资金、风控底线、实盘准入批准链、凭据或部署):
+    全局全套流程照旧,本文件不提供任何减法。
+  - 两档都**不适用**的规则(不论档位照做):G3 意图边界、G5 安全合规、G7 脱敏、G4 一致性、
+    G8「两轮都做」、G12 学习闭环、**代码内的全部实盘防线**(不改任何阈值)、CI 闸门。
+  - **判据由代码执行**(`tools/check_domain.py`,仅标准库):按路径清单把每个文件判成
+    研究域 / 不可降级 / 执行域,退出码 `0` 全研究域 / `1` 含执行域 / `2` 环境不可用
+    (fail-closed:判不了等于不放行)。**默认拒绝**:不在白名单里的一律执行域。
+  - **清单是实测出来的,不是拍脑袋写的**:`tools/verdict_graph.py` 用**函数级** AST 分析
+    算出每个文件「自己定义或直接调用了哪些判定点」(`check_gate` / `check_live_admission` /
+    `write_approval` / `record_approval` / `screen_source` / `check_instance_state` /
+    `check_class`)。实测推翻了直觉:名字带 research 的 `scripts/research_sandbox.py` 是
+    **批准账本的唯一写入者**;`risk/candidate_eval.py` **直接调 `check_gate`**;
+    `scripts/backtest_lib.py` 回测跑完**核对风控底线**;`scripts/research_api.py` /
+    `research_approval_server.py` / `research_gateway.py` 是批准与筛查链的入口。
+    另有**数据流**上的耦合 AST 看不见(`risk/dsr.py` / `risk/plateau.py` /
+    `risk/trial_ledger.py` 是门槛第 9/8 条的输入),靠人工清单兜住——**图找得到的归图,
+    图找不到的归清单**。
+  - **清单有动态探针盯着**(`tests/test_check_domain.py`,82 条):全仓不变量
+    (任何拥有判定点的文件必须判为不可降级,**含尚未入库的新文件**)、研究白名单不得拥有
+    判定点、生产 import 闭包不得与白名单相交、以及**探针自身的准确性夹具**
+    (既不漏报也不误报——误伤的探针等于没有探针)。
+  - **探针经变异验证**:删 `trading/` 条目、把 `risk/live_admission.py` 挪进白名单、
+    把整个 `scripts/` 放进白名单、把 `risk/candidate_eval.py` 挪进白名单、
+    把 `research_sandbox.py` / `backtest_lib.py` 移出不可降级、
+    新建一个直接调 `check_gate` 的文件——**七种变异全部被抓住**。
+  - CI:`research-guard.yml` 的 ruff 清单与测试清单已纳入这三个新文件
+    (否则新代码没有闸门覆盖——「写下了但没人跑」等于没有防线)。
+  - **本决策不削弱任何一道代码内的防线,也不改它们的阈值**;它只减少改动的**审批成本**,
+    不减少缺陷的**检出能力**。
+
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:
