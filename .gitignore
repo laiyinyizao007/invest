@@ -36,7 +36,8 @@ tools/bisheng/v3_ids.json
 # 容器运行时挂载目录(策略状态、日志、风控状态文件、心跳),不入库
 runtime/
 
-.env.*.bak
+.env.*
+!.env.example
 
 # 含设备序列号/MAC/测试环境 IP 的本机产物与券商原始文件,不入库
 terminal-info.txt

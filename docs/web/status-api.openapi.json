@@ -1321,16 +1321,6 @@
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
             }
-          },
-          {
-            "name": "parent",
-            "in": "query",
-            "required": true,
-            "description": "父代候选的哈希(与父代比对)",
-            "schema": {
-              "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
-            }
           }
         ]
       }
@@ -3250,61 +3240,17 @@
       },
       "EvolutionList": {
         "type": "object",
-        "description": "进化战役列表(**裸数据**,与 curve/log/heatmap 同族端点一致)。state/level/message 放在数据里,不套 Section 外壳。",
+        "description": "战役(一代代变异与评估的过程)列表。campaign_id 就是台账文件名。",
         "properties": {
           "campaigns": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EvolutionCampaign"
             }
-          },
-          "total": {
-            "type": "integer",
-            "description": "战役总数"
-          },
-          "checked": {
-            "type": "integer",
-            "description": "本次实际统计的战役数"
-          },
-          "unscanned": {
-            "type": "integer",
-            "description": "未检查的战役数(>0 时区块级别为 warn)"
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "ok",
-              "missing",
-              "unknown"
-            ],
-            "description": "区块状态:没有战役是 missing;有战役没被统计或台账损坏是 unknown"
-          },
-          "level": {
-            "type": "string",
-            "enum": [
-              "ok",
-              "warn",
-              "critical",
-              "unknown"
-            ],
-            "description": "严重程度(徽标用)"
-          },
-          "message": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "说明,例如『还有 N 个战役未检查』"
           }
         },
         "required": [
-          "campaigns",
-          "checked",
-          "level",
-          "message",
-          "state",
-          "total",
-          "unscanned"
+          "campaigns"
         ],
         "additionalProperties": true
       },
@@ -3446,8 +3392,7 @@
             "type": [
               "number",
               "null"
-            ],
-            "description": "该代最好的一条的收益"
+            ]
           },
           "worst_max_drawdown": {
             "type": [
@@ -3461,20 +3406,6 @@
               "type": "string"
             },
             "description": "该代出现的质量多样性格子"
-          },
-          "mean_total_return": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "description": "该代所有候选的平均收益(画收益曲线用这个;只用最好的一条会高估种群)"
-          },
-          "mean_max_drawdown": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "description": "该代所有候选的平均最大回撤"
           }
         },
         "required": [

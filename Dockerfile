@@ -31,6 +31,8 @@ COPY trading ./trading
 COPY notify ./notify
 COPY scripts ./scripts
 COPY config ./config
+COPY ctp_tools ./ctp_tools
+COPY evidence ./evidence
 
 # 非 root 运行;状态目录通过卷挂载持久化(见 docker-compose.yml)
 RUN useradd --create-home --uid 1000 trader \

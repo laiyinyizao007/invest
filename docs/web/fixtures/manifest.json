@@ -376,5 +376,19 @@
     "path": "/api/research/runs/{run_id}",
     "status": 200,
     "note": "一次回测的运行详情:回测的数字在 stats 里(不是 metrics)"
+  },
+  {
+    "fixture": "control-pause-request",
+    "method": "POST",
+    "path": "/api/control/pause",
+    "status": 200,
+    "note": "阶段③ 暂停开仓的请求体(两步确认:确认词 + 原因)"
+  },
+  {
+    "fixture": "control-resume-request",
+    "method": "POST",
+    "path": "/api/control/resume",
+    "status": 200,
+    "note": "阶段③ 恢复开仓的请求体"
   }
 ]

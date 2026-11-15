@@ -55,6 +55,45 @@
         "heartbeat": null,
         "trusted": false,
         "tail_uncertain": false
+      },
+      {
+        "day": "2026-11-10",
+        "started": 0,
+        "trades": 0,
+        "clean": false,
+        "has_severe": false,
+        "events": [],
+        "first_ts": null,
+        "last_ts": null,
+        "heartbeat": null,
+        "trusted": false,
+        "tail_uncertain": false
+      },
+      {
+        "day": "2026-11-10",
+        "started": 0,
+        "trades": 0,
+        "clean": false,
+        "has_severe": false,
+        "events": [],
+        "first_ts": null,
+        "last_ts": null,
+        "heartbeat": null,
+        "trusted": false,
+        "tail_uncertain": false
+      },
+      {
+        "day": "2026-11-10",
+        "started": 0,
+        "trades": 0,
+        "clean": false,
+        "has_severe": false,
+        "events": [],
+        "first_ts": null,
+        "last_ts": null,
+        "heartbeat": null,
+        "trusted": false,
+        "tail_uncertain": false
       }
     ],
     "checklist": [
