@@ -400,6 +400,14 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as exc:
             print(f"环境不可用(fail-closed): {exc}", file=sys.stderr)
             return 2
+        if not paths:
+            # **本次没有改动** ≠ 环境不可用。
+            # 这两者共用退出码 2 会让 CI 的 fail-closed 判定误伤:push 到 main 时
+            # base==HEAD、diff 为空、工作树干净,就是这一支——
+            # 那时若也返回 2,CI 会永久变红(codex 第 2 轮的 Critical-1)。
+            # 「没有改动」不是失败:返回 0,并说明白。
+            print(f"相对 {args.diff!r} 没有改动(也没有未跟踪文件):无待判定的文件。")
+            return 0
     else:
         paths = list(args.paths)
 

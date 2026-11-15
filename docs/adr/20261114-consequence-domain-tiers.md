@@ -160,7 +160,7 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
   判据是**直接归属**(自己定义或直接调用),不是传递可达——
   传递可达会把助手的判定算到调用者头上(误伤),而**误伤的探针等于没有探针**。
   另有一支**数据流**分析(见下「已知局限」第 2 条)。
-- `tests/test_check_domain.py`:**90 条**,含双向探针(放行 + 拦截)、
+- `tests/test_check_domain.py`:**94 条**,含双向探针(放行 + 拦截)、
   全仓不变量(调用关系 + 数据流两支)、探针自身的准确性夹具。
 - `CLAUDE.md`:本仓库的分档规则与两档流程对照表。
 - CI:`research-guard.yml` 的 ruff 清单与测试清单**已**纳入这三个新文件;
@@ -170,21 +170,31 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
 
 ### 探针的变异验证
 
-探针本身会被证伪,否则它只是一段好看的断言。已做的变异(每次都被抓住,
-条数由 `pytest` 的 FAILED 行数实测,不是估的):
+探针本身会被证伪,否则它只是一段好看的断言。**变异验证已变成可复算的脚本**
+`tools/check_mutations.py`:它把仓库复制到临时目录(在副本上做变异,真工作树全程不动),
+逐个施加变异并数 `pytest` 的 FAILED 行数。**条数是实测的,不靠人记**——
+第 1 轮 codex 复核就发现本表有三行数字对不上(测试从 82 条长到 90 条,红的用例集自然变了)。
+
+```bash
+python tools/check_mutations.py            # 跑全部变异
+python tools/check_mutations.py --verify   # 额外核对本表数字与实测是否一致
+```
 
 | 变异 | 变红的测试条数 |
 |---|---|
-| 删掉 `trading/` 的不可降级条目 | 1 |
-| 把 `risk/live_admission.py` 挪进研究白名单 | 5 |
-| 把 `risk/candidate_eval.py` 挪进研究白名单 | 3 |
+| 删掉 `trading/` 的不可降级条目 | 2 |
+| 把 `risk/live_admission.py` 移出不可降级 | 6 |
+| 把 `risk/candidate_eval.py` 移出不可降级 | 3 |
 | 把 `scripts/research_sandbox.py` 移出不可降级 | 4 |
-| 把 `scripts/backtest_lib.py` 移出不可降级 | 3 |
+| 把 `scripts/backtest_lib.py` 移出不可降级 | 4 |
 | 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | 2 |
+| 把 `scripts/research_grid.py` 移出不可降级 | 3 |
+| 把 `scripts/research_api.py` 移出不可降级 | 4 |
+| 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | 6 |
 | 把整个 `scripts/` 放进研究白名单 | 6 |
-| 把 `walk_forward_optimizer.py` 挪进研究白名单(H1 类:数据流) | 2 |
-| 把 `optimize.py` 挪进研究白名单 | 6 |
 | 新建一个直接调 `check_gate` 的文件(不入库) | 1(`test_every_sink_owning_file_is_never_downgrade`) |
+
+(数字由脚本实测。`--verify` 会核对本表与实测是否一致。)
 
 最后一条尤其重要:它证明这条不变量对**尚未入库的新文件**也生效
 (扫描含 `git status --porcelain -uall` 的未跟踪文件,而不只是 `git ls-files`)。
@@ -212,17 +222,45 @@ H1 暴露的是**一整类**耦合:模块**不调用**判定点,但它的**值**
 只认调用关系永远抓不到这一类。
 
 于是新增 `verdict_graph.all_gate_input_providers`:在**拥有判定点**的文件里,
-找出「从 import 进来的模块上读取的属性」(如 `wf.DATA_FILE`),被读到的那些模块
+找出「从 import 进来的模块上读取的东西」(如 `wf.DATA_FILE`),被读到的那些模块
 就是判定输入的提供者,必须与判定点同级受保护。
 
-实测结果(生产文件,10 个):`walk_forward_optimizer.py`、`research_api.py`、
-`research_sandbox.py`、`research_config.py`、`research_console.py`、
-`research_gateway.py`、`segment_windows.py`、`segment_ledger.py`、
-`constitution.py`、`bootstrap.py`、`dashboard/safe.py`。
 新增不变量 `test_every_gate_input_provider_is_never_downgrade` 自动覆盖这一类——
 **不再依赖人手写一条断言去钉某个文件**。
 
-**这一支仍然有边界**:它只看「拥有判定点的文件」读到的属性。
-若某个值经**第三个**模块中转才流进判定点(而不是被拥有判定点的文件直接读到),
-这一支看不见。实测 `research_api.py` 是直接读 `wf.DATA_FILE` 的,所以抓到了。
+**这一支仍然有边界**:它只看「拥有判定点的文件」直接读到的值。
+若某个值经**第三个**模块中转才流进判定点,这一支看不见。
+实测 `research_api.py` 是直接读 `wf.DATA_FILE` 的,所以抓到了。
+
+## 第 2 轮 codex 复核的发现与处置
+
+第 1 轮的 12 条发现经独立复现**全部真修**(逐条复验证据见第 1 轮报告)。
+第 2 轮复核(2026-11-14,同样逐条独立复现)在此基础上发现:
+**1 条 Critical(修复引入的)、3 条 Medium、5 条 Low**。
+
+| 编号 | 问题 | 处置 |
+|---|---|---|
+| **C-1** | **新加的 CI 冒烟关卡在两条触发路径上都会让 CI 永久变红**:`pull_request` 事件下浅克隆没有 `origin/main` → `git diff` rc=128 → 分档器 exit 2 → 关卡红;push 到 main 时 base==HEAD、diff 为空 → 分档器 exit 2 → 关卡红。根因:「没有改动」与「环境不可用」共用退出码 2 | ①checkout 加 `fetch-depth: 0`(与 constitution-guard.yml 同口径);②`--diff` 成功但**改动集为空** → 打印说明并 **exit 0**;只有 git 读取失败才 exit 2。**已用真实 CLI 在模拟检出里复现并复验两条路径** |
+| **M-1** | 新数据流探针对 `from X import DATA_FILE` 这种**函数式 import** 漏报(只认模块别名 + 属性)——同一份代码换个 import 写法就绕过整条探针 | 已修(裸名字读取也记来源模块);补了三种 import 写法的夹具 |
+| **M-2** | 数据流探针**过度包含**:「读了任意属性」太宽,`research_console.reconfigure_stdio`(控制台编码 helper)也被算成门槛输入。若拥有判定点的文件读了某个**研究文件**的属性,那个研究文件会被强制升级为不可降级 → **研究档被侵蚀** | 已收窄:排除**语句位置的纯副作用调用**(结果没人用)。实测 provider 集合从 25 降到 24,且 `research_console.py` 已不在其中;`walk_forward_optimizer.py` 仍在 |
+| **M-3** | ADR 变异表里 3 行数字不可复现、1 行**变异描述写反了**(「把 optimize.py 挪进白名单」——它本来就在白名单里) | 变异验证改为**可复算的脚本** `tools/check_mutations.py`:复制仓库到临时目录、逐个施加变异、数 FAILED 行数;ADR 表格按脚本实测重写,`--verify` 可核对 |
+| **L-1** | CLI 改吐 UTF-8 后,`test_cli_exit_codes` 按 locale(cp1252)解码 → 解码失败 → stdout 变 None → 那个用例**空跑通过**(只看退出码),还抛线程警告 | 已加 `encoding="utf-8", errors="replace"`,并断言 stdout 里确实有「研究域」「不可降级」 |
+| **L-2** | 「文档条数必须是真的」那条断言按行 + 不区分数字,同一行第二个「N 条」会误报;且只查含文件名的行 | 已收紧为**只取该行的第一个数字**,并对「文档里提到本文件但没写条数」也报错 |
+| **L-3** | ADR 的 provider 清单写「10 个」却列了 11 个名字,且含并不在集合内的 `research_gateway.py` | 已按实测重写 |
+| **L-4** | 目录前缀的「拼写近似」检查对 8 个前缀里 6 个**不可达**(拿整段路径比单段目录名) | 已换成**穷尽**判据:每个前缀必须**要么是真实存在的目录、要么是 gitignore 的运行时目录**;两者都不是 → 写错了。**踩过的坑**:`git check-ignore` 对**不存在**的路径会给假匹配(退出码 0),必须探目录**里面的一个文件**才有意义 |
+| **L-5** | `tools/bisheng/run_v*.py` 经 subprocess 调 `research_api approve`,`run_v3.py` 硬编码另一仓库的绝对路径 | **未处置**:与本 Issue 无关(既有问题),但「`tools/bisheng/` 判研究域」与「批准链属执行域」的口径张力需交代 → 见下「已知局限」第 7 条 |
+
+### 第 2 轮之后的口径交代:批准链与研究域的张力
+
+`tools/bisheng/` 判研究域,但它的 `run_v1/v2/v3.py` 会用 subprocess 调
+`research_api.py approve`。**当前挡得住**:`approve` 在非 TTY 下拒绝
+(`research_api.py:569-571`),且要求人粘贴**完整 64 位 sha256**(`:579`)——
+自动化调用拿不到批准权(这正是带外批准设计的用意)。
+
+但这条张力是真实存在的:一个「只产出结论」的目录里,藏着一个通往批准链的调用。
+**处置**:不把 `tools/bisheng/` 整片挪进执行域(那会让研究档失去意义——
+毕昇编排脚本本身确实只产出工作流定义),而是在 `CLAUDE.md` §4 规则 8 里
+明确写出「**削弱研究脚本里的防线调用一律升档**」这条内容判据,
+把「研究域文件调用批准链」这件事纳入人工判断。
+`run_v3.py` 的硬编码绝对路径是既有问题,不在本 Issue 范围,已如实登记。
 

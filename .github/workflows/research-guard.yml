@@ -31,6 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 —— **必须**:默认的浅克隆(fetch-depth: 1)在 `pull_request`
+          # 事件下只检出 `refs/pull/N/merge`,**没有 origin/main 这个引用**,
+          # 后面那步「按后果域分档」跑 `git diff origin/main...HEAD` 会 rc=128 →
+          # 分档器 fail-closed 退出 2 → **CI 永久变红**(codex 第 2 轮的 Critical-1)。
+          # 完整历史也让那一步能真的比对出改动。
+          # 与 constitution-guard.yml 同一条口径(它也需要完整历史)。
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -81,6 +89,7 @@ jobs:
             tools/check_constitution_history.py \
             tools/check_domain.py \
             tools/verdict_graph.py \
+            tools/check_mutations.py \
             dashboard/__init__.py \
             dashboard/safe.py \
             notify \
@@ -142,7 +151,7 @@ jobs:
             tests/test_research_gate.py \
             tests/test_research_grid.py
 
-      # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮复核的 M4)。
+      # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #
       # 为什么要有这一步:上面那一步只是**测**分档器(单元测试 + 探针),
       # 但分档器作为 CLI 的那条路径——`--diff` 读 git、打印中文档位、
@@ -150,15 +159,40 @@ jobs:
       # 正是这条路径(codex 的 M5:它在 Windows cp1252 控制台上直接崩,
       # 退出码变成 1,与「判为执行域」无法区分)。
       #
-      # 这一步跑的是**真实 CLI**:非 UTF-8 控制台下不得崩溃、退出码语义
-      # (0 研究域 / 1 执行域 / 2 环境不可用)必须对得上。
+      # 这一步跑的是**真实 CLI**:非 UTF-8 控制台下不得崩溃、退出码语义必须对得上。
+      #
+      # **退出码语义**(三条,互不重叠):
+      #   0 = 全部研究域,**或**本次没有改动;
+      #   1 = 含执行域文件(该走完整流程);
+      #   2 = 环境不可用(fail-closed)——**只有这一种**该让关卡失败。
+      # 第 2 轮复核指出:若把「没有改动」也算 2,push 到 main 时(base==HEAD、
+      # 工作树干净)就会**永久变红**。已把「没有改动」分出来,返回 0。
       - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码)
         run: |
+          set -e
           # PYTHONIOENCODING=cp1252 复现 Windows 默认控制台:崩了就红。
           PYTHONIOENCODING=cp1252 python tools/check_domain.py scripts/optimize.py
-          # 全仓库扫一遍:必须能跑完,且退出码非 2(2 = 环境不可用 = fail-closed)。
-          python tools/check_domain.py --diff origin/main || rc=$?
-          if [ "${rc:-0}" = "2" ]; then
+          # 按本次 PR 的改动分档。0 与 1 都是**正常**结果(1 = 含执行域文件,
+          # 该走完整流程——这里只要求命令能跑通,不做流程判定)。
+          # 2 = 环境不可用(fail-closed),那才是失败。
+          rc=0
+          python tools/check_domain.py --diff "origin/${{ github.base_ref || 'main' }}" || rc=$?
+          if [ "$rc" = "2" ]; then
             echo "分档器返回 2(环境不可用)——按 fail-closed 处理,本关卡失败"; exit 1
           fi
+          echo "分档器退出码=$rc(0/1 均正常;2 才是环境不可用)"
           exit 0
+
+      # 变异验证(codex 第 2 轮的 M3):分档清单的每次改动都必须被测试抓住。
+      #
+      # 为什么要有这一步:ADR 里那张「N 种变异全部被抓住,条数实测」的表,
+      # 第 1 轮复核就发现**三行数字对不上**(测试从 82 条长到 90 条,
+      # 红的用例集自然变了),而且有一行**变异描述写反了**。
+      # 靠人记的数字会过期 —— 这条关卡把它变成机器保证:
+      # 脚本在**仓库副本**上逐个施加变异、数 pytest 的 FAILED 行数,
+      # 任何一种变异没被抓住就红。`--verify` 还会核对 ADR 表格里的数字。
+      #
+      # 注意它在**副本**里做(真工作树全程不动),所以跑起来慢一点是应该的。
+      - name: 分档清单的变异验证(每个清单改动都必须被抓住)
+        run: |
+          python tools/check_mutations.py --verify

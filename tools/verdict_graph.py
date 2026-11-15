@@ -250,11 +250,25 @@ def owned_sinks(path: Path) -> set[str]:
 
 
 def _attribute_reads(info: ModuleInfo) -> set[tuple[Path, str]]:
-    """这个文件从 import 进来的模块上读了哪些属性(只算「读取」)。"""
+    """这个文件从 import 进来的模块上读了哪些东西(只算「读取」)。
+
+    两种写法都要认,否则探针会因 import 写法不同而**失明**
+    (codex 第 2 轮的 Medium-1):
+
+    1. **模块别名 + 属性**:`import X as wf` → `wf.DATA_FILE`
+       → 记 (X, "DATA_FILE")
+    2. **函数式 import**:`from X import DATA_FILE` → `DATA_FILE`
+       → 记 (X, "DATA_FILE")。这里读的是**裸名字**,不是属性;
+       但值的来源同样是 X 模块。
+
+    第 2 种若不认,同一份代码换个 import 写法就绕过了整条数据流探针。
+    """
     reads: set[tuple[Path, str]] = set()
     tree = _parse(info.path)
     if tree is None:
         return reads
+
+    # 1) 模块别名 + 属性读取
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
             continue
@@ -268,7 +282,93 @@ def _attribute_reads(info: ModuleInfo) -> set[tuple[Path, str]]:
         if func is not None:
             continue  # 函数别名上取属性,不是模块属性
         reads.add((target, node.attr))
+
+    # 2) 函数式 import 的裸名字读取:`from X import DATA_FILE` → 读 `DATA_FILE`
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            continue
+        alias = info.aliases.get(node.id)
+        if alias is None:
+            continue
+        target, func = alias
+        if func is None:
+            continue  # 模块别名:已在上面按属性读过
+        reads.add((target, func))
+
     return reads
+
+
+def _relevant_reads(info: ModuleInfo) -> set[tuple[Path, str]]:
+    """上面那些读取里,**排除掉纯副作用调用**之后剩下的。
+
+    为什么要有这一层(codex 第 2 轮的 Medium-2):「读了一个模块的属性」本身
+    太宽——`research_console.reconfigure_stdio`(控制台编码 helper)与
+    `walk_forward_optimizer.DATA_FILE`(评估用的数据文件)在前者眼里没有区别,
+    但前者与门槛毫无关系。若照单全收,一旦某个拥有判定点的文件读了某个
+    **研究文件**的属性,那个研究文件就会被强制升级为不可降级 —— **研究档被侵蚀**,
+    而这正是本 ADR 要避免的方向。
+
+    排除判据只取一条:**语句位置的调用,且返回值没人用**(纯副作用)。
+    - `rconsole.reconfigure_stdio()` 单独成句 → 排除(它改的是进程状态,不是数据);
+    - `load_bars_csv(wf.DATA_FILE, ...)` → `wf.DATA_FILE` 是实参 → 保留;
+    - `windows = [... for w in wf.build_windows()]` → 读取的值被用 → 保留;
+    - `from X import DATA_FILE` → 读的是裸名字(值),不是调用 → 保留。
+
+    **只排除这一种形态**,是因为漏报(把真的耦合判成无关)比误报危险:
+    漏报 = 一条真钱链路没人守;误报 = 研究档被无谓地收紧。
+    """
+    tree = _parse(info.path)
+    if tree is None:
+        return set()
+
+    # 语句位置的调用(返回值被丢弃):`ast.Expr` 的值是 Call
+    discarded: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            discarded.add(id(node.value))
+
+    # 「纯副作用调用」的接收者属性(如 `rconsole.reconfigure_stdio`)也要排除
+    discarded_funcs: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            if isinstance(func, ast.Attribute):
+                discarded_funcs.add(id(func))
+
+    relevant: set[tuple[Path, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            if id(node) in discarded_funcs:
+                continue  # 纯副作用调用的函数名本身
+            base = node.value
+            if not isinstance(base, ast.Name):
+                continue
+            alias = info.aliases.get(base.id)
+            if alias is None or alias[1] is not None:
+                continue
+            relevant.add((alias[0], node.attr))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+                continue
+            alias = info.aliases.get(func.value.id)
+            if alias is None or alias[1] is not None:
+                continue
+            if id(node) in discarded:
+                continue  # 纯副作用调用:结果没人用
+            relevant.add((alias[0], func.attr))
+
+    # 函数式 import 的裸名字读取:`from X import DATA_FILE` → 读 `DATA_FILE`
+    # (值的来源是 X 模块;这里读的是**值**而不是调用,一律保留)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            continue
+        alias = info.aliases.get(node.id)
+        if alias is None or alias[1] is None:
+            continue
+        relevant.add((alias[0], alias[1]))
+
+    return relevant
 
 
 def gate_input_providers(path: Path) -> set[str]:
@@ -277,7 +377,7 @@ def gate_input_providers(path: Path) -> set[str]:
     if not owned_sinks(path):
         return set()
     out: set[str] = set()
-    for target, _attr in _attribute_reads(info):
+    for target, _attr in _relevant_reads(info):
         try:
             out.add(target.relative_to(ROOT).as_posix())
         except ValueError:

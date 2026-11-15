@@ -37,7 +37,7 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 ### 清单靠什么保证不失效
 
 清单是手写的,会随仓库演进而失准。所以有四道**动态探针**盯着
-(`tests/test_check_domain.py`,90 条):
+(`tests/test_check_domain.py`,94 条):
 
 1. **全仓不变量(调用关系)**:任何**自己定义或直接调用**了真钱链路判定点的文件
    (`check_gate` / `check_live_admission` / `write_approval` / `record_approval` /
@@ -51,9 +51,13 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 4. **探针自己要被检验**:分析器既不漏报也不误报——用一组人工核对的期望值夹住它。
    尤其要挡住「经助手间接到达就把助手的判定算到调用者头上」的误伤。
 
-> 这四道探针本身经**变异验证**(九种清单改动,每次都被抓住,条数实测)。
+> 这四道探针本身经**变异验证**:`tools/check_mutations.py` 把仓库复制到临时目录,
+> 逐个施加清单改动并数 `pytest` 的 FAILED 行数——**每个改动都必须变红,否则脚本失败**。
+> 条数是实测的,不靠人记(靠人记过一次:ADR 表里三行数字对不上、一行变异描述写反)。
+>
 > 「写下了但没人跑」等于没有防线——所以 CI 里既有清单的 ruff/测试覆盖,
-> 也有**分档器自身的冒烟关卡**(真实 CLI,非 UTF-8 控制台 + 退出码语义)。
+> 也有**分档器自身的冒烟关卡**(真实 CLI,非 UTF-8 控制台 + 退出码语义)
+> 与**变异验证关卡**。
 
 ### 分档里最容易搞错的几处
 
@@ -199,6 +203,9 @@ python -m pytest -p no:cacheprovider -q tests/test_check_domain.py
 
 # 分档器自己的动态探针(白名单与生产依赖图不相交)
 python -m pytest -p no:cacheprovider -q tests/test_check_domain.py -k production_closure
+
+# 变异验证(改了分档清单后跑:每个清单改动都必须被测试抓住)
+python tools/check_mutations.py --verify
 ```
 
 ## 7. 必读的仓库文档

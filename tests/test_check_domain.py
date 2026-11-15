@@ -238,7 +238,7 @@ def test_whitelist_entries_all_exist() -> None:
 
 
 def test_research_dir_prefixes_are_deliberate() -> None:
-    """研究**目录前缀**清单里的每一条,都必须是有意为之的。
+    """研究**目录前缀**清单里的每一条,都必须**要么真实存在、要么是运行时目录**。
 
     目录前缀不做「存在性」校验——其中 `pending_strategies/`、`data/research/`、
     `data/research-control/`、`data/results/` 是 **gitignore 的运行时目录**,
@@ -246,32 +246,31 @@ def test_research_dir_prefixes_are_deliberate() -> None:
 
     但也不能因此放任:一条**写错**的目录前缀(比如 `pendng_strategies/`)会
     静默失效——该目录下的文件落进默认拒绝(安全方向),可是研究文件会因此
-    拿不到轻流程(可用性损失,且没人会发现)。所以这里校验:
-    ①前缀不是拼错的近似目录;②凡是**已入库**的目录(tools/bisheng/、evidence/、
-    docs/adr/、docs/plans/)必须真的存在。
+    拿不到轻流程(可用性损失,且没人会发现)。
+
+    所以判据是**穷尽**的:每个前缀必须落在下面两类之一——
+    ①**真实存在**的目录(已入库的:tools/bisheng/、evidence/、docs/adr/、docs/plans/);
+    ②**gitignore 的运行时目录**(pending_strategies/、data/* —— 运行时才有内容)。
+    两类都不满足 → 前缀写错了 → 红。
+    (这条比「拼写近似」有意义:后者对 8 个前缀里 6 个不可达——codex 第 2 轮的 Low-4。)
     """
-    tracked = set(_repo_files())
     for prefix in cd.RESEARCH_DIRS:
         assert prefix.endswith("/"), f"目录前缀应以 / 结尾:{prefix}"
-        # ①已入库的目录必须存在
-        if any(rel.startswith(prefix) for rel in tracked):
-            assert (ROOT / prefix.rstrip("/")).exists(), (
-                f"目录前缀 {prefix} 在仓库里有文件,但目录本身不存在"
-            )
-        # ②拼写近似检查:去掉元音后的名字不得与某个已入库目录撞上
-        stem = prefix.rstrip("/")
-        squashed = stem.replace("a", "").replace("e", "").replace("i", "") \
-                       .replace("o", "").replace("u", "")
-        for other in tracked:
-            other_stem = other.split("/")[0]
-            if other_stem == stem:
-                continue
-            other_squashed = other_stem.replace("a", "").replace("e", "") \
-                                   .replace("i", "").replace("o", "").replace("u", "")
-            if other_squashed == squashed and other_stem != stem:
-                raise AssertionError(
-                    f"目录前缀 {prefix} 可能是 {other_stem} 的拼写错误"
-                )
+        if (ROOT / prefix.rstrip("/")).exists():
+            continue  # ①目录真实存在
+        # ②必须是 gitignore 的运行时目录:它不在库里,运行时才会有内容。
+        #    **必须探一个目录里的文件**,不能探目录本身:
+        #    `git check-ignore` 对**不存在**的路径会给出假匹配
+        #    (实测:任何不存在的路径都报 ".gitignore:65" 且退出码 0),
+        #    那样这条判据就恒真、等于没有。
+        probe = subprocess.run(
+            ["git", "-C", str(ROOT), "check-ignore", "-q", f"{prefix}__probe__.tmp"],
+            capture_output=True, text=True,
+        )
+        assert probe.returncode == 0, (
+            f"目录前缀 {prefix} 既不是真实存在的目录,也不是 gitignore 的运行时目录"
+            f" —— 多半是写错了"
+        )
 
 
 def test_never_downgrade_entries_all_exist() -> None:
@@ -586,16 +585,25 @@ def test_cli_exit_codes(tmp_path: Path) -> None:
     """退出码:0 全研究域 / 1 含执行域 / 2 用法错误。"""
     script = str(ROOT / "tools" / "check_domain.py")
 
+    # **必须显式指定 encoding="utf-8"**:CLI 现在输出 UTF-8(Windows 控制台是 cp1252),
+    # 而 `text=True` 默认按 locale 解码 —— 解码失败时 stdout 变成 None,
+    # 这个用例就变成「只看退出码、看不见输出」的**空跑通过**
+    # (codex 第 2 轮的 Low-1)。
     ok = subprocess.run([sys.executable, script, "scripts/optimize.py"],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True,
+                         encoding="utf-8", errors="replace")
     assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert ok.stdout is not None and "研究域" in ok.stdout, "CLI 输出必须能被读到"
 
     blocked = subprocess.run([sys.executable, script, "scripts/optimize.py",
                               "risk/live_admission.py"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace")
     assert blocked.returncode == 1
+    assert blocked.stdout is not None and "不可降级" in blocked.stdout
 
-    empty = subprocess.run([sys.executable, script], capture_output=True, text=True)
+    empty = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
     assert empty.returncode == 2
 
 
@@ -652,13 +660,23 @@ def test_documented_test_count_matches_reality() -> None:
         if not path.exists():
             continue
         text = path.read_text(encoding="utf-8")
-        # 只看提到本文件的那一行
+        counted = False
         for line in text.splitlines():
             if "test_check_domain.py" not in line:
                 continue
-            for num in re.findall(r"(\d+)\s*条", line):
-                if int(num) != actual:
-                    stale.append(f"{name}: 写的是 {num} 条,实际 {actual} 条")
+            # 只看**确实是条数声明**的行:`\d+ 条`。
+            # 光看「含条字」会误伤散文(如「放行一条真钱链路……由 tests/… 的」)。
+            # **只取第一个**:同一行后面可能还有别的「N 条」,全取会误报
+            # (codex 第 2 轮的 Low-2)。
+            match = re.search(r"(\d+)\s*条", line)
+            if match is None:
+                continue
+            counted = True
+            if int(match.group(1)) != actual:
+                stale.append(f"{name}: 写的是 {match.group(1)} 条,实际 {actual} 条")
+        if not counted:
+            # 条数被挪到不含文件名的行 → 守护会静默失效,这里拦住
+            stale.append(f"{name}: 没有任何一行同时提到本文件与条数(守护会静默失效)")
     assert not stale, (
         "文档里的测试条数与实际不符(改了用例数要同步文档):\n  " + "\n  ".join(stale)
     )
@@ -676,3 +694,61 @@ def _collect_count() -> list[str]:
     if not ids:
         raise AssertionError(f"pytest --collect-only 没收集到用例:\n{proc.stdout[-500:]}")
     return ids
+
+
+@pytest.mark.parametrize("import_style", [
+    "import walk_forward_optimizer as wf\ndef rd():\n    return wf.DATA_FILE\n",
+    "import walk_forward_optimizer\ndef rd():\n    return walk_forward_optimizer.DATA_FILE\n",
+    "from walk_forward_optimizer import DATA_FILE\ndef rd():\n    return DATA_FILE\n",
+])
+def test_data_flow_probe_sees_every_import_style(import_style: str) -> None:
+    """数据流探针不得因 **import 写法**不同而失明(codex 第 2 轮的 Medium-1)。
+
+    `from X import DATA_FILE` 这种写法读的是**裸名字**而不是属性,
+    早期版本直接 `continue` 掉了——于是同一份代码换个 import 写法
+    就绕过了整条数据流探针,只剩人写的那条断言还在拦。
+    """
+    # 路径必须**每次不同**:verdict_graph 按路径缓存模块信息,
+    # 复用同一个路径会读到上一轮的缓存(参数化三种写法会互相干扰)。
+    probe = ROOT / "scripts" / f"zz_probe_import_{abs(hash(import_style))}.py"
+    probe.write_text(
+        "from risk.promotion_gate import check_gate\n"
+        "def go(c):\n    return check_gate(c)\n" + import_style,
+        encoding="utf-8",
+    )
+    try:
+        providers = vg.gate_input_providers(probe)
+        assert "scripts/walk_forward_optimizer.py" in providers, (
+            f"该 import 写法下探针失明了,providers={sorted(providers)}"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_data_flow_probe_ignores_incidental_reads() -> None:
+    """数据流探针不得**过度包含**(codex 第 2 轮的 Medium-2)。
+
+    「读了一个模块的属性」太宽:读一个跟门槛毫无关系的 helper
+    (如控制台编码 helper `reconfigure_stdio`)不应把那个模块拉进保护面。
+    否则一旦拥有判定点的文件读了某个**研究文件**的属性,
+    那个研究文件会被强制升级为不可降级 —— **研究档被侵蚀**,
+    与本 ADR 的方向相反。
+
+    收窄判据:被读的值(或其调用结果)**流进了另一个调用的实参**。
+    """
+    probe = ROOT / "scripts" / "zz_probe_incidental.py"  # 独立路径,避免缓存串扰
+    probe.write_text(
+        "from risk.promotion_gate import check_gate\n"
+        "def go(c):\n    return check_gate(c)\n"
+        "import research_console as rconsole\n"
+        "def setup():\n"
+        "    rconsole.reconfigure_stdio()   # 纯副作用,结果没人用\n",
+        encoding="utf-8",
+    )
+    try:
+        providers = vg.gate_input_providers(probe)
+        assert "scripts/research_console.py" not in providers, (
+            f"无关的 helper 读取被算成了门槛输入: {sorted(providers)}"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
