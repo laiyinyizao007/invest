@@ -149,7 +149,15 @@ jobs:
       - name: 研究侧核心防线(候选能力收口,Issue #31)
         run: |
           # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
-          python -m pytest -p no:cacheprovider -q tests/test_fs_capability_closure.py
+          #
+          # `--junitxml` + 后面那条断言:pytest 的退出码**分不出**
+          # "全跑了"与"整份被跳过"(全跳过时退出码也是 0)。
+          # 第 46 轮(codex 第二轮 M1):模块级一行 `pytestmark = skipif(True)`
+          # 就能让这一步绿着不跑。这里从报告里读"跑了多少条":
+          # 一条没跑 / 全被跳过 / 有失败 ⇒ fail-closed。
+          python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/closure.xml" \
+            tests/test_fs_capability_closure.py
+          python -c "import sys,xml.etree.ElementTree as ET;r=ET.parse(sys.argv[1]).getroot();s=[r] if r.tag=='testsuite' else list(r.iter('testsuite'));t=sum(int(x.get('tests',0)) for x in s);k=sum(int(x.get('skipped',0)) for x in s);f=sum(int(x.get('failures',0))+int(x.get('errors',0)) for x in s);print('tests=%d skipped=%d failed=%d'%(t,k,f));sys.exit(1) if (t==0 or k==t or f>0) else None" "$RUNNER_TEMP/closure.xml"
 
       # 并集回归套件:main(#22 导入白名单 + 模块代理)与 #26(按路径的导入裁决 +
       # 对象层)加固**同一个**沙盒后的合流行为。**本分支也改 research_sandbox**,
@@ -161,12 +169,16 @@ jobs:
       - name: 研究侧并集回归(main 白名单 x #26 路径裁决)
         run: |
           # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
-          python -m pytest -p no:cacheprovider -q tests/test_merge_main_sandbox_union.py
+          # 同样的兜底断言(第 46 轮):全被跳过 ⇒ 这一步不能算绿。
+          python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/union.xml" \
+            tests/test_merge_main_sandbox_union.py
+          python -c "import sys,xml.etree.ElementTree as ET;r=ET.parse(sys.argv[1]).getroot();s=[r] if r.tag=='testsuite' else list(r.iter('testsuite'));t=sum(int(x.get('tests',0)) for x in s);k=sum(int(x.get('skipped',0)) for x in s);f=sum(int(x.get('failures',0))+int(x.get('errors',0)) for x in s);print('tests=%d skipped=%d failed=%d'%(t,k,f));sys.exit(1) if (t==0 or k==t or f>0) else None" "$RUNNER_TEMP/union.xml"
 
       - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置/分档器)
 
         run: |
-          # `--continue-on-collection-errors`:某个文件在**收集阶段**报错时,pytest 会以退出码 4 结束,
+          # `--continue-on-collection-errors`:某个文件在**收集阶段**报错时,pytest 会以退出码 1 结束
+          # (实测:带这个开关是 1、不带是 2;此前这里写的是 4,是错的),
           # 但**其余文件仍然要跑**(第 11 轮 codex 的 F9)。不加这个开关,一个文件坏掉就把这一整步的
           # 研究侧测试全废掉——闸门看上去配好了,实际没跑几个。
           #

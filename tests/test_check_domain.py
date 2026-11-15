@@ -401,6 +401,12 @@ def test_critical_defense_files_are_never_downgrade() -> None:
         "scripts/segment_ledger.py",
         "config/immutable_constitution.json",
         "config/test_segment_usage.json",
+        # 第 47 轮:账本的**人工维护入口**——verdict_graph **找不到**它们
+        # (判定点没有 import 它们),只能由人工清单点名:
+        # 能**重写批准账本**(迁移/重置)= 改「哪条批准算数」。
+        "risk/ledger_chain.py",
+        "risk/ledger_admin.py",
+        "scripts/research_ledger.py",
     ]
     for path in critical:
         assert cd.classify(path)[0] == "never_downgrade", path

@@ -92,6 +92,18 @@ NEVER_DOWNGRADE = (
     "scripts/research_gateway.py",        # 模型→内核的唯一网络通道(端点白名单)
     "scripts/research_config.py",         # 沙盒配置加载器(硬边界、只能追加的禁用清单)
 
+    # --- 账本防篡改与人工维护入口(第 47 轮补记)---
+    # 试验账本与批准账本的哈希链 + 外置锚点。批准账本的内容**被实盘准入消费**:
+    # 链断了却被当成没事发生 = 一条失效的批准被当成有效。改它 = 改批准的效力。
+    # **图找得到**:scripts/research_sandbox.py(record_approval 的唯一写入者)import 它,
+    # 它的值被喂进判定点 ⇒ verdict_graph 的数据流探针会把它算成 provider。
+    "risk/ledger_chain.py",
+    # 人工迁移/重置两本账本的入口:**能重写批准账本**(reset 会丢弃链外内容)。
+    # **图找不到**(判定点没有 import 它)⇒ 按「图找得到的归图,图找不到的归清单」兜住。
+    "risk/ledger_admin.py",
+    # 上面那个入口的 CLI 把手(与 research_console.py 同类:本身薄,但它是人操作的入口)。
+    "scripts/research_ledger.py",
+
     # --- 门槛评估的编排层 ---
     # 名字像"研究",但算出的东西直接喂进 check_gate
     "scripts/research_gate.py",
@@ -217,6 +229,10 @@ NEVER_DOWNGRADE = (
     "tests/test_sandbox_module_view.py",
     "tests/test_sandbox_round25_rules.py",
     "tests/test_sandbox_round26_rules.py",
+    # 第 47 轮:核心防线套件——直接调 screen_source / record_approval
+    "tests/test_fs_capability_closure.py",
+    # 第 47 轮:批准状态用例改为走唯一的写入者(record_approval)⇒ 它直接调用判定点
+    "tests/test_research_mcp.py",
 )
 
 # --------------------------------------------------------------------------

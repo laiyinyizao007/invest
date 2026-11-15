@@ -2164,6 +2164,10 @@ def test_the_bootstrap_guard_detector_knows_a_flipped_predicate():
 
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "research-guard.yml"
 CLOSURE_SUITE = ROOT / "tests" / "test_fs_capability_closure.py"
+# 本文件自己:守卫也要有守卫(第 46 轮)——否则"守卫文件被整份跳过"没人拦。
+BOUNDARY_SUITE = Path(__file__).resolve()
+# 生产入口:纪律守卫要**对着它**核对"硬依赖交易栈"这件事(见下面 `_production_entry_…`)。
+PRODUCTION_API = ROOT / "scripts" / "research_api.py"
 
 # 被标成"需要交易栈"但源码里**看不出**依赖的用例:它们对交易栈的依赖是**间接**的
 # (子进程要 vnpy / 要读到行情库 / 要扫描本机已装的包),静态看不出来。逐条登记理由——
@@ -2177,6 +2181,9 @@ TRADING_STACK_INDIRECT = {
         "扫描本机**已安装**的 vnpy 族包,没装就无从扫起",
     "test_thread_and_process_executors_reexported_by_whitelisted_modules_are_refused":
         "同上:要真模块才能拿到再导出的成员",
+    "test_run_child_opens_the_vnpy_database_before_the_window_and_registers_nothing":
+        "在**子进程**里 import vnpy.trader.database(peewee 的库对象是进程级单例,"
+        "同进程里别的用例建过连接就判不清先后),静态看不出来",
 }
 
 
@@ -2199,6 +2206,18 @@ def _pytest_command_lines(workflow_text: str) -> list[str]:
     return [line for line in lines if "python -m pytest" in line]
 
 
+def _is_collect_only(command: str) -> bool:
+    """这条 pytest 命令是不是"只收集不执行"?
+
+    第 46 轮(codex 第二轮 M4,Low):此前用 `" --co" not in c` 判——而 `" --co"` 是
+    `" --continue-on-collection-errors"` 的**子串** ⇒ 带那个开关的命令被误判成
+    "只收集不执行" ⇒ 把两份套件挪进共享步骤(那里**确实在跑**)会误报红。
+    这里改成**词边界**匹配:只有独立成词的 `--co` / `--collect-only` 才算。
+    """
+    return bool(re.search(r"(?<!\S)--co(?!\S)", command)
+                or re.search(r"(?<!\S)--collect-only(?!\S)", command))
+
+
 def _closure_suite_tests() -> dict[str, ast.FunctionDef]:
     """核心防线套件里的测试函数:名字 → 函数节点。"""
     tree = ast.parse(_read_source(CLOSURE_SUITE))
@@ -2218,19 +2237,11 @@ def _is_marked_trading_stack(node: ast.FunctionDef) -> bool:
     )
 
 
-def _references_trading_stack(node: ast.FunctionDef) -> bool:
-    """这个用例**直接**引用交易栈吗?
+def _imports_trading_stack(node: ast.FunctionDef) -> bool:
+    """这个用例**自己**在运行时 import 交易栈吗?(直接依赖)
 
-    两种形态:
-      - 运行时的 `import vnpy…` / `from vnpy… import …`;
-      - 候选源码里的 `from vnpy_ctastrategy import CtaTemplate`(字符串常量里的 import)。
-    只有静态筛查、从不执行候选源码的用例**不算**(它们在研究侧 CI 上照跑)。
+    只看真正的 `import vnpy…` / `from vnpy… import …` 语句。
     """
-    docstring = None
-    if (node.body and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)):
-        docstring = node.body[0].value
     for stmt in ast.walk(node):
         if isinstance(stmt, ast.Import):
             if any(alias.name.split(".")[0] == "vnpy" or alias.name.startswith("vnpy_ctastrategy")
@@ -2240,8 +2251,112 @@ def _references_trading_stack(node: ast.FunctionDef) -> bool:
             module = stmt.module or ""
             if module.split(".")[0] == "vnpy" or module.startswith("vnpy_ctastrategy"):
                 return True
-        elif isinstance(stmt, ast.Constant) and isinstance(stmt.value, str) and stmt is not docstring:
-            if "from vnpy" in stmt.value or "import vnpy" in stmt.value:
+    return False
+
+
+def _production_entry_calls(node: ast.FunctionDef) -> list[ast.Call]:
+    """这个用例里对生产入口(`run_candidate` → `api.import_candidate`)的调用点。"""
+    return [
+        stmt for stmt in ast.walk(node)
+        if (isinstance(stmt, ast.Call) and isinstance(stmt.func, ast.Name)
+            and stmt.func.id == "run_candidate")
+    ]
+
+
+def _call_parents(node: ast.FunctionDef) -> dict:
+    """函数体内每个节点的父节点(用于判断一次调用处在什么上下文里)。"""
+    parents: dict = {}
+    for parent in ast.walk(node):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+    return parents
+
+
+# `except*`(3.11+)用的 `ast.TryStar` **不是** `ast.Try` 的子类——不单独认它,
+# `try/except*:` 里的调用就会被判成「没被包住」(漏判 ⇒ 守卫被绕过)。
+# 3.10 上没有 `TryStar`,退化即可(CI 跑 3.11/3.12,都有)。
+_TRY_NODES = (ast.Try, getattr(ast, "TryStar", ast.Try))
+
+
+def _is_failure_swallowing(call: ast.Call, parents: dict) -> bool:
+    """这次调用是不是**被包住**了——失败路径被吞掉。
+
+    「被包住」= 调用点在 `pytest.raises(...)` 的**块体**里,或在 `try:` 的**体**里
+    (有 handler)。此时用例期待的是入口**拒绝**候选:静态筛查先拒,或候选自己先炸,
+    生产代码里那句 `from vnpy_ctastrategy import CtaTemplate` **根本没走到**。
+
+    漏判的方向很关键:漏判成「没被包住」⇒ 那次调用被当成"离不开交易栈" ⇒
+    **一条其实不需要交易栈的用例也能挂上标记**⇒ 纪律守卫被绕过。
+    所以这里对「被包住」的判定必须**宽**:认 `pytest.raises(...)`、也认
+    `from pytest import raises` 之后直接写的 `raises(...)`;`try:` 认普通 `Try`,
+    也认 3.11+ 的 `except*`(`ast.TryStar` **不是** `ast.Try` 的子类)。
+    """
+    cur = parents.get(call)
+    while cur is not None:
+        if isinstance(cur, _TRY_NODES):
+            for stmt in cur.body:
+                if stmt is call or call in ast.walk(stmt):
+                    return True
+        if isinstance(cur, ast.With):
+            for item in cur.items:
+                ctx = item.context_expr
+                if not isinstance(ctx, ast.Call):
+                    continue
+                func = ctx.func
+                if (isinstance(func, ast.Attribute) and func.attr == "raises") or (
+                        isinstance(func, ast.Name) and func.id == "raises"):
+                    return True
+        cur = parents.get(cur)
+    return False
+
+
+def _calls_production_entry(node: ast.FunctionDef) -> bool:
+    """这个用例**离不开**交易栈吗?(走生产入口,且那次调用没被包住)
+
+    候选源码样板里写着 `from vnpy_ctastrategy import CtaTemplate` **不算**理由——
+    第 46 轮(codex 第二轮 M2,Medium):那条判据太弱,候选样板里的字符串就能满足它,
+    于是"给一条根本不需要交易栈的用例加上标记"也能通过纪律守卫。
+    真正成立的理由是**这条用例走的是生产入口**,而生产入口**硬依赖**交易栈——
+    而"硬依赖"这件事要**对着生产代码核对**,不能写死成一句会过期的断言。
+
+    第 47 轮再收紧一层:**那次调用不能被 try/except 或 pytest.raises 包住**。
+    实测(codex 第 2 轮点名的 4 条「样板型」用例):它们期待的正是入口**拒绝**候选,
+    生产代码里那句 import 根本没走到 ⇒ 在无 vnpy 环境里它们**全绿**。
+    没被包住则只有两种可能——走到了那句 import(真的要交易栈),
+    或异常直接逃出去、用例失败;两者都说明它**离不开**交易栈。
+    """
+    parents = _call_parents(node)
+    return any(not _is_failure_swallowing(call, parents)
+               for call in _production_entry_calls(node))
+
+
+def _production_entry_hard_requires_the_trading_stack() -> bool:
+    """生产入口 `scripts/research_api.py::import_candidate` 是否**硬依赖**交易栈?
+
+    核对的是**生产代码本身**:那里有一条在 `try` **之外**的
+    `from vnpy_ctastrategy import CtaTemplate` ⇒ 没装 vnpy 时这条 import 直接抛
+    ImportError(不会被 except 吞掉)⇒ 整条生产入口在研究侧 CI 上不可用。
+
+    为什么要每次都去读生产代码,而不是写死一句"生产入口要交易栈":
+    写死的那句会随生产代码改动而**悄悄过期**——哪天 vnpy 依赖被拿掉,
+    纪律守卫还在说"这些用例需要交易栈",CI 上的覆盖被无声地偷掉,而没人会发现。
+    这里让守卫**每次都核对生产代码**:依赖没了,守卫立刻变红。
+    """
+    tree = ast.parse(_read_source(PRODUCTION_API))
+    fn = next((node for node in ast.walk(tree)
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and node.name == "import_candidate"), None)
+    if fn is None:
+        return False
+    # `try` 内部的 import 会被 except 吞掉 ⇒ 那不算硬依赖
+    swallowed = set()
+    for stmt in ast.walk(fn):
+        if isinstance(stmt, ast.Try):
+            for sub in ast.walk(stmt):
+                swallowed.add(id(sub))
+    for stmt in ast.walk(fn):
+        if isinstance(stmt, ast.ImportFrom) and (stmt.module or "") == "vnpy_ctastrategy":
+            if id(stmt) not in swallowed:
                 return True
     return False
 
@@ -2262,7 +2377,7 @@ def test_the_core_closure_suites_are_actually_run_by_the_ci_gate(suite):
     """
     commands = _pytest_command_lines(_read_source(CI_WORKFLOW))
     # `--collect-only` 只收集不执行:那不叫"跑起来"(守卫不许靠它过)。
-    running = [c for c in commands if "--collect-only" not in c and " --co" not in c]
+    running = [c for c in commands if not _is_collect_only(c)]
     assert any(suite in command for command in running), (
         f"{CI_WORKFLOW.name} 里没有 pytest 调用 {suite}"
         f"(实测的 pytest 命令: {commands})")
@@ -2285,13 +2400,260 @@ def test_the_trading_stack_marks_are_justified_and_never_blanket():
     assert marked, "没有任何用例被标成需要交易栈——检查是不是把标记删光了"
     assert unmarked, "整份套件都被标成需要交易栈:等于在 CI 上一次都不跑(防线等于没建)"
 
+    # 三档**可核对**的理由(第 46 轮,codex 第二轮 M2):
+    #   ① 用例自己 import 交易栈;
+    #   ② 用例走生产入口,而生产入口的硬依赖**已对着生产代码核对过**;
+    #   ② 用例走生产入口(且那次调用**没被 try/except 包住**),
+    #     而生产入口的硬依赖**已对着生产代码核对过**;
+    #   ③ 登记在 TRADING_STACK_INDIRECT 里(依赖是间接的,静态看不出来)。
+    # **候选源码样板里提到 vnpy 不再算理由**——那太弱,候选样板能满足它。
+    production_needs_stack = _production_entry_hard_requires_the_trading_stack()
     unjustified = {
         name for name in marked
-        if not _references_trading_stack(tests[name]) and name not in TRADING_STACK_INDIRECT
+        if not (
+            _imports_trading_stack(tests[name])
+            or (_calls_production_entry(tests[name]) and production_needs_stack)
+            or name in TRADING_STACK_INDIRECT
+        )
     }
     assert not unjustified, (
-        f"这些用例标了 @requires_trading_stack,却既没直接引用交易栈、也没登记理由: {sorted(unjustified)}"
+        f"这些用例标了 @requires_trading_stack,却既没自己 import 交易栈、"
+        f"也没走(硬依赖交易栈的)生产入口、也没登记在 TRADING_STACK_INDIRECT: {sorted(unjustified)}"
         "(多标一条 = 在 CI 上少跑一条防线)")
 
     stale = set(TRADING_STACK_INDIRECT) - marked
     assert not stale, f"TRADING_STACK_INDIRECT 里有陈旧条目(用例已改名或不再被标记): {sorted(stale)}"
+
+
+# ---------------------------------------------------------------------------
+# 第 46 轮(codex 第二轮 must-close 1/2):核心防线套件不许被"整份一刀切跳过";
+#           标记纪律的理由必须**可核对**,且被跳过的用例要有**显式名单**
+# ---------------------------------------------------------------------------
+
+# 平台相关的跳过必须逐条登记(用例名 → 理由):改这个清单要一起改。
+# 登记的目的:让"CI 上少跑了哪几条"变成一份**显式的、可评审的**清单。
+PLATFORM_SKIPS = {
+    "test_the_spawn_exemption_is_one_shot_not_sticky":
+        "_winapi.CreateProcess 只在 Windows 上存在",
+    "test_winapi_createfile_with_write_access_is_judged_by_path":
+        "_winapi 只在 Windows 上存在",
+    "test_registry_writes_are_denied_inside_the_window":
+        "winreg 只在 Windows 上存在",
+    "test_file_lock_reports_a_real_permission_error_instead_of_waiting_the_full_timeout":
+        "Windows 上对目录做 O_EXCL 创建抛 PermissionError(POSIX 上不会)",
+}
+
+# 标了 `@requires_trading_stack` 的用例名单(**只增不减**)。
+# 纪律守卫判的是"依赖**是不是**真的",判不了"这条用例**该不该**依赖交易栈"——
+# 名单把"研究侧 CI 上被跳过了哪几条"变成一份显式清单:
+# 多标一条要在这里登记(评审时看得见),少标一条(其实需要)也要在这里补。
+TRADING_STACK_MARKED = {
+    "test_backtest_reads_market_data_before_the_candidate_is_constructed",
+    "test_bars_are_fixed_before_the_candidate_is_imported",
+    "test_capability_library_classes_reexported_by_whitelisted_modules_are_refused",
+    "test_forward_ref_evaluate_is_denied_by_the_audit_hook",
+    "test_get_type_hints_is_refused_with_its_rule_name",
+    "test_import_time_pickle_attack_is_denied_through_the_production_entry",
+    "test_import_time_write_is_denied_through_the_production_entry",
+    "test_importlib_import_module_reexport_is_refused_by_the_object_layer",
+    "test_legitimate_typing_usage_still_works",
+    "test_library_read_primitives_are_refused_by_name_and_the_rule_is_named",
+    "test_normal_candidate_still_imports_through_the_production_entry",
+    "test_production_path_candidate_cannot_vacuum_into_through_the_framework_database",
+    "test_production_path_refuses_import_module_and_leaves_framework_modules_untouched",
+    "test_run_child_opens_the_vnpy_database_before_the_window_and_registers_nothing",
+    "test_run_window_wraps_the_gate_evaluate_and_backtest_children",
+    "test_save_json_style_primitives_are_not_reachable_by_the_candidate",
+    "test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed",
+    "test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin",
+    "test_the_candidate_cannot_obtain_the_database_handle_through_any_reexport",
+    "test_the_candidate_cannot_read_test_segment_bars_through_the_database",
+    "test_the_candidate_cannot_read_the_database_through_any_reexport",
+    "test_the_candidate_cannot_read_the_process_environment",
+    "test_the_data_primitive_rule_applies_to_module_members_only_not_to_template_methods",
+    "test_the_library_still_evaluates_its_own_generated_code",
+    "test_the_optional_get_args_route_cannot_reach_the_evaluator",
+    "test_the_production_import_cannot_rewrite_the_csv_in_the_first_place",
+    "test_the_production_import_path_cannot_call_save_json",
+    "test_thread_and_process_executors_reexported_by_whitelisted_modules_are_refused",
+    "test_threads_processes_paths_reexported_by_whitelisted_modules_are_refused",
+    "test_typing_eval_type_is_refused_by_the_module_proxy_at_runtime",
+    "test_vnpy_alpha_is_refused_by_the_runtime_import_gate",
+}
+
+
+def _module_level_pytestmark(tree: ast.Module):
+    """模块级 `pytestmark = …` 的值节点(没有则 None)。"""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "pytestmark":
+                    return node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "pytestmark":
+                return node.value
+    return None
+
+
+def _mark_names(node) -> set[str]:
+    """节点里出现的 `pytest.mark.<名字>` 标记名集合。"""
+    return {
+        sub.attr
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Attribute)
+        and isinstance(sub.value, ast.Attribute)
+        and sub.value.attr == "mark"
+    }
+
+
+def test_the_core_closure_suite_cannot_be_skipped_wholesale():
+    """核心防线套件不许被"整份一刀切跳过"(第 46 轮,codex 第二轮 M1,Medium-High)。
+
+    模块级加一行 `pytestmark = pytest.mark.skipif(True, reason="…")` ⇒
+    整份文件 169 条全 skipped、pytest 退出码 **0** ⇒ **CI 步骤绿着不跑**。
+    这与本轮要消灭的失败模式("闸门看上去配好了,实际没跑")完全同类,
+    而且只需要改一行——所以必须有一条守卫盯着它。
+    """
+    for path in (CLOSURE_SUITE, BOUNDARY_SUITE):
+        tree = ast.parse(_read_source(path))
+        pytestmark = _module_level_pytestmark(tree)
+        if pytestmark is None:
+            continue
+        skipped = _mark_names(pytestmark) & {"skip", "skipif"}
+        assert not skipped, (
+            f"{path.name}: 模块级 pytestmark 里有跳过类标记 {sorted(skipped)}"
+            "——整份一刀切跳过 = CI 步骤绿着不跑")
+
+
+def test_the_core_closure_suite_only_skips_for_registered_reasons():
+    """除了 `@requires_trading_stack` 与**登记过的**平台跳过,不许再有别的跳过。
+
+    两个方向都要挡:
+      - 换个标记名(`pytest.mark.skip`、参数级 `pytest.param(..., marks=[skipif])`)
+        偷跑——那些同样归到"跳过类标记"里;
+      - 无条件跳过(`skipif(True)`)——登记也救不了,平台跳过必须是**有条件的**。
+    """
+    for path in (CLOSURE_SUITE, BOUNDARY_SUITE):
+        tree = ast.parse(_read_source(path))
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not node.name.startswith("test_"):
+                continue
+            marks = _mark_names(node) & {"skip", "skipif"}
+            if not marks:
+                continue
+            assert node.name in PLATFORM_SKIPS, (
+                f"{path.name}:{node.lineno} {node.name} 用了跳过类标记 {sorted(marks)},"
+                "但没登记在 PLATFORM_SKIPS 里(平台相关跳过要登记理由;"
+                "没登记的跳过 = CI 上少跑一条防线)")
+            for dec in node.decorator_list:
+                if not isinstance(dec, ast.Attribute) or dec.attr != "skip":
+                    continue
+                # 裸 `pytest.mark.skip` 本身就是**无条件**跳过:登记也救不了。
+                raise AssertionError(
+                    f"{path.name}:{node.lineno} {node.name} 用了裸 pytest.mark.skip"
+                    "(无条件不跑):那不是平台差异,是不跑这条防线")
+            for dec in node.decorator_list:
+                if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                        and dec.func.attr == "skipif"):
+                    condition = dec.args[0] if dec.args else None
+                    assert not (isinstance(condition, ast.Constant) and condition.value is True), (
+                        f"{path.name}:{node.lineno} {node.name} 是**无条件**跳过"
+                        "(skipif(True)):那不是平台差异,是不跑这条防线)")
+
+
+def test_the_trading_stack_marks_match_the_registered_roster():
+    """被标成"需要交易栈"的用例集合必须与 `TRADING_STACK_MARKED` **完全一致**。
+
+    纪律守卫判的是"依赖**是不是**真的",判不了"这条用例**该不该**依赖交易栈"——
+    名单把"研究侧 CI 上少跑了哪几条"变成一份显式清单:
+    多标一条要在这里加一行(评审时看得见),少标一条(其实需要)也要补。
+    """
+    tests = _closure_suite_tests()
+    marked = {name for name, node in tests.items() if _is_marked_trading_stack(node)}
+    unregistered = marked - TRADING_STACK_MARKED
+    assert not unregistered, (
+        "这些用例标了 @requires_trading_stack 但没登记在 TRADING_STACK_MARKED 里: "
+        f"{sorted(unregistered)}(多标一条 = 在 CI 上少跑一条防线;要标就得在这里登记)")
+    stale = TRADING_STACK_MARKED - marked
+    assert not stale, (
+        f"TRADING_STACK_MARKED 里有陈旧条目(用例已改名或不再被标记): {sorted(stale)}")
+
+
+def _swallowing_of(source: str) -> bool:
+    """把一段源码解析成函数,返回「其中那次生产入口调用是不是被包住」。"""
+    fn = ast.parse(source).body[0]
+    assert isinstance(fn, ast.FunctionDef), fn
+    parents = _call_parents(fn)
+    calls = _production_entry_calls(fn)
+    assert calls, "这段源码里没有 run_candidate 调用"
+    return all(_is_failure_swallowing(call, parents) for call in calls)
+
+
+def test_the_failure_swallowing_detector_covers_every_wrapper_form():
+    """「被包住」的判定**自己**也要有探针(第 47 轮之三,实测发现的洞)。
+
+    漏判的方向很关键:漏判成「没被包住」⇒ 那次调用被当成"离不开交易栈"
+    ⇒ 一条**其实不需要**交易栈的用例也能挂上标记 ⇒ 纪律守卫被绕过。
+    所以「被包住」必须**认全**包裹形态:
+
+    - `try:` 的体(有 handler);
+    - `except*`(3.11+)——`ast.TryStar` **不是** `ast.Try` 的子类,漏认就等于漏判;
+    - `with pytest.raises(...):` 的块体;
+    - `with raises(...):` 的块体(`from pytest import raises` 之后的写法)——
+      只认 `pytest.raises` 会让这条形态**漏判**⇒ 守卫被绕过。
+    """
+    # 基准:没被包住 ⇒ 调用"离不开交易栈"(标记才算有理由)
+    assert not _swallowing_of(
+        """
+def t():
+    run_candidate(x)
+"""), "裸调用不该被判成'被包住'"
+
+    # try/except 的体
+    assert _swallowing_of(
+        """
+def t():
+    try:
+        run_candidate(x)
+    except Exception:
+        pass
+"""), "try/except 的体算被包住"
+
+    # except*(3.11+):ast.TryStar 不是 ast.Try 的子类,必须单独认
+    assert _swallowing_of(
+        """
+def t():
+    try:
+        run_candidate(x)
+    except* Exception:
+        pass
+"""), "except* 的 try 体也算被包住"
+
+    # pytest.raises 的块体
+    assert _swallowing_of(
+        """
+def t():
+    with pytest.raises(ValueError):
+        run_candidate(x)
+"""), "with pytest.raises 的块体算被包住"
+
+    # 不带 pytest. 前缀的 raises(第 47 轮之三补上的形态)
+    assert _swallowing_of(
+        """
+def t():
+    with raises(ValueError):
+        run_candidate(x)
+"""), "with raises 的块体也算被包住(漏判它 = 守卫被绕过)"
+
+    # 反向:handler **里面**的调用是"重试",不是"被包住"——
+    # 判成"被包住"会把一条真需要交易栈的用例判成没理由(过度收紧)。
+    assert not _swallowing_of(
+        """
+def t():
+    try:
+        pass
+    except Exception:
+        run_candidate(x)
+"""), "except 处理器里的调用是重试,不算被包住"

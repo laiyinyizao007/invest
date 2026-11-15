@@ -2454,6 +2454,52 @@ def test_an_exec_whose_trigger_frame_cannot_be_read_is_refused(monkeypatch):
     assert "audit:eval-origin-unknown" in str(info.value), str(info.value)
 
 
+# ---------- 第 46 轮(codex 第二轮 MC3):求值帧这族规则在 CI 上真跑 ----------
+
+def _forward_ref_evaluate(fr):
+    """跨版本地调 `ForwardRef._evaluate`。
+
+    3.12 是 `(globalns, localns)`;3.13 多了**必填**的关键字参数 `recursive_guard`
+    (同时会打 `type_params` 的弃用警告)。这里按签名决定怎么调——
+    测试不能因为 Python 版本变了就**悄悄不测那条规则**。
+    """
+    import inspect
+    params = inspect.signature(type(fr)._evaluate).parameters
+    if "recursive_guard" in params:
+        return fr._evaluate({}, None, recursive_guard=set())
+    return fr._evaluate({}, None)
+
+
+def test_the_audit_hook_denies_forward_ref_eval_without_the_trading_stack():
+    """**不经生产入口**也能验到 `audit:forward-ref-eval`——这条用例在 CI 上真跑。
+
+    第 46 轮(codex 第二轮 M3,Medium):承载第 40 轮新规则的那几条用例全部经
+    `run_candidate`(生产入口),而生产入口硬依赖交易栈 ⇒ 在研究侧 CI 上**一条都不跑**
+    ⇒ 新接的核心防线 CI 步骤对这族规则的覆盖率是 **0**。
+    这里补一条**沙盒层**用例:直接开 `candidate_window()`,不走生产入口 ⇒ 不需要 vnpy。
+    """
+    with rs.candidate_window():
+        with pytest.raises(rs.AuditDenied) as info:
+            import typing
+            fr = typing.ForwardRef("__import__('os').environ")
+            _forward_ref_evaluate(fr)
+    assert info.value.rule == "audit:forward-ref-eval", info.value.rule
+    assert ("audit:forward-ref-eval", "exec") in rs.window_denials(), rs.window_denials()
+
+
+def test_the_audit_hook_still_allows_the_libraries_own_exec():
+    """放行方向:库**自己** eval 自己生成的代码必须照旧跑通(否则规则就成了"一律拒")。
+
+    `collections.namedtuple` 会 exec 一段框架生成的代码,触发帧是它自己
+    ⇒ 不在 `FORBIDDEN_EVAL_FRAMES` 里 ⇒ 不该被拒。
+    """
+    with rs.candidate_window():
+        import collections
+        point = collections.namedtuple("Point", "x y")
+        assert point(1, 2).x == 1
+    assert rs.window_denials() == (), rs.window_denials()
+
+
 # ---------- L2:`vnpy.alpha` 的**运行期**导入门也要有用例 ----------
 
 @requires_trading_stack

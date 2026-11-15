@@ -206,6 +206,11 @@ python tools/check_mutations.py --verify   # 另核对「本表的变异集合 =
 | 把 `scripts/research_api.py` 移出不可降级 | `scripts/research_api.py` |
 | 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | `scripts/optimize.py` |
 | 把整个 `scripts/` 放进研究**目录**白名单 | `scripts/some_brand_new_thing.py` |
+| 把 `risk/ledger_chain.py` 移出不可降级 | `risk/ledger_chain.py` |
+| 把 `risk/ledger_admin.py` 移出不可降级 | `risk/ledger_admin.py` |
+| 把 `scripts/research_ledger.py` 移出不可降级 | `scripts/research_ledger.py` |
+| 把 `tests/test_fs_capability_closure.py` 移出不可降级 | `tests/test_fs_capability_closure.py` |
+| 把 `tests/test_research_mcp.py` 移出不可降级 | `tests/test_research_mcp.py` |
 | 新建一个直接调 `check_gate` 的文件(不入库) | 该新文件自身 |
 
 **表里不写「变红几条」**——那个数字随本文件的用例数变化(每加一条用例就变),
@@ -345,5 +350,29 @@ PR 路径永远有改动(base != HEAD),所以这条分支**在 PR 的 CI 上从�
 - 任何「已覆盖 / 已验证 / 已复算」的措辞,都必须有一条**能在别处跑出同样结果**的机器检查;
 - 探针自身要有**反向**验证(准确性夹具、变异验证、cp1252 回归);
 - 数字(测试条数、变异条数、provider 数量)一律**由脚本实测**,文档只引用不手写。
+
+## 第 47 轮补记:#31 分支引入的账本链与两个新增用例
+
+Issue #31(候选能力收口)给仓库引入了三个新模块,并让一个既有用例改为**走唯一的写入者**。
+合并 main 的分档器之后,两条全仓不变量立刻变红——这是**它们在正常工作**,不是误报:
+
+| 文件 | 为什么必须不可降级 | 哪条探针抓住它 |
+|---|---|---|
+| `risk/ledger_chain.py` | 批准/试验账本的哈希链与外置锚点;批准账本的内容被实盘准入消费 | 数据流探针(`research_sandbox` 是判定点,它的值被喂进去) |
+| `risk/ledger_admin.py` | 人工迁移/重置两本账本,**能重写批准账本** | **图找不到** ⇒ 由 `tests/test_check_domain.py` 的点名断言兜住 |
+| `scripts/research_ledger.py` | 上面那个入口的 CLI 把手 | 同上 |
+| `tests/test_fs_capability_closure.py` | 核心防线套件,直接调 `screen_source` / `record_approval` | 调用关系探针 |
+| `tests/test_research_mcp.py` | 批准状态用例改为走 `record_approval`(唯一写入者) | 调用关系探针 |
+
+两条不变量**各自覆盖一半**,剩下的靠**人工清单 + 点名断言**——这是本 ADR 一贯的
+「图找得到的归图,图找不到的归清单,两层都要有」。
+
+**这次改动本身是执行域改动**(清单就是代码):走完整流程 + codex 双轮复核。
+它**不放松**任何防线——加进去的五条全部是**收紧**(把默认拒绝写死成不可降级),
+且每条都配了变异:从清单里删掉它,变异验证脚本必须看到**测试变红**。
+
+教训(与前几轮同源):**清单是会随仓库演进而失准的**,新增文件不会自动进清单。
+全仓不变量把这件事从「靠人记得」变成「机器拦」——代价是新分支必须先补清单才能过 CI,
+这正是它应有的摩擦。
 
 

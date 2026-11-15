@@ -172,7 +172,7 @@
       - **动态探针**:"需要交易栈的用例集合"是**实测**出来的——先改成守卫式导入,在无 vnpy 的干净环境里跑,
         取**实际失败集**再逐条标记,复跑必须零失败、且未标记的用例一条都不许失败。
       - **变异验证(2 项全部红)**:从 workflow 删掉 `pytest tests/test_fs_capability_closure.py` → 红(接线守卫);
-        给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` → 红(标记纪律守卫)。
+        给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` → 红(标记纪律守卫)——**注**:这条声明当时是无条件的假声明,实测旧判据下 88 条里只抓住 84 条(4 条「样板型」抓不住);第 46 轮换判据、第 47 轮再收紧后实测全部抓住(变异 M4/M9 红)。
       - **验证**:无 vnpy 环境(仅 numpy/pandas/mcp/pyyaml/typing_extensions)
         `test_fs_capability_closure.py` **133 passed / 32 skipped / 0 failed**、
         `test_merge_main_sandbox_union.py` **74 passed / 2 skipped**(那 2 条要真模块才判得了准入审计);
@@ -212,6 +212,79 @@
       - **残余(如实)**:本轮只改了**错误消息与翻译口径**与**超时参数的显式化**,没有改任何判定逻辑——
         "链坏了"此前也被说成"被占用",现在至少**说对了原因**;但**错误仍然 fail-closed**(一律拒绝),没有变宽松。
         第一轮外部审查(Gemini)因配额耗尽未完成,第二轮(codex CLI)的结果见 PR #32 正文。
+    - **第 46 轮(CI 接线本身也要有守卫——「闸门配好了,实际没跑」的最后一族)**:
+      codex 第 2 轮复核(锚定 2026-11-15 02:21 的树)**40/50**(质量 8/安全 8/性能 7/架构 8/文档 9)⇒ **需小修**,
+      给了 3 条 must-close 与 4 条建议小修;本轮把 must-close 三条**全部关掉**。
+      - **MC1(Medium-High):一行 `pytestmark = pytest.mark.skipif(True)` 就能让核心防线那一步「绿着不跑」**
+        (实测 169 skipped、pytest 退出码 0)。已补三条守卫:模块级 `pytestmark` 里不许有 `skip`/`skipif`;
+        除 `@requires_trading_stack` 外不许有任何 `skipif`(`skipif(True)` 与裸 `pytest.mark.skip` 一律拒绝,**登记过的**平台跳过被改写也红);
+        被标记的用例集合必须与显式名单 `TRADING_STACK_MARKED`(31 条,只增不减)**完全一致**(多标、少标都红)。
+        名单另加 `PLATFORM_SKIPS`(4 条平台差异,逐条写理由)。CI 侧再加一道兜底:两个核心步骤加 `--junitxml`,
+        从 XML 里读 `tests`/`skipped`/`failures`——`t==0`(一条没跑)、`k==t`(全被跳过)、`f>0` 三种都红
+        (**pytest 的退出码分不出「全跑了」与「全跳过了」**,那正是被 codex 抓到的失败模式)。
+      - **MC2(Medium):「有理由」的判据太弱**——旧判据把**候选源码字符串**里出现的 vnpy 也算作直接引用交易栈,
+        候选样板就能满足它。改为三档:①用例**自己** import 交易栈;②走生产入口 `run_candidate` → `api.import_candidate`,
+        而「生产入口硬依赖交易栈」这件事**对着生产代码核对**(每次读 `scripts/research_api.py::import_candidate`,
+        找那句**在 `try` 之外**的 `from vnpy_ctastrategy import CtaTemplate`)——**不写死**:哪天生产代码把 vnpy 依赖拿掉,守卫立刻变红;
+        ③依赖间接的(子进程要 vnpy / 要读行情库 / 要扫本机已装的包)逐条登记进 `TRADING_STACK_INDIRECT` 并写明理由。
+        **同时更正一句此前写错的声明**:「给一条不依赖交易栈的用例加标记 → 红」当时是**无条件**的假声明
+        (实测旧判据下 88 条只抓住 84 条,4 条「样板型」抓不住);本轮之后实测**全部**抓住(变异 M4/M9 红)。
+      - **MC3(Medium):求值帧这族新规则在 CI 上覆盖率仍是 0**——它们的用例走生产入口 → 被候选样板绑到交易栈上 → 研究侧 CI 全跳过。
+        补两条**不经生产入口**的沙盒层用例(直接 `with rs.candidate_window():`):前向引用求值必须被 `audit:forward-ref-eval` 拒
+        (并断言 `("audit:forward-ref-eval", "exec") in rs.window_denials()`)、`collections.namedtuple` 的正常用法**不许**被拒(放行方向)。
+        两条都不需要 vnpy ⇒ 在研究侧 CI 上真跑,该族规则的覆盖率从 0 变成真覆盖。
+      - **M4(Low)**:接线守卫的 `" --co"` 是 `" --continue-on-collection-errors"` 的**子串** ⇒ 假阳性
+        (把两份套件挪进共享步骤会误报红),改成词边界正则 `(?<!\S)--co(?!\S)`;
+        workflow 里那句「pytest 会以退出码 4 结束」与实测不符(带开关是 **1**、不带是 **2**),已改成实测值。
+      - **变异验证(10 项全部符合预期:9 红 + 1 绿)**:M1 模块级一刀切跳过 → 红;M2 未登记的 skipif → 红;
+        M3 登记过的平台跳过被改成无条件跳过 → 红;M4 给不相关用例加标记 → 红;M5 名单与实际标记不一致 → 红;
+        M8 裸 `pytest.mark.skip` → 红;M6 摘掉求值帧规则 → 红;M9 给「样板型」用例加标记 → 红;
+        M10 把「没被包住」的判定反过来 → 红;M7 把两份套件挪进共享步骤 → **保持绿**(证明 `--co` 假阳性确实修掉了)。
+      - **验证**:`tests/test_fs_capability_closure.py` **171 passed**;`tests/test_research_boundary.py` **89 passed**;
+        `tests/test_check_domain.py` **99 passed**;`python tools/check_mutations.py --verify` **16 种变异全部被抓住**且 ADR 集合一致(16 行对上)。
+      - **残余(如实)**:codex 的 **M5**(`find_spec` 头部无异常兜底)、**M6**(`verify()` 的 O(n) 切片拷贝)、
+        **M7**(重入判据在 token 读不到时退化为「等满超时 + 说错话」)**本轮未做**:
+        M6 属功能改动 → Issue #29,M5/M7 要改生产代码(按分支冻结规则登记为残余);
+        **G8 第一轮外部审查(Gemini)因免费配额 429 仍缺席**,配额恢复后补跑;
+        第 44 轮那句「32 条需要交易栈的用例在 CI 上仍然不跑」**仍然成立**(本轮只把求值帧这族摘出来)。
+    - **第 47 轮(合并 main 之后,后果域清单要补登 —— 执行域改动)**:
+      本分支引入三个新模块(`risk/ledger_chain.py`、`risk/ledger_admin.py`、`scripts/research_ledger.py`),
+      并让 `tests/test_research_mcp.py` 改为**走唯一的写入者** `record_approval`。
+      合并 main 的后果域分档(#38/#45)之后,两条全仓不变量立刻变红
+      (`test_every_sink_owning_file_is_never_downgrade`、`test_every_gate_input_provider_is_never_downgrade`)——
+      **这是它们在正常工作,不是误报**:清单是手写的,新增文件不会自动进去。
+      - `tools/check_domain.py` 的不可降级清单补 5 条;`tools/check_mutations.py` 每条配一条变异(删掉它 ⇒ 必须有测试变红);
+        `tests/test_check_domain.py` 点名断言 3 个新模块;后果域 ADR 的变异表补 5 行 + 一节补记。
+      - 两条不变量**各覆盖一半**:`risk/ledger_chain.py` 由**数据流探针**抓到,两个用例文件由**调用关系探针**抓到;
+        `risk/ledger_admin.py` 与 `scripts/research_ledger.py` **图找不到**(判定点没 import 它们)⇒ 只能人工清单 + 点名断言兜住
+        ——正是「图找得到的归图,图找不到的归清单,两层都要有」。
+      - 这次改动**不放松**任何防线(五条全是收紧:把「默认拒绝」写死成「不可降级」);
+        `python tools/check_mutations.py --verify` **16 种变异全部被抓住**、ADR 变异集合与脚本一致。
+      - **第 47 轮之二(纪律守卫自己也有洞——实测发现的,不是推理)**:拿反例去撞守卫——
+        给 codex 点名的那 4 条「样板型」用例各加一次 `@requires_trading_stack`,**第 46 轮的判据没拦住**
+        (它只问「这条用例走没走生产入口」,而那 4 条走的正是生产入口,只是**期待入口拒绝候选**,
+        生产代码里那句 `from vnpy_ctastrategy import CtaTemplate` 根本没走到 ⇒ 那 4 条在无 vnpy 环境里**全绿**,
+        标记它们等于在 CI 上白丢覆盖)。收紧:那次 `run_candidate` 调用**不能被 `try/except` 或 `pytest.raises` 包住**
+        (没被包住 ⇒ 要么走到了那句 import,要么异常直接逃出去、用例失败;两者都说明它离不开交易栈)。
+        实测 31 条已登记标记**全部**至少有一次没被包住的调用(收紧后仍成立),
+        那 4 条的全部调用都被包住(收紧后被正确判为「无理由」);变异 M9/M10 双向红。
+        **教训**:判据「更严」不等于「更对」——守卫的质量只能靠**拿反例去撞**来确认。
+    - **第 47 轮之三(自己再读一遍代码,翻出两处缺陷)**:
+      第 47 轮做完之后做了一轮**静态复读**(不靠跑测试),翻出两处问题,都已修并配了变异:
+      - **一份死代码**:`tests/test_research_boundary.py` 里 `_calls_production_entry` **定义了两遍**
+        (第 46 轮的弱版 + 第 47 轮的严版)。Python 取后者 ⇒ 行为正确,但前一份是死代码,
+        而且**离危险很近**:弱的那份正是第 46 轮判定为「太弱」的判据,一旦有人调整定义顺序,
+        纪律守卫就会静悄悄地退回旧水平。**这类缺陷动态检查全都发现不了**(不改变行为 ⇒ 绿着),
+        只有把文件读一遍才看得见 ⇒ 已删,并把「改完同名定义要 `grep -c` 数一遍」记成手法。
+      - **一处漏判**:「被包住」的判定只认 `pytest.raises(...)` 与 `try:` 的体,
+        漏了 `with raises(...)`(不带 `pytest.` 前缀)与 `except*`(`ast.TryStar` **不是** `ast.Try` 的子类)。
+        **漏判方向危险**:漏判成「没被包住」⇒ 那次调用被当成离不开交易栈
+        ⇒ 一条**其实不需要**交易栈的用例也能挂标记 ⇒ 纪律守卫被绕过。已补齐,
+        并给这个判定**自己**加了探针(六段合成源码钉住六种形态),配 3 条变异,实测**3/3 红**。
+      - **验证**:`tests/test_research_boundary.py` **90 passed**;第 46/47 轮的 10 条变异复跑 **10/10 符合预期**;
+        CI 那份显式 ruff 清单 **All checks passed!**;全量默认顺序 **3431 passed / 5 failed / 5 errors**
+        (基线 3325/3/5;多出的 2 条失败是 dashboard/drill 的**墙钟时间断言**,本次全量跑时 codex 复核正在后台占用 CPU,
+        两条单独跑与合跑都通过 ⇒ 判为**负载偶发**,须在无并发负载下复跑证实)。
 - **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
   却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
