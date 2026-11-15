@@ -4,7 +4,7 @@
 - 日期:2026-11-15
 - 跟踪:Issue [#29](https://github.com/laiyinyizao007/invest/issues/29)(本 Issue 的方案文档)
 - 关联:`20261113-evolution-engine`(第 9 条 DSR 锁定、C3 冲突、候选同进程的残余登记)、
-  `20261109-promotion-gate`(8+1 条门槛)、`20261112-candidate-evaluation`(样本外=滚动验证段)、
+  `20261109-promotion-gate`(8 条门槛)、`20261112-candidate-evaluation`(样本外=滚动验证段)、
   `20261111-risk-floor-immutability`(风控底线不可优化)、`20261112-research-sandbox-groundwork`(纵深防御而非沙盒)
 
 ## 背景
@@ -24,7 +24,12 @@ PR #24(Issue #21)的 G8 复审连续五轮没有收敛(Issue #29 正文记的分
 2. 候选能改写框架算出来的数字:结果文件、序列化器、评估输入(`wf.build_windows`)都在同一进程里,
    codex 实测"候选劫持 `json.dumps` 后,框架在伪造的 payload 上算出真 MAC,父层验签通过并采信 `oos_sharpe=42`"。
 3. 候选能读写磁盘:行情 CSV(含测试段与封存前向留出集)、试验账本 `trials.jsonl`、批准账本 `approvals.json`。
-4. 候选能读本机凭据(`.env` 经 `import bootstrap` 载入的 CTP_*)、能执行任意命令(pickle 反序列化链)。
+4. 候选能读本机配置与凭据文件:子进程环境是**白名单**过滤过的(`rs.sandbox_env` / `ENV_ALLOW`,
+   不含 `CTP_*`/`WEBHOOK_*`/`LIVE_*`),但**同进程内候选能直接 `open()` 本机任意文件**——
+   包括 `data/` 下的行情 CSV(含测试段与封存前向留出集)、两本账本、以及本机上的 `.env`
+   (`.env` 不在环境白名单里,但**文件本身在磁盘上**,候选自己 open 就读得到);
+   `import bootstrap` 还会 `chdir` 到仓库根、把仓库根插进 `sys.path`、并 `import vnpy.trader.setting`。
+   候选还能执行任意命令(pickle 反序列化链)。
 5. 同进程内**没有任何一条通道能证明"这句话是框架说的"**:结果文件、stderr、退出码,候选都能自己写。
 
 逐条堵"写法"没有理由收敛到 ≥ 45(第 32/33 轮补记已经写了这条趋势判断)。
@@ -35,13 +40,17 @@ PR #24(Issue #21)的 G8 复审连续五轮没有收敛(Issue #29 正文记的分
 - 候选只负责产出**信号**;回测、评估、记账、结果落盘、指标计算全部由**框架进程**独立完成。
 - 框架进程**不信任候选进程的任何自报数字**:候选返回的数字一律不可信,框架只把它当作"要执行的交易动作序列"。
 - 候选进程拿不到:真实行情文件路径、测试段数据、交接单与 MAC 密钥、框架模块对象。
-- 既有阈值一个都不动:DSR ≥ 0.95、可疑夏普上限 3.0、η = 1.10、预算 60、16 格。
+- 既有阈值一个都不动:DSR ≥ 0.95、可疑夏普上限 3.0、η = 1.10。
+  (另两个数字——**查询预算 60** 与 **4×4=16 格**——只存在于未合并的 `origin/feat/21-stage3`
+  (`risk/ladder.py:64` 的 `DEFAULT_QUERY_BUDGET = 60`、`risk/behavior.py` 的 16 格),
+  **main 上没有**;main 侧的对应物是 `config/research_sandbox.json` 的 `grid.max_cells = 343`
+  与 `grid.min_round_trips = 10`。本方案同样不改这两个分支上的数。)
 
 ---
 
 ## 1. 现状事实(先核实代码,不凭描述)
 
-> 核实基线:本仓库 `main`(commit `fda4f71`)。另有两条未合并的分支与本方案相关,下文逐一标注:
+> 核实基线:本仓库 `main`(commit `96959a2`)。另有两条未合并的分支与本方案相关,下文逐一标注:
 > `origin/feat/21-stage3`(PR #24,Issue #21 的阶段 3 实现,含第 27~34 轮补记)、
 > `origin/feat/31-fs-capability`(PR #32,Issue #31,含 `risk/ledger_chain.py` 与 `candidate_window` 审计钩子)。
 > **这些分支上的文件在 `main` 上并不存在**(例如 `risk/ledger_chain.py`、`scripts/research_ledger.py`、
@@ -57,7 +66,7 @@ PR #24(Issue #21)的 G8 复审连续五轮没有收敛(Issue #29 正文记的分
 | `run_evaluate_child` | `scripts/research_api.py:901-936` | 子进程入口:复查 → `import_candidate` → `load_bars_csv` → `run_evaluation`(选参 + 门槛)→ 回传**已算好的 metrics 与选参结果** |
 | `spawn_child` | `scripts/research_api.py:192-211`(main 版)/ 分支 `feat/21-stage3` 上已改为交接单 + MAC | main 上:子进程 stdout 里取最后一行 `RESEARCH_RESULT_JSON:` 前缀的内容作为结果;分支上改为父进程造随机临时目录 + 随机 MAC 密钥的**交接单**,经 stdin 交给子进程,结果写文件并附 MAC,父进程验签 |
 | `evaluate_job` | `scripts/research_api.py:764-799` | 父进程:读账本 `prior` → `charge_trials("grid_cell", MIN_GRID_CELLS=27)` 预扣 → 起子进程 → 回传后按**子进程自报的** `trials.grid_cells` 补记差额(`top_up_grid_trials`,`scripts/research_api.py:140-147`) |
-| `safe_builtins` | `scripts/research_sandbox.py:1765-1830` | 候选执行时的最小内建集合:去掉 `UNSAFE_BUILTINS`,`__import__` 换成受限导入器(黑名单 → 路径裁决 → 导入白名单 → 配置准入审计) |
+| `safe_builtins` | `scripts/research_sandbox.py:1765-1823` | 候选执行时的最小内建集合:去掉 `UNSAFE_BUILTINS`,`__import__` 换成受限导入器(黑名单 → 路径裁决 → 导入白名单 → 配置准入审计) |
 | `RepoImportGuard` | `scripts/research_sandbox.py:1076+` | 按**路径**裁决候选的 import:仓库内非白名单目录拒绝;白名单目录还要满足"候选运行前就存在且此后没被改过";仓库外(站点包)同样要求运行前就存在 |
 | `candidate_window` | **不在 main**;在 `origin/feat/31-fs-capability:scripts/research_sandbox.py:2146` | 审计钩子窗口(`sys.addaudithook`):窗口内拒写模式 `open`、`os.remove/rename`、subprocess、socket、pickle.find_class 等;窗口外不判定。**只拦写与能力,不拦读** |
 | `research_grid.validate_grid` | `scripts/research_grid.py:57-85` | 校验候选声明的 `param_grid`:恰好 3 个参数、每个 3~10 个取值、严格递增、不含受保护参数、格子数 ≤ `max_cells` |
@@ -116,7 +125,8 @@ flowchart TD
   `run_evaluate_child` 先 `import_candidate`(候选代码此刻起在进程内),再 `load_bars_csv`,再 `run_evaluation`。
 - 于是候选可以:`import`/`monkey-patch` 框架模块(第 21~26 轮实测的逃逸)、
   在导入期改写 `wf.build_windows` 让验证窗口塌成选参窗口(第 32 轮实测)、
-  劫持 `json.dumps` 让框架在伪造 body 上算真 MAC(第 32 轮实测)、直接读写行情 CSV 与两本账本(Issue #31 实测)。
+  劫持 `json.dumps` 让框架在伪造 body 上算真 MAC(第 32 轮实测)、直接读写行情 CSV 与两本账本
+  (Issue #31 实测,证据在未合并的 `origin/feat/31-fs-capability` 上)。
 - 结果通道的 MAC **只证明"通道没被截断"**,证明不了"结果是真的"——因为**候选在同一进程里能读到交接单(含 MAC 密钥)**。
   第 31 轮 codex 已明确更正过这句(原写"伪造一定被检测"**不成立**)。
 
@@ -228,7 +238,7 @@ flowchart TD
 | 测试段数据 | 框架在生成切片时按 `segment_windows` 的 `test` 起点硬切;切片本身不含 |
 | 交接单与 MAC 密钥 | **交接单机制整体取消**(见第 4.4 节):新架构里没有"候选交回结果文件"这件事 |
 | 框架模块对象 | 不同进程;候选进程的 `sys.path` 里**没有仓库根**(见第 4.3 节) |
-| 本机凭据 | 环境变量白名单(沿用 `rs.sandbox_env`);候选进程不 import `bootstrap`(它会 `load_dotenv`) |
+| 本机凭据 | 环境变量白名单(沿用 `rs.sandbox_env`);候选进程不 import `bootstrap` —— 它的模块级副作用是 `os.chdir(仓库根)` + 把仓库根插进 `sys.path` + `import vnpy.trader.setting`(核实 `scripts/bootstrap.py:25-42`)。**注意**:`.env` **不是** import 时加载的,只在显式调用 `bootstrap.load_env()` 时才 `load_dotenv`(全仓库 8 处调用点,`backtest_lib.py`/`optimize.py` 都不调用)—— 所以"import bootstrap 就等于载入 .env"是错的说法 |
 
 ### 3.2 输出(候选给框架的)
 
@@ -339,7 +349,10 @@ flowchart TD
    Windows 上 cwd 必须是存在的目录,`tempfile.mkdtemp()` 满足。
 5. **继承的句柄**:`Popen` 默认 `close_fds=True`(Windows 上 Python 3.7+ 同样默认关闭除标准句柄外的继承),
    父进程的行情文件句柄**不会**被继承。要显式核对并加测试。
-6. **不 import `bootstrap`**:候选宿主脚本自己不 import `bootstrap`(那会 `load_dotenv(.env)` 把 CTP 凭据载入)。
+6. **不 import `bootstrap`**:候选宿主脚本自己不 import `bootstrap`。理由是它的**模块级副作用**:
+   `os.chdir(仓库根)`、把仓库根 `sys.path.insert(0, …)`、`import vnpy.trader.setting`
+   (核实 `scripts/bootstrap.py:25-42`)—— 前两条会把仓库根重新变成候选的可达路径。
+   (`.env` 的加载与 import 无关,只在显式 `bootstrap.load_env()` 时发生,见第 3.1 节表格。)
    候选宿主只用标准库 + numpy + ta-lib。
 7. **stdout 编码要自己钉**:`-E` 会**连 `PYTHONIOENCODING` 一起忽略**(实测:`PYTHONIOENCODING=utf-8 python -E -P`
    的 `sys.stdout.encoding` 是 `cp1252`,不带 `-E` 才是 `utf-8`)。
@@ -436,8 +449,9 @@ class Candidate(TrendAtr15mStrategy):
 而基类 `strategies/trend_atr_strategy.py` 直接 `from vnpy.trader.utility import ArrayManager, BarGenerator, ...`
 拉进 vnpy 交易栈,`from risk.risk_guard import DailyLossGuard, TrailingStop, stop_distance, within_budget`
 拉进全部风控计算(`risk_budget`、`stop_distance`、`within_budget`、`DailyLossGuard`、`TrailingStop`)。
-(核实:基类本身**不** import `bootstrap`;`import bootstrap`(会 `load_dotenv(.env)`)发生在
-`scripts/backtest_lib.py:9` 与 `scripts/optimize.py` 这类框架侧脚本里。)
+(核实:基类本身**不** import `bootstrap`;`import bootstrap` 发生在 `scripts/backtest_lib.py:9` 与
+`scripts/optimize.py:23` 这类框架侧脚本里。它的模块级副作用是 `chdir` 到仓库根 + 把仓库根插进 `sys.path`
++ `import vnpy.trader.setting`(`scripts/bootstrap.py:25-42`);`.env` 只在显式 `bootstrap.load_env()` 时加载。)
 
 **如果候选进程连基类都继承不了,现有候选全部写不出来,整个进化引擎就没有输入了。**
 这就是 Issue 里点名的"最难的一点"。
@@ -446,7 +460,7 @@ class Candidate(TrendAtr15mStrategy):
 
 | 路线 | 做法 | 优点 | 缺点 | 结论 |
 |---|---|---|---|---|
-| **A. 基类副本** | 把基类**拆成两份**:一份"框架版"(带风控,留在框架进程),一份"候选版"(只含指标与信号模板,不含任何风控计算),候选进程用候选版 | 候选写法几乎不变;风控计算物理上不在候选进程里 | 要维护两份基类,漂移风险;候选版仍需 `ArrayManager` | **采纳为主线** |
+| **A. 基类副本** | 把基类**拆成两份**:一份"框架版"(带风控,留在框架进程),一份"候选版"(只含指标与信号模板,不含任何风控计算),候选进程用候选版 | 候选写法**几乎**不变(见下方"代价的准确形态");风控计算物理上不在候选进程里 | 要维护两份基类,漂移风险;候选版仍需 `ArrayManager` | **采纳为主线** |
 | **B. 纯函数信号** | 约定候选只写 `def signal(bars, params) -> list[int]`,不继承任何类 | 最干净,边界最硬 | 现有候选全部要重写;`self.am` 这类指标访问要另给一套 API;与 `risk/constitution.py` 的"必须继承模板家族"运行时校验**直接冲突** | 作为**长期备选**,本轮不采纳 |
 | **C. 候选进程里跑完整基类** | 候选进程照旧 import 完整 `strategies` 包(含风控) | 改动最小 | 风控代码又回到候选进程;候选可改写基类 ⇒ 老问题复发 | **不采纳** |
 
@@ -500,8 +514,10 @@ flowchart LR
   **不是纯标准库**(第 5.3 节初稿里写的"仅标准库 + numpy"**不准确**,此处更正)。
 - ta-lib 是 C 扩展,候选进程的镜像/环境必须带它(`docker/research/requirements.txt` 里已有 `ta-lib`)。
   在 Windows 上,`ta-lib` 的 wheel 安装是已知的坑(需先装 C 库)——**这是实现前要实测的一步**。
-- 好处仍然成立:候选进程**不需要 vnpy 交易栈、不需要 CTP 库、不需要 `.env`**,
+- 好处仍然成立:候选进程**不需要 vnpy 交易栈、不需要 CTP 库、不需要读 `.env`**,
   `docker/research` 里候选侧的镜像可以比网关侧更小。
+  (注意:"不需要读 `.env`"指**不需要把凭据载入环境**;`.env` 文件本身是否在候选进程的可达路径内,
+  由 S4 的挂载/路径边界决定,不由这条保证。)
 - 代价:候选版的 `BarData` 与 vn.py 的 `BarData` 字段必须对齐(字段名与语义),框架在喂数据时做一次转换。
   这是一次性的机械工作,且可用测试锁住(同一段 K 线,两套 `BarData` 的字段逐一相等)。
 
@@ -549,6 +565,16 @@ flowchart LR
   在新架构里,候选**不在框架进程里**,所以"改写框架的类"根本做不到;这条校验的对象变了
   ——它应当改成校验"候选是否继承了**候选版模板**、是否只重写了允许重写的成员"。
   → **改造保留**(判据的参照系从"框架模板"换成"候选版模板")。
+- **两条会直接挡死候选的硬约束,必须与上面这条一起改**(原稿只提了 `check_class`,漏了前一条):
+  1. `scripts/research_api.py:500-502`:`if not (isinstance(candidate, type) and issubclass(candidate, CtaTemplate)):
+     raise JobError(EXIT_REFUSED, …)` —— 候选类**必须是 `vnpy_ctastrategy.CtaTemplate` 的子类**,
+     否则直接拒绝。候选版模板换了继承链 ⇒ 这条必须同步改成"必须是候选版模板的子类",
+     否则**所有候选都会被拒**。
+  2. `risk/constitution.py:1667-1675` `check_class`:`root = family_root(template);
+     if not (isinstance(candidate, type) and issubclass(candidate, root)): return ["候选类必须继承模板家族 …"]`
+     —— 这条的参照系(模板家族根)也要换成候选版模板。
+  → 两条**必须同时改**,否则候选在框架侧就被拒,连子进程都进不去。
+  → 实现时要有探针钉住:候选版模板的子类**通过**、不继承它的类**被拒**且拒绝理由指向"继承"这一条。
 - **参数校验**(`check_params`):**完全保留**,而且更重要 —— 参数在框架侧由框架自己塞进候选进程,
   候选改不了;但"调用方请求里带受保护参数"这条要继续在框架入口挡住。
 - **受保护对象指纹**(`snapshot_protected_state` / `check_protected_state`):
@@ -655,7 +681,9 @@ flowchart LR
 - 阈值**一个都不动**:`min_dsr=0.95`、`max_suspicious_sharpe=3.0`、`min_oos_sharpe=1.5`、
   `max_drawdown_pct=20.0`、`max_drawdown_yuan=2000.0`、`min_round_trips=150`、
   `min_random_percentile=95.0`、`min_stress_sharpe=1.0`、`min_sharpe_ci_lower=0.0`、
-  η = 1.10、预算 60、16 格。
+  η = 1.10(这 9 条 + η 全部在 main 的 `risk/promotion_gate.py:25-33` 与
+  `docs/adr/20261113-evolution-engine.md:151`)。
+  **分支侧另两个数**(查询预算 60、4×4=16 格)只在 `origin/feat/21-stage3` 上,本方案同样不动。
 - **随机入场对照**(`strategies/random_entry_15m_strategy.py`)是**框架自己的**代码,
   新架构下它跑在框架进程里 —— 这顺带解决一条旧残余:
   现在随机对照跑在候选同进程,候选理论上能改写对照策略的行为。
@@ -707,8 +735,17 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 
 **做什么**
 - 框架侧:切片生成器,从内存读行情并**只取训练/验证段**,断言不含 `datetime >= test_start`。
-  - 复用 `scripts/segment_windows.py` 的 `windows_for(key)["test"][0]`(= 2024-01-01,与
-  `walk_forward_optimizer.TEST_SEGMENT_START` 同值)与 `scripts/research_gate.py::slice_bars` 的同一把尺子。
+  - **尺子必须用门槛路径现有的那把**,不能换成 `segment_windows`:
+    - 现状测试段起点是 **两个 2024-01-01 常量** —— `scripts/research_gate.py:17` 的 `TEST_SEGMENT_START`
+      与 `scripts/walk_forward_optimizer.py:48` 的同名常量(有测试锁定两者一致),加上
+      `walk_forward_optimizer.py:94-110` 里写死的 W1~W3 窗口;`scripts/research_gate.py::slice_bars` 用的就是前者。
+    - **不要用 `scripts/segment_windows.py` 的 `windows_for(key)`**:那是给日线复权品种
+      (`CADJ`/`MAADJ`)用的另一套切分,`WINDOWS["test"]` 起点是 **2023-01-01**(只有 `WINDOWS_ADJ` 才是 2024-01-01)。
+      而门槛路径用的 key 是 `walk_forward_optimizer.KEY = "C15"`,`windows_for("C15")["test"][0]` = **2023-01-01**
+      —— 与门槛路径的 2024-01-01 **不是同一个值**。照它切会把候选放进去年更早的一段数据,
+      等于换了一把尺子(方向更保守,但与"同一把尺子"的前提不符,且会让历史结果不可比)。
+    - 结论:切片断言直接用 `research_gate.TEST_SEGMENT_START`,并在测试里锁它与
+      `walk_forward_optimizer.TEST_SEGMENT_START` 相等(现状已有这条锁定,迁移后不能丢)。
 - 候选进程不再收到任何路径:源码与切片都走 stdin;cwd 设为空临时目录。
 - 候选宿主脚本**不 import `bootstrap`**。
 
@@ -718,7 +755,9 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
    `data/research/trials.jsonl`(文件不存在)。
 3. 候选拿到的切片里**不含 2024-01-01 及之后**的 K 线(框架侧断言 + 候选侧长度/时间戳抽查)。
 4. 候选进程环境变量里**没有** `CTP_*` / `WEBHOOK_*` / `LIVE_*` / 毕昇 API key(沿用 `rs.sandbox_env` + 已知凭据值清单抽查)。
-5. 候选进程里 `os.environ` 看不到 `.env` 的内容(候选宿主不 `load_dotenv`)。
+5. 候选进程里 `os.environ` 看不到 `.env` 的内容(候选宿主不 `load_env`)——
+   但这只挡住"环境变量里的"凭据;`.env` **文件本身**在磁盘上,候选若能 `open()` 到它照样能读。
+   所以这条的真正保证来自 S4 的只读挂载 / 路径不可达,不是来自环境变量。
 
 **可回退点**:S2 只改"数据怎么送",不改回测语义;出问题时可退回"路径方式送切片"作为临时形态
 (带 S2 的验收标准失效的显式警告),但**不得**退回"给候选进程完整仓库"。
@@ -801,13 +840,13 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 | ADR | 既有结论 | 是否受影响 | 说明 |
 |---|---|---|---|
 | `20261113-evolution-engine` | **第 9 条 DSR ≥ 0.95 锁定** | **不受影响**(数值) | 阈值不动。但 DSR 的 **N 的计算位置**从"父进程预扣 + 子进程自报补记"变成"框架自己数" ⇒ N 变准 ⇒ DSR 变严 ⇒ **C3 冲突会更明显**(见下)。这是 ADR 已登记的取舍,不是新问题 |
-| `20261113-evolution-engine` | **C3:DSR 门槛在样本量下几乎不可达**(第 15 轮 codex 发现,待用户裁决) | **受正面影响,但需重新裁决** | 新架构让 DSR 第一次真正生效,C3 从"理论冲突"变成"现实阻塞"。ADR 已列出三个解法(①按家族累计 ②更长 OOS/多品种 ③重新审视可疑上限 3.0)。**本 Issue 不改任何阈值**,但把裁决时机提前到了实现之前 |
-| `20261113-evolution-engine` | **「候选与框架同进程」是残余风险**(第 27~34 轮反复登记,明写"真正闭合只能靠候选独立进程执行") | **正是本 Issue 要闭合的对象** | 本 ADR 的这一条残余登记**不需要修订**,而是被本方案兑现。第 8 节的"需拍板"里不含它 |
-| `20261113-evolution-engine` | **试验记账规则**(每格计 1 次、先记账再跑失败不退、全局累计、账本由可信父进程读写、子进程只收 `--prior-trials`、跨进程不加锁) | **部分需要修订** | "先记账再跑、失败不退、全局累计"三条**不变**;"子进程只收 `--prior-trials`"这条**失效**(不再有子进程);"跨进程不加锁"这条**由 PR #32 的哈希链 + 跨进程锁取代**;"网格数由子进程自报"这条**必须改成框架自己数**(第 6.1 节) |
+| `20261113-evolution-engine` | **C3:DSR 门槛在样本量下几乎不可达**(第 15 轮 codex 发现,待用户裁决)—— **该结论只在未合并的 `origin/feat/21-stage3` 上,main 的 ADR 只记到第 26 轮、不含 C3** | **受正面影响,但需重新裁决** | 新架构让 DSR 第一次真正生效,C3 从"理论冲突"变成"现实阻塞"。ADR 已列出三个解法(①按家族累计 ②更长 OOS/多品种 ③重新审视可疑上限 3.0)。**本 Issue 不改任何阈值**,但把裁决时机提前到了实现之前。合并 PR #24 时 C3 一并进 main |
+| `20261113-evolution-engine` | **「候选与框架同进程」是残余风险**(第 27~34 轮反复登记,明写"真正闭合只能靠候选独立进程执行")—— **同样只在 `origin/feat/21-stage3` 上,main 的 ADR 无此残余登记** | **正是本 Issue 要闭合的对象** | 本 ADR 的这一条残余登记**不需要修订**,而是被本方案兑现。第 8 节的"需拍板"里不含它 |
+| `20261113-evolution-engine` | **试验记账规则**(每格计 1 次、先记账再跑失败不退、全局累计、账本由可信父进程读写、子进程只收 `--prior-trials`、跨进程不加锁) | **部分需要修订** | "先记账再跑、失败不退、全局累计"三条**不变**;"子进程只收 `--prior-trials`"这条**失效**(不再有子进程);"跨进程不加锁"这条**由 PR #32 的哈希链 + 跨进程锁取代**;"网格数由子进程自报"这条**必须改成框架自己数**(第 6.1 节)。**归属说明**:前四条在 main 的 ADR `:36` 逐字可查,"网格数由子进程自报"是 `feat/21-stage3` 分支第 25 轮起的补记,**main 上没有** |
 | `20261113-evolution-engine` | **阶段 3 修订:反馈按信息来源分层、梯子量化、DSR 不选父代** | **不受影响** | 梯子/揭示层在网关侧,与候选进程无关 |
 | `20261113-evolution-engine` | **阶段 1 DSR 的 V 用理论值 1/(T-1)**;阶段 3 计划改经验方差 | **不受影响** | 公式不动,只换调用位置 |
 | `20261113-evolution-engine` | **PBO 延后**及其重启触发条件 | **不受影响** | |
-| `20261109-promotion-gate` | **8 条门槛 + 第 9 条 DSR;阈值不得事后放宽** | **不受影响** | 阈值与 `check_gate` 语义一字不改,只是调用点从子进程挪到框架进程 |
+| `20261109-promotion-gate` | **8 条门槛;阈值不得事后放宽**(该 ADR 的门槛表只有 8 条;第 9 条 DSR 登记在 `20261113-evolution-engine` 与 `risk/promotion_gate.py::GateThresholds.min_dsr`) | **不受影响** | 阈值与 `check_gate` 语义一字不改,只是调用点从子进程挪到框架进程 |
 | `20261112-candidate-evaluation` | **样本外 = 滚动验证段;测试段不可达;门槛数值不放宽** | **不受影响,但"测试段不可达"的实现机制升级** | 现状是"框架不把测试段喂给评估";新机制是"测试段根本没进候选进程的切片"。同一纪律,更强的保证 |
 | `20261111-risk-floor-immutability` | **风控底线不可优化;底线是约束不是变量** | **强化(不是修订)** | 新架构下风控计算**物理上不在候选进程里**。这与 ADR 意图一致,不需要改结论,但 ADR 里"靠运行时检测候选改写底线"的表述需要补一句"新架构下底线不与候选同处一进程" |
 | `20261112-research-sandbox-groundwork` / `20261112-research-sandbox-config-and-approval` | **纵深防御,不是沙盒;容器隔离已落地;真正边界是人工审批 + 容器隔离** | **部分需要修订措辞** | 现状容器隔离是"网关与沙盒一起在容器里";新架构下候选进程要么在同容器内的独立受限进程(Windows 开发路径),要么在独立容器(S4)。ADR 里"容器隔离已落地"这句话的含义要重述 |
@@ -840,6 +879,16 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 建议采纳**路线 A(基类副本)**;路线 B(纯函数信号)更干净但与
 `risk/constitution.py` 的"必须继承模板家族"运行时校验直接冲突,且现有候选全部要重写。
 需确认路线 A 可接受(尤其"候选版模板不含风控计算"这一取舍)。
+**同时要拍板 A 内部的一个子取舍**(原稿把两件事混成一件,这里拆开):
+**A1. 受限副本用同名包 `strategies/` 还是另起新名?**
+- 同名:现存 4 个候选**一字不改**即可 import(它们对仓库的依赖只有那一行 import)——
+  但候选进程里有个与框架同名同形的 `strategies` 包,两处模板容易混;
+  `check_class` 的"模板家族根"判定也要整体换基准。
+- 另起新名:候选源码那行 import 要改,`parameters` 声明要从表达式改成字面量
+  (第 9.1 节 R3 已列),毕昇提示词模板要改 → **候选格式 breaking change**。
+- **本方案建议另起新名**(名字不同才不会在评审与排障时把两份模板搞混),
+  并把 breaking change 的成本如实计入人天。
+**A2. 候选版模板不含风控计算** —— 这条是路线 A 的核心,建议照第 5.3 节执行。
 
 **拍板点 5:本 Issue 的依赖项要补一条。**
 Issue 现在写"先合并 PR #27"。但本方案的实施**强烈依赖 PR #32(Issue #31)**
@@ -885,8 +934,24 @@ Issue 现在写"先合并 PR #27"。但本方案的实施**强烈依赖 PR #32(I
   → 候选源码**必须改**成 import 候选版模板。**这是一次候选格式的 breaking change**,
   所有现存候选(`pending_strategies/` 下 4 个)都要改,毕昇的提示词模板也要改。
   → **这是本方案最大的落地成本,必须明确写出来**,不能装作"零改动"。
+- **代价的准确形态(更正)**:breaking change 之所以产生,是因为本方案**选择让候选版模板另起新名**
+  (第 5.3 节开头的要求)。**它不是"受限进程"的技术必然** —— 现存 4 个候选对仓库的依赖**只有那一行 import**
+  (核实 `pending_strategies/*.py:1` 各自唯一的 import 行);若把受限副本以**同名包 `strategies/`**
+  放进候选进程的 `sys.path`,候选源码**一字不改**也能 import 成功。
+  → 真正的取舍是:**同名副本**(候选零改动)vs **另起新名**(候选要改,但不与 `strategies` 包重名混淆、
+  且 `check_class` 的"模板家族根"判定能整体换基准)。本方案选后者,把代价如实记在这里,
+  **不把它说成不可省的硬约束**。这直接关系到拍板点 4 的取舍口径。
 - 候选版模板与框架版模板的**漂移**:两份模板的指标/时序逻辑若不一致,新旧路径就不等价。
   → 必须有"同一段 K 线、同一参数,新旧两条路径给出**逐根相同**的信号序列"这条测试。
+- **`parameters` 声明是表达式,不是字面量(方案缺的一块)**:
+  现存 4 个候选全部写成 `parameters = TrendAtr15mStrategy.parameters + ["breakout_n"]`,
+  而基类的 `parameters` 含受保护项(`strategies/trend_atr_strategy.py:69-73`:
+  `fast_window / slow_window / atr_mult / atr_window / risk_budget / take_profit_r / max_daily_losses / history_vt_symbol`)。
+  `param_grid` 在现存候选里**确实都是字面量 dict**(AST 方案可行),但 `parameters` 不是。
+  → 新架构下 `parameters` 必须**由候选版模板重新内联**(候选写 `parameters = [...]` 字面量),
+  或者由框架侧注入受保护参数。这一条是**第二处候选源码 breaking change**,原稿漏了。
+  → 与第 5.5 节"参数校验完全保留"之间还缺衔接:框架侧注入与候选侧声明如何对齐,
+  要在实现前定死(否则候选声明的参数集与框架实际传参不一致,`param_grid` 里出现框架没传的参数就会静默取默认值)。
 
 **R4 · 候选进程拿不到 `numpy` 怎么办。**
 `ALLOWED_MODULE_ROOTS` 里有 numpy/pandas(白名单),但 `origin/feat/31-fs-capability` 分支把它们移出了默认白名单
@@ -933,17 +998,29 @@ S1 建议保留旧的同进程路径作回退。**两套并存就是 Issue 说�
 - 候选进程在 Windows 上用 Job Object 的实际效果(本机未实测;`pywin32` 与 `ctypes` 两条路都没试过)。
 - seccomp 过滤在 Python 解释器里的可用性与性能代价(未实测;`python-seccomp` 的维护状态未核实)。
 - `evaluate` 在新架构下的实际耗时(没有基准数据)。
-- 毕昇提示词模板(`tools/bisheng/templates.json` 等)里有多少内容依赖"候选继承 `strategies.*`"——
-  只粗略看过存在提示词文件,**没有逐条核对**。
+
+**更正一条**:原文把"毕昇提示词对 `strategies.*` 基类的依赖"也列进"没法核实",这不成立——
+`tools/bisheng/build_v3.py` 的 `SYSTEM_CODE` 里**逐字写死了**候选模板
+(`from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy`、
+`parameters = TrendAtr15mStrategy.parameters + ["breakout_n"]`、三轴 `param_grid` 规则,
+核实 `tools/bisheng/build_v3.py:23,27-36`),依赖是**确凿的**,这直接支撑"提示词模板也要改"这条代价。
+反而是 `tools/bisheng/templates.json` **核实不了**——它是 `.gitignore` 排除的本地产物,不在仓库里。
+所以这一条的形态是:**已知依赖确实存在且范围清楚;未知的只是本机那份生成产物的具体内容**。
 
 ---
 
 ## 10. 工作量估计
 
 **依据说明**:下列人天是按"参照本仓库同类改动的实际规模"估的,不是拍脑袋。
-本仓库最近几次同量级改动的规模参照:
-- Issue #26 沙盒加固(PR #27):跨 8 个文件、约 2600 行新增(含测试),多轮 codex 复审,累计投入远超 10 人天。
-- Issue #31 文件能力收口(PR #32):8 个文件、约 300 行新增 + 300 行测试,同样多轮复审。
+本仓库最近两次同量级改动的**实测规模**(用 `git diff --shortstat` 核过):
+- Issue #26 沙盒加固(PR #27,合并提交 `ba325e0` 相对第一父提交):**16 个文件、5943 行新增、69 行删除**
+  —— 其中 `scripts/research_sandbox.py` 约 +1603、`tests/` 8 个文件合计约 +3545、ADR 约 +724。
+- Issue #31 文件能力收口(PR #32,`origin/feat/31-fs-capability` 相对 `origin/main`):
+  **21 个文件、3359 行新增、63 行删除** —— 其中 `tests/test_fs_capability_closure.py` 约 +1761、
+  `risk/ledger_chain.py` +205、`risk/ledger_admin.py` +202、`scripts/research_ledger.py` +114、
+  `scripts/research_sandbox.py` +469。
+  两条都经过 8~12 轮 codex 复审,累计投入远超 10 人天。
+  (原稿把这两条估成"8 文件 / 2600 行"与"8 文件 / 300 行",**低估了 2 倍与 10 倍** —— 会直接压低下面的人天区间,故按实测值改。)
 - `scripts/research_sandbox.py` 现约 2856 行、`risk/constitution.py` 约 1972 行 —— 这两个文件是本方案的
   主要改动面(大量删除)。
 
@@ -979,7 +1056,7 @@ G8 双轮复审本身要预留 **10~20 人天**。**总投入估计 35~60 人天
 | A3 | 候选返回的任何数字都不进入框架的指标计算 | 框架侧 AST 不变量 + 端到端探针(候选报 `sharpe=42`,落盘结果的夏普不变) |
 | A4 | 框架独立算指标:夏普/回撤/往返/DSR/门槛判定全部在框架进程 | 代码路径核对 + 探针(框架进程 `sys.modules` 里没有候选代码) |
 | A5 | 试验次数由框架独立数:账本 count ≥ 实际跑的格子数,在崩溃/超时/自报造假三种情形下都成立 | 账本比对 + 变异验证 |
-| A6 | 既有阈值一个都不动:DSR ≥ 0.95、可疑夏普上限 3.0、η = 1.10、预算 60、16 格 | `GateThresholds` 快照测试 + ADR 逐条核对 |
+| A6 | 既有阈值一个都不动:DSR ≥ 0.95、可疑夏普上限 3.0、η = 1.10(以及分支侧的预算 60、16 格) | `GateThresholds` 快照测试 + ADR 逐条核对 |
 | A7 | 新旧两条路径给出**逐根相同**的信号序列与相同的夏普/回撤/往返 | 等价性测试(同候选、同参数、同窗口) |
 | A8 | 每条边界都有放行 + 拦截双向探针与变异验证 | 测试清单逐条核对 |
 | A9 | G8 两轮独立复审 ≥ 45/50 | 双轮 codex 复审 |
