@@ -39,8 +39,14 @@ def check_live_admission(environment: str, on_simnow: bool, approval_path: Path)
     return True, f"实盘准入批准:策略 {record['strategy']},批准人 {record['approver']},时间 {record['approved_at']}。"
 
 
-def write_approval(path: Path, strategy: str, metrics: CandidateMetrics, approver: str, now: datetime) -> list[str]:
-    """跑晋级门槛;只有全部通过才写批准文件。返回未通过的条目(空列表 = 已写出)。"""
+def write_approval(path: Path, strategy: str, metrics: CandidateMetrics, approver: str, now: datetime,
+                   sha256: str | None = None) -> list[str]:
+    """跑晋级门槛;只有全部通过才写批准文件。返回未通过的条目(空列表 = 已写出)。
+
+    `sha256`:这份批准对应**哪一段字节**。给了它,运行时装载才能核对
+    「批准通过记录」与「实际要跑的那份字节」是同一份——
+    否则换个文件就能蹭别人的晋级通过记录(Issue #37)。
+    """
     failures = check_gate(metrics)
     if failures:
         return failures
@@ -51,6 +57,8 @@ def write_approval(path: Path, strategy: str, metrics: CandidateMetrics, approve
         "gate_failures": [],
         "metrics": asdict(metrics),
     }
+    if sha256:
+        record["sha256"] = str(sha256).strip().lower()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return []

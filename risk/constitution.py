@@ -584,6 +584,58 @@ def _self_instance_attr(node: ast.AST) -> bool:
     return bool(path) and len(path) == 2 and path[0] == "self"
 
 
+def _gate_attr_violations(tree: ast.AST) -> list[str]:
+    """闸门函数名的**任何**写入形态都要拒(第 4 轮 codex 实测的 M1)。
+
+    只看 `x.attr = v` 是不够的——实测这几种改法全都绕过了:
+      - `x.attr: int = v`(AnnAssign)
+      - `a, b = v`(元组解包)
+      - `x.attr += v`(AugAssign)
+      - `del x.attr`
+      - `setattr(obj, "attr", v)` / `delattr(obj, "attr")`
+      - `vars(obj)["attr"] = v`
+    名字是**字符串**或藏在容器里时,按属性名查黑名单看不见它。
+    """
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        # ① 属性写入/删除(含 AnnAssign 与元组解包里的元素)
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            for element in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                if isinstance(element, ast.Attribute) and element.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 改写了闸门函数 {element.attr}"
+                                    "(把「拒绝」这件事的执行者换掉)")
+        # ② `del x.attr`
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 删除了闸门函数 {target.attr}")
+        # ③ `setattr(obj, "名字", v)` / `delattr(obj, "名字")`
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in ("setattr", "delattr") and len(node.args) >= 2:
+            name_node = node.args[1]
+            if isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) \
+                    and name_node.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                findings.append(f"第 {node.lineno} 行: 按名改写了闸门函数 {name_node.value}"
+                                "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
+        # ④ `vars(obj)["名字"] = v`
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Call) \
+                        and isinstance(target.value.func, ast.Name) and target.value.func.id == "vars":
+                    key = target.slice
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str) \
+                            and key.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(f"第 {node.lineno} 行: 通过 vars() 改写了闸门函数 {key.value}")
+    return findings
+
+
 def _setattr_protected_name(node: ast.Call, c: Constitution) -> str | None:
     """`setattr(obj, "名字", 值)` 里的「名字」是不是受保护成员。
 
@@ -1037,6 +1089,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     # 而位置信息只有走完整棵树才认得全(赋值、海象、调用实参、返回、字面量)。
     for lineno, message in _container_escape_findings(tree):
         findings.append(f"第 {lineno} 行: {message}(拿到之后可以原地改写它, 伪造回测结果)")
+    # 闸门函数名的**任何**写入形态(AnnAssign / 元组解包 / AugAssign / del /
+    # setattr / delattr / vars()[...])——第 4 轮 codex 实测:只挡 `x.attr = v` 会被绕开。
+    findings.extend(_gate_attr_violations(tree))
     return findings
 
 

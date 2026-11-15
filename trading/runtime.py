@@ -297,6 +297,11 @@ class TradingRuntime:
             return (f"批准目录必须固定为 {root / 'approved'},当前是 {approved_dir};"
                     f"把它指到别处会让候选目录与运行时认的目录混为一谈")
         approvals_file = root / "data" / "research-control" / "approvals.json"
+        # 第三、四道门(与「人批准」独立的记录):「已收菜」(收菜那道把源码打给人看的关口)
+        # 与「晋级门槛通过」(人工审阅挡不住「这策略没有统计优势」)。
+        # 今天没有任何候选通过过门槛 → 这条路实际上**关着**(见 Issue #37)。
+        collected_file = root / "data" / "research-control" / "collected.json"
+        promotion_file = root / "data" / "state" / "promotion_approval.json"
         # 批准目录整体自检:里面有任何一个文件与账本不一致,就拒绝启动(fail-closed)。
         problems = approved_guard.check_approved_consistency(
             approved_dir=approved_dir, approvals_file=approvals_file)
@@ -311,6 +316,8 @@ class TradingRuntime:
                 class_name=cfg.approved_class_in_file,
                 setting=cfg.strategy_setting,
                 template_name=cfg.approved_template,
+                collected_file=collected_file,
+                promotion_file=promotion_file,
             )
         except approved_guard.ApprovedLoadError as exc:
             return str(exc)

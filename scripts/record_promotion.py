@@ -38,6 +38,9 @@ def main(argv: list[str] | None = None, now: datetime | None = None) -> int:
     parser.add_argument("--strategy", required=True, help="策略名称(写入批准记录)")
     parser.add_argument("--approver", required=True, help="批准人(写入批准记录)")
     parser.add_argument("--out", type=Path, default=bootstrap.ROOT / APPROVAL_RELATIVE, help="批准文件路径")
+    parser.add_argument("--sha256", default="",
+                        help="这份晋级通过对应**哪一段字节**(sha256);"
+                             "运行时装载会核对它与实际要跑的文件是不是同一份")
     args = parser.parse_args(argv)
 
     try:
@@ -49,7 +52,8 @@ def main(argv: list[str] | None = None, now: datetime | None = None) -> int:
         print("--strategy 与 --approver 不能为空。", file=sys.stderr)
         return EXIT_BAD_INPUT
 
-    failures = write_approval(args.out, args.strategy.strip(), metrics, args.approver.strip(), now or datetime.now())
+    failures = write_approval(args.out, args.strategy.strip(), metrics, args.approver.strip(),
+                              now or datetime.now(), sha256=args.sha256 or None)
     if failures:
         print("未通过晋级门槛,没有写出批准文件:", file=sys.stderr)
         for line in failures:

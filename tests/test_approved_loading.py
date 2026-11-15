@@ -57,13 +57,33 @@ def approved(tmp_path):
     return approved_dir, ledger
 
 
-def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: str = CANDIDATE) -> str:
+def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: str = CANDIDATE,
+             collected: bool = True, promotion: bool = True) -> str:
+    """装一份「已批准 + 已收菜 + 晋级通过」的文件,返回它的 sha256。
+
+    三条记录是三道**独立**的门:
+    - 批准账本:人读过代码、粘过哈希;
+    - 收菜记录:经过了收菜那道关口(收菜时把源码打给人看);
+    - 晋级通过:这个策略**统计上有优势**(人工审阅挡不住这条)。
+    """
     path = approved_dir / name
     path.write_text(source, encoding="utf-8")
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     data = json.loads(ledger.read_text(encoding="utf-8"))
     data[sha] = {"name": name, "at": "2026-11-14T00:00:00"}
     ledger.write_text(json.dumps(data), encoding="utf-8")
+    root = approved_dir.parent
+    if collected:
+        collected_file = root / "data" / "research-control" / "collected.json"
+        collected_file.parent.mkdir(parents=True, exist_ok=True)
+        collected_file.write_text(json.dumps({sha: {"name": name, "collected_at": "2026-11-14T00:00:00"}}),
+                                 encoding="utf-8")
+    if promotion:
+        promotion_file = root / "data" / "state" / "promotion_approval.json"
+        promotion_file.parent.mkdir(parents=True, exist_ok=True)
+        promotion_file.write_text(json.dumps({"strategy": name, "sha256": sha, "approver": "test",
+                                              "approved_at": "2026-11-14T00:00:00", "gate_failures": []}),
+                                 encoding="utf-8")
     return sha
 
 
@@ -321,8 +341,9 @@ sys.exit(1)
 def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
     """端到端载荷:把 300 元单笔预算换成一个恒 0 的函数,再把第四层关掉。
 
-    静态层对 `sys.modules[...]` + `setattr` 这条路**看不见**(实测 screen_source 返回 []),
-    第四层是最后的兜底——所以这一条必须过。
+    静态层现在**看得见**这条路了(第 3 轮加的「按名改写」规则:名字是字符串时
+    按属性名查黑名单看不见它),所以它在 exec **之前**就被拒;
+    第四层仍然是兜底——这条用例断言的是「整条链最终拒绝了它」。
     """
     approved_dir, ledger = approved
     _install(approved_dir, ledger, source=(
@@ -590,6 +611,7 @@ def test_a_deleted_or_emptied_gate_does_not_crash_the_loader(approved):
         out = _probe_load(approved_dir, ledger, "")
         assert "CRASH" not in out, out
         assert "REFUSED" in out, out
+        assert "NOT_REFUSED" not in out, out
 
 
 def test_a_replaced_constitution_loader_is_refused(approved):
@@ -615,3 +637,34 @@ def test_two_clean_loads_are_allowed(approved):
     out = _probe_load(approved_dir, ledger, "")
     # 注意 "NOT_REFUSED" 里也含 "REFUSED",所以要断言的是「没被拒」的那一边
     assert "NOT_REFUSED" in out, out
+
+
+def test_the_runtime_refuses_without_the_promotion_record(make_runtime, approved):
+    """**没有晋级门槛通过记录 → 拒绝装载**。
+
+    这是第 4 轮 codex 建议的折中:把「运行时装载候选」这条路**关着**,
+    直到「运行时装载前的晋级门槛闸门」(Issue #37)真正落地。
+    人工审阅挡得住「代码里有坏东西」,挡不住「这策略没有统计优势」。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, promotion=False)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "晋级" in problem
+
+
+def test_the_runtime_refuses_without_the_collected_record(make_runtime, approved):
+    """人工 `cp` 把文件拷进 approved/ → 没有「已收菜」记录 → 拒绝装载。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, collected=False)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "收菜" in problem

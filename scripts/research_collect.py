@@ -39,6 +39,7 @@ import os
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import research_config as rc
@@ -222,8 +223,27 @@ def collect_job(strategy: str, input_fn=None, write=None, replace: bool = False)
     say(f"已收菜: {target.name}(绑定到上面的 sha256;代码改动后需要重新批准并重新收菜)")
     if previous is not None:
         say(f"旧版本已保留为: {previous.name}")
+    _mark_collected(paths["collected_file"], sha, source.name)
     return {"collected": True, "already": already, "name": source.name,
             "approved_dir": approved_dir.name, "replaced": previous is not None}
+
+
+def _mark_collected(collected_file: Path, sha: str, name: str) -> None:
+    """写「已收菜」记录:这段字节**经过了收菜那道关口**。
+
+    运行时要求这条记录存在——人工 `cp` 把文件拷进 `approved/` 就绕不过收菜
+    (收菜时会把源码打给人看、并要求粘贴完整哈希)。
+    """
+    path = Path(collected_file)
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}                     # 读不出来就当空,下面整份重写
+    data[sha] = {"name": name, "collected_at": datetime.now().isoformat(timespec="seconds")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
 
 def list_job(write=None) -> dict:

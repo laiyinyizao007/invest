@@ -62,3 +62,45 @@ def is_approved_sha(sha256: str, approvals_file: Path | str) -> bool:
 def is_approved_path(path: Path | str, approvals_file: Path | str) -> bool:
     """按**文件当前内容**查批准记录(会读一次文件算哈希)。"""
     return file_sha256(path) in load_approvals(approvals_file)
+
+
+def load_collected(collected_file: Path | str) -> dict:
+    """读「已收菜」记录:`{sha256: {"name":..., "collected_at":...}}`。
+
+    为什么单独一个文件:批准账本 `approvals.json` 的**写入口必须唯一**
+    (`research_sandbox.record_approval`;有测试用 AST 锁住「没有别的写入者」)。
+    收菜是另一件事——它证明的是「这段字节**经过了收菜那道关口**」——
+    所以另开一个文件,写入口也只有收菜脚本一个。
+
+    运行时要求这个记录存在:人工 `cp` 把文件拷进 `approved/` 就绕不过收菜那道关口
+    (收菜时会把源码打给人看、并要求粘贴完整哈希)。
+    """
+    path = Path(collected_file)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ApprovalLedgerError(f"收菜记录无法读取,拒绝继续(fail-closed): {exc}") from exc
+    if not isinstance(data, dict):
+        raise ApprovalLedgerError("收菜记录格式错误(应为对象)")
+    return data
+
+
+def load_promotion(promotion_file: Path | str) -> dict:
+    """读晋级门槛的批准文件(`data/state/promotion_approval.json`)。
+
+    这是**第二道**与「人批准」独立的门:人工审阅挡得住「代码里有坏东西」,
+    挡不住「这策略没有统计优势」。今天没有任何候选通过过门槛,
+    所以这道门实际上把「从 `approved/` 装载」这条路**关着**(见 Issue #37)。
+    """
+    path = Path(promotion_file)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ApprovalLedgerError(f"晋级批准文件无法读取,拒绝继续(fail-closed): {exc}") from exc
+    if not isinstance(data, dict):
+        raise ApprovalLedgerError("晋级批准文件格式错误(应为对象)")
+    return data

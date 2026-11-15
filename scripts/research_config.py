@@ -43,6 +43,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
                 "rate_limit_per_minute": 30, "max_body_bytes": 131072},
     "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
               "approvals_file": "data/research-control/approvals.json",
+              "collected_file": "data/research-control/collected.json",
               "approved_dir": "approved"},
     "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": [], "allowed_modules": []},
 }
@@ -73,6 +74,9 @@ RESERVED_FILES = {".env", ".env.simnow.bak"}
 # 改成**结构约束**:目录固定、文件名固定,没有借名的余地。
 CONTROL_DIR = ("data", "research-control")
 APPROVALS_FILE_NAME = "approvals.json"
+# 「已收菜」记录:收菜脚本写、运行时装载读。证明这段字节**经过了收菜那道关口**
+# (人工 cp 拷进 approved/ 就绕不过它)。
+COLLECTED_FILE_NAME = "collected.json"
 TOKEN_FILE_NAME = "gateway.token"
 # 批准目录:固定在项目根下的 `approved/`。收菜往这里写,运行时装载只从这里读。
 APPROVED_DIR_NAME = "approved"
@@ -157,6 +161,9 @@ def _validate(cfg: dict) -> None:
     # 位置不能配——配了就有「把批准目录指到别处」的口子(比如指到 strategies/ 里,
     # 于是候选目录与受信目录混为一谈)。它同时在 RESERVED_DIRS 里,所以不能走上面那条
     # 「不得指向受保护目录」的通用检查(那条针对的是**可指向别处**的路径),改为结构约束。
+    collected = _relative_inside(cfg["paths"]["collected_file"], "paths.collected_file")
+    if collected.parts != CONTROL_DIR + (COLLECTED_FILE_NAME,):
+        raise ConfigError(f"paths.collected_file 必须固定为 {'/'.join(CONTROL_DIR)}/{COLLECTED_FILE_NAME}")
     approved = _relative_inside(cfg["paths"]["approved_dir"], "paths.approved_dir")
     if approved.parts != (APPROVED_DIR_NAME,):
         raise ConfigError(f"paths.approved_dir 必须固定为 {APPROVED_DIR_NAME}")
@@ -196,6 +203,7 @@ def resolve_paths(cfg: dict, root: Path) -> dict[str, Path]:
         "pending_dir": cfg["paths"]["pending_dir"], "results_dir": cfg["paths"]["results_dir"],
         "approvals_file": cfg["paths"]["approvals_file"], "token_file": cfg["gateway"]["token_file"],
         "approved_dir": cfg["paths"]["approved_dir"],
+        "collected_file": cfg["paths"]["collected_file"],
     }
     resolved = {}
     for key, rel in out.items():
