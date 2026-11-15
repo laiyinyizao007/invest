@@ -289,7 +289,7 @@ flowchart TD
 ```
 
 - **L0 是本方案的地基,也是唯一必须先落地的一层。** 它单独就把"候选改写框架模块状态"
-  和"候选伪造指标"变成不可能——这两条是四轮复审里分数起不来的主因。
+  和"候选伪造指标"变成不可能——这两条是五轮复审里分数起不来的主因。
 - L1~L3 是纵深防御的加固,可在 L0 落地后按平台分批推进。
 
 ### 4.3 L0+L1:候选进程怎么起(跨平台最小可用形态)
@@ -297,16 +297,21 @@ flowchart TD
 现状 `spawn_child`(`scripts/research_api.py:192`)已经用 `Popen` 起子进程,只是那个子进程里同时跑着框架逻辑。
 改造点很小:
 
-```text
-父进程(框架)
-  ├─ 起候选进程: python -I -S? scripts/research_candidate_host.py --class <名>
-  │    · cwd = 一个空的临时目录(不是仓库根)
-  │    · env = rs.sandbox_env(os.environ) 白名单(沿用,已排除 CTP_*/WEBHOOK_*/LIVE_*)
-  │    · 候选源码以**源码文本**经 stdin 传入(或写到临时目录下的只读副本),不传仓库内路径
-  │    · 不传任何行情文件路径:切片由父进程从内存读出后序列化进 stdin
-  │    · stdout:控制消息 JSON(固定前缀 CANDIDATE_SIGNALS_V1:) + 长度前缀二进制信号帧;其余输出丢弃或只进本机日志
-  └─ 读信号序列 → 自己做回测/指标/门槛/记账/落盘
+```mermaid
+flowchart TD
+    P["父进程(框架)"]
+    P -->|"spawn: python -E -P scripts/research_candidate_host.py --class <名>"| C["候选进程"]
+    C -->|"stdout: CANDIDATE_SIGNALS_V1: 控制 JSON + 长度前缀二进制信号帧"| P
+    P --> W["框架自己:回测 / 指标 / 门槛 / 记账 / 落盘"]
 ```
+
+候选进程的约束:
+
+- cwd = 一个空的临时目录(不是仓库根)。
+- env = `rs.sandbox_env(os.environ)` 白名单(沿用,已排除 `CTP_*`/`WEBHOOK_*`/`LIVE_*`)。
+- 候选源码以**源码文本**经 stdin 传入(或写到临时目录下的只读副本),不传仓库内路径。
+- 不传任何行情文件路径:切片由父进程从内存读出后序列化进 stdin。
+- stdout 只认固定前缀 `CANDIDATE_SIGNALS_V1:` 的控制消息与随后的长度前缀二进制帧;其余输出丢弃或只进本机日志。
 
 要点:
 
