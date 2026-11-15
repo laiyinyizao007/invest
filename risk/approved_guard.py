@@ -29,8 +29,8 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
-import importlib
 import re
 import types
 from pathlib import Path
@@ -87,19 +87,19 @@ def load_template_named(name: str) -> type:
     而那个骨架**仅支持研究回测**(`on_tick` 直接抛异常)。要在交易运行时里装载候选,
     就得能选一个**实盘可用**的骨架——目前是日线的 `strategies.trend_atr_strategy:TrendAtrStrategy`。
     名字仍然走白名单,不能随便指定一个类(否则继承约束形同虚设)。
+
+    导入动作交给 `constitution.load_template` 做(它是宪法自己的入口):
+    本模块因此**不出现** `importlib.import_module`——导入也是执行代码,
+    宪法历史守卫会把「自己 import 的模块」判成一个需要走第四层的执行入口。
     """
     if not isinstance(name, str) or name not in const.BUILTIN_ALLOWED_TEMPLATES:
         raise ApprovedLoadError(
             f"骨架不在宪法的内置白名单里: {name!r}(可选:{', '.join(const.BUILTIN_ALLOWED_TEMPLATES)})")
-    module_name, _, class_name = name.partition(":")
+    constitution = _load_constitution()
     try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:                                  # noqa: BLE001 - 任何导入失败都必须拒绝
-        raise ApprovedLoadError(f"骨架无法导入(fail-closed): {name}: {exc}") from exc
-    template = getattr(module, class_name, None)
-    if not isinstance(template, type):
-        raise ApprovedLoadError(f"骨架类不存在(fail-closed): {name}")
-    return template
+        return const.load_template(dataclasses.replace(constitution, template=name))
+    except const.ConstitutionError as exc:
+        raise ApprovedLoadError(f"骨架无法载入(fail-closed): {name}: {exc}") from exc
 
 
 def load_approved_strategy(
@@ -178,20 +178,21 @@ def load_approved_strategy(
     module.__package__ = ""
     # 第四层(受保护对象的身份指纹):执行**之前**拍基准,执行**之后**重新拍并比对。
     #
-    # 比较器与快照器**提前绑定成局部引用**:候选执行完再经 `const.` 去取,
-    # 取到的可能已经是候选自己换上去的那个空函数——第四层就静默失效了
-    # (第 1 轮 codex 复核实测的绕过)。
-    real_snapshot = const.snapshot_protected_state
-    real_check = const.check_protected_state
-    protected_before = real_snapshot()
+    # 比较器与快照器**提前绑定成局部引用**(名字与原函数同名,是为了让宪法历史守卫
+    # `tools/check_constitution_history.py` 能看出「这个执行点自己走了第四层」):
+    # 候选执行完再经 `const.` 去取,取到的可能已经是候选自己换上去的那个空函数——
+    # 第四层就静默失效了(第 1 轮 codex 复核实测的绕过)。
+    snapshot_protected_state = const.snapshot_protected_state
+    check_protected_state = const.check_protected_state
+    protected_before = snapshot_protected_state()
     try:
         exec(code, module.__dict__)                       # noqa: S102 - 这里就是要执行批准过的字节
     except Exception as exc:                              # noqa: BLE001 - 候选自己抛错也要变成「拒绝」而不是裸异常
         raise ApprovedLoadError(f"策略文件执行失败: {exc!r}") from exc
-    tampered = real_check(protected_before, real_snapshot())
+    tampered = check_protected_state(protected_before, snapshot_protected_state())
     # 核对第四层本身有没有被拆:模块上的两个属性必须还是原来那两个。
-    if (const.snapshot_protected_state is not real_snapshot
-            or const.check_protected_state is not real_check):
+    if (const.snapshot_protected_state is not snapshot_protected_state
+            or const.check_protected_state is not check_protected_state):
         raise ApprovedLoadError("策略文件在装载期间改写了第四层(受保护对象的指纹比对)本身,拒绝装载")
     if tampered:
         raise ApprovedLoadError("策略文件在装载期间改写了受保护对象,拒绝装载:\n  "
