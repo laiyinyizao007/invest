@@ -55,6 +55,56 @@ class ApprovedLoadError(Exception):
     """装载被拒。调用方必须拒绝启动,不得降级。"""
 
 
+# ---- 闸门函数:在**模块导入时**绑成常量 ----
+#
+# 为什么不能等到装载时再去 `const.` 上取:候选改写的是**模块属性**,
+# 而我们在装载时取到的就已经是它换上去的那个了(第 1 轮 codex 实测的绕过:
+# `const.check_protected_state = lambda *a, **k: []` → 第四层恒为「没被改写」)。
+#
+# 绑成常量之后:① 我们用的始终是「导入时那个真函数」;
+# ② 装载前后逐一核对「模块上的属性还是不是那个真函数」——
+# 候选换掉了就当场发现,并把整个进程标记为**已中毒**(下面 `_POISONED`)。
+#
+# 清单:不只第四层那两个,筛查、类级校验、参数校验、账本读取**全部**在内——
+# 候选能把它们一个个换掉,而它们正是「拒绝」这件事的执行者。
+_CANONICAL_GATES: dict[str, object] = {
+    "snapshot_protected_state": const.snapshot_protected_state,
+    "check_protected_state": const.check_protected_state,
+    "screen_source": const.screen_source,
+    "check_class": const.check_class,
+    "check_params": const.check_params,
+}
+_CANONICAL_LEDGER: dict[str, object] = {
+    "load_approvals": approval_ledger.load_approvals,
+    "file_sha256": approval_ledger.file_sha256,
+    "is_approved_sha": approval_ledger.is_approved_sha,
+}
+# 进程级中毒标记:一次装载被拒之后,本进程**不再允许**装载任何候选。
+# 理由:被拒的候选可能已经改写了进程里的东西(改写发生在 exec 期间,拒绝发生在比对之后),
+# 那次改写**留在进程里**。若允许第二次装载,第二次就会绑到已被换掉的闸门上。
+# 运行时是「一进程一次装载」,失败即退出;这里把这条约定**变成代码强制**。
+_POISONED = False
+
+
+def _gates_intact() -> list[str]:
+    """核对所有闸门函数还是导入时那批(候选有没有换掉它们)。"""
+    broken: list[str] = []
+    for name, canonical in _CANONICAL_GATES.items():
+        if getattr(const, name, None) is not canonical:
+            broken.append(f"risk.constitution.{name}")
+    for name, canonical in _CANONICAL_LEDGER.items():
+        if getattr(approval_ledger, name, None) is not canonical:
+            broken.append(f"risk.approval_ledger.{name}")
+    return broken
+
+
+def _refuse_poisoned(reason: str) -> None:
+    """记下「本进程已中毒」并拒绝。"""
+    global _POISONED
+    _POISONED = True
+    raise ApprovedLoadError(reason)
+
+
 def _read_approved_bytes(approved_dir: Path, file_name: str) -> tuple[Path, bytes]:
     """定位并读取 `approved/` 里的一个文件(只读一次字节)。"""
     if not isinstance(file_name, str) or not SAFE_FILE_NAME.fullmatch(file_name):
@@ -109,7 +159,6 @@ def load_approved_strategy(
     file_name: str,
     class_name: str = "Candidate",
     setting: dict | None = None,
-    template: type | None = None,
     template_name: str | None = None,
 ) -> tuple[type, str]:
     """装载并返回 `(策略类, 这份字节的 sha256)`。任何一项校验不过 → `ApprovedLoadError`。
@@ -118,7 +167,20 @@ def load_approved_strategy(
     换批准版本就换命名空间,旧版本的持久化状态不会被新版本继承。
 
     `setting` 是要传给策略的设置字典:只校验**风控底线**参数(见 `RISK_FLOOR_PARAMS`)。
+
+    **被投毒之后不再装载**:一次被拒的候选可能已经把进程改坏了(改写发生在 exec 期间,
+    拒绝发生在比对之后),那次改写留在进程里。所以一旦发现闸门或受保护对象被改写,
+    本进程就被标记为**已中毒**,之后任何装载一律拒绝(要装别的候选就起新进程)。
+    正常情况下(没有投毒)可以多次装载。
     """
+    if _POISONED:
+        raise ApprovedLoadError(
+            "本进程已经尝试装载过一次候选,不再允许第二次"
+            "(上一次可能已改写进程状态;请起新进程)")
+    broken = _gates_intact()
+    if broken:
+        _refuse_poisoned("装载闸门本身已被改写,拒绝装载(本进程已中毒):" + ", ".join(broken))
+
     if not isinstance(class_name, str) or not SAFE_CLASS_NAME.fullmatch(class_name):
         raise ApprovedLoadError(f"策略类名不合法: {class_name!r}")
 
@@ -136,30 +198,32 @@ def load_approved_strategy(
             f"(批准绑定的是字节;改过代码就要重新批准并重新收菜)")
 
     # ③ 合规:静态筛查 + 风控底线参数校验
+    # **用清单文件里的那一份**(const.load()),不是内置默认值:
+    # 清单文件的设计就是「只能追加」,将来往 JSON 里加保护项,运行侧也得认。
+    constitution = _load_constitution()
     try:
         source = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ApprovedLoadError(f"策略文件不是合法 UTF-8: {exc}") from exc
-    findings = const.screen_source(source)
+    findings = const.screen_source(source, constitution)
     if findings:
         raise ApprovedLoadError("静态筛查未通过,拒绝装载:\n  " + "\n  ".join(findings))
     if setting is not None:
         floor = {k: v for k, v in setting.items() if k in RISK_FLOOR_PARAMS}
-        param_findings = const.check_params(floor)
+        param_findings = const.check_params(floor, constitution)
         if param_findings:
             raise ApprovedLoadError("策略设置未通过校验,拒绝装载:\n  " + "\n  ".join(param_findings))
 
     # 模板:人维护的骨架。默认取宪法指定的那一个;
     # `template_name` 用来选**实盘可用**的骨架(默认那个是仅研究回测的 15m 骨架)。
-    if template is None:
-        if template_name:
-            template = load_template_named(template_name)
-        else:
-            constitution = _load_constitution()
-            try:
-                template = const.load_template(constitution)
-            except const.ConstitutionError as exc:
-                raise ApprovedLoadError(f"策略骨架模板不可用,拒绝装载(fail-closed): {exc}") from exc
+    # 骨架只能按**名字**选(名字走宪法的内置白名单):没有「直接传一个类进来」的口子。
+    if template_name:
+        template = load_template_named(template_name)
+    else:
+        try:
+            template = const.load_template(constitution)
+        except const.ConstitutionError as exc:
+            raise ApprovedLoadError(f"策略骨架模板不可用,拒绝装载(fail-closed): {exc}") from exc
     # 骨架自报「仅研究」→ 拒绝在**交易运行时**装载:这类骨架的 on_tick 直接抛异常
     # (见 strategies/trend_atr_15m_strategy.py),策略会在实盘第一根 tick 上静默死掉——
     # 失败方向安全(不下单),但错误信息极具误导性,不如在装载时就拒绝并说清楚。
@@ -178,25 +242,31 @@ def load_approved_strategy(
     module.__package__ = ""
     # 第四层(受保护对象的身份指纹):执行**之前**拍基准,执行**之后**重新拍并比对。
     #
-    # 比较器与快照器**提前绑定成局部引用**(名字与原函数同名,是为了让宪法历史守卫
-    # `tools/check_constitution_history.py` 能看出「这个执行点自己走了第四层」):
-    # 候选执行完再经 `const.` 去取,取到的可能已经是候选自己换上去的那个空函数——
-    # 第四层就静默失效了(第 1 轮 codex 复核实测的绕过)。
-    snapshot_protected_state = const.snapshot_protected_state
-    check_protected_state = const.check_protected_state
-    protected_before = snapshot_protected_state()
+    # 这里是**规范的调用形状**(宪法历史守卫按这个形状认执行点;
+    # 它同时禁止在本模块里定义同名的东西——遮蔽会让调用落到影子函数上)。
+    #
+    # 单靠这个形状**不够**:候选可以在 exec 期间把 `const.check_protected_state` 换成空函数,
+    # 于是上面这行调到的就是那个空函数、结论恒为「没被改写」(第 1 轮 codex 实测的绕过)。
+    # 真正堵住它的是下面那句 `_gates_intact()`:**比对结论可以被伪造,但属性身份核对不能**——
+    # 候选换掉模块属性,我们就当场发现。
+    protected_before = const.snapshot_protected_state()
     try:
         exec(code, module.__dict__)                       # noqa: S102 - 这里就是要执行批准过的字节
-    except Exception as exc:                              # noqa: BLE001 - 候选自己抛错也要变成「拒绝」而不是裸异常
+    except BaseException as exc:                          # noqa: BLE001 - 候选自己抛错也要变成「拒绝」
+        # **必须兜住 SystemExit / KeyboardInterrupt**:候选 `raise SystemExit(0)` 若逃出去,
+        # 交易进程会以**退出码 0** 结束——`restart: on-failure` 不重启、监控看着像「正常停止」,
+        # 而且零告警(第 2 轮 codex 实测)。研究侧写的是 `except (Exception, SystemExit)`,同一条口径。
         raise ApprovedLoadError(f"策略文件执行失败: {exc!r}") from exc
-    tampered = check_protected_state(protected_before, snapshot_protected_state())
-    # 核对第四层本身有没有被拆:模块上的两个属性必须还是原来那两个。
-    if (const.snapshot_protected_state is not snapshot_protected_state
-            or const.check_protected_state is not check_protected_state):
-        raise ApprovedLoadError("策略文件在装载期间改写了第四层(受保护对象的指纹比对)本身,拒绝装载")
+    tampered = const.check_protected_state(protected_before, const.snapshot_protected_state())
+    # 核对**所有**闸门有没有被拆:筛查、类级校验、参数校验、账本读取、第四层——
+    # 候选能把它们一个个换掉,而它们正是「拒绝」这件事的执行者。
+    broken = _gates_intact()
+    if broken:
+        _refuse_poisoned("策略文件在装载期间改写了装载闸门本身,拒绝装载(本进程已中毒):"
+                         + ", ".join(broken))
     if tampered:
-        raise ApprovedLoadError("策略文件在装载期间改写了受保护对象,拒绝装载:\n  "
-                                + "\n  ".join(tampered))
+        _refuse_poisoned("策略文件在装载期间改写了受保护对象,拒绝装载(本进程已中毒):\n  "
+                         + "\n  ".join(tampered))
 
     cls = getattr(module, class_name, None)
     if not isinstance(cls, type):
@@ -207,7 +277,7 @@ def load_approved_strategy(
     # ③(补)类级校验:静态层不判断「是否重写了模板成员」——模板成员名单要到运行时才知道,
     # 那一层由 `check_class` 负责。研究侧有这层(`research_api.import_candidate`),
     # 运行侧原先漏了 → 研究侧拒的候选运行侧会收(第 1 轮 codex 复核发现)。
-    class_findings = const.check_class(cls, template)
+    class_findings = const.check_class(cls, template, constitution)
     if class_findings:
         raise ApprovedLoadError("候选重写了不允许重写的模板成员,拒绝装载:\n  "
                                 + "\n  ".join(class_findings))
@@ -224,15 +294,18 @@ def check_approved_consistency(
     返回人类可读的问题列表;空列表表示一致。
     """
     problems: list[str] = []
+    broken = _gates_intact()
+    if broken:
+        return ["装载闸门已被改写(fail-closed):" + ", ".join(broken)]
     approved_dir = Path(approved_dir)
     if not approved_dir.is_dir():
         return problems
     try:
-        ledger = approval_ledger.load_approvals(approvals_file)
+        ledger = _CANONICAL_LEDGER["load_approvals"](approvals_file)
     except approval_ledger.ApprovalLedgerError as exc:
         return [f"批准账本不可读(fail-closed): {exc}"]
     for path in sorted(approved_dir.glob("*.py")):
-        sha = approval_ledger.file_sha256(path)
+        sha = _CANONICAL_LEDGER["file_sha256"](path)
         if sha not in ledger:
             problems.append(f"{path.name}:当前内容不在批准账本里(被改过或从未批准)")
     return problems

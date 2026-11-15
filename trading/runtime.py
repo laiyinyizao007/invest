@@ -314,6 +314,10 @@ class TradingRuntime:
             )
         except approved_guard.ApprovedLoadError as exc:
             return str(exc)
+        except BaseException as exc:                          # noqa: BLE001
+            # 任何别的异常也必须变成「拒绝 + 告警 + 退出码 3」,
+            # 不能变成裸 traceback + 退出码 1(操作者会收不到告警,只看到一个栈)。
+            return f"策略装载异常: {exc!r}"
         # 状态命名空间按**批准哈希**派生:换批准版本就换命名空间,
         # 旧版本的持仓/止损状态不会被新版本继承(不靠操作者记得改 --strategy-name)。
         if not cfg.approved_strategy_name:

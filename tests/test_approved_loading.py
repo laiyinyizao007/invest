@@ -313,7 +313,9 @@ sys.exit(1)
                           encoding="utf-8", errors="replace", timeout=120,
                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
-    assert "第四层" in proc.stdout
+    # 拒绝理由必须指出「闸门被改写」——只断言"被拒"没有区分力:
+    # 修复前的代码会以「不是策略骨架的子类」拒绝,断言照样成立。
+    assert "闸门" in proc.stdout, proc.stdout
 
 
 def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
@@ -330,7 +332,9 @@ def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
         "import risk.constitution as _c\n"
         "_c.check_protected_state = lambda *a, **k: []\n"
         "\n"
-        "class Candidate:\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
         "    pass\n"))
 
     # 这个载荷在**被拒之前**就已经把进程里的 risk.risk_guard.within_budget 换掉了
@@ -351,7 +355,7 @@ try:
         class_name='Candidate',
         template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
 except approved_guard.ApprovedLoadError as exc:
-    print('REFUSED')
+    print('REFUSED:' + str(exc))
     sys.exit(0)
 print('NOT_REFUSED')
 sys.exit(1)
@@ -361,6 +365,10 @@ sys.exit(1)
                           encoding="utf-8", errors="replace", timeout=120,
                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    # 拒绝理由必须指向「闸门被改写」或「受保护对象被改写」——
+    # 只断言"被拒"没有区分力:载荷必须**真的是骨架子类**,
+    # 否则「不是策略骨架的子类」会先一步拒绝,断言照样成立(第 2 轮 codex 复核指出)。
+    assert ("闸门" in proc.stdout or "受保护对象" in proc.stdout), proc.stdout
 
 
 def test_a_candidate_that_overrides_a_template_member_is_refused(approved):
@@ -423,3 +431,84 @@ def test_a_setting_carrying_the_risk_floor_is_refused(approved):
     with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
         _load(approved_dir, ledger, setting={"risk_budget": 999999})
     assert "策略设置未通过校验" in str(excinfo.value)
+
+
+def test_a_poisoned_process_refuses_every_further_load(approved):
+    """被投毒之后,本进程不再允许装载任何候选(第 2 轮 codex 实测的 F1)。
+
+    载荷 #1 关掉闸门并被拒;载荷 #2 才是真正的攻击。
+    如果第二次装载绑到**已被换掉**的闸门上,第四层就死了。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+
+def load(name):
+    try:
+        approved_guard.load_approved_strategy(
+            approved_dir=approved_dir, approvals_file=ledger, file_name=name,
+            class_name='Candidate',
+            template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+        return 'LOADED'
+    except approved_guard.ApprovedLoadError as exc:
+        return 'REFUSED:' + str(exc)
+
+print('FIRST:' + load('cand.py'))
+print('SECOND:' + load('cand.py'))
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    out = proc.stdout
+    assert "FIRST:REFUSED" in out, (out, proc.stderr[-800:])
+    assert "SECOND:REFUSED" in out, (out, proc.stderr[-800:])
+    assert "NOT_LOADED" not in out
+
+
+def test_a_candidate_cannot_exit_the_process_silently(approved):
+    """候选在导入期 `raise SystemExit(0)` 不得让交易进程以**退出码 0** 结束。
+
+    那会变成「正常停止」:`restart: on-failure` 不重启、监控看着像没事、且零告警。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "raise SystemExit(0)\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    assert proc.returncode == 0, proc.returncode
