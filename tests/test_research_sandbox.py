@@ -372,11 +372,14 @@ def test_recording_twice_keeps_one_entry(tmp_path):
 
 
 def test_a_stale_lock_does_not_block_approvals_forever(tmp_path):
-    """进程崩了会留下锁文件:不认残留锁的话,一次崩溃就让**之后所有**批准永久失败。"""
+    """进程崩了会留下锁文件:不认残留锁的话,一次崩溃就让**之后所有**批准永久失败。
+
+    第 40 轮:锁统一到 `risk/ledger_chain.file_lock`(`<账本名>.chainlock`),锁文件里写着持有者 PID,
+    "持有者已死"是一条独立的判据(不必等满 stale_seconds)。"""
     f = tmp_path / "s.py"
     f.write_text("a = 1\n", encoding="utf-8")
     approvals = tmp_path / "approvals.json"
-    lock = tmp_path / "approvals.json.lock"
+    lock = tmp_path / "approvals.json.chainlock"
     lock.write_text("999999 0\n", encoding="ascii")          # 一个早就不存在的 PID
 
     sha = rs.record_approval(f, approvals)
@@ -390,13 +393,56 @@ def test_a_lock_held_by_a_live_process_is_not_stolen(tmp_path, monkeypatch):
     f = tmp_path / "s.py"
     f.write_text("a = 1\n", encoding="utf-8")
     approvals = tmp_path / "approvals.json"
-    lock = tmp_path / "approvals.json.lock"
+    lock = tmp_path / "approvals.json.chainlock"
     lock.write_text(f"{os.getpid()} {time.time()}\n", encoding="ascii")
 
     with pytest.raises(rs.SandboxError):
         rs.record_approval(f, approvals)
 
     assert lock.exists()          # 锁还在,没被抢
+
+
+def test_the_approvals_ledger_admin_entries_take_the_same_lock_as_record_approval(tmp_path, monkeypatch):
+    """第 40 轮(codex 的 High 3):批准记录此前有**两把互不相干**的锁,而账本维护入口一把都不拿——
+    "批准与重置并发"能静默丢掉一条已批准的记录,而链仍然自洽(重置按有效前缀重新定锚)。
+    现在所有写批准记录的路径共用同一把锁:锁被占着时,维护入口必须**失败**,不能照改不误。"""
+    from risk import ledger_admin as admin
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text("{}", encoding="utf-8")
+    lock = tmp_path / "approvals.json.chainlock"
+    lock.write_text(f"{os.getpid()} {time.time()}\n", encoding="ascii")   # 一把活着的锁
+
+    monkeypatch.setattr(rs, "APPROVALS_LOCK_TIMEOUT", 0.2)
+    monkeypatch.setattr(admin, "ADMIN_LOCK_TIMEOUT", 0.2)
+
+    with pytest.raises(admin.AdminError):
+        admin.reset_approvals(approvals)
+    with pytest.raises(admin.AdminError):
+        admin.migrate_approvals(approvals)
+
+    assert approvals.read_text(encoding="utf-8") == "{}"     # 没被改动
+    assert lock.exists()                                     # 锁还在,没被抢
+
+
+def test_the_reset_reads_the_ledger_while_holding_the_lock(tmp_path, monkeypatch):
+    """同一把锁的另一个可观测后果:维护入口在**读**之前就要拿到锁——
+    否则"先读后加锁"之间夹进来的批准会被静默丢掉(读与写都在锁内)。"""
+    from risk import ledger_admin as admin
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text("{}", encoding="utf-8")
+    states: list[bool] = []
+    real_load = admin._load_dict
+
+    def spy(path):
+        states.append((tmp_path / "approvals.json.chainlock").exists())
+        return real_load(path)
+
+    monkeypatch.setattr(admin, "_load_dict", spy)
+    admin.reset_approvals(approvals)
+
+    assert states == [True], "读账本时必须已经持有锁"
 
 
 def test_a_write_failure_is_reported_as_a_sandbox_error(tmp_path, monkeypatch):

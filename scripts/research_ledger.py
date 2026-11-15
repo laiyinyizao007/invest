@@ -73,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     rst.add_argument("--reason", required=True, help="原因(必填,写进审计日志)")
     rst.add_argument("--force", action="store_true", help="账本状态正常时也重置")
     rst.add_argument("--add-trials", type=int, default=0, help="(仅 trials)按估计补记的试验次数,宁多勿少")
+    rst.add_argument("--allow-reduce-n", action="store_true",
+                     help="(仅 trials)确认允许重置后累计试验次数变小(N 变小会让 DSR 的分母变小、去通胀失效;"
+                          "默认拒绝,必须显式确认)")
     args = parser.parse_args(argv)
     trials, approvals = _paths()
     targets = {"trials": trials, "approvals": approvals}
@@ -99,9 +102,13 @@ def main(argv: list[str] | None = None) -> int:
                 if args.add_trials:
                     print("拒绝: --add-trials 只用于 trials", file=sys.stderr)
                     return 1
+                if args.allow_reduce_n:
+                    print("拒绝: --allow-reduce-n 只用于 trials", file=sys.stderr)
+                    return 1
                 out = admin.reset_approvals(approvals)
             else:
-                out = admin.reset_trials(trials, add_trials=args.add_trials)
+                out = admin.reset_trials(trials, add_trials=args.add_trials,
+                                         allow_reduce_n=args.allow_reduce_n, reason=args.reason)
             _audit({"action": "reset", "ledger": args.ledger, "reason": args.reason[:200], "result": out})
     except (admin.AdminError, tl.TrialLedgerError, chain.LedgerChainError) as exc:
         print(f"拒绝: {exc}", file=sys.stderr)

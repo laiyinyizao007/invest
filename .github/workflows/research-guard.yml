@@ -90,6 +90,7 @@ jobs:
             tests/test_constitution_round11.py \
             tests/test_constitution_round12.py \
             tests/test_fs_capability_closure.py \
+            tests/test_merge_main_sandbox_union.py \
             tests/test_research_api.py \
             tests/test_research_approval_server.py \
             tests/test_research_boundary.py \
@@ -121,6 +122,34 @@ jobs:
           #  改了这个文件 CI 却不会发现)。pytest 单独钉版本(它不在那个文件里)。
           python -m pip install --quiet -r requirements-research.txt pytest==8.3.4
           python -m pytest -p no:cacheprovider -q tests/test_research_boundary.py
+
+      # 核心防线套件(Issue #31):候选能力收口。它此前**一次都没在 CI 上跑过**——
+      # 文件头 `import bootstrap` 会拖进 vnpy,而这个 job 只装 numpy/pandas/mcp/pyyaml,
+      # 于是整份文件在收集阶段就 ModuleNotFoundError:**闸门看上去配好了,实际没跑**
+      # (第 7 轮 codex 的 High 同族:边界不变量写成了测试却没有任何 job 会跑它)。
+      #
+      # 现在把"需要交易栈的用例"逐条用 `@requires_trading_stack` 显式标出来
+      # (缺标记的用例在 CI 上会**直接失败**,不会被静默跳过),
+      # 其余与交易栈无关的防线用例在这里真的跑。
+      #
+      # 单独一步(不与其它文件合跑):这份文件是核心防线,它收集失败就必须**整步红**,
+      # 不能被 `--continue-on-collection-errors` 吞掉(那是"其余测试"那一步的取舍)。
+      - name: 研究侧核心防线(候选能力收口,Issue #31)
+        run: |
+          # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
+          python -m pytest -p no:cacheprovider -q tests/test_fs_capability_closure.py
+
+      # 并集回归套件:main(#22 导入白名单 + 模块代理)与 #26(按路径的导入裁决 +
+      # 对象层)加固**同一个**沙盒后的合流行为。**本分支也改 research_sandbox**,
+      # 所以这套并集回归正是本分支的回归风险面——它此前同样没在 CI 上跑过。
+      #
+      # 单独一步(收集失败必须整步红,不被别的文件的收集错误吞掉):
+      # 两条依赖 matplotlib/psutil 的冲突用例在研究侧依赖里没有这两个模块,
+      # 按用例自身的说明跳过(缺真模块判不了准入审计)。
+      - name: 研究侧并集回归(main 白名单 x #26 路径裁决)
+        run: |
+          # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
+          python -m pytest -p no:cacheprovider -q tests/test_merge_main_sandbox_union.py
 
       - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
         run: |

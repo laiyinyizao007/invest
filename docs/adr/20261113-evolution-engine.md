@@ -1011,7 +1011,7 @@ G8 要求双轮都 ≥45 才算发布档;第 12/13/14 轮 codex 为 **38.5 / 38.
 | 按名 setter(不得引用或定义) | `update_setting` | `BUILTIN_FORBIDDEN_BY_NAME_SETTERS` |
 | 下单/撤单接口(不得引用) | `buy`、`sell`、`short`、`cover`、`send_order`、`send_stop_order`、`send_local_stop_order`、`cancel_order`、`cancel_all`、`cancel_all_orders` | `BUILTIN_FORBIDDEN_ORDER_CALLS` |
 | 禁用内建(不得引用) | `exec`、`eval`、`compile`、`open`、`__import__`、`getattr`、`setattr`、`delattr`、`globals`、`locals`、`vars`、`input`、`type` | `research_sandbox.FORBIDDEN_CALLS` |
-| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__`、`__spec__`、`__loader__`、`__file__`、`__path__`、`__package__`、`__reduce__`、`__reduce_ex__`、`__getattr__`(第 11 轮,main #22 并入)、**走栈**(第 24 轮新增):`__traceback__`、`__context__`、`__cause__`、`__suppress_context__`、`tb_frame`、`tb_next`、`tb_lasti`、`tb_lineno`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`f_back`、`f_lineno`、`gi_frame`、`gi_code`、`cr_frame`、`cr_code`、`ag_frame`、`ag_code`、`__getattribute__`、`__closure__`、`cell_contents` | `research_sandbox.FORBIDDEN_ATTRS` |
+| 禁用属性(裸名与字符串都拒) | `__bases__`、`__subclasses__`、`__globals__`、`__builtins__`、`__dict__`、`__code__`、`__mro__`、`__class__`、`__defaults__`、`__kwdefaults__`、`__annotations__`、`__wrapped__`、`__instancecheck__`、`__subclasscheck__`、`__subclasshook__`、`__prepare__`、`__spec__`、`__loader__`、`__file__`、`__path__`、`__package__`、`__reduce__`、`__reduce_ex__`、`__getattr__`(第 11 轮,main #22 并入)、**走栈**(第 24 轮新增):`__traceback__`、`__context__`、`__cause__`、`__suppress_context__`、`tb_frame`、`tb_next`、`tb_lasti`、`tb_lineno`、`f_globals`、`f_locals`、`f_builtins`、`f_code`、`f_back`、`f_lineno`、`gi_frame`、`gi_code`、`cr_frame`、`cr_code`、`ag_frame`、`ag_code`、`__getattribute__`、`__closure__`、`cell_contents`,**按名求值的执行器**(第 40 轮新增):`_evaluate`、`_eval_type` | `research_sandbox.FORBIDDEN_ATTRS` |
 | 禁用字符串(同上,再加上按名改写/反射的内建名) | 上面那组,外加 `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`globals`、`locals`、`vars`、`input`、`__import__`、`__getattribute__`、`__setattr__`、`__delattr__`,**危险模块名当钥匙**(第 24 轮新增):`subprocess`、`ctypes`、`_os`、`real_import` | `research_sandbox.FORBIDDEN_STRINGS` |
 | 禁用字符串·**按键取语境**(危险模块的**短名**:当键取时拒,当普通词时放行——第 24 轮自查修,见下) | `os`、`sys`、`posix`、`nt` | `research_sandbox.FORBIDDEN_KEY_STRINGS` |
 | 执行时**不提供**的内建 | `setattr`、`delattr`、`getattr`、`eval`、`exec`、`compile`、`open`、`globals`、`locals`、`vars`、`breakpoint`、`input`、`type`、`object`、`help`、`exit`、`quit`、`license`、`credits` | `research_sandbox.UNSAFE_BUILTINS` |
@@ -2041,6 +2041,72 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 这类问题的根在"按成员枚举"的收敛性:扫描只覆盖已装版本的模块级公开成员,升级 vnpy 后须重跑 `%TEMP%\scan_reexports.py`(本 PR 把其核心判据固化为 `test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin`,只覆盖列出的 11 个模块)。
 ② sqlite3 无 `open` 事件(已按 `sqlite3.connect` 单独处置)与上面列出的无法裁决的原语。③ (已更正,第 38 轮)第 37 轮曾在回测窗口放行 vnpy 数据库的 sqlite 连接,这反而是个口子;已撤销,改为窗口前由框架建好连接、窗口里不登记任何路径。
 
+第 37 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
+
+| 变异 | 结果 |
+|---|---|
+| `importlib` 拿出 `CAPABILITY_MODULE_NAMES` | 红 |
+| 去掉 `import a.b as c` 的前缀回退核对 | 红 |
+| `sqlite3.connect` 从判定里拿掉 | 红 |
+| 清空 builtins 导入原语名单 | 红 |
+| 清空 `UNREACHABLE_ORIGINS` | 红 |
+| `armed` 黏住不清零 | 红 |
+| 去掉 argv 的 git 可执行文件核对 | 红 |
+| 锁:权限错误一律当被占用 | 红 |
+| 锁:未来 mtime 不算陈旧 | 红 |
+| 去掉 `_winapi.CreateFile` 规则 | 红 |
+| 去掉 winreg 事件拒绝 | 红 |
+
+均无等价变异。
+
+### 第 38 轮复审(codex 35/50)的补修:活动数据库句柄不可达
+**Critical(已复现并修复)**:第 37 轮在回测窗口里登记 vnpy 数据库的 sqlite 路径,**自己引入了更大的口子**——候选 `from vnpy.trader.database import get_database`
+可达(生产 `import_candidate`、静态筛查开),`db.db` 是 peewee `SqliteDatabase` 的原始句柄(**实例属性,不受对象层规则管**),
+`db.db.execute_sql("ATTACH DATABASE …")`/`VACUUM INTO` 在允许目录之外落盘(钩子看不见,`window_denials` 为空),
+`INSERT/UPDATE dbbardata` 改框架行情库——`backtest_lib` 里候选 `__init__`(`add_strategy`)先于 `engine.load_data()`,同一次回测就读到被改过的价格。
+**且不登记任何 sqlite 路径时攻击同样成功**:框架连接早在窗口外建好,`ATTACH`/`VACUUM INTO` 在已打开的连接上不发可判路径的事件(`connect` 事件只在新连接时发)。
+
+**修法(能力层,不是事件名单)**:
+1. **不给句柄**:`get_database`/`database`/`get_datafeed`/`datafeed`(`vnpy.trader.database`/`datafeed`)进 `UNREACHABLE_MEMBERS`;
+   再按"**来源模块.函数名**"登记 `UNREACHABLE_QUALIFIED`(`vnpy.trader.database.get_database`、`datafeed.get_datafeed`、`utility.get_folder_path/get_file_path/save_json/load_json`),
+   于是 `vnpy_ctastrategy.backtesting`/`engine` 里的**再导出**同样被挡(规则:返回活动句柄的函数);`peewee`/`playhouse`/`vnpy_sqlite`/`sqlite3` 进 `UNREACHABLE_ORIGINS`(实例按来源挡)。
+2. **撤销**回测窗口的 sqlite 路径登记(`candidate_window` 不再有 `sqlite_paths` 参数):回测入口在**窗口之前**调用 `get_database()` 把连接建好(缓存在 vnpy 模块全局),
+   窗口里的 `load_bar` 等复用这条已有连接,不发新 `connect`;窗口里**任何**新的 `sqlite3.connect` 按路径判(只放行允许目录与 `:memory:`),**对"框架的库"也没有特例**。
+   实测不需要 `file:…?mode=ro` 方案:此机无日线数据,真实回测只能走到"没有日线数据"这条报错,但窗口内读库(`load_bar_data`)无拒绝(用例在新进程里验证"先建连接"这一步,拿掉即红)。
+3. **③ 行情先取定**:`backtest_lib.run_engine` 把 `engine.load_data()` 前置到 `add_strategy` 之前(`load_data` 只依赖 `set_parameters`,不依赖策略实例;改动最小一刀,既有回测测试全绿)。
+   **如实**:这只保证"候选 `__init__` 之前行情已读入引擎";候选仍能经 `self.cta_engine.history_data` 在内存里改引擎已读入的列表——这是同进程残余(#29),由运行时第五层(行情容器基准)部分覆盖,不是本改动的能力。
+  **更正(第 39 轮)**:这条残余**实测不成立**——`cta_engine` 是 `BUILTIN_PROTECTED_STATE_OBJECTS`,静态层直接拒,运行时也进不了指纹范围;第 39 轮已把它删掉。此处保留原文只为留痕,以第 39 轮的结论为准。
+
+**sqlite 事件层的限制(明写,不要再补事件名)**:`sqlite3` 事件层**判不了** `ATTACH DATABASE`、`VACUUM INTO`、已打开连接上的任意 SQL——它们不发带路径的审计事件
+(`test_event_layer_cannot_judge_vacuum_into_on_an_open_connection` 钉住)。修法只能在**能力层**(不把句柄给候选)或 **sqlite 层**(只读打开 `file:…?mode=ro`),往事件名单里补名字**不收敛**。
+
+**对象层的边界(第三处同族盲区,残余清单新增一栏)**:对象层按 `__module__` 判**模块成员**的来源;**函数返回值、实例属性、调用后得到的对象不在判定范围内**。
+第 35 轮(函数级能力)、第 37 轮(导入原语)、第 38 轮(活动句柄)是同一族问题:凡"拿到函数再调用得到危险对象"的路径,只能在"拿到函数/实例"这一步拒。
+**系统性扫描(第 2 项)**:扫描脚本 `%TEMP%\scan_handles.py`——枚举 `vnpy.trader.*`/`vnpy.event.*`/`vnpy_ctastrategy.*`(排除 gui/ui/ctp/wechat)的公开函数
+(名字 `get_/create_/open_/connect/make_/new_/init_`、返回注解含 Database/Engine/Connection/Cursor/Session/Handle/Socket/IO/File/Thread/Process/Manager/Client)
+与模块级实例(类型来源非内置/数据类/枚举且带 `db/connection/cursor/execute*`,先调用一次 `get_database()` 让 `database` 变成实例)。
+修前 14 个命中,10 个放行;**已拦**:`get_database`(3 处:database、backtesting、engine)、`get_datafeed`(2 处)、`get_folder_path`(logger 再导出)、`database` 实例;
+**已审查为无害并登记**:`get_digits`(纯计算)、`get_localzone_name`(字符串)、`get_target_value`(取指标数值)、`make_subplots`(plotly 布局,plotly 不可 import)。
+**可重复**:同一判据已做成回归用例 `test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed`——升级 vnpy 后若出现新的、未被对象层挡住也未审查的句柄型成员,用例变红,逼着人去审。
+**局限**:判据是启发式(名字+注解+属性),不递归调用函数看返回值;覆盖面只到上述三个包;第三方 numpy/pandas 内部未扫。库自带的重导出会随 vnpy 升级变化——这是**持续**成本,不是一次性修复。
+
+**小项**:`vnpy.trader.utility.Path` 在 `UNREACHABLE_MEMBERS` 与 `UNREACHABLE_ORIGINS`(pathlib)里重复登记。**没有去重**:我先删了成员那条,宪法历史守卫立即报"内置保护只能增不能减"——按项目纪律,保留重复比放松守卫更对;别处再导出的 `Path` 由来源规则统一处置,用例两条路各测一遍;
+`_argv_matches` 的 docstring 写明实际判定范围:整条命令行逐项相等,且 `argv[0]` 的 basename(去扩展名、小写)为 `git`——只核名字,不核路径是不是真 git。
+**G8**:本轮同样**未跑**外部评审,状态:待复核。
+
+第 38 轮补修的变异验证:
+
+| 变异 | 结果 |
+|---|---|
+| 去掉按来源再导出的 qualified 规则 | 红 |
+| 去掉 peewee/vnpy_sqlite 实例来源 | 红 |
+| 只去掉 `UNREACHABLE_MEMBERS` 里的句柄登记 | 红,但**只因规则名断言**;攻击本身仍被 qualified+来源两层冗余挡住(纵深,不是等价变异也不是漏洞) |
+| 句柄三层防线全拿掉 | 红;端到端用例里候选 `VACUUM INTO` 真的成功(`ATTACKED`),证明探针不是空转 |
+| 回测入口不先建连接 | 红(新进程里的行为用例) |
+| 回测入口改回先 `add_strategy` 后 `load_data` | 红 |
+
+无等价变异。
+
 ### 第 39 轮复审(codex 36/50):库读原语按模式收口 + 对象层拒绝要带规则名
 **背景**:第 35~38 轮把"写侧"(文件写、进程创建、反序列化、账本/批准记录)逐条收住了;第 39 轮 codex 的判断是**止损**——
 **读侧在同进程下原理上不可收敛**(候选与框架共享解释器,候选能读到本机任意文件、任意库数据),
@@ -2068,7 +2134,8 @@ Issue #29 提为唯一阻塞项。所以这一批做完就**不再加新功能**
   那次 connect 落在窗口内、路径在允许目录之外,会被钩子拒(回测直接失败)。所以给"框架读库"一条**窄**豁免
   `framework_exempt(sqlite_paths=[vnpy 库文件])`:**只**豁免 `sqlite3.connect` 到那一个文件,**不豁免** `open`/写——
   候选照样改不动那个库文件(用例钉住)。豁免只接在 `run_child`(回测入口)上;`evaluate`/`gate` 走 CSV,不读库。
-- **不再登记"sqlite 路径白名单"**(第 38 轮那条):它既不必要也不解决问题(候选拿不到句柄)。
+- **不再在沙盒规则里登记"sqlite 路径白名单"**(第 38 轮那条):它既不必要也不解决问题(候选拿不到句柄)。
+  框架自己读库走的是**窄豁免**(`framework_exempt(sqlite_paths=…)`,见上一条),不是路径白名单登记——两者不是一回事,别再混写(第 40 轮更正)。
 
 **2. 对象层的 `AttributeError` 被 `IMPORT_FROM` 回退掩盖 → 转成带规则名的 `ImportError`**
 CPython 的 `IMPORT_FROM` 在属性访问抛 `AttributeError` 时会**回退到 `sys.modules`** 取真模块,
@@ -2079,7 +2146,8 @@ CPython 的 `IMPORT_FROM` 在属性访问抛 `AttributeError` 时会**回退到 
 
 **3. 系统性扫描扩到"读/写数据原语"**
 扫描脚本 `%TEMP%\scan_dataprims.py`(可重复跑):白名单模块里名字匹配数据原语模式的**模块级**成员,逐个用对象层规则验证是否已挡。
-修前 47 个命中(其中模块级的读原语 `load_bar_data`/`load_tick_data` 可达),修后 0 个可达。
+修前 47 个命中(其中模块级的读原语 `load_bar_data`/`load_tick_data` 可达)。
+**当时记的"修后 0 个可达"是错的**(第 40 轮更正):判据只覆盖"模块级数据原语名字",不覆盖**来源根不全**与**类级成员**——`concurrent`(线程/进程池执行器)与 pandas 的`DataFrame`/`Series`/`ExponentialMovingWindow` 都从白名单模块漏了出去,实测**仍有 6 项可达**;直到第 40 轮把来源根改成**派生**(`DANGEROUS_MODULE_NAMES` ∪ `UNREACHABLE_ORIGINS`)、并补上类级能力库规则,才真正是 0。
 同一判据已固化成回归用例 `test_the_systematic_scan_also_covers_data_read_primitives`:
 vnpy 升级后若出现新的读原语,用例变红,逼着人去审。
 **局限**:判据是**模块级成员**的名字模式(类的方法不在其内);不递归进实例属性与返回值;只覆盖本机已装版本的三个包。
@@ -2118,68 +2186,512 @@ vnpy 升级后若出现新的读原语,用例变红,逼着人去审。
 
 无等价变异。
 
+### 第 40 轮复审(codex G8 第二轮 34/50)的补修:按名求值的执行器、前向引用求值、守卫登记与锁统一
 
-第 37 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
+**背景**:codex 第二轮给了 **34/50**(需改进)。本分支**冻结功能改动**——只接受"补规则与用例"的修复,
+功能性的活(如把候选挪出进程)一律转 **Issue #29**。本轮做的是三件事:
+①**规则层**:把"按名求值的执行器"这一族封住(其中一条是**实测复现的凭据泄漏**);
+②**守卫层**:守卫自己漏守的形状补上(正则/映射/新名单),并把"危险来源"改成**派生**;
+③**一致性层**:两把互不相干的锁、一次会**悄悄把 N 变小**的人工重置。
+
+**0. 本轮的一条方法论**:静态推理必然漏,每一族规则都用**动态探针**双向验证(放行 + 拦截),
+并且断言**是哪条规则**拒的;被实测否掉的候选规则**如实写进 ADR**(见第 2 条里的两种"看代码对象"的判据)。
+
+---
+
+#### 1. Critical(已复现并修复):"按名求值的执行器"——候选不需要 `eval` 本身
+
+**根因**:候选不需要拿到 `eval`/`exec`/`getattr` 本身,只要能调用一个**替它按名字取属性/求值**的函数——
+那个函数所在命名空间里的**真内建**就等于递到了候选手上:
+
+    真内建 → 真 `__import__` → 真 `research_sandbox` 模块 → 把 `_AUDIT.active` 改成 False
+           → 审计钩子被关掉 → 真 `open` 在允许目录之外写成功
+
+**实测**:`typing.get_type_hints(C)`。它按 `C.__module__` 去 `sys.modules` 里取 `base_globals`,
+而候选可以自己把 `C.__module__` 换成 `"json"`、把注解写成字符串 `"__import__('os').environ"`——
+`get_type_hints` 就在 **json 的命名空间**里求值它,于是候选拿到真 `os`、真环境变量
+(实测读到了 `ANTHROPIC_AUTH_TOKEN`)。静态层看不见(名字是拼出来的),对象层也拦不到(取的是 `typing` 的成员)。
+
+**修法**(对象层):新增 `EVALUATOR_MEMBERS`(规则名 `按名求值的执行器`),登记已知成员。
+
+**如实**:这一族**无法穷举证明不存在**——任何一个公开的"按名取属性"的 API 都可能是执行器。
+所以规则只登记**已知成员**,真正的边界是 Issue #29(候选独立进程 + 只读挂载)。
+
+---
+
+#### 2. Critical(已复现并修复):前向引用求值(`typing.ForwardRef._evaluate`)
+
+这是上面一族**同源但更隐蔽**的成员:它**不在模块成员表里**,而是**实例方法**,
+而实例可以**不出现 `ForwardRef` 这个名字**就拿到(`typing.Optional["…"]` → `typing.get_args` → 实例)。
+
+**实测(生产入口 `import_candidate`,不是简化探针)**:
+
+    fr = typing.ForwardRef("__import__('os').environ['PATH']")
+    fr._evaluate({}, None, recursive_guard=set())
+
+`eval` 在**空的 globalns** 里跑,CPython 会把**真内建**注入那个空字典 ⇒ 真 `__import__` → 真 `os` → 真环境变量。
+实测把真 `PATH` 的值读了出来,并经异常消息带了出来(`Forward reference must be an expression -- got '<真 PATH>'`)。
+
+**静态层看不见载荷**:它藏在字符串字面量里(`"__import__('os').environ['PATH']"`),静态筛查**零告警**。
+
+**修法(两层,各管一段)**:
+
+- **静态层**:`FORBIDDEN_ATTRS` 增 `_evaluate` / `_eval_type`。依据是:候选**必须写出这个名字**才能调它——
+  `getattr` / `type` / `__dict__` / `__getattribute__` 一律已被禁,动态拼名字的路也走不通(实测)。
+- **事件层**:新增 `FORBIDDEN_EVAL_FRAMES`,`exec` 审计事件按"**谁触发的这次 exec**"判,规则名 `audit:forward-ref-eval`。
+
+**判据为什么是"帧"**:实测过两种"看代码对象"的判据,都**不成立**,如实记下:
+
+| 候选判据 | 实测结果 |
+|---|---|
+| `dis` 看末条指令(`RETURN_VALUE` vs `RETURN_CONST`) | 不成立:eval `None` 的末条指令与 exec 模式模块体**同样**可能是 `RETURN_CONST`;两种模式都能以 `RERAISE` 收尾 |
+| `co_consts[-1] is None` | 不成立:合法的 `collections.namedtuple` 与 `typing.NamedTuple` 同样会产生 **eval 模式**的 exec 事件(eval 模式 ≠ 危险) |
+| **帧归属**(模块名 + 限定名) | **成立**:危险帧 `typing.py:ForwardRef._evaluate`;合法帧 `collections/__init__.py:namedtuple`、`dataclasses.py:_FuncBuilder.add_fns_to_class` |
+
+**放行方向**(有用例钉住,避免把正常候选整片拒掉):
+
+- `typing.Optional["int"]` 只 **compile**、不 **exec**(实测)⇒ 照旧可用;
+- `collections.namedtuple` / `dataclasses` / `enum` / `typing.NamedTuple` 全部照旧跑通——它们 eval 的是**自己生成**的代码(字段名已校验),不是候选给的字符串;
+- `typing.ForwardRef("int")` 的**构造**本身不求值(只 compile)⇒ 放行;被拒的是**求值**这一步。
+
+**系统性复扫**(白名单里"会 eval/exec 的执行点",共 **7** 个,逐个动态验证):
+
+| 执行点 | 判定 |
+|---|---|
+| `typing.ForwardRef._evaluate` | 危险 ⇒ 事件层拒(`audit:forward-ref-eval`) |
+| `typing.get_type_hints` | 危险 ⇒ 对象层拒(`按名求值的执行器`) |
+| `collections.namedtuple` / `functools.namedtuple` / `statistics.namedtuple` | 合法(eval 的是自己生成的代码) |
+| `dataclasses._FuncBuilder.add_fns_to_class` | 合法(同上) |
+| `dataclasses._is_type` | **误报**:源码里那句 eval 只出现在**注释**里("it would involve a eval() penalty …") |
+
+第一版扫描脚本**漏了**这一族(`typing.ForwardRef._evaluate` 的名字以下划线开头,被"只扫公开成员"的过滤器滤掉了)——
+**静态推理必然漏**的第一例;第二版不按名字过滤才把它找出来。
+
+---
+
+#### 3. High(已修):两把互不相干的锁
+
+`research_sandbox.record_approval` 用的是本模块的 `approvals.json.lock`,`risk/ledger_chain.file_lock` 用的是
+`approvals.json.chainlock`,而 `risk/ledger_admin.py` 的 `migrate_approvals` / `reset_approvals` **一把锁都不拿**。
+⇒ "批准与重置并发"能**静默丢掉一条已批准的记录**,而链仍然自洽(重置按有效前缀重新定锚),事后查不出来。
+现在两边**共用同一把锁**(`risk/ledger_chain.file_lock`),互斥才成立;等锁超时按"失败"处理(人工维护是低频操作,失败后重试即可)。
+
+---
+
+#### 4. Medium 1(已修):不许**悄悄**把 N 变小
+
+链断之后的人工出路是"保留有效前缀、丢弃其后内容、按保留部分重新定锚"。但 N 变小 = **DSR 的分母变小** = 去通胀失效
+(年化 Sharpe 3.5:N=1620 时 DSR 0.6397 不过,N=1 时 0.9999 过)。原先的"防变小"判据只看**有效前缀**,
+而链在中间断掉时有效前缀可能比真实历史少一大截——拿它当基准等于"变小不算变小"。
+
+- 判据改成按**能解析出来的每一行**求和(`_claimed_total`,链字段对不对不管):它是"账本声称的 N"的上界,宁可高估。
+- 变小必须**显式**加 `--allow-reduce-n`(并写 `--reason`),否则拒绝。
+- 重置把 before/after 写进**链里**(`kind=ledger_reset`,`count` 恒为 0——它不是一次试验),于是"曾经变小过"本身可审计;
+  普通写入路径**不许**伪造这一种记录(`record_trials` 只认三种试验类型)。
+
+---
+
+#### 5. Medium 2(**冻结**,登记为遗留项):账本写入路径 O(n²)
+
+每追加一行都要重算并重写整条链 ⇒ 写入次数一多就是 O(n²)。修它属于**功能改动**(会动账本格式与写入路径),
+本分支冻结 ⇒ 只登记,不改。**跟踪 Issue:#40**。
+
+#### 6. Medium 3(已修):守卫自己**没守住**的东西
+
+- `DATA_PRIMITIVE_PATTERN` 是**编译出来的正则**,`AUDIT_PATH_MUTATION_EVENTS` 是 `{事件: 参数下标}` 的**映射**——
+  原先的提取器只认"字符串集合",于是这两种形状**从来没有被比对过**:把模式改宽(少拒几个名字)、
+  删掉映射里的一个事件(少查一条路径),守卫照样全绿。这与第 25 轮 `frozenset` 那次是同一类病:"没登记 = 没守着"。
+  现在按 **冻结正则**(模式字符串与历史不同就报错)与 **受保护映射**(键只能增、每个键的下标集只能增)两种新形状登记。
+- 本轮新增的 `EVALUATOR_MEMBERS` / `FORBIDDEN_EVAL_FRAMES` 同样登记进注册表,并补一条用例盯着"登记这件事本身"。
+
+#### 7. Medium 4(已修,并**更正此前的说法**):导入顺序**不变量**写进代码
+
+`vnpy.trader.logger` 在**导入期**就会拉起 loguru → colorama → `ctypes.windll.kernel32`:
+在候选窗口里导入它会被审计钩子按能力拒掉 `ctypes.dlopen`,报出来的是 `AttributeError: kernel32`——
+**看起来像颜色库坏了**,实际是钩子按能力拒了 ctypes。
+
+**更正**:这一条早先写的是"此前它只是**碰巧**没发生(子进程入口先 `from backtest_lib import …`)"——**不准确**。
+实测(全新解释器,逐步看 `sys.modules`):
+
+| 动作 | `vnpy.trader.logger` 在 `sys.modules` 里? |
+|---|---|
+| `import bootstrap` | 否 |
+| `import backtest_lib` | **是**(它顶层导了 `vnpy_ctastrategy.backtesting`) |
+| `const.snapshot_protected_state()` | **是**(→ `_preload_protected_modules()` → `strategies.…` → vnpy) |
+
+而 `import_candidate` 在**开窗口之前**必然调过 `const.snapshot_protected_state()`
+(第四层的身份指纹要拍快照)⇒ 窗口内的第一次导入一直是**缓存命中**,并没有"复发"这回事。
+
+那为什么还要**显式**写一层?因为上面两条都是**间接**的:它们挂在"别的包恰好 import 了 vnpy"这个事实上。
+哪天子进程入口不再先导 `backtest_lib`、或模板包改成不 import vnpy,窗口内的第一次导入就会变成"真·第一次"
+⇒ 被拒,而且**报错点离原因很远**(看起来像颜色库坏了)。现在把不变量**显式**写在开窗口的那一行旁边
+(`import_candidate` 里、窗口之前):显式预载 `vnpy.trader.logger` 与 `vnpy_ctastrategy`,
+**不依赖任何别的包的内部行为**——这是**纵深防御**,不是"补一个坏掉的洞"。
+
+刻意**不用** `importlib.import_module`——那在守卫眼里是"动态导入任意模块"的执行入口,
+会被要求自己成对取快照并比对(这里导的是写死的两个框架模块,本来没什么可比的);写成静态 `import` 既表达清楚"就是这两个"。
+放在 `import_candidate` 里而不是抽成一个函数:这个不变量绑定的是"**开窗口之前**",而开窗口的只有这一处;
+抽出去就得靠"每个调用方都记得先调它"——那正是本条要消灭的"碰巧没发生"。
+(研究栈的交易栈 import 只许出现在已登记的例外作用域里,见 `tests/test_research_boundary.py`;
+放在 `import_candidate` 里**不需要新开例外**,边界规则一个字都没改。)
+
+**用例怎么才算数(第一版是空转的)**:第一版修复侧用例**直接调那个预载函数**,结果**删掉预载它照样绿**
+——它测到的是"helper 有效果",不是"生产路径确实预载了"。现在拆成两条:
+
+- **不变式用例**:在**窗口边界**上断言(`rs.candidate_window` 被套一层探针)交易栈**已经**就位;
+- **隔离用例**:把**间接的那层**换成空实现(`const.snapshot_protected_state = lambda: {}`),
+  让候选自己在窗口里 `import vnpy.trader.logger`——**没有**显式预载 ⇒ 窗口内的第一次导入被拒
+  ⇒ 候选失败;**有**显式预载 ⇒ 缓存命中 ⇒ 候选照常跑完。
+
+**变异验证**:删掉显式预载 ⇒ 隔离用例红(报 `AttributeError: kernel32`),不变式用例仍绿
+(因为间接那层还在兜着)——两条用例分工明确,谁也替代不了谁。
+
+#### 8. 更正一条**不实**的说法(记为误报,不改代码)
+
+"候选把 dataclass 的 `__module__` 换成 `"json"`,`get_type_hints` 就会在 json 的命名空间里求值" —— 这条**在静态层就已经被封**:
+`risk/constitution.py` 的**类装饰器**规则(`类 D 不得使用类装饰器`)拒掉 `@dataclass`(实测),
+所以候选根本写不出带装饰器的 dataclass。**记为误报**。(注意代价:这条规则也顺带拒掉了 `@dataclass` 这种**正常**写法,
+是既有取舍,不在本轮范围。)
+
+#### 9. 残余(**如实写**,别读成"已闭合")
+
+- **同进程里"按名求值"一族不可能穷举**(第 1 条):只登记已知成员,真边界是 #29。
+- **读侧整体未收口**:`self.load_bar` 能读**任意区间**的行情(含测试段),零审计拒绝。**跟踪 Issue:#42**
+  (真正的修复在 #29 的只读挂载,本条是它的验收清单)。
+- **sqlite 豁免与写**:候选仍能经真 `sqlite3` 写**被豁免**的 vnpy 库文件——这与 `framework_exempt` docstring 里
+  "**不豁免** open/写"的说法**矛盾**。此处明写出来(以本条为准),修它属于 #29 的读/写族。**跟踪 Issue:#43**。
+- **`window_denials()` 没有生产消费者**:拒绝记录只进内存,生产路径没有任何地方读它 ⇒ "被拒了"这件事目前只有测试看得见。
+  登记为遗留项(不修功能)。**跟踪 Issue:#41**。
+
+#### 10. 其它同批改动
+
+- `string` 进 `DANGEROUS_MODULE_NAMES`:`string.Formatter.get_field("0.__globals__", …)` 会在 **string.py 自己的帧里**
+  按候选给的名字取属性——静态层看不见(名字是拼出来的)、运行期对象层也拦不到(那一帧不是候选的模块)。实测:
+  候选用它拿到**真内建** → 真 `__import__` → 真 `research_sandbox` → 关掉审计钩子 → 写成功。
+  它与 `getattr`/`eval`/`exec`/`compile` 同一族(静态层本来就禁那四个)。
+- `vnpy.alpha` 进 `FORBIDDEN_MODULE_PATHS`(规则:按全名禁用):`vnpy/alpha/dataset/utility.py` 有一处
+  `eval(expression, {}, d)`,表达式由调用方给(潜伏风险;当前因缺 `polars` 导不进来)。
+- 危险来源**改成派生**:`_OBJECT_ORIGIN_ROOTS = (DANGEROUS_MODULE_NAMES − {builtins}) ∪ UNREACHABLE_ORIGINS`。
+  第 39 轮记的"修后 0 个可达"**是错的**:手写名单漏了 `concurrent` 与 pandas 的几个类级成员(实测仍有 6 项可达);
+  改成派生之后才真正是 0,并有回归用例盯着。
+
+**G8**:本轮补修完成,**待复核**(外部评审在本轮结束后统一跑)。
+
+第 40 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
 
 | 变异 | 结果 |
 |---|---|
-| `importlib` 拿出 `CAPABILITY_MODULE_NAMES` | 红 |
-| 去掉 `import a.b as c` 的前缀回退核对 | 红 |
-| `sqlite3.connect` 从判定里拿掉 | 红 |
-| 清空 builtins 导入原语名单 | 红 |
-| 清空 `UNREACHABLE_ORIGINS` | 红 |
-| `armed` 黏住不清零 | 红 |
-| 去掉 argv 的 git 可执行文件核对 | 红 |
-| 锁:权限错误一律当被占用 | 红 |
-| 锁:未来 mtime 不算陈旧 | 红 |
-| 去掉 `_winapi.CreateFile` 规则 | 红 |
-| 去掉 winreg 事件拒绝 | 红 |
+| 事件层判据失效(`if False and _audit_frame_is_forbidden_eval(…)`) | 红(3 条:直接求值 / `get_args` 绕路 / 读环境变量) |
+| 静态层去掉 `_evaluate` / `_eval_type` | 红(静态筛查用例) |
+| 求值帧名单不登记进宪法历史守卫 | 红(登记用例) |
+| 环境变量断言改成比对 PATH(截断后失真) | 假绿——已改成比对**本次用例自己设的标记值**,再测变异即红 |
+| 删掉显式的导入预载(`import_candidate` 里那两行) | 红(隔离用例:候选在窗口内第一次导入 logger 被拒 → `AttributeError: kernel32`);窗口边界那条仍绿(间接那层还在兜) |
 
-均无等价变异。
-
-### 第 38 轮复审(codex 35/50)的补修:活动数据库句柄不可达
-**Critical(已复现并修复)**:第 37 轮在回测窗口里登记 vnpy 数据库的 sqlite 路径,**自己引入了更大的口子**——候选 `from vnpy.trader.database import get_database`
-可达(生产 `import_candidate`、静态筛查开),`db.db` 是 peewee `SqliteDatabase` 的原始句柄(**实例属性,不受对象层规则管**),
-`db.db.execute_sql("ATTACH DATABASE …")`/`VACUUM INTO` 在允许目录之外落盘(钩子看不见,`window_denials` 为空),
-`INSERT/UPDATE dbbardata` 改框架行情库——`backtest_lib` 里候选 `__init__`(`add_strategy`)先于 `engine.load_data()`,同一次回测就读到被改过的价格。
-**且不登记任何 sqlite 路径时攻击同样成功**:框架连接早在窗口外建好,`ATTACH`/`VACUUM INTO` 在已打开的连接上不发可判路径的事件(`connect` 事件只在新连接时发)。
-
-**修法(能力层,不是事件名单)**:
-1. **不给句柄**:`get_database`/`database`/`get_datafeed`/`datafeed`(`vnpy.trader.database`/`datafeed`)进 `UNREACHABLE_MEMBERS`;
-   再按"**来源模块.函数名**"登记 `UNREACHABLE_QUALIFIED`(`vnpy.trader.database.get_database`、`datafeed.get_datafeed`、`utility.get_folder_path/get_file_path/save_json/load_json`),
-   于是 `vnpy_ctastrategy.backtesting`/`engine` 里的**再导出**同样被挡(规则:返回活动句柄的函数);`peewee`/`playhouse`/`vnpy_sqlite`/`sqlite3` 进 `UNREACHABLE_ORIGINS`(实例按来源挡)。
-2. **撤销**回测窗口的 sqlite 路径登记(`candidate_window` 不再有 `sqlite_paths` 参数):回测入口在**窗口之前**调用 `get_database()` 把连接建好(缓存在 vnpy 模块全局),
-   窗口里的 `load_bar` 等复用这条已有连接,不发新 `connect`;窗口里**任何**新的 `sqlite3.connect` 按路径判(只放行允许目录与 `:memory:`),**对"框架的库"也没有特例**。
-   实测不需要 `file:…?mode=ro` 方案:此机无日线数据,真实回测只能走到"没有日线数据"这条报错,但窗口内读库(`load_bar_data`)无拒绝(用例在新进程里验证"先建连接"这一步,拿掉即红)。
-3. **③ 行情先取定**:`backtest_lib.run_engine` 把 `engine.load_data()` 前置到 `add_strategy` 之前(`load_data` 只依赖 `set_parameters`,不依赖策略实例;改动最小一刀,既有回测测试全绿)。
-   **如实**:这只保证"候选 `__init__` 之前行情已读入引擎";候选仍能经 `self.cta_engine.history_data` 在内存里改引擎已读入的列表——这是同进程残余(#29),由运行时第五层(行情容器基准)部分覆盖,不是本改动的能力。
-
-**sqlite 事件层的限制(明写,不要再补事件名)**:`sqlite3` 事件层**判不了** `ATTACH DATABASE`、`VACUUM INTO`、已打开连接上的任意 SQL——它们不发带路径的审计事件
-(`test_event_layer_cannot_judge_vacuum_into_on_an_open_connection` 钉住)。修法只能在**能力层**(不把句柄给候选)或 **sqlite 层**(只读打开 `file:…?mode=ro`),往事件名单里补名字**不收敛**。
-
-**对象层的边界(第三处同族盲区,残余清单新增一栏)**:对象层按 `__module__` 判**模块成员**的来源;**函数返回值、实例属性、调用后得到的对象不在判定范围内**。
-第 35 轮(函数级能力)、第 37 轮(导入原语)、第 38 轮(活动句柄)是同一族问题:凡"拿到函数再调用得到危险对象"的路径,只能在"拿到函数/实例"这一步拒。
-**系统性扫描(第 2 项)**:扫描脚本 `%TEMP%\scan_handles.py`——枚举 `vnpy.trader.*`/`vnpy.event.*`/`vnpy_ctastrategy.*`(排除 gui/ui/ctp/wechat)的公开函数
-(名字 `get_/create_/open_/connect/make_/new_/init_`、返回注解含 Database/Engine/Connection/Cursor/Session/Handle/Socket/IO/File/Thread/Process/Manager/Client)
-与模块级实例(类型来源非内置/数据类/枚举且带 `db/connection/cursor/execute*`,先调用一次 `get_database()` 让 `database` 变成实例)。
-修前 14 个命中,10 个放行;**已拦**:`get_database`(3 处:database、backtesting、engine)、`get_datafeed`(2 处)、`get_folder_path`(logger 再导出)、`database` 实例;
-**已审查为无害并登记**:`get_digits`(纯计算)、`get_localzone_name`(字符串)、`get_target_value`(取指标数值)、`make_subplots`(plotly 布局,plotly 不可 import)。
-**可重复**:同一判据已做成回归用例 `test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed`——升级 vnpy 后若出现新的、未被对象层挡住也未审查的句柄型成员,用例变红,逼着人去审。
-**局限**:判据是启发式(名字+注解+属性),不递归调用函数看返回值;覆盖面只到上述三个包;第三方 numpy/pandas 内部未扫。库自带的重导出会随 vnpy 升级变化——这是**持续**成本,不是一次性修复。
-
-**小项**:`vnpy.trader.utility.Path` 在 `UNREACHABLE_MEMBERS` 与 `UNREACHABLE_ORIGINS`(pathlib)里重复登记。**没有去重**:我先删了成员那条,宪法历史守卫立即报"内置保护只能增不能减"——按项目纪律,保留重复比放松守卫更对;别处再导出的 `Path` 由来源规则统一处置,用例两条路各测一遍;
-`_argv_matches` 的 docstring 写明实际判定范围:整条命令行逐项相等,且 `argv[0]` 的 basename(去扩展名、小写)为 `git`——只核名字,不核路径是不是真 git。
-**G8**:本轮同样**未跑**外部评审,状态:待复核。
-
-第 38 轮补修的变异验证:
-
-| 变异 | 结果 |
-|---|---|
-| 去掉按来源再导出的 qualified 规则 | 红 |
-| 去掉 peewee/vnpy_sqlite 实例来源 | 红 |
-| 只去掉 `UNREACHABLE_MEMBERS` 里的句柄登记 | 红,但**只因规则名断言**;攻击本身仍被 qualified+来源两层冗余挡住(纵深,不是等价变异也不是漏洞) |
-| 句柄三层防线全拿掉 | 红;端到端用例里候选 `VACUUM INTO` 真的成功(`ATTACKED`),证明探针不是空转 |
-| 回测入口不先建连接 | 红(新进程里的行为用例) |
-| 回测入口改回先 `add_strategy` 后 `load_data` | 红 |
+**一条"用例本身空转"的记录(第 ⑦ 条的方法教训)**:第一版修复侧用例**直接调预载函数**,
+**删掉预载它照样绿**——它测的是"helper 有效果",不是"生产路径确实预载了"。
+现在拆成两条("窗口边界不变式" + "隔离:关掉间接那层"),各自盯各自的那一层。
 
 无等价变异。
+
+
+### 第 41~43 轮:用例自身的守卫、锁的**每线程**身份、以及 codex G8 第二轮的收口
+
+本节记三件事的取舍与残留:①第 41 轮(一条用例自己会**空转**);②第 42 轮(锁的"重入"判据到底按**线程**还是按**进程**);
+③第 43 轮(codex G8 第二轮 `38/50` 的 must-close 项逐条收口)。分支冻结规则不变:**只补规则与用例**,功能改动一律转 Issue #29。
+
+---
+
+#### 1. 第 41 轮:一条用例自己会空转(而且是**假绿**)
+
+`tests/test_research_api.py::test_all_three_child_entrypoints_go_through_the_same_validation_function`
+在全量套件里**偶发失败**(单跑绿、全量跑红)。**根因不是产品的顺序依赖**,而是 `inspect.getsource`
+**按行号**从磁盘上的当前文件切块:模块导入之后文件被改写(行号位移),它就返回**另一段**源码块
+(实测:改写后 `getsource` 返回的是**上一个函数**的源码块)。
+
+**为什么必须修**:这类错块会让"源码里**没有** `check_candidate_class(`"这类**否定式**断言**假绿**——
+本项目最在意的那类静默失败(守卫宣称守住了,其实那条断言压根没在看目标函数)。
+
+修法:断言前先核对"拿到的确实是这个函数的源码块";`tests/test_merge_main_sandbox_union.py` 里读
+`import_candidate` 源码的那条同样加核对。第 43 轮把这两条进一步换成 **`ast.parse` + 按名字取函数节点 + `ast.unparse`**
+(不再依赖行号,也不依赖磁盘上文件的当前状态)。注意 `ast.unparse` 会把字符串引号**归一化成单引号**,
+断言里要一并归一化,否则会因引号形式不同而误判。
+
+#### 2. 第 42 轮:锁的"重入"必须按**线程**判,不能按进程判
+
+第 40 轮把账本锁统一成一把之后,锁文件里除 PID 外还写了一个 token,用来识别"**同一个线程**又来拿这把锁"(重入)。
+**第一版按进程分组**,后果是:同进程里**另一个线程**持有/等待同一把锁是**真并发**,却被误判成重入并立刻失败——
+6 线程并发批准的用例直接打挂(5/6 个线程报"被本进程重复获取(重入)")。
+
+改成**每线程**的 token(`threading.local()` + 每线程一次 `uuid4`):重入按**线程**判,别的线程一律**等**。
+同时把"拿不到锁"与"**临界区内部**抛出的链错误"分开:此前两者都被翻译成"被其他进程占用"——
+而临界区里失败时那句话是**错的**(不是被占用,是活儿失败了)。现在只翻译**取锁**失败,临界区异常原样往上抛。
+
+#### 3. 第 43 轮(codex G8 第二轮 38/50):must-close 逐条收口
+
+codex 第二轮给的 38/50 里,有四条 must-close 与一批 M/L。本轮逐条处置如下(**每条都配双向动态探针 + 变异验证**):
+
+##### 3.1 H2(已修):锚点记累计次数 ⇒ "账本被删掉几行"**精确**可算
+
+此前锚点只记 `<seq> <hash>`。删掉账本中间几行**既不改长度也不改哈希链**(删的是中间,首尾的 prev/hash 仍自洽),
+读侧看不出来;更糟的是人工重置的"防变小"基准取自**文件当前自称的次数**,于是基准跟着缩水——
+把账本从 60 截到 10 再重置,基准变成 10,"缩小"**完全检不出来**,重置记录还把 before/after 都写成 10,把丢失**洗白**。
+
+- 锚点扩成 `<seq> <hash> <total>`(旧的两段锚点仍读得了,只是拿不到累计次数);第三段不是数字 ⇒ fail-closed。
+- 读侧 `verify()` 把前 `seq` 行的 `count` 合计与锚点 `total` 比对,对不上 ⇒ fail-closed(**删行在读侧就露出来**)。
+- 写路径(`trial_ledger.record_trials`、`ledger_admin.migrate_trials/reset_trials`)都写 `total`。
+- 人工重置的基准改成 `max(文件自称的累计, 锚点累计)`;因为锚点覆盖 rows 1..anchor_seq,
+  **丢了多少次是精确可算的**(`anchor_total − 保留前缀合计`,不是估计)。丢了就必须 `--add-trials <丢失数>` 补回,
+  或显式 `--allow-reduce-n --reason`;重置记录里另写 `lost` 与 `anchor_seq`——
+  否则"曾经变小过"只存在于 before/after 两个数里(它们可能相等,等于洗白)。
+
+##### 3.2 H3(已修):"按名求值的执行器"这条规则要按**值的来源**判
+
+第 40 轮的 `EVALUATOR_MEMBERS` 只按**访问路径**判(`typing.get_type_hints`),
+于是 `typing_extensions.get_type_hints`——**同一个函数对象**,访问路径却不在名单里 ⇒ 放行。
+此前它只是因为"typing_extensions 本身被导入门挡住"才没出事:那是**别的规则**兜着,不是这条规则管用。
+
+现在规则按**值的来源**判(`__module__` + `__name__`):不管候选从哪个模块拿到,只要拿到的是"按名求值的执行器"这个**东西**,就拒。
+用例两侧都钉住:再导出的 `get_type_hints` **被拒并断言规则名**;`typing` 的无害成员**仍然可达**(放行方向不能被误伤)。
+
+##### 3.3 M1(已修):取不到触发帧 ⇒ fail-closed
+
+`exec` 审计事件要靠"**谁触发的这次 exec**"判(`FORBIDDEN_EVAL_FRAMES`)。此前取不到帧时按 fail-**open** 放行
+(只有 `co_filename == "<string>"` 才拒)。本函数自己的论证说:库自己 eval 的代码**都由 Python 帧触发**
+⇒ 取不到帧本来就不是合法路径 ⇒ **查不了 = 没查 ⇒ 拒**。新增规则名 `audit:eval-origin-unknown`
+(与"已确认是求值点"的 `audit:forward-ref-eval` 分开:这里并不知道是谁触发的,只知道**判不出来**)。
+
+##### 3.4 M2(已修):锁的陈旧判据改成"**持有者还在不在**",且同一把锁**统一口径**
+
+- 主判据改为"**持有者进程已死**"(Windows 上用 `OpenProcess` 判存活,不能用 `os.kill(pid,0)`——那会 TerminateProcess)。
+  持有者还活着 ⇒ 锁**不是**陈旧的,**哪怕它已经很老**也不抢(此前"年龄到了就抢"会抢走活人的锁)。
+  年龄只在**读不到 PID** 时当兜底。
+- 同一把锁文件的**所有调用方必须用同一个 `stale_seconds`**:批准路径此前是 60 秒、账本维护入口是默认 30 秒,
+  而两者锁的是**同一个** `approvals.json.chainlock` ⇒ 维护入口能按自己的口径把批准路径的**活锁**当陈旧锁抢走。
+  统一为 `risk/ledger_chain.DEFAULT_STALE_SECONDS = 30.0`,批准路径改为引用这个常量。
+
+##### 3.5 M3(已修):错误消息按 `reason` 分情形说
+
+`LedgerChainError` 增加 `reason`(`occupancy` / `reentrancy` / `permission` / `chain` / `generic`),
+调用方据此说对话:把"本进程同一线程重入"说成"被其他进程占用"是**说错话**(对权限错误同样)。
+批准路径与账本维护入口各自按 reason 翻译;"占用"那条额外说明是**暂态占用,请稍后重试**。
+
+##### 3.6 M4(已修,并**更正此前的说法**):sqlite 豁免只覆盖 connect 事件
+
+`framework_exempt(sqlite_paths=…)` 这条窄豁免**只覆盖 connect 事件**;连上之后的 SQL 写
+(`UPDATE`/`DELETE`/`ATTACH`/`VACUUM`)在事件层**发不出带路径的事件**(sqlite3 的文件写在 C 层,不走 `open` 事件)
+⇒ 那条路径上既没被豁免、也没被拦。候选今天改不动那个库文件,靠的是**能力层**(sqlite3 模块本身在危险名单里、库句柄不可达),
+**不是**靠这条豁免。原 docstring 写"不豁免 open/写,候选照样不能写那个库文件",听起来像是这条豁免**顺带**保证了写不被允许——那是**错的**,已按事实改写
+(`scripts/research_sandbox.py` 与 `scripts/research_api.py` 两处)。**跟踪 Issue:#43**(候选仍能经真 `sqlite3` 写被豁免的库文件)。
+
+##### 3.7 L2(已修):`vnpy.alpha` 的运行期导入门用例
+
+第 40 轮只补了静态筛查用例;本轮补一条**运行期导入门**用例(静态层过了,导入门仍须拒)。
+
+##### 3.8 L3(已修):源码断言改成 AST
+
+见第 1 节。`tests/test_merge_main_sandbox_union.py` 里"代理与视图共用同一条对象层规则"与
+"生产路径把两道防线接进同一个调用"两条用例改成 AST 判据(按名字取函数节点、比对调用点与参数),
+不再用 `inspect.getsource` 切块。**坑**:`safe_builtins` 的 `allowed_modules` 是**位置参数**,不是关键字参数;
+`ast.unparse` 把引号归一化成单引号——两条都踩过。
+
+##### 3.9 L5(已修,并**更正一处过虑的担心**):白名单成员的可达性实测
+
+codex 担心 `EVALUATOR_MEMBERS` 这类规则会**误伤**白名单模块的正常成员。**实测**:放行 numpy/pandas 后,
+被对象层拦下的公开成员只有 **3 个**(`numpy.ctypeslib`、`numpy.f2py`、`pandas.errors`)——**过虑不成立**。
+固化成一条回归扫描用例(白名单模块的普通成员仍然可达),vnpy/numpy 升级后若新增成员被误伤,这条会变红。
+
+#### 4. 第 43 轮的变异验证(改回旧行为,用例必须变红)
+
+| 变异 | 结果 |
+|---|---|
+| 重置基准不看锚点累计次数(回到第 40 轮口径) | 红(截断账本被重置成更小的 N) |
+| 不算"丢了多少次"(只靠 before<after 那道总闸) | 红 |
+| 读侧不核锚点累计次数 | 红 |
+| 执行器名单只按访问路径判(再导出放行) | 红 |
+| 锁的年龄判据回到"年龄到了就抢"(会抢活人的锁) | 红 |
+| 两个调用方的陈旧口径不一致(批准路径改回 60 秒) | 红 |
+| 重入也说成"被其他进程占用" | 红 |
+| 取不到触发帧 ⇒ 放行(fail-open 回到 fail-closed 之前) | 红 |
+
+#### 5. 如实登记的残余
+
+- **锚点仍无密钥**:账本与锚点**都能被同一写权限的人改**,同时改两边骗得过读侧。本轮把"删行"从**完全不可见**变成
+  "**精确可见**",但"同时改账本与锚点"这条仍在。真边界是 **Issue #29**(独立进程 + 只读挂载)。
+- **宪法守卫的噪音(L1)**:它按**历史提交**逐个比对,同一个漂移会被重复报很多次,且每次都重新解析全部提交 ⇒ 慢且吵。**跟踪 Issue:#44**。
+- **`window_denials()` 没有生产消费者**:拒绝记录只进内存(#41)。
+- **读侧整体未收口**:`self.load_bar` 能读任意区间(含测试段)(#42)。
+- **`sqlite` 豁免与写**:见 3.6(#43)。
+
+#### 6. 本轮未做(分支冻结)
+
+以下都是**功能改动**,不在本分支做,一律转 Issue #29 或已登记的 Issue:
+候选独立进程化(#29)、账本写入路径 O(n²)(#40)、`window_denials()` 的生产消费(#41)、读侧只读挂载(#42)、
+sqlite 库文件的写入拦截(#43)。
+
+### 第 44 轮:把核心防线**真的接进 CI**(闸门配了,但从没跑过)
+
+分支冻结规则不变:**本分支只接受"补规则与用例"的修复**,功能改动一律转 Issue #29。
+本轮**只改测试与 CI 配置,没有动生产代码**。
+
+#### 1. 发现:闸门看上去配好了,实际一次都没跑
+
+查 `.github/workflows/research-guard.yml` 的实际调用面(不是看注释):本 issue 的两份核心套件
+
+- `tests/test_fs_capability_closure.py`(Issue #31 的能力收口防线,165 条)
+- `tests/test_merge_main_sandbox_union.py`(main #22 × #26 的并集回归,76 条)
+
+**在 ruff 清单里(第 92 行),却不在任何一条 pytest 调用里**。原因很直白:两份文件都写的是
+`import bootstrap`,而 `scripts/bootstrap.py` 在**导入期**就 `from vnpy.trader.setting import SETTINGS` ⇒
+研究侧 CI(只装 numpy/pandas/mcp/pyyaml)上**整份文件在收集阶段就 `ModuleNotFoundError`**。
+
+这正是本仓库第 7 轮 codex 的 High 说过的那句话,原样又发生了一次:**"边界不变量写成了测试,
+却没有 job 会跑它——于是看起来有防线、实际随时能改坏"**。第 40~43 轮修的是"规则对不对",
+本轮修的是"**规则会不会被跑到**":规则再对,不跑就是零。
+
+#### 2. 修法(三步,都不碰生产代码)
+
+1. **守卫式导入 bootstrap**——用仓库**既有惯例**(与 `tests/test_constitution_round11.py` 同款):
+   `if importlib.util.find_spec("vnpy") is not None: import bootstrap`。
+   不新造写法:那条惯例旁边本来就有一条守卫断言(`_is_find_spec_vnpy_is_not_none`)在盯谓词没被写反。
+   **不用** `try/except ModuleNotFoundError`:那样"交易栈没装"与"import 真的坏了"就分不开了。
+2. **逐条显式标记需要交易栈的用例**——`@requires_trading_stack`(判据:`importlib.util.find_spec("vnpy_ctastrategy")`)。
+   **环境驱动**:本机(装了 vnpy)这些用例照跑,一条不少;研究侧 CI 上跳过并打印原因。
+   **漏标记不会被静默吞掉**:没标记又要交易栈的用例在 CI 上会**直接失败**(而不是被跳过),
+   这正是我们要的行为——漏标会立刻暴露,不会悄悄退化。
+3. **CI 里单跑一步**(不与其它文件合跑):收集失败必须**整步红**,不被 `--continue-on-collection-errors` 吞掉
+   (那是"研究侧其余测试"那一步的取舍,核心防线不该享受)。
+
+#### 3. 两条守卫断言(放进本来就在 CI 上跑的 `tests/test_research_boundary.py`)
+
+- **接线守卫**:workflow 里必须有一行 `python -m pytest` 指向这两份套件(两份分别参数化)。
+- **标记纪律守卫**:被标成"需要交易栈"的用例,必须**直接**引用交易栈(运行时 import,或候选源码里的 import),
+  或登记在显式清单 `TRADING_STACK_INDIRECT` 里并写明理由(那 4 条是**间接**依赖:子进程要 vnpy /
+  要读到行情库 / 要扫描本机已装的包)。两头都查:不许一刀切(整份跳过 = 防线等于没建),
+  也不许多标(多标一条 = 在 CI 上少跑一条防线)。清单不许有陈旧条目。
+
+#### 4. 动态探针(不是静态推理)
+
+在没有 vnpy 的干净环境里实测(见下"验证")。**"需要交易栈的用例集合"是实测出来的**:
+先把两份文件都改成守卫式导入,在无 vnpy 环境里跑,取**实际失败集**,再逐条标 `@requires_trading_stack`;
+标完复跑必须**零失败**,且**未标记的用例一条都不许失败**(否则就是漏标)。
+
+守卫本身也做了**变异验证**(改回旧行为必须变红):
+
+| 变异 | 结果 |
+|---|---|
+| 从 workflow 里删掉 `pytest tests/test_fs_capability_closure.py` | 红(接线守卫) |
+| 给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` | 红(标记纪律守卫) |
+
+#### 5. 验证
+
+- 无 vnpy 环境(仅 numpy/pandas/mcp/pyyaml/typing_extensions):`tests/test_fs_capability_closure.py`
+  **133 passed / 32 skipped / 0 failed**;`tests/test_merge_main_sandbox_union.py` **74 passed / 2 skipped**
+  (那 2 条要真模块才判得了准入审计,缺模块时按用例自己的说明跳过)。
+- 研究侧 CI 的整条命令面(8 份 + 本轮两份)在同一环境里跑:**598 passed / 55 skipped / 0 failed**。
+- 本机(装了 vnpy):同一批 **327 passed**(165 + 76 + 86),**标记一条都没让本地少跑**。
+- `python tools/check_constitution_history.py` 通过;CI 的 ruff 精确清单(ruff 0.14.8)通过。
+
+#### 6. 如实登记的残余
+
+- **本轮在 Windows 上实测,CI 的 runner 是 Linux**:Windows 专属用例(`_winapi`/`winreg`)在 CI 上按 `skipif` 跳过,
+  Linux 专属行为未在本机验证过。CI 首跑若红,按"Linux 上的真实差异"处理,不要回退接线。
+- **那 32 条需要交易栈的用例,在 CI 上仍然不跑**(它们只能在装交易栈的环境里跑)。
+  这是**诚实的边界**:能力收口的另一半(与 vnpy 再导出相关的规则)在 CI 上没有覆盖。
+- **研究侧还有 4 份沙盒规则套件没进 CI**(`test_sandbox_round25_rules.py`、`test_sandbox_round26_rules.py`、
+  `test_sandbox_round26_followup_rules.py`、`test_candidate_escape_production_path.py`):它们的候选源码要
+  `import strategies` 模板(→ `vnpy.trader.database`),**真的需要交易栈**,接线需要逐条标记。**跟踪 Issue:#46**。
+- 仓库层面仍**没有**跑全套测试的 CI job(96 份测试文件里绝大多数不在任何 CI 里)。那是更大的工程问题,不在本 issue。
+
+### 第 45 轮:维护入口把"链坏了"说成"被其他进程占用"(第 42 轮修过的那一族,这一边漏了)
+
+#### 1. 发现
+
+第 44 轮做完 CI 接线之后,第一轮 G8 外部审查(Gemini)因**免费配额耗尽**返回 429、没跑完,
+外部意见缺席。改用自查 + codex CLI(第二轮)继续,自查里翻出一条**第 42 轮就该一起修**的漏网:
+
+`risk/ledger_admin._ledger_lock`(账本维护入口的跨进程锁)把**整个临界区**圈在 `try` 里:
+
+```python
+try:
+    with chain.file_lock(Path(path), timeout=ADMIN_LOCK_TIMEOUT):
+        yield                                   # ← 临界区**内部**在这里
+except chain.LedgerChainError as exc:
+    raise AdminError(_ledger_lock_message(...)) from exc
+```
+
+于是临界区**内部**抛的 `LedgerChainError`(reason=`chain`:锚点写失败、链对不上、锚点格式不合法)
+也被翻译成 **"账本被其他进程占用,拒绝维护"**。那句话是**错的**:
+
+| 真实原因 | 该怎么办 | 消息说成"被占用"的后果 |
+|---|---|---|
+| 被别的进程占着(暂态) | **稍后重试**即可 | 恰好对 |
+| 链坏了(reason=`chain`) | 重试**没用**,得人工处理 | 操作员会一直重试,永远出不来 |
+
+这与第 42 轮在 `scripts/research_sandbox._approvals_lock` 修掉的是**同一个问题**——
+那一轮只改了沙盒侧,**账本维护入口漏了**(两处代码是同一天写的,一处改了一处没改)。
+
+同样的毛病还有第二层:两处 `_..._lock_message` 里只有 `reentrancy` 与 `permission` 单独说,
+其余 reason(含 `occupancy` 与 `chain`/`generic`)**一律落进兜底**,兜底那句话是"被其他进程占用"。
+于是即便原因不是占用,消息也这么说。
+
+#### 2. 修法
+
+① **`ledger_admin._ledger_lock`**:改成手动 `__enter__`/`__exit__`,**只翻译"拿不到锁"这一种失败**;
+临界区内部失败**原样抛**(异常类型也不吞——`AdminError` 只用于"锁没拿到"这一种)。
+
+② **两处消息函数**:把 `occupancy` 从兜底分支里**单独拎出来**:
+- `occupancy` ⇒ 说"暂态占用,**请稍后重试**"(附持有者与已等待时长);
+- `reentrancy` ⇒ 说"本进程同一线程重入,重试没用";
+- `permission` ⇒ 说"权限错误,不是被占用";
+- 其它(reason=`chain`/`generic`/未来新增)⇒ 只说"锁获取失败(reason=...)",**不替未知原因编一个原因**。
+
+③ **顺带把两套口径的分工写清**(此前混在一起,读代码时分不清哪个是安全参数):
+
+| 参数 | 是什么 | 能不能有差异 |
+|---|---|---|
+| `stale_seconds` | 多久算**残留锁**、可以抢走 | **不能**——同一把锁文件的所有调用方必须用同一个值(否则快的那个能按自己的口径抢走慢的那个的**活锁**) |
+| `timeout` | 等不到锁就**放弃** | **能**——这是调用方策略:人工维护入口 5 秒(失败即重试),写入路径 30 秒(宁可多等,别把一次并发写入变成失败) |
+
+此前"默认的 30 秒"是个**只有不传参的人才用的暗口径**(`risk/trial_ledger` 就是不传的,
+而另两个调用方都显式传 5.0)。现在 `risk/trial_ledger` 把它显式写成 `LOCK_TIMEOUT`,
+三个调用方都**显式**传 `stale_seconds`——**不留暗口径**。
+
+#### 3. 用例与变异验证
+
+新增 4 条用例(`tests/test_fs_capability_closure.py`):
+
+| 用例 | 钉住什么 |
+|---|---|
+| `test_an_error_inside_the_admin_lock_is_not_reported_as_occupancy` | 临界区内部失败**原样抛** `LedgerChainError`,消息里**不许**出现"被其他进程占用" |
+| `test_the_admin_lock_occupancy_message_says_it_is_transient` | 占用单独说、且写明"请稍后重试";`chain` **不许**被说成占用 |
+| `test_the_sandbox_lock_occupancy_message_says_it_is_transient` | 沙盒侧同一件事 |
+| `test_every_lock_caller_passes_the_staleness_limit_explicitly` | 三个调用方的**安全**口径一致,且都**显式**传参(源码层面钉住) |
+
+变异验证(5 项**全部红**):
+
+| 变异 | 结果 |
+|---|---|
+| 删掉 `ledger_admin` 的 `occupancy` 分支 | 红 |
+| 把 `ledger_admin` 改回"整个临界区都圈住" | 红 |
+| 回到第 45 轮之前的**完整**原状 | 两条用例都红 |
+| 删掉沙盒侧的 `occupancy` 分支 | 红 |
+| 删掉 `trial_ledger` 显式传的 `stale_seconds` | 红 |
+
+#### 4. 验证
+
+- `tests/test_fs_capability_closure.py`:**169 passed**(原 165)。
+- `tests/test_research_boundary.py` + `tests/test_merge_main_sandbox_union.py`:**162 passed**。
+- `python tools/check_constitution_history.py` 通过;CI 精确 ruff 清单(ruff 0.14.8)**All checks passed**;
+  `python -W error::SyntaxWarning -m compileall` 通过。
+- 全量默认顺序套件:**3325 passed / 3 failed / 5 errors**——失败与错误全部落在
+  `tests/test_dashboard_boundaries.py` 与 `tests/test_drill.py`(**本分支未触及的既有失败**)。
+
+#### 5. 如实登记的残余
+
+- 本轮只改了**错误消息与翻译口径**、以及**超时参数的显式化**,**没有改任何判定逻辑**:
+  "链坏了"此前也被说成"被占用",现在至少**说对了原因**;错误仍然 **fail-closed**(一律拒绝),没有变宽松。
+- 第一轮 G8 外部审查(Gemini 2.5-pro / 2.5-flash)因**免费配额耗尽**返回 429,
+  **外部意见在第 45 轮缺席**;第二轮(codex CLI)照常跑了。下一轮配额恢复后应补跑第一轮。
+- `timeout` 与 `stale_seconds` 的分工现在写进了代码注释与本 ADR,但**没有守卫断言**去拦
+  "有人把 `stale_seconds` 改成不同值"——目前靠用例 `test_every_lock_caller_passes_the_staleness_limit_explicitly`
+  的源码断言兜着(它盯的是"显式传 + 传的是同一个常量")。

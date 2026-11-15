@@ -47,7 +47,15 @@ PENDING_DIR = "pending_strategies"
 # 那是同进程残余,由 Issue #29(独立进程 + 只读挂载)闭合。见 ADR 第 39 轮。
 SEGMENTS = ("train", "valid")
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
-LOCK_STALE_SECONDS = 60.0            # 残留锁(持有者已崩)的判定上限
+# 残留锁(持有者已崩)的判定上限(秒)。
+# 第 43 轮:这个值**必须与账本维护入口用同一个**(两者锁的是同一个 `approvals.json.chainlock`;
+# 此前这里是 60 秒、那边是默认 30 秒,于是维护入口能按自己的口径把批准路径的**活锁**当陈旧锁抢走)。
+# 现在统一取 `risk/ledger_chain.DEFAULT_STALE_SECONDS`。
+# 注:陈旧的**主**判据已经是"持有者进程还在不在"(持有者活着就一律等它),年龄只在读不到 PID 时兜底。
+LOCK_STALE_SECONDS = chain.DEFAULT_STALE_SECONDS
+# 批准记录锁的等待上限(秒)。拿不到锁就**失败**:批准记录写错一条就是"没批准却生效"。
+# 做成模块级常量是为了让用例能把等待缩到毫秒级(不必真的等满)。
+APPROVALS_LOCK_TIMEOUT = 5.0
 
 FORBIDDEN_MODULES = {
     "os", "sys", "subprocess", "socket", "ctypes", "shutil", "pathlib", "importlib", "pickle", "marshal",
@@ -115,6 +123,12 @@ DANGEROUS_MODULE_NAMES = {
     # 反射与执行
     "builtins", "inspect", "gc", "operator", "importlib", "_importlib", "_imp",
     "runpy", "code", "pkgutil", "zipimport", "marshal", "pickle", "shelve",
+    # `string`(第 40 轮实测):`string.Formatter.get_field("0.__globals__", …)` 会在 **string.py 自己的帧里**
+    # 按候选给的名字取属性 —— 静态层看不见(候选的名字是拼出来的)、运行期的对象层也拦不到
+    # (那一帧不是候选的模块)。实测:候选用它拿到**真内建** → 真 `__import__` → 真的 `research_sandbox` 模块
+    # → 把 `_AUDIT.active` 改成 False 就把审计钩子**关掉**了,随后真 `open` 在允许目录之外写成功。
+    # 它是"按名取属性的执行器",与 `getattr`/`eval`/`exec`/`compile` 同一族(静态层本来就禁那四个)。
+    "string",
     "timeit", "doctest", "pdb", "bdb", "trace", "profile", "cProfile",
     "multiprocessing", "concurrent", "threading", "asyncio",
     # 原生代码
@@ -161,6 +175,21 @@ UNREACHABLE_ORIGINS = frozenset({"threading", "multiprocessing", "pathlib", "glo
                                  # 数据库驱动/ORM 的**实例**(`vnpy.trader.database.database` 带 peewee 的 `.db` 原始句柄):
                                  # 句柄上的 `execute_sql("ATTACH DATABASE …")`/`VACUUM INTO` 在事件层判不了(第 38 轮实测)
                                  "peewee", "playhouse", "vnpy_sqlite", "sqlite3"})
+
+# 第 40 轮(codex 第 39 轮后的 High 1;**本机动态探针独立复现**):对象层的"来源"判定此前**只查 UNREACHABLE_ORIGINS
+# 这一个集合**,而"能给候选起线程/进程、拿真实路径、执行代码"的来源散落在 DANGEROUS_MODULE_NAMES 里——
+# `concurrent` 就这么漏了:候选 `from vnpy.trader.optimize import ProcessPoolExecutor` **实测拿到**
+# (`vnpy_ctastrategy.engine` 还再导出了 `ThreadPoolExecutor` 与 `Future`,codex 只报了第一个,本机扫描三个都实测到)。
+#
+# 这已是同一族**第三次**漏(第 37 轮 `importlib` → 第 37 轮 `multiprocessing` → 本轮 `concurrent`),
+# 所以**不再手补名单**:非模块成员的来源根一律按 DANGEROUS_MODULE_NAMES 判。
+# DANGEROUS_MODULE_NAMES 本身已登记进宪法守卫的"只增不减"集合(`SANDBOX_SETS`),所以这个并集**只会变大不会变小**,
+# 方向与"内置保护只能增不能减"一致。
+# `builtins` **排除**在外:非模块成员里来自 builtins 的可能是无害的(`len` 这类),
+# 而内建原语另有一条更精确的规则(`BUILTIN_PRIMITIVE_NAMES`,报"规则:导入原语"),
+# 一刀切会把放行方向也堵掉(用例 `test_builtins_import_primitive_reexported_by_a_module_is_refused`
+# 的放行侧就是 `carrier.harmless = len`)。
+_OBJECT_ORIGIN_ROOTS = (frozenset(DANGEROUS_MODULE_NAMES) - {"builtins"}) | UNREACHABLE_ORIGINS
 # **按"来源模块.函数名"拒绝**:调用后返回活动句柄/引擎的函数(`get_database()` 返回 peewee 句柄的包装,`get_datafeed()` 返回行情源客户端)。
 # 对象层只判模块成员,**不判函数返回值**——所以必须在"拿到函数"这一步拒,而且按函数的来源(`__module__` + `__name__`)判,
 # 这样 `vnpy_ctastrategy.engine.get_database` 这类再导出同样被挡。只增不减(宪法守卫登记)。
@@ -813,6 +842,21 @@ def _check_object_rules(module, name, value) -> None:
         raise AttributeError(
             f"禁止访问 {module.__name__}.{name}:它能按调用方给的任意路径读写文件,"
             f"不交给候选(规则:任意路径读写原语)")
+    # **按名求值的执行器**(第 40 轮实测):这类函数把**候选给的字符串**在**别的模块的命名空间**里求值,
+    # 等于把真内建递出去。`typing.get_type_hints(C)` 是实测到的那一个:
+    # 候选把 `C.__module__` 改成 "json"、注解写成 "__import__('os').environ",
+    # 于是拿到**真 os**,读到了进程的环境变量(实测读到 ANTHROPIC_AUTH_TOKEN)——
+    # 静态层看不见(名字是拼出来的),运行期的对象层也拦不到(求值发生在 typing 自己的帧里)。
+    if f"{getattr(module, '__name__', '')}.{name}" in EVALUATOR_MEMBERS:
+        raise AttributeError(
+            f"禁止访问 {module.__name__}.{name}:它会把候选给的表达式在别的命名空间里求值,"
+            f"等于把真内建递给候选(规则:按名求值的执行器)")
+    # 第 43 轮(codex 的 H3):上面那条按**访问路径**判,会漏**再导出**——
+    # `typing_extensions.get_type_hints` 与 `typing.get_type_hints` 是**同一个函数对象**,
+    # 但访问路径是 "typing_extensions.get_type_hints",不在名单里 ⇒ 放行。
+    # 此前它只是因为"typing_extensions 本身被导入门挡住"才没出事——那是**别的规则**兜着,
+    # 不是这条规则管用(与仓库里反复批判的"靠别的层兜着"同一族问题)。
+    # 所以下面(按**值的来源**判)那条才是这条规则真正的判据。
     if isinstance(value, ModuleType):
         if _is_dangerous_module(value):
             raise AttributeError(
@@ -844,10 +888,35 @@ def _check_object_rules(module, name, value) -> None:
             raise AttributeError(
                 f"禁止访问 {module.__name__}.{name}:它是 {origin}.{value_name},调用后会返回活动句柄/引擎"
                 f"(对象层不判函数返回值,只能在拿到函数这一步拒;规则:返回活动句柄的函数)")
-        if isinstance(origin, str) and origin.split(".")[0] in UNREACHABLE_ORIGINS:
+        if f"{origin}.{value_name}" in EVALUATOR_MEMBERS:
+            # **按值的来源**判(第 43 轮):不管候选是从哪个模块拿到的,只要拿到的
+            # 是"按名求值的执行器"这个**东西**,就拒——再导出也逃不掉。
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:它是 {origin}.{value_name},"
+                f"会把候选给的表达式在别的命名空间里求值,"
+                f"等于把真内建递给候选(规则:按名求值的执行器)")
+        # 第 40 轮:**先**判"执行能力"(能力泄漏),**再**判"来源不可达"——
+        # 否则 `ctypes.CDLL`/`importlib.import_module` 这类会被更宽的"来源"规则先接住,
+        # 报出的规则名从"能力泄漏"变成"按来源不可达",用例就分不清"红了"是"红对了原因"。
+        # (仓库第 22 轮的老教训:断言必须钉住**是哪条规则**拒的。)
+        source = _capability_source(value)
+        if source:
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:它来自 {source},"
+                f"递出去等于把执行能力递给候选(规则:能力泄漏)")
+        if isinstance(origin, str) and origin.split(".")[0] in _OBJECT_ORIGIN_ROOTS:
             raise AttributeError(
                 f"禁止访问 {module.__name__}.{name}:它来自 {origin},白名单模块再导出它会让候选起线程/进程或拿到真实路径"
                 f"(规则:按来源不可达)")
+        # 第 40 轮(Medium 5):"函数级能力库未授权"此前**只查模块**,类不在射程内——
+        # 于是 `from vnpy_ctastrategy.backtesting import DataFrame` 照样拿到 `pandas.core.frame.DataFrame`
+        # (pandas 是大攻击面:`to_csv`/`to_pickle` 是任意写,`DataFrame.eval` 能用 pandas 的真实 globals 求表达式)。
+        # 口径与模块那一支对齐:**来源根属于能力库、且这次没被放行,就不递给候选**。
+        lib_root = origin.split(".")[0] if isinstance(origin, str) else ""
+        if lib_root in CAPABILITY_LIB_ROOTS and lib_root not in _ACTIVE_ALLOWED_ROOTS[0]:
+            raise AttributeError(
+                f"禁止访问 {module.__name__}.{name}:它来自 {lib_root},"
+                f"{lib_root} 没有列入本次的导入白名单,不能经别的模块的属性绕进来(规则:函数级能力库未授权)")
     # 非模块的值:如果它**定义在** ctypes/subprocess 里(`subprocess.Popen`、
     # `ctypes.CDLL`),递出去一样能执行命令——按对象来源判,不看名字。
     source = _capability_source(value)
@@ -909,7 +978,16 @@ FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__",
                    # 闭包单元(第 24 轮实测):受限导入器把真导入器藏在闭包单元里,
                    # 而闭包单元在 f_locals 里看得见——`f.__closure__[0].cell_contents`
                    # 就是真导入器。这两个名字静态层一律不许引用。
-                   "__closure__", "cell_contents"}
+                   "__closure__", "cell_contents",
+                   # **前向引用求值器**(第 40 轮实测,生产入口复现):
+                   # `typing.ForwardRef` 里存着候选给的**字符串注解**,
+                   # 一旦有人调 `fr._evaluate({}, None, recursive_guard=set())`,
+                   # `eval` 就在**空的 globalns** 里跑——CPython 会把**真内建**注入进去,
+                   # 于是真 `__import__` → 真 `os` → 真环境变量(实测读到了真 PATH 的值)。
+                   # 载荷藏在字符串字面量里,静态层看不见这一层(事件层判据见 `FORBIDDEN_EVAL_FRAMES`),
+                   # 但候选**必须写出这个名字**才能调它(getattr/type/__dict__/__getattribute__ 一律已被禁),
+                   # 所以这里按名字拒;事件层再兜一道(候选若用别的写法绕开名字,事件层照样拒)。
+                   "_evaluate", "_eval_type"}
 
 # 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
 # `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,
@@ -1003,6 +1081,13 @@ EXTRA_FORBIDDEN_MODULES = frozenset({"unittest", "unittest.mock", "mock"})
 # 根名字"numpy"照常放行——候选正当需要 numpy;这里只堵这几个角落。
 FORBIDDEN_MODULE_PATHS = frozenset({
     "numpy.ctypeslib", "numpy.f2py", "numpy.distutils",
+    # `vnpy.alpha` 全路径(第 40 轮实测):`vnpy/alpha/dataset/utility.py:258` 有
+    # `eval(expression, {}, d)` —— 表达式由**调用方**给。候选只要能 import 到这个模块
+    # 里的那个函数,就把"任意表达式求值"递到了自己手上(真内建)。
+    # 本机当前**导不进去**(缺 `polars`,`vnpy.alpha.dataset.template` 顶层就 import 它),
+    # 所以这条是**潜伏**风险而不是已实测的逃逸;但缺依赖是环境的事,规则不能靠环境兜底。
+    # 只增不减(宪法守卫登记)。
+    "vnpy.alpha",
 })
 
 # ---------------------------------------------------------------------------
@@ -1732,8 +1817,13 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
 ALLOWED_MODULE_ROOTS = frozenset({
     "math", "statistics", "collections", "datetime", "typing", "enum", "dataclasses",
     "itertools", "functools", "abc", "decimal", "fractions", "random", "copy", "re",
-    "string", "time", "json", "strategies", "vnpy", "vnpy_ctastrategy",
+    "time", "json", "strategies", "vnpy", "vnpy_ctastrategy",
 })
+# **`string` 不在白名单里**(第 40 轮实测):`string.Formatter` 是"按候选给的名字取属性"的执行器——
+# 候选用它拿到真内建 → 真 `__import__` → 真的框架模块 → 把审计钩子关掉,随后在允许目录之外写成功。
+# 静态层本来就把 `getattr`/`eval`/`exec`/`compile` 列为"反射检查",`string` 是同一族的漏网执行器。
+# 代价:候选用不了 `string.ascii_letters` 之类的常量(策略模板基本用不到);要用的走配置追加也不放行
+# (`string` 在 `DANGEROUS_MODULE_NAMES` 里,黑名单先判,配置追加也放不出来)。
 
 # **函数级能力库**(Issue #31):它们本身没有危险的"模块名",但 `np.memmap`/`np.savetxt`/`DataFrame.to_csv`/
 # `pd.read_pickle`/`np.load(allow_pickle=True)` 给的是任意文件读写与反序列化执行——第 35 轮 codex 实测
@@ -1760,6 +1850,24 @@ UNREACHABLE_MEMBERS = frozenset({
     # (含测试段)。模板只需要 `CtaTemplate`,这两个类没有正当理由给候选。
     "vnpy_ctastrategy.backtesting.BacktestingEngine", "vnpy_ctastrategy.backtesting.BaseDatabase",
     "vnpy_ctastrategy.engine.CtaEngine", "vnpy_ctastrategy.engine.BaseDatabase",
+})
+
+# **"按名求值的执行器"**(第 40 轮实测):候选不需要拿到 `eval`/`exec`/`getattr` 本身,
+# 只要能调用一个"替它按名字取属性/求值"的函数,那个函数所在的命名空间里的
+# **真内建**就等于递到了候选手上(真内建 → 真 `__import__` → 真 `research_sandbox`
+# → 把 `_AUDIT.active` 改成 False 就把审计钩子关掉 → 真 `open` 写任意路径)。
+#
+# 已实测的一条:`typing.get_type_hints(C)`。它按 `C.__module__` 去 `sys.modules` 里取
+# `base_globals`,而候选可以自己把 `C.__module__` 换成 `"json"`;再把注解写成字符串
+# `"__import__('os').environ"`,`get_type_hints` 就在 **json 的命名空间**里求值它 ——
+# 于是拿到真 `os`、真环境变量(实测读到了 `ANTHROPIC_AUTH_TOKEN`)。
+# 静态层看不见(名字是拼出来的、注解是字符串)、对象层也拦不到(取的是 `typing` 的成员)。
+#
+# 这一族**无法穷举证明不存在**(任何一个"按名取属性"的公开 API 都可能是执行器),
+# 所以规则只登记**已知成员**,并靠 #29(候选独立进程 + 只读挂载)做真正的边界。
+# 只增不减(宪法守卫登记)。
+EVALUATOR_MEMBERS = frozenset({
+    "typing.get_type_hints",
 })
 # 最近一次 `safe_builtins` 生效的导入白名单根(对象层规则要用);只由框架写,候选碰不到本模块。
 _ACTIVE_ALLOWED_ROOTS: list = [ALLOWED_MODULE_ROOTS]
@@ -1981,7 +2089,9 @@ class SandboxError(ValueError):
 #   - 同进程里候选与框架共享解释器,能影响框架的问题由 Issue #29(独立进程/容器)闭合;
 #   - 只拦写不拦读:候选照样能读任意本机文件(含测试段 CSV、.env),读侧由 #29 的只读挂载解决;
 #   - 候选可以 `try/except` 吞掉本钩子抛的异常继续跑(被拒的动作确实没发生,拒绝记录在 `window_denials()`);
-#   - 不拦 `exec`/`compile`,所以"在窗口里编译并执行一段新代码"仍可能;它能拿到的能力仍受上面的写/进程/网络事件约束。
+#   - `exec`/`compile` **整体**不拦(库自己 eval 自己生成的代码是合法的:namedtuple/dataclass),
+#     只拦**替候选求值候选给的字符串**的那一类(见 `FORBIDDEN_EVAL_FRAMES`);
+#     所以"在窗口里编译并执行一段自己写的代码"仍可能;它能拿到的能力仍受上面的写/进程/网络事件约束。
 # 它的作用是把"白名单模块的函数级写文件/起进程"这条**最便宜**的攻击收掉,与对象层规则、账本哈希链并存。
 #
 # 实现要点:
@@ -2022,6 +2132,31 @@ AUDIT_PATH_MUTATION_EVENTS = {
 _WRITE_OPEN_FLAGS = (getattr(os, "O_WRONLY", 1) | getattr(os, "O_RDWR", 2) | getattr(os, "O_CREAT", 0)
                      | getattr(os, "O_APPEND", 0) | getattr(os, "O_TRUNC", 0) | getattr(os, "O_EXCL", 0))
 _AUDIT_NULL_DEVICES = frozenset({os.path.normcase(os.devnull), "nul", "/dev/null"})
+
+# **禁止的求值帧**(第 40 轮实测):`exec` 审计事件发生时,是谁触发的它?
+#
+# 危险帧:`typing.ForwardRef._evaluate` —— 它把**候选给的字符串**在别的命名空间里求值。
+# 实测(生产入口 `import_candidate`):`fr._evaluate({}, None, recursive_guard=set())` 会让
+# CPython 把**真内建**注入那个空的 globalns,于是真 `__import__` → 真 `os` → 真环境变量
+# (实测把真 PATH 的值读了出来,并经异常消息带了出来)。
+#
+# 合法帧不在表里:
+# - `collections.namedtuple` / `dataclasses` 的 exec:它们 eval 的是**自己生成**的代码
+#   (字段名已校验过),不是候选给的字符串;
+# - `typing.Optional["int"]` 只会 **compile**、不会 exec(实测),所以不受影响。
+#
+# 判据用**帧**(模块名 + 限定名),不是"代码对象长什么样":
+# 实测过两种"看代码对象"的判据都**不成立**——
+#   - `dis` 看末条指令:eval `None` 与 exec 的末条指令同样可能是 `RETURN_CONST`;
+#   - `co_consts[-1] is None`:合法的 `collections.namedtuple` 也会产生 eval 模式的 exec 事件。
+# 只有"谁触发的这次 exec"能稳定区分(实测帧表:`typing.py:ForwardRef._evaluate` vs
+# `collections/__init__.py:namedtuple` vs `dataclasses.py:_FuncBuilder.add_fns_to_class`)。
+#
+# 名单只增不减(宪法守卫登记)。
+FORBIDDEN_EVAL_FRAMES = frozenset({
+    "typing.ForwardRef._evaluate",
+    "typing._eval_type",
+})
 
 
 class _AuditState:
@@ -2071,6 +2206,28 @@ def _audit_deny(rule: str, event: str, record: bool = True):
     if record:
         _AUDIT.denials.append((rule, event))
     raise AuditDenied(rule, event)
+
+
+def _audit_frame_is_forbidden_eval(frame, code) -> bool:
+    """这次 `exec` 是不是"替候选求值候选给的字符串"(见 `FORBIDDEN_EVAL_FRAMES` 的理由与实测)。
+
+    `frame`:触发这次 exec 的 Python 帧(取不到是 None);`code`:被执行的代码对象。
+    判据是**帧的归属**(模块名 + 限定名),不是代码对象的样子——
+    实测过两种"看代码对象"的判据都不成立(`dis` 末条指令 / `co_consts[-1] is None`),
+    只有"谁触发的"能稳定区分。
+    取不到帧时按"**查不了 = 没查**"处理 ⇒ **拒**(第 43 轮,codex 的 M1):
+    此前是 fail-open(`co_filename == '<string>'` 才拒),于是"来自真实文件"的代码被放行;
+    而本函数自己的论证(帧表见 `FORBIDDEN_EVAL_FRAMES` 上面的注释)说:
+    库自己 eval 的代码**都由 Python 帧触发** ⇒ 取不到帧本来就不是合法路径。"""
+    if frame is None:
+        return True
+    try:
+        code_obj = frame.f_code
+        qualname = getattr(code_obj, "co_qualname", code_obj.co_name)
+        module = frame.f_globals.get("__name__")
+    except Exception:                       # noqa: BLE001 - 取不到帧信息 = 认不准 = 按可疑处理
+        return True
+    return f"{module}.{qualname}" in FORBIDDEN_EVAL_FRAMES
 
 
 def _is_bytecode_cache(norm: str) -> bool:
@@ -2127,6 +2284,26 @@ def _audit_hook(event, args):
         for prefix in AUDIT_DENIED_EVENT_PREFIXES:
             if event.startswith(prefix):
                 _audit_deny("audit:" + prefix.rstrip("."), event)
+        if event == "exec":
+            # **前向引用求值**(第 40 轮实测,生产入口复现):`typing.ForwardRef._evaluate`
+            # 把候选给的字符串在**空 globalns** 里 eval 掉——CPython 会把**真内建**注入进去,
+            # 于是真 `__import__` → 真 `os` → 真环境变量(实测读到了真 PATH)。
+            # 静态层看不见载荷(藏在字符串字面量里),对象层也拦不到(取的是 typing 的成员),
+            # 这一族只能在**事件层**按"谁触发的这次 exec"判。
+            # 合法用法不受影响:`typing.Optional["int"]` 只 compile 不 exec;
+            # `collections.namedtuple` / `dataclasses` 的 exec 触发帧是它们自己。
+            try:
+                frame = sys._getframe(1)      # 帧 0 是本钩子,帧 1 是触发这次 exec 的那一帧
+            except ValueError:                # 没有 Python 调用方(C 层直接 eval):取不到帧
+                frame = None
+            if frame is None:
+                # **查不了 = 没查** ⇒ fail-closed(第 43 轮,codex 的 M1)。
+                # 规则名与"已确认是求值点"分开:这里并不知道是谁触发的,
+                # 只知道**判不出来**,所以不能放行(此前放行 = fail-open)。
+                _audit_deny("audit:eval-origin-unknown", event)
+            if _audit_frame_is_forbidden_eval(frame, args[0] if args else None):
+                _audit_deny("audit:forward-ref-eval", event)
+            return
         if event == "open":
             path, mode, flags = (tuple(args) + (None, None, None))[:3]
             if _open_is_write(mode, flags):
@@ -2217,7 +2394,12 @@ def framework_exempt(paths=(), argv=None, sqlite_paths=()):
     - `argv`:只放行 argv **恰好等于**它的那一次 `subprocess.Popen`(守卫跑只读 git),
       以及该次调用内部的底层创建进程事件;别的 Popen 照拒;
     - `sqlite_paths`:只放行 `sqlite3.connect` 到这几个路径(框架自己在窗口里读 vnpy 库时用)。
-      **不豁免** `open`/写:候选照样不能写那个库文件。
+      **如实说明(第 43 轮,codex 的 M4)**:这条豁免**只覆盖 connect 事件**;
+      连上之后的 SQL 写(`UPDATE`/`DELETE`/`ATTACH`/`VACUUM`)在事件层**发不出带路径的事件**
+      (sqlite3 的文件写在 C 层,不走 `open` 事件)⇒ 那条路径上既没被豁免、也没被拦。
+      候选今天改不动那个库文件,靠的是**能力层**(sqlite3 模块本身在危险名单里、
+      库句柄不可达),**不是**靠这条豁免。原 docstring 说"不豁免 open/写,候选照样不能写那个库文件",
+      听起来像是这条豁免**顺带**保证了写不被允许——那是**错的**,已按事实改写。
     只有框架代码调用,参数都由框架决定;候选拿不到本函数。用法限于 `_git_run_unchecked` 与 `_purge_bytecode_cache`
     (tests/test_fs_capability_closure.py 有接线核对 + 变异:改回全局开关用例会变红)。"""
     previous = (_AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed, _AUDIT.exempt_sqlite)
@@ -3181,105 +3363,61 @@ def _atomic_replace(tmp: Path, target: Path, attempts: int = 5) -> None:
             time.sleep(0.1 * (index + 1))
 
 
-def _pid_alive(pid: int) -> bool:
-    """进程还在不在。
-
-    **不能**用 `os.kill(pid, 0)`:Windows 上 CPython 把它实现成 TerminateProcess(pid, 0)
-    ——那会把别人的进程杀掉。
-    """
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        # **必须** use_last_error=True:否则 get_last_error() 拿到的是线程的旧值,
-        # 不是这次 OpenProcess 失败的原因(第 5 轮 codex 的 L3)。
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        # **必须**显式声明 restype/argtypes(第 6 轮 codex 的 M4):
-        # 默认 restype 是 c_int,HANDLE 是 64 位指针,会被截断成 32 位——
-        # 截断后的值可能为 0(活进程被误判成已死 → 残留锁被误抢),
-        # 更糟的是拿截断后的句柄去 CloseHandle,可能关掉**别的**进程的句柄。
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return ctypes.get_last_error() == 5          # 5 = ACCESS_DENIED:进程在,只是没权限查
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _lock_is_stale(lock_path: Path) -> bool:
-    """锁是不是**残留**的(持有者已经不在了)。
-
-    进程崩了不会清锁文件:不认残留锁的话,一次崩溃就会让**之后所有**批准永久失败
-    (第 8 轮 codex 的 M1)。锁文件里写着持有者的 PID 与时间戳。
-    """
-    try:
-        content = lock_path.read_text(encoding="ascii", errors="ignore").split()
-        pid = int(content[0]) if content else -1
-        age = time.time() - lock_path.stat().st_mtime
-    except (OSError, ValueError):
-        return False
-    if age > LOCK_STALE_SECONDS:
-        return True
-    return pid > 0 and not _pid_alive(pid)
-
-
-def _unlink_quiet(path: Path, attempts: int = 10) -> bool:
-    """删文件;Windows 上别的进程正开着它时重试几次。
-
-    删不掉就留着(比如别的进程正读着它):留着只是残留,不像**误删**那样危险。
-    但释放锁时必须重试到位——锁文件留着 = 批准记录被锁住,之后所有批准都失败。
-    """
-    for index in range(attempts):
-        try:
-            path.unlink(missing_ok=True)
-            return True
-        except OSError:
-            time.sleep(0.02 * (index + 1))
-    return False
-
-
 @contextlib.contextmanager
-def _approvals_lock(approvals_file: Path, timeout: float = 5.0):
-    """批准记录的跨进程独占锁(锁文件 + O_EXCL)。
+def _approvals_lock(approvals_file: Path, timeout: float | None = None):
+    """批准记录的跨进程独占锁——**与账本链共用同一把锁**(`risk/ledger_chain.file_lock`)。
+
+    第 40 轮(codex 的 High 3):此前批准记录上有**两把互不相干**的锁——本模块的 `approvals.json.lock`
+    与 `risk/ledger_chain.file_lock` 的 `approvals.json.chainlock`;而 `risk/ledger_admin.py` 的
+    `migrate_approvals` / `reset_approvals` **一把锁都不拿**。于是"批准与重置并发"能静默丢掉
+    一条已批准的记录,而链仍然自洽(重置按有效前缀重新定锚)——锁形同虚设。
+    现在所有写批准记录的路径共用一把锁(`<账本名>.chainlock`),互斥才真正成立。
 
     拿不到锁就**失败**,不等待也不绕过:批准记录写错一条就是"没批准却生效"。
-    残留锁(持有者已崩)会被识别并抢走——否则一次崩溃就让批准永久瘫痪。
+    残留锁(持有者已崩)由 `file_lock` 按"进程已死"或"年龄超限"判定并抢走——
+    否则一次崩溃就让批准永久瘫痪。
     """
-    lock_path = approvals_file.with_name(approvals_file.name + ".lock")
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            try:
-                os.write(fd, f"{os.getpid()} {time.time():.3f}\n".encode("ascii"))
-            finally:
-                os.close(fd)
-            break
-        except FileExistsError:
-            if _lock_is_stale(lock_path):
-                _unlink_quiet(lock_path)            # 抢锁:持有者已经不在了
-                continue
-            if time.monotonic() >= deadline:
-                raise SandboxError(f"批准记录被其他进程占用,拒绝写入: {approvals_file}")
-            time.sleep(0.05)
+    timeout = APPROVALS_LOCK_TIMEOUT if timeout is None else timeout
+    # **只**把"拿不到锁"翻译成 SandboxError(第 42 轮):临界区**内部**抛出的
+    # LedgerChainError 原样往上抛——否则会被说成"被其他进程占用",而那句话在那种
+    # 情形下是错的(不是被占用,是临界区里的活儿失败了)。
+    # 第 43 轮:连"拿不到锁"也分情形说(暂态占用 / 本进程重入 / 权限错误):
+    # 一律说"被其他进程占用"对重入和权限错误都是**说错话**。
+    manager = chain.file_lock(Path(approvals_file), timeout=timeout,
+                               stale_seconds=LOCK_STALE_SECONDS)
+    # `stale_seconds` 已显式传(LOCK_STALE_SECONDS 就是 chain.DEFAULT_STALE_SECONDS,
+    # 有用例钉住两者相等);`timeout` 也显式传(第 45 轮:不留"靠默认值"的暗口径)。
+    try:
+        manager.__enter__()
+    except chain.LedgerChainError as exc:
+        raise SandboxError(_approvals_lock_message(approvals_file, exc)) from exc
     try:
         yield
     finally:
-        # 释放锁必须重试:Windows 上有别的线程正读着锁文件时,删会失败
-        # (WinError 32)。删不掉 = 锁留着 = 之后所有批准都被锁住
-        # (第 9 轮 codex 的 M3 的并发用例把它逼出来了)。
-        _unlink_quiet(lock_path)
+        manager.__exit__(None, None, None)
+
+
+def _approvals_lock_message(approvals_file, exc: chain.LedgerChainError) -> str:
+    """拿不到锁时的对外说法(按 `LedgerChainError.reason` 分情形)。
+
+    第 45 轮:`occupancy` 从"兜底分支"里**单独拎出来**。
+    此前只有 `reentrancy` 与 `permission` 单独说,其余(含 `occupancy`)一律落进兜底,
+    兜底那句话是"批准记录被其他进程占用"——于是 reason=`chain`/`generic` 也被说成
+    "被其他进程占用",**说错了原因**(被占用 ⇒ 该重试;链坏了 ⇒ 重试没用,得人工处理)。
+    兜底现在只说"锁获取失败(reason=...)",不替未知原因编一个原因。
+    """
+    reason = getattr(exc, "reason", "generic")
+    if reason == "reentrancy":
+        return (f"批准记录写入被**本进程同一线程**重复获取(重入),拒绝写入: "
+                f"{approvals_file}({exc})")
+    if reason == "permission":
+        return (f"批准记录锁文件无法创建(权限错误,不是被其他进程占用),拒绝写入: "
+                f"{approvals_file}({exc})")
+    if reason == "occupancy":
+        return (f"批准记录被其他进程占用(暂态占用,**请稍后重试**),拒绝写入: "
+                f"{approvals_file}({exc})")
+    return f"批准记录锁获取失败(reason={reason}),拒绝写入: {approvals_file}({exc})"
+
 
 
 _ID = re.compile(r"^[A-Za-z0-9_-]+$")

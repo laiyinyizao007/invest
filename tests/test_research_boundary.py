@@ -2156,3 +2156,142 @@ def test_the_bootstrap_guard_detector_knows_a_flipped_predicate():
     ).body[1]
     assert _is_find_spec_vnpy_is_not_none(ok.test)
     assert not _is_find_spec_vnpy_is_not_none(flipped.test)
+
+
+# ---------------------------------------------------------------------------
+# CI 闸门接线:核心防线套件必须**真的**被某个 job 跑
+# ---------------------------------------------------------------------------
+
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "research-guard.yml"
+CLOSURE_SUITE = ROOT / "tests" / "test_fs_capability_closure.py"
+
+# 被标成"需要交易栈"但源码里**看不出**依赖的用例:它们对交易栈的依赖是**间接**的
+# (子进程要 vnpy / 要读到行情库 / 要扫描本机已装的包),静态看不出来。逐条登记理由——
+# 登记项有名字与理由,改动时要一起改,不能悄悄多标一条把 CI 的覆盖偷掉。
+TRADING_STACK_INDIRECT = {
+    "test_run_window_wraps_the_gate_evaluate_and_backtest_children":
+        "子进程走 gate/evaluate/backtest 三个入口,那三个入口要交易栈",
+    "test_bars_are_fixed_before_the_candidate_is_imported":
+        "要真的取到日线(读行情库),交易栈在位才有数据可取",
+    "test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin":
+        "扫描本机**已安装**的 vnpy 族包,没装就无从扫起",
+    "test_thread_and_process_executors_reexported_by_whitelisted_modules_are_refused":
+        "同上:要真模块才能拿到再导出的成员",
+}
+
+
+def _pytest_command_lines(workflow_text: str) -> list[str]:
+    """抽出 workflow 里所有 `python -m pytest ...` 命令行(按行尾的反斜杠续行合并)。"""
+    lines: list[str] = []
+    buf = ""
+    for raw in workflow_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        buf = f"{buf} {line}".strip() if buf else line
+        if buf.endswith("\\"):
+            buf = buf[:-1].strip()
+            continue
+        lines.append(buf)
+        buf = ""
+    if buf:
+        lines.append(buf)
+    return [line for line in lines if "python -m pytest" in line]
+
+
+def _closure_suite_tests() -> dict[str, ast.FunctionDef]:
+    """核心防线套件里的测试函数:名字 → 函数节点。"""
+    tree = ast.parse(_read_source(CLOSURE_SUITE))
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+
+
+def _is_marked_trading_stack(node: ast.FunctionDef) -> bool:
+    """这个用例带 `@requires_trading_stack` 吗?"""
+    return any(
+        getattr(dec, "id", None) == "requires_trading_stack"
+        or (isinstance(dec, ast.Attribute) and dec.attr == "requires_trading_stack")
+        for dec in node.decorator_list
+    )
+
+
+def _references_trading_stack(node: ast.FunctionDef) -> bool:
+    """这个用例**直接**引用交易栈吗?
+
+    两种形态:
+      - 运行时的 `import vnpy…` / `from vnpy… import …`;
+      - 候选源码里的 `from vnpy_ctastrategy import CtaTemplate`(字符串常量里的 import)。
+    只有静态筛查、从不执行候选源码的用例**不算**(它们在研究侧 CI 上照跑)。
+    """
+    docstring = None
+    if (node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)):
+        docstring = node.body[0].value
+    for stmt in ast.walk(node):
+        if isinstance(stmt, ast.Import):
+            if any(alias.name.split(".")[0] == "vnpy" or alias.name.startswith("vnpy_ctastrategy")
+                   for alias in stmt.names):
+                return True
+        elif isinstance(stmt, ast.ImportFrom):
+            module = stmt.module or ""
+            if module.split(".")[0] == "vnpy" or module.startswith("vnpy_ctastrategy"):
+                return True
+        elif isinstance(stmt, ast.Constant) and isinstance(stmt.value, str) and stmt is not docstring:
+            if "from vnpy" in stmt.value or "import vnpy" in stmt.value:
+                return True
+    return False
+
+
+@pytest.mark.parametrize("suite", [
+    "tests/test_fs_capability_closure.py",
+    "tests/test_merge_main_sandbox_union.py",
+])
+def test_the_core_closure_suites_are_actually_run_by_the_ci_gate(suite):
+    """本 issue 的核心防线套件必须被 CI **真的跑起来**。
+
+    这两份套件此前**一次都没在 CI 上跑过**:文件头 `import bootstrap` 会拖进 vnpy,
+    而研究侧 job 只装 numpy/pandas/mcp/pyyaml,整份文件在收集阶段就 ModuleNotFoundError——
+    **闸门看上去配好了,实际没跑**(第 7 轮 codex 的 High 同族:边界不变量写成了测试,
+    却没有 job 会跑它)。
+
+    这里把它钉成一条断言:workflow 里必须有一行 `python -m pytest` 指向这份文件。
+    """
+    commands = _pytest_command_lines(_read_source(CI_WORKFLOW))
+    # `--collect-only` 只收集不执行:那不叫"跑起来"(守卫不许靠它过)。
+    running = [c for c in commands if "--collect-only" not in c and " --co" not in c]
+    assert any(suite in command for command in running), (
+        f"{CI_WORKFLOW.name} 里没有 pytest 调用 {suite}"
+        f"(实测的 pytest 命令: {commands})")
+
+
+def test_the_trading_stack_marks_are_justified_and_never_blanket():
+    """`@requires_trading_stack` 要**逐条有理由**,不许一刀切。
+
+    两头都查:
+      - 标了的用例必须**直接**引用交易栈,或登记在 `TRADING_STACK_INDIRECT` 里(附理由);
+        否则就是"多标一条,顺手把 CI 的覆盖偷掉"——那比不接线还糟。
+      - 未标的用例必须**至少有**一条(整份文件一刀切跳过 = 防线等于没建)。
+      - `TRADING_STACK_INDIRECT` 里不许有陈旧条目(用例改名/删除后要一起清)。
+    """
+    tests = _closure_suite_tests()
+    assert tests, f"{CLOSURE_SUITE.name} 里没找到测试函数(解析器改了吗?)"
+
+    marked = {name for name, node in tests.items() if _is_marked_trading_stack(node)}
+    unmarked = set(tests) - marked
+    assert marked, "没有任何用例被标成需要交易栈——检查是不是把标记删光了"
+    assert unmarked, "整份套件都被标成需要交易栈:等于在 CI 上一次都不跑(防线等于没建)"
+
+    unjustified = {
+        name for name in marked
+        if not _references_trading_stack(tests[name]) and name not in TRADING_STACK_INDIRECT
+    }
+    assert not unjustified, (
+        f"这些用例标了 @requires_trading_stack,却既没直接引用交易栈、也没登记理由: {sorted(unjustified)}"
+        "(多标一条 = 在 CI 上少跑一条防线)")
+
+    stale = set(TRADING_STACK_INDIRECT) - marked
+    assert not stale, f"TRADING_STACK_INDIRECT 里有陈旧条目(用例已改名或不再被标记): {sorted(stale)}"

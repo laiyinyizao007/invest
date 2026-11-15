@@ -41,6 +41,177 @@
       显式放行 numpy 后 `np.loadtxt` 仍可读含测试段的派生 CSV"。
     - 对外面料更正:`SEGMENTS` 注释、`data` 输出新增 `test_segment_read_via_local_file: true`。
     G8:待复核。
+  - **第 40 轮复审(codex G8 第二轮 34/50)的补修 —— 只补规则与用例,功能改动一律转 Issue #29**:
+    分支冻结规则:**本分支只接受"补规则与用例"的修复**。
+    - **①Critical:"按名求值的执行器"(`typing.get_type_hints`)**——候选不需要 `eval` 本身,只要能调用一个
+      **替它按名字取属性/求值**的函数,那个函数所在命名空间里的**真内建**就等于递到了候选手上
+      (真内建 → 真 `__import__` → 真 `research_sandbox` → 把 `_AUDIT.active` 改成 False → 审计钩子被关掉)。
+      实测:候选把 `__module__` 换成 `"json"`、注解写成字符串,`get_type_hints` 就在 **json 的命名空间**里求值它,
+      实测读到了真环境变量(`ANTHROPIC_AUTH_TOKEN`)。静态层看不见(名字是拼出来的)、对象层也拦不到(取的是 `typing` 的成员)。
+      修法:新增对象层名单 `EVALUATOR_MEMBERS`,规则名 `按名求值的执行器`。
+      **如实**:这一族**无法穷举证明不存在**,只登记已知成员,真边界是 Issue #29。
+    - **②Critical:前向引用求值(`typing.ForwardRef._evaluate`)**——上一条的同源但更隐蔽的成员:它是**实例方法**,
+      且实例可以**不出现 `ForwardRef` 这个名字**就拿到(`typing.Optional["…"]` → `get_args` → 实例)。
+      实测(生产入口 `import_candidate`,不是简化探针):`fr._evaluate({}, None, recursive_guard=set())` 让 `eval` 在
+      **空的 globalns** 里跑,CPython 把**真内建**注入那个空字典 ⇒ 真 `__import__` → 真 `os` → 真环境变量;
+      实测把真 `PATH` 的值读了出来并经异常消息带出。静态层**零告警**(载荷藏在字符串字面量里)。
+      修法**两层各管一段**:静态层 `FORBIDDEN_ATTRS` 增 `_evaluate` / `_eval_type`(依据:候选**必须写出这个名字**才能调它——
+      `getattr`/`type`/`__dict__`/`__getattribute__` 一律已被禁,动态拼名字的路实测走不通);
+      事件层新增 `FORBIDDEN_EVAL_FRAMES`,`exec` 审计事件按"**谁触发的这次 exec**"判,规则名 `audit:forward-ref-eval`,
+      取不到触发帧时按"查不了等于没查"处理(只放行**不是**从字符串编译来的代码)。
+      **判据为什么是"帧"**:实测过两种"看代码对象"的判据都**不成立**(`dis` 末条指令、`co_consts[-1] is None`——合法的
+      `collections.namedtuple` 同样产生 eval 模式的 exec 事件),如实记进 ADR。**放行方向**:`typing.Optional["int"]` 只 compile 不 exec、
+      `collections.namedtuple`/`dataclasses`/`enum`/`typing.NamedTuple` 全部照旧跑通(它们 eval 的是**自己生成**的代码)。
+      **系统性复扫**:白名单里"会 eval/exec 的执行点"共 **7** 个,逐个动态验证(其中 `dataclasses._is_type` 是**注释里的 eval**,误报);
+      第一版扫描脚本因过滤下划线开头的名字而**漏掉**这一族——静态推理必然漏的第一例。
+    - **③High:两把互不相干的锁**——`record_approval` 用 `approvals.json.lock`,`risk/ledger_chain.file_lock` 用 `approvals.json.chainlock`,
+      而 `risk/ledger_admin.py` 的 `migrate_approvals` / `reset_approvals` **一把锁都不拿** ⇒ "批准与重置并发"能**静默丢掉一条已批准的记录**
+      而链仍自洽(重置按有效前缀重新定锚),事后查不出来。现在两边**共用同一把锁**(`risk/ledger_chain.file_lock`),等锁超时按失败处理。
+    - **④Medium:不许悄悄把 N 变小**——N 变小 = DSR 的**分母**变小 = 去通胀失效(年化 Sharpe 3.5:N=1620 时 DSR 0.6397 不过,N=1 时 0.9999 过);
+      原先的"防变小"判据只看**有效前缀**,链在中间断掉时有效前缀可能比真实历史少一大截 ⇒ 拿它当基准等于"变小不算变小"。
+      判据改成按**能解析出来的每一行**求和(`_claimed_total`,宁可高估);变小必须**显式**加 `--allow-reduce-n`(并写 `--reason`);
+      重置把 before/after 写进**链里**(`kind=ledger_reset`,`count` 恒为 0——它不是一次试验),于是"曾经变小过"本身可审计。
+    - **⑤Medium:守卫自己没守住的东西**——`DATA_PRIMITIVE_PATTERN` 是**编译出来的正则**、`AUDIT_PATH_MUTATION_EVENTS` 是**映射**,
+      原先的提取器只认"字符串集合" ⇒ 这两种形状**从来没有被比对过**(把模式改宽、删掉映射里的一个事件,守卫照样全绿)。
+      现按**冻结正则**与**受保护映射**(键只能增、每个键的下标集只能增)两种新形状登记;本轮新增的 `EVALUATOR_MEMBERS` /
+      `FORBIDDEN_EVAL_FRAMES` 同样登记进注册表,并补一条用例盯着"登记这件事本身"。
+    - **⑥Medium:导入顺序不变量写进代码(并**更正此前的说法**)**——`vnpy.trader.logger` 在**导入期**就会拉起
+      loguru → colorama → `ctypes.windll.kernel32`,在候选窗口里导入它会被审计钩子按能力拒掉 `ctypes.dlopen`,
+      报出来的是 `AttributeError: kernel32`——**看起来像颜色库坏了**,实际是钩子按能力拒了 ctypes。
+      **更正**:此前记的是"它只是**碰巧**没发生,**顺序一改就复发**"——**不准确**。实测(全新解释器逐步看 `sys.modules`):
+      `import bootstrap` 之后 logger **不在**;`import backtest_lib` 之后**在**;
+      `const.snapshot_protected_state()` 之后**也在**(→ `_preload_protected_modules()` → `strategies.…` → vnpy)。
+      而 `import_candidate` 开窗口**之前**必然调过 `const.snapshot_protected_state()`(第四层要拍身份指纹),
+      所以窗口内的第一次导入一直是**缓存命中**,并没有"复发"这回事。
+      那为什么还要**显式**写一层?上面两条都是**间接**的,挂在"别的包恰好 import 了 vnpy"这个事实上;
+      哪天子进程入口不再先导 `backtest_lib`、或模板包改成不 import vnpy,窗口内的第一次导入就变成"真·第一次"⇒ 被拒,
+      且报错点离原因很远。现在把不变量**显式**写在开窗口的那一行旁边(`import_candidate` 内、窗口之前):
+      显式预载 `vnpy.trader.logger` 与 `vnpy_ctastrategy`,**不依赖任何别的包的内部行为**——这是**纵深防御**,
+      不是"补一个坏掉的洞"。刻意**不用** `importlib.import_module`(动态导入任意模块是执行入口,守卫会要求成对取快照);
+      写成静态 `import` 表达清楚"就是这两个"。放在 `import_candidate` 里而不是抽成函数:不变量绑定的是"**开窗口之前**",
+      而开窗口的只有这一处;抽出去就得靠"每个调用方都记得先调它",那正是本条要消灭的"碰巧没发生"。
+      **边界规则一个字没改**:研究栈的交易栈 import 只许出现在已登记的例外作用域里,而 `import_candidate` 本来就在册。
+    - **⑦更正一条不实说法(记为误报,不改代码)**——"候选把 dataclass 的 `__module__` 换成 `json`"这条在静态层就已被封
+      (`risk/constitution.py` 的**类装饰器**规则拒掉 `@dataclass`)。代价是这条规则也顺带拒掉了 `@dataclass` 这种**正常**写法(既有取舍)。
+    - **⑧其它同批改动**——`string` 进 `DANGEROUS_MODULE_NAMES`(它的 `Formatter.get_field` 能在 **string.py 自己的帧里**
+      按候选给的名字取属性 ⇒ 真内建 ⇒ 关掉审计钩子);`vnpy.alpha` 进 `FORBIDDEN_MODULE_PATHS`(有一处拿调用方给的表达式去 eval);
+      危险来源**改成派生**(`_OBJECT_ORIGIN_ROOTS = (DANGEROUS_MODULE_NAMES − {builtins}) ∪ UNREACHABLE_ORIGINS`)——
+      第 39 轮记的"修后 0 个可达"**是错的**(手写名单漏了 `concurrent` 与 pandas 的几个类级成员,实测仍有 6 项可达),改成派生之后才真正是 0。
+    - **⑨如实登记的残余**——同进程里"按名求值"一族不可能穷举;**读侧整体未收口**(`self.load_bar` 能读任意区间含测试段,零审计拒绝);
+      候选仍能经真 `sqlite3` 写**被豁免**的 vnpy 库文件(与 `framework_exempt` docstring 里"不豁免 open/写"**矛盾**,以本条为准);
+      `window_denials()` **没有生产消费者**(拒绝记录只进内存,生产路径没有任何地方读它)。
+    - **⑩本分支冻结的功能项(登记为遗留,不改)**——账本写入路径 O(n²)(每追加一行都重算并重写整条链)。
+      上面登记的残余与冻结项已各开 Issue 跟踪:**#40**(账本写入路径 O(n²))、**#41**(`window_denials()` 没有生产消费者)、**#42**(读侧整体未收口:`self.load_bar` 能读任意区间含测试段;真正的修复在 #29 的只读挂载)、**#43**(sqlite 豁免与 docstring「不豁免写」矛盾)。
+    - 测试:`tests/test_fs_capability_closure.py` 新增 **15 条**(133 → 148,放行+拦截双向,断言**是哪条规则**拒的),
+      含一条端到端用例断言**本次用例自己设的环境变量标记一个字都没漏出去**(不比对 PATH——消息会截断,比对全长会失真、造成假绿);
+      `tests/test_research_sandbox.py` 新增 2 条(ADR 保留字表与代码常量逐个核对、禁用属性新增 `_evaluate`/`_eval_type`);
+      `tests/test_research_api.py` 新增 3 条(导入期副作用**危害侧**复现 + **窗口边界**不变式 + **隔离**用例)。
+      变异验证:事件层判据失效 → 红 3 条;静态层去掉 `_evaluate`/`_eval_type` → 红 1 条;求值帧名单不登记 → 红 1 条;
+      **删掉显式的导入预载 → 隔离用例红**(`AttributeError: kernel32`)。
+      **第一版修复侧用例是空转的(已改)**:它直接调预载函数,**删掉预载照样绿**——测到的是"helper 有效果",
+      不是"生产路径确实预载了"。现在拆成"窗口边界不变式"与"隔离(关掉间接那层)"两条,分工明确。
+    - **第 41 轮(补一条用例自身的守卫)**——全量套件里 `tests/test_research_api.py::test_all_three_child_entrypoints_go_through_the_same_validation_function` 偶发失败(单跑绿、全量跑红)。**根因不是产品的顺序依赖**,而是 `inspect.getsource` **按行号**从磁盘上的当前文件切块:模块导入之后文件被改写(行号位移),它就返回**另一段**源码。本轮改动落盘的时刻正好落在全量运行窗口内,那条用例因此拿到错位的块而误报(实测:改写后 `getsource` 返回的是**上一个函数**的源码块)。
+      修法:断言前先核对"拿到的确实是这个函数的源码块"(`f"def {name}(" in source`);`tests/test_merge_main_sandbox_union.py` 里读 `import_candidate` 源码的那条同样加核对。
+      **为什么必须核对**:错块会让"源码里**没有** `check_candidate_class(`"这类**否定式**断言**假绿**——这正是本项目最在意的那类静默失败。
+      `python tools/check_constitution_history.py` 通过。G8:待复核。
+    - **第 42~43 轮(锁的每线程身份 + codex G8 第二轮 38/50 的 must-close 收口)**:
+      分支冻结规则不变:**只补规则与用例**,功能改动一律转 Issue #29。
+      - **第 43 轮顺带把第 41 轮的"核对源码块"升级成 AST 判据**——`ast.parse` + 按名字取函数节点 + `ast.unparse`,
+        不再依赖行号、不依赖磁盘上文件的当前状态。**坑**:`ast.unparse` 把字符串引号**归一化成单引号**,断言要一并归一化。
+      - **第 42 轮:锁的"重入"必须按**线程**判,不能按进程**——锁文件里除 PID 外再写一个 **每线程** 的 token
+        (`threading.local()` + 每线程一次 `uuid4`)。**第一版按进程分组**,后果是同进程里**另一个线程**持有/等待同一把锁是**真并发**,
+        却被误判成重入并立刻失败 ⇒ 6 线程并发批准的用例直接打挂(5/6 个线程报"被本进程重复获取(重入)")。
+        现在:重入按**线程**判,别的线程一律**等**。同时把"**取锁**失败"与"**临界区内部**抛出的链错误"分开——
+        此前两者都被翻译成"被其他进程占用",而临界区里失败时那句话是**错的**(不是被占用,是活儿失败了)。
+      - **第 43 轮(codex G8 第二轮 38/50 的 must-close 逐条收口)**:
+        ① **H2:锚点记累计次数 ⇒ "账本被删掉几行"精确可算**——锚点扩成 `<seq> <hash> <total>`(旧两段锚点仍读得了);
+          读侧 `verify()` 把前 `seq` 行的 `count` 合计与锚点 `total` 比对,对不上即 fail-closed(**删行在读侧就露出来**);
+          人工重置的基准改成 `max(文件自称, 锚点记的)`,**丢了多少次是精确可算的**(不是估计)⇒ 必须 `--add-trials <丢失数>` 补回
+          或显式 `--allow-reduce-n --reason`;重置记录另写 `lost` 与 `anchor_seq`(否则"曾经变小过"只存在于 before/after 两个数里,可能相等=洗白)。
+          ② **H3:"按名求值的执行器"按**值的来源**判**——此前只按**访问路径**判,`typing_extensions.get_type_hints`
+          (与 `typing.get_type_hints` **同一个函数对象**)放行;它此前只是被"别的规则"兜着才没出事。现在按 `__module__`+`__name__` 判。
+        ③ **M1:取不到触发帧 ⇒ fail-closed**(新增规则名 `audit:eval-origin-unknown`)——此前取不到帧是 fail-**open**;
+          而本函数自己的论证说库自己 eval 的代码**都由 Python 帧触发** ⇒ 取不到帧本就不是合法路径。
+        ④ **M2:锁的陈旧判据改成"持有者还在不在"**(Windows 用 `OpenProcess` 判存活,**不能**用 `os.kill(pid,0)`——那会 TerminateProcess);
+          持有者活着就**哪怕锁很老也不抢**;年龄只在读不到 PID 时兜底。同一把锁**统一口径**:
+          批准路径此前 60 秒、维护入口 30 秒,而两者锁的是**同一个** `approvals.json.chainlock` ⇒ 统一为 `DEFAULT_STALE_SECONDS = 30.0`。
+        ⑤ **M3:错误消息按 `reason` 分情形说**(`occupancy`/`reentrancy`/`permission`/`chain`/`generic`)——
+          把"本进程同一线程重入"说成"被其他进程占用"是**说错话**(对权限错误同样)。
+        ⑥ **M4(更正此前的说法):sqlite 豁免只覆盖 connect 事件**——连上之后的 SQL 写(`UPDATE`/`DELETE`/`ATTACH`/`VACUUM`)
+          在事件层**发不出带路径的事件**;候选今天改不动那个库文件靠的是**能力层**,**不是**这条豁免。原 docstring 的说法**是错的**,已按事实改写。
+        ⑦ **L2**:`vnpy.alpha` 的**运行期导入门**用例;**L3**:源码断言改 AST;
+        ⑧ **L5(更正一处过虑的担心)**:实测放行 numpy/pandas 后,被对象层拦下的公开成员只有 **3 个**
+        (`numpy.ctypeslib`/`numpy.f2py`/`pandas.errors`)⇒ codex 担心的"过度拦截"**不成立**,固化成回归扫描用例。
+      - **变异验证(第 43 轮,8 项全部红)**:重置基准不看锚点累计 / 不算"丢了多少次" / 读侧不核锚点累计 /
+        执行器名单只按访问路径判 / 锁的年龄判据回到"年龄到了就抢" / 两个调用方的陈旧口径不一致 /
+        重入也说成"被其他进程占用" / 取不到触发帧放行(fail-open)。
+      - **残余(如实)**:**锚点仍无密钥**(同时改账本与锚点骗得过读侧;本轮把"删行"从完全不可见变成精确可见);
+        **宪法守卫的噪音**(同一处漂移按历史提交重复报、每次重解析全部提交)——**新开 Issue #44**;
+        `window_denials()` 无生产消费者(#41);读侧整体未收口(#42);sqlite 豁免与写(#43)。
+      - 测试(收集到的用例数):`tests/test_fs_capability_closure.py` **148 → 165 条**、`tests/test_research_sandbox.py` **132 → 134 条**、`tests/test_research_api.py` **98 → 101 条**。
+        `python tools/check_constitution_history.py` 通过。G8:待复核。
+    - **第 44 轮(把核心防线**真的接进 CI**:闸门配了,但从没跑过)**:
+      分支冻结规则不变:**只补规则与用例**,功能改动一律转 Issue #29。本轮**只改测试与 CI 配置,没动生产代码**。
+      - **发现**:查 `.github/workflows/research-guard.yml` 的**实际调用面**(不是看注释)——
+        `tests/test_fs_capability_closure.py`(165 条)与 `tests/test_merge_main_sandbox_union.py`(76 条)
+        **在 ruff 清单里,却不在任何一条 pytest 调用里**。根因很直白:两份都写 `import bootstrap`,
+        而 `scripts/bootstrap.py` 在**导入期**就 `from vnpy.trader.setting import SETTINGS`
+        ⇒ 研究侧 CI(只装 numpy/pandas/mcp/pyyaml)上**整份文件在收集阶段就 ModuleNotFoundError**。
+        这正是第 7 轮 codex 的 High 说过的那句话原样又发生一次:**"写成了测试,却没有 job 会跑它"**。
+        第 40~43 轮修的是"规则对不对",本轮修的是"**规则会不会被跑到**":规则再对,不跑就是零。
+      - **修法三步**:① `import bootstrap` 改成仓库**既有惯例**的守卫写法
+        (`if importlib.util.find_spec("vnpy") is not None: import bootstrap`,与 `tests/test_constitution_round11.py` 同款,
+        那条惯例旁边本来就有守卫断言在盯谓词没被写反);② 需要交易栈的用例**逐条**标 `@requires_trading_stack`
+        (判据 `find_spec("vnpy_ctastrategy")`,**环境驱动**:本机照跑、CI 跳过并打印原因;
+        **漏标记不会被静默吞掉**——没标记又要交易栈的用例在 CI 上会**直接失败**);
+        ③ CI 里**单跑一步**(收集失败必须整步红,不被 `--continue-on-collection-errors` 吞掉)。
+      - **两条守卫断言**(放进本来就在 CI 上跑的 `tests/test_research_boundary.py`):
+        **接线守卫**(workflow 里必须有一行 `python -m pytest` 指向这两份套件)与
+        **标记纪律守卫**(标了"需要交易栈"必须直接引用交易栈或登记在显式清单 `TRADING_STACK_INDIRECT` 并写明理由;
+        不许一刀切整份跳过,也不许多标一条把 CI 覆盖偷掉;清单不许有陈旧条目)。
+      - **动态探针**:"需要交易栈的用例集合"是**实测**出来的——先改成守卫式导入,在无 vnpy 的干净环境里跑,
+        取**实际失败集**再逐条标记,复跑必须零失败、且未标记的用例一条都不许失败。
+      - **变异验证(2 项全部红)**:从 workflow 删掉 `pytest tests/test_fs_capability_closure.py` → 红(接线守卫);
+        给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` → 红(标记纪律守卫)。
+      - **验证**:无 vnpy 环境(仅 numpy/pandas/mcp/pyyaml/typing_extensions)
+        `test_fs_capability_closure.py` **133 passed / 32 skipped / 0 failed**、
+        `test_merge_main_sandbox_union.py` **74 passed / 2 skipped**(那 2 条要真模块才判得了准入审计);
+        研究侧 CI 的整条命令面(8 份 + 本轮两份)同一环境 **598 passed / 55 skipped / 0 failed**;
+        本机(装了 vnpy)同一批 **327 passed**(165 + 76 + 86),**标记一条都没让本地少跑**。
+      - **残余(如实)**:本轮在 Windows 上实测、CI 的 runner 是 Linux(Linux 专属行为未在本机验证);
+        那 32 条需要交易栈的用例在 CI 上仍然不跑(**能力收口的另一半在 CI 上没有覆盖**);
+        研究侧还有 4 份沙盒规则套件没进 CI(候选源码要 `import strategies` 模板,真需要交易栈)——**新开 Issue #46**;
+        仓库层面仍没有跑全套测试的 CI job。
+    - **第 45 轮(维护入口把"链坏了"说成"被其他进程占用"——第 42 轮修过的那一族,这一边漏了)**:
+      分支冻结规则不变:**只补规则与用例**,功能改动一律转 Issue #29。本轮**只改规则与错误消息 + 补用例**。
+      - **发现(第一轮外部审查因 Gemini 免费配额耗尽 429 未跑完,由自查补上)**:
+        `risk/ledger_admin._ledger_lock` 把**整个临界区**圈在 `try` 里,于是临界区**内部**抛的
+        `LedgerChainError`(reason=`chain`,如锚点写失败/链对不上)会被翻译成
+        **"账本被其他进程占用,拒绝维护"**——**那句话是错的**:
+        被占用 ⇒ 该稍后重试;链坏了 ⇒ 重试没用,得人工处理。
+        这与第 42 轮在 `scripts/research_sandbox._approvals_lock` 修掉的是**同一个问题**:那一边改了,这一边漏了。
+      - **修法**:① `ledger_admin._ledger_lock` 改成手动 `__enter__`/`__exit__`,只翻译"**拿不到锁**"这一种失败,
+        临界区内部失败**原样抛**(类型也不吞);② 两处 `_..._lock_message` 把 `occupancy` 从**兜底分支**里单独拎出来——
+        此前 `reentrancy`/`permission` 单独说,其余(含 `occupancy` 与 `chain`/`generic`)一律落进兜底,
+        于是 `chain` 也被说成"被其他进程占用";现在占用单独说(并写明"暂态占用,**请稍后重试**"),
+        未知 reason 只说"锁获取失败(reason=...)",**不替未知原因编一个原因**。
+      - **顺带把两套口径的分工写清(此前混在一起)**:`stale_seconds` 是**安全口径**(多久算残留锁,可以抢走)
+        ⇒ 同一把锁文件的所有调用方必须用**同一个**值;`timeout`(等不到就放弃)是**调用方策略**
+        ⇒ 人工维护入口 5 秒(失败即重试)、写入路径 30 秒(宁可多等),**故意不同**,不该被抹平。
+        此前"默认的 30 秒"是个**只有不传参的人才用的暗口径**——现在 `risk/trial_ledger` 把它显式写成
+        `LOCK_TIMEOUT`,三个调用方都**显式**传 `stale_seconds`,不留暗口径。
+      - **变异验证(5 项全部红)**:① 删掉 `ledger_admin` 的 `occupancy` 分支 → 红;
+        ② 把 `ledger_admin` 改回"整个临界区都圈住" → 红;③ 回到第 45 轮之前的完整原状 → 两条用例都红;
+        ④ 删掉沙盒侧的 `occupancy` 分支 → 红;⑤ 删掉 `trial_ledger` 显式传的 `stale_seconds` → 红。
+      - **验证**:`tests/test_fs_capability_closure.py` **169 passed**(原 165,新增 4 条);
+        `tests/test_research_boundary.py` + `tests/test_merge_main_sandbox_union.py` **162 passed**;
+        `python tools/check_constitution_history.py` 通过;CI 精确 ruff 清单(ruff 0.14.8)**All checks passed**;
+        `python -W error::SyntaxWarning -m compileall` 通过。
+        全量默认顺序套件:**3325 passed / 3 failed / 5 errors**——失败与错误全部落在
+        `tests/test_dashboard_boundaries.py` 与 `tests/test_drill.py`(本分支未触及的既有失败)。
+      - **残余(如实)**:本轮只改了**错误消息与翻译口径**与**超时参数的显式化**,没有改任何判定逻辑——
+        "链坏了"此前也被说成"被占用",现在至少**说对了原因**;但**错误仍然 fail-closed**(一律拒绝),没有变宽松。
+        第一轮外部审查(Gemini)因配额耗尽未完成,第二轮(codex CLI)的结果见 PR #32 正文。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

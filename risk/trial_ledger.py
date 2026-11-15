@@ -18,6 +18,10 @@
 
 阶段 1 只做全局累计(保守:家族划分随阶段 3 的谱系再引入)。同一进程内用线程锁、跨进程用锁文件串行写
 (有了哈希链,两个写者读到同一个尾巴会把链写成分叉,所以跨进程互斥不再可省)。
+
+**锚点里还记着"那一时刻的累计次数"**(第 43 轮):只有哈希时,"删掉账本中间几行"既不改长度也不改哈希链,
+读侧看不出来、人工重置还会**静默**把 N 变小(DSR 的分母变小 = 去通胀失效)。带上累计次数后,
+删行**精确**可算(丢了多少次),读侧 fail-closed、人工重置必须显式补记。
 """
 from __future__ import annotations
 
@@ -29,7 +33,16 @@ from pathlib import Path
 from risk import ledger_chain as chain
 
 KINDS = ("submission", "grid_cell", "gate_run")
+# **人工重置留下的记录**(第 40 轮,Medium 1):`count` 恒为 0(重置本身不是一次试验),
+# 但它把"重置前后的累计试验次数"写进**链里**,于是"重置把 N 变小"这件事本身可审计。
+# 只由 `risk/ledger_admin.reset_trials` 写;`record_trials` 不许写这一种(见下)。
+RESET_KIND = "ledger_reset"
+READ_KINDS = KINDS + (RESET_KIND,)
 # 上限:count 过大时 DSR 的尾概率 1-1/N 会舍入成 1.0 并抛 StatisticsError,账本在语法上有效却让评估永久失败
+# 拿不到账本锁时的等待上限(秒)。写入路径的策略:宁可多等一会儿,
+# 别把一次并发写入变成一次失败(与人工维护入口的 5 秒**故意不同**——
+# 那是调用方策略,不是安全口径;安全口径是 stale_seconds,见 risk/ledger_chain.py)。
+LOCK_TIMEOUT = chain.DEFAULT_LOCK_TIMEOUT
 MAX_ENTRY_COUNT = 10**9
 MAX_TOTAL = 10**12
 TOOL_HINT = ('旧账本(无链):`python scripts/research_ledger.py migrate trials`;链断/回滚/截断:'
@@ -47,10 +60,16 @@ def check_row(data: object) -> dict:
     if not isinstance(data, dict):
         raise ValueError("记录不是对象")
     count = data.get("count")
+    kind = data.get("kind")
+    if kind not in READ_KINDS:
+        raise ValueError("未知的 kind")
+    if kind == RESET_KIND:
+        # 重置记录不是一次试验:count 恒为 0(它只记 before/after)。
+        if isinstance(count, bool) or not isinstance(count, int) or count != 0:
+            raise ValueError("重置记录的 count 必须是 0")
+        return data
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_ENTRY_COUNT:
         raise ValueError(f"count 必须是 1..{MAX_ENTRY_COUNT} 的整数")
-    if data.get("kind") not in KINDS:
-        raise ValueError("未知的 kind")
     return data
 
 
@@ -87,6 +106,7 @@ def total_trials(path: Path) -> int:
 def record_trials(path: Path, kind: str, count: int, *, at: float) -> int:
     """追加一条试验记录并返回追加后的累计次数。"""
     if kind not in KINDS:
+        # `ledger_reset` 只能由人工重置入口写:普通写入路径不许伪造"重置记录"。
         raise TrialLedgerError(f"未知的试验类型: {kind!r}")
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_ENTRY_COUNT:
         raise TrialLedgerError(f"试验次数必须是 1..{MAX_ENTRY_COUNT} 的整数")
@@ -94,7 +114,12 @@ def record_trials(path: Path, kind: str, count: int, *, at: float) -> int:
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with chain.file_lock(path):
+            # 等待上限**显式**写出来(第 45 轮):此前靠 `file_lock` 的默认值,
+            # 而默认值是"只有不传参的人才用"的暗口径——另两个调用方都显式传 5.0,
+            # 这里不传就成了 30 秒。写入路径的策略与人工维护入口**故意不同**
+            # (宁可多等,别把一次并发写入变成一次失败),但**必须写在明面上**。
+            with chain.file_lock(path, timeout=LOCK_TIMEOUT,
+                                 stale_seconds=chain.DEFAULT_STALE_SECONDS):
                 rows = _entries(path)                        # 先校验链与锚点,损坏/被篡改则不追加
                 existing = sum(e["count"] for e in rows)
                 if existing + count > MAX_TOTAL:
@@ -108,7 +133,8 @@ def record_trials(path: Path, kind: str, count: int, *, at: float) -> int:
                         os.fsync(stream.fileno())
                 except OSError as exc:
                     raise TrialLedgerError(f"试验账本写入失败(fail-closed): {exc}") from exc
-                chain.write_anchor(chain.anchor_path_for(path), record["seq"], record["hash"])
+                chain.write_anchor(chain.anchor_path_for(path), record["seq"], record["hash"],
+                                   total=existing + count)
         except chain.LedgerChainError as exc:
             raise TrialLedgerError(str(exc)) from exc
     return existing + count

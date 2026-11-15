@@ -8,6 +8,7 @@
 "被拒"的用例**断言是哪条规则拒的**(只断言"抛了异常"不够,第 22 轮踩过的坑)。
 发现两边打架的地方也写成回归用例(见文件里标"冲突"的几条)。
 """
+import importlib.util
 import sys
 import textwrap
 import types as pytypes
@@ -17,7 +18,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-import bootstrap  # noqa: E402,F401  必须先于 vnpy.trader.database 导入
+# 研究侧 CI 不装 vnpy(见 .github/workflows/research-guard.yml),那里没有
+# vnpy.trader.database 可管;按仓库既有惯例(与 tests/test_constitution_round11.py 同款)
+# 只在交易栈在位时才导入 bootstrap。
+if importlib.util.find_spec("vnpy") is not None:
+    import bootstrap  # noqa: E402,F401  必须先于 vnpy.trader.database 导入
 import research_api as api  # noqa: E402
 import research_sandbox as rs  # noqa: E402
 pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
@@ -41,12 +46,41 @@ def test_the_allowlist_lets_the_repo_import_guard_own_the_strategies_package():
     assert rs.ALLOWED_REPO_IMPORT_DIRS == ("strategies",)
 
 
-def test_the_proxy_and_the_view_share_the_same_object_layer_rule():
-    """代理(main)与视图(#26)的对象层判据是**同一个函数**,不会各自漂移。"""
-    import inspect
+def _source_function(path, name, class_name=None):
+    """按**名字**在源文件里定位一个函数(ast,不看行号)。"""
+    import ast
+    import pathlib
 
-    assert "_check_object_rules" in inspect.getsource(rs._GuardedModule.__getattribute__)
-    assert "_check_object_rules" in inspect.getsource(rs._view_value)
+    parsed = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+    for node in ast.walk(parsed):
+        if class_name is None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return node
+        elif isinstance(node, ast.ClassDef) and node.name == class_name:
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == name:
+                    return sub
+    raise AssertionError(f"源文件里找不到 {class_name + '.' if class_name else ''}{name}")
+
+
+def _called_names(node):
+    """函数体里调用到的名字集合。"""
+    import ast
+
+    return {ast.unparse(child.func) for child in ast.walk(node) if isinstance(child, ast.Call)}
+
+
+def test_the_proxy_and_the_view_share_the_same_object_layer_rule():
+    """代理(main)与视图(#26)的对象层判据是**同一个函数**,不会各自漂移。
+
+    第 43 轮(codex 的 L3):断言改成 **ast 按名字定位**——
+    `inspect.getsource` 是按行号切块的,文件在导入后被改写就会拿到**别的**源码块,
+    那时这条断言等于在检验另一段代码。"""
+    source = rs.__file__
+
+    assert "_check_object_rules" in _called_names(
+        _source_function(source, "__getattribute__", "_GuardedModule"))
+    assert "_check_object_rules" in _called_names(_source_function(source, "_view_value"))
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +186,18 @@ def test_a_config_added_module_that_leaks_is_refused_by_the_audit():
         assert type(module) is rs._GuardedModule
 
 
-@pytest.mark.parametrize("name", ["matplotlib", "psutil"])
+# 这两个模块**不在**研究侧依赖里(requirements-research.txt),只有交易环境装。
+# 而"配置追加后仍被拒"这条断言必须**看到真模块**才判得了(准入审计要查它的命名空间),
+# 所以缺模块时整条跳过——不是"没法测就放行"。
+_MISSING_MODULE = "该模块不在研究侧依赖里(只有交易环境装),没有真模块判不了准入审计"
+
+
+@pytest.mark.parametrize("name", [
+    pytest.param("matplotlib", marks=pytest.mark.skipif(
+        importlib.util.find_spec("matplotlib") is None, reason=_MISSING_MODULE)),
+    pytest.param("psutil", marks=pytest.mark.skipif(
+        importlib.util.find_spec("psutil") is None, reason=_MISSING_MODULE)),
+])
 def test_conflict_matplotlib_and_psutil_cannot_be_enabled_even_by_config(name):
     """**冲突(两边口径不一致,取更严的一侧,如实记录)**。
 
@@ -362,16 +407,33 @@ def test_the_production_screen_refuses_with_the_expected_rule(tmp_path, source, 
 
 def test_the_production_path_wires_both_defences_into_one_call():
     """接线检查(声明了的防线必须真接上):`import_candidate` 同时传了 `allowed_modules` 与 `repo_guard`,
-    并且在预加载之前调用了 `verify_trusted_tree`。"""
-    import inspect
+    并且在预加载之前调用了 `verify_trusted_tree`。
 
-    src = inspect.getsource(api.import_candidate)
-    call = src[src.index("rs.safe_builtins("):]
-    call = call[:call.index(")") + 1]
+    第 43 轮(codex 的 L3):断言改成 **ast 按名字定位**——
+    `inspect.getsource` 按行号切块,文件在导入后被改写就会拿到**别的**源码块,
+    那时下面的断言等于在检验另一段代码。"""
+    import ast
 
-    assert 'cfg["screening"]["allowed_modules"]' in call, call
-    assert "repo_guard=repo_guard" in call, call
-    assert src.index("verify_trusted_tree") < src.index("protected_before = const.snapshot_protected_state()")
+    node = _source_function(api.__file__, "import_candidate")
+    safe_builtins = [child for child in ast.walk(node)
+                     if isinstance(child, ast.Call) and ast.unparse(child.func).endswith("safe_builtins")]
+    assert safe_builtins, "import_candidate 里没有 safe_builtins 调用"
+    keywords = {kw.arg: ast.unparse(kw.value) for kw in safe_builtins[0].keywords}
+    # ast.unparse 的引号风格与源码不一定一致(它统一成单引号),比对时先归一化。
+    positional = [ast.unparse(arg).replace('"', "'") for arg in safe_builtins[0].args]
+    assert "cfg['screening']['allowed_modules']" in positional, (positional, keywords)
+    assert keywords.get("repo_guard") == "repo_guard", (positional, keywords)
+
+    lines = {}
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            name = ast.unparse(child.func)
+            if name.endswith("verify_trusted_tree"):
+                lines["verify"] = child.lineno
+            if name.endswith("snapshot_protected_state"):
+                lines["snapshot"] = child.lineno
+    assert "verify" in lines and "snapshot" in lines, lines
+    assert lines["verify"] < lines["snapshot"], lines
 
 
 # 这些用例会走生产入口、把**临时仓库里的**包真的导入进 sys.modules。monkeypatch.delitem 只还原

@@ -90,7 +90,13 @@ SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORB
                 "FORBIDDEN_KEY_STRINGS",
                 # Issue #31:候选执行窗口的审计钩子拒绝名单与"函数级能力库"名单。少一项 = 多放开一种能力,只增不减。
                 "AUDIT_DENIED_EVENTS", "AUDIT_DENIED_EVENT_PREFIXES", "CAPABILITY_LIB_ROOTS", "UNREACHABLE_MEMBERS",
-                "UNREACHABLE_ORIGINS", "BUILTIN_PRIMITIVE_NAMES", "AUDIT_DENIED_EVENTS_WINREG", "UNREACHABLE_QUALIFIED")
+                "UNREACHABLE_ORIGINS", "BUILTIN_PRIMITIVE_NAMES", "AUDIT_DENIED_EVENTS_WINREG", "UNREACHABLE_QUALIFIED",
+                # Issue #31 第 40 轮:"按名求值的执行器"名单(对象层按"模块名.成员名"拒)。
+                # 少一项 = 少堵一个"把真内建递给候选"的执行器,只增不减。
+                "EVALUATOR_MEMBERS",
+                # Issue #31 第 40 轮:"禁止的求值帧"名单(事件层按"谁触发的这次 exec"拒)。
+                # 少一项 = 少堵一个"替候选求值候选给的字符串"的求值点,只增不减。
+                "FORBIDDEN_EVAL_FRAMES")
 
 # 沙盒层的**允许**集合(第 21 轮新增的仓库内导入白名单):语义与 deny set 相反——
 # 多一项 = 多放开一点仓库内的模块(候选能 import 的东西变多),所以它必须**只减不增**。
@@ -98,6 +104,19 @@ SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORB
 # 引用次数的守望(执行点不许消失)——按现有先例(`BUILTIN_ALLOWED_OVERRIDES`),
 # 两个方向都被冻住:要改这个白名单必须显式改守卫,不能顺手加一项。
 SANDBOX_ALLOW_SETS = ("ALLOWED_REPO_IMPORT_DIRS",)
+
+# **受保护的编译正则**(第 40 轮,Medium 3):`DATA_PRIMITIVE_PATTERN` 是编译后的正则,
+# 原来的提取器只认"字符串集合",于是它**从来没有被比对过**——把模式改宽(少拒几个名字)
+# 守卫照样全绿(与第 25 轮 `frozenset` 那次一样的"没登记 = 没守着")。
+# 正则没有"只增不减"的自然序(模式字符串与集合不同,无法逐项比较),所以按**冻结**处理:
+# 模式字符串与历史版本不同就报错——要改必须显式改守卫(而不是顺手把模式放宽)。
+SANDBOX_FROZEN_PATTERNS = ("DATA_PRIMITIVE_PATTERN",)
+
+# **受保护的映射**(第 40 轮,Medium 3):`AUDIT_PATH_MUTATION_EVENTS` 是 {事件: 参数下标元组}——
+# 审计钩子靠它决定"哪些事件要查哪个参数是不是落在允许目录里"。判据:
+# - **键只能增**:少一个事件 = 少查一种会改文件的动作(比如把 `os.remove` 删掉);
+# - **每个键的下标集合只能增**:少一个下标 = 少查一条路径(比如把 `os.rename` 的第二个下标删掉)。
+SANDBOX_PROTECTED_MAPS = ("AUDIT_PATH_MUTATION_EVENTS",)
 
 # 注册表:(文件相对路径, 该文件里受保护的常量名)
 BUILTIN_REGISTRY = (
@@ -217,6 +236,76 @@ def const_string_set(source: str, names) -> dict[str, set[str]]:
                 progressed = True
         if not progressed:
             break
+    return found
+
+
+def const_frozen_pattern(source: str, names) -> dict[str, str]:
+    """从源码里取出若干 `re.compile("字面量")` 形式的常量(第 40 轮)。
+
+    只认**单个位置参数是字符串字面量**的写法;`re.compile(常量)`、拼接出来的模式等一律取不到——
+    取不到就报"无法解析"(查不了等于没查),不能让它冒充通过。"""
+    found: dict[str, str] = {}
+    for node in ast.parse(source).body:
+        name = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        if name is None or name not in names or value is None:
+            continue
+        if not isinstance(value, ast.Call) or not (1 <= len(value.args) <= 2):
+            continue
+        func = value.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "compile"
+                and isinstance(func.value, ast.Name) and func.value.id == "re"):
+            continue
+        arg = value.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found[name] = arg.value
+    return found
+
+
+def const_int_map(source: str, names) -> dict[str, dict[str, frozenset[int]]]:
+    """从源码里取出 {名称: {键: 下标集合}} 形式的常量(第 40 轮:`AUDIT_PATH_MUTATION_EVENTS`)。
+
+    值的元素必须是**整数常量**(布尔不算);其它形态取不到就报"无法解析"。"""
+    def eval_indexes(node):
+        if not isinstance(node, ast.Tuple) or not node.elts:
+            return None
+        out = set()
+        for elt in node.elts:
+            if not isinstance(elt, ast.Constant) or isinstance(elt.value, bool) \
+                    or not isinstance(elt.value, int):
+                return None
+            out.add(elt.value)
+        return frozenset(out)
+
+    found: dict[str, dict[str, frozenset[int]]] = {}
+    for node in ast.parse(source).body:
+        name = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        if name is None or name not in names or value is None:
+            continue
+        if not isinstance(value, ast.Dict):
+            continue
+        out: dict[str, frozenset[int]] = {}
+        ok = True
+        for key, item in zip(value.keys, value.values):
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                ok = False
+                break
+            indexes = eval_indexes(item)
+            if indexes is None:
+                ok = False
+                break
+            out[key.value] = indexes
+        if ok:
+            found[name] = out
     return found
 
 
@@ -532,6 +621,67 @@ def check_builtin_protections(root: Path) -> list[str]:
     return problems
 
 
+def check_frozen_patterns(root: Path) -> list[str]:
+    """受保护的编译正则:模式字符串与历史版本不同就报错(冻结)。
+
+    第 40 轮(Medium 3):`DATA_PRIMITIVE_PATTERN` 此前**从未被比对过**——提取器不认 `re.compile`,
+    于是把模式改宽(少拒几个名字)守卫照样全绿。正则没有"只增不减"的自然序,
+    所以按冻结处理:要改必须显式改守卫。"""
+    problems: list[str] = []
+    rel = "scripts/research_sandbox.py"
+    current_source = (root / rel).read_text(encoding="utf-8")
+    current = const_frozen_pattern(current_source, SANDBOX_FROZEN_PATTERNS)
+    missing = [name for name in SANDBOX_FROZEN_PATTERNS if name not in current]
+    if missing:
+        problems.append(f"{rel} 里的受保护正则 {missing} 无法解析成字面量模式,历史比对对它们无效")
+        return problems
+    for rev in _commits_touching(root, rel):
+        older_source = _read_at(root, rev, rel)
+        if older_source is None:
+            continue
+        older = const_frozen_pattern(older_source, SANDBOX_FROZEN_PATTERNS)
+        for name, pattern in older.items():
+            if current[name] != pattern:
+                problems.append(
+                    f"{rel} 的 {name} 在提交 {rev[:8]} 之后被改动"
+                    f"(受保护的正则是冻结项:要改必须显式改守卫)")
+    return problems
+
+
+def check_protected_maps(root: Path) -> list[str]:
+    """受保护的映射({事件: 参数下标}):键只能增,每个键的下标集合只能增。
+
+    第 40 轮(Medium 3):`AUDIT_PATH_MUTATION_EVENTS` 此前**从未被比对过**——
+    删掉 `os.remove` 或删掉 `os.rename` 的第二个下标,守卫照样全绿。"""
+    problems: list[str] = []
+    rel = "scripts/research_sandbox.py"
+    current_source = (root / rel).read_text(encoding="utf-8")
+    current = const_int_map(current_source, SANDBOX_PROTECTED_MAPS)
+    missing = [name for name in SANDBOX_PROTECTED_MAPS if name not in current]
+    if missing:
+        problems.append(f"{rel} 里的受保护映射 {missing} 无法解析成 {{键: 下标}} 形式,历史比对对它们无效")
+        return problems
+    for rev in _commits_touching(root, rel):
+        older_source = _read_at(root, rev, rel)
+        if older_source is None:
+            continue
+        older = const_int_map(older_source, SANDBOX_PROTECTED_MAPS)
+        for name, values in older.items():
+            now = current[name]
+            for key, indexes in values.items():
+                if key not in now:
+                    problems.append(
+                        f"{rel} 的 {name} 里的事件 {key!r} 在提交 {rev[:8]} 之后被删除了"
+                        f"(受保护的映射只能增:少一个事件 = 少查一种改文件的动作)")
+                    continue
+                gone = indexes - now[key]
+                if gone:
+                    problems.append(
+                        f"{rel} 的 {name} 里事件 {key!r} 的参数下标 {sorted(gone)} 在提交 {rev[:8]} 之后被删除了"
+                        f"(受保护的映射只能增:少一个下标 = 少查一条路径)")
+    return problems
+
+
 def check_registry_completeness(root: Path) -> list[str]:
     """注册表必须覆盖源码里**全部**字符串集合型的内置保护常量。
 
@@ -554,6 +704,28 @@ def check_registry_completeness(root: Path) -> list[str]:
                 continue
             if const_string_set(source, (name,)).get(name) is not None:
                 problems.append(f"{rel} 的 {name} 是字符串集合型的内置保护常量,但没登记进历史守卫的注册表")
+
+    # 第 40 轮(Medium 3):字符串集合之外的两种保护形状也必须登记——
+    # **公开的编译正则**(拒谁靠它)与**公开的 {键: 下标} 映射**(查哪条路径靠它)。
+    # 这两种形状此前完全没有守护:改宽正则、删掉映射里的一个事件,守卫都全绿。
+    # 只管**公开名**(下划线开头的是解析/脱敏用的启发式,不属于"拒谁"的保护清单)。
+    rel = "scripts/research_sandbox.py"
+    source = (root / rel).read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+        else:
+            continue
+        if name.startswith("_"):
+            continue
+        if const_frozen_pattern(source, (name,)).get(name) is not None \
+                and name not in SANDBOX_FROZEN_PATTERNS:
+            problems.append(f"{rel} 的 {name} 是编译出来的保护正则,但没登记进历史守卫的冻结正则表")
+        if const_int_map(source, (name,)).get(name) is not None \
+                and name not in SANDBOX_PROTECTED_MAPS:
+            problems.append(f"{rel} 的 {name} 是 {{键: 下标}} 形态的保护映射,但没登记进历史守卫的映射表")
     return problems
 
 
@@ -1224,6 +1396,8 @@ def check_all(root: Path) -> list[str]:
     problems += check_constitution_file(root)
     problems += check_builtin_protections(root)
     problems += check_registry_completeness(root)
+    problems += check_frozen_patterns(root)
+    problems += check_protected_maps(root)
     problems += check_single_constants(root)
     problems += check_protected_usage(root)
     problems += check_call_site_shape(root)

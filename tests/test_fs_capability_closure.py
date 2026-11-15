@@ -7,17 +7,29 @@
 """
 import contextlib
 import copy
+import importlib.util
 import json
 import os
 import pickle
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
-import bootstrap  # noqa: F401  与既有用例一致:先于 vnpy.trader.database
+# `bootstrap` 的唯一作用是"在 vnpy.trader.database 之前把时区设成 CST-8"。
+# 研究侧 CI 不装 vnpy(见 .github/workflows/research-guard.yml),那里根本没有
+# vnpy.trader.database 可管;按仓库既有惯例(与 tests/test_constitution_round11.py 同款)
+# 只在交易栈在位时才导入它。
+#
+# 注意**不是**"import 失败就整份文件跳过":那会让这份核心防线在 CI 上一次都不跑
+# (第 7 轮 codex 的 High 同族——闸门看上去配好了,实际没跑)。
+# 真正需要交易栈的用例由 `@requires_trading_stack` 逐条显式标出。
+if importlib.util.find_spec("vnpy") is not None:
+    import bootstrap  # noqa: F401  与既有用例一致:先于 vnpy.trader.database
 import numpy as np   # 必须在进入窗口前导入:pandas 首次导入会 ctypes.dlopen,窗口里会被拒
 import pandas as pd
 import research_api as api
@@ -27,6 +39,36 @@ from risk import ledger_chain as chain
 from risk import trial_ledger as tl
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# ---------------------------------------------------------------------------
+# 需要交易栈的用例:逐条**显式**标记,而不是"import 失败就整份文件跳过"
+# ---------------------------------------------------------------------------
+# 这份文件是 Issue #31 的核心防线(候选能力收口)。它此前**在 CI 上一次都没跑过**:
+# 文件头的 `import bootstrap` 会拖进 vnpy,而研究侧 CI 只装 numpy/pandas/mcp/pyyaml,
+# 于是整份文件在收集阶段就 ModuleNotFoundError——**闸门看上去配好了,实际没跑**
+# (第 7 轮 codex 的 High 同族)。现在把"需要交易栈的用例"逐条标记出来,
+# 让**其余与交易栈无关的防线用例真的在 CI 上跑**。
+#
+# 这个标记是**环境驱动**的,不是"为了让 CI 绿而放宽":
+#   - 本机(装了 vnpy)这些用例**照常跑**,一条不少;
+#   - 跳过时 pytest 会打印原因,CI 日志里看得见;
+#   - 用例本身断言"**是哪条规则**拒的",规则失灵时照样红(第 22 轮教训)。
+# 新增用例若要用 vnpy,**必须**加这个标记——否则它在 CI 上会直接失败
+# (而不是被静默跳过),这正是我们要的行为:漏标记会立刻暴露,不会悄悄退化。
+
+
+def _has_trading_stack() -> bool:
+    """交易栈(vnpy_ctastrategy)在不在?——决定 `@requires_trading_stack` 是否跳过。"""
+    try:
+        return importlib.util.find_spec("vnpy_ctastrategy") is not None
+    except (ImportError, ValueError):   # pragma: no cover - 找不到就是没有
+        return False
+
+
+requires_trading_stack = pytest.mark.skipif(
+    not _has_trading_stack(),
+    reason="需要交易栈(vnpy_ctastrategy):研究侧 CI 不装交易栈,这类用例在本地全量环境跑",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -348,6 +390,7 @@ def run_candidate(tmp_path, monkeypatch, source, allowed=("numpy", "pandas"), st
     return api.import_candidate(path, "S", api.rs.file_sha256(path))
 
 
+@requires_trading_stack
 def test_import_time_write_is_denied_through_the_production_entry(repo, tmp_path, monkeypatch, victim):
     """导入期窗口:候选在模块顶层 np.savetxt 改"行情 CSV"——被拒,文件不变,窗口复位。"""
     before = victim.read_bytes()
@@ -371,6 +414,7 @@ def test_import_time_write_is_denied_through_the_production_entry(repo, tmp_path
     assert not rs._AUDIT.active
 
 
+@requires_trading_stack
 def test_import_time_pickle_attack_is_denied_through_the_production_entry(repo, tmp_path, monkeypatch):
     marker = tmp_path / "import_marker"
     payload = tmp_path / "p.pkl"
@@ -393,6 +437,7 @@ def test_import_time_pickle_attack_is_denied_through_the_production_entry(repo, 
     assert not marker.exists()
 
 
+@requires_trading_stack
 def test_normal_candidate_still_imports_through_the_production_entry(repo, tmp_path, monkeypatch):
     source = """
         import numpy as np
@@ -446,6 +491,7 @@ def test_the_candidate_cannot_reach_the_switch_through_numpy_attributes(repo, tm
     assert cls.LEAK is None, f"{expr} 居然拿到了 {cls.LEAK}"
 
 
+@requires_trading_stack
 def test_run_window_wraps_the_gate_evaluate_and_backtest_children(monkeypatch, tmp_path):
     """三个子进程入口的**运行期**窗口接线:调用候选相关的运行函数时窗口是开的,返回后复位。"""
     import research_gate
@@ -572,7 +618,8 @@ def test_trial_ledger_records_form_a_hash_chain_and_anchor_is_elsewhere(tmp_path
     assert [r["seq"] for r in rows] == [1, 2, 3]
     assert rows[0]["prev"] == chain.GENESIS and rows[1]["prev"] == rows[0]["hash"]
     anchor = chain.anchor_path_for(path)
-    assert anchor.read_text(encoding="ascii").split() == ["3", rows[-1]["hash"]]
+    # 第 43 轮:锚点是三段 —— seq、头哈希、**那一刻的累计次数**(有了它才查得出"删行")。
+    assert anchor.read_text(encoding="ascii").split() == ["3", rows[-1]["hash"], "6"]
     assert anchor.parent != path.parent and anchor.parent.name == "ledger_anchor"
     assert tl.total_trials(path) == 6
 
@@ -726,6 +773,47 @@ def test_trial_reset_keeps_the_valid_prefix_and_supports_manual_top_up(tmp_path)
     out = admin.reset_trials(path, add_trials=100, at=5.0)
     assert out["kept"] == 3 and out["total"] == 1 + 2 + 100 and out["backup"]
     assert tl.total_trials(path) == 103
+
+
+def test_reset_trials_refuses_to_shrink_the_trial_count_without_an_explicit_flag(tmp_path):
+    """第 40 轮(Medium 1):重置**不许悄悄把 N 变小**——N 变小 = DSR 的分母变小 = 去通胀失效
+    (年化 Sharpe 3.5:N=1620 时 DSR 0.6397 不过,N=1 时 0.9999 过;见 risk/trial_ledger.py 的说明)。
+
+    基准取"账本**声称**的总数"(不看链):链在中间断掉时,有效前缀比真实历史少一大截,
+    拿有效前缀当基准就等于"变小不算变小"。"""
+    path = make_trials(tmp_path)                                       # 1+2+3 = 6
+    rows = lines(path)
+    path.write_text(rows[0] + "\n" + rows[1] + "\n" + '{"kind":"submission","count":3}\n', encoding="utf-8")
+
+    with pytest.raises(admin.AdminError, match="降到"):
+        admin.reset_trials(path, reason="链断")
+
+    out = admin.reset_trials(path, allow_reduce_n=True, reason="链断,丢失的试验次数无法恢复")
+    assert out["before"] == 6 and out["total"] == 3                 # 6 → 3:变小这件事被显式确认过
+    recorded = [json.loads(line) for line in lines(path)]
+    resets = [r for r in recorded if r["kind"] == tl.RESET_KIND]
+    assert len(resets) == 1 and resets[0]["before"] == 6 and resets[0]["after"] == 3
+    assert resets[0]["count"] == 0 and "reason" in resets[0]        # 重置本身不是一次试验
+    assert tl.total_trials(path) == 3                                # 链仍然自洽(N 确实变成了 3)
+
+
+def test_the_reset_cli_refuses_to_shrink_the_trial_count_without_the_flag(tmp_path, monkeypatch, capsys):
+    """命令行入口同样必须拦住(守卫不能只做在库里)。"""
+    import research_ledger as cli
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    approvals = tmp_path / "data" / "research-control" / "approvals.json"
+    monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals))
+    for index in range(3):
+        tl.record_trials(trials, "submission", index + 1, at=float(index))
+    rows = trials.read_text(encoding="utf-8").splitlines()
+    trials.write_text(rows[0] + "\n" + rows[1] + "\n" + '{"kind":"submission","count":3}\n', encoding="utf-8")
+
+    assert cli.main(["reset", "trials", "--reason", "链断"]) == 1
+    assert "降到" in capsys.readouterr().err
+
+    assert cli.main(["reset", "trials", "--reason", "链断", "--allow-reduce-n"]) == 0
+    capsys.readouterr()
+    assert tl.total_trials(trials) == 3
 
 
 # ---- 批准账本 ----
@@ -896,6 +984,7 @@ def _args(kind):
 
 
 @pytest.mark.parametrize("kind", ["gate", "evaluate"])
+@requires_trading_stack
 def test_bars_are_fixed_before_the_candidate_is_imported(kind, child_env, monkeypatch):
     """导入期(假设绕过了钩子的)外部写改了 CSV,框架拿到的仍是导入前读到的那份数据。"""
     csv, research_gate = child_env
@@ -918,6 +1007,7 @@ def test_bars_are_fixed_before_the_candidate_is_imported(kind, child_env, monkey
     assert [bar.close_price for bar in captured["bars"]] == [10.5, 10.5], "框架读到了导入期被改过的价格"
 
 
+@requires_trading_stack
 def test_the_production_import_cannot_rewrite_the_csv_in_the_first_place(repo, tmp_path, monkeypatch):
     """上一条的另一半:生产入口里,候选导入期 np.savetxt 改 CSV 被钩子拒(两层各自成立)。"""
     csv = tmp_path / "bars.csv"
@@ -1023,6 +1113,7 @@ def test_os_write_has_no_audit_event_and_stdout_logging_still_works(victim, caps
 
 # ---- vnpy.trader.utility 的任意路径写原语 ----
 
+@requires_trading_stack
 def test_save_json_style_primitives_are_not_reachable_by_the_candidate(tmp_path):
     """第 32 号 PR 复审 Medium:`vnpy.trader.utility.save_json(filename)` 用 `get_file_path(filename)`(joinpath),
     绝对路径胜出 = 任意路径写。对象层规则把这些函数从候选可达的属性里拿掉;模板需要的成员仍可取。"""
@@ -1046,6 +1137,7 @@ def test_save_json_style_primitives_are_not_reachable_by_the_candidate(tmp_path)
     assert isinstance(types, object)
 
 
+@requires_trading_stack
 def test_the_production_import_path_cannot_call_save_json(repo, tmp_path, monkeypatch):
     target = tmp_path / "save_json_victim.json"
     source = f"""
@@ -1169,6 +1261,7 @@ def test_known_residual_a_callback_planted_in_the_window_fires_outside_it(tmp_pa
 # 第 37 轮复审:导入原语再导出 / sqlite3 无 open 事件 / 账本锁分类
 # ======================================================================
 
+@requires_trading_stack
 def test_importlib_import_module_reexport_is_refused_by_the_object_layer():
     """Critical:`vnpy.trader.database`/`datafeed` 再导出了 `importlib.import_module`(不受限的导入原语)。
     断言是**对象层的"能力泄漏"规则**拒的(按 `__module__` 的根判来源,不是名字名单)。"""
@@ -1201,6 +1294,7 @@ def test_builtins_import_primitive_reexported_by_a_module_is_refused():
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_threads_processes_paths_reexported_by_whitelisted_modules_are_refused():
     import vnpy.trader.engine as engine
     import vnpy.trader.utility as util
@@ -1220,14 +1314,20 @@ def test_threads_processes_paths_reexported_by_whitelisted_modules_are_refused()
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin():
     """系统性扫描的回归版(完整扫描脚本与结果见 ADR):逐个公开成员按 `__module__`/模块名判来源,
     凡是危险来源,对象层规则必须拒;不按成员名猜。覆盖脚本扫描里出过命中的那几个模块。"""
     import importlib
     import types
-    dangerous = {"importlib", "os", "posix", "nt", "sys", "subprocess", "ctypes", "pickle", "marshal", "socket", "shutil",
-                 "sqlite3", "tempfile", "mmap", "zipfile", "tarfile", "dbm", "shelve", "runpy", "signal", "atexit", "gc",
-                 "inspect", "io", "pathlib", "glob", "threading", "multiprocessing", "requests", "urllib", "http"}
+    # **危险来源集合从 `rs.DANGEROUS_MODULE_NAMES` 派生**,不再手写名单:
+    # 第 40 轮实测证明"手写名单"这一族已经漏了三次(第 37 轮 `importlib` → 第 37 轮 `multiprocessing`
+    # → 第 40 轮 `concurrent`),每漏一次就要补一次名字。派生之后,危险模块登记一次,
+    # 本用例自动跟着变严——`concurrent` 就是这么被补上的(实测 `vnpy.trader.optimize.ProcessPoolExecutor`、
+    # `vnpy_ctastrategy.engine.ThreadPoolExecutor`/`Future` 三个都可达)。
+    # `builtins` 排除:内建原语另有一条更精确的规则(`BUILTIN_PRIMITIVE_NAMES`),一刀切会误伤放行方向。
+    dangerous = (set(rs.DANGEROUS_MODULE_NAMES) - {"builtins"}) | set(rs.UNREACHABLE_ORIGINS)
+    assert "concurrent" in dangerous, "concurrent 必须在危险来源集合里(第 40 轮实测漏过)"
     rs.safe_builtins(())
     leaked = []
     for name in ("vnpy.trader.database", "vnpy.trader.datafeed", "vnpy.trader.engine", "vnpy.trader.utility",
@@ -1248,6 +1348,53 @@ def test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin():
     assert leaked == [], leaked
 
 
+@requires_trading_stack
+def test_thread_and_process_executors_reexported_by_whitelisted_modules_are_refused():
+    """第 40 轮(实测):候选 `from vnpy.trader.optimize import ProcessPoolExecutor` **实测拿到**——
+    对象层的"来源"判定此前只查 `UNREACHABLE_ORIGINS` 一个集合,而"能起线程/进程"的来源在
+    `DANGEROUS_MODULE_NAMES` 里,`concurrent` 就这么漏了。同一族第三次漏(importlib → multiprocessing → concurrent),
+    所以判据改成派生而不是补名字;这里钉住**规则名**("按来源不可达"),并覆盖另两个同源成员
+    (`vnpy_ctastrategy.engine` 还再导出了 `ThreadPoolExecutor` 与 `Future`,codex 只报了第一个)。"""
+    import importlib
+    rs.safe_builtins(())
+    cases = [
+        ("vnpy.trader.optimize", "ProcessPoolExecutor"),
+        ("vnpy_ctastrategy.engine", "ThreadPoolExecutor"),
+        ("vnpy_ctastrategy.engine", "Future"),
+    ]
+    for module_name, member in cases:
+        module = importlib.import_module(module_name)
+        value = getattr(module, member)
+        assert value is not None, f"{module_name}.{member} 不存在,本用例的前提变了"
+        with pytest.raises(AttributeError, match="规则:按来源不可达"):
+            rs._check_object_rules(module, member, value)
+    # 放行方向:同一个白名单模块里正常模板要用的东西照旧可达
+    assert rs._check_object_rules is not None
+    assert rs._proxy_for(importlib.import_module("vnpy.trader.utility")).ArrayManager is not None
+    rs._PROXY_CACHE.clear()
+
+
+@requires_trading_stack
+def test_capability_library_classes_reexported_by_whitelisted_modules_are_refused():
+    """第 40 轮(实测):"函数级能力库未授权"此前**只查模块**,类不在射程内——
+    `from vnpy_ctastrategy.backtesting import DataFrame` 照样拿到 `pandas.core.frame.DataFrame`
+    (pandas 是大攻击面:`to_csv`/`to_pickle` 是任意写,`DataFrame.eval` 能用 pandas 的真实 globals 求表达式)。
+    这里钉住规则名("函数级能力库未授权"),并覆盖同模块的另外两个类。"""
+    import importlib
+    rs.safe_builtins(())
+    for member in ("DataFrame", "Series", "ExponentialMovingWindow"):
+        module = importlib.import_module("vnpy_ctastrategy.backtesting")
+        value = getattr(module, member)
+        assert value is not None, f"{member} 不存在,本用例的前提变了"
+        with pytest.raises(AttributeError, match="规则:函数级能力库未授权"):
+            rs._check_object_rules(module, member, value)
+    # 放行方向:模板真正要用的类不受影响
+    from vnpy.trader.object import BarData
+    assert rs._check_object_rules(importlib.import_module("vnpy.trader.object"), "BarData", BarData) is None
+    rs._PROXY_CACHE.clear()
+
+
+@requires_trading_stack
 def test_production_path_refuses_import_module_and_leaves_framework_modules_untouched(repo, tmp_path, monkeypatch):
     """端到端(生产 import_candidate,静态筛查开):候选经 `import_module` 复活 research_grid 并改 `validate_grid`
     ——对象层规则拒,框架模块对象未变(第 33 轮"格子上限失效 → 试验少记"不能原样复活)。"""
@@ -1354,12 +1501,101 @@ def test_file_lock_gives_up_on_a_persistent_permission_error_with_a_distinct_mes
     assert time.monotonic() - started < 5
 
 
-def test_file_lock_still_reports_a_genuinely_held_lock_as_busy(tmp_path):
+def _write_a_foreign_holder_lock(target: Path, token: str = "foreign-token") -> subprocess.Popen:
+    """假装**另一个活着的进程**持有着这把锁(真起一个子进程,取它的 PID)。
+
+    第 42 轮:原先那条用例是**同一个进程**嵌套拿两次锁,却断言"被其他进程占用"——
+    占用者其实就是本进程,那句话是错的。现在分成两种情形分别测。"""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    lock = target.with_name(target.name + ".chainlock")
+    lock.write_text(f"{proc.pid} {time.time():.3f} {token}\n", encoding="ascii")
+    return proc
+
+
+def test_a_lock_held_by_another_process_is_reported_as_busy(tmp_path):
     target = tmp_path / "z.jsonl"
-    with chain.file_lock(target):
+    proc = _write_a_foreign_holder_lock(target)
+    try:
+        started = time.monotonic()
         with pytest.raises(chain.LedgerChainError, match="被其他进程占用"):
             with chain.file_lock(target, timeout=0.3):
                 pass
+        assert time.monotonic() - started < 5
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def test_the_same_thread_cannot_take_the_same_lock_twice(tmp_path):
+    """**重入**(第 42 轮):**同一个线程**再拿同一把锁 ⇒ 立刻失败,而不是空转到超时。
+
+    原先的行为:O_EXCL 见到自己刚建的锁文件 ⇒ 等满 timeout(批准路径 5 秒、默认 30 秒),
+    最后报"被其他进程占用"——**占用者就是本进程**,那句话是错的。
+
+    注意:判定是**线程级**的。同一进程的**另一个**线程拿这把锁是**真并发**(该等),
+    见 `test_another_thread_of_the_same_process_waits_instead_of_being_called_reentrant`。"""
+    target = tmp_path / "r.jsonl"
+    with chain.file_lock(target):
+        started = time.monotonic()
+        with pytest.raises(chain.LedgerChainError, match="本进程同一线程"):
+            with chain.file_lock(target, timeout=5):
+                pass
+        assert time.monotonic() - started < 2, "重入没有立刻失败,是在等满超时"
+
+
+def test_another_thread_of_the_same_process_waits_instead_of_being_called_reentrant(tmp_path):
+    """同进程的**另一个线程**拿同一把锁 ⇒ **等**,不是"重入"(第 42 轮第三版)。
+
+    这条是上一条的**反向探针**:第一版把 token 定成每进程一个,于是别的线程
+    在等锁时被误判成"重入"直接拒绝,把 6 线程并发批准打挂了
+    (`tests/test_research_sandbox.py::test_concurrent_approvals_do_not_lose_entries`)。
+    真正的重入只发生在**同一个线程**嵌套拿同一把锁。"""
+    target = tmp_path / "t.jsonl"
+    outcome: list[str] = []
+
+    def worker() -> None:
+        try:
+            with chain.file_lock(target, timeout=10):
+                outcome.append("拿到锁")
+        except chain.LedgerChainError as exc:
+            outcome.append(f"失败: {exc}")
+
+    with chain.file_lock(target):
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=5)
+        # 别的线程此刻必须还在**等**(不能已经失败),也不能已经拿到锁
+        assert outcome == [], f"另一个线程不该在主线程持锁期间就结束:{outcome}"
+        assert thread.is_alive(), "另一个线程应该还在等锁"
+
+    thread.join(timeout=15)
+    assert outcome == ["拿到锁"], f"另一个线程应该等主线程放锁后拿到:{outcome}"
+    assert not thread.is_alive()
+
+
+def test_an_error_inside_the_approvals_lock_is_not_reported_as_occupancy(tmp_path):
+    """临界区**内部**失败 ≠ "被其他进程占用"(第 42 轮)。
+
+    原先 `except chain.LedgerChainError` 圈住整个临界区,于是里面抛的
+    LedgerChainError 被翻译成"批准记录被其他进程占用,拒绝写入"——**那句话是错的**。
+    现在只翻译"拿不到锁"这一种。"""
+    with pytest.raises(chain.LedgerChainError, match="链断了"):
+        with rs._approvals_lock(tmp_path / "approvals.json"):
+            raise chain.LedgerChainError("链断了")
+
+
+def test_a_reused_pid_is_not_mistaken_for_a_reentrant_lock(tmp_path):
+    """PID 被复用时(锁文件里的 PID 恰好是我们、但 token 不是)⇒ **不算**重入。
+
+    没有 token 时,系统把别人的残留锁认成自己的 ⇒ 报"本进程重入",把真故障说错。"""
+    target = tmp_path / "p.jsonl"
+    lock = target.with_name(target.name + ".chainlock")
+    lock.write_text(f"{os.getpid()} {time.time():.3f} somebody-elses-token\n", encoding="ascii")
+    started = time.monotonic()
+    with pytest.raises(chain.LedgerChainError, match="被其他进程占用"):
+        with chain.file_lock(target, timeout=0.3):
+            pass
+    assert time.monotonic() - started < 5
 
 
 def test_a_lockfile_with_a_future_mtime_is_treated_as_stale(tmp_path):
@@ -1417,6 +1653,7 @@ def test_event_layer_cannot_judge_vacuum_into_on_an_open_connection(tmp_path):
     con.close()
 
 
+@requires_trading_stack
 def test_run_child_opens_the_vnpy_database_before_the_window_and_registers_nothing():
     """行为测试(**新进程里**跑——peewee 的库对象是进程级单例,同进程里别的用例建过连接会让"先建连接"无从区分):
     回测入口在窗口之前建好 vnpy 数据库连接;窗口里 peewee 读库复用它(无新 connect 事件、无拒绝)。
@@ -1456,6 +1693,7 @@ def test_run_child_opens_the_vnpy_database_before_the_window_and_registers_nothi
     assert seen.get("active") is True and seen.get("bars") == 0 and seen.get("denials") == [], (seen, proc.stdout[-600:])
 
 
+@requires_trading_stack
 def test_the_candidate_cannot_obtain_the_database_handle_through_any_reexport():
     """对象层只判**模块成员**,不判函数返回值/实例属性:所以活动句柄必须在"拿到函数/实例"这一步拒。"""
     import types
@@ -1479,6 +1717,7 @@ def test_the_candidate_cannot_obtain_the_database_handle_through_any_reexport():
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_production_path_candidate_cannot_vacuum_into_through_the_framework_database(repo, tmp_path, monkeypatch):
     """端到端(生产 import_candidate,静态筛查开):候选经 `get_database().db.execute_sql("VACUUM INTO …")`
     想在允许目录之外落盘——拿不到句柄,文件没出现。放行方向:同一候选里模板正常成员照常可用。"""
@@ -1517,6 +1756,7 @@ def test_production_path_candidate_cannot_vacuum_into_through_the_framework_data
     assert [x.__name__ for x in cls.OK] == ["ArrayManager", "BarGenerator"]       # 放行方向
 
 
+@requires_trading_stack
 def test_systematic_handle_scan_every_unblocked_handle_returning_member_is_reviewed():
     """第 38 轮的系统性扫描(可重复):白名单模块里"调用后返回活动句柄/引擎/连接"的公开函数、以及带 db/connection/cursor/execute*
     的模块级实例。判据与 `%TEMP%\\\\scan_handles.py` 同。**每个未被对象层挡住的命中必须出现在下面的已审查清单里**——
@@ -1577,6 +1817,7 @@ def test_systematic_handle_scan_every_unblocked_handle_returning_member_is_revie
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_backtest_reads_market_data_before_the_candidate_is_constructed(monkeypatch):
     """③ 回测入口:`engine.load_data()` 在 `add_strategy`(候选 `__init__` 在此跑)**之前**——
     与 gate/evaluate 入口"先取定行情、再让候选运行"同一模式。改回旧顺序 → 本用例变红。"""
@@ -1620,6 +1861,7 @@ def test_the_data_primitive_pattern_covers_read_and_write_primitives():
     # 规则只作用于**模块级**成员,模板方法不受影响(另有用例钉住这一点)。
 
 
+@requires_trading_stack
 def test_the_data_primitive_rule_applies_to_module_members_only_not_to_template_methods():
     """`CtaTemplate.load_bar` 是**类成员**(模板自己的方法),不受这条规则约束——规则只管模块级成员。
     模板方法被拦会误伤正常候选(它们本来就在继承 CtaTemplate)。"""
@@ -1630,6 +1872,7 @@ def test_the_data_primitive_rule_applies_to_module_members_only_not_to_template_
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_library_read_primitives_are_refused_by_name_and_the_rule_is_named():
     """`vnpy_ctastrategy.backtesting.load_bar_data` 能读任意区间(含测试段);按模式收口,断言规则名。"""
     import vnpy_ctastrategy.backtesting as bt
@@ -1640,6 +1883,7 @@ def test_library_read_primitives_are_refused_by_name_and_the_rule_is_named():
     rs._PROXY_CACHE.clear()
 
 
+@requires_trading_stack
 def test_the_candidate_cannot_read_the_database_through_any_reexport(repo, tmp_path, monkeypatch):
     """生产入口:候选拿不到任何库读原语(`load_bar_data` 的再导出 + `get_database`)。断言规则名。"""
     source = """
@@ -1679,6 +1923,7 @@ def test_the_candidate_cannot_read_the_database_through_any_reexport(repo, tmp_p
     assert [x.__name__ for x in cls.OK] == ["ArrayManager", "BarGenerator", "round_to", "BarData"]
 
 
+@requires_trading_stack
 def test_the_candidate_cannot_read_test_segment_bars_through_the_database(tmp_path):
     """回测路径:候选在窗口内拿不到库读原语(对象层按模式收口),也建不了允许目录外的库。"""
     import sqlite3
@@ -1759,3 +2004,601 @@ def test_the_systematic_scan_also_covers_data_read_primitives():
                 pass
     assert leaked == [], f"白名单模块里还有未收口的数据读写原语: {leaked}"
     rs._PROXY_CACHE.clear()
+# ======================================================================
+# 第 40 轮:前向引用求值一族(把真内建递给候选)
+#
+# 根因(生产入口 `import_candidate` 实测,不是推理):
+#   `typing.ForwardRef` 存着候选给的**字符串注解**。一旦有人调
+#   `fr._evaluate({}, None, recursive_guard=set())`,`eval` 就在**空的 globalns** 里跑——
+#   CPython 会把**真内建**注入那个空字典,于是真 `__import__` → 真 `os` → 真环境变量。
+#   实测把真 `PATH` 的值读了出来,并经异常消息带了出来。
+#
+# 这一族**静态层看不见载荷**:它藏在字符串字面量里(`"__import__('os').environ['PATH']"`)。
+# 静态层能做的只有"候选必须写出 `_evaluate`/`_eval_type` 才能调它"
+# (getattr / type / __dict__ / __getattribute__ 一律已被禁),所以按名字拒。
+# 事件层是第二道:按"谁触发的这次 exec"判(帧表实测,见 `FORBIDDEN_EVAL_FRAMES`)。
+# 对象层是第三道:`typing.get_type_hints` 这类"按名求值的执行器"早已拒。
+#
+# 双向:每条用例都断言**是哪条规则**拒的(第 22 轮教训:规则失灵时用例照样绿),
+# 并且都有对应的放行方向(正常 typing 用法、库自己 eval 自己生成的代码必须照旧跑通)。
+# ======================================================================
+
+# 载荷刻意放进字符串字面量:静态层看不见它,只有运行期才暴露。
+# 读的是**本次用例自己设的环境变量**:断言"这个标记一个字都没漏出去"是确定性的,
+# 不用去比对 PATH(太长,截断后就看不出来,断言会失真——第 40 轮自查时踩过)。
+_MARKER_ENV = "BISHENG_ROUND40_MARKER"
+_PAYLOAD = f"__import__('os').environ[{_MARKER_ENV!r}]"
+_MARKER_VALUE = "BISHENG-ROUND40-MARKER-8f3a1c"
+
+
+@pytest.fixture()
+def marker_env(monkeypatch):
+    """本节用例的载荷读的是这个环境变量:统一设好——
+    免得某个用例"恰好"因为变量没设而看起来没泄漏(假绿)。"""
+    monkeypatch.setenv(_MARKER_ENV, _MARKER_VALUE)
+    return _MARKER_VALUE
+
+
+@requires_trading_stack
+def test_forward_ref_evaluate_is_denied_by_the_audit_hook(repo, tmp_path, monkeypatch, marker_env):
+    """拦截方向:候选调 `ForwardRef._evaluate` 求值自己给的字符串 → 事件层拒,规则名 `audit:forward-ref-eval`。"""
+    source = f"""
+        import typing
+        RESULT = {{}}
+        try:
+            fr = typing.ForwardRef({_PAYLOAD!r})
+            fr._evaluate({{}}, None, recursive_guard=set())
+            RESULT["leaked"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "leaked" not in cls.RESULT, "候选求值成功了——真内建已经递到它手上"
+    assert "audit:forward-ref-eval" in cls.RESULT["err"], cls.RESULT
+    assert ("audit:forward-ref-eval", "exec") in rs.window_denials(), rs.window_denials()
+
+
+@requires_trading_stack
+def test_the_optional_get_args_route_cannot_reach_the_evaluator(repo, tmp_path, monkeypatch, marker_env):
+    """同一条路换个入口:不必出现 `ForwardRef` 这个名字(`Optional["…"]` → `get_args` 也能拿到实例)照样拒。"""
+    source = f"""
+        import typing
+        RESULT = {{}}
+        try:
+            fr = typing.get_args(typing.Optional[{_PAYLOAD!r}])[0]
+            fr._evaluate({{}}, None, recursive_guard=set())
+            RESULT["leaked"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "leaked" not in cls.RESULT, cls.RESULT
+    assert "audit:forward-ref-eval" in cls.RESULT["err"], cls.RESULT
+
+
+@requires_trading_stack
+def test_the_candidate_cannot_read_the_process_environment(repo, tmp_path, monkeypatch, marker_env):
+    """端到端:这条向量修好之后,候选读不到**真环境变量**——标记值一个字都不许漏出去。"""
+    marker = marker_env
+    source = f"""
+        import typing
+        RESULT = {{}}
+        try:
+            fr = typing.ForwardRef({_PAYLOAD!r})
+            fr._evaluate({{}}, None, recursive_guard=set())
+            RESULT["leaked"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)[:200]
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    blob = str(cls.RESULT)
+    assert "leaked" not in cls.RESULT, blob
+    assert marker not in blob, f"真环境变量的值漏进了候选的输出: {blob[:200]}"
+
+
+def test_forward_ref_evaluate_is_refused_by_the_static_screen(repo, tmp_path, monkeypatch):
+    """静态层:候选必须写出这两个名字才能调它,所以在筛查阶段就拒(口径与运行期一致)。"""
+    cases = (
+        (f'import typing\nfr = typing.ForwardRef({_PAYLOAD!r})\nfr._evaluate({{}}, None, recursive_guard=set())\n',
+         "禁止访问 _evaluate"),
+        ('import typing\nfr = typing.ForwardRef("int")\ntyping._eval_type(fr, {}, None)\n',
+         "禁止访问 _eval_type"),
+    )
+    for snippet, needle in cases:
+        source = snippet + "from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    pass\n"
+        with pytest.raises(api.JobError) as info:
+            run_candidate(tmp_path, monkeypatch, source, static=True)
+        assert needle in info.value.message, info.value.message
+
+
+@requires_trading_stack
+def test_typing_eval_type_is_refused_by_the_module_proxy_at_runtime(repo, tmp_path, monkeypatch, marker_env):
+    """运行期的名字层:`typing._eval_type` 是下划线私有名,模块代理取不到(与静态层口径一致)。"""
+    source = f"""
+        import typing
+        RESULT = {{}}
+        try:
+            typing._eval_type(typing.ForwardRef({_PAYLOAD!r}), {{}}, None)
+            RESULT["leaked"] = True
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "leaked" not in cls.RESULT, cls.RESULT
+    assert "_eval_type" in cls.RESULT["err"], cls.RESULT
+
+
+@requires_trading_stack
+def test_legitimate_typing_usage_still_works(repo, tmp_path, monkeypatch):
+    """放行方向:正常 typing 用法不受影响(事件层只拦"替候选求值候选给的字符串"的那种 exec)。"""
+    source = """
+        import typing
+        import collections
+        import enum
+        RESULT = {}
+        RESULT["optional"] = str(typing.Optional["int"])
+        RESULT["get_args"] = str(typing.get_args(typing.Optional[int]))
+        RESULT["forward_ref"] = str(typing.ForwardRef("int"))
+        RESULT["namedtuple_typing"] = typing.NamedTuple("P", [("a", int)])(1).a
+        RESULT["namedtuple_std"] = collections.namedtuple("Q", ["b"])(2).b
+        RESULT["enum"] = enum.Enum("E", ["A", "B"]).A.value
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "Optional[ForwardRef('int')]" in cls.RESULT["optional"], cls.RESULT
+    assert cls.RESULT["get_args"] == "(<class 'int'>, <class 'NoneType'>)", cls.RESULT
+    assert cls.RESULT["forward_ref"] == "ForwardRef('int')", cls.RESULT
+    assert cls.RESULT["namedtuple_typing"] == 1 and cls.RESULT["namedtuple_std"] == 2, cls.RESULT
+    assert cls.RESULT["enum"] == 1, cls.RESULT
+    assert rs.window_denials() == (), rs.window_denials()
+
+
+@requires_trading_stack
+def test_the_library_still_evaluates_its_own_generated_code(repo, tmp_path, monkeypatch):
+    """反向对照:库自己 eval **自己生成**的代码(namedtuple/dataclass)必须照旧跑通——
+    事件层的判据若太宽,会把正常候选整片拒掉。"""
+    source = """
+        import collections
+        import dataclasses
+        RESULT = {}
+        RESULT["nt"] = collections.namedtuple("P", ["a"])(1).a
+        RESULT["dc"] = dataclasses.make_dataclass("C", [("a", int)])(1).a
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert cls.RESULT["nt"] == 1 and cls.RESULT["dc"] == 1, cls.RESULT
+    assert rs.window_denials() == (), rs.window_denials()
+
+
+def test_the_string_module_is_refused_even_when_the_config_adds_it_to_the_allowlist(repo, tmp_path, monkeypatch):
+    """`string` 的 `Formatter.get_field` 能顺着"属性名"摸到真内建 → 真框架模块 → 关掉审计钩子。
+    配置把它追加进白名单也不能放行(黑名单先判)。"""
+    safe = rs.safe_builtins((), ("string",))
+    with pytest.raises(ImportError):
+        safe["__import__"]("string")
+    source = """
+        import string
+        RESULT = {"r": "放行了"}
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    with pytest.raises(api.CandidateError) as info:
+        run_candidate(tmp_path, monkeypatch, source, allowed=("numpy", "pandas", "string"))
+    assert "string" in info.value.detail["message"], info.value.detail
+
+
+def test_vnpy_alpha_is_refused_by_the_static_screen(repo, tmp_path, monkeypatch):
+    """`vnpy.alpha` 里有一处拿调用方给的表达式去 eval 的代码(潜伏风险):静态层按**全名**禁。"""
+    findings = rs.screen_source("import vnpy.alpha\n")
+    assert any("禁止导入 vnpy.alpha" in f for f in findings), findings
+    source = """
+        import vnpy.alpha
+        RESULT = {"r": "放行了"}
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    with pytest.raises(api.JobError) as info:
+        run_candidate(tmp_path, monkeypatch, source, static=True)
+    assert "禁止导入 vnpy.alpha" in info.value.message, info.value.message
+
+
+@requires_trading_stack
+def test_get_type_hints_is_refused_with_its_rule_name(repo, tmp_path, monkeypatch):
+    """对象层:`typing.get_type_hints` 按名求值候选给的表达式 → 规则名 `按名求值的执行器`。"""
+    source = """
+        import typing
+        RESULT = {}
+        try:
+            RESULT["r"] = str(typing.get_type_hints(dict))
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "按名求值的执行器" in cls.RESULT["err"], cls.RESULT
+    assert "get_type_hints" in cls.RESULT["err"], cls.RESULT
+
+
+def test_the_forbidden_eval_frames_are_registered_in_the_constitution_guard():
+    """新增的求值帧名单必须登记进历史守卫:没登记 = 没人守(第 25 轮 codex 实测过)。"""
+    guard = (ROOT / "tools" / "check_constitution_history.py").read_text(encoding="utf-8")
+    assert "FORBIDDEN_EVAL_FRAMES" in guard, "求值帧名单没有登记进宪法历史守卫"
+    assert "typing.ForwardRef._evaluate" in rs.FORBIDDEN_EVAL_FRAMES, rs.FORBIDDEN_EVAL_FRAMES
+
+
+# ======================================================================
+# 第 43 轮(codex 第二轮的 4 条 must-close + 几条便宜的补强)
+# ======================================================================
+
+# ---------- H2:账本被删了行,重置不许悄悄把 N 变小 ----------
+
+def _trials_ledger(tmp_path, counts=(1, 2, 3)):
+    path = tmp_path / "data" / "research" / "trials.jsonl"
+    for index, count in enumerate(counts):
+        tl.record_trials(path, "submission", count, at=float(index))
+    return path
+
+
+def _truncate_to_first_row(path):
+    """把账本截到只剩第一行(链仍然自洽——这是最阴的一种删法)。"""
+    rows = path.read_text(encoding="utf-8").splitlines()
+    path.write_text(rows[0] + "\n", encoding="utf-8")
+
+
+def test_a_truncated_ledger_cannot_be_reset_into_a_silently_smaller_n(tmp_path):
+    """删行后重置必须**先说清楚丢了多少次**,不许悄悄把 N 变小(第 43 轮,codex 的 H2)。
+
+    此前(第 40 轮)的"防变小"基准是"文件当前自称的累计次数"——行被删了,基准也跟着变小,
+    于是 60 → 10 这种缩小**完全检不出来**,而且重置记录还会把 before/after 都写成 10,
+    把丢失**洗白**。现在基准含**锚点记着的累计次数**,丢行 ⇒ 基准不变 ⇒ 必须显式确认。"""
+    path = _trials_ledger(tmp_path, counts=(10, 20, 30))
+    assert tl.total_trials(path) == 60
+    _truncate_to_first_row(path)
+
+    with pytest.raises(admin.AdminError) as info:
+        admin.reset_trials(path, reason="测试")
+    message = str(info.value)
+    assert "被删掉" in message, message
+    assert "50" in message, message              # 丢的是 20+30 = 50 次(锚点可证,精确)
+    # 账本没被动过(拒绝发生在写之前)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_the_lost_trials_can_be_restored_by_adding_them_back(tmp_path):
+    """丢失的次数**精确**可算(锚点带累计次数),所以补记也是精确的:补齐后 N 不变小。"""
+    path = _trials_ledger(tmp_path, counts=(10, 20, 30))
+    _truncate_to_first_row(path)
+
+    result = admin.reset_trials(path, add_trials=50, reason="测试:补记被删的行")
+
+    assert result["total"] == 60, result
+    assert result["before"] == 60, result
+    assert result["lost"] == 50, result
+    # 重置记录里也记着丢了多少(可审计)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reset_rows = [r for r in rows if r.get("kind") == tl.RESET_KIND]
+    assert reset_rows and reset_rows[-1]["lost"] == 50, rows
+    assert reset_rows[-1]["before"] == 60 and reset_rows[-1]["after"] == 60, rows
+
+
+def test_an_explicitly_allowed_reduction_is_still_recorded_honestly(tmp_path):
+    """即便人工显式允许变小,重置记录里的 before 也必须是**锚点可证的 60**,不是"当前文件的 10"。
+
+    否则 before==after==10,审计轨迹上"什么都没丢"——把丢失洗白(第 43 轮,codex 的 H2)。"""
+    path = _trials_ledger(tmp_path, counts=(10, 20, 30))
+    _truncate_to_first_row(path)
+
+    result = admin.reset_trials(path, allow_reduce_n=True, reason="测试:接受变小")
+
+    assert result["before"] == 60, result
+    assert result["total"] == 10, result
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reset_rows = [r for r in rows if r.get("kind") == tl.RESET_KIND]
+    assert reset_rows[-1]["before"] == 60 and reset_rows[-1]["after"] == 10, rows
+    assert reset_rows[-1]["lost"] == 50, rows
+
+
+def test_a_ledger_whose_anchor_total_does_not_match_is_refused(tmp_path):
+    """锚点记的累计次数与账本对不上 ⇒ fail-closed(第 43 轮)。
+
+    锚点是**账本之外的**信任根:它记的累计次数必须与账本前 N 条的合计一致,
+    否则说明账本被换过/删过行。"""
+    path = _trials_ledger(tmp_path, counts=(1, 2, 3))
+    anchor = chain.anchor_path_for(path)
+    seq, head, _total = chain.read_anchor(anchor)
+    anchor.write_text(f"{seq} {head} 99\n", encoding="ascii")
+
+    with pytest.raises(tl.TrialLedgerError) as info:
+        tl.total_trials(path)
+    assert "累计次数与锚点对不上" in str(info.value), str(info.value)
+
+
+# ---------- H3:"按名求值的执行器"按**值的来源**判,再导出也逃不掉 ----------
+
+def test_the_evaluator_rule_catches_a_reexported_get_type_hints():
+    """`typing_extensions.get_type_hints` 与 `typing.get_type_hints` 是**同一个函数对象**。
+
+    按**访问路径**判会漏它("typing_extensions.get_type_hints" 不在名单里);
+    此前它只是因为"typing_extensions 本身被导入门挡住"才没出事——那是**别的规则**兜着。
+    现在按**值的来源**判(`typing.get_type_hints`),再导出也拒(第 43 轮,codex 的 H3)。"""
+    import typing
+    import typing_extensions
+
+    assert typing_extensions.get_type_hints is typing.get_type_hints
+    view = rs._view_for(typing_extensions)
+    with pytest.raises(AttributeError) as info:
+        rs._check_object_rules(view, "get_type_hints", typing_extensions.get_type_hints)
+    assert "按名求值的执行器" in str(info.value), str(info.value)
+
+
+def test_a_harmless_typing_member_is_still_reachable():
+    """**放行侧**:这条规则不该把无害成员一起打死(`typing.get_args` 只读类型参数)。"""
+    import typing
+
+    view = rs._view_for(typing)
+    rs._check_object_rules(view, "get_args", typing.get_args)     # 不抛 = 放行
+
+
+# ---------- M2:持有者还活着就**不抢**它的锁 ----------
+
+def test_a_live_holders_lock_is_not_stolen_even_when_it_is_old(tmp_path):
+    """持有者进程**还活着** ⇒ 锁不是陈旧的,哪怕它的年龄已经超过 `stale_seconds`。
+
+    此前是"年龄到了就抢":持有者只是写得慢一点也会被抢走锁,于是"批准与重置并发"
+    照样能静默丢记录(第 43 轮,codex 的 M2)。"""
+    target = tmp_path / "old.jsonl"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    lock = target.with_name(target.name + ".chainlock")
+    lock.write_text(f"{proc.pid} {time.time():.3f} foreign-token\n", encoding="ascii")
+    old = time.time() - 3600                       # 一小时前"创建"的锁
+    os.utime(lock, (old, old))
+    try:
+        started = time.monotonic()
+        with pytest.raises(chain.LedgerChainError) as info:
+            with chain.file_lock(target, timeout=0.5):
+                pass
+        assert "被其他进程占用" in str(info.value), str(info.value)
+        assert time.monotonic() - started < 5
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def test_both_callers_of_the_approvals_lock_use_the_same_staleness_limit():
+    """同一把 `approvals.json.chainlock`,两个调用方必须用**同一个**陈旧口径。
+
+    此前批准路径 60 秒、账本维护入口 30 秒 ⇒ 维护入口能按自己的口径抢走批准路径的活锁
+    (第 43 轮,codex 的 M2)。"""
+    assert rs.LOCK_STALE_SECONDS == chain.DEFAULT_STALE_SECONDS, (
+        rs.LOCK_STALE_SECONDS, chain.DEFAULT_STALE_SECONDS)
+
+
+# ---------- M3:锁失败的对外说法按情形分 ----------
+
+def test_the_reentrancy_message_does_not_say_another_process_holds_the_lock(tmp_path):
+    """重入 ≠ "被其他进程占用"(第 43 轮,codex 的 M3)。"""
+    target = tmp_path / "approvals.json"
+    with rs._approvals_lock(target):
+        with pytest.raises(rs.SandboxError) as info:
+            with rs._approvals_lock(target):
+                pass
+    message = str(info.value)
+    assert "本进程同一线程" in message, message
+    assert "被其他进程占用" not in message, message
+
+
+def test_the_occupancy_message_says_it_is_transient(tmp_path):
+    """暂态占用要说清"该等/该重试",并给出持有者与已等待时长(第 43 轮,codex 的 M3)。"""
+    target = tmp_path / "approvals.json"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    lock = target.with_name(target.name + ".chainlock")
+    lock.write_text(f"{proc.pid} {time.time():.3f} foreign-token\n", encoding="ascii")
+    try:
+        with pytest.raises(rs.SandboxError) as info:
+            with rs._approvals_lock(target, timeout=0.5):
+                pass
+        message = str(info.value)
+        assert "被其他进程占用" in message, message
+        assert "请稍后重试" in message, message
+        assert str(proc.pid) in message, message
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+# ---------- M1:取不到触发帧 ⇒ fail-closed ----------
+
+def test_an_exec_whose_trigger_frame_cannot_be_read_is_refused(monkeypatch):
+    """**查不了 = 没查** ⇒ 拒(第 43 轮,codex 的 M1)。
+
+    此前是 fail-open:只有 `co_filename == "<string>"` 才拒,于是"来自真实文件"的代码
+    (取不到帧时最可能的情形)被放行。"""
+    assert rs._audit_frame_is_forbidden_eval(None, None) is True
+
+    def _no_frame(depth=0):
+        raise ValueError("no frame")
+
+    monkeypatch.setattr(rs.sys, "_getframe", _no_frame)
+    with rs.candidate_window():
+        with pytest.raises(rs.AuditDenied) as info:
+            rs._audit_hook("exec", (compile("1+1", "<string>", "eval"),))
+    assert "audit:eval-origin-unknown" in str(info.value), str(info.value)
+
+
+# ---------- L2:`vnpy.alpha` 的**运行期**导入门也要有用例 ----------
+
+@requires_trading_stack
+def test_vnpy_alpha_is_refused_by_the_runtime_import_gate(repo, tmp_path, monkeypatch):
+    """静态层拦 `vnpy.alpha` 之外,**运行期导入门**也拦(第 43 轮,codex 的 L2)。
+
+    静态层被绕过时(比如源码是拼出来的),这一层才是关键;此前只有静态层有用例。"""
+    source = """
+        RESULT = {}
+        try:
+            import vnpy.alpha
+            RESULT["r"] = "放行了"
+        except Exception as exc:
+            RESULT["err"] = str(exc)
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source)
+    assert "禁止导入 vnpy.alpha" in cls.RESULT.get("err", ""), cls.RESULT
+    assert "按全名禁用" in cls.RESULT.get("err", ""), cls.RESULT
+
+
+# ---------- L5:白名单模块的公开成员不该被"按来源不可达"整片打死 ----------
+
+def test_the_whitelisted_libraries_keep_their_ordinary_members_reachable(monkeypatch):
+    """白名单模块(numpy/pandas)的**公开成员**基本都该拿得到(第 43 轮,codex 的 L5)。
+
+    `_OBJECT_ORIGIN_ROOTS` 是**派生**出来的来源根集合(危险模块名 ∪ 不可达来源),
+    口径一改就可能把白名单模块的正常成员**整片**打死——而那不会报错,只表现为
+    "候选突然用不了 numpy.array"。所以这里做一次**扫描式回归**:
+    实测(2026-11-14,numpy/pandas 放行时)被拒的公开成员只有 3 个,
+    全是本来就该拒的(numpy.ctypeslib / numpy.f2py / pandas.errors —— 它们把
+    ctypes/subprocess 递出来)。这里把"被拒的公开成员数量"钉住,整片打死会立刻红。"""
+    import numpy
+    import pandas
+
+    monkeypatch.setattr(rs, "_ACTIVE_ALLOWED_ROOTS",
+                        [tuple(set(rs.ALLOWED_MODULE_ROOTS) | {"numpy", "pandas"})])
+    blocked: dict[str, list[str]] = {}
+    for module in (numpy, pandas):
+        view = rs._view_for(module)
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(module, name)
+            except Exception:                       # noqa: BLE001 - 拿不到就跳过
+                continue
+            try:
+                rs._check_object_rules(view, name, value)
+            except AttributeError as exc:
+                rule = str(exc).split("(规则:")[-1].rstrip(")")
+                blocked.setdefault(f"{module.__name__}:{rule}", []).append(name)
+
+    total_blocked = sum(len(names) for names in blocked.values())
+    assert total_blocked <= 10, f"白名单模块的公开成员被拒得太多了(可能整片打死):{blocked}"
+    # 常见的核心成员必须拿得到
+    for module, name in ((numpy, "array"), (numpy, "mean"), (pandas, "DataFrame"),
+                         (pandas, "Series"), (pandas, "concat")):
+        rs._check_object_rules(rs._view_for(module), name, getattr(module, name))
+
+
+# ---------- 第 45 轮:维护入口的锁错误不许把"链坏了"说成"被其他进程占用" ----------
+
+def test_an_error_inside_the_admin_lock_is_not_reported_as_occupancy(tmp_path):
+    """临界区**内部**失败 ≠ "被其他进程占用"(第 45 轮)。
+
+    `risk/ledger_admin._ledger_lock` 此前把**整个临界区**圈在 `try` 里,
+    于是临界区里抛的 `LedgerChainError`(reason="chain",如锚点写失败)被翻译成
+    "账本被其他进程占用"——**那句话是错的**:
+    被占用 ⇒ 该稍后重试;链坏了 ⇒ 重试没用,得人工处理。
+    这与第 42 轮在 `scripts/research_sandbox._approvals_lock` 修掉的是同一个问题,
+    那一边改了,这一边漏了。
+
+    钉住两件事:①异常**类型**不变(仍原样抛 `LedgerChainError`,不吞);
+    ②消息里**不许**出现"被其他进程占用"。"""
+    path = _trials_ledger(tmp_path, counts=(1,))
+    original = chain.write_anchor
+
+    def broken_write_anchor(*args, **kwargs):
+        raise chain.LedgerChainError("锚点写失败(fail-closed): 磁盘满了", reason="chain")
+
+    chain.write_anchor = broken_write_anchor
+    try:
+        with pytest.raises(chain.LedgerChainError) as info:
+            admin.reset_trials(path, reason="第 45 轮用例")
+    finally:
+        chain.write_anchor = original
+    message = str(info.value)
+    assert "被其他进程占用" not in message, message
+    assert "磁盘满了" in message, message
+
+
+def test_the_admin_lock_occupancy_message_says_it_is_transient(tmp_path):
+    """暂态占用要说清"该重试",并把占用与其它失败**分开说**(第 45 轮)。
+
+    此前 `occupancy` 与 `chain`/`generic` 共用兜底分支,兜底说的是"被其他进程占用",
+    于是 reason="chain" 也被说成"被其他进程占用"。现在 `occupancy` 单独说。"""
+    message = admin._ledger_lock_message(
+        "trials.jsonl", chain.LedgerChainError("账本被其他进程占用", reason="occupancy"))
+    assert "被其他进程占用" in message, message
+    assert "请稍后重试" in message, message
+
+    other = admin._ledger_lock_message(
+        "trials.jsonl", chain.LedgerChainError("链坏了", reason="chain"))
+    assert "被其他进程占用" not in other, other
+    assert "reason=chain" in other, other
+
+
+def test_the_sandbox_lock_occupancy_message_says_it_is_transient(tmp_path):
+    """沙盒侧同一件事:占用单独说,其它 reason 不许被说成占用(第 45 轮)。"""
+    message = rs._approvals_lock_message(
+        "approvals.json", chain.LedgerChainError("账本被其他进程占用", reason="occupancy"))
+    assert "被其他进程占用" in message, message
+    assert "请稍后重试" in message, message
+
+    other = rs._approvals_lock_message(
+        "approvals.json", chain.LedgerChainError("链坏了", reason="chain"))
+    assert "被其他进程占用" not in other, other
+    assert "reason=chain" in other, other
+
+
+def test_every_lock_caller_passes_the_staleness_limit_explicitly():
+    """**安全口径**(`stale_seconds`)必须三个调用方完全一致(第 45 轮)。
+
+    `stale_seconds` 决定"多久算残留锁、可以抢走"——它是**安全**参数:
+    同一把锁文件的不同调用方用不同口径,快的那个能按自己的口径把慢的那个的**活锁**
+    当成陈旧锁抢走(第 43 轮 codex 的 M2 就是这个)。所以它**不许**有策略差异。
+
+    与之相对,`timeout`(等不到就放弃) 是**调用方策略**:
+    人工维护入口失败即重试(5 秒),写入路径宁可多等(30 秒)。两者**故意不同**,
+    所以这条用例只钉住:①三个调用方用的 `stale_seconds` 完全一致;
+    ②每个调用方都**显式**传参,不靠 `file_lock` 的默认值——
+    默认值是"只有不传参的人才用"的暗口径(此前 `risk/trial_ledger` 就是不传的)。"""
+    assert admin.ADMIN_LOCK_TIMEOUT == 5.0, admin.ADMIN_LOCK_TIMEOUT
+    assert rs.APPROVALS_LOCK_TIMEOUT == 5.0, rs.APPROVALS_LOCK_TIMEOUT
+    assert tl.LOCK_TIMEOUT == chain.DEFAULT_LOCK_TIMEOUT, tl.LOCK_TIMEOUT
+    # 三个调用方用的**安全**口径必须是同一个值:
+    assert rs.LOCK_STALE_SECONDS == chain.DEFAULT_STALE_SECONDS
+    # 每个调用方都显式传了 stale_seconds(源码层面钉住,不留暗口径):
+    for path, needle in (
+            (ROOT / "risk" / "ledger_admin.py", "stale_seconds=chain.DEFAULT_STALE_SECONDS"),
+            (ROOT / "risk" / "trial_ledger.py", "stale_seconds=chain.DEFAULT_STALE_SECONDS"),
+            (ROOT / "scripts" / "research_sandbox.py", "stale_seconds=LOCK_STALE_SECONDS")):
+        source = path.read_text(encoding="utf-8")
+        assert needle in source, f"{path.name} 没有显式传 stale_seconds:{needle}"
