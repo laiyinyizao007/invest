@@ -67,6 +67,10 @@ def parse_args(argv: list[str] | None, env: Mapping[str, str]) -> argparse.Names
                         help="预热用的历史日线代码,如 CADJ.DCE(由 build_continuous.py --save 写入数据库)")
     parser.add_argument("--setting", default="{}", help='策略参数 JSON,如 \'{"fast_window":10,"slow_window":40}\'')
     parser.add_argument("--heartbeat", type=float, default=float(env.get("HEARTBEAT_SECONDS", "0") or 0))
+    parser.add_argument("--approved", default="", help="从批准目录装载策略:approved/ 里的文件名,如 my_candidate.py")
+    parser.add_argument("--approved-dir", default="", help="批准目录路径(默认:项目根下的 approved/)")
+    parser.add_argument("--approvals-file", default="", help="批准账本路径(默认:data/research-control/approvals.json)")
+    parser.add_argument("--approved-class", default="Candidate", help="批准文件里的类名(默认 Candidate)")
     parser.add_argument("--check", action="store_true", help="只校验配置与依赖,不连接、不交易")
     return parser.parse_args(argv)
 
@@ -131,6 +135,10 @@ def main(
         gateway_setting=gateway_setting,
         heartbeat_seconds=args.heartbeat,
         heartbeat_file=bootstrap.ROOT / "data" / "state" / "heartbeat",
+        approved_file=args.approved or None,
+        approved_dir=Path(args.approved_dir) if args.approved_dir else None,
+        approvals_file=Path(args.approvals_file) if args.approvals_file else None,
+        approved_strategy_class=args.approved_class,
     )
     if args.check:
         print(f"配置检查通过: 合约 {args.symbol},历史 {args.history or '(同合约)'},"

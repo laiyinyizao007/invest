@@ -6,6 +6,39 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **闭合沙盒状态机:`approved/` 目录 + 收菜动作 + 运行时装载 fail-closed**(Issue [#34](https://github.com/laiyinyizao007/invest/issues/34);
+  ADR `20261115-approved-sandbox-closure`)。**这轮补的是整条链上最要紧的一处断裂**:
+  阶段四的状态机「pending → 人工批准 → `approved/`(runtime 只认)」此前只落了前半段——
+  `approved/` 目录根本不存在,批准只往账本写一条记录,**没有任何下游消费它**。
+  于是批准过的代码与没批准的代码在运行时受到同样的对待,批准沦为流程仪式而不是授权。
+  - **收菜**(`scripts/research_collect.py`,**独立脚本**:网关 import `research_api`,但 import 不到收菜模块,
+    端点白名单里也没有它——外层只能请求批准,不能请求收菜、更不能自己批准):
+    四道校验缺一不可——① 源文件当前字节的 sha256 **必须在批准账本里**;② 人确认之后**再算一次** sha256
+    (防「批准后文件被换掉」的 TOCTOU);③ 写入 `approved/` 之后**复算**目标文件 sha256
+    (复制必须逐字节一致,不一致就删掉并拒绝);④ 目标路径固定 `approved/<原文件名>`,不接受任何路径参数。
+    写盘用「唯一临时名(pid + uuid)+ `os.replace` + Windows 重试」,与 `record_approval` 同款。
+    人的门槛与批准一致:交互式终端 + 粘贴**完整 64 位**哈希(敲 `y` 不算——任何程序都能喂一个 `y`)。
+  - **运行时装载**(`risk/approved_guard.py` + `trading/runtime.py`):装载时做四件事——
+    位置(必须在 `approved/` 内,解析后的父目录就是它)、授权(账本命中)、合规(宪法静态筛查 + 设置里不得夹带
+    受保护参数如 `risk_budget`)、同一性(哈希、筛查、编译、执行基于**同一份字节**;只读一次字节再编译执行,
+    `.pyc` 没有机会生效)。任何一项不过 → `EXIT_STARTUP_FAILED`(3)并告警,**绝不降级**到 `strategies/` 里的默认策略
+    (回退等于「装不上就换一个照样跑」,那批准就白批了)。装载点选在**连网关之前**:没过批准复核的策略不该登录 CTP。
+    `RuntimeConfig.approved_file` 等四项**全为 `None` 时行为与从前完全一致**。
+  - **批准账本共享只读模块**(`risk/approval_ledger.py`):研究侧写、运行侧读;写入口仍然唯一在
+    `research_sandbox.record_approval`,共享模块里**没有任何写入口**(AST 测试锁住)。
+    研究侧的读取改为委托,异常类型与文案**逐字不变**(既有调用点靠它识别拒绝)。
+  - **第四层跟着新执行入口走**:宪法历史守卫(`tools/check_constitution_history.py`)要求任何执行候选代码的入口
+    必须在**同一个函数体**里自己成对取快照并比对——`approved_guard` 因此在 `exec` 前后各拍一次受保护对象的身份指纹。
+    这条不是新规矩,是既有守卫**第一次拦住本 PR 的新代码**后按要求补齐的。
+  - **骨架契约独立单测**(`tests/test_strategy_skeleton_contract.py`):roadmap 要求「策略骨架模板由人维护、
+    有独立单测」——骨架事实上早已存在(宪法 template 指向它),缺的是这份独立单测。
+  - **断耦演练**(`scripts/decoupling_drill.py`,证据 `docs/decoupling-drill.md`):阶段四 4b 的退出条件之一。
+    三项全过:内层(`trading/`/`risk/`/`strategies/`)不 import 任何研究侧模块、外层容器环境里没有 `CTP_*`、
+    **外层停掉时内层照跑**(心跳继续刷新、策略仍在运行)。演练只停**自己起的一次性探针容器**,
+    不碰正在服务别人的网关容器。⚠️ **不连真 CTP**:证明的是「外层宕机不阻断内层」,不是实盘可用性。
+  - `approved/` **不入库**(未经审查的代码不进版本库);`docker-compose.yml` 挂载它与只读的批准账本。
+  - **如实记录的取舍**:宪法第三层(运行**途中**的实例级复检)在运行时装载里**没有**完整实现——
+    静态层已禁止候选引用 `guard`/`trail`/`cta_engine`,本轮只在**装载期**做了完整指纹比对;运行途中的持续核对留待评估。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

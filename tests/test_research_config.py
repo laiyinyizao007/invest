@@ -58,6 +58,9 @@ def test_partial_file_overrides_only_what_it_names(tmp_path):
     {"paths": {"pending_dir": "strategies"}},      # 不得指向正式策略目录
     {"paths": {"pending_dir": "approved"}},
     {"gateway": {"token_file": ".env"}},           # 不得借用交易 .env
+    {"paths": {"approved_dir": "elsewhere"}},       # 批准目录必须固定在项目根下的 approved/
+    {"paths": {"approved_dir": "data/approved"}},   # 同上:不得挪到别处
+    {"paths": {"approved_dir": "../approved"}},     # 同上:不得越出项目根
 ])
 def test_invalid_values_are_rejected(tmp_path, data):
     with pytest.raises(rc.ConfigError):
@@ -98,7 +101,9 @@ def test_resolved_paths_stay_inside_project_root(tmp_path):
     paths = rc.resolve_paths(cfg, tmp_path)
 
     assert all(tmp_path in p.parents for p in paths.values())
-    assert set(paths) == {"pending_dir", "results_dir", "approvals_file", "token_file"}
+    # approved_dir 是收菜的目标目录(运行时唯一认的目录);它固定在项目根下,不可配置到别处
+    assert set(paths) == {"pending_dir", "results_dir", "approvals_file", "token_file",
+                          "approved_dir"}
 
 
 def test_config_path_can_be_overridden_by_environment(tmp_path, monkeypatch):

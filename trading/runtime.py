@@ -34,6 +34,7 @@ from vnpy.trader.logger import ERROR
 from vnpy.trader.utility import get_file_path
 from vnpy_ctastrategy import CtaStrategyApp
 
+from risk import approved_guard
 from risk.positions import describe, signed_net, undirected
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
@@ -86,6 +87,15 @@ class RuntimeConfig:
     stale_cancel_open_orders: bool = True
     drift_tolerance_seconds: float = 15.0            # 策略持仓与账户持仓不一致持续超过该时间 → 视为漂移,告警并紧急平仓
     heartbeat_file: Path | None = None               # 运行中每 10 秒刷新一次,供容器健康检查判断进程是否真的在工作
+
+    # ---- 批准目录装载(阶段四 4c:approved/ 是运行时唯一认的目录)----
+    # 全部为 None 时行为与从前**完全一致**(仍从 strategies/ 装载受信骨架)。
+    # 一旦给了 approved_file,策略就从 approved/ 装载,且必须通过批准账本与宪法的复核,
+    # 否则拒绝启动(EXIT_STARTUP_FAILED)——**不回退**到默认策略。
+    approved_file: str | None = None                 # approved/ 里的文件名,如 "my_candidate.py"
+    approved_dir: Path | None = None                 # 批准目录;None 时取项目根下的 approved/
+    approvals_file: Path | None = None               # 批准账本;None 时取项目根下的 data/research-control/approvals.json
+    approved_strategy_class: str = "Candidate"       # 批准文件里的类名
 
     def __post_init__(self) -> None:
         # 等持仓回报稳定的时间设下限:配成 0 时,两次"未到回报的空快照"会被当成稳定而通过对账
@@ -217,6 +227,11 @@ class TradingRuntime:
         if problem:
             self.notify("FATAL", "启动失败", problem)
             return EXIT_STARTUP_FAILED
+        # 批准目录装载**先于**连网关:策略没过批准复核就不该登录 CTP、更不该下单。
+        problem = self._load_approved_strategy()
+        if problem:
+            self.notify("FATAL", "策略装载被拒,拒绝启动", problem)
+            return EXIT_STARTUP_FAILED
         self._t_connect = self._mono()
         try:
             self.main.connect(self.config.gateway_setting, self.config.gateway_name)
@@ -257,6 +272,37 @@ class TradingRuntime:
         if not snapshot:
             return "无任何里程碑"
         return ", ".join(f"{k}={v:.1f}s" for k, v in sorted(snapshot.items(), key=lambda kv: kv[1]))
+
+    def _load_approved_strategy(self) -> str | None:
+        """从 `approved/` 装载策略(配置了 approved_file 时)。
+
+        返回 None 表示成功(或本次没要求装载);返回一段说明表示**拒绝**。
+        拒绝的原因只有一种:这份代码凭什么有权被执行?答案必须是「人批准过这段字节」。
+        校验不过就拒绝启动,**绝不**回退到 `strategies/` 里的默认策略——
+        回退等于「装不上就换一个照样跑」,那批准就白批了。
+        """
+        cfg = self.config
+        if not cfg.approved_file:
+            return None
+        root = Path(__file__).resolve().parents[1]
+        approved_dir = Path(cfg.approved_dir) if cfg.approved_dir else root / "approved"
+        approvals_file = (Path(cfg.approvals_file) if cfg.approvals_file
+                          else root / "data" / "research-control" / "approvals.json")
+        try:
+            cls = approved_guard.load_approved_strategy(
+                approved_dir=approved_dir,
+                approvals_file=approvals_file,
+                file_name=cfg.approved_file,
+                class_name=cfg.approved_strategy_class,
+                setting=cfg.strategy_setting,
+            )
+        except approved_guard.ApprovedLoadError as exc:
+            return str(exc)
+        # 注册进 CTA 引擎的类表:键名沿用 strategy_class,引擎按名字取类
+        self.cta.classes[cfg.strategy_class] = cls
+        self.main.write_log(
+            f"已从批准目录装载策略: {cfg.approved_file} -> {cfg.strategy_class}", source="Runtime")
+        return None
 
     def _check_state_writable(self) -> str | None:
         """状态目录必须可写,否则风控状态(尤其是硬锁定)写不进磁盘,重启后会被"洗掉"。Docker 挂载卷默认属 root,容器内 uid 1000 写不进。"""

@@ -42,7 +42,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "gateway": {"host": "127.0.0.1", "port": 8765, "token_file": "data/research-control/gateway.token",
                 "rate_limit_per_minute": 30, "max_body_bytes": 131072},
     "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
-              "approvals_file": "data/research-control/approvals.json"},
+              "approvals_file": "data/research-control/approvals.json",
+              "approved_dir": "approved"},
     "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": [], "allowed_modules": []},
 }
 
@@ -73,6 +74,8 @@ RESERVED_FILES = {".env", ".env.simnow.bak"}
 CONTROL_DIR = ("data", "research-control")
 APPROVALS_FILE_NAME = "approvals.json"
 TOKEN_FILE_NAME = "gateway.token"
+# 批准目录:固定在项目根下的 `approved/`。收菜往这里写,运行时装载只从这里读。
+APPROVED_DIR_NAME = "approved"
 SAFE_NAME_PATTERNS_MUST_REJECT = ("../x.py", "a/b.py", "a\\b.py", ".py", "x.txt")
 
 
@@ -150,6 +153,13 @@ def _validate(cfg: dict) -> None:
     approvals = _relative_inside(cfg["paths"]["approvals_file"], "paths.approvals_file")
     if approvals.parts != CONTROL_DIR + (APPROVALS_FILE_NAME,):
         raise ConfigError(f"paths.approvals_file 必须固定为 {'/'.join(CONTROL_DIR)}/{APPROVALS_FILE_NAME}")
+    # 批准目录同样**固定**:它是「运行时唯一认的目录」,收菜往这里写、装载从这里读。
+    # 位置不能配——配了就有「把批准目录指到别处」的口子(比如指到 strategies/ 里,
+    # 于是候选目录与受信目录混为一谈)。它同时在 RESERVED_DIRS 里,所以不能走上面那条
+    # 「不得指向受保护目录」的通用检查(那条针对的是**可指向别处**的路径),改为结构约束。
+    approved = _relative_inside(cfg["paths"]["approved_dir"], "paths.approved_dir")
+    if approved.parts != (APPROVED_DIR_NAME,):
+        raise ConfigError(f"paths.approved_dir 必须固定为 {APPROVED_DIR_NAME}")
     token = _relative_inside(cfg["gateway"]["token_file"], "gateway.token_file")
     if token.name.lower() in reserved_files or token.parts[0].lower() in reserved_dirs:
         raise ConfigError("gateway.token_file 不得借用凭据文件或源码目录")
@@ -185,6 +195,7 @@ def resolve_paths(cfg: dict, root: Path) -> dict[str, Path]:
     out = {
         "pending_dir": cfg["paths"]["pending_dir"], "results_dir": cfg["paths"]["results_dir"],
         "approvals_file": cfg["paths"]["approvals_file"], "token_file": cfg["gateway"]["token_file"],
+        "approved_dir": cfg["paths"]["approved_dir"],
     }
     resolved = {}
     for key, rel in out.items():
