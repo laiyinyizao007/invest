@@ -5,6 +5,29 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+### Fixed（修复）
+- **导入守卫把仓库内 venv 的站点包当成「仓库内模块」误杀**(Issue [#47](https://github.com/laiyinyizao007/invest/issues/47),
+  新 ADR `20261115-import-guard-site-package-classification`)。`RepoImportGuard` 的 docstring 写了三条规则,
+  其中第三条是「在仓库根**之外**(标准库、站点包)→ 也必须『候选开始运行之前就存在』」,
+  而它的理由(第 24 轮 codex 记的)是「站点包在宿主机上通常可写,候选往里写一个辅助模块就能绕开仓库内的路径规则」。
+  **但第三条是按「物理上是否在仓库根之下」实现的**——本仓库的 venv 就在仓库根之内(`.venv/`),
+  于是站点包里的模块落进第一条被直接拒掉,第三条那条更宽松也更正确的规则**从来没被应用过**。
+  - 现象:在主 checkout 里用仓库自带 venv 跑研究侧测试,`tests/test_research_api.py` 有 **4 条红**
+    (候选侧报 `禁止导入仓库内模块 vnpy_ctastrategy:它不在允许的目录 ['strategies'] 内`——
+    `vnpy_ctastrategy` 是站点包,不是本仓库的代码)。**CI 永远看不到**:CI 现装依赖,
+    站点包在 checkout 之外,走的是第三条。
+  - 修法:判据改成「**这是不是本仓库自己的代码**」——新增 `site_package_roots()` 算出当前解释器的
+    站点包根,守卫构造时取一次;`_is_site_package()` + `_outside_repo()` 统一五处分类判定
+    (模块、祖先包、包位置、通配符)。
+  - **这是收窄分类,不是放宽防线**:站点包那一支本来就带「预先存在且此后没被改过」的检查,
+    修复只是让分类对得上 docstring;仓库自己的代码(`risk/`/`scripts/`/`trading/`/`strategies/`)
+    仍然落进「仓库之内 → 只许在允许目录里」那一支,一道检查都没松;
+    判不出站点包时退回原来的字面口径(fail-closed)。
+  - 验证:新增 `tests/test_import_guard_venv_site_packages.py`,**放行与拦截各配一条**
+    (仓库内站点包预先存在→放行;仓库自己的 `risk/evil`→仍拒;候选运行期间往站点包写的模块→仍拒)。
+    **同一份用例在修复前是红的**,红的理由正是那道误分类,不是「用例跑不起来」。
+    另在临时 checkout 里造出「站点包真的解析到 checkout 根之下」的布局实测:修复前 4 条红,修复后 98 全绿。
+
 ### Added（新增）
 - **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,

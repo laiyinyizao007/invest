@@ -1073,6 +1073,75 @@ def _floor_to_granularity(value_ns: int, granularity: int) -> int:
 # 受信目录的提交基准缓存:键 = (仓库根, 允许目录),值 = (仓库顶层, 已提交文件集合) 或 None(取不到)。
 
 
+def site_package_roots() -> tuple[Path, ...]:
+    """当前解释器的站点包根(site-packages / dist-packages)。
+
+    **为什么需要它**(Issue #47):仓库自带的 venv 常常就躺在仓库根之内
+    (本仓库是 `.venv/`),于是站点包里的模块**物理上**在仓库根之下。
+    若按字面判定「在仓库根之下 = 仓库内模块」,它们会落进「直接拒」那一支,
+    而 docstring 第三支(站点包:要求「候选开始运行之前就存在」)就永远用不上——
+    候选于是连 `vnpy_ctastrategy` 都 import 不了(本仓库主 checkout 里实测 4 条用例红)。
+
+    这**不是**放宽防线:站点包那一支本来就带「预先存在且此后没被改过」的检查
+    (第 24 轮 codex 的原始理由:站点包在宿主机上通常可写,候选往里写一个辅助模块
+    就能绕开仓库内的路径规则)。本函数只是让分类**对得上 docstring**,
+    不改变任何一道检查的松紧。
+
+    取值口径:标准库给的路径(sysconfig)+ site 模块的清单 + 按 sys.prefix 拼的兜底。
+    取不到就少一条根——**判不出站点包时仍走原来的「仓库内模块」那一支**(fail-closed)。
+    """
+    roots: list[Path] = []
+
+    def add(p: object) -> None:
+        if not p or not isinstance(p, (str, Path)):
+            return
+        try:
+            resolved = Path(p).resolve()
+        except OSError:
+            return
+        if resolved not in roots:
+            roots.append(resolved)
+
+    try:
+        import sysconfig
+
+        paths = sysconfig.get_paths()
+        for key in ("purelib", "platlib"):
+            add(paths.get(key))
+    except Exception:  # noqa: BLE001 —— 取不到就少一条根,判据退回到原来的口径
+        pass
+
+    try:
+        import site
+
+        getter = getattr(site, "getsitepackages", None)
+        if callable(getter):
+            for p in getter():
+                add(p)
+        user = getattr(site, "getusersitepackages", None)
+        if callable(user):
+            add(user())
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 兜底:按 sys.prefix 拼。dist-packages 是 Debian 系的名字。
+    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    prefixes = {getattr(sys, "prefix", None), getattr(sys, "base_prefix", None)}
+    for base in prefixes:
+        if not base:
+            continue
+        for rel in (
+            "Lib/site-packages",
+            "lib/site-packages",
+            f"lib/python{version}/site-packages",
+            f"lib/python{version}/dist-packages",
+            f"local/lib/python{version}/dist-packages",
+        ):
+            add(Path(base) / rel)
+
+    return tuple(roots)
+
+
 class RepoImportGuard:
     """按**路径**裁决候选能不能导入某个模块。
 
@@ -1089,6 +1158,9 @@ class RepoImportGuard:
                  verify_trusted_against_git: bool = True):
         self.repo_root = Path(repo_root).resolve()
         self.allowed_dirs = tuple(allowed_dirs)
+        # 站点包根(Issue #47):判「这个模块算不算仓库之外的第三方库」时要用。
+        # 取不到就是空元组 —— 那时分类退回到原来的字面口径(fail-closed)。
+        self.site_roots = site_package_roots()
         self.snapshot = dict(snapshot or {})
         self.started_at_ns = started_at_ns if started_at_ns is not None else time.time_ns()
         # 受信目录要不要与**仓库提交**核对(第 25 轮 codex 的 Critical 1)。
@@ -1154,6 +1226,29 @@ class RepoImportGuard:
                 return os.access(base, os.W_OK)
         return False
 
+    def _is_site_package(self, resolved: Path) -> bool:
+        """这个路径是不是**站点包**(第三方库)——哪怕它物理上落在仓库根之内。
+
+        本仓库的 venv 就在仓库根之内(`.venv/`),站点包里的模块物理上在仓库之下。
+        按字面判定会把它们当「仓库内模块」直接拒掉,docstring 第三支(站点包:
+        要求「候选开始运行之前就存在」)就永远用不上(Issue #47)。
+        """
+        for root in self.site_roots:
+            if resolved == root or root in resolved.parents:
+                return True
+        return False
+
+    def _outside_repo(self, resolved: Path) -> bool:
+        """这个路径算不算「仓库之外」。
+
+        仓库之外 = 物理上不在仓库根之下 **或** 它是站点包(第三方库)。
+        仓库自己的代码(`risk/`、`scripts/`、`trading/`、`strategies/` 等)
+        仍然落进「仓库之内 → 只许在允许目录里」那一支,一道检查都没松。
+        """
+        if self.repo_root != resolved and self.repo_root not in resolved.parents:
+            return True
+        return self._is_site_package(resolved)
+
     def _under_allowed_dir(self, resolved: Path) -> bool:
         for name in self.allowed_dirs:
             base = self.repo_root / name
@@ -1187,7 +1282,7 @@ class RepoImportGuard:
             # 等于给"从 zip 里执行模块"开了一个后门,与本文件其它地方的 fail-closed 纪律相反。
             return (f"禁止导入 {name}:无法确认来源文件的状态"
                     f"(查不了等于没查,fail-closed)")
-        if self.repo_root != resolved and self.repo_root not in resolved.parents:
+        if self._outside_repo(resolved):
             # 仓库之外(标准库/站点包):仍要求"候选开始运行之前就存在"。
             # 站点包在宿主机上通常可写,候选往里写一个辅助模块就能绕开仓库内的规则。
             reason = self._written_during_run(resolved)
@@ -1264,7 +1359,7 @@ class RepoImportGuard:
             except OSError:
                 return (f"禁止导入 {name}:祖先包 {pkg_name} 的来源文件无法确认"
                         f"(查不了等于没查,fail-closed)")
-            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+            if self._outside_repo(resolved):
                 # 仓库之外的祖先包(站点包):口径同仓库外那一支。
                 reason = self._written_during_run(resolved)
                 if reason:
@@ -1352,7 +1447,7 @@ class RepoImportGuard:
                 # "查不出来"被当成了"没问题"。与本文件其它地方的 fail-closed 口径相反。
                 return (f"禁止从 {name} 导入:无法确认包位置的状态"
                         f"(查不了等于没查,fail-closed)")
-            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+            if self._outside_repo(resolved):
                 continue                                        # 仓库之外(站点包)照旧放行
             if not self._under_allowed_dir(resolved):
                 return (f"禁止从 {name} 导入:包位置 {self._rel(resolved)} 不在允许的目录 "
@@ -1404,7 +1499,7 @@ class RepoImportGuard:
                 # "查不出来"被当成了"没问题",与同文件 `check_package` 的 fail-closed 口径相反。
                 return (f"禁止从 {name} 导入 *:无法确认包位置的状态"
                         f"(查不了等于没查,fail-closed)")
-            if self.repo_root != resolved and self.repo_root not in resolved.parents:
+            if self._outside_repo(resolved):
                 # 仓库之外(站点包):**同样**要过"运行之前就存在"这一关。
                 # 站点包在宿主机上通常可写,候选往里面写一个模块,
                 # 而包自己的 `__all__` 正好列着那个名字——通配符导入会由
