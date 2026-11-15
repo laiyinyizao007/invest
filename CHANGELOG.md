@@ -37,6 +37,103 @@
   - 工作量估计 **25~39 人天**(不含 G8 双轮复审;含复审按本仓库历史约 10~20 人天,合计 35~60 人天);
     每条边界配**放行 + 拦截双向动态探针**与变异验证。
   - 本次**只写方案文档,未改任何实现代码**;既有 ADR 的结论一条都没改。
+
+- **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
+  ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
+  却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
+  双轮 codex、文档原子提交),而它的产物**可以重跑、失败只影响结论、不动钱**。
+  本次新增仓库根 `CLAUDE.md`,按**后果域**分档,而不是按改动规模分档:
+  - **研究域**(只影响研究产物):跳过 P2 plan.md 与 plan-down、结构化确认块、6/6 清单、
+    Issue + worktree;G8 只省第二轮(第一轮照做);G1 降级为 CHANGELOG 记一笔;
+    G9 沿用最低 70%;G14 只登记越出研究域的部分。**ADR 记录与相关既有测试照做。**
+  - **执行域**(可能影响真实委托/持仓/资金、风控底线、实盘准入批准链、凭据或部署):
+    全局全套流程照旧,本文件不提供任何减法。
+  - 两档都**不适用**的规则(不论档位照做):G3 意图边界、G5 安全合规、G7 脱敏、G4 一致性、
+    G8「两轮都做」、G12 学习闭环、**代码内的全部实盘防线**(不改任何阈值)、CI 闸门。
+  - **判据由代码执行**(`tools/check_domain.py`,仅标准库):按路径清单把每个文件判成
+    研究域 / 不可降级 / 执行域,退出码 `0` 全研究域 / `1` 含执行域 / `2` 环境不可用
+    (fail-closed:判不了等于不放行)。**默认拒绝**:不在白名单里的一律执行域。
+  - **清单是实测出来的,不是拍脑袋写的**:`tools/verdict_graph.py` 用**函数级** AST 分析
+    算出每个文件「自己定义或直接调用了哪些判定点」(`check_gate` / `check_live_admission` /
+    `write_approval` / `record_approval` / `screen_source` / `check_instance_state` /
+    `check_class`)。实测推翻了直觉:名字带 research 的 `scripts/research_sandbox.py` 是
+    **批准账本的唯一写入者**;`risk/candidate_eval.py` **直接调 `check_gate`**;
+    `scripts/backtest_lib.py` 回测跑完**核对风控底线**;`scripts/research_api.py` /
+    `research_approval_server.py` / `research_gateway.py` 是批准与筛查链的入口。
+    另有**数据流**上的耦合 AST 看不见(`risk/dsr.py` / `risk/plateau.py` /
+    `risk/trial_ledger.py` 是门槛第 9/8 条的输入),靠人工清单兜住——**图找得到的归图,
+    图找不到的归清单**。
+  - **清单有动态探针盯着**(`tests/test_check_domain.py`,99 条):两道**全仓不变量**
+    ——①**调用关系**:任何自己定义或直接调用判定点的文件必须判为不可降级
+    (**含尚未入库的新文件**);②**数据流**:不调用判定点、但**值被喂进**判定点的模块
+    同样不可降级(实测例子:`research_api.py` 从 `walk_forward_optimizer` 取
+    `wf.DATA_FILE` / `wf.build_windows()`,改它 = 改门槛的评估窗口与数据)。
+    另有:研究白名单不得拥有判定点、生产 import 闭包不得与白名单相交、
+    以及**探针自身的准确性夹具**(既不漏报也不误报——误伤的探针等于没有探针)。
+  - **探针经变异验证**(十一种清单改动,每次都被抓住,条数由脚本实测):删 `trading/` 条目、
+    把 `risk/live_admission.py` / `risk/candidate_eval.py` / `research_sandbox.py` /
+    `backtest_lib.py` / `walk_forward_optimizer.py` / `research_grid.py` / `research_api.py`
+    移出不可降级、把 `scripts/optimize.py` 移出研究白名单、把整个 `scripts/` 放进研究**目录**白名单、
+    新建一个直接调 `check_gate` 的文件。变异验证是**可复算的脚本** `tools/check_mutations.py`
+    (复制仓库到临时目录、逐个施加变异、数 pytest 的 FAILED 行数);`--verify` 还会核对
+    ADR 表格里的数字。
+  - CI:`research-guard.yml` 的 ruff 清单与测试清单已纳入这四个新文件,
+    另加一步**分档器冒烟**(真实 CLI,`PYTHONIOENCODING=cp1252` + 退出码语义)与
+    **变异验证**——只有单元测试的话,CLI 那条路径与变异台架在 CI 上从没被跑过。
+  - **第 1 轮 codex 复核的处置**(2 High / 5 Medium / 6 Low,逐条独立复现后):
+    ①`walk_forward_optimizer.py` 曾被判研究域,但它提供门槛评估的窗口与数据文件
+    ——已移入不可降级,并**新增数据流探针**自动覆盖这一整类,不再依赖人手写断言;
+    ②`verdict_graph` 对 `from X import f as g` 后调 `g(...)` 的形态**漏报**——已修
+    (裸名字分支查别名表),并补了三种调用形态的夹具;
+    ③未跟踪**目录**里的文件不被扫描(`git status` 缺 `-uall`)——已改;
+    ④「生产闭包不相交」的模块解析器不认 `scripts/` 裸模块导入,`scripts/bootstrap.py`
+    漏在闭包外——已统一口径(闭包 17 → 18 项);
+    ⑤文档三处不实(条数、校验范围、点名了没有该调用的文件)——已订正;
+    ⑥分档判定在 CI 里没有机器强制点——已加冒烟关卡;
+    ⑦Windows cp1252 控制台上 CLI 直接崩(CLAUDE.md 文档的命令在主力开发环境不可用)
+    ——已加 stdout/stderr 重配,并补了非 UTF-8 控制台的回归用例。
+  - **第 2 轮 codex 复核的处置**(第 1 轮的 12 条经独立复现全部真修;本轮新发现
+    1 Critical / 3 Medium / 5 Low,同样逐条独立复现后处置):
+    ①**Critical:新加的 CI 冒烟关卡在两条触发路径上都会让 CI 永久变红**——
+    `pull_request` 事件下浅克隆没有 `origin/main` → `git diff` rc=128 → 分档器 exit 2;
+    push 到 main 时 base==HEAD、diff 为空 → 同样 exit 2。根因是「没有改动」与
+    「环境不可用」共用退出码 2。已改为:checkout 加 `fetch-depth: 0`;
+    `--diff` 成功但**改动集为空** → 打印说明并 **exit 0**,只有 git 读取失败才 exit 2。
+    ②数据流探针对 `from X import DATA_FILE` 这种**函数式 import** 漏报(只认模块别名)
+    ——已修,并补了三种 import 写形的夹具;
+    ③数据流探针**过度包含**(读一个跟门槛无关的 helper 也被算成门槛输入,
+    有把研究文件强制升级、**侵蚀研究档**的风险)——已收窄为排除「语句位置的
+    纯副作用调用」,provider 集合 25 → 24 且无关的 `research_console.py` 已不在其中;
+    ④ADR 变异表三行数字不可复现、一行**变异描述写反**——变异验证改为**可复算的脚本**
+    `tools/check_mutations.py`(复制仓库到临时目录、逐个施加变异、数 FAILED 行数),
+    ADR 表格按脚本实测重写,`--verify` 可核对;CI 里也加了这一步;
+    ⑤CLI 改吐 UTF-8 后,守护 CLI 契约的用例按 locale 解码 → stdout 变 None → **空跑通过**
+    ——已加 `encoding="utf-8"`,并断言 stdout 里确有「研究域」「不可降级」;
+    ⑥「文档条数必须是真的」那条断言按行且会误报第二个「N 条」——已收紧,
+    并补验「条数写错 / 条数被挪走 / 条数被删」三种情形都变红;
+    ⑦目录前缀的「拼写近似」检查对 8 个前缀里 6 个**不可达**——已换成**穷尽**判据
+    (要么是真实存在的目录、要么是 gitignore 的运行时目录,两者都不是即写错);
+    ⑧ADR 的 provider 清单写「10 个」却列了 11 个名字且含不在集合内的条目——已按实测重写。
+  - **第 4 轮 Sourcery 复核的处置**(2 条实质发现):
+    ①**fail-open 口子**:`python` 遇到未捕获异常时退出码是 **1**,而 1 在本工具的语义里
+    是「判为执行域」(**正常结果**)——于是「分档器自己崩了」与「分档器说这是执行域」
+    在 CI 眼里完全一样,崩了也照样放行。已改:CLI 入口把任何未预期异常归到 **2**
+    (环境不可用,fail-closed);CI 的冒烟关卡除退出码外还要求输出里有「总判定:」这一行。
+    语义自洽了:**退出码 1 = 我确实判出了执行域;退出码 2 = 我没能给出判断**。
+    ②「削弱型改动一律升档」只列了具体调用、没有总则——已改为先立总则
+    (少做一次检查 / 把「拒绝」改成「告警后继续」/ 阈值调松 / fail-open /
+    让不可能变可能),已知易踩处只作示例,并写明「拿不准 → 升档」。
+    另有三条 subprocess 安全告警经核为误报(实参全是本地常量、不经 shell),已在代码里写明。
+  - **合并到 main 之后才暴露的缺口**:#38 合并后 main 上的 Research Guard 直接变红
+    (PR 的 CI 是绿的)。根因:冒烟关卡要求输出里有「总判定:」这一行,但
+    **「没有改动」那一支没打印它**——而那一支正是 **push 到 main** 时走的
+    (base==HEAD、diff 为空)。PR 路径永远有改动,这条分支**从没被走到**。
+    本地推理说「push 到 main → exit 0」没错——**退出码对,输出形状不对**。
+    已修:那一支也打印「总判定: 无改动(无需分档)」,让每次成功运行都以结论行收尾;
+    并补了回归用例。**「合并前全绿」不等于「合并后全绿」**。
+  - **本决策不削弱任何一道代码内的防线,也不改它们的阈值**;它只减少改动的**审批成本**,
+    不减少缺陷的**检出能力**。
+
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:
