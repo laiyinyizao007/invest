@@ -31,6 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 —— **必须**:默认的浅克隆(fetch-depth: 1)在 `pull_request`
+          # 事件下只检出 `refs/pull/N/merge`,**没有 origin/main 这个引用**,
+          # 后面那步「按后果域分档」跑 `git diff origin/main...HEAD` 会 rc=128 →
+          # 分档器 fail-closed 退出 2 → **CI 永久变红**(codex 第 2 轮的 Critical-1)。
+          # 完整历史也让那一步能真的比对出改动。
+          # 与 constitution-guard.yml 同一条口径(它也需要完整历史)。
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -81,10 +89,14 @@ jobs:
             tools/bisheng/build_v3.py \
             tools/bisheng/bs.py \
             tools/check_constitution_history.py \
+            tools/check_domain.py \
+            tools/verdict_graph.py \
+            tools/check_mutations.py \
             dashboard/__init__.py \
             dashboard/safe.py \
             notify \
             risk \
+            tests/test_check_domain.py \
             tests/test_dashboard_app.py \
             tests/test_dashboard_collect_more.py \
             tests/test_constitution_round11.py \
@@ -151,12 +163,18 @@ jobs:
           # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
           python -m pytest -p no:cacheprovider -q tests/test_merge_main_sandbox_union.py
 
-      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
+      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置/分档器)
+
         run: |
           # `--continue-on-collection-errors`:某个文件在**收集阶段**报错时,pytest 会以退出码 4 结束,
           # 但**其余文件仍然要跑**(第 11 轮 codex 的 F9)。不加这个开关,一个文件坏掉就把这一整步的
           # 研究侧测试全废掉——闸门看上去配好了,实际没跑几个。
+          #
+          # test_check_domain.py 也在这里:分档器是**流程闸门**,它自己的清单一旦失准
+          # (把执行域文件误判成研究域),后面所有分档都会跟着错。它只依赖标准库 +
+          # git,不装交易环境也能跑(第 12 轮 codex 的教训:依赖声明与实际依赖必须一致)。
           python -m pytest -p no:cacheprovider --continue-on-collection-errors -q \
+            tests/test_check_domain.py \
             tests/test_research_config.py \
             tests/test_research_sandbox.py \
             tests/test_research_gateway.py \
@@ -165,3 +183,60 @@ jobs:
             tests/test_research_mcp.py \
             tests/test_research_gate.py \
             tests/test_research_grid.py
+
+      # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
+      #
+      # 为什么要有这一步:上面那一步只是**测**分档器(单元测试 + 探针),
+      # 但分档器作为 CLI 的那条路径——`--diff` 读 git、打印中文档位、
+      # 按退出码表态——**没有任何 CI 跑过**。而 CLAUDE.md 文档里给出的命令
+      # 正是这条路径(codex 的 M5:它在 Windows cp1252 控制台上直接崩,
+      # 退出码变成 1,与「判为执行域」无法区分)。
+      #
+      # 这一步跑的是**真实 CLI**:非 UTF-8 控制台下不得崩溃、退出码语义必须对得上。
+      #
+      # **退出码语义**(三条,互不重叠):
+      #   0 = 全部研究域,**或**本次没有改动;
+      #   1 = 含执行域文件(该走完整流程);
+      #   2 = 环境不可用(fail-closed)——**只有这一种**该让关卡失败。
+      # 第 2 轮复核指出:若把「没有改动」也算 2,push 到 main 时(base==HEAD、
+      # 工作树干净)就会**永久变红**。已把「没有改动」分出来,返回 0。
+      - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码 + 输出自证)
+        run: |
+          set -e
+          # PYTHONIOENCODING=cp1252 复现 Windows 默认控制台:崩了就红。
+          PYTHONIOENCODING=cp1252 python tools/check_domain.py scripts/optimize.py
+          # 按本次 PR 的改动分档。0 与 1 都是**正常**结果(1 = 含执行域文件,
+          # 该走完整流程——这里只要求命令能跑通,不做流程判定)。
+          # 2 = 环境不可用(fail-closed),那才是失败。
+          rc=0
+          out=$(python tools/check_domain.py --diff "origin/${{ github.base_ref || 'main' }}" 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" = "2" ]; then
+            echo "分档器返回 2(环境不可用)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          # **必须看到「总判定:」这一行**,否则不能算「它给出了判断」。
+          # 只看退出码是不够的:Sourcery 复核抓到过一个 fail-open 口子——
+          # Python 遇到未捕获异常时退出码也是 **1**,而 1 在本工具的语义里
+          # 是「判为执行域」(正常结果)。于是「分档器自己崩了」与
+          # 「分档器说这是执行域」在 CI 眼里完全一样,崩了也照样放行。
+          # 两道防线:①CLI 现在把未预期异常归到 2(见 tools/check_domain.py::_cli);
+          # ②这里再要求输出里有结论行,崩了就没有。
+          if ! echo "$out" | grep -q "总判定:"; then
+            echo "分档器没有给出判定结论(崩溃?退出码=$rc)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          echo "分档器退出码=$rc(0/1 均正常;2 才是环境不可用)"
+          exit 0
+
+      # 变异验证(codex 第 2 轮的 M3):分档清单的每次改动都必须被测试抓住。
+      #
+      # 为什么要有这一步:ADR 里那张「N 种变异全部被抓住,条数实测」的表,
+      # 第 1 轮复核就发现**三行数字对不上**(测试从 82 条长到 90 条,
+      # 红的用例集自然变了),而且有一行**变异描述写反了**。
+      # 靠人记的数字会过期 —— 这条关卡把它变成机器保证:
+      # 脚本在**仓库副本**上逐个施加变异、数 pytest 的 FAILED 行数,
+      # 任何一种变异没被抓住就红。`--verify` 还会核对 ADR 表格里的数字。
+      #
+      # 注意它在**副本**里做(真工作树全程不动),所以跑起来慢一点是应该的。
+      - name: 分档清单的变异验证(每个清单改动都必须被抓住)
+        run: |
+          python tools/check_mutations.py --verify
