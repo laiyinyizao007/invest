@@ -40,7 +40,7 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 ### 清单靠什么保证不失效
 
 清单是手写的,会随仓库演进而失准。所以有四道**动态探针**盯着
-(`tests/test_check_domain.py`,98 条)。
+(`tests/test_check_domain.py`,99 条)。
 **守卫工具自身**(`tools/check_domain.py`、`tools/verdict_graph.py`、`tools/check_mutations.py`)
 也在不可降级清单里——它们是「谁拥有判定点」「清单有没有被测住」的裁决者。
 
