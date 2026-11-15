@@ -287,9 +287,14 @@ def test_exemption_is_wired_only_at_the_three_framework_call_sites():
     calls = [line.strip() for line in source.splitlines()
              if "with framework_exempt(" in line and not line.strip().startswith("#")]
     assert len(calls) == 3, calls
+    # 研究侧模块里的豁免只有那三处(路径级 .pyc、命令级 git、家目录)
     assert "framework_privilege" not in source
     api_source = (ROOT / "scripts" / "research_api.py").read_text(encoding="utf-8")
-    assert "framework_exempt" not in api_source
+    # research_api 里允许**一处**豁免:框架自己在窗口里读 vnpy 库(sqlite 连接惰性打开,落在窗口内)。
+    # 它必须是**窄**豁免(只豁免 sqlite3.connect 到那个库),不带 paths=/argv=。
+    calls = [line.strip() for line in api_source.splitlines() if "rs.framework_exempt(" in line]
+    assert len(calls) == 1 and "sqlite_paths=" in calls[0], calls
+    assert "argv=" not in calls[0] and "framework_exempt(paths=" not in calls[0], calls
 
 
 def test_the_hook_denial_sets_cover_the_required_capabilities():
@@ -1504,7 +1509,10 @@ def test_production_path_candidate_cannot_vacuum_into_through_the_framework_data
     cls = run_candidate(tmp_path, monkeypatch, source, static=True)
     assert set(cls.RESULT) == set(imports)
     for label, outcome in cls.RESULT.items():
+        # 断言**是哪条规则**拒的,不是"红了就行"(第 39 轮 High:对象层的 AttributeError 被 IMPORT_FROM 回退掩盖,
+        # 候选只看到无关的提示——所以受限导入器把对象层的拒绝转成带规则名的 ImportError)。
         assert outcome.startswith("refused:"), (label, outcome)
+        assert "规则:" in outcome, (label, outcome)
     assert not out.exists()
     assert [x.__name__ for x in cls.OK] == ["ArrayManager", "BarGenerator"]       # 放行方向
 
@@ -1593,3 +1601,161 @@ def test_backtest_reads_market_data_before_the_candidate_is_constructed(monkeypa
     with pytest.raises(Stop):
         backtest_lib.run_backtest(type("S", (), {}), {}, "CADJ", start, end)
     assert order == ["load_data", "add_strategy"]
+
+
+# ======================================================================
+# 第 39 轮复审:库读原语按模式收口 / 对象层拒绝要带规则名
+# ======================================================================
+
+def test_the_data_primitive_pattern_covers_read_and_write_primitives():
+    """收口按**模式**,不是列两个名字。覆盖读与写两侧的数据语义。"""
+    pattern = rs.DATA_PRIMITIVE_PATTERN
+    for name in ("load_bar_data", "load_tick_data", "save_bar_data", "delete_bar_data",
+                 "get_order_data", "set_account_data", "load_data", "get_position"):
+        assert pattern.match(name), name
+    for name in ("load_bars_csv", "get_datafeed", "get_target_value", "get_digits",
+                 "get_pricetick", "ArrayManager", "BarGenerator", "round_to"):
+        assert not pattern.match(name), name
+    # `load_bar` 命中模式(它就是"读 bar 数据"),但它只是**类成员**(模板自己的方法):
+    # 规则只作用于**模块级**成员,模板方法不受影响(另有用例钉住这一点)。
+
+
+def test_the_data_primitive_rule_applies_to_module_members_only_not_to_template_methods():
+    """`CtaTemplate.load_bar` 是**类成员**(模板自己的方法),不受这条规则约束——规则只管模块级成员。
+    模板方法被拦会误伤正常候选(它们本来就在继承 CtaTemplate)。"""
+    import vnpy_ctastrategy.template as tpl
+    rs.safe_builtins(())
+    with pytest.raises(AttributeError, match="规则:数据读写原语"):
+        rs._check_object_rules(tpl, "load_bar_data", getattr(tpl, "CtaTemplate"))
+    rs._PROXY_CACHE.clear()
+
+
+def test_library_read_primitives_are_refused_by_name_and_the_rule_is_named():
+    """`vnpy_ctastrategy.backtesting.load_bar_data` 能读任意区间(含测试段);按模式收口,断言规则名。"""
+    import vnpy_ctastrategy.backtesting as bt
+    rs.safe_builtins(())
+    for name in ("load_bar_data", "load_tick_data"):
+        with pytest.raises(AttributeError, match="规则:数据读写原语"):
+            rs._check_object_rules(bt, name, getattr(bt, name))
+    rs._PROXY_CACHE.clear()
+
+
+def test_the_candidate_cannot_read_the_database_through_any_reexport(repo, tmp_path, monkeypatch):
+    """生产入口:候选拿不到任何库读原语(`load_bar_data` 的再导出 + `get_database`)。断言规则名。"""
+    source = """
+        RESULT = {}
+        try:
+            from vnpy_ctastrategy.backtesting import load_bar_data as g
+            RESULT["bt.load_bar_data"] = "REACHABLE"
+        except Exception as exc:
+            RESULT["bt.load_bar_data"] = "refused:" + str(exc)
+        try:
+            from vnpy_ctastrategy.backtesting import BaseDatabase as g
+            RESULT["bt.BaseDatabase"] = "REACHABLE"
+        except Exception as exc:
+            RESULT["bt.BaseDatabase"] = "refused:" + str(exc)
+        try:
+            from vnpy_ctastrategy.engine import get_database as g
+            RESULT["engine.get_database"] = "REACHABLE"
+        except Exception as exc:
+            RESULT["engine.get_database"] = "refused:" + str(exc)
+        try:
+            from vnpy.trader.database import get_database as g
+            RESULT["db.get_database"] = "REACHABLE"
+        except Exception as exc:
+            RESULT["db.get_database"] = "refused:" + str(exc)
+        from vnpy.trader.utility import ArrayManager, BarGenerator, round_to
+        from vnpy.trader.object import BarData
+        from vnpy_ctastrategy import CtaTemplate
+        class S(CtaTemplate):
+            pass
+        S.RESULT = RESULT
+        S.OK = (ArrayManager, BarGenerator, round_to, BarData)
+    """
+    cls = run_candidate(tmp_path, monkeypatch, source, static=True)
+    for label, outcome in cls.RESULT.items():
+        assert outcome.startswith("refused:"), (label, outcome)
+        assert "规则:" in outcome, (label, outcome)
+    assert [x.__name__ for x in cls.OK] == ["ArrayManager", "BarGenerator", "round_to", "BarData"]
+
+
+def test_the_candidate_cannot_read_test_segment_bars_through_the_database(tmp_path):
+    """回测路径:候选在窗口内拿不到库读原语(对象层按模式收口),也建不了允许目录外的库。"""
+    import sqlite3
+    import vnpy_ctastrategy.backtesting as bt
+    with rs.candidate_window():
+        with pytest.raises(AttributeError, match="规则:数据读写原语"):
+            rs._check_object_rules(bt, "load_bar_data", bt.load_bar_data)
+        with _expect_rule("audit:sqlite3-connect"):
+            sqlite3.connect(str(tmp_path / "evil.db"))
+    assert not (tmp_path / "evil.db").exists()
+
+
+def test_the_framework_sqlite_exemption_is_narrow_and_does_not_allow_writes(tmp_path):
+    """框架读库的豁免**只**豁免 `sqlite3.connect` 到那个库文件;写那个文件仍然被拒。"""
+    import sqlite3
+    db_file = tmp_path / "vnpy.db"
+    db_file.write_bytes(b"")
+    with rs.candidate_window():
+        with rs.framework_exempt(sqlite_paths=[db_file]):
+            sqlite3.connect(str(db_file)).close()                  # connect 到框架的库:放行
+            with _expect_rule("audit:open-write"):
+                open(db_file, "w")
+            with _expect_rule("audit:sqlite3-connect"):
+                sqlite3.connect(str(tmp_path / "other.db"))         # 别的库:照拒
+    assert not (tmp_path / "other.db").exists()
+
+
+def test_the_object_layer_refusal_carries_its_rule_name():
+    """对象层的拒绝必须**带规则名**:CPython 的 IMPORT_FROM 在 AttributeError 时回退到 sys.modules,
+    候选于是只看到无关提示(第 39 轮 High)。所以对象层抛的异常里必须有规则名,受限导入器据此转 ImportError。"""
+    import types
+    import ctypes
+    carrier = types.ModuleType("carrier_rule")
+    carrier.leaky = ctypes.CDLL                      # 能力泄漏(ctypes/subprocess 来源)
+    monkey = types.ModuleType("carrier_data")
+    monkey.load_bar_data = lambda *a, **k: None     # 数据读写原语(名字匹配)
+    rs.safe_builtins(())
+    proxy = rs._proxy_for(carrier)
+    with pytest.raises(AttributeError, match="规则:能力泄漏"):
+        proxy.leaky
+    with pytest.raises(AttributeError, match="规则:数据读写原语"):
+        rs._check_object_rules(monkey, "load_bar_data", monkey.load_bar_data)
+    rs._PROXY_CACHE.clear()
+
+
+def test_the_systematic_scan_also_covers_data_read_primitives():
+    """扫描判据扩到"读/写数据原语":白名单模块里名字匹配数据原语模式的**模块级**成员必须都被收口。
+    升级 vnpy 后若出现新的读原语,本用例变红(判据与 `%TEMP%\\\\scan_dataprims.py` 同)。"""
+    import importlib
+    import inspect
+    import pkgutil
+    modules = {}
+    for root in ("vnpy", "vnpy_ctastrategy", "strategies"):
+        try:
+            pkg = importlib.import_module(root)
+        except BaseException:       # noqa: BLE001
+            continue
+        modules[root] = pkg
+        for info in pkgutil.walk_packages(getattr(pkg, "__path__", []), root + "."):
+            if any(x in info.name for x in (".gui", ".ui", "__main__", ".test", "ctp", "wechat")):
+                continue
+            try:
+                modules[info.name] = importlib.import_module(info.name)
+            except BaseException:   # noqa: BLE001 —— 导入不了的可选子模块不在候选可达范围
+                pass
+    rs.safe_builtins(())
+    leaked = []
+    for mname, mod in modules.items():
+        for name, value in list(vars(mod).items()):
+            if name.startswith("_") or not rs.DATA_PRIMITIVE_PATTERN.match(name):
+                continue
+            if not (inspect.isfunction(value) or inspect.isbuiltin(value) or inspect.ismethod(value)):
+                continue
+            try:
+                rs._check_object_rules(mod, name, value)
+                leaked.append(f"{mname}.{name}")
+            except AttributeError:
+                pass
+    assert leaked == [], f"白名单模块里还有未收口的数据读写原语: {leaked}"
+    rs._PROXY_CACHE.clear()

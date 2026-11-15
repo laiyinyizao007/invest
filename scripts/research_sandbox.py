@@ -42,7 +42,10 @@ from risk import constitution as const  # noqa: E402
 from risk import ledger_chain as chain  # noqa: E402
 
 PENDING_DIR = "pending_strategies"
-SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
+# 沙盒**只跑**这两段。但要说清楚边界(第 39 轮更正):这只保证"沙盒不把测试段喂给候选、
+# 候选拿不到读库的函数";**进程内读任意本机文件仍未被拦**(候选可以自己 open() 派生 CSV,里面含测试段数据)——
+# 那是同进程残余,由 Issue #29(独立进程 + 只读挂载)闭合。见 ADR 第 39 轮。
+SEGMENTS = ("train", "valid")
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
 LOCK_STALE_SECONDS = 60.0            # 残留锁(持有者已崩)的判定上限
 
@@ -165,6 +168,15 @@ UNREACHABLE_QUALIFIED = frozenset({
     "vnpy.trader.database.get_database", "vnpy.trader.datafeed.get_datafeed", "vnpy.trader.utility.get_folder_path",
     "vnpy.trader.utility.get_file_path", "vnpy.trader.utility.save_json", "vnpy.trader.utility.load_json",
 })
+# **库读/写原语**(第 39 轮 Critical):`vnpy_ctastrategy.backtesting.load_bar_data(...)` 是模块级函数,
+# 它内部 `get_database().load_bar_data(...)` 读**任意区间**的日线/ Tick——含测试段(实测 689 根日线,零审计拒绝)。
+# 逐个列名字不收敛(库自带一堆 `load_/save_/delete_/get_/set_` + 数据语义的名字),所以按**名字模式**收口:
+# 模块级成员名匹配下面这个模式(动词 + 数据语义)的一律不给候选。框架自己用**真模块**,不受影响。
+# 放行方向:模板正常需要的 `ArrayManager`/`BarGenerator`/`round_to`/`BarData` 都不匹配这个模式。
+# 词边界要注意:`get_pricetick` 结尾是 "tick" 但**不是**数据原语(是价格最小变动价位),
+# 所以数据语义词前面必须是非空前缀或紧跟第一个下划线(`get_pricetick` 的 "price" 与 "tick" 之间没有下划线,不算)。
+DATA_PRIMITIVE_PATTERN = re.compile(
+    r"^(load|save|delete|get|set)_(?:\w+_)?(data|bar|tick|history|order|trade|position|account)$", re.IGNORECASE)
 # builtins 里的"导入/执行原语"被某个模块当成属性再导出(`mod.__import__`/`mod.open`……),`__module__` 都是 "builtins",按名字判。
 BUILTIN_PRIMITIVE_NAMES = frozenset({"__import__", "open", "exec", "eval", "compile"})
 # `builtins.open.__module__` 是 "io"(不是 "builtins"),按 `__module__` 判会漏——所以另按**身份**判。
@@ -790,6 +802,13 @@ def _check_object_rules(module, name, value) -> None:
     合并 main #22 之后,候选拿到的是代理,名字层(下划线/泄漏属性名,抛 ImportError)
     与对象层(这里,抛 AttributeError)两套规则都在代理的取属性里生效。
     """
+    # **库读/写原语**(第 39 轮):模块级成员名命中"动词 + 数据语义"模式 -> 不给候选。
+    # 只对**模块**的成员生效(类的方法名不按这条拒:`CtaTemplate.load_bar` 是引擎回调,`get_data` 是账户数据,
+    # 拦了会误伤模板;类里的 `BaseDatabase.load_bar_data` 是抽象方法,拿不到实例也调不通)。
+    if isinstance(module, ModuleType) and DATA_PRIMITIVE_PATTERN.match(name):
+        raise AttributeError(
+            f"禁止访问 {module.__name__}.{name}:它是库的数据读写原语"
+            f"(可读任意区间/品种的行情与交易数据,含测试段),不交给候选(规则:数据读写原语)")
     if f"{getattr(module, '__name__', '')}.{name}" in UNREACHABLE_MEMBERS:
         raise AttributeError(
             f"禁止访问 {module.__name__}.{name}:它能按调用方给的任意路径读写文件,"
@@ -1506,6 +1525,7 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
     _leak = _capability_leak
     _danger = _is_dangerous_module
     _proxy = _proxy_for                     # 候选拿到的是代理(名字层 + 对象层两套规则都在代理里)
+    _rules = _check_object_rules            # 对象层判定(转 ImportError 时把规则名带出去)
     _audit = audit_module
     _guarded_cls = _GuardedModule
     _builtin_roots = ALLOWED_MODULE_ROOTS
@@ -1611,6 +1631,16 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
                 sub = _get(module, item)
             except AttributeError:
                 sub = None
+            # **对象层的拒绝要转成 ImportError 再抛**(第 39 轮 High):CPython 的 `IMPORT_FROM` 在属性访问抛
+            # `AttributeError` 时会**回退到 `sys.modules`** 取真模块——于是候选看到的是一句无关的
+            # "cannot import name …" 或 "模块属性 __spec__ 不可用",**看不到真正命中的规则**。
+            # 这里对 fromlist 里的每个成员先按对象层规则判一遍:命中就把规则名带在 ImportError 里抛出,
+            # 导入因此**失败**(而不是交出真对象)。
+            if sub is not None:
+                try:
+                    _rules(module, item, sub)
+                except AttributeError as exc:
+                    raise ImportError(f"禁止导入 {name}.{item}:{exc}") from None
             if isinstance(sub, _mt):
                 if _danger(sub):
                     raise ImportError(f"禁止导入 {name}.{item}:模块视图不把危险模块 "
@@ -1648,7 +1678,7 @@ def _build_restricted_import(safe: dict, real_import, blocked: set, repo_guard,
         # 于是 `import vnpy.trader.database as db` 拿到的是**未包装的真模块**(`db.import_module` 就是真的 importlib 函数),
         # 对象层规则整个被绕开。所以这里对点号名的**每一级前缀**按真模块再判一次(危险模块/能力泄漏),
         # 与上面 fromlist 里"回退到 sys.modules 的真模块"同一个道理。
-        if not fromlist and "." in target:
+        if "." in target:
             parts = target.split(".")
             for index in range(2, len(parts) + 1):
                 prefix = ".".join(parts[:index])
@@ -1726,6 +1756,10 @@ UNREACHABLE_MEMBERS = frozenset({
     # 活动数据库实例/句柄入口(模块级变量,首次 get_database 后就是带 `.db` 的实例)
     "vnpy.trader.database.get_database", "vnpy.trader.database.database", "vnpy.trader.datafeed.get_datafeed",
     "vnpy.trader.datafeed.datafeed",
+    # 引擎与数据库基类本身:候选拿到就能调 `load_data()`/`load_bar_data()` 读**任意区间**的库数据
+    # (含测试段)。模板只需要 `CtaTemplate`,这两个类没有正当理由给候选。
+    "vnpy_ctastrategy.backtesting.BacktestingEngine", "vnpy_ctastrategy.backtesting.BaseDatabase",
+    "vnpy_ctastrategy.engine.CtaEngine", "vnpy_ctastrategy.engine.BaseDatabase",
 })
 # 最近一次 `safe_builtins` 生效的导入白名单根(对象层规则要用);只由框架写,候选碰不到本模块。
 _ACTIVE_ALLOWED_ROOTS: list = [ALLOWED_MODULE_ROOTS]
@@ -1991,7 +2025,8 @@ _AUDIT_NULL_DEVICES = frozenset({os.path.normcase(os.devnull), "nul", "/dev/null
 
 
 class _AuditState:
-    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed", "exempt_paths", "exempt_argv", "armed")
+    __slots__ = ("active", "allowed", "depth", "denials", "busy", "installed", "exempt_paths", "exempt_argv", "armed",
+                 "exempt_sqlite")
 
     def __init__(self):
         self.active = False
@@ -2003,6 +2038,7 @@ class _AuditState:
         self.exempt_paths: tuple = ()      # 路径级豁免:只放行这几个**规范化路径**的变更/写(框架清 .pyc、建 git 家目录)
         self.exempt_argv: list | None = None   # 进程级豁免:只放行**这一条**argv 的 Popen(守卫跑只读 git)
         self.armed = False                 # Popen 匹配后,放行**紧接着的一次**底层创建进程事件(用掉即清零)
+        self.exempt_sqlite: tuple = ()     # 只豁免 `sqlite3.connect` 到这几个路径(框架自己的库读);**不豁免** open/写
 
 
 _AUDIT = _AuditState()
@@ -2108,7 +2144,7 @@ def _audit_hook(event, args):
             if isinstance(target, (str, bytes, os.PathLike)) and os.fsdecode(target) != ":memory:":
                 norm = _audit_norm(target)
                 if (norm is not None and not _audit_inside_allowed(norm, state.allowed)
-                        and norm not in state.exempt_paths):
+                        and norm not in state.exempt_paths and norm not in state.exempt_sqlite):
                     _audit_deny("audit:sqlite3-connect", event)
             return
         if event == "_winapi.CreateFile":
@@ -2174,22 +2210,26 @@ def candidate_window(scratch_dir: Path | None = None):
 
 
 @contextlib.contextmanager
-def framework_exempt(paths=(), argv=None):
+def framework_exempt(paths=(), argv=None, sqlite_paths=()):
     """框架自己的动作发生在候选导入期间,会被窗口拦下,给它们一个**路径级/命令级**的显式豁免(不是关全局开关)。
 
     - `paths`:只放行这几个路径的变更/写(守卫清某个 `.pyc`、建 git 家目录);窗口其余部分**始终**受裁决;
     - `argv`:只放行 argv **恰好等于**它的那一次 `subprocess.Popen`(守卫跑只读 git),
-      以及该次调用内部的底层创建进程事件;别的 Popen 照拒。
+      以及该次调用内部的底层创建进程事件;别的 Popen 照拒;
+    - `sqlite_paths`:只放行 `sqlite3.connect` 到这几个路径(框架自己在窗口里读 vnpy 库时用)。
+      **不豁免** `open`/写:候选照样不能写那个库文件。
     只有框架代码调用,参数都由框架决定;候选拿不到本函数。用法限于 `_git_run_unchecked` 与 `_purge_bytecode_cache`
     (tests/test_fs_capability_closure.py 有接线核对 + 变异:改回全局开关用例会变红)。"""
-    previous = (_AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed)
+    previous = (_AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed, _AUDIT.exempt_sqlite)
     _AUDIT.exempt_paths = tuple(p for p in (_audit_norm(x) for x in paths) if p) + previous[0]
     _AUDIT.exempt_argv = list(argv) if argv is not None else previous[1]
+    _AUDIT.exempt_sqlite = tuple(p for p in (_audit_norm(x) for x in sqlite_paths) if p) + previous[3]
     _AUDIT.armed = False
     try:
         yield
     finally:
-        _AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed = previous
+        (_AUDIT.exempt_paths, _AUDIT.exempt_argv, _AUDIT.armed,
+         _AUDIT.exempt_sqlite) = previous
 
 
 # 本机路径不该出现在**会外发的文本**里(网关响应 → 毕昇工作流 → 模型)。

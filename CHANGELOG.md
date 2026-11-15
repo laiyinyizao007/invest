@@ -28,6 +28,19 @@
     修在能力层:`get_database`/`database`/`get_datafeed` 及其**再导出**(按来源模块.函数名)不可达,`peewee`/`vnpy_sqlite` 实例按来源挡;**撤销**窗口的 sqlite 路径登记,改为窗口前由框架建好连接;回测入口把 `load_data` 前置到候选 `__init__` 之前;
     ②系统性扫描"调用后返回活动句柄"的公开函数/实例(14 命中、10 放行,全部拦下或审查登记),固化为可重复的回归用例(vnpy 升级后新增的未审查句柄型成员会让它变红);
     ③ADR 明写 sqlite 事件层判不了 ATTACH/VACUUM INTO/已开连接复用;④对象层边界补残余栏(不判函数返回值/实例属性);⑤`utility.Path` 重复登记保留(宪法守卫只增不减)。G8:待复核。
+  - **第 39 轮复审(codex 36/50)的补修 —— 本线最后一批,之后冻结功能改动**:codex 判断是止损:写侧已闭合,**读侧在同进程下原理上不可收敛**,
+    唯一能真正闭合的是 Issue #29(候选独立进程化 + 只读挂载)。用户已决定本线做完这批就冻结,Issue #29 提为唯一阻塞项。
+    - **库读原语按模式收口**:`vnpy_ctastrategy.backtesting.load_bar_data` 能读任意区间(含测试段,实测 689 根日线、零审计拒绝)→
+      按名字模式收口**模块级**成员(类的方法不拦,否则误伤模板);另把 `BacktestingEngine`/`BaseDatabase`/`CtaEngine` 登记为不可达。
+      放行方向:`ArrayManager`/`BarGenerator`/`round_to`/`BarData` 仍可 import。
+    - **框架读库走窄豁免**:peewee 连接惰性打开,框架在窗口内第一次查询才 connect → `framework_exempt(sqlite_paths=[vnpy 库文件])`
+      只豁免那一个文件的 `sqlite3.connect`,不豁免 `open`/写。
+    - **对象层的拒绝转成带规则名的 ImportError**(CPython 的 IMPORT_FROM 回退会掩盖 `AttributeError`,候选看不到命中的规则);仓库用例改成断言规则名。
+    - **系统性扫描扩到"读/写数据原语"**(`%TEMP%` 下的 `scan_dataprims.py`,可重复跑),并固化成回归用例(vnpy 升级后新读原语会变红)。
+    - **更正一条不实残余**(`self.cta_engine.history_data` 那条实测不成立,`cta_engine` 被静态层直接拒),并新增"读侧整体未收口:
+      显式放行 numpy 后 `np.loadtxt` 仍可读含测试段的派生 CSV"。
+    - 对外面料更正:`SEGMENTS` 注释、`data` 输出新增 `test_segment_read_via_local_file: true`。
+    G8:待复核。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

@@ -2040,7 +2040,150 @@ CI 跑 `pytest tests/test_constitution.py`——而根 `tests/conftest.py` 会 i
 **新增残余**:① 对象层按 `__module__` 判来源,但**导入原语此前未被覆盖**——白名单加固可被白名单模块的再导出绕过(本轮的 Critical 即是);
 这类问题的根在"按成员枚举"的收敛性:扫描只覆盖已装版本的模块级公开成员,升级 vnpy 后须重跑 `%TEMP%\scan_reexports.py`(本 PR 把其核心判据固化为 `test_systematic_scan_no_whitelisted_module_hands_out_a_dangerous_origin`,只覆盖列出的 11 个模块)。
 ② sqlite3 无 `open` 事件(已按 `sqlite3.connect` 单独处置)与上面列出的无法裁决的原语。③ (已更正,第 38 轮)第 37 轮曾在回测窗口放行 vnpy 数据库的 sqlite 连接,这反而是个口子;已撤销,改为窗口前由框架建好连接、窗口里不登记任何路径。
+### 第 39 轮复审(codex 36/50):库读原语按模式收口 + 对象层拒绝要带规则名
+**背景**:第 35~38 轮把"写侧"(文件写、进程创建、反序列化、账本/批准记录)逐条收住了;第 39 轮 codex 的判断是**止损**——
+**读侧在同进程下原理上不可收敛**(候选与框架共享解释器,候选能读到本机任意文件、任意库数据),
+唯一能真正闭合的是 **Issue #29(候选独立进程化 + 只读挂载)**。用户已决定:**本线做最后一批收尾改动后冻结功能改动**,
+Issue #29 提为唯一阻塞项。所以这一批做完就**不再加新功能**,只接受"补规则与用例"的修复。
+
+**1. 库读原语按**模式**收口(不是列两个名字)**
+`vnpy_ctastrategy.backtesting.load_bar_data(symbol, exchange, interval, start, end)` 是**模块级函数**,
+它内部 `get_database().load_bar_data(...)` 读**任意区间**的日线/Tick——含测试段(实测 689 根日线,零审计拒绝)。
+逐个列名字不收敛(库里一堆 `load_/save_/delete_/get_/set_` + 数据语义的名字),所以按**名字模式**收口:
+
+    DATA_PRIMITIVE_PATTERN = ^(load|save|delete|get|set)_(?:\w+_)?(data|bar|tick|history|order|trade|position|account)$
+
+- 规则只作用于**模块级成员**:类的方法名不按这条拒(`CtaTemplate.load_bar` 是引擎回调、`get_data` 是账户数据,
+  拦了会误伤正常候选——模板本来就继承 `CtaTemplate`);`BaseDatabase.load_bar_data` 是抽象方法,拿不到实例也调不通。
+- 词边界要注意:`get_pricetick` 结尾是 "tick" 但**不是**数据原语(价格最小变动价位),所以数据语义词前面必须有下划线边界。
+- 另外把**引擎与数据库基类**本身登记进 `UNREACHABLE_MEMBERS`(`BacktestingEngine`/`BaseDatabase`/`CtaEngine`):
+  候选拿到它们就能调 `load_data()` 读任意区间;模板只需要 `CtaTemplate`。
+- **放行方向**(有用例钉住):`ArrayManager`/`BarGenerator`/`round_to`/`BarData` 仍可 import;模板只用位置参数调 `BarGenerator` 不受影响。
+
+**选的哪条路、为什么**:题目给的两条路是「按模式收口库读原语」或「回测入口不预建连接 + 给 `engine.load_data()` 一条框架级豁免」。
+**两条都做了**,各管一段:
+- 能力层(按模式收口 + 引擎/数据库类不可达)——这是**主防线**:候选根本拿不到读库的函数与句柄。
+- 事件层(窄豁免):peewee 的连接是**惰性**打开的,框架自己在窗口里第一次查询才 `sqlite3.connect`,
+  那次 connect 落在窗口内、路径在允许目录之外,会被钩子拒(回测直接失败)。所以给"框架读库"一条**窄**豁免
+  `framework_exempt(sqlite_paths=[vnpy 库文件])`:**只**豁免 `sqlite3.connect` 到那一个文件,**不豁免** `open`/写——
+  候选照样改不动那个库文件(用例钉住)。豁免只接在 `run_child`(回测入口)上;`evaluate`/`gate` 走 CSV,不读库。
+- **不再登记"sqlite 路径白名单"**(第 38 轮那条):它既不必要也不解决问题(候选拿不到句柄)。
+
+**2. 对象层的 `AttributeError` 被 `IMPORT_FROM` 回退掩盖 → 转成带规则名的 `ImportError`**
+CPython 的 `IMPORT_FROM` 在属性访问抛 `AttributeError` 时会**回退到 `sys.modules`** 取真模块,
+于是候选看到的是一句无关的 "cannot import name …" 或 "模块属性 __spec__ 不可用",**看不到真正命中的规则**。
+现在受限导入器对 fromlist 里的每个成员先按对象层规则判一遍:命中就把**规则名**带在 `ImportError` 里抛出
+(规则名在 `_check_object_rules` 的消息里:`规则:能力泄漏` / `规则:数据读写原语` / `规则:按来源不可达` / `规则:返回活动句柄的函数` / `规则:任意路径读写原语`)。
+仓库自己的用例也从 `startswith("refused:")` 改成断言**规则名**("红了但可能红错原因"是第 22 轮的老教训)。
+
+**3. 系统性扫描扩到"读/写数据原语"**
+扫描脚本 `%TEMP%\scan_dataprims.py`(可重复跑):白名单模块里名字匹配数据原语模式的**模块级**成员,逐个用对象层规则验证是否已挡。
+修前 47 个命中(其中模块级的读原语 `load_bar_data`/`load_tick_data` 可达),修后 0 个可达。
+同一判据已固化成回归用例 `test_the_systematic_scan_also_covers_data_read_primitives`:
+vnpy 升级后若出现新的读原语,用例变红,逼着人去审。
+**局限**:判据是**模块级成员**的名字模式(类的方法不在其内);不递归进实例属性与返回值;只覆盖本机已装版本的三个包。
+
+**4. 更正一条**不实**残余 + 补一条新残余**
+- 原残余写"候选仍能经 `self.cta_engine.history_data` 改内存里已读入的列表"——**实测不成立**:
+  `cta_engine` 是 `BUILTIN_PROTECTED_STATE_OBJECTS`,静态层直接拒("禁止引用受保护的风控状态对象 cta_engine"),运行时也进不了指纹范围。已删。
+- 新残余:**撤销 sqlite 路径登记的副作用**——回测路径上,框架那条**已打开**的连接在窗口内可被候选复用
+  (候选拿不到句柄,但同进程共享解释器这件事本身没变);以及**读侧整体未收口**:
+  候选在默认白名单下读不到本机文件(`open` 被静态层禁、`numpy` 不在白名单),但**运维一旦显式放行 numpy**,
+  `np.loadtxt` 就能读派生 CSV(含测试段数据)——**读侧只有 #29 能真正闭合**。
+
+**5. `vnpy.trader.setting.SETTINGS` 仍可达**(它带 `database.database` 的库文件名)。只记一笔,不改:
+库文件名不是能力,拿到也没有用(读库要句柄,已封)。
+
+**6. 对外面料里不实的说法一并更正**
+- `research_sandbox.SEGMENTS` 的注释:原文"测试段不可经由沙盒到达"过强。改成:沙盒**只跑** train/valid,
+  且**不给候选读库的函数**;**进程内读任意本机文件未被拦**(同进程残余,#29)。
+- `research_api.data` 输出的 `test_segment_accessible_via_sandbox` 保留(它说的是"沙盒不把测试段喂给候选"),
+  但同一条输出新增 `test_segment_read_via_local_file: true`,把"进程内读本机文件仍可达"这件事显式写出来——
+  免得下游把这个布尔读成"候选无论如何都看不到测试段"。
+- 网关的模块头"**不存在**:…访问测试段"指的是**网关端点**层面(网关没有这样的端点),仍然成立,不改。
+
+### 第 39 轮复审(codex 36/50):库读原语按模式收口 + 对象层拒绝要带规则名
+**背景**:第 35~38 轮把"写侧"(文件写、进程创建、反序列化、账本/批准记录)逐条收住了;第 39 轮 codex 的判断是**止损**——
+**读侧在同进程下原理上不可收敛**(候选与框架共享解释器,候选能读到本机任意文件、任意库数据),
+唯一能真正闭合的是 **Issue #29(候选独立进程化 + 只读挂载)**。用户已决定:**本线做最后一批收尾改动后冻结功能改动**,
+Issue #29 提为唯一阻塞项。所以这一批做完就**不再加新功能**,只接受"补规则与用例"的修复。
+
+**1. 库读原语按**模式**收口(不是列两个名字)**
+`vnpy_ctastrategy.backtesting.load_bar_data(symbol, exchange, interval, start, end)` 是**模块级函数**,
+它内部 `get_database().load_bar_data(...)` 读**任意区间**的日线/Tick——含测试段(实测 689 根日线,零审计拒绝)。
+逐个列名字不收敛(库里一堆 `load_/save_/delete_/get_/set_` + 数据语义的名字),所以按**名字模式**收口:
+
+    DATA_PRIMITIVE_PATTERN = ^(load|save|delete|get|set)_(?:\w+_)?(data|bar|tick|history|order|trade|position|account)$
+
+- 规则只作用于**模块级成员**:类的方法名不按这条拒(`CtaTemplate.load_bar` 是引擎回调、`get_data` 是账户数据,
+  拦了会误伤正常候选——模板本来就继承 `CtaTemplate`);`BaseDatabase.load_bar_data` 是抽象方法,拿不到实例也调不通。
+- 词边界要注意:`get_pricetick` 结尾是 "tick" 但**不是**数据原语(价格最小变动价位),所以数据语义词前面必须有下划线边界。
+- 另外把**引擎与数据库基类**本身登记进 `UNREACHABLE_MEMBERS`(`BacktestingEngine`/`BaseDatabase`/`CtaEngine`):
+  候选拿到它们就能调 `load_data()` 读任意区间;模板只需要 `CtaTemplate`。
+- **放行方向**(有用例钉住):`ArrayManager`/`BarGenerator`/`round_to`/`BarData` 仍可 import;模板只用位置参数调 `BarGenerator` 不受影响。
+
+**选的哪条路、为什么**:题目给的两条路是「按模式收口库读原语」或「回测入口不预建连接 + 给 `engine.load_data()` 一条框架级豁免」。
+**两条都做了**,各管一段:
+- 能力层(按模式收口 + 引擎/数据库类不可达)——这是**主防线**:候选根本拿不到读库的函数与句柄。
+- 事件层(窄豁免):peewee 的连接是**惰性**打开的,框架自己在窗口里第一次查询才 `sqlite3.connect`,
+  那次 connect 落在窗口内、路径在允许目录之外,会被钩子拒(回测直接失败)。所以给"框架读库"一条**窄**豁免
+  `framework_exempt(sqlite_paths=[vnpy 库文件])`:**只**豁免 `sqlite3.connect` 到那一个文件,**不豁免** `open`/写——
+  候选照样改不动那个库文件(用例钉住)。豁免只接在 `run_child`(回测入口)上;`evaluate`/`gate` 走 CSV,不读库。
+- **不再登记"sqlite 路径白名单"**(第 38 轮那条):它既不必要也不解决问题(候选拿不到句柄)。
+
+**2. 对象层的 `AttributeError` 被 `IMPORT_FROM` 回退掩盖 → 转成带规则名的 `ImportError`**
+CPython 的 `IMPORT_FROM` 在属性访问抛 `AttributeError` 时会**回退到 `sys.modules`** 取真模块,
+于是候选看到的是一句无关的 "cannot import name …" 或 "模块属性 __spec__ 不可用",**看不到真正命中的规则**。
+现在受限导入器对 fromlist 里的每个成员先按对象层规则判一遍:命中就把**规则名**带在 `ImportError` 里抛出
+(规则名在 `_check_object_rules` 的消息里:`规则:能力泄漏` / `规则:数据读写原语` / `规则:按来源不可达` / `规则:返回活动句柄的函数` / `规则:任意路径读写原语`)。
+仓库自己的用例也从 `startswith("refused:")` 改成断言**规则名**("红了但可能红错原因"是第 22 轮的老教训)。
+
+**3. 系统性扫描扩到"读/写数据原语"**
+扫描脚本 `%TEMP%\scan_dataprims.py`(可重复跑):白名单模块里名字匹配数据原语模式的**模块级**成员,逐个用对象层规则验证是否已挡。
+修前 47 个命中(其中模块级的读原语 `load_bar_data`/`load_tick_data` 可达),修后 0 个可达。
+同一判据已固化成回归用例 `test_the_systematic_scan_also_covers_data_read_primitives`:
+vnpy 升级后若出现新的读原语,用例变红,逼着人去审。
+**局限**:判据是**模块级成员**的名字模式(类的方法不在其内);不递归进实例属性与返回值;只覆盖本机已装版本的三个包。
+
+**4. 更正一条**不实**残余 + 补一条新残余**
+- 原残余写"候选仍能经 `self.cta_engine.history_data` 改内存里已读入的列表"——**实测不成立**:
+  `cta_engine` 是 `BUILTIN_PROTECTED_STATE_OBJECTS`,静态层直接拒("禁止引用受保护的风控状态对象 cta_engine"),运行时也进不了指纹范围。已删。
+- 新残余:**撤销 sqlite 路径登记的副作用**——回测路径上,框架那条**已打开**的连接在窗口内可被候选复用
+  (候选拿不到句柄,但同进程共享解释器这件事本身没变);以及**读侧整体未收口**:
+  候选在默认白名单下读不到本机文件(`open` 被静态层禁、`numpy` 不在白名单),但**运维一旦显式放行 numpy**,
+  `np.loadtxt` 就能读派生 CSV(含测试段数据)——**读侧只有 #29 能真正闭合**。
+
+**5. `vnpy.trader.setting.SETTINGS` 仍可达**(它带 `database.database` 的库文件名)。只记一笔,不改:
+库文件名不是能力,拿到也没有用(读库要句柄,已封)。
+
+**6. 对外面料里不实的说法一并更正**
+- `research_sandbox.SEGMENTS` 的注释:原文"测试段不可经由沙盒到达"过强。改成:沙盒**只跑** train/valid,
+  且**不给候选读库的函数**;**进程内读任意本机文件未被拦**(同进程残余,#29)。
+- `research_api.data` 输出的 `test_segment_accessible_via_sandbox` 保留(它说的是"沙盒不把测试段喂给候选"),
+  但同一条输出新增 `test_segment_read_via_local_file: true`,把"进程内读本机文件仍可达"这件事显式写出来——
+  免得下游把这个布尔读成"候选无论如何都看不到测试段"。
+- 网关的模块头"**不存在**:…访问测试段"指的是**网关端点**层面(网关没有这样的端点),仍然成立,不改。
+
 **G8**:本轮同样**未跑**外部评审,状态:待复核。
+
+第 39 轮补修的变异验证:
+
+| 变异 | 结果 |
+|---|---|
+| 清空 `DATA_PRIMITIVE_PATTERN`(库读原语不再收口) | 红 |
+| 去掉引擎/数据库基类的不可达登记 | 红 |
+| 对象层拒绝不再转 `ImportError`(退回被掩盖) | 红 |
+| 去掉 sqlite 窄豁免(框架读库被钩子拒) | 红 |
+| sqlite 豁免改成放行一切 connect | 红 |
+| 去掉 prefix 回退核对 | 红 |
+
+无等价变异。
+
+
+第 39 轮补修的变异验证:
+
+MUT_TABLE
+
 
 第 37 轮补修的变异验证(改回旧行为,`tests/test_fs_capability_closure.py` 必须变红):
 

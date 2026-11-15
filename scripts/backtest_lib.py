@@ -82,6 +82,20 @@ def run_engine(
     return engine
 
 
+def vnpy_database_paths() -> list:
+    """vnpy 库文件路径(peewee 的连接是惰性打开的:第一次查询才 connect)。
+
+    放在**交易侧**模块里而不是 `research_api`:常驻研究进程(网关/MCP/批准进程)不许 import vnpy,
+    而研究侧只在这一条路径上需要这个路径(回测子进程的窗口里给"框架读库"一条窄豁免)。
+    取不到就返回空表:那时窗口里的回测读库会被钩子拒(fail-closed,不是放开)。"""
+    try:
+        from vnpy.trader.setting import SETTINGS
+        from vnpy.trader.utility import get_file_path
+        return [get_file_path(SETTINGS["database.database"])]
+    except Exception:                                # noqa: BLE001
+        return []
+
+
 def load_bars_csv(path, symbol: str, exchange: Exchange, interval: Interval = Interval.MINUTE) -> list[BarData]:
     """读 import_minute.py 输出的 K 线 CSV(时间戳为开始时间,已复权),转成 vn.py BarData 列表。
 

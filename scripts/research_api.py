@@ -538,7 +538,11 @@ def data_report() -> list:
         out.append({
             "key": key,
             "segments": {seg: [f"{windows[seg][0]:%Y-%m-%d}", f"{windows[seg][1]:%Y-%m-%d}"] for seg in rs.SEGMENTS},
+            # 这条只说"沙盒**不把**测试段喂给候选、也不给候选读库的函数";
+            # 进程内读任意本机文件(含派生 CSV 里的测试段数据)仍未被拦(同进程残余,Issue #29)。
+            # 别把它读成"候选无论如何都看不到测试段"。
             "test_segment_accessible_via_sandbox": False,
+            "test_segment_read_via_local_file": True,
             "test_segment_consumed": consumed,
         })
     return out
@@ -947,7 +951,8 @@ def run_evaluate_child(args) -> int:
 
 def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
-    from backtest_lib import run_backtest
+    # `vnpy_database_paths` 在**交易侧**模块里(常驻研究进程不许 import vnpy,见 tests/test_research_boundary.py)。
+    from backtest_lib import run_backtest, vnpy_database_paths
     from strategies.instruments import INSTRUMENTS
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
@@ -973,13 +978,12 @@ def run_child(args) -> int:
     # 回测要读 vnpy 数据库(sqlite)。**在窗口之前**由框架先把连接建好(`get_database()` 缓存在模块全局里),
     # 窗口里的 `load_bar` 等只复用这条已有连接,不再发新的 `sqlite3.connect`——于是窗口里**不需要、也不登记任何 sqlite 路径**
     # (第 38 轮:登记既不必要,也不解决问题;候选拿活动句柄的入口 `get_database`/`database` 在对象层已不可达)。
+    # 框架自己在窗口里读 vnpy 库(sqlite):peewee 的连接是**惰性**打开的,第一次查询才 connect,
+    # 那次 connect 落在窗口内会被钩子拒(路径在允许目录之外)。所以给"框架读库"一条**窄**豁免:
+    # 只豁免 `sqlite3.connect` 到那个库文件——**不豁免** `open`/写,候选照样改不动库文件。
+    # (候选也拿不到句柄:`get_database`/`database` 在对象层不可达,见 ADR 第 38/39 轮。)
     try:
-        from vnpy.trader.database import get_database
-        get_database()
-    except Exception:                                # noqa: BLE001 —— 建不起来就让回测自己报错
-        pass
-    try:
-        with rs.candidate_window():
+        with rs.candidate_window(), rs.framework_exempt(sqlite_paths=vnpy_database_paths()):
             stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
