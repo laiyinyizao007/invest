@@ -197,16 +197,16 @@ python tools/check_mutations.py --verify   # 额外核对本表数字与实测�
 
 | 变异 | 变红的测试条数 |
 |---|---|
-| 删掉 `trading/` 的不可降级条目 | 2 |
-| 把 `risk/live_admission.py` 移出不可降级 | 6 |
-| 把 `risk/candidate_eval.py` 移出不可降级 | 3 |
-| 把 `scripts/research_sandbox.py` 移出不可降级 | 4 |
-| 把 `scripts/backtest_lib.py` 移出不可降级 | 4 |
-| 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | 2 |
-| 把 `scripts/research_grid.py` 移出不可降级 | 3 |
-| 把 `scripts/research_api.py` 移出不可降级 | 4 |
-| 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | 6 |
-| 把整个 `scripts/` 放进研究**目录**白名单 | 3 |
+| 删掉 `trading/` 的不可降级条目 | 3 |
+| 把 `risk/live_admission.py` 移出不可降级 | 7 |
+| 把 `risk/candidate_eval.py` 移出不可降级 | 4 |
+| 把 `scripts/research_sandbox.py` 移出不可降级 | 5 |
+| 把 `scripts/backtest_lib.py` 移出不可降级 | 5 |
+| 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | 3 |
+| 把 `scripts/research_grid.py` 移出不可降级 | 4 |
+| 把 `scripts/research_api.py` 移出不可降级 | 5 |
+| 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | 7 |
+| 把整个 `scripts/` 放进研究**目录**白名单 | 4 |
 | 新建一个直接调 `check_gate` 的文件(不入库) | 1(`test_every_sink_owning_file_is_never_downgrade`) |
 
 (数字由脚本实测。`--verify` 会核对本表与实测是否一致。)

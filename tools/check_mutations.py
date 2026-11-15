@@ -124,6 +124,11 @@ def _run_tests(cwd: Path) -> tuple[int, str]:
     **必须显式 encoding="utf-8"**:子进程被 PYTHONUTF8=1 逼着吐 UTF-8,
     而 `text=True` 默认按 locale(cp1252)解码 —— 解码失败时 stdout 变 None,
     紧接着 `.splitlines()` 就崩(第 3 轮的 Critical-1 第二处)。
+
+    **关于「subprocess 实参不是静态字符串」**:这里的实参全部来自**本地常量**
+    (`sys.executable` + 固定的测试路径),且**不经 shell**(`shell=False` 是默认),
+    外部输入进不来。`_tier_of` 里的路径经 `%r` 转成 Python 字面量后作为 `-c`
+    的参数传入,同样不经 shell。
     """
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
