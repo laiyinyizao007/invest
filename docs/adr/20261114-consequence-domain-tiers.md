@@ -187,12 +187,11 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
 
 探针本身会被证伪,否则它只是一段好看的断言。**变异验证已变成可复算的脚本**
 `tools/check_mutations.py`:它把仓库复制到临时目录(在副本上做变异,真工作树全程不动),
-逐个施加变异并数 `pytest` 的 FAILED 行数。**条数是实测的,不靠人记**——
-第 1 轮 codex 复核就发现本表有三行数字对不上(测试从 82 条长到 90 条,红的用例集自然变了)。
+逐个施加变异并检查两件事——**每种变异都被测试抓住**、**每种变异都真的翻转了判定**。
 
 ```bash
 python tools/check_mutations.py            # 跑全部变异
-python tools/check_mutations.py --verify   # 额外核对本表数字与实测是否一致
+python tools/check_mutations.py --verify   # 另核对「本表的变异集合 == 脚本里的变异集合」
 ```
 
 | 变异 | 见证路径(变异前后分档结果必须翻转) |
