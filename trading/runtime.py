@@ -97,6 +97,7 @@ class RuntimeConfig:
     approved_root: Path | None = None                # 批准目录与账本的共同根;None 时取本文件所在代码根
     approved_class_in_file: str = "Candidate"        # 批准文件里的类名(与 strategy_class 是两回事:那是引擎类表的键)
     approved_strategy_name: str | None = None        # 状态命名空间;None 时按批准哈希派生(换版本自动换命名空间)
+    approved_key: str | None = None                  # 本次要跑的品种(如 C15);给了就与装载门记录的 key 核对
     approved_template: str | None = None             # 骨架(模块:类);None 时用宪法指定的默认骨架
                                                       # ——默认那个是**仅研究回测**的 15m 骨架,会被拒绝装载,
                                                       # 实盘要用日线骨架:strategies.trend_atr_strategy:TrendAtrStrategy
@@ -301,7 +302,9 @@ class TradingRuntime:
         # 与「晋级门槛通过」(人工审阅挡不住「这策略没有统计优势」)。
         # 今天没有任何候选通过过门槛 → 这条路实际上**关着**(见 Issue #37)。
         collected_file = root / "data" / "research-control" / "collected.json"
-        promotion_file = root / "data" / "state" / "promotion_approval.json"
+        # 装载门是**独立**的一份记录(与准入门那份分开):准入门问「能不能连生产 API」,
+        # 装载门问「这份代码配不配跑」——共用一份记录会让「过了一次门槛」同时满足两件事。
+        promotion_file = root / "data" / "state" / "approved_promotion.json"
         # 批准目录整体自检:里面有任何一个文件与账本不一致,就拒绝启动(fail-closed)。
         problems = approved_guard.check_approved_consistency(
             approved_dir=approved_dir, approvals_file=approvals_file)
@@ -318,6 +321,7 @@ class TradingRuntime:
                 template_name=cfg.approved_template,
                 collected_file=collected_file,
                 promotion_file=promotion_file,
+                expected_key=cfg.approved_key,
             )
         except approved_guard.ApprovedLoadError as exc:
             return str(exc)

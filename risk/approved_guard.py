@@ -220,6 +220,7 @@ def load_approved_strategy(
     template_name: str | None = None,
     collected_file: Path | str | None,
     promotion_file: Path | str | None,
+    expected_key: str | None = None,
 ) -> tuple[type, str]:
     """装载并返回 `(策略类, 这份字节的 sha256)`。任何一项校验不过 → `ApprovedLoadError`。
 
@@ -228,6 +229,9 @@ def load_approved_strategy(
 
     `setting` 是要传给策略的设置字典:对**整个** setting 做受保护参数校验,
     只对 `SETTING_EXEMPT_PARAMS` 里那一个具名的操作参数豁免。
+
+    `expected_key`:本次要跑的品种(如 C15)。给了就与装载门记录里的 key 核对——
+    记录只授权它被评估过的那个品种。
 
     `collected_file` / `promotion_file`:第三、第四道门——
     「这段字节**经过了收菜那道关口**」(收菜时会把源码打给人看)与
@@ -290,13 +294,17 @@ def load_approved_strategy(
                     f"{file_name} 没有「已收菜」记录,拒绝装载"
                     f"(收菜是那道把源码打给人看的关口;人工拷贝绕过不了它)")
 
-        # ②c 晋级门槛通过记录:与「人批准」独立的第四道门。
+        # ②c 晋级门槛通过记录(装载门):与「人批准」独立的第四道门。
         # 人工审阅挡得住「代码里有坏东西」,挡不住「这策略没有统计优势」。
-        # 今天没有任何候选通过过门槛 → 这道门实际上把「从 approved/ 装载」**关着**
-        # (见 Issue #37)。
+        # 这份记录绑定**品种 / 字节 / 那一次评估**(Issue #37):它只授权
+        # 它被评估过的那一份代码、那个品种。
         if promotion_file is not None:
             promotion = approval_ledger.load_promotion(promotion_file)
+            if not isinstance(promotion, dict):
+                raise ApprovedLoadError("晋级门槛通过记录格式不对,拒绝装载")
             record_sha = str(promotion.get("sha256") or "")
+            record_key = str(promotion.get("key") or "").strip()
+            record_run = str(promotion.get("run_id") or "").strip()
             if not record_sha:
                 raise ApprovedLoadError(
                     f"{file_name} 没有晋级门槛通过记录,拒绝装载"
@@ -305,6 +313,16 @@ def load_approved_strategy(
                 raise ApprovedLoadError(
                     f"晋级门槛通过记录对应的是另一份字节,拒绝装载"
                     f"(记录 {record_sha[:12]}… ≠ 本文件 {sha[:12]}…)")
+            if not record_key:
+                raise ApprovedLoadError("晋级门槛通过记录没有品种(key),拒绝装载")
+            if not record_run:
+                raise ApprovedLoadError("晋级门槛通过记录没有 run_id(哪一次评估),拒绝装载")
+            if expected_key and expected_key != record_key:
+                raise ApprovedLoadError(
+                    f"晋级门槛通过记录对应的是品种 {record_key},"
+                    f"而本次要跑的是 {expected_key},拒绝装载")
+            if promotion.get("gate_failures") != []:
+                raise ApprovedLoadError("晋级门槛通过记录里记录了未通过的门槛项,拒绝装载")
 
         # ③ 合规:静态筛查 + 参数校验
         # **用清单文件里的那一份**(const.load()),不是内置默认值:

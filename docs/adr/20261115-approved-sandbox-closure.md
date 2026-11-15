@@ -260,6 +260,31 @@ _c.check_protected_state = lambda *a, **k: []
 `del x.attr`、`setattr(obj, "名字", …)`、`delattr`、`vars(obj)["名字"] = …` 全都过。
 修法:`_gate_attr_violations()` 一次把这七种形态都收进来。
 
+### 22. 准入门与装载门是**两份独立的记录**(Issue #37)
+
+两道门问的不是一件事:
+
+| 记录 | 问的问题 | 谁消费 | 绑定什么 |
+|---|---|---|---|
+| `data/state/promotion_approval.json` | 「这个账号/这套系统能不能连生产 API」 | `run_headless.check_live_admission` | 策略名 + 批准人 + 指标 |
+| `data/state/approved_promotion.json` | 「这份**代码**配不配被装载执行」 | `risk/approved_guard` | **品种 + 字节 + 那一次评估** |
+
+共用一份记录会有两个毛病:①「过了一次门槛」同时满足两件事;②没法单独撤销其中一件。
+拆开之后,装载门那份额外绑定三样东西:
+
+- **`key`**(品种,如 C15):同一份代码换个品种不通用——那份通过授权的是「它被评估过的那个品种」。
+  写入时**从那次评估的结果文件里取**(`data/research/<run_id>.json` 的 `key`),
+  人手填的 `--key` 与评估结果不一致时**拒绝**;
+- **`sha256`**(字节):换个文件不能蹭别人的通过记录;
+- **`run_id`**(哪一次评估):数据一更新,同一次通过的含义就变了,记下 run_id 才追得回来。
+
+装载时四样都要对上:记录存在 → `gate_failures == []` → sha256 与要跑的字节一致 →
+key 与运行时声明的品种(可选 `--approved-key`)一致。
+
+**今天没有任何候选通过过晋级门槛 → 这份记录不存在 → `approved/` 装载这条路是关着的。**
+这是刻意的:第 4 轮 codex 测出的 H1(宪法风控底线可被已批准的候选用 `setattr`/`getattr`/`vars`
+绕过)因此到不了实盘;要打开这条路,先做完 §20 的能力隔离与 #38。
+
 ## 实现
 
 - `risk/approval_ledger.py`:只读账本访问(`load_approvals` / `is_approved_sha` / `file_sha256`)。

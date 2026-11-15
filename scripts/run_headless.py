@@ -71,6 +71,8 @@ def parse_args(argv: list[str] | None, env: Mapping[str, str]) -> argparse.Names
     parser.add_argument("--approved-dir", default="",
                         help="批准目录路径(必须解析到 <项目根>/approved;钉死是为了不让候选目录与受信目录混为一谈)")
     parser.add_argument("--approved-class", default="Candidate", help="批准文件里的类名(默认 Candidate)")
+    parser.add_argument("--approved-key", default="",
+                        help="本次要跑的品种(如 C15);给了就与装载门批准记录的 key 核对")
     parser.add_argument("--approved-template", default="",
                         help="装载用的骨架(模块:类);缺省用宪法指定的默认骨架——"
                              "那是**仅研究回测**的 15m 骨架,会被拒绝装载;"
@@ -146,6 +148,7 @@ def main(
         approved_file=args.approved or None,
         approved_dir=Path(args.approved_dir) if args.approved_dir else None,
         approved_class_in_file=args.approved_class,
+        approved_key=args.approved_key or None,
         approved_template=args.approved_template or None,
     )
     if args.check:

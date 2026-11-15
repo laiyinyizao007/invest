@@ -79,11 +79,13 @@ def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: st
         collected_file.write_text(json.dumps({sha: {"name": name, "collected_at": "2026-11-14T00:00:00"}}),
                                  encoding="utf-8")
     if promotion:
-        promotion_file = root / "data" / "state" / "promotion_approval.json"
+        # 装载门的记录(与准入门那份分开):绑定 **品种 / 字节 / 那一次评估**
+        promotion_file = root / "data" / "state" / "approved_promotion.json"
         promotion_file.parent.mkdir(parents=True, exist_ok=True)
-        promotion_file.write_text(json.dumps({"strategy": name, "sha256": sha, "approver": "test",
-                                              "approved_at": "2026-11-14T00:00:00", "gate_failures": []}),
-                                 encoding="utf-8")
+        promotion_file.write_text(json.dumps({"strategy": name, "key": "C15", "sha256": sha,
+                                              "run_id": "20261114-000000-test", "approver": "test",
+                                              "approved_at": "2026-11-14T00:00:00", "gate_failures": [],
+                                              "metrics": {}}), encoding="utf-8")
     return sha
 
 
@@ -678,3 +680,68 @@ def test_the_runtime_refuses_without_the_collected_record(make_runtime, approved
 
     assert problem is not None
     assert "收菜" in problem
+
+
+def test_the_load_gate_binds_the_key_the_strategy_was_evaluated_on(make_runtime, approved):
+    """装载门记录里的品种必须与本次要跑的品种一致(Issue #37 的「品种绑定」)。
+
+    同一份代码换个品种不通用:那份通过记录授权的是「它被评估过的那个品种」。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE, "approved_key": "MAADJ"})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "品种" in problem
+
+
+def test_the_load_gate_binds_the_bytes(make_runtime, approved):
+    """记录绑定的是**这份字节**:换一份文件就不能蹭记录。"""
+    approved_dir, ledger = approved
+    sha = _install(approved_dir, ledger)
+    # 账本里批准的是 sha;装载门记录也绑定 sha。改文件内容 → 哈希变了 → 两道门都拒
+    (approved_dir / "cand.py").write_text(CANDIDATE + "\n# 改了\n", encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert sha[:12] not in problem        # 拒绝理由里不应泄露完整哈希口径
+
+
+def test_the_load_gate_requires_a_run_id(make_runtime, approved):
+    """记录必须写明「哪一次评估」(run_id):数据一更新,同一次通过的含义就变了。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    promotion_file = approved_dir.parent / "data" / "state" / "approved_promotion.json"
+    record = json.loads(promotion_file.read_text(encoding="utf-8"))
+    record.pop("run_id")
+    promotion_file.write_text(json.dumps(record), encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "run_id" in problem
+
+
+def test_the_load_gate_requires_a_key(make_runtime, approved):
+    """记录必须写明品种(key)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    promotion_file = approved_dir.parent / "data" / "state" / "approved_promotion.json"
+    record = json.loads(promotion_file.read_text(encoding="utf-8"))
+    record.pop("key")
+    promotion_file.write_text(json.dumps(record), encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "品种" in problem or "key" in problem
