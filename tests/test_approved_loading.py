@@ -287,9 +287,30 @@ def test_the_fourth_layer_cannot_be_switched_off_by_the_candidate(approved):
         "class Candidate:\n"
         "    pass\n"))
 
-    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
-        _load(approved_dir, ledger)
-    assert "第四层" in str(excinfo.value)
+    # ⚠️ 这个载荷会把**本进程**里的 risk.constitution.check_protected_state
+    # 换成空函数(拒绝发生在比对之后,替换发生在 exec 期间)。
+    # 留着会污染后面所有依赖真第四层的用例(全套跑时表现为几条指纹测试莫名失败)——
+    # 所以这条在**子进程**里跑。
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120)
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    assert "第四层" in proc.stdout
 
 
 def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
