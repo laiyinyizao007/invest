@@ -112,6 +112,7 @@ flowchart LR
 
   - [`20261111-broker-test-compliance.md`](docs/adr/20261111-broker-test-compliance.md):国信程序化测试合规——阈值触达预警(走 Webhook、按指标节流)、手动暂停开仓(标志文件)、证据与报告
   - [`20261111-market-recording-and-dsh-orchestration.md`](docs/adr/20261111-market-recording-and-dsh-orchestration.md):行情录制采用官方 DataRecorder 与独立数据库；DSH 采用短任务 `ensure`/`watchdog` + wrapper，不直接承载长期前台录制
+  - [`20261115-candidate-process-isolation.md`](docs/adr/20261115-candidate-process-isolation.md):**候选独立进程执行**(设计方案,待评审;Issue [#29](https://github.com/laiyinyizao007/invest/issues/29))——候选只产出信号序列,回测/评估/记账/落盘/指标全部由框架进程独立完成;试验次数改由框架自己数(不再采信候选自报);不改动任何已锁定阈值(DSR ≥ 0.95、可疑夏普上限 3.0、η = 1.10、预算 60、16 格);含 5 个需用户拍板的点(C3 冲突裁决、网格读不出的口径、运行时三层是否删除、基类路线、依赖补 PR #32)
 
 ## 4. 设计决策 & 技术债务
 > 只保留**未解决**的条目。已处理或重复的行已归档到 `docs/roadmap.md` §2.7;各条目的阶段归属见 `docs/roadmap.md` §2.4 末尾的去向表。

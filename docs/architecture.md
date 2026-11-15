@@ -37,6 +37,7 @@
 | PP 参数平原 / PBO/DSR | PART | 参数平原 IMPL(`risk/plateau.py` + `scripts/research_grid.py`);PBO/DSR PLAN |
 | TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
 | RSA 研究沙盒 API(CLI + HTTP 网关 + 容器) | IMPL | `scripts/research_api.py`、`research_gateway.py`、`docker-compose.research.yml`、`docker/research/`;端到端经毕昇容器 → 沙盒容器实测;**威胁模型:纵深防御而非完整隔离**(见 ADR) |
+| 候选独立进程执行 | PLAN(设计方案待评审) | ADR `20261115-candidate-process-isolation.md`,Issue [#29](https://github.com/laiyinyizao007/invest/issues/29):候选只产出信号序列,回测/评估/记账/落盘/指标全部由框架进程独立完成;试验次数改由框架自己数;**未改动任何已锁定阈值**;含 5 个需用户拍板的点 |
 | SBX 骨架目录 | PART | `pending_strategies/` 已落地(外层唯一可写位置);`approved/` 与骨架模板未做 |
 | 外层 Bisheng AI 研究员 | PART | 本机部署(仅 127.0.0.1);工具与工作流 v3、无 LLM 联调工作流已建;**LLM 节点联调待额度**;`tools/bisheng/` |
 | 诊断书 / 候选评估 / 中文报告 | IMPL | `risk/diagnosis.py`、`risk/candidate_eval.py`、`risk/report.py`(纯函数) |
