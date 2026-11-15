@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import ast
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +34,6 @@ import verdict_graph as vg  # noqa: E402
 @pytest.mark.parametrize("path", [
     "scripts/optimize.py",
     "scripts/optimize_15m.py",
-    "scripts/walk_forward_optimizer.py",
     "scripts/fetch_data.py",
     "scripts/import_minute.py",
     "scripts/build_continuous.py",
@@ -48,6 +49,21 @@ def test_research_paths_pass(path: str) -> None:
     """放行:纯研究产物的文件判为研究域。"""
     tier, _ = cd.classify(path)
     assert tier == "research", f"{path} 应判研究域,实际 {tier}"
+
+
+def test_walk_forward_optimizer_is_never_downgrade() -> None:
+    """滚动优化器提供**晋级门槛评估用的窗口与数据文件**,必须不可降级。
+
+    事实链:`research_api.py:887-890` 取 `wf.DATA_FILE` 与 `wf.build_windows()`
+    交给 `run_gate(...)` → `research_gate.py:67` → `ce.evaluate(...)` → `check_gate`。
+    改它 = 改 check_gate 的输入。它还自带一份 `TEST_SEGMENT_START`
+    (与 `scripts/segment_windows.py` 重复的边界实现),同样属方法学闸门面。
+
+    这条是 codex 第 1 轮复核的 H1(High):初版把它留在研究白名单,
+    而同一判据下的 `research_grid.py` 已在不可降级清单里——**同一能力两种分档**。
+    """
+    assert cd.classify("scripts/walk_forward_optimizer.py")[0] == "never_downgrade"
+    assert "scripts/walk_forward_optimizer.py" not in cd.RESEARCH_FILES
 
 
 @pytest.mark.parametrize("path", [
@@ -190,7 +206,9 @@ def _repo_files() -> list[str]:
         capture_output=True, text=True, check=True,
     ).stdout.splitlines()
     status = subprocess.run(
-        ["git", "-C", str(ROOT), "status", "--porcelain"],
+        # `-uall`:不带它,git 会把**未跟踪的整个目录**折叠成一行 `?? newpkg/`,
+        # 目录里的文件就看不见了 —— 新建目录里的文件会绕过所有扫描。
+        ["git", "-C", str(ROOT), "status", "--porcelain", "-uall"],
         capture_output=True, text=True, check=True,
     ).stdout.splitlines()
     extra: list[str] = []
@@ -217,6 +235,43 @@ def test_whitelist_entries_all_exist() -> None:
     missing = [p for p in cd.RESEARCH_FILES
                if p not in tracked and not (ROOT / p).exists()]
     assert not missing, f"研究白名单里有仓库中不存在的文件: {missing}"
+
+
+def test_research_dir_prefixes_are_deliberate() -> None:
+    """研究**目录前缀**清单里的每一条,都必须是有意为之的。
+
+    目录前缀不做「存在性」校验——其中 `pending_strategies/`、`data/research/`、
+    `data/research-control/`、`data/results/` 是 **gitignore 的运行时目录**,
+    在干净的 worktree 里本来就不存在(已实测确认),校验它们会误报。
+
+    但也不能因此放任:一条**写错**的目录前缀(比如 `pendng_strategies/`)会
+    静默失效——该目录下的文件落进默认拒绝(安全方向),可是研究文件会因此
+    拿不到轻流程(可用性损失,且没人会发现)。所以这里校验:
+    ①前缀不是拼错的近似目录;②凡是**已入库**的目录(tools/bisheng/、evidence/、
+    docs/adr/、docs/plans/)必须真的存在。
+    """
+    tracked = set(_repo_files())
+    for prefix in cd.RESEARCH_DIRS:
+        assert prefix.endswith("/"), f"目录前缀应以 / 结尾:{prefix}"
+        # ①已入库的目录必须存在
+        if any(rel.startswith(prefix) for rel in tracked):
+            assert (ROOT / prefix.rstrip("/")).exists(), (
+                f"目录前缀 {prefix} 在仓库里有文件,但目录本身不存在"
+            )
+        # ②拼写近似检查:去掉元音后的名字不得与某个已入库目录撞上
+        stem = prefix.rstrip("/")
+        squashed = stem.replace("a", "").replace("e", "").replace("i", "") \
+                       .replace("o", "").replace("u", "")
+        for other in tracked:
+            other_stem = other.split("/")[0]
+            if other_stem == stem:
+                continue
+            other_squashed = other_stem.replace("a", "").replace("e", "") \
+                                   .replace("i", "").replace("o", "").replace("u", "")
+            if other_squashed == squashed and other_stem != stem:
+                raise AssertionError(
+                    f"目录前缀 {prefix} 可能是 {other_stem} 的拼写错误"
+                )
 
 
 def test_never_downgrade_entries_all_exist() -> None:
@@ -249,10 +304,18 @@ def test_credential_patterns_are_blocked() -> None:
 
 
 def _production_closure() -> set[str]:
-    """算出生产入口(交易运行时)的本地 import 闭包。"""
+    """算出生产入口(交易运行时)的本地 import 闭包。
+
+    **模块解析必须认 `scripts/` 下的裸模块导入**:`scripts/run_headless.py` 里是
+    `import bootstrap`,解析到的是 `scripts/bootstrap.py`——而 bootstrap 负责加载
+    `.env` 的交易凭据、设置时区与导入顺序。只按「仓库根 + 模块名」解析会**漏掉它**,
+    闭包就不完整(实测 17 项 vs 完整 18 项)。
+    解析器与 `tools/verdict_graph.py` 保持同一口径,免得两处各算各的。
+    """
     def mod_to_path(mod: str) -> Path | None:
         p = mod.replace(".", "/")
-        for cand in (ROOT / f"{p}.py", ROOT / p / "__init__.py"):
+        for cand in (ROOT / f"{p}.py", ROOT / p / "__init__.py",
+                     ROOT / "scripts" / f"{p}.py", ROOT / "scripts" / p / "__init__.py"):
             if cand.exists():
                 return cand
         return None
@@ -407,6 +470,33 @@ def test_every_sink_owning_file_is_never_downgrade() -> None:
     )
 
 
+def test_every_gate_input_provider_is_never_downgrade() -> None:
+    """**全仓不变量(数据流那一支)**:判定**输入**的提供者也必须不可降级。
+
+    上一条查的是「自己调用判定点」的文件。这条查的是**另一类**:不调用判定点,
+    但它的**值**被喂进判定点的文件。
+
+    实测例子(codex 第 1 轮复核的 H1,High):`scripts/research_api.py` 从
+    `walk_forward_optimizer` 取 `wf.DATA_FILE`(用哪份数据)、`wf.build_windows()`
+    (在哪个窗口上评估)、`wf.SYMBOL`、`wf.KEY`,再交给 `run_gate(...)` → `check_gate`。
+    改那个模块 = 改 check_gate 的输入,而调用图上看它「谁都不拥有」——
+    所以这条不变量是**独立**的,不是上一条的重复。
+    """
+    files = []
+    for rel in _repo_files():
+        fp = ROOT / rel
+        if fp.exists() and fp.suffix == ".py":
+            files.append(fp)
+    offenders = [
+        rel for rel in sorted(vg.all_gate_input_providers(files))
+        if cd.classify(rel)[0] != "never_downgrade"
+    ]
+    assert not offenders, (
+        "这些文件的值会流进真钱链路的判定点,却没有被判为不可降级: "
+        f"{offenders}"
+    )
+
+
 def test_verdict_graph_detector_itself_is_accurate() -> None:
     """**探针自己也要被检验**:分析器必须既不漏报,也不误报。
 
@@ -450,6 +540,44 @@ def test_verdict_graph_detector_itself_is_accurate() -> None:
         assert not owned, f"{rel} 不应拥有判定点,实际 {sorted(owned)}"
 
 
+@pytest.mark.parametrize("source,expect", [
+    # 直接导入并调用
+    ("from risk.promotion_gate import check_gate\ndef go(c):\n    return check_gate(c)\n", "check_gate"),
+    # 模块别名 + 属性调用
+    ("import risk.promotion_gate as pg\ndef go(c):\n    return pg.check_gate(c)\n", "check_gate"),
+    # **函数别名**:裸名字与判定点对不上,只看裸名字会漏报
+    ("from risk.promotion_gate import check_gate as cg\ndef go(c):\n    return cg(c)\n", "check_gate"),
+])
+def test_verdict_graph_detects_all_call_forms(source: str, expect: str, tmp_path: Path) -> None:
+    """三种调用形态都必须被检出——尤其**函数别名**那一种。
+
+    codex 第 1 轮复核的 H2(High):`from X import f as g` 后调 `g(...)`,
+    裸名字 `g` 与判定点的名字对不上,只看裸名字的版本**漏报**,
+    等于给了一条绕过所有探针的路。
+    """
+    probe = ROOT / "scripts" / "zz_probe_alias.py"
+    probe.write_text(source, encoding="utf-8")
+    try:
+        owned = vg.owned_sinks(probe)
+        assert expect in owned, f"应检出 {expect},实际 {sorted(owned)}"
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_path_with_dotdot_cannot_escape_to_research() -> None:
+    """`..` 不得被用来绕过默认拒绝。
+
+    `data/research/../risk/live_admission.py` 若按字面匹配到 `data/research/` 前缀,
+    就会判成**研究域**——一条绕过所有闸门的路。git 不会产出这种路径,
+    但分档器是命令行工具,路径由人给。
+    """
+    for path in ("data/research/../risk/live_admission.py",
+                 "data/research/../../risk/promotion_gate.py",
+                 "../../etc/passwd"):
+        tier, _ = cd.classify(path)
+        assert tier != "research", f"{path} 不应判研究域,实际 {tier}"
+
+
 # --------------------------------------------------------------------------
 # CLI 层:退出码语义
 # --------------------------------------------------------------------------
@@ -471,6 +599,24 @@ def test_cli_exit_codes(tmp_path: Path) -> None:
     assert empty.returncode == 2
 
 
+def test_cli_survives_non_utf8_console() -> None:
+    """CLI 在**非 UTF-8 控制台**上不得崩溃(codex 第 1 轮复核的 M5)。
+
+    Windows 控制台默认 cp1252,打印中文档位标签会抛 `UnicodeEncodeError`——
+    即 CLAUDE.md 文档里那条命令在本仓库主力开发环境(Windows)直接崩,
+    退出码也变成 1(与「判为执行域」无法区分)。
+    这里用 `PYTHONIOENCODING=cp1252` 复现那个环境。
+    """
+    script = str(ROOT / "tools" / "check_domain.py")
+    env = dict(os.environ, PYTHONIOENCODING="cp1252")
+    proc = subprocess.run([sys.executable, script, "scripts/optimize.py"],
+                          capture_output=True, text=True, env=env,
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, f"cp1252 下崩溃了:\n{proc.stdout}\n{proc.stderr}"
+    assert "UnicodeEncodeError" not in proc.stderr
+    assert "研究域" in proc.stdout
+
+
 def test_cli_reports_reason_per_file(capsys: pytest.CaptureFixture[str]) -> None:
     """报告必须给出理由——分档结论要能被复核,不能是黑盒。"""
     rc = cd.main(["scripts/optimize.py", "risk/live_admission.py"])
@@ -479,3 +625,54 @@ def test_cli_reports_reason_per_file(capsys: pytest.CaptureFixture[str]) -> None
     assert "研究域" in out and "不可降级" in out
     assert "研究白名单单文件" in out
     assert "真钱链路" in out
+
+
+# --------------------------------------------------------------------------
+# 文档里的条数必须是真的
+# --------------------------------------------------------------------------
+
+def test_documented_test_count_matches_reality() -> None:
+    """文档里写的「本文件有 N 条」必须与实际收集到的条数一致。
+
+    **为什么要有这条**:本仓库吃过一次亏——复核期间工作树被并发改动,
+    六处文档的条数当场作废(见 CHANGELOG 「数字口径统一重算」)。
+    本仓库的既有结论是「今后改动测试条数都要重跑一次 collect」——
+    但那靠人记。这条断言把它变成机器保证:
+    **改了本文件(加/删用例)而没同步文档,这里立刻红。**
+    """
+    actual = len(_collect_count())
+    docs = {
+        "CLAUDE.md": ROOT / "CLAUDE.md",
+        "CHANGELOG.md": ROOT / "CHANGELOG.md",
+        "docs/adr/20261114-consequence-domain-tiers.md":
+            ROOT / "docs" / "adr" / "20261114-consequence-domain-tiers.md",
+    }
+    stale: list[str] = []
+    for name, path in docs.items():
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        # 只看提到本文件的那一行
+        for line in text.splitlines():
+            if "test_check_domain.py" not in line:
+                continue
+            for num in re.findall(r"(\d+)\s*条", line):
+                if int(num) != actual:
+                    stale.append(f"{name}: 写的是 {num} 条,实际 {actual} 条")
+    assert not stale, (
+        "文档里的测试条数与实际不符(改了用例数要同步文档):\n  " + "\n  ".join(stale)
+    )
+
+
+def _collect_count() -> list[str]:
+    """收集本文件的用例 id 列表(用 `--collect-only` 数,与 pytest 报告一致)。"""
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_check_domain.py",
+         "--collect-only", "-q", "-p", "no:cacheprovider"],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**os.environ, "PYTHONUTF8": "1"},
+    )
+    ids = [line.strip() for line in proc.stdout.splitlines() if "::" in line]
+    if not ids:
+        raise AssertionError(f"pytest --collect-only 没收集到用例:\n{proc.stdout[-500:]}")
+    return ids

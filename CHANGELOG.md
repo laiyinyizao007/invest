@@ -31,16 +31,33 @@
     另有**数据流**上的耦合 AST 看不见(`risk/dsr.py` / `risk/plateau.py` /
     `risk/trial_ledger.py` 是门槛第 9/8 条的输入),靠人工清单兜住——**图找得到的归图,
     图找不到的归清单**。
-  - **清单有动态探针盯着**(`tests/test_check_domain.py`,82 条):全仓不变量
-    (任何拥有判定点的文件必须判为不可降级,**含尚未入库的新文件**)、研究白名单不得拥有
-    判定点、生产 import 闭包不得与白名单相交、以及**探针自身的准确性夹具**
-    (既不漏报也不误报——误伤的探针等于没有探针)。
-  - **探针经变异验证**:删 `trading/` 条目、把 `risk/live_admission.py` 挪进白名单、
-    把整个 `scripts/` 放进白名单、把 `risk/candidate_eval.py` 挪进白名单、
-    把 `research_sandbox.py` / `backtest_lib.py` 移出不可降级、
-    新建一个直接调 `check_gate` 的文件——**七种变异全部被抓住**。
-  - CI:`research-guard.yml` 的 ruff 清单与测试清单已纳入这三个新文件
-    (否则新代码没有闸门覆盖——「写下了但没人跑」等于没有防线)。
+  - **清单有动态探针盯着**(`tests/test_check_domain.py`,90 条):两道**全仓不变量**
+    ——①**调用关系**:任何自己定义或直接调用判定点的文件必须判为不可降级
+    (**含尚未入库的新文件**);②**数据流**:不调用判定点、但**值被喂进**判定点的模块
+    同样不可降级(实测例子:`research_api.py` 从 `walk_forward_optimizer` 取
+    `wf.DATA_FILE` / `wf.build_windows()`,改它 = 改门槛的评估窗口与数据)。
+    另有:研究白名单不得拥有判定点、生产 import 闭包不得与白名单相交、
+    以及**探针自身的准确性夹具**(既不漏报也不误报——误伤的探针等于没有探针)。
+  - **探针经变异验证**(九种清单改动,每次都被抓住,条数实测):删 `trading/` 条目、
+    把 `risk/live_admission.py` / `risk/candidate_eval.py` / `walk_forward_optimizer.py` /
+    `optimize.py` 挪进白名单、把整个 `scripts/` 放进白名单、
+    把 `research_sandbox.py` / `backtest_lib.py` / `walk_forward_optimizer.py`
+    移出不可降级、新建一个直接调 `check_gate` 的文件。
+  - CI:`research-guard.yml` 的 ruff 清单与测试清单已纳入这三个新文件,
+    另加一步**分档器冒烟**(真实 CLI,`PYTHONIOENCODING=cp1252` + 退出码语义)——
+    只有单元测试的话,CLI 那条路径在 CI 上从没被跑过。
+  - **第 1 轮 codex 复核的处置**(2 High / 5 Medium / 6 Low,逐条独立复现后):
+    ①`walk_forward_optimizer.py` 曾被判研究域,但它提供门槛评估的窗口与数据文件
+    ——已移入不可降级,并**新增数据流探针**自动覆盖这一整类,不再依赖人手写断言;
+    ②`verdict_graph` 对 `from X import f as g` 后调 `g(...)` 的形态**漏报**——已修
+    (裸名字分支查别名表),并补了三种调用形态的夹具;
+    ③未跟踪**目录**里的文件不被扫描(`git status` 缺 `-uall`)——已改;
+    ④「生产闭包不相交」的模块解析器不认 `scripts/` 裸模块导入,`scripts/bootstrap.py`
+    漏在闭包外——已统一口径(闭包 17 → 18 项);
+    ⑤文档三处不实(条数、校验范围、点名了没有该调用的文件)——已订正;
+    ⑥分档判定在 CI 里没有机器强制点——已加冒烟关卡;
+    ⑦Windows cp1252 控制台上 CLI 直接崩(CLAUDE.md 文档的命令在主力开发环境不可用)
+    ——已加 stdout/stderr 重配,并补了非 UTF-8 控制台的回归用例。
   - **本决策不削弱任何一道代码内的防线,也不改它们的阈值**;它只减少改动的**审批成本**,
     不减少缺陷的**检出能力**。
 

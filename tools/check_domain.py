@@ -36,11 +36,28 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import posixpath
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _reconfigure_stdio() -> None:
+    """把 stdout/stderr 设成 utf-8 + errors="replace"。
+
+    **为什么必须做**:Windows 控制台默认是 cp1252,打印中文档位标签会抛
+    `UnicodeEncodeError`——即 CLAUDE.md 文档里那条命令在本仓库主力开发环境
+    (Windows)直接崩,退出码也变成 1(与「判为执行域」无法区分)。
+    本仓库已有同样的处理(`scripts/research_console.py::reconfigure_stdio`、
+    `scripts/bootstrap.py`),这里沿用同一口径。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass  # 非 TextIO(被 pytest 捕获等)时跳过
 
 # --------------------------------------------------------------------------
 # 不可降级清单:改它能改变真钱链路的结论。
@@ -79,6 +96,11 @@ NEVER_DOWNGRADE = (
     # 名字像"研究",但算出的东西直接喂进 check_gate
     "scripts/research_gate.py",
     "scripts/research_grid.py",
+    # 滚动优化器:它提供**晋级门槛评估用的窗口与数据文件**
+    # (research_api.py:887-890 取 wf.DATA_FILE / wf.build_windows() 后交给 run_gate),
+    # 改它 = 改 check_gate 的输入。它还自带一份 TEST_SEGMENT_START(与
+    # scripts/segment_windows.py 重复的边界实现),所以同样属于「方法学闸门」面。
+    "scripts/walk_forward_optimizer.py",
 
     # --- 回测引擎:跑完要核对风控底线有没有被改写 ---
     "scripts/backtest_lib.py",
@@ -134,7 +156,6 @@ NEVER_DOWNGRADE = (
     "scripts/status_server.py",
     "scripts/unattended_report.py",
     "scripts/bootstrap.py",     # 导入顺序与时区:改它会影响所有脚本的运行环境
-    "config/risk_manager_setting.json",
 
     # --- 模型可见通道:工具目录恰为三项是锁死的不变量 ---
     "tools/research_mcp/",
@@ -214,9 +235,10 @@ RESEARCH_DIRS = (
 # 单文件
 RESEARCH_FILES = (
     # 选参与优化(只产出候选参数,不判定门槛是否通过)
+    # 注意:walk_forward_optimizer.py **不在**这里——它提供门槛评估用的窗口与
+    # 数据文件(见 NEVER_DOWNGRADE 里的说明)。
     "scripts/optimize.py",
     "scripts/optimize_15m.py",
-    "scripts/walk_forward_optimizer.py",
     # 数据准备(离线)
     "scripts/build_continuous.py",
     "scripts/calc_ladder_eta.py",
@@ -229,10 +251,9 @@ RESEARCH_FILES = (
     "README.md",
 )
 
-# 白名单里的例外:docs/web/ 是状态面板的前端与契约,面板能反映交易实况 → 执行域。
-RESEARCH_DIR_EXCLUSIONS = (
-    "docs/web/",
-)
+# 说明:`docs/` **不是**研究目录——只有 `docs/adr/` 与 `docs/plans/` 是。
+# 所以 `docs/web/`(状态面板的前端与契约)不需要「例外」机制:它本来就落到默认拒绝,
+# 即执行域。这里显式列出它,只是为了报告里能说得出**为什么**是执行域。
 
 # 执行域里其余的敏感面:不是「不可降级」(改它们不必都算削弱防线),
 # 但它们是交易/部署面,默认落在执行域即可,单独列出仅为报告可读性。
@@ -247,6 +268,7 @@ EXECUTION_NOTES = (
     "tools/build_static_manifest.py",
     "tools/repro_logout_crash.py",
     "tools/simnow_gui.ps1",
+    "docs/web/",                # 状态面板的前端与契约(面板能反映交易实况)
     "docs/live-readiness.md",
     "docs/runbook-simnow.md",
     "docs/runbook-market-recording.md",
@@ -259,10 +281,23 @@ EXECUTION_NOTES = (
 
 
 def _norm(path: str) -> str:
-    """统一成仓库内相对路径、正斜杠、无前导 ./。"""
+    """统一成仓库内相对路径、正斜杠、无前导 ./。
+
+    **必须解析 `..`**:否则 `data/research/../risk/live_admission.py` 会按字面
+    匹配到 `data/research/` 前缀而被判成**研究域**——一条绕过所有闸门的路。
+    git 不会产出这种路径,但分档器是命令行工具,路径由人给。
+    解析后若**逃出仓库**,一律判执行域(默认拒绝)。
+    """
     p = path.strip().replace("\\", "/")
     if p.startswith("./"):
         p = p[2:]
+    if not p:
+        return p
+    # posixpath.normpath 会消掉 `..` 与重复斜杠
+    p = posixpath.normpath(p)
+    if p == ".." or p.startswith("../"):
+        # 逃出仓库:交回 classify() 的默认拒绝分支
+        return p
     return p
 
 
@@ -290,10 +325,6 @@ def classify(path: str) -> tuple[str, str]:
     for prefix in NEVER_DOWNGRADE:
         if _matches(rel, prefix):
             return "never_downgrade", f"真钱链路:{prefix}"
-
-    for prefix in RESEARCH_DIR_EXCLUSIONS:
-        if _matches(rel, prefix):
-            return "execution", f"研究白名单例外:{prefix}"
 
     for prefix in RESEARCH_DIRS:
         if _matches(rel, prefix):
@@ -331,7 +362,9 @@ def git_changed_paths(base: str) -> list[str]:
             capture_output=True, text=True, check=True,
         ).stdout.splitlines()
         status = subprocess.run(
-            ["git", "-C", str(ROOT), "status", "--porcelain"],
+            # `-uall`:不带它,git 会把**未跟踪的整个目录**折叠成一行 `?? newpkg/`,
+            # 目录里的文件就看不见了 —— 新建目录里的文件会绕过所有扫描。
+            ["git", "-C", str(ROOT), "status", "--porcelain", "-uall"],
             capture_output=True, text=True, check=True,
         ).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -350,6 +383,7 @@ def git_changed_paths(base: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _reconfigure_stdio()
     parser = argparse.ArgumentParser(
         description="按后果域给变更文件分档(研究域 / 不可降级 / 执行域)",
     )

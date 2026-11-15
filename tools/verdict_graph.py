@@ -177,11 +177,24 @@ def _resolved_name(info: ModuleInfo, desc: tuple[str, ...]) -> str | None:
 
     `rs.screen_source(...)` → "screen_source"(rs 是模块别名,属性名就是函数名)
     `from risk.promotion_gate import check_gate` → "check_gate"
+    `from risk.promotion_gate import check_gate as cg` → "check_gate"
     `const.check_instance_state(...)` → "check_instance_state"
     `self.foo()` → None(接收者不是裸名字,无法确定)
+
+    **别名那一支不能省**:`from X import f as g` 之后调的是 `g(...)`,
+    裸名字 `g` 与判定点的名字对不上,只看裸名字会**漏报**——
+    实测过:`from risk.promotion_gate import check_gate as cg` + `cg(c)`
+    在漏报版里 `owned_sinks` 返回空,等于给了一条绕过所有探针的路。
     """
     if desc[0] == _CALL_NAME:
-        return desc[1]
+        name = desc[1]
+        # 先看它是不是某个「函数别名」(from X import f as g)
+        alias = info.aliases.get(name)
+        if alias is not None:
+            _target, func = alias
+            if func is not None:
+                return func
+        return name
     if desc[0] == _CALL_ATTR:
         alias_name, attr = desc[1], desc[2]
         alias = info.aliases.get(alias_name)
@@ -222,13 +235,80 @@ def owned_sinks(path: Path) -> set[str]:
     return hits
 
 
-def imported_modules(path: Path) -> set[str]:
-    """这个文件 import 的本地模块(仓库相对路径)。"""
+# --------------------------------------------------------------------------
+# 数据流:门槛**输入**的提供者
+# --------------------------------------------------------------------------
+#
+# 只认调用关系会漏掉一整类耦合:某个模块**不调用**判定点,但它的**值**被喂进判定点。
+# 实测例子(codex 第 1 轮复核的 H1):`scripts/research_api.py` 从
+# `walk_forward_optimizer` 取 `wf.DATA_FILE`(用哪份数据)与 `wf.build_windows()`
+# (在哪个窗口上评估),再交给 `run_gate(...)` → `check_gate`。
+# 改那个模块 = 改 check_gate 的输入,而调用图上看它「谁都不拥有」。
+#
+# 判据:**一个拥有判定点的文件,从某个 import 进来的模块上读取了属性**(如 `wf.DATA_FILE`),
+# 那么那个模块就是判定输入的提供者,必须与判定点同级受保护。
+
+
+def _attribute_reads(info: ModuleInfo) -> set[tuple[Path, str]]:
+    """这个文件从 import 进来的模块上读了哪些属性(只算「读取」)。"""
+    reads: set[tuple[Path, str]] = set()
+    tree = _parse(info.path)
+    if tree is None:
+        return reads
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
+            continue
+        base = node.value
+        if not isinstance(base, ast.Name):
+            continue
+        alias = info.aliases.get(base.id)
+        if alias is None:
+            continue
+        target, func = alias
+        if func is not None:
+            continue  # 函数别名上取属性,不是模块属性
+        reads.add((target, node.attr))
+    return reads
+
+
+def gate_input_providers(path: Path) -> set[str]:
+    """判定输入的提供者(仓库相对路径):从它们手里取的值会流进某个判定点。"""
     info = _info(path)
+    if not owned_sinks(path):
+        return set()
     out: set[str] = set()
-    for _alias, (target, _func) in info.aliases.items():
+    for target, _attr in _attribute_reads(info):
         try:
             out.add(target.relative_to(ROOT).as_posix())
         except ValueError:
             continue
     return out
+
+
+def all_gate_input_providers(paths: list[Path]) -> set[str]:
+    """在给定的文件集合里找出所有判定输入的提供者(迭代到不动点)。
+
+    **只看生产文件**:测试用例读某个模块的属性(如 `tests/test_plateau.py` 读
+    `optimize.smoothed`)是为了断言,不是把它的值喂进判定点。测试文件本来就已经
+    整片在不可降级清单里(改断言 = 削弱检出能力),不需要这条规则重复覆盖。
+    """
+    providers: set[str] = set()
+    frontier = []
+    for fp in paths:
+        try:
+            rel = fp.relative_to(ROOT).as_posix()
+        except ValueError:
+            continue  # 不在仓库内(如 .github 下的脚本)
+        if not rel.startswith("tests/"):
+            frontier.append(fp)
+    for _ in range(5):  # 迭代上限,防环
+        grew = False
+        for fp in frontier:
+            for rel in gate_input_providers(fp):
+                if rel not in providers:
+                    providers.add(rel)
+                    grew = True
+        if not grew:
+            break
+        frontier = [ROOT / rel for rel in providers if (ROOT / rel).exists()]
+    return providers

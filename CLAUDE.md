@@ -36,17 +36,24 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 
 ### 清单靠什么保证不失效
 
-清单是手写的,会随仓库演进而失准。所以有三道**动态探针**盯着
-(`tests/test_check_domain.py`,82 条):
+清单是手写的,会随仓库演进而失准。所以有四道**动态探针**盯着
+(`tests/test_check_domain.py`,90 条):
 
-1. **全仓不变量**:任何**自己定义或直接调用**了真钱链路判定点的文件
+1. **全仓不变量(调用关系)**:任何**自己定义或直接调用**了真钱链路判定点的文件
    (`check_gate` / `check_live_admission` / `write_approval` / `record_approval` /
    `screen_source` / `check_instance_state` / `check_class`),必须被判为不可降级。
    新建一个文件直接调 `check_gate`,这里立刻红。
    判定由 `tools/verdict_graph.py` 做**函数级**分析(纯标准库 AST)。
-2. **白名单不得拥有判定点**:与上一条互为反面。研究域文件只能产出结论。
-3. **探针自己要被检验**:分析器既不漏报也不误报——用一组人工核对的期望值夹住它。
+2. **全仓不变量(数据流)**:不调用判定点、但**值被喂进**判定点的模块,同样必须不可降级。
+   实测例子:`research_api.py` 从 `walk_forward_optimizer` 取 `wf.DATA_FILE`
+   (用哪份数据)与 `wf.build_windows()`(在哪个窗口上评估)——改它 = 改门槛的输入。
+3. **白名单不得拥有判定点**:与第 1 条互为反面。研究域文件只能产出结论。
+4. **探针自己要被检验**:分析器既不漏报也不误报——用一组人工核对的期望值夹住它。
    尤其要挡住「经助手间接到达就把助手的判定算到调用者头上」的误伤。
+
+> 这四道探针本身经**变异验证**(九种清单改动,每次都被抓住,条数实测)。
+> 「写下了但没人跑」等于没有防线——所以 CI 里既有清单的 ruff/测试覆盖,
+> 也有**分档器自身的冒烟关卡**(真实 CLI,非 UTF-8 控制台 + 退出码语义)。
 
 ### 分档里最容易搞错的几处
 
@@ -59,17 +66,19 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 | `scripts/research_api.py` / `research_approval_server.py` / `research_gateway.py` | 批准链与筛查的入口 |
 | `risk/candidate_eval.py` | 组装门槛输入并**直接调** `check_gate` |
 | `risk/dsr.py` / `risk/plateau.py` / `risk/trial_ledger.py` | 门槛第 9/8 条与去通胀次数的**输入** |
+| `scripts/walk_forward_optimizer.py` | 提供门槛评估用的**窗口与数据文件**(`wf.DATA_FILE` / `wf.build_windows()`) |
 | `scripts/backtest_lib.py` | 回测跑完**核对风控底线**有没有被改写 |
 | `scripts/segment_windows.py` / `segment_ledger.py` | 划定测试段边界、登记「只看一次」 |
 | `risk/report.py` / `risk/diagnosis.py` | 人类读的判定表述(「通过/未通过」)与诊断口径 |
 
-反过来,`scripts/optimize*.py`、`scripts/walk_forward_optimizer.py`、
-`scripts/calc_ladder_eta.py`、`scripts/fetch_data.py`、`scripts/import_minute.py`、
+反过来,`scripts/optimize*.py`、`scripts/calc_ladder_eta.py`、
+`scripts/fetch_data.py`、`scripts/import_minute.py`、
 `scripts/build_continuous.py`、`pending_strategies/*` 只产出结论,判研究域。
 
-> 注:`tools/verdict_graph.py` 认的是**调用关系**,认不出**数据流**。
-> `risk/dsr.py` 自己不调任何判定点,但它的输出是门槛第 9 条的输入——
-> 这类耦合靠上面的人工清单兜住。**图找得到的归图,图找不到的归清单**,两层都要有。
+> 注:`tools/verdict_graph.py` 认的是**调用关系**与**直接数据流**(拥有判定点的文件
+> 从 import 进来的模块上读属性),认不出更绕的耦合——`risk/dsr.py` 这类纯函数
+> 的输出虽是门槛输入,但它不与判定点直接相连,靠上面的人工清单兜住。
+> **图找得到的归图,图找不到的归清单**,两层都要有。
 
 ---
 
@@ -153,11 +162,11 @@ python tools/check_domain.py --diff origin/main  # 直接取 git 改动(含未�
 
 8. **削弱研究脚本里的防线调用(机器判不了,靠人/代理判断)**:
    研究域文件虽然不拥有判定点,但它们**调用**着防线。改动若**移除或绕过**这些调用,
-   等于削弱防线,即使文件仍在研究域,也要按执行域处理。已知需要盯的两处:
-   - `scripts/optimize*.py` / `walk_forward_optimizer.py` 里的 `segment_ledger.check()` /
+   等于削弱防线,即使文件仍在研究域,也要按执行域处理。已知需要盯的:
+   - `scripts/optimize.py` / `scripts/optimize_15m.py` 里的 `segment_ledger.check()` /
      `record()`——去掉它,测试段就能被再看一次(多重检验偏差)。
-     (注:`segment_ledger.record()` 内部会先调 `check()`,所以删掉调用点上的 `check()`
-     仍然 fail-closed;但删掉 `record()` 调用本身就会漏登记。)
+     (注:`segment_ledger.record()` 内部会先调 `check()`——已实测确认——
+     所以删掉调用点上的 `check()` 仍然 fail-closed;但删掉 `record()` 调用本身就会漏登记。)
    - `scripts/research_sandbox.py` 相关的筛查调用——但那个文件本来就不可降级。
 
    判定方法:这次改动有没有**减少**对 `check_gate` / `record_approval` / `screen_source` /

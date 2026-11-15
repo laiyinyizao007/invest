@@ -113,12 +113,17 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
    **动态探针**兜住:测试真的算出生产入口的 import 闭包,断言它与研究白名单**不相交**。
    依赖图不会随仓库演进而失准,手写清单会。
 
-2. **判定点分析只认调用关系,认不出数据流。** `risk/dsr.py` 自己不调用任何判定点,
-   但它的输出是晋级门槛第 9 条的输入;改它能直接放行一个不合格候选。
-   这类耦合**只能靠人工清单**(`tools/check_domain.py` 的 `NEVER_DOWNGRADE`)兜住。
-   缓解:人工清单里逐条写了理由;新增耦合时要人判断。
-   **残余**:新引入的数据流耦合(某人写了个新模块,其输出被喂进门槛)不会被自动发现,
-   要靠 codex 复核与全仓不变量(拥有判定点即不可降级)之外的第三道眼力。
+2. **判定点分析认得出调用关系与「直接数据流」,认不出更绕的耦合。**
+   - **调用关系**:文件自己定义或直接调用判定点 → `owned_sinks` 认得。
+   - **直接数据流**:拥有判定点的文件从某个 import 进来的模块上**读属性**
+     (如 `research_api.py` 读 `wf.DATA_FILE`)→ `all_gate_input_providers` 认得。
+     这一支是第 1 轮 codex 的 H1 逼出来的。
+   - **认不出的**:值经**第三个**模块中转才流进判定点(被拥有判定点的文件不直接读它);
+     以及 `risk/dsr.py` / `risk/plateau.py` / `risk/trial_ledger.py` 这类
+     **纯函数**——它们不调判定点,输出却是门槛第 9/8 条的输入,靠人工清单兜住。
+   缓解:人工清单里逐条写了理由;`CLAUDE.md` §4 规则 7/8 兜住「文档声明防线」
+   与「削弱研究脚本里的防线调用」两类内容判据;G8 第一轮 codex 复核是第三道眼力。
+   **残余**:新引入的、绕一道中转的数据流耦合,不会被自动发现。
 
 3. **「削弱型改动」这条规则只能部分机械化。** 路径判据抓得住「改了防线文件」,
    抓不住「在一个研究文件里悄悄放宽某项检查」。例如在 `risk/diagnosis.py` 里把某个
@@ -135,8 +140,13 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
 
 5. **清单会过时。** 新的研究文件要进白名单必须改 `tools/check_domain.py`。
    这有一道好处(改清单 = 执行域改动 = 要复核),也有一个坏处(新增研究文件多一步手续)。
-   动态探针会持续检查白名单路径是否真实存在,防止清单里躺着已删除的文件——
+   动态探针会持续检查白名单里的**单文件**是否真实存在,防止清单里躺着已删除的文件——
    否则新建同名文件会自动获得研究域待遇。
+   **目录前缀**(`RESEARCH_DIRS`)不做存在性校验:其中 `pending_strategies/`、
+   `data/research/`、`data/research-control/`、`data/results/` 是 **gitignore 的
+   运行时目录**,在干净的 worktree 里本来就不存在(已实测确认),校验它们会误报。
+   代价:一个已删除的目录前缀会静默留着,直到有人往里放文件——但那属于
+   「新建研究文件」,按上面那条本来就要改清单。
 
 6. **本决策只管流程,不管代码。** 它减少的是改动的**审批成本**,不是缺陷的**检出能力**。
    代码内的防线与 CI 闸门一个都没动。
@@ -144,28 +154,75 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
 ## 实现状态
 
 - `tools/check_domain.py`:仅标准库,不 import bootstrap(不装交易环境也能跑)。
+  打印前把 stdout/stderr 重配成 utf-8 + `errors="replace"`——Windows 控制台默认
+  cp1252,不改会直接抛 `UnicodeEncodeError`(codex 第 1 轮的 M5)。
 - `tools/verdict_graph.py`:判定点的**函数级** AST 分析(纯标准库)。
   判据是**直接归属**(自己定义或直接调用),不是传递可达——
   传递可达会把助手的判定算到调用者头上(误伤),而**误伤的探针等于没有探针**。
-- `tests/test_check_domain.py`:82 条,含双向探针(放行 + 拦截)、
-  全仓不变量、探针自身的准确性夹具。
+  另有一支**数据流**分析(见下「已知局限」第 2 条)。
+- `tests/test_check_domain.py`:**90 条**,含双向探针(放行 + 拦截)、
+  全仓不变量(调用关系 + 数据流两支)、探针自身的准确性夹具。
 - `CLAUDE.md`:本仓库的分档规则与两档流程对照表。
-- CI:`research-guard.yml` 的 ruff 清单与测试清单**已**纳入这三个新文件
-  (否则新代码没有闸门覆盖——与本仓库历次教训一致:「写下了但没人跑」等于没有防线)。
+- CI:`research-guard.yml` 的 ruff 清单与测试清单**已**纳入这三个新文件;
+  另加一步**分档器冒烟**(用 `PYTHONIOENCODING=cp1252` 跑真实 CLI,验退出码语义)
+  ——只有单元测试的话,CLI 那条路径(--diff 读 git、打印中文、按退出码表态)
+  在 CI 上从没被跑过(codex 第 1 轮的 M4)。
 
 ### 探针的变异验证
 
-探针本身会被证伪,否则它只是一段好看的断言。已做的变异(每次都被抓住):
+探针本身会被证伪,否则它只是一段好看的断言。已做的变异(每次都被抓住,
+条数由 `pytest` 的 FAILED 行数实测,不是估的):
 
-| 变异 | 被哪些测试抓住 |
+| 变异 | 变红的测试条数 |
 |---|---|
-| 删掉 `trading/` 的不可降级条目 | `test_never_downgrade_paths_are_blocked` |
-| 把 `risk/live_admission.py` 挪进研究白名单 | 7 条(含生产闭包不相交那条) |
-| 把整个 `scripts/` 放进研究白名单 | `test_unknown_and_excluded_paths_are_blocked` 等 |
-| 把 `risk/candidate_eval.py` 挪进研究白名单 | `test_research_whitelist_owns_no_verdict_sink` 等 4 条 |
-| 把 `scripts/research_sandbox.py` 移出不可降级 | 3 条(含全仓不变量) |
-| 把 `scripts/backtest_lib.py` 移出不可降级 | 3 条(含全仓不变量) |
-| 新建一个直接调 `check_gate` 的文件(不入库) | `test_every_sink_owning_file_is_never_downgrade` |
+| 删掉 `trading/` 的不可降级条目 | 1 |
+| 把 `risk/live_admission.py` 挪进研究白名单 | 5 |
+| 把 `risk/candidate_eval.py` 挪进研究白名单 | 3 |
+| 把 `scripts/research_sandbox.py` 移出不可降级 | 4 |
+| 把 `scripts/backtest_lib.py` 移出不可降级 | 3 |
+| 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | 2 |
+| 把整个 `scripts/` 放进研究白名单 | 6 |
+| 把 `walk_forward_optimizer.py` 挪进研究白名单(H1 类:数据流) | 2 |
+| 把 `optimize.py` 挪进研究白名单 | 6 |
+| 新建一个直接调 `check_gate` 的文件(不入库) | 1(`test_every_sink_owning_file_is_never_downgrade`) |
 
 最后一条尤其重要:它证明这条不变量对**尚未入库的新文件**也生效
-(扫描含 `git status` 的未跟踪文件,而不只是 `git ls-files`)。
+(扫描含 `git status --porcelain -uall` 的未跟踪文件,而不只是 `git ls-files`)。
+**`-uall` 不可省**:不带它,git 会把未跟踪的整个目录折叠成一行 `?? newpkg/`,
+目录里的文件就看不见了(codex 第 1 轮的 M1)。
+
+## 第 1 轮 codex 复核的发现与处置
+
+本 ADR 与实现经 codex CLI 第 1 轮复核(2026-11-14)。发现 2 条 High、5 条 Medium、
+6 条 Low。**逐条独立复现后**的处置:
+
+| 编号 | 问题 | 处置 |
+|---|---|---|
+| **H1** | `scripts/walk_forward_optimizer.py` 判研究域,但它的 `DATA_FILE` / `build_windows()` 经 `research_api.py:887-890` → `run_gate` → `check_gate` **决定门槛的评估窗口与数据** | 已移入不可降级;并新增**数据流探针**(见下)自动覆盖这一类 |
+| **H2** | `verdict_graph` 对 `from X import f as g` 后调 `g(...)` 的形态**漏报** | 已修(裸名字分支查别名表);补了三种调用形态的夹具 |
+| **M1** | 未跟踪**目录**里的文件不被扫描(`git status` 缺 `-uall`) | 已改 `-uall`(两处) |
+| **M2** | 「生产闭包不相交」那条的模块解析器不认 `scripts/` 裸模块导入,`scripts/bootstrap.py` 漏在闭包外 | 已统一口径;闭包从 17 项变 18 项 |
+| **M3** | 文档三处不实(变异条数、白名单存在性校验范围、点名了没有该调用的文件) | 已逐条订正 |
+| **M4** | 分档判定在 CI 里没有任何机器强制点 | 已加分档器冒烟关卡 |
+| **M5** | Windows cp1252 控制台上 CLI 直接崩 | 已加 stdout/stderr 重配;补了 `PYTHONIOENCODING=cp1252` 的回归用例 |
+
+### H1 引出的能力升级:数据流探针
+
+H1 暴露的是**一整类**耦合:模块**不调用**判定点,但它的**值**被喂进判定点。
+只认调用关系永远抓不到这一类。
+
+于是新增 `verdict_graph.all_gate_input_providers`:在**拥有判定点**的文件里,
+找出「从 import 进来的模块上读取的属性」(如 `wf.DATA_FILE`),被读到的那些模块
+就是判定输入的提供者,必须与判定点同级受保护。
+
+实测结果(生产文件,10 个):`walk_forward_optimizer.py`、`research_api.py`、
+`research_sandbox.py`、`research_config.py`、`research_console.py`、
+`research_gateway.py`、`segment_windows.py`、`segment_ledger.py`、
+`constitution.py`、`bootstrap.py`、`dashboard/safe.py`。
+新增不变量 `test_every_gate_input_provider_is_never_downgrade` 自动覆盖这一类——
+**不再依赖人手写一条断言去钉某个文件**。
+
+**这一支仍然有边界**:它只看「拥有判定点的文件」读到的属性。
+若某个值经**第三个**模块中转才流进判定点(而不是被拥有判定点的文件直接读到),
+这一支看不见。实测 `research_api.py` 是直接读 `wf.DATA_FILE` 的,所以抓到了。
+

@@ -141,3 +141,24 @@ jobs:
             tests/test_research_mcp.py \
             tests/test_research_gate.py \
             tests/test_research_grid.py
+
+      # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮复核的 M4)。
+      #
+      # 为什么要有这一步:上面那一步只是**测**分档器(单元测试 + 探针),
+      # 但分档器作为 CLI 的那条路径——`--diff` 读 git、打印中文档位、
+      # 按退出码表态——**没有任何 CI 跑过**。而 CLAUDE.md 文档里给出的命令
+      # 正是这条路径(codex 的 M5:它在 Windows cp1252 控制台上直接崩,
+      # 退出码变成 1,与「判为执行域」无法区分)。
+      #
+      # 这一步跑的是**真实 CLI**:非 UTF-8 控制台下不得崩溃、退出码语义
+      # (0 研究域 / 1 执行域 / 2 环境不可用)必须对得上。
+      - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码)
+        run: |
+          # PYTHONIOENCODING=cp1252 复现 Windows 默认控制台:崩了就红。
+          PYTHONIOENCODING=cp1252 python tools/check_domain.py scripts/optimize.py
+          # 全仓库扫一遍:必须能跑完,且退出码非 2(2 = 环境不可用 = fail-closed)。
+          python tools/check_domain.py --diff origin/main || rc=$?
+          if [ "${rc:-0}" = "2" ]; then
+            echo "分档器返回 2(环境不可用)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          exit 0
