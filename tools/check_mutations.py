@@ -337,7 +337,7 @@ def _verify_adr(results: list[tuple[str, int]], adr_path: Path | None = None) ->
         for line in bad:
             print(f"  - {line}", file=sys.stderr)
         return 1
-    print(f"ADR 里的变异条数与实测一致({matched} 行全部对上)。")
+    print(f"ADR 里列出的变异集合与脚本一致({matched} 行全部对上)。")
     return 0
 
 

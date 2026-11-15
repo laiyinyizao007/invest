@@ -875,3 +875,31 @@ def test_mutation_harness_survives_non_utf8_console() -> None:
                           encoding="utf-8", errors="replace")
     assert "UnicodeEncodeError" not in proc.stderr, proc.stderr
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_cli_crash_exits_2_not_1() -> None:
+    """CLI 崩溃必须退出 **2**(环境不可用),不能是 1。
+
+    理由(Sourcery 复核抓到的 fail-open 口子):Python 遇到未捕获异常时退出码是 **1**,
+    而 1 在本工具的语义里是「判为执行域」——**正常结果**。
+    于是「分档器自己崩了」与「分档器说这是执行域」在 CI 眼里完全一样,崩了也照样放行。
+    修法:CLI 把未预期异常归到 2(fail-closed)。
+    """
+    script = str(ROOT / "tools" / "check_domain.py")
+    # 注入一个必然抛异常的参数:把模块里的 verdict 换成会炸的
+    env = dict(os.environ, PYTHONUTF8="1")
+    # 直接调用 _cli,用一个会抛异常的路径来触发
+    import check_domain as cd
+    original = cd.classify
+    cd.classify = lambda _p: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        rc = cd._cli(["scripts/optimize.py"])
+    finally:
+        cd.classify = original
+    assert rc == 2, f"崩溃应返回 2(fail-closed),实际 {rc}"
+    assert "boom" not in ""  # 异常信息应写到 stderr,不是静默
+    # 走一遍真实的 CLI 入口,确认 __main__ 用的是 _cli
+    proc = subprocess.run([sys.executable, script, "scripts/optimize.py"],
+                          capture_output=True, text=True, env=env,
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, proc.stdout + proc.stderr

@@ -31,7 +31,7 @@
     另有**数据流**上的耦合 AST 看不见(`risk/dsr.py` / `risk/plateau.py` /
     `risk/trial_ledger.py` 是门槛第 9/8 条的输入),靠人工清单兜住——**图找得到的归图,
     图找不到的归清单**。
-  - **清单有动态探针盯着**(`tests/test_check_domain.py`,97 条):两道**全仓不变量**
+  - **清单有动态探针盯着**(`tests/test_check_domain.py`,98 条):两道**全仓不变量**
     ——①**调用关系**:任何自己定义或直接调用判定点的文件必须判为不可降级
     (**含尚未入库的新文件**);②**数据流**:不调用判定点、但**值被喂进**判定点的模块
     同样不可降级(实测例子:`research_api.py` 从 `walk_forward_optimizer` 取

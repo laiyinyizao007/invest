@@ -438,5 +438,23 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if overall == "research" else 1
 
 
+def _cli(argv: list[str] | None = None) -> int:
+    """CLI 入口:**任何未预期的异常都返回 2(环境不可用),而不是 1。**
+
+    为什么:Sourcery 复核抓到的一个 fail-open 口子——Python 遇到未捕获异常时
+    退出码是 **1**,而 1 在本工具的语义里是「判为执行域」(正常结果)。
+    于是「分档器自己崩了」与「分档器说这是执行域」在 CI 眼里**完全一样**,
+    崩了也照样放行。这里把崩溃归到 2(fail-closed),语义才自洽:
+    **退出码 1 = 我确实判出了执行域;退出码 2 = 我没能给出判断。**
+    """
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        return 2
+    except Exception as exc:  # noqa: BLE001 — 这里就是要兜住一切
+        print(f"分档器异常退出(fail-closed): {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_cli())

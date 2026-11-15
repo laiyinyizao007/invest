@@ -167,7 +167,7 @@ jobs:
       #   2 = 环境不可用(fail-closed)——**只有这一种**该让关卡失败。
       # 第 2 轮复核指出:若把「没有改动」也算 2,push 到 main 时(base==HEAD、
       # 工作树干净)就会**永久变红**。已把「没有改动」分出来,返回 0。
-      - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码)
+      - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码 + 输出自证)
         run: |
           set -e
           # PYTHONIOENCODING=cp1252 复现 Windows 默认控制台:崩了就红。
@@ -176,9 +176,20 @@ jobs:
           # 该走完整流程——这里只要求命令能跑通,不做流程判定)。
           # 2 = 环境不可用(fail-closed),那才是失败。
           rc=0
-          python tools/check_domain.py --diff "origin/${{ github.base_ref || 'main' }}" || rc=$?
+          out=$(python tools/check_domain.py --diff "origin/${{ github.base_ref || 'main' }}" 2>&1) || rc=$?
+          echo "$out"
           if [ "$rc" = "2" ]; then
             echo "分档器返回 2(环境不可用)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          # **必须看到「总判定:」这一行**,否则不能算「它给出了判断」。
+          # 只看退出码是不够的:Sourcery 复核抓到过一个 fail-open 口子——
+          # Python 遇到未捕获异常时退出码也是 **1**,而 1 在本工具的语义里
+          # 是「判为执行域」(正常结果)。于是「分档器自己崩了」与
+          # 「分档器说这是执行域」在 CI 眼里完全一样,崩了也照样放行。
+          # 两道防线:①CLI 现在把未预期异常归到 2(见 tools/check_domain.py::_cli);
+          # ②这里再要求输出里有结论行,崩了就没有。
+          if ! echo "$out" | grep -q "总判定:"; then
+            echo "分档器没有给出判定结论(崩溃?退出码=$rc)——按 fail-closed 处理,本关卡失败"; exit 1
           fi
           echo "分档器退出码=$rc(0/1 均正常;2 才是环境不可用)"
           exit 0
