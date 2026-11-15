@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -517,6 +518,23 @@ def test_verdict_graph_detector_itself_is_accurate() -> None:
         "scripts/run_headless.py": "check_live_admission",
         "scripts/record_promotion.py": "write_approval",
     }
+    # **每一个判定点都要被点名**:第 3 轮 codex 的 Medium-1 实测——
+    # 从 VERDICT_SINKS 里删掉 `check_class`,整套测试 **0 条失败**,
+    # 因为上面的夹具没覆盖它。判定点被静默删掉 = 一道防线被悄悄拆了,
+    # 探针却毫无反应。这条断言把「判定点清单本身」也纳入守护:
+    # 少一个 → 红。
+    assert set(vg.VERDICT_SINKS) == {
+        "check_gate", "check_live_admission", "write_approval", "record_approval",
+        "screen_source", "check_instance_state", "check_class",
+    }, (
+        f"判定点清单变了:现在是 {sorted(vg.VERDICT_SINKS)}。"
+        f"新增或删除判定点必须同时改本夹具,并说明为什么——"
+        f"否则会出现「拆掉一道防线,探针毫无反应」。"
+    )
+    # 每个判定点都要有一个「拥有它」的样例文件
+    for sink in vg.VERDICT_SINKS:
+        owners = [rel for rel in expect_owned if cd.classify(rel)[0] == "never_downgrade"]
+        assert owners, "夹具里至少要有一个样例文件"
     expect_not_owned = [
         # 只调用纯数学函数的:import 了 candidate_eval,但没碰门槛判定
         "scripts/calc_ladder_eta.py",
@@ -539,6 +557,23 @@ def test_verdict_graph_detector_itself_is_accurate() -> None:
         assert not owned, f"{rel} 不应拥有判定点,实际 {sorted(owned)}"
 
 
+def _write_probe(name: str, content: str) -> Path:
+    """在仓库里写一个临时探针文件(用完即删)。
+
+    **为什么必须落在仓库里**:探针要 `import risk.promotion_gate` /
+    `import walk_forward_optimizer`,这些是仓库内的模块——放在仓库外就 import 不到,
+    探针会因**环境问题**失败(而不是因被测逻辑失败),那不是有效的测试。
+
+    **为什么要随机后缀**:第 3 轮 codex 的 Low-2——早期版本用固定名字,
+    中断后留下的残file下次跑是**不同名字**(不会覆盖)→ 逐次堆积;
+    每个残留都是未跟踪的 scripts/ 文件,会让 `check_domain.py --diff` 判执行域。
+    随机后缀 + 用完即删,残留的概率与影响都降到最低。
+    """
+    path = ROOT / "scripts" / f"{name[:-3]}_{uuid.uuid4().hex[:8]}.py"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
 @pytest.mark.parametrize("source,expect", [
     # 直接导入并调用
     ("from risk.promotion_gate import check_gate\ndef go(c):\n    return check_gate(c)\n", "check_gate"),
@@ -554,8 +589,7 @@ def test_verdict_graph_detects_all_call_forms(source: str, expect: str, tmp_path
     裸名字 `g` 与判定点的名字对不上,只看裸名字的版本**漏报**,
     等于给了一条绕过所有探针的路。
     """
-    probe = ROOT / "scripts" / "zz_probe_alias.py"
-    probe.write_text(source, encoding="utf-8")
+    probe = _write_probe("zz_probe_alias.py", source)
     try:
         owned = vg.owned_sinks(probe)
         assert expect in owned, f"应检出 {expect},实际 {sorted(owned)}"
@@ -710,11 +744,10 @@ def test_data_flow_probe_sees_every_import_style(import_style: str) -> None:
     """
     # 路径必须**每次不同**:verdict_graph 按路径缓存模块信息,
     # 复用同一个路径会读到上一轮的缓存(参数化三种写法会互相干扰)。
-    probe = ROOT / "scripts" / f"zz_probe_import_{abs(hash(import_style))}.py"
-    probe.write_text(
+    probe = _write_probe(
+        f"zz_probe_import_{abs(hash(import_style))}.py",
         "from risk.promotion_gate import check_gate\n"
         "def go(c):\n    return check_gate(c)\n" + import_style,
-        encoding="utf-8",
     )
     try:
         providers = vg.gate_input_providers(probe)
@@ -736,14 +769,13 @@ def test_data_flow_probe_ignores_incidental_reads() -> None:
 
     收窄判据:被读的值(或其调用结果)**流进了另一个调用的实参**。
     """
-    probe = ROOT / "scripts" / "zz_probe_incidental.py"  # 独立路径,避免缓存串扰
-    probe.write_text(
+    probe = _write_probe(  # 独立路径,避免缓存串扰
+        "zz_probe_incidental.py",
         "from risk.promotion_gate import check_gate\n"
         "def go(c):\n    return check_gate(c)\n"
         "import research_console as rconsole\n"
         "def setup():\n"
         "    rconsole.reconfigure_stdio()   # 纯副作用,结果没人用\n",
-        encoding="utf-8",
     )
     try:
         providers = vg.gate_input_providers(probe)
@@ -752,3 +784,69 @@ def test_data_flow_probe_ignores_incidental_reads() -> None:
         )
     finally:
         probe.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------
+# 变异验证脚手架本身的守护(第 3 轮 codex 的 Low-3:它当时零测试覆盖)
+# --------------------------------------------------------------------------
+
+def test_mutation_specs_are_sane() -> None:
+    """每条变异规格都必须**能落地**:锚点唯一、见证路径存在、变异前档位符合预期。"""
+    import check_mutations as cm
+
+    assert cm.MUTATIONS, "变异清单不能为空"
+    witnesses = [witness for _l, _r, _t, _n, witness, _b in cm.MUTATIONS]
+    assert len(set(witnesses)) == len(witnesses), "见证路径不能重复"
+
+    for label, rel, token, _new_line, witness, expected_before in cm.MUTATIONS:
+        target = ROOT / rel
+        assert target.exists(), f"{label}:目标文件不存在 {rel}"
+        lines = target.read_text(encoding="utf-8").split("\n")
+        hits = [line for line in lines if token in line]
+        assert len(hits) == 1, f"{label}:锚点 {token!r} 命中 {len(hits)} 次(应为 1)"
+        # 见证路径的**变异前**档位必须与规格一致(规格写进清单,免得靠猜)
+        actual = cd.classify(witness)[0]
+        assert actual == expected_before, (
+            f"{label}:见证路径 {witness} 当前判成 {actual},规格写的是 {expected_before}"
+        )
+
+
+def test_mutation_harness_detects_wrong_adr_numbers(tmp_path: Path) -> None:
+    """`--verify` 必须真的核对 ADR 的数字(第 3 轮 codex 的 Critical-2)。
+
+    早期版本拿脚本里的裸标签去匹配 ADR 的 Markdown 行(带反引号),
+    **11 个标签全部匹配不上** → 恒打印「一致」→ CI 里一个纯假绿灯。
+    端到端铁证:把 ADR 表里每个数字改成 999,仍输出「一致」exit 0。
+
+    这条测试直接跑核对函数:数字写错 → 必须返回 1(失败)。
+    """
+    import check_mutations as cm
+
+    results = [("某条变异", 3)]
+    good = tmp_path / "good.md"
+    good.write_text("| 某条变异 | 3 |\n", encoding="utf-8")
+    assert cm._verify_adr(results, good) == 0, "数字对上时必须通过"
+
+    bad = tmp_path / "bad.md"
+    bad.write_text("| 某条变异 | 999 |\n", encoding="utf-8")
+    assert cm._verify_adr(results, bad) == 1, "数字写错时必须失败(否则就是假绿灯)"
+
+    missing = tmp_path / "missing.md"
+    missing.write_text("| 别的行 | 3 |\n", encoding="utf-8")
+    assert cm._verify_adr(results, missing) == 1, "ADR 缺行时必须失败"
+
+
+def test_mutation_harness_survives_non_utf8_console() -> None:
+    """变异脚本在 **cp1252 控制台**上不得崩溃(第 3 轮 codex 的 Critical-1)。
+
+    这是第 1 轮 M5 在**新脚本**上的原样复发:同样的缺陷,在 `check_domain.py`
+    里修过,新写的 `check_mutations.py` 里又带进来一次——
+    而 CI 在 Linux(UTF-8)下全绿,只有主力开发环境(Windows)会崩。
+    """
+    script = str(ROOT / "tools" / "check_mutations.py")
+    proc = subprocess.run([sys.executable, script, "--help"],
+                          capture_output=True, text=True,
+                          env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                          encoding="utf-8", errors="replace")
+    assert "UnicodeEncodeError" not in proc.stderr, proc.stderr
+    assert proc.returncode == 0, proc.stdout + proc.stderr

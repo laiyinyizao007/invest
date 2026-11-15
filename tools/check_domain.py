@@ -179,6 +179,12 @@ NEVER_DOWNGRADE = (
     # --- CI 检出能力:改测试 = 改「缺陷能不能被发现」 ---
     ".github/workflows/",
     "tools/check_constitution_history.py",
+    # 守卫工具自身:它们是「谁拥有判定点」与「清单有没有被测住」的**裁决者**,
+    # 改它们 = 改「什么被允许发生」。第 3 轮 codex 的 Medium-1:实测从
+    # VERDICT_SINKS 里删掉一个判定点,0 条测试失败——因为守卫工具没被保护、
+    # 准确性夹具也没点名全部判定点。
+    "tools/verdict_graph.py",
+    "tools/check_mutations.py",
     # 防线不变量与门槛相关的用例:改断言 = 削弱检出能力
     "tests/test_research_boundary.py",
     "tests/test_research_config.py",
