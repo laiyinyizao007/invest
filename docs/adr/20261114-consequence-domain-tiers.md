@@ -195,21 +195,26 @@ python tools/check_mutations.py            # 跑全部变异
 python tools/check_mutations.py --verify   # 额外核对本表数字与实测是否一致
 ```
 
-| 变异 | 变红的测试条数 |
+| 变异 | 见证路径(变异前后分档结果必须翻转) |
 |---|---|
-| 删掉 `trading/` 的不可降级条目 | 3 |
-| 把 `risk/live_admission.py` 移出不可降级 | 7 |
-| 把 `risk/candidate_eval.py` 移出不可降级 | 4 |
-| 把 `scripts/research_sandbox.py` 移出不可降级 | 5 |
-| 把 `scripts/backtest_lib.py` 移出不可降级 | 5 |
-| 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | 3 |
-| 把 `scripts/research_grid.py` 移出不可降级 | 4 |
-| 把 `scripts/research_api.py` 移出不可降级 | 5 |
-| 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | 7 |
-| 把整个 `scripts/` 放进研究**目录**白名单 | 4 |
-| 新建一个直接调 `check_gate` 的文件(不入库) | 1(`test_every_sink_owning_file_is_never_downgrade`) |
+| 删掉 `trading/` 的不可降级条目 | `trading/runtime.py` |
+| 把 `risk/live_admission.py` 移出不可降级 | `risk/live_admission.py` |
+| 把 `risk/candidate_eval.py` 移出不可降级 | `risk/candidate_eval.py` |
+| 把 `scripts/research_sandbox.py` 移出不可降级 | `scripts/research_sandbox.py` |
+| 把 `scripts/backtest_lib.py` 移出不可降级 | `scripts/backtest_lib.py` |
+| 把 `scripts/walk_forward_optimizer.py` 移出不可降级 | `scripts/walk_forward_optimizer.py` |
+| 把 `scripts/research_grid.py` 移出不可降级 | `scripts/research_grid.py` |
+| 把 `scripts/research_api.py` 移出不可降级 | `scripts/research_api.py` |
+| 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | `scripts/optimize.py` |
+| 把整个 `scripts/` 放进研究**目录**白名单 | `scripts/some_brand_new_thing.py` |
+| 新建一个直接调 `check_gate` 的文件(不入库) | 该新文件自身 |
 
-(数字由脚本实测。`--verify` 会核对本表与实测是否一致。)
+**表里不写「变红几条」**——那个数字随本文件的用例数变化(每加一条用例就变),
+写进文档就必然过期:CI 上已经因此红过两次(数字对不上、标签对不上)。
+**有意义且稳定**的是两件事,都由脚本在 CI 上每次实跑:
+①每种变异**都**被抓住(有一条没被抓住 → 脚本退出码 1 → 关卡红);
+②每种变异**都真的翻转了判定**(见证路径的档位变了)——否则它只是空操作。
+`--verify` 另核对「本表列出的变异集合 == 脚本里的变异集合」,防止文档与实现各说各话。
 
 最后一条尤其重要:它证明这条不变量对**尚未入库的新文件**也生效
 (扫描含 `git status --porcelain -uall` 的未跟踪文件,而不只是 `git ls-files`)。

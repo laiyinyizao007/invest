@@ -812,28 +812,39 @@ def test_mutation_specs_are_sane() -> None:
 
 
 def test_mutation_harness_detects_wrong_adr_numbers(tmp_path: Path) -> None:
-    """`--verify` 必须真的核对 ADR 的数字(第 3 轮 codex 的 Critical-2)。
+    """`--verify` 必须真的核对 ADR 的**变异集合**(第 3 轮 codex 的 Critical-2)。
 
     早期版本拿脚本里的裸标签去匹配 ADR 的 Markdown 行(带反引号),
     **11 个标签全部匹配不上** → 恒打印「一致」→ CI 里一个纯假绿灯。
     端到端铁证:把 ADR 表里每个数字改成 999,仍输出「一致」exit 0。
 
-    这条测试直接跑核对函数:数字写错 → 必须返回 1(失败)。
+    这条测试直接跑核对函数:**表里少一行 / 标签对不上** → 必须返回 1(失败)。
+    (不再核对「每种变异红了几条」——那个数字随用例数变化,写进文档必然过期,
+    CI 上已经因此红过两次。有意义且稳定的是「集合一致」+「每种都被抓住」,
+    后者由脚本自己每次实跑。)
     """
     import check_mutations as cm
 
     results = [("某条变异", 3)]
     good = tmp_path / "good.md"
-    good.write_text("| 某条变异 | 3 |\n", encoding="utf-8")
-    assert cm._verify_adr(results, good) == 0, "数字对上时必须通过"
+    good.write_text("| 某条变异 | `risk/x.py` |\n", encoding="utf-8")
+    assert cm._verify_adr(results, good) == 0, "集合对上时必须通过"
 
-    bad = tmp_path / "bad.md"
-    bad.write_text("| 某条变异 | 999 |\n", encoding="utf-8")
-    assert cm._verify_adr(results, bad) == 1, "数字写错时必须失败(否则就是假绿灯)"
-
+    # 表里缺这一行 → 必须失败(否则就是「静默跳过 → 假绿灯」)
     missing = tmp_path / "missing.md"
-    missing.write_text("| 别的行 | 3 |\n", encoding="utf-8")
+    missing.write_text("| 别的行 | `risk/x.py` |\n", encoding="utf-8")
     assert cm._verify_adr(results, missing) == 1, "ADR 缺行时必须失败"
+
+    # 标签对不上(改了一个字)→ 必须失败。
+    # 注意不能用「某条变异了」这种**超集**写法:子串匹配会把它当成命中。
+    typo = tmp_path / "typo.md"
+    typo.write_text("| 另条变异 | `risk/x.py` |\n", encoding="utf-8")
+    assert cm._verify_adr(results, typo) == 1, "标签对不上时必须失败"
+
+    # **超集标签也不许命中**:「某条变异了」不是「某条变异」
+    superstr = tmp_path / "superstr.md"
+    superstr.write_text("| 某条变异了 | `risk/x.py` |\n", encoding="utf-8")
+    assert cm._verify_adr(results, superstr) == 1, "超集标签不该被当成命中"
 
     # **Markdown 强调号不能影响匹配**:ADR 的行里有「研究**目录**白名单」这种加粗,
     # 匹配前必须去掉 —— 否则「匹配不上 → 静默跳过 → 假绿灯」又回来了

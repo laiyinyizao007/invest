@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -283,14 +282,25 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _verify_adr(results: list[tuple[str, int]], adr_path: Path | None = None) -> int:
-    """核对 ADR 里的变异表与实测是否一致。
+    """核对 ADR 里的**变异集合**与实测是否一致。
 
-    **匹配前必须去掉 Markdown 反引号**:ADR 的表里写的是
-    `| 删掉 trading/ 的不可降级条目 | 2 |`(带反引号),而脚本里的标签是
-    「删掉 trading/ 的不可降级条目」——直接 `in` 匹配**一个都命中不了**,
-    于是恒打印「一致」→ 纯假绿灯(第 3 轮的 Critical-2)。
+    **只核对「集合」,不核对「每种变异红了几条」**:那个数字随本文件的用例数
+    变化(每加一条用例就变),写进文档必然过期——CI 上已经因此红过两次
+    (一次数字对不上、一次标签对不上)。有意义且稳定的只有两件事,
+    都由脚本在 CI 上每次实跑:每种变异都被抓住、每种变异都真的翻转了判定。
+
+    **匹配前必须去掉 Markdown 反引号与强调号**:ADR 的行里写的是
+    `| 把整个 scripts/ 放进研究**目录**白名单 | ... |`,脚本里的标签没有那些标记——
+    直接 `in` 匹配**一个都命中不了**,于是恒打印「一致」→ 纯假绿灯
+    (第 3 轮的 Critical-2,CI 上真的发生过)。
+
+    **不能**去掉下划线:`risk/live_admission.py` 这类路径里有它,
+    去掉就把路径改了(实测:去掉后八行全部对不上)。
 
     **还必须断言行数齐全**:找不到标签不能只跳过——那正是「守护静默失效」的样子。
+
+    **按整格比对,不用子串**:`in` 会让「某条变异了」匹配上标签「某条变异」——
+    那样「标签写错一个字」这种失准就检测不出来(实测踩过)。
     """
     adr = adr_path or (ROOT / "docs" / "adr" / "20261114-consequence-domain-tiers.md")
     if not adr.exists():
@@ -306,20 +316,20 @@ def _verify_adr(results: list[tuple[str, int]], adr_path: Path | None = None) ->
         normalized = normalized.replace(mark, "")
     bad: list[str] = []
     matched = 0
-    for label, n in results:
-        rows = [line for line in normalized.splitlines()
-                if label in line and line.strip().startswith("|")]
-        if not rows:
-            bad.append(f"ADR 表里没有「{label}」这一行")
+    # 按**整格**比对,不用子串:`in` 会让「某条变异了」匹配上标签「某条变异」——
+    # 那样「标签写错了一个字」这种失准就检测不出来(实测踩过)。
+    listed: set[str] = set()
+    for line in normalized.splitlines():
+        if not line.strip().startswith("|"):
             continue
-        matched += 1
-        row = rows[0]
-        # 取该行的**第一个**数字(末行是 `| 1(...) |`,正则要求 `| N |` 匹配不到)
-        nums = re.findall(r"\d+", row)
-        if not nums:
-            bad.append(f"ADR 的「{label}」那一行没有数字")
-        elif int(nums[0]) != n:
-            bad.append(f"ADR 的「{label}」写 {nums[0]},实测 {n}")
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells:
+            listed.add(cells[0])
+    for label, _n in results:
+        if label in listed:
+            matched += 1
+        else:
+            bad.append(f"ADR 表里没有「{label}」这一行")
     if matched != len(results):
         bad.append(f"ADR 表只匹配到 {matched} 行,实测有 {len(results)} 种变异")
     if bad:
