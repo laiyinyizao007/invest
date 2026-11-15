@@ -121,10 +121,10 @@ def test_two_candidates_can_coexist_in_the_approved_dir(tmp_path):
 
     first, _sha1 = approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name="slow_candidate.py",
-        template_name=LIVE_TEMPLATE)
+        template_name=LIVE_TEMPLATE, collected_file=None, promotion_file=None)
     second, _sha2 = approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name="fast_candidate.py",
-        template_name=LIVE_TEMPLATE)
+        template_name=LIVE_TEMPLATE, collected_file=None, promotion_file=None)
 
     assert first is not second
     assert first.fast_window == 8 and second.fast_window == 12

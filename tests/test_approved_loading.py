@@ -88,9 +88,14 @@ def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: st
 
 
 def _load(approved_dir, ledger, name="cand.py", setting=None, template_name=LIVE_TEMPLATE):
+    """低层装载:**显式**传 `None` 表示「本调用不做收菜/晋级这两道检查」。
+
+    这两个参数在守卫 API 上是必填的(给默认值就等于「忘了传就悄悄跳过一道门」)。
+    """
     cls, _sha = approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name=name,
-        class_name="Candidate", setting=setting, template_name=template_name)
+        class_name="Candidate", setting=setting, template_name=template_name,
+        collected_file=None, promotion_file=None)
     return cls
 
 
@@ -321,7 +326,8 @@ try:
     approved_guard.load_approved_strategy(
         approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
         class_name='Candidate',
-        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
 except approved_guard.ApprovedLoadError as exc:
     print('REFUSED:' + str(exc))
     sys.exit(0)
@@ -374,7 +380,8 @@ try:
     approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
         class_name='Candidate',
-        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
 except approved_guard.ApprovedLoadError as exc:
     print('REFUSED:' + str(exc))
     sys.exit(0)
@@ -482,7 +489,8 @@ def load(name):
         approved_guard.load_approved_strategy(
             approved_dir=approved_dir, approvals_file=ledger, file_name=name,
             class_name='Candidate',
-            template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+            template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
         return 'LOADED'
     except approved_guard.ApprovedLoadError as exc:
         return 'REFUSED:' + str(exc)
@@ -521,7 +529,8 @@ try:
     approved_guard.load_approved_strategy(
         approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
         class_name='Candidate',
-        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
 except approved_guard.ApprovedLoadError as exc:
     print('REFUSED:' + str(exc))
     sys.exit(0)
@@ -552,7 +561,8 @@ try:
     approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
         class_name='Candidate',
-        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
 except approved_guard.ApprovedLoadError as exc:
     print('REFUSED:' + str(exc))
     sys.exit(0)

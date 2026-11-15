@@ -218,8 +218,8 @@ def load_approved_strategy(
     class_name: str = "Candidate",
     setting: dict | None = None,
     template_name: str | None = None,
-    collected_file: Path | str | None = None,
-    promotion_file: Path | str | None = None,
+    collected_file: Path | str | None,
+    promotion_file: Path | str | None,
 ) -> tuple[type, str]:
     """装载并返回 `(策略类, 这份字节的 sha256)`。任何一项校验不过 → `ApprovedLoadError`。
 
@@ -232,7 +232,10 @@ def load_approved_strategy(
     `collected_file` / `promotion_file`:第三、第四道门——
     「这段字节**经过了收菜那道关口**」(收菜时会把源码打给人看)与
     「这个策略**通过了晋级门槛**」。两者都是独立于「人批准过」的记录。
-    给了就查;没给就跳过(调用方自己决定要不要这道门)。
+
+    ⚠️ 这两个参数是**必填**的(可以显式传 `None` 表示「本调用不做这道检查」):
+    给它们默认值就等于「忘了传就悄悄跳过一道门」——那是 fail-open。
+    运行时永远传真实的路径;只有低层测试会显式传 `None`。
 
     **被投毒之后不再装载**:一次被拒的候选可能已经把进程改坏了(改写发生在 exec 期间,
     拒绝发生在比对之后),那次改写留在进程里。所以一旦发现闸门或受保护对象被改写,
