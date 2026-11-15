@@ -64,6 +64,7 @@ jobs:
         run: |
           python -m pip install --quiet ruff==0.14.8
           python -m ruff check \
+            scripts/backtest_lib.py \
             scripts/research_api.py \
             scripts/research_approval_server.py \
             scripts/research_config.py \
