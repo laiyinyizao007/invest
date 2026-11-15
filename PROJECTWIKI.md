@@ -79,7 +79,7 @@ flowchart LR
 | RG / PG | `risk/risk_guard.py`、`risk/promotion_gate.py` | 完成 |
 | RT / GR | `trading/runtime.py`、`trading/guard_rule.py`、`trading/safe_risk.py` | 完成(仅假网关离线测试;**未在真实 CTP 上验证**) |
 | WH | `notify/webhook.py` | 完成 |
-| 批准目录 | `risk/approval_ledger.py`(只读账本)、`risk/approved_guard.py`(装载四道校验 + 第四层指纹比对)、`scripts/research_collect.py`(收菜 CLI,本机人工触发) | 完成(2026-11-15,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34)):**批准终于成为真正的授权**——运行时装载复核账本与宪法,不过即拒绝启动(`EXIT_STARTUP_FAILED`),绝不降级到默认策略。收菜不新增网关端点(网关 import 不到它)。`approved/` 不入库 |
+| 批准目录 | `risk/approval_ledger.py`(只读账本)、`risk/approved_guard.py`(装载五道校验 + 第四层指纹比对 + 类级校验)、`scripts/research_collect.py`(收菜 CLI,本机人工触发) | 完成(2026-11-15,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34);第 1 轮 codex 复核 32/50 后修了四处):**批准终于成为真正的授权**——运行时装载复核账本与宪法,不过即拒绝启动(`EXIT_STARTUP_FAILED`),绝不降级到默认策略。收菜不新增网关端点(网关 import 不到它)。`approved/` 不入库 |
 | 断耦演练 | `scripts/decoupling_drill.py` | 完成(2026-11-15):三项全过——内层不 import 研究侧、外层容器环境无 `CTP_*`、外层停掉时内层心跳与策略照跑。证据见 `docs/decoupling-drill.md`。**不连真 CTP**:证明的是断耦,不是实盘可用性 |
 | CTP | `scripts/run_headless.py`(无头入口)、`Dockerfile`、`docker-compose.yml` | **部分**:主机端与容器内均跑通完整启动管道(2026-11-10);废单文本、撤单失败、断线重连、夜盘跨日**未在真实 CTP 验证** |
 | GUI | `scripts/run_gui.py` | 完成(人工观察用,非无人值守) |
