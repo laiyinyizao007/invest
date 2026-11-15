@@ -21,6 +21,9 @@
 用法:
     python scripts/decoupling_drill.py             # 跑三项检查,输出 JSON
     python scripts/decoupling_drill.py --report    # 追加证据到 docs/decoupling-drill.md
+
+它借用 `tests/fakes.py` 的假网关与同步事件引擎(演练是测试性产物,不需要一套真的 CTP 前置;
+`scripts/` 因此引了 `tests/` 的模块——这是**有意**的一处耦合,不是分层事故)。
 """
 from __future__ import annotations
 

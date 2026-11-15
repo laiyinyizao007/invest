@@ -93,9 +93,13 @@ class RuntimeConfig:
     # 一旦给了 approved_file,策略就从 approved/ 装载,且必须通过批准账本与宪法的复核,
     # 否则拒绝启动(EXIT_STARTUP_FAILED)——**不回退**到默认策略。
     approved_file: str | None = None                 # approved/ 里的文件名,如 "my_candidate.py"
-    approved_dir: Path | None = None                 # 批准目录;None 时取项目根下的 approved/
-    approvals_file: Path | None = None               # 批准账本;None 时取项目根下的 data/research-control/approvals.json
-    approved_strategy_class: str = "Candidate"       # 批准文件里的类名
+    approved_dir: Path | None = None                 # 批准目录;None 时取 <approved_root>/approved(位置**钉死**,不可改指)
+    approved_root: Path | None = None                # 批准目录与账本的共同根;None 时取本文件所在代码根
+    approved_class_in_file: str = "Candidate"        # 批准文件里的类名(与 strategy_class 是两回事:那是引擎类表的键)
+    approved_strategy_name: str | None = None        # 状态命名空间;None 时按批准哈希派生(换版本自动换命名空间)
+    approved_template: str | None = None             # 骨架(模块:类);None 时用宪法指定的默认骨架
+                                                      # ——默认那个是**仅研究回测**的 15m 骨架,会被拒绝装载,
+                                                      # 实盘要用日线骨架:strategies.trend_atr_strategy:TrendAtrStrategy
 
     def __post_init__(self) -> None:
         # 等持仓回报稳定的时间设下限:配成 0 时,两次"未到回报的空快照"会被当成稳定而通过对账
@@ -284,24 +288,41 @@ class TradingRuntime:
         cfg = self.config
         if not cfg.approved_file:
             return None
-        root = Path(__file__).resolve().parents[1]
+        root = Path(cfg.approved_root) if cfg.approved_root else Path(__file__).resolve().parents[1]
         approved_dir = Path(cfg.approved_dir) if cfg.approved_dir else root / "approved"
-        approvals_file = (Path(cfg.approvals_file) if cfg.approvals_file
-                          else root / "data" / "research-control" / "approvals.json")
+        # 批准目录的位置**钉死**:解析后必须就是 `<root>/approved`。
+        # 把它配成别处(尤其 `strategies/`)等于「候选目录与受信目录混为一谈」——
+        # 研究侧用同一份受保护目录名单把这条堵死(见 research_config.RESERVED_DIRS)。
+        if approved_dir.resolve() != (root / "approved").resolve():
+            return (f"批准目录必须固定为 {root / 'approved'},当前是 {approved_dir};"
+                    f"把它指到别处会让候选目录与运行时认的目录混为一谈")
+        approvals_file = root / "data" / "research-control" / "approvals.json"
+        # 批准目录整体自检:里面有任何一个文件与账本不一致,就拒绝启动(fail-closed)。
+        problems = approved_guard.check_approved_consistency(
+            approved_dir=approved_dir, approvals_file=approvals_file)
+        if problems:
+            return ("批准目录与批准账本不一致,拒绝启动:" + "; ".join(problems)
+                    + "。请重新收菜(approved/ 里的文件被改过或从未批准)")
         try:
-            cls = approved_guard.load_approved_strategy(
+            cls, sha = approved_guard.load_approved_strategy(
                 approved_dir=approved_dir,
                 approvals_file=approvals_file,
                 file_name=cfg.approved_file,
-                class_name=cfg.approved_strategy_class,
+                class_name=cfg.approved_class_in_file,
                 setting=cfg.strategy_setting,
+                template_name=cfg.approved_template,
             )
         except approved_guard.ApprovedLoadError as exc:
             return str(exc)
+        # 状态命名空间按**批准哈希**派生:换批准版本就换命名空间,
+        # 旧版本的持仓/止损状态不会被新版本继承(不靠操作者记得改 --strategy-name)。
+        if not cfg.approved_strategy_name:
+            cfg.strategy_name = f"approved_{sha[:8]}"
         # 注册进 CTA 引擎的类表:键名沿用 strategy_class,引擎按名字取类
         self.cta.classes[cfg.strategy_class] = cls
         self.main.write_log(
-            f"已从批准目录装载策略: {cfg.approved_file} -> {cfg.strategy_class}", source="Runtime")
+            f"已从批准目录装载策略: {cfg.approved_file} -> {cfg.strategy_class}"
+            f"(状态命名空间 {cfg.strategy_name})", source="Runtime")
         return None
 
     def _check_state_writable(self) -> str | None:

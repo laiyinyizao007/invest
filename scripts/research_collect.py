@@ -33,9 +33,9 @@ stdout 只出 JSON(模型可见通道的候选,出口统一过 `rs.scrub_model_v
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-import re
 import sys
 import time
 import uuid
@@ -45,6 +45,7 @@ import research_config as rc
 import research_sandbox as rs
 from risk import approval_ledger
 from risk import constitution as const
+from risk.approved_guard import SAFE_FILE_NAME
 
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 2, 3
 
@@ -93,9 +94,10 @@ def resolve_source(strategy: str, cfg: dict, paths: dict) -> Path:
     name = strategy.strip()
     if name != Path(name).name or name in (".", ".."):
         raise CollectError(f"--strategy 只接受文件名(不含路径): {name!r}")
-    pattern = cfg["candidates"]["name_pattern"]
-    if not re.fullmatch(pattern, name):
-        raise CollectError(f"策略文件名不符合约定 {pattern}: {name!r}")
+    # 与运行时装载共用同一份文件名规则(risk/approved_guard.SAFE_FILE_NAME):
+    # 收得进却装不上是最难查的一类错——两边必须同一条规则。
+    if not SAFE_FILE_NAME.fullmatch(name):
+        raise CollectError(f"策略文件名不符合约定 {SAFE_FILE_NAME.pattern}: {name!r}")
     source = paths["pending_dir"] / name
     if not source.is_file():
         raise CollectError(f"候选文件不存在: {name}")
@@ -137,20 +139,26 @@ def _atomic_write(target: Path, payload: bytes) -> None:
                 pass
 
 
-def collect_job(strategy: str, input_fn=None, write=None) -> dict:
+def collect_job(strategy: str, input_fn=None, write=None, replace: bool = False) -> dict:
     """收菜:校验 → 人确认 → 原子写入 → 复算。
 
     `input_fn`/`write` 是给测试用的注入点(与 `research_api.approve_job` 同一手法):
     正式入口不传,于是走 `input()`/`stderr`。
+
+    `replace`:目标文件已存在**且内容不同**时,默认**拒绝**——
+    覆盖 approved/ 里的旧版本等于换掉运行时正在认的策略,这是另一件需要显式授权的事。
+    带 `--replace` 才覆盖,并把旧版本留成 `<名>.prev`(字节一致),便于回溯。
     """
     cfg, paths = settings()
     source = resolve_source(strategy, cfg, paths)
     approvals_file = paths["approvals_file"]
     approved_dir = paths["approved_dir"]
 
-    # ① 账本必须命中「这份字节」——收菜不产生批准,只搬运已批准的字节
+    # ① 账本必须命中「这份字节」——收菜不产生批准,只搬运已批准的字节。
+    # **只读一次字节**:哈希、筛查、落盘全部基于同一份 raw(否则「按读 A 授权、落盘读 B」,
+    # 两者可以不是同一份字节——第 1 轮 codex 复核指出过这个缝)。
     raw = source.read_bytes()
-    sha = approval_ledger.file_sha256(source)
+    sha = hashlib.sha256(raw).hexdigest()
     ledger = approval_ledger.load_approvals(approvals_file)
     if sha not in ledger:
         raise CollectError(
@@ -171,6 +179,13 @@ def collect_job(strategy: str, input_fn=None, write=None) -> dict:
                            "自动化调用不得把代码收进运行时认的目录。")
     say(f"文件: {source.name}   大小: {len(raw)} 字节   sha256: {sha}")
     say("⚠ 这行 sha256 只用在本机终端里核对,**不要抄进聊天窗口**(抄出去就等于把收菜权交出去)。")
+    # **把源码打出来**:收菜是「这段代码从此有权被运行时执行」的最后一道人工关口。
+    # 批准那一步的形式是「粘贴哈希」,不等于「读懂」;此处的源码是让人真正看一眼的机会
+    # (第 1 轮 codex 复核指出:批准升格成执行权,批准环节的强度却没同步升格)。
+    say("-" * 60)
+    for number, line in enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1):
+        say(f"{number:4d} | {line}")
+    say("-" * 60)
     say("要收进 approved/ 的话,把上面的 sha256 完整粘贴回来: ")
     try:
         answer = (input_fn or input)("")
@@ -187,6 +202,17 @@ def collect_job(strategy: str, input_fn=None, write=None) -> dict:
     # ④ 原子写入 + 复算:复制必须逐字节一致
     target = approved_dir / source.name
     already = target.exists() and approval_ledger.file_sha256(target) == sha
+    if target.exists() and not already and not replace:
+        # 目标位置已有**另一份**已批准的字节:换掉它等于换掉运行时正在认的策略,
+        # 那是另一件需要显式授权的事(而且运行中的进程可能正持有它)。
+        raise CollectError(
+            f"{target.name} 已在批准目录里且内容不同,拒绝覆盖"
+            f"(要换版本请显式加 --replace;换版本时也要同时换运行时的 strategy_name,"
+            f"否则旧版本的持久化状态会被新版本继承)")
+    previous = None
+    if target.exists() and not already and replace:
+        previous = target.with_name(f"{target.name}.prev")
+        _atomic_write(previous, target.read_bytes())
     _atomic_write(target, raw)
     written = approval_ledger.file_sha256(target)
     if written != sha:
@@ -194,14 +220,17 @@ def collect_job(strategy: str, input_fn=None, write=None) -> dict:
         raise CollectError(f"写入后校验不一致,已删除目标文件(未收菜): {source.name}",
                            code=EXIT_FAILED)
     say(f"已收菜: {target.name}(绑定到上面的 sha256;代码改动后需要重新批准并重新收菜)")
+    if previous is not None:
+        say(f"旧版本已保留为: {previous.name}")
     return {"collected": True, "already": already, "name": source.name,
-            "approved_dir": approved_dir.name}
+            "approved_dir": approved_dir.name, "replaced": previous is not None}
 
 
 def list_job(write=None) -> dict:
     """列出 `approved/` 里的文件与它们的账本状态。
 
-    stdout 只给名字与状态位;哈希走 stderr(人读通道)。
+    stdout 只给名字与状态位;**哈希只走 stderr**(人读通道)——
+    stdout 是模型可见通道的候选,哈希不能从那里出去(模型拿到哈希就能替人念哈希)。
     """
     cfg, paths = settings()
     approved_dir = paths["approved_dir"]
@@ -209,11 +238,12 @@ def list_job(write=None) -> dict:
     say = write or (lambda text: print(text, file=sys.stderr))
     entries: list[dict] = []
     if approved_dir.is_dir():
+        ledger = approval_ledger.load_approvals(approvals_file)
         for path in sorted(approved_dir.glob("*.py")):
             sha = approval_ledger.file_sha256(path)
-            in_ledger = sha in approval_ledger.load_approvals(approvals_file)
+            in_ledger = sha in ledger
             entries.append({"name": path.name, "size": path.stat().st_size,
-                            "approved": in_ledger, "sha256": sha})
+                            "approved": in_ledger})
             say(f"{path.name}   {path.stat().st_size} 字节   sha256: {sha}   "
                 f"账本命中: {'是' if in_ledger else '否'}")
     return {"approved_dir": approved_dir.name, "entries": entries}
@@ -225,12 +255,14 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     collect = sub.add_parser("collect", help="把一个已批准的候选收进 approved/")
     collect.add_argument("--strategy", required=True, help="候选文件名(不含路径)")
+    collect.add_argument("--replace", action="store_true",
+                         help="允许覆盖批准目录里已存在的**另一版本**(旧版本保留为 <名>.prev)")
     sub.add_parser("list", help="列出 approved/ 里的文件与账本状态")
     args = parser.parse_args(argv)
 
     try:
         if args.command == "collect":
-            emit(collect_job(args.strategy))
+            emit(collect_job(args.strategy, replace=args.replace))
         else:
             emit(list_job())
     except CollectError as exc:

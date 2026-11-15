@@ -184,6 +184,60 @@ def test_collect_refuses_a_candidate_that_fails_the_static_screen(sandbox, monke
     assert not (sandbox / "approved" / "cand.py").exists()
 
 
+def test_collect_refuses_to_overwrite_a_different_approved_version(sandbox, monkeypatch):
+    """换版本是另一件需要显式授权的事:默认拒绝覆盖批准目录里已存在的另一版本。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    # 同名文件,但内容不同(新版本)
+    source.write_text(CANDIDATE.replace("fast_window = 8", "fast_window = 12"), encoding="utf-8")
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    _approve(sandbox, source, new_sha)
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("cand.py", input_fn=lambda _: new_sha, write=lambda _t: None)
+
+    assert "拒绝覆盖" in excinfo.value.message
+    # 旧版本仍在,没被换掉
+    assert "fast_window = 8" in (sandbox / "approved" / "cand.py").read_text(encoding="utf-8")
+
+
+def test_collect_can_replace_an_existing_version_when_asked(sandbox, monkeypatch):
+    """显式 --replace 才覆盖,并把旧版本留成 .prev(便于回溯)。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    source.write_text(CANDIDATE.replace("fast_window = 8", "fast_window = 12"), encoding="utf-8")
+    new_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    _approve(sandbox, source, new_sha)
+
+    result = collect.collect_job("cand.py", input_fn=lambda _: new_sha, write=lambda _t: None,
+                                 replace=True)
+
+    assert result["replaced"] is True
+    assert "fast_window = 12" in (sandbox / "approved" / "cand.py").read_text(encoding="utf-8")
+    previous = sandbox / "approved" / "cand.py.prev"
+    assert previous.is_file()
+    assert "fast_window = 8" in previous.read_text(encoding="utf-8")
+
+
+def test_collect_is_idempotent_for_the_same_version(sandbox, monkeypatch):
+    """同一份字节重复收菜不算「覆盖」——目标内容一致,直接放行。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+    result = collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    assert result["already"] is True
+    assert result["replaced"] is False
+
+
 def test_list_reports_the_ledger_state(sandbox, monkeypatch):
     monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
     source = _write_candidate(sandbox)
@@ -196,6 +250,8 @@ def test_list_reports_the_ledger_state(sandbox, monkeypatch):
 
     assert [e["name"] for e in listed["entries"]] == ["cand.py"]
     assert listed["entries"][0]["approved"] is False
+    # 哈希**不进** stdout 的 JSON(stdout 是模型可见通道的候选)
+    assert "sha256" not in listed["entries"][0]
 
 
 def test_the_gateway_cannot_reach_the_collect_module():

@@ -12,6 +12,7 @@
 """
 import hashlib
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,10 +28,16 @@ from trading.runtime import (  # noqa: E402
     TradingRuntime,
 )
 
-CANDIDATE = '''from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+# 交易运行时装载用的是**实盘可用**的骨架(日线);
+# 15m 骨架带 research_only 标记,装载时会被拒绝(见 test_research_only_skeleton_is_refused)。
+ROOT = Path(__file__).resolve().parents[1]
+
+LIVE_TEMPLATE = "strategies.trend_atr_strategy:TrendAtrStrategy"
+
+CANDIDATE = '''from strategies.trend_atr_strategy import TrendAtrStrategy
 
 
-class Candidate(TrendAtr15mStrategy):
+class Candidate(TrendAtrStrategy):
     fast_window = 8
     slow_window = 20
     atr_mult = 2.0
@@ -42,7 +49,9 @@ def approved(tmp_path):
     """一个临时的批准目录 + 账本。"""
     approved_dir = tmp_path / "approved"
     approved_dir.mkdir()
-    ledger = tmp_path / "approvals.json"
+    # 账本放在与运行时一致的路径约定下:<root>/data/research-control/approvals.json
+    ledger = tmp_path / "data" / "research-control" / "approvals.json"
+    ledger.parent.mkdir(parents=True)
     ledger.write_text("{}", encoding="utf-8")
     return approved_dir, ledger
 
@@ -57,10 +66,11 @@ def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: st
     return sha
 
 
-def _load(approved_dir, ledger, name="cand.py", setting=None):
-    return approved_guard.load_approved_strategy(
+def _load(approved_dir, ledger, name="cand.py", setting=None, template_name=LIVE_TEMPLATE):
+    cls, _sha = approved_guard.load_approved_strategy(
         approved_dir=approved_dir, approvals_file=ledger, file_name=name,
-        class_name="Candidate", setting=setting)
+        class_name="Candidate", setting=setting, template_name=template_name)
+    return cls
 
 
 def test_an_approved_candidate_loads(approved):
@@ -70,8 +80,8 @@ def test_an_approved_candidate_loads(approved):
     cls = _load(approved_dir, ledger)
 
     assert cls.__name__ == "Candidate"
-    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
-    assert issubclass(cls, TrendAtr15mStrategy)
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+    assert issubclass(cls, TrendAtrStrategy)
 
 
 def test_a_file_that_was_never_approved_is_refused(approved):
@@ -230,8 +240,8 @@ def make_runtime(monkeypatch, tmp_path):
 def test_runtime_loads_the_approved_strategy(make_runtime, approved, tmp_path):
     approved_dir, ledger = approved
     _install(approved_dir, ledger)
-    rt = make_runtime({"approved_file": "cand.py", "approved_dir": approved_dir,
-                       "approvals_file": ledger, "strategy_class": "ApprovedCandidate"})
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE, "strategy_class": "ApprovedCandidate"})
 
     assert rt._load_approved_strategy() is None
     assert rt.cta.classes["ApprovedCandidate"].__name__ == "Candidate"
@@ -240,8 +250,8 @@ def test_runtime_loads_the_approved_strategy(make_runtime, approved, tmp_path):
 def test_runtime_refuses_to_start_when_the_approved_strategy_is_not_approved(make_runtime, approved):
     approved_dir, ledger = approved
     (approved_dir / "cand.py").write_text(CANDIDATE, encoding="utf-8")
-    rt = make_runtime({"approved_file": "cand.py", "approved_dir": approved_dir,
-                       "approvals_file": ledger})
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
 
     code = rt.start()
 
@@ -256,3 +266,134 @@ def test_runtime_without_an_approved_file_behaves_exactly_as_before(make_runtime
 
     assert rt._load_approved_strategy() is None
     assert "ApprovedCandidate" not in rt.cta.classes
+
+
+# ---------- 第 1 轮 codex 复核实测出的绕过(必须逐条钉住)----------
+
+def test_the_fourth_layer_cannot_be_switched_off_by_the_candidate(approved):
+    """候选不能把第四层(受保护对象的指纹比对)自己关掉。
+
+    绕过手法:候选在自己的模块体里 `import risk.constitution as _c;
+    _c.check_protected_state = lambda *a, **k: []`——如果装载器在 exec **之后**
+    才经 `const.` 去取比较器,取到的就是候选换上去的那个空函数,第四层静默失效。
+    修法:比较器与快照器在 exec 之前就绑定成局部引用,并在 exec 之后核对它们没被换掉。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "_c.snapshot_protected_state = lambda *a, **k: {}\n"
+        "\n"
+        "class Candidate:\n"
+        "    pass\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "第四层" in str(excinfo.value)
+
+
+def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
+    """端到端载荷:把 300 元单笔预算换成一个恒 0 的函数,再把第四层关掉。
+
+    静态层对 `sys.modules[...]` + `setattr` 这条路**看不见**(实测 screen_source 返回 []),
+    第四层是最后的兜底——所以这一条必须过。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import sys\n"
+        "_m = sys.modules['risk.risk_guard']\n"
+        "setattr(_m, 'within_budget', lambda *a, **k: 0.0)\n"
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "\n"
+        "class Candidate:\n"
+        "    pass\n"))
+
+    # 这个载荷在**被拒之前**就已经把进程里的 risk.risk_guard.within_budget 换掉了
+    # (拒绝发生在比对之后,而改写发生在 exec 期间)。所以:
+    #   ① 拒绝必须发生(这里是断言的重点);
+    #   ② 污染不能留在本进程里——否则后面的测试都跑在一个被拆了风控的进程上。
+    # 因此这一条在**子进程**里跑(与 codex 复核时的做法一致)。
+    probe = """
+import sys, types
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy')
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED')
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120)
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+
+
+def test_a_candidate_that_overrides_a_template_member_is_refused(approved):
+    """类级校验(`check_class`):候选不得重写白名单以外的模板成员。
+
+    静态层只按**名字**查黑名单,`on_daily_bar` / `variables` / `daily_end` 这些
+    不在受保护名单里的模板成员,静态层看不见——那一层由 `check_class` 负责。
+    研究侧有这层,运行侧原先漏了(第 1 轮 codex 复核发现)。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    def on_daily_bar(self, bar):\n"
+        "        return None\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "模板成员" in str(excinfo.value)
+
+
+def test_the_research_only_skeleton_is_refused_in_the_trading_runtime(approved):
+    """15m 骨架仅支持研究回测(on_tick 直接抛异常)→ 交易运行时装载时必须拒绝。
+
+    否则策略会在实盘第一根 tick 上抛异常并被引擎静默停掉:
+    失败方向安全(不下单),但错误信息极具误导性。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy\n"
+        "\n"
+        "class Candidate(TrendAtr15mStrategy):\n"
+        "    pass\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger, template_name=None)
+    assert "仅支持研究回测" in str(excinfo.value)
+
+
+def test_a_setting_with_a_history_symbol_still_loads(approved):
+    """`history_vt_symbol` 是操作参数(预热用哪个历史合约),不是风控底线。
+
+    它在宪法的受保护参数表里,但运行时自己要从 `--history` 传它;
+    若一并禁掉,实盘的正常配置(带历史预热)就永远装不上。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    cls = _load(approved_dir, ledger, setting={"history_vt_symbol": "CADJ.DCE",
+                                              "fast_window": 10})
+    assert cls.__name__ == "Candidate"
+
+
+def test_a_setting_carrying_the_risk_floor_is_refused(approved):
+    """风控底线参数仍由调用方指定 → 拒绝。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger, setting={"risk_budget": 999999})
+    assert "策略设置未通过校验" in str(excinfo.value)

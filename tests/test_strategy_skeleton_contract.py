@@ -38,10 +38,14 @@ SKELETON_VARIABLES = [
     "skipped_by_budget", "trail_side", "trail_extreme", "trail_stop",
 ]
 
-CANDIDATE = '''from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+# 15m 骨架带 research_only 标记:交易运行时装载会拒绝它(见 test_research_only_skeleton_is_refused)。
+# 这里的「并存」用例走**实盘可用**的日线骨架。
+LIVE_TEMPLATE = "strategies.trend_atr_strategy:TrendAtrStrategy"
+
+CANDIDATE = '''from strategies.trend_atr_strategy import TrendAtrStrategy
 
 
-class Candidate(TrendAtr15mStrategy):
+class Candidate(TrendAtrStrategy):
     fast_window = 8
     slow_window = 20
     atr_mult = 2.0
@@ -115,16 +119,18 @@ def test_two_candidates_can_coexist_in_the_approved_dir(tmp_path):
         data[sha] = {"name": name, "at": "2026-11-14T00:00:00"}
     ledger.write_text(json.dumps(data), encoding="utf-8")
 
-    first = approved_guard.load_approved_strategy(
-        approved_dir=approved_dir, approvals_file=ledger, file_name="slow_candidate.py")
-    second = approved_guard.load_approved_strategy(
-        approved_dir=approved_dir, approvals_file=ledger, file_name="fast_candidate.py")
+    first, _sha1 = approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name="slow_candidate.py",
+        template_name=LIVE_TEMPLATE)
+    second, _sha2 = approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name="fast_candidate.py",
+        template_name=LIVE_TEMPLATE)
 
     assert first is not second
     assert first.fast_window == 8 and second.fast_window == 12
-    skeleton = skeleton_class()
-    assert issubclass(first, skeleton)
-    assert issubclass(second, skeleton)
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+    assert issubclass(first, TrendAtrStrategy)
+    assert issubclass(second, TrendAtrStrategy)
 
 
 def test_the_skeleton_has_its_own_unit_tests():
