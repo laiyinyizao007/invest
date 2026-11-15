@@ -835,6 +835,20 @@ def test_mutation_harness_detects_wrong_adr_numbers(tmp_path: Path) -> None:
     missing.write_text("| 别的行 | 3 |\n", encoding="utf-8")
     assert cm._verify_adr(results, missing) == 1, "ADR 缺行时必须失败"
 
+    # **Markdown 强调号不能影响匹配**:ADR 的行里有「研究**目录**白名单」这种加粗,
+    # 匹配前必须去掉 —— 否则「匹配不上 → 静默跳过 → 假绿灯」又回来了
+    # (CI 上真的发生过一次:数字全对,只有这一行的加粗让标签对不上)。
+    bold = tmp_path / "bold.md"
+    bold.write_text("| 某条**变异** | 3 |\n", encoding="utf-8")
+    assert cm._verify_adr([("某条变异", 3)], bold) == 0, "加粗标记不该影响匹配"
+
+    # **下划线不能被去掉**:`risk/live_admission.py` 这类路径里有它,
+    # 归一化时去掉 `_` 会把路径改了(实测:去掉后八行全部对不上)。
+    underscore = tmp_path / "underscore.md"
+    underscore.write_text("| 把 risk/live_admission.py 移出不可降级 | 3 |\n", encoding="utf-8")
+    assert cm._verify_adr([("把 risk/live_admission.py 移出不可降级", 3)],
+                           underscore) == 0, "路径里的下划线不能被归一化吃掉"
+
 
 def test_mutation_harness_survives_non_utf8_console() -> None:
     """变异脚本在 **cp1252 控制台**上不得崩溃(第 3 轮 codex 的 Critical-1)。

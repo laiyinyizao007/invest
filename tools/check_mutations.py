@@ -296,7 +296,14 @@ def _verify_adr(results: list[tuple[str, int]], adr_path: Path | None = None) ->
     if not adr.exists():
         print("ADR 不存在,跳过核对", file=sys.stderr)
         return 2
-    normalized = adr.read_text(encoding="utf-8").replace("`", "")
+    # 归一化:去掉反引号与 Markdown 强调号。
+    # **必须**去掉强调号——ADR 的行里有「研究**目录**白名单」这种加粗,
+    # 留着它就与脚本标签差两个字符,又变成「匹配不上 → 静默跳过 → 假绿灯」。
+    # **不能**去掉下划线:`risk/live_admission.py` 这类路径里有它,
+    # 去掉就把路径改了(实测:去掉 `_` 后八行全部对不上)。
+    normalized = adr.read_text(encoding="utf-8")
+    for mark in ("`", "*"):
+        normalized = normalized.replace(mark, "")
     bad: list[str] = []
     matched = 0
     for label, n in results:
