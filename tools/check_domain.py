@@ -412,7 +412,13 @@ def main(argv: list[str] | None = None) -> int:
             # base==HEAD、diff 为空、工作树干净,就是这一支——
             # 那时若也返回 2,CI 会永久变红(codex 第 2 轮的 Critical-1)。
             # 「没有改动」不是失败:返回 0,并说明白。
+            #
+            # **必须也打印「总判定:」这一行**:CI 的冒烟关卡要求输出里有结论行
+            # (否则「分档器崩了」与「分档器说这是执行域」在 CI 眼里一样——
+            #  见 ADR 第 4 轮 S-1)。push 到 main 时 base==HEAD、diff 为空,
+            # 走的正是这一支——它的输出也必须有结论行,否则关卡会误判成「崩溃」。
             print(f"相对 {args.diff!r} 没有改动(也没有未跟踪文件):无待判定的文件。")
+            print("总判定: 无改动(无需分档)")
             return 0
     else:
         paths = list(args.paths)

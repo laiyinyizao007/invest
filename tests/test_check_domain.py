@@ -903,3 +903,32 @@ def test_cli_crash_exits_2_not_1() -> None:
                           capture_output=True, text=True, env=env,
                           encoding="utf-8", errors="replace")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_no_change_path_prints_a_conclusion_line() -> None:
+    """「没有改动」那一支**也必须**打印「总判定:」这一行。
+
+    背景:push 到 main 时 base==HEAD、diff 为空,走的正是这一支。它原先只打印
+    「无待判定的文件」,**没有结论行**;而 CI 的冒烟关卡要求输出里有结论行
+    (第 4 轮 S-1:否则「分档器崩了」与「分档器说这是执行域」在 CI 眼里一样),
+    于是这一支被误判成「崩溃」→ **main 上的 Research Guard 直接变红**。
+
+    PR 路径永远有改动(base != HEAD),所以这条分支在 PR 的 CI 上**从来没被走到**。
+    这条测试把它钉住。
+    """
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "check_domain.py"), "--diff", "HEAD"],
+        capture_output=True, text=True, cwd=str(ROOT),
+        env={**os.environ, "PYTHONUTF8": "1"},
+        encoding="utf-8", errors="replace",
+    )
+    # 本测试文件本身是工作区的未跟踪改动,所以这里不假设「没有改动」;
+    # 只要求:**只要退出码是 0,输出里就必须有结论行**。
+    if proc.returncode == 0:
+        assert "总判定:" in proc.stdout, (
+            f"退出码 0 但没有结论行:\n{proc.stdout}\n{proc.stderr}"
+        )
+    # 无论退出码是什么,都**不能**是 traceback(崩溃会伪装成 exit 1)
+    assert "Traceback" not in proc.stderr, proc.stderr
