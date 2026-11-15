@@ -12,6 +12,7 @@
 """
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -307,8 +308,10 @@ except approved_guard.ApprovedLoadError as exc:
 print('NOT_REFUSED')
 sys.exit(1)
 """ % (str(ROOT), str(approved_dir), str(ledger))
+    # 子进程要显式给 UTF-8:控制台代码页是 cp1252,子进程打印中文会 UnicodeEncodeError
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=120)
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
     assert "第四层" in proc.stdout
 
@@ -353,8 +356,10 @@ except approved_guard.ApprovedLoadError as exc:
 print('NOT_REFUSED')
 sys.exit(1)
 """ % (str(ROOT), str(approved_dir), str(ledger))
+    # 子进程要显式给 UTF-8:控制台代码页是 cp1252,子进程打印中文会 UnicodeEncodeError
     proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=120)
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
 
 
