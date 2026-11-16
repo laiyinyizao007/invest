@@ -15,6 +15,9 @@
     python scripts/flatten_positions.py                      # 只看不动(打印将发出的平仓单)
     python scripts/flatten_positions.py --confirm-flatten    # 真发平仓单
     python scripts/flatten_positions.py --profile .env.guoxin  # 指定档案(清的是那个档案的账户)
+    # 计划里出现「买入平仓」时(净持仓账户的净多会被报成空头,那一单可能是加仓),
+    # 必须先在交易客户端核对方向,再加 --confirm-direction 才能发:
+    python scripts/flatten_positions.py --confirm-flatten --confirm-direction
 
 **这个工具平的是账户里的**全部**持仓,不是 `--symbol` 指定的那个合约**
 (`--symbol` 只是「额外订阅哪个合约的行情」)。要平哪个合约请在交易客户端里操作。
@@ -22,6 +25,8 @@
 安全约束
 --------
 - 默认**只看不动**;真要发单必须显式加 `--confirm-flatten`;
+- 计划里有「买入平仓」时还要 `--confirm-direction`:方向只在 stderr 提示一句是不够的,
+  这个工具会动真实仓位,方向反了(净持仓账户的净多被报成空头 ⇒ 加仓)比不平更糟;
 - 只允许连**模拟盘/测试盘**:交易前置与行情前置都必须在可信地址表内
   (国信测试前置或 SimNow)。生产 API **没有强制放行开关**,加什么参数都不行;
 - 平仓方向与持仓方向相反,手数等于持仓手数;上期所/能源中心拆成今仓/昨仓两张单,
@@ -178,14 +183,19 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]],
         if exchange is None or not code:
             continue
         bid, ask, last = quotes.get(vt_symbol, (0.0, 0.0, 0.0))
-        if pos.direction == Direction.LONG:
+        # 分派也走**归一化后的方向键**,与合并键同源:合并用的是 `normalize_direction`
+        # (枚举名),若这里按枚举相等分派,一行 `direction` 是字符串 "Long" 的持仓会被
+        # 合进 LONG 键却在分派时被跳过 → 该持仓不进平仓计划,留在账户上
+        # (2026-11-16 codex 复核 L1)。
+        pos_dir = normalize_direction(pos.direction)
+        if pos_dir == "LONG":
             direction, raw_price = Direction.SHORT, bid
             reason = "平多:卖出挂在买一"
-        elif pos.direction == Direction.SHORT:
+        elif pos_dir == "SHORT":
             direction, raw_price = Direction.LONG, ask
             reason = "平空:买入挂在卖一"
         else:
-            continue                      # NET:方向不明,交给上层报错
+            continue                      # NET 或认不出来的方向:交给上层报错/人工处理
         if raw_price <= 0:
             raw_price = last
             reason += "(盘口没有对手价,退回最新价)"
@@ -513,7 +523,8 @@ def run(args: argparse.Namespace) -> int:
         # 净持仓账户的**净多**也报成空头(PosiDirection=净 → Direction.SHORT),
         # 那种情况下这单是**加仓**。双边持仓账户不受影响,但我们分不出这两种情况
         # → 交给人在 --confirm-flatten 之前拿交易客户端核对方向。
-        if any(p.direction == Direction.LONG for p in plans):
+        needs_direction_check = any(p.direction == Direction.LONG for p in plans)
+        if needs_direction_check:
             print("⚠ 上面的「买入平仓」对应柜台回报的**空头**持仓。注意:净持仓账户的净多"
                   "会被 vnpy_ctp 报成空头,那种情况下这单是加仓。请先在交易客户端核对方向,"
                   "再决定要不要 --confirm-flatten。", file=sys.stderr)
@@ -531,9 +542,24 @@ def run(args: argparse.Namespace) -> int:
 
         if not args.confirm_flatten:
             print("未加 --confirm-flatten:只打印计划,不发任何委托。")
+            if needs_direction_check:
+                print("  提示:计划里有「买入平仓」,真要发单还得再加 --confirm-direction"
+                      "(先在交易客户端核对过方向)。", file=sys.stderr)
             record["结论"] = "dry-run"
             save_record()
             return EXIT_OK
+
+        # 方向不明的「买入平仓」不许自动发:这个工具是**会动真实仓位**的,
+        # 一句 stderr 提示不算闸门 —— 读完提示时单子已经在路上。
+        # 净持仓账户的净多会被报成空头,那一单是**加仓**而不是平仓(方向反了比不平更糟)。
+        # 所以:必须人工在交易客户端核对过方向,再加 --confirm-direction 才放行
+        # (2026-11-16 codex 复核 M4)。
+        if needs_direction_check and not args.confirm_direction:
+            print("✗ 存在「买入平仓」计划,而净持仓账户的净多会被报成空头 ⇒ 这一单可能是**加仓**而不是平仓。"
+                  "请先在交易客户端核对持仓方向;确认无误后再加 --confirm-direction 重跑。", file=sys.stderr)
+            record["结论"] = "方向待人工核对(缺 --confirm-direction),未发单"
+            save_record()
+            return EXIT_CONFIG
 
         all_filled = True
         try:
@@ -634,6 +660,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="", help="额外订阅这个合约的行情(默认取 .env 的 LIVE_VT_SYMBOL);"
                                                     "**平仓范围不受它影响**:本工具平的是账户里的全部持仓")
     parser.add_argument("--confirm-flatten", action="store_true", help="确认真的要发出平仓委托")
+    parser.add_argument("--confirm-direction", action="store_true",
+                        help="确认已在交易客户端核对过持仓方向(计划里出现「买入平仓」时必须一起给,"
+                             "否则拒绝发单:净持仓账户的净多会被报成空头,那一单是加仓)")
     parser.add_argument("--connect-timeout", type=float, default=300.0,
                         help="等待合约表就绪的最长时间(秒);柜台的合约表查询实测要 90 秒以上")
     parser.add_argument("--position-wait", type=float, default=15.0)

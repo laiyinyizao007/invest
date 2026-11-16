@@ -308,7 +308,7 @@ def test_cancel_reports_a_failure_without_raising():
 def _args(**kw):
     import argparse
 
-    base = dict(profile=".env.guoxin", symbol="c2701.DCE", confirm_flatten=False,
+    base = dict(profile=".env.guoxin", symbol="c2701.DCE", confirm_flatten=False, confirm_direction=False,
                 connect_timeout=1.0, position_wait=0.1, tick_wait=0.1, fill_timeout=0.1)
     base.update(kw)
     return argparse.Namespace(**base)
@@ -582,6 +582,54 @@ def test_a_short_position_is_flagged_for_a_direction_check(monkeypatch, tmp_path
     assert f.run(_args(tick_wait=0.0)) == f.EXIT_OK
     err = capsys.readouterr().err
     assert "买入平仓" in err and "加仓" in err
+
+
+def test_a_buy_to_close_plan_needs_an_explicit_direction_confirmation(monkeypatch, tmp_path, capsys):
+    """「买入平仓」计划 ⇒ 必须再有 `--confirm-direction` 才发单。
+
+    为什么:净持仓账户的**净多**会被 vnpy_ctp 报成空头,那一单是**加仓**而不是平仓。
+    这个工具会动真实仓位,一句 stderr 提示不算闸门 —— 读完提示时单子已经在路上
+    (2026-11-16 codex 复核 M4)。所以:方向没核对过 ⇒ 拒绝发单,退出码 2。
+    """
+    import flatten_positions as f
+
+    pos = _pos("c2701", Exchange.DCE, Direction.SHORT, 3)
+    pos.vt_symbol = "c2701.DCE"
+    _install_fakes(monkeypatch, tmp_path, positions=[pos], positions_after=(), fill="filled")
+    assert f.run(_args(confirm_flatten=True, tick_wait=0.0)) == f.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "--confirm-direction" in err
+    records = list((tmp_path / "data" / "flatten").glob("flatten-*.json"))
+    assert records and json.loads(records[0].read_text(encoding="utf-8"))["结论"].startswith("方向待人工核对")
+
+
+def test_the_direction_confirmation_lets_the_buy_to_close_plan_through(monkeypatch, tmp_path, capsys):
+    """人工核对过方向(`--confirm-direction`)⇒ 照常发单。"""
+    import flatten_positions as f
+
+    pos = _pos("c2701", Exchange.DCE, Direction.SHORT, 3)
+    pos.vt_symbol = "c2701.DCE"
+    _install_fakes(monkeypatch, tmp_path, positions=[pos], positions_after=(), fill="filled")
+    assert f.run(_args(confirm_flatten=True, confirm_direction=True, tick_wait=0.0)) == f.EXIT_OK
+    out = capsys.readouterr().out
+    assert "买入平仓 c2701.DCE 3 手" in out
+
+
+def test_the_plan_dispatches_on_the_normalized_direction(monkeypatch, tmp_path):
+    """方向是字符串时也要能分派(与合并键同源)。
+
+    2026-11-16 codex 复核 L1:合并键用 `normalize_direction`(枚举名),分派却用枚举相等
+    ⇒ 一行 `direction` 是 "Long" 的持仓会被合进 LONG 键却在分派时被跳过,留在账户上。
+    """
+    from flatten_positions import plan_closes
+    from vnpy.trader.constant import Exchange as _Ex
+
+    pos = SimpleNamespace(vt_symbol="c2701.DCE", exchange=_Ex.DCE, direction="Long",
+                          volume=3, yd_volume=0, frozen=0)
+    plans = plan_closes([pos], {"c2701.DCE": (2185.0, 2186.0, 2185.0)}, {"c2701.DCE": 1.0})
+    assert len(plans) == 1
+    assert plans[0].direction == Direction.SHORT          # 平多 = 卖出
+    assert plans[0].volume == 3
 
 
 def test_a_position_without_a_reliable_split_goes_to_a_human(monkeypatch, tmp_path, capsys):

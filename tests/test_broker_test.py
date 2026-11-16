@@ -18,7 +18,7 @@ from fakes import FakeGateway, SyncEventEngine  # noqa: E402
 from trading.events import EVENT_GUARD_ALERT  # noqa: E402
 from trading.safe_risk import SafeRiskManagerApp  # noqa: E402
 from vnpy.event import Event  # noqa: E402
-from vnpy.trader.constant import Direction, Exchange, Offset  # noqa: E402
+from vnpy.trader.constant import Direction, Offset  # noqa: E402
 from vnpy.trader.engine import MainEngine  # noqa: E402
 from vnpy.trader.event import (  # noqa: E402
     EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TIMER, EVENT_TRADE,
@@ -52,7 +52,10 @@ class Env:
         self.gw.push_account(10_000)
         self.ctx = bt.Ctx(main_engine=self.main, risk_engine=self.risk, collector=self.collector, symbol="c2601.DCE",
                           gateway_name="CTP", alerts=self.alerts, trades=self.trades,
-                          pump=self.pump, sleep=lambda s: None, in_session=in_session, position_wait=0.2)
+                          pump=self.pump, sleep=lambda s: None, in_session=in_session, position_wait=0.2,
+                          # 注入假时钟:每次 pump 前进 1 秒。超时与「计数稳定 1 秒」都按它算,
+                          # 测试不必真等(2026-11-16 codex 复核 M3:改之前整个套件慢 63%)。
+                          clock=lambda: self.clock_t)
         self.ctx.contract = self.collector.contract_of("c2601.DCE")
         self.ctx.tick = self.collector.tick_of("c2601.DCE")
         self.book = bt.Book()
@@ -207,6 +210,128 @@ def test_an_unconfirmed_cancel_makes_the_cancel_metric_inconclusive(env, monkeyp
     assert any("撤单未确认" in line for s in p31.shots for line in s.lines)
 
 
+def test_an_order_over_the_limit_that_was_still_sent_is_a_failure_not_a_skipped_test(env, monkeypatch):
+    """阈值确实失效 = **硬失败**,不能被「判不出来」洗成 SKIP。
+
+    2026-11-16 codex 复核 H1 复现:计数一次跳了不止 +1(基数取旧),
+    而超阈值的那一笔**真的发出去了**(证据行字面写着「未被拦截(意外)」)——
+    这时 P3.1/T6 判成 SKIP,报告里就写成「未测试」,一次真实的阈值失效被洗掉了。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:                     # 第二笔 = 超阈值那笔:假装风控没拦下
+            return "VT999999"
+        return real_send(ctx, req)
+
+    real_settle = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real_settle(ctx, rule, attr, timeout) - 2, 0)   # 故意报旧两笔 ⇒ 基数取旧
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    calls["n"] = 0
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值未生效" in p31.summary
+    assert item(env, "T6").status == be.FAIL
+    assert any("未被拦截(意外)" in line for s in p31.shots for line in s.lines)
+
+
+def test_a_skipped_threshold_says_which_part_could_not_be_judged(env, monkeypatch):
+    """SKIP 必须说清**哪里**判不出来,不能一律写「计数未推进」。
+
+    2026-11-16 codex 复核 M2:summary 写死「计数未推进」,对「基数取旧」「撤单未确认」
+    两档完全说反;这段文字会落进报告的缺失项清单,写错会把人引向错误的动作。
+    """
+    real = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real(ctx, rule, attr, timeout) - 1, 0)     # 故意报旧一笔 ⇒ 基数取旧
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "计数基数取旧" in p31.summary
+    assert "计数未推进" not in p31.summary
+
+
+def test_an_unconfirmed_cancel_in_the_summary_points_at_the_counter(env, monkeypatch):
+    """「撤单未确认」要在摘要里点名:演示单可能还挂在柜台上,得人去核对。"""
+    env.ctx.cancel_wait = 0.5
+    env.gw.cancel_works = False                     # 我们的撤单请求不生效
+    real_wait = bt.wait_counter_at_least
+
+    def fake_wait(ctx, rule, attr, target, timeout):
+        if attr == "total_cancel_count":
+            rule.total_cancel_count = max(rule.total_cancel_count, target)
+            return True
+        return real_wait(ctx, rule, attr, target, timeout)
+
+    monkeypatch.setattr(bt, "wait_counter_at_least", fake_wait)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "撤单未确认" in p31.summary
+    assert "柜台" in p31.summary
+
+
+def test_orders_that_could_not_be_cancelled_are_written_into_the_evidence(env, monkeypatch):
+    """撤不掉的委托必须进**证据**,不能只在日志里说一句。
+
+    2026-11-16 codex 复核 L3:`cancel_active` 原先什么都不返回,步骤证据里一个字都没有,
+    只能靠整轮结束时的 final_safety 兜底。
+    """
+    env.rule.stale_order_seconds = 10 ** 6         # 挡住「挂单超时自动撤单」这个干扰项
+    env.gw.cancel_works = False                    # 撤单请求不生效
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert any("仍在活动或本地查不到的委托" in line for s in p31.shots for line in s.lines), p31.shots
+
+
+def test_an_order_the_collector_lost_is_reported_as_not_confirmed_gone(env):
+    """本地查不到委托 ≠ 它已经不在柜台上:状态未知就当还挂着,进证据。
+
+    2026-11-16 第 1 轮复核建议:查不到订单号时只当「已消失」会漏报,
+    而这张单可能还挂在柜台上 → 必须和「仍在活动」一起报出来。
+    """
+    sent: list[str] = []
+    real_send = bt.send
+
+    def fake_send(ctx, req):
+        oid = real_send(ctx, req)
+        sent.append(oid)
+        return oid
+
+    env.ctx.collector.orders.clear()        # 本地缓存里没有这张单(模拟回报丢失)
+    bt.send = fake_send
+    try:
+        left = bt.cancel_active(env.ctx, ["VT-NOT-FOUND"])
+    finally:
+        bt.send = real_send
+    assert left == ["VT-NOT-FOUND"]         # 查不到 = 撤不掉,不许当成「干净了」
+
+
+def test_the_production_clock_is_time_monotonic():
+    """生产里 `Ctx.clock` 必须就是 `time.monotonic`(超时语义不能被改)。
+
+    测试注入假时钟是为了跑得快;一旦默认时钟被换成别的东西,
+    生产里的「等 5 秒/等稳定 1 秒」的口径就变了,而测试还全绿 ⇒ 兜一条断言。
+    """
+    import time as _time
+    assert bt.Ctx.__dataclass_fields__["clock"].default is _time.monotonic
+
+
 def test_cancel_active_waits_until_the_order_reaches_a_terminal_state(env, monkeypatch):
     """撤单请求发出 ≠ 撤成功:撤完必须等到终态。
 
@@ -270,7 +395,11 @@ def test_a_corrupt_state_file_is_not_treated_as_unlocked(tmp_path):
 
 
 def test_an_unreadable_state_file_is_not_treated_as_unlocked(tmp_path, monkeypatch):
-    """状态文件读不出来(权限/占用)同样判不出来 → 拒绝跑。"""
+    """状态文件读不出来(权限/占用)同样判不出来 → 拒绝跑。
+
+    判据与运行时同一份(`AccountGuard._load` 把读失败当损坏 → 硬锁定),
+    所以提示里出现的是「硬锁定」并附上真实原因,不是本地的「读不出来」。
+    """
     state = tmp_path / "guard.json"
     state.write_text("{}", encoding="utf-8")
 
@@ -279,7 +408,7 @@ def test_an_unreadable_state_file_is_not_treated_as_unlocked(tmp_path, monkeypat
 
     monkeypatch.setattr(Path, "read_text", boom)
     note = bt.locked_state_note(state)
-    assert note and "读不出来" in note
+    assert note and "占用" in note          # 拒绝跑,并说明真实原因
 
 
 def test_threshold_cancel_metric_is_skipped_off_session(tmp_path):
@@ -916,24 +1045,80 @@ def test_exit_code_separates_incomplete_evidence_from_failed_items():
 
 # ---------- 账户锁定:不要白跑一次登录 ----------
 
+def _guard_state(**over) -> dict:
+    """一份**完整**的 AccountGuard 状态文件内容。
+
+    必填字段缺一个,运行时的 `AccountGuard._load` 就判「文件损坏」→ 硬锁定
+    (2026-11-16 codex 复核 H2:本地另写一套解析会把这判成「没锁」)。
+    """
+    state = {
+        "account_id": "TESTACCT",   # 虚构占位:真实账号号不进版本库
+        "last_equity": 10000.0,
+        "peak_equity": 10000.0,
+        "day": "2026-01-01",
+        "day_start_equity": 10000.0,
+        "daily_locked_day": None,
+        "hard_locked": False,
+        "hard_reason": "",
+        "hard_locked_at": "",
+        "unlock_history": [],
+        "manual_orders": {},
+    }
+    state.update(over)
+    return state
+
+
 def test_locked_state_note_reads_the_isolated_guard_state(tmp_path):
     """锁定状态下开仓委托会被本地风控全部拦下,取证会白跑一次券商登录额度。"""
     from risk.account_guard import trading_day
     state = tmp_path / "guard.json"
     day = trading_day(bt.beijing_now()).isoformat()
 
-    state.write_text(json.dumps({"hard_locked": True, "hard_reason": "权益回撤"}), encoding="utf-8")
+    state.write_text(json.dumps(_guard_state(hard_locked=True, hard_reason="权益回撤")), encoding="utf-8")
     note = bt.locked_state_note(state)
     assert "硬锁定" in note and "权益回撤" in note
 
-    state.write_text(json.dumps({"hard_locked": False, "daily_locked_day": day}), encoding="utf-8")
+    state.write_text(json.dumps(_guard_state(daily_locked_day=day)), encoding="utf-8")
     note = bt.locked_state_note(state)
     assert "当日锁定" in note and day in note
 
-    state.write_text(json.dumps({"hard_locked": False, "daily_locked_day": "2000-01-01"}), encoding="utf-8")
+    state.write_text(json.dumps(_guard_state(daily_locked_day="2000-01-01")), encoding="utf-8")
     assert bt.locked_state_note(state) == ""            # 旧交易日的锁定已经过期
 
-    assert bt.locked_state_note(tmp_path / "missing.json") == ""   # 读不到状态文件就当没有状态
+    assert bt.locked_state_note(tmp_path / "missing.json") == ""   # 没有状态文件 = 从来没锁过
+
+
+def test_locked_state_note_agrees_with_the_runtime_guard(tmp_path):
+    """本地判「没锁」而运行时判「硬锁定」⇒ 白跑一次国信登录额度。
+
+    2026-11-16 codex 复核 H2 复现:状态文件只写 `{"hard_locked": false}` 时,
+    本地解析判「没锁」放行,而 `AccountGuard._load` 因缺必填字段直接硬锁定
+    ⇒ 登录一次、委托全被拒、证据只剩一堆「被拦下」。
+    两份判据必须同源:直接用 AccountGuard 读。
+    """
+    from risk.account_guard import AccountGuard, AccountLimits
+    state = tmp_path / "guard.json"
+    state.write_text(json.dumps({"hard_locked": False}), encoding="utf-8")
+
+    guard = AccountGuard(AccountLimits(), state)
+    assert guard.hard_locked is True                    # 运行时:文件损坏 → 硬锁定
+
+    note = bt.locked_state_note(state)
+    assert note != ""                                   # 本地也必须拒绝跑
+    assert "硬锁定" in note or "损坏" in note
+
+
+def test_locked_state_note_refuses_a_broken_state_file_instead_of_crashing(tmp_path):
+    """坏文件(不是 JSON / 不是 JSON 对象 / 不是 UTF-8)⇒ 拒绝跑,并且**不抛异常**。
+
+    抛异常的话,操作者拿到的是 traceback 而不是可执行的说明,退出码也会变成「崩溃」。
+    """
+    state = tmp_path / "guard.json"
+    for raw in (b"not json at all", b"[]", b"42", b'"x"', b"\xff\xfe\x00broken"):
+        state.write_bytes(raw)
+        note = bt.locked_state_note(state)
+        assert note != "", raw                           # 绝不能当成「没锁」放行
+
 
 
 def test_main_refuses_to_connect_when_the_account_is_locked(monkeypatch, capsys, tmp_path):
@@ -944,7 +1129,7 @@ def test_main_refuses_to_connect_when_the_account_is_locked(monkeypatch, capsys,
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     (state_dir / "guard.json").write_text(
-        json.dumps({"hard_locked": False, "daily_locked_day": trading_day(bt.beijing_now()).isoformat()}),
+        json.dumps(_guard_state(daily_locked_day=trading_day(bt.beijing_now()).isoformat())),
         encoding="utf-8")
     monkeypatch.setattr(bt, "BT_ROOT", tmp_path)
     assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
@@ -1033,6 +1218,17 @@ def test_settle_counter_gives_up_instead_of_hanging():
             return self._n
 
     class _Ctx:
+        """假上下文:时钟每次 pump 前进 1 秒(计数一直跳 ⇒ 永远等不到「稳定 1 秒」)。"""
+
+        def __init__(self) -> None:
+            self.t = 0.0
+
+        def clock(self) -> float:
+            return self.t
+
+        def pump(self) -> None:
+            self.t += 1.0
+
         def sleep(self, _s: float) -> None:
             return None
 
