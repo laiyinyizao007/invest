@@ -11,9 +11,12 @@
   `risk/constitution.py` 两边是**同一条防线的两次演进**(main +102 行 / 本分支 +876 行)
   ⇒ 底稿取本分支那份,把 main 的四样东西并进来:闸门函数名黑名单 `BUILTIN_PROTECTED_GATE_ATTRS`、
   `_gate_attr_violations()`、`_setattr_protected_name()`、以及把它们接进 `screen_source` 的两处。
-  main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` **不单独并入**——
-  通用判定(`_gate_attr_violations` 走遍全树)已覆盖该形态,单独再插只会在同一次写入上报两条重复结论;
-  **覆盖范围不减**。`CHANGELOG.md` 两边各加一段,语义不冲突 ⇒ 两边都保留。
+  main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` **一开始被我判为「不必并入」,
+  后被仓库自己的宪法历史守卫驳回,已改回并入**:守卫守的是「受保护常量的活代码引用次数只许增不许减」,
+  我那次裁决把引用次数从 6 降到 5 ⇒ 报红「常量还在但底线的执行点被删了」。
+  **守卫是对的**——「反正有别的判定覆盖」是推理,不是代码里写着的事实;照那条推理做,
+  这次合并就会成为第一个洞。代价(如实):同一次属性写入现在报两条**内容相同**的结论
+  (main 自己就如此,保持原样)。`CHANGELOG.md` 两边各加一段,语义不冲突 ⇒ 两边都保留。
 - **补一条 main 自己没配探针的规则**:闸门函数名的**七种**写入形态
   (赋值/带注解赋值/复合赋值/元组解包/`del`/`setattr`/`delattr`/`vars()[...]`)——
   main 在 PR #34 里加了这条规则,但**没配动态探针**(仓库规矩:每条新规则都要有放行+拦截双向探针)。

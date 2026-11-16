@@ -527,10 +527,21 @@ main 加的是「闸门函数名黑名单 + 七种写入形态 + 按名 setattr�
    - `_gate_attr_violations(tree)`(闸门名的**任何**写入形态);
    - `_setattr_protected_name(node, c)`(`setattr(obj, "名字", v)` 这种按字符串写的);
    - 以及 main 把上面两者接进 `screen_source` 的两处。
-3. **main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` 分支不单独并入**:
-   同一份文件里已经有覆盖该形态的通用判定(`_gate_attr_violations` 走遍全树,
+3. **main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` 分支,一开始被我判为「不必并入」——
+   然后被仓库自己的守卫驳回,已改回并入。**
+   当时的理由是:同一份文件里已经有覆盖该形态的通用判定(`_gate_attr_violations` 走遍全树,
    Assign / AnnAssign / AugAssign / 元组解包 / del / setattr / delattr / `vars()[...]` 全在里头),
-   单独再插一条只会在**同一次写入**上报两条重复结论。**覆盖范围不减**,只是不重复报。
+   单独再插一条只会在**同一次写入**上报两条重复结论,覆盖范围不减。
+   **但仓库的宪法历史守卫(`tools/check_constitution_history.py`)判的不是「覆盖范围」,判的是
+   「受保护常量的活代码引用次数只许增不许减」** ⇒ 我那次裁决把 `BUILTIN_PROTECTED_GATE_ATTRS`
+   的引用次数从 6 降到 5 ⇒ 守卫报红:
+   「引用次数从 6 降到 5(常量还在但底线的执行点被删了,只能增不能减)」。
+   **守卫是对的**:这条规则守的就是**执行点不许消失**,而「反正有别的判定覆盖」是**我的推理**,
+   不是**代码里写着的事实**——如果后来有人删掉那个通用判定,这次合并就成了第一个洞。
+   ⇒ 已把该分支按 main 的原样并入(引用次数回到 6),守卫转绿。
+   **代价(如实)**:同一次属性写入现在会报两条**内容相同**的结论
+   (`x.screen_source = 1` → 两条「改写了闸门函数 screen_source」)——
+   这是 main 自己就有的行为,合并保持原样,不夹在这次合并里改判定口径。
 4. `CHANGELOG.md` 两边各加了一段(本分支的「只读视图」与 main 的「第 4 轮 codex 复核」),
    **语义不冲突** ⇒ 两边都保留(本分支在前)。
 

@@ -1683,6 +1683,10 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     violation = _write_violation(target, c, import_names)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+                    elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(
+                            f"第 {node.lineno} 行: 改写了闸门函数 {target.attr}"
+                            "(把「拒绝」这件事的执行者换掉)")
                     elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
                             target.attr, _attr_path(target) or []) and not _self_instance_attr(target, import_names):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
