@@ -249,7 +249,8 @@
     ⇒ `python -I -c "from dashboard import collectors"` 直接 `ZoneInfoNotFoundError`。
     两处(以及 `scripts/guoxin_oneclick.py`、`scripts/unattended_report.py`)统一改成**固定 UTC+8 偏移**,
     仪表盘隔离进程现在能 import 成功;回归用例扩到「`-I` 子进程里 import 仪表盘与证据统计模块」,
-    改回 `ZoneInfo` 必红。
+    改回 `ZoneInfo` 必红。顺带订正 `dashboard/collectors.py` 里那句过期注释
+    (「风控进程写的是本地时间」——现在写的是**北京时间 + `+08:00` 偏移**,偏移量与宿主机时区无关)。
   - **M1(Medium)——摘要会吞掉关键告警「演示单已成交 ⇒ 账户可能多出持仓」**。P3.1 摘要原来只取**第一个**非空原因
     (`order_stalled or cancel_stalled`),报单指标一旦也判不出来,撤单指标那条持仓告警整条消失 ——
     而摘要正是**进国信报告正文的那行字**。现在两个指标的原因**都**收集(并标明是「报单」还是「撤单」),

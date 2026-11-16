@@ -103,7 +103,9 @@ def _validate_guard(raw: Any, limits: dict) -> dict | None:
     sampled = raw.get("sampled_at")
     sampled_ts = None
     if sampled is not None:
-        # 带时区的 ISO 字符串。无时区的会被 parse_iso 当成 UTC——风控进程写的是本地时间,会差 8 小时,所以直接拒绝
+        # 带时区的 ISO 字符串。无时区的会被 parse_iso 当成 UTC——那会让「权益新鲜度」凭空差 8 小时,所以直接拒绝。
+        # 风控进程写的是**北京时间 naive 值 + +08:00 偏移**(risk/account_guard.py 用固定 UTC+8 落盘),
+        # 不是本机时间,所以这里的偏移量与宿主机时区无关。
         if not isinstance(sampled, str) or not _has_offset(sampled):
             return None
         sampled_ts = m.parse_iso(sampled)
