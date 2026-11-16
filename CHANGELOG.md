@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
+  (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。
+  自愈层用**用户级守护进程**(每 10 分钟 `ensure`;Windows 计划任务注册被拒 `0x80070005 Access Denied`),
+  实测 `ensure` 正确识别已有进程(`already_running` 事件),不重复拉起。
+  **一条必须写进手册的观察**:玉米/甲醇夜盘 21:00–23:00 收盘后,`last_tick` 停在 22:59:59.5、
+  与本机差 762 秒 → 超 `filter_window` → 状态必然是 `degraded`、tick 被丢弃。
+  **这不是故障,是收盘**;分辨法=先核对本机时钟(本次对百度/微软/Akamai 三个源,误差 <2 秒),
+  再看 `last_tick` 是不是整点整秒的收盘时刻。下一个时段(日盘 09:00)自动开录。
+  ADR `20261111-market-recording-and-dsh-orchestration.md` 选的 dsh-cron 条目**从未接线**(runbook §5 第 3 步未完成),
+  该 ADR 待补一句说明现状。
 - **录制常驻化与数据扩充方案**(`docs/plans/20261116-recording-and-data-plan.md`;研究域)。
   把「玉米上不了实盘」的瓶颈**定量**了:晋级门槛里与样本量耦合的三条(往返 ≥150 /
   样本外夏普 ≥1.5 / 夏普 95% CI 下界 >0)中,第三条要求 `夏普 > 1.96/√样本外年数`——
