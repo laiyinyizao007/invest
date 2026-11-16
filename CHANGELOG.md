@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **本金、手续费与滑点假设的核实状态**(新 ADR [`docs/adr/20261116-capital-and-cost-assumptions.md`](docs/adr/20261116-capital-and-cost-assumptions.md),
+  只记录、不改任何风控常量):把国信费率表与 6 个品种的交易所规格列为**已核实**,把保证金估算、
+  塑料/豆一/豆二规格、1 个 tick 滑点列为**未核实**;并登记三条待验证假设(滑点是成本最大变量、
+  固定成本对 1 万元本金的压力、单笔预算占本金 3% 高于常见经验线——仅作对照,不建议修改)。
 - **复用官方/成熟组件评估的结论与待办**(新 ADR [`docs/adr/20261116-reuse-official-components-eval.md`](docs/adr/20261116-reuse-official-components-eval.md),
   只记录、不改代码):结论是先做策略;登记 4 项触发条件驱动的待办(DSR 参考实现对照测试、夏普口径核对、
   无头启动流程与官方 `no_ui/run.py` 对读、通知库评估),并记下明确不做的组件(`vnpy_akshare`、`empyrical-reloaded`、
