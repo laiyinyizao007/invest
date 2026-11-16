@@ -2580,7 +2580,7 @@ sqlite 库文件的写入拦截(#43)。
 | 变异 | 结果 |
 |---|---|
 | 从 workflow 里删掉 `pytest tests/test_fs_capability_closure.py` | 红(接线守卫) |
-| 给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` | 红(标记纪律守卫)——**但这条声明在第 46 轮之前是无条件的假声明**:实测旧判据下 88 条未标记用例里只抓住 84 条,4 条「样板型」抓不住。第 46 轮换判据、第 47 轮再收紧后,实测**全部**抓住(变异 M4/M9 红) |
+| 给一条**不依赖**交易栈的用例加上 `@requires_trading_stack` | 红(标记纪律守卫)——**但这条声明在第 46 轮之前是无条件的假声明**:实测旧判据下 88 条未标记用例里只抓住 84 条,几条「样板型」抓不住(第 48 轮按 codex 实测更正:是 **5** 条,不是 4 条)。第 46 轮换判据、第 47 轮再收紧后,实测**全部**抓住(变异 M4/M9 红) |
 
 #### 5. 验证
 
@@ -2720,7 +2720,9 @@ codex 第 2 轮复核(锚定 2026-11-15 02:21 的树)的结论:**40/50**(质量 
 
 名单改成**显式的两副**,不再靠推断:
 
-- `PLATFORM_SKIPS`:4 条平台差异(`os.name != "nt"`),逐条写明理由(为什么只在一侧成立);
+- `PLATFORM_SKIPS`:平台差异跳过,**第 48 轮按实测更正为 5 条**(第 46 轮写 4 条时是手数的,
+  不是脚本实测——第 48 轮新增了 dbm 那一族:Windows 的 `dbm.dumb` 是纯 Python ⇒ 会发审计事件,
+  POSIX 的 `dbm.ndbm/gdbm` 是 C 层 ⇒ 不发),逐条写明理由(为什么只在一侧成立);
 - `TRADING_STACK_MARKED`:31 条「需要交易栈」的用例,**只增不减**;
   纪律守卫判的是「依赖**是不是**真的」,判不了「这条用例**该不该**依赖交易栈」——
   名单把「CI 上被跳过了哪几条」变成一份**可评审的显式清单**。
@@ -2746,7 +2748,7 @@ codex 第 2 轮复核(锚定 2026-11-15 02:21 的树)的结论:**40/50**(质量 
 
 **同时更正一句此前写错的声明**(codex MC2 的明确要求):ADR 与 CHANGELOG 里都写着
 「给一条不依赖交易栈的用例加上标记 → 红(标记纪律守卫)」。实测(codex 第 2 轮复现):
-**旧**判据下 88 条未标记用例里只抓住 84 条,4 条「样板型」抓不住 ⇒ 那句「→ 红」当时是
+**旧**判据下 88 条未标记用例里只抓住 84 条,几条「样板型」抓不住(第 48 轮按 codex 实测更正:是 **5** 条)⇒ 那句「→ 红」当时是
 **无条件**的假声明。第 46 轮换判据、第 47 轮再收紧后,实测**全部**抓住(变异 M4 / M9 红)。
 
 #### 3. MC3 —— 求值帧这族规则在 CI 上真跑
@@ -2825,12 +2827,13 @@ FAILED tests/test_check_domain.py::test_every_gate_input_provider_is_never_downg
 
 #### 第 47 轮之二:纪律守卫自己也有洞(实测发现的,不是推理)
 
-补完清单后做了一轮**反向自检**:把 codex 第 2 轮 M2 点名的那 4 条「样板型」用例
+补完清单后做了一轮**反向自检**:把 codex 第 2 轮 M2 点名的那几条「样板型」用例
+(第 48 轮按 codex 实测更正:是 **5** 条,不是 4 条)
 (`test_forward_ref_evaluate_is_refused_by_the_static_screen` 等)各加一次 `@requires_trading_stack`,
 看纪律守卫会不会拦。**第 46 轮的判据没拦住**——因为它只问「这条用例走没走生产入口」,
-而这 4 条走的正是生产入口,只是**期待入口拒绝候选**(静态筛查先拒),
+而这 5 条走的正是生产入口,只是**期待入口拒绝候选**(静态筛查先拒),
 生产代码里那句 `from vnpy_ctastrategy import CtaTemplate` 根本没走到
-⇒ 那 4 条在无 vnpy 环境里**全绿**,标记它们等于在 CI 上白丢覆盖。
+⇒ 那 5 条在无 vnpy 环境里**全绿**,标记它们等于在 CI 上白丢覆盖。
 
 收紧办法:那次 `run_candidate` 调用**不能被 `try/except` 或 `pytest.raises` 包住**。
 
@@ -2839,8 +2842,8 @@ FAILED tests/test_check_domain.py::test_every_gate_input_provider_is_never_downg
 - 被包住 ⇒ 用例期待的是入口**拒绝**,那句 import 没走到 ⇒ 理由不成立。
 
 实测:31 条已登记的标记**全部**至少有一次没被包住的调用(收紧后仍然成立),
-那 4 条「样板型」用例的全部调用都被包住(收紧后被正确判为「无理由」)。
-变异验证:M9(给那 4 条之一加标记 → 红)、M10(把「没被包住」的判定反过来 → 31 条全部失去理由 → 红)。
+那 5 条「样板型」用例的全部调用都被包住(收紧后被正确判为「无理由」)。
+变异验证:M9(给那 5 条之一加标记 → 红)、M10(把「没被包住」的判定反过来 → 31 条全部失去理由 → 红)。
 
 **教训**:判据「更严」不等于「更对」。第 46 轮把判据从「字符串里提到 vnpy」换成
 「对着生产代码核对过的硬依赖」,方向是对的,但**仍然能被「用例期待拒绝」这一形态满足**——
@@ -2902,3 +2905,436 @@ FAILED tests/test_check_domain.py::test_every_gate_input_provider_is_never_downg
   **codex CLI 复核正在后台跑** ⇒ CPU 争用 ⇒ 超时。两条**单独跑都通过**,
   与本轮改动的套件**一起跑也全部通过**。判定为**负载导致的偶发**,不是本轮改动引入——
   但「偶发」这个说法必须靠**无并发负载下的复跑**来证,不能靠推理,所以还要再跑一次全量。
+
+### 第 48 轮:codex 第 2 轮复核的 must-close **全部收口**,并给纪律守卫装上「它自己也会有洞」的探针
+
+#### 0. 这一轮的起点:codex 第 2 轮复核 39/50
+
+codex 第 2 轮复核(锚定 `d4b95c0` 那棵树)**39/50**(质量 8 / 安全 8 / 性能 7 / 架构 8 / 文档 8)
+⇒ **需小修**,给了 **4 条 must-close**(MC1~MC4)、6 条 Medium(H1/M2~M6)、7 条 Low(L1~L7)。
+它自己给出的结论是:「不是功能问题,是**守卫自己还留着一个洞**」。
+
+本轮把这四条 must-close **逐条关掉**,并把 codex 点的 Low 逐条处置(做了的写清做了什么,
+没做的**如实登记**)。分支冻结规则不变:**只补规则与用例**,功能改动一律转 Issue #29。
+
+| codex 编号 | 它指出的是什么 | 本轮怎么关的 |
+|---|---|---|
+| **MC1**(=H1) | 纪律守卫套件**自己**没有 CI 级兜底:整份被跳过、或删掉其中几条守卫用例,CI 依旧全绿;`_module_level_pytestmark` 只扫**顶层** ⇒ `if 条件: pytestmark = …` 整份漏掉;`conftest.py` 的收集钩子同样能静默摘掉守卫用例 | ① 守卫那一步也补 `--junitxml` + `tools/check_ci_ran.py`(第 1 节);② 模块级 `pytestmark` 改成**递归**扫 `if/try/with/for/while` 的模块层体(不进函数/类);③ 新增「conftest 里不许有改收集的钩子」守卫(允许名单现在是空的) |
+| **MC2**(=M2) | 「被包住」的判定:漏判 `contextlib.suppress` / `ExitStack` / 调用放进局部 helper 再由 `pytest.raises` 调用;误判 `try/finally`(无 handler)与 `except: raise` | 「被包住」判定补到 10 种形态;`try` 必须有 handler 才算吞;handler 原样重抛 ⇒ 不吞;调用在**嵌套函数**里 ⇒ 静态判不准 ⇒ 按「被包住」处理(保守方向) |
+| **MC3**(=M3+M4) | 别名写法(`from pytest import mark`、`skipif = pytest.mark.skipif`)完全隐形;「无条件跳过」只认字面 `skipif(True)` ⇒ `skipif(1)` / `skipif(condition=True)` / 裸 `pytest.mark.skip` 实测**仍绿** ⇒ 文档措辞夸大 | 别名表(命名空间别名 + 工厂别名)扫出来;无条件判定补全为常量真值(`True`/`1`/`not False`)+ `condition=` 关键字 + 裸 `pytest.mark.skip`(带不带 reason 都一样) |
+| **MC4**(=M5/M6) | XML 兜底只抓「全跳过」,抓不住「**部分**丢覆盖」(一条被别名 skip、测试文件少一条 ⇒ `k<t` 仍绿);守卫用例**自己没有库存守卫**(删掉一条守卫没人发现) | 「CI 上必须真跑的用例」变成**机器可读名单** `tests/guard_roster.json`;CI 侧 `tools/check_ci_ran.py` 按名单**逐条**核对(没出现 / 出现却是 skipped ⇒ 红);名单与套件**互相**校验(陈旧、漏登记、登记了却会被跳过,三个方向都红) |
+
+#### 1. MC1 的另一半:守卫套件自己也要有 CI 级兜底
+
+`research-guard.yml` 里跑**核心防线**与**并集回归**那两步此前都有 `--junitxml` + 断言,
+**唯独跑纪律守卫那一步没有**——也就是说:本轮要消灭的失败模式(「闸门配好了,实际没跑」)
+**仍然能打在守卫自己身上**,而且不需要改任何生产代码。
+
+现在守卫那一步也用同一道闸门:
+
+```bash
+rm -f "$RUNNER_TEMP/boundary.xml"          # codex L4:别读到上一轮的陈旧报告
+python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/boundary.xml" \
+  tests/test_research_boundary.py
+python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/boundary.xml" \
+  --roster tests/guard_roster.json --suite tests/test_research_boundary.py
+```
+
+`rm -f` 是 codex L4 提的:自托管 runner 的临时目录不一定每次都清干净,
+pytest 崩在写报告之前时,闸门会去读**上一轮的陈旧 XML**,看着全绿其实什么都没跑。
+三步(边界/核心/并集)都加了这一行。
+
+#### 2. MC4:把「CI 上必须真跑的用例」变成一份**机器可读**名单
+
+`tests/guard_roster.json`(`must_run` 映射:套件路径 → 用例名列表)。两侧共读同一份:
+
+- **守卫侧**(`tests/test_research_boundary.py::test_the_guard_roster_matches_the_suites_it_names`)
+  断言名单与套件**完全一致**,三个方向都挡:
+  名单里的名字不存在于套件(陈旧,兜底查了个空)、
+  套件里「CI 上应该真跑」的用例不在名单里(漏登记,兜底看不见它)、
+  名单里的用例其实**会被跳过**(「必须真跑」是句空话,兜底会一直红)。
+- **CI 侧**(`tools/check_ci_ran.py`)按名单逐条核对 junit 报告:
+  点名的用例没出现在报告里、或出现了却是 `skipped` ⇒ 红。
+  **本轮复核再补一条(静默降级)**:点名的那份套件**不在名单里**(或名单里那一条是空的)
+  ⇒ 点名核对一条都做不了 ⇒ 此前只打印一句「提示」就继续 ⇒ 闸门**降级**成只看总数
+  ⇒ 「把整份套件的条目从名单里删掉」这个改法不会让 CI 红 ⇒ 现在**红**。
+  确实不需要名单的套件(并集回归那份有按依赖跳过的用例)必须**显式**加
+  `--allow-unlisted-suite`——这个口子是故意开的小窗,默认关着。
+  守卫侧同时补了一条:名单里必须**恰好**是那两份套件(少一整份 ⇒ 逐条检查碰不到它)。
+
+为什么必须是名单而不是「总数」:pytest 的退出码**分不出**「全跑了」与「整份被跳过」
+(第 46 轮已经踩过),而总数也看不出「某一条防线被摘掉了、其余还在跑」。
+**名单把这件事从「看不出来」变成「CI 直接红」**。
+
+`tools/check_ci_ran.py` 自己的守卫在 `tests/test_check_ci_ran.py`(22 条):
+正常报告 / 参数化后缀 / 缺用例 / 被跳过 / 部分被跳过 / 全被跳过 / 空报告 / 有失败 /
+报告文件缺失 / XML 损坏 / 单 `testsuite` 根 / 名单可读 / 名单里的名字都真实存在。
+
+#### 3. 第 48 轮之二:纪律守卫自己也要有「变异验证」
+
+codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异」**仓库里没有实现**——
+那是手工拿反例去撞守卫,**不可复算**,别人也跑不了。这与本仓库「数字一律脚本实测」
+的自订规则冲突,也是「写下了但没人跑」的老毛病。
+
+现在脚本化:`tools/check_guard_mutations.py`
+——在**仓库副本**上逐个施加 24 种变异,每一种都必须让**钉死的见证用例**变红;
+其中一条是**无害的注释改动**,必须**保持绿**(证明这份脚本不是「永远红」,空转的见证不算见证)。
+
+四条防「假绿」的规矩:
+
+1. 变异必须让见证套件真的红(否则脚本红);
+2. 无害改动必须保持绿(否则脚本红);
+3. **基线不绿 ⇒ 退出码 2**(环境坏了,不是守卫有洞);
+4. **收集错误 ⇒ 退出码 2**(变异规格写错了,与「守卫没抓住」分开说)。
+
+副本要**自带 git 仓库**(守卫里有探针走 `git ls-files`,没有 `.git` 时它们会直接报错——
+那不是探针在工作,是环境坏了);`.github/` 也得复制(接线守卫要读 workflow,缺了它那条守卫
+会因为读不到文件而报错,看起来像「变异被抓住」,其实是假绿)。
+
+脚本在**仓库外**的临时目录里做,真工作树全程不动;行尾符按原样保留(仓库里 CRLF 与 LF 都有,
+统一改写会让 diff 全是行尾噪声)。
+
+#### 4. 纪律守卫的变异表(24 条)
+
+| 变异 | 改的是哪个文件 | 见证 |
+|---|---|---|
+| 在核心防线套件顶部加一行模块级 pytestmark 一刀切跳过 | tests/test_fs_capability_closure.py | 守卫套件 |
+| 把模块级 pytestmark 包在 if 里(顶层扫描的老洞) | tests/test_fs_capability_closure.py | 守卫套件 |
+| 给一条没登记的用例加条件 skipif | tests/test_fs_capability_closure.py | 守卫套件 |
+| 用别名写法给一条没登记的用例加 skipif | tests/test_fs_capability_closure.py | 守卫套件 |
+| 把登记过的平台跳过改成无条件跳过(skipif(True)) | tests/test_fs_capability_closure.py | 守卫套件 |
+| 把登记过的平台跳过改成 skipif(1) | tests/test_fs_capability_closure.py | 守卫套件 |
+| 把登记过的平台跳过改成 skipif(condition=True) | tests/test_fs_capability_closure.py | 守卫套件 |
+| 给一条用例加裸 pytest.mark.skip | tests/test_fs_capability_closure.py | 守卫套件 |
+| 给一条不依赖交易栈的用例加上 @requires_trading_stack | tests/test_fs_capability_closure.py | 守卫套件 |
+| 给一条『期待入口拒绝候选』的用例加上 @requires_trading_stack | tests/test_fs_capability_closure.py | 守卫套件 |
+| 把 TRADING_STACK_MARKED 名单里的一条删掉 | tests/test_research_boundary.py | 守卫套件 |
+| 把『没被包住』的判定反过来 | tests/test_research_boundary.py | 守卫套件 |
+| 让『被包住』的判定不认 except* 语法 | tests/test_research_boundary.py | 守卫套件 |
+| 让『被包住』的判定不认裸名 raises | tests/test_research_boundary.py | 守卫套件 |
+| 让『被包住』的判定不认 contextlib.suppress | tests/test_research_boundary.py | 守卫套件 |
+| 在 conftest 里加一个改收集的钩子 | tests/conftest.py | 守卫套件 |
+| 把 CI 名单里的一条用例换成不存在的名字 | tests/guard_roster.json | 守卫套件 |
+| 让 CI 闸门放行『名单点名的用例被跳过』 | tools/check_ci_ran.py | 闸门自身的用例 |
+| 让 CI 闸门不再把参数化后缀去掉(名单永远匹配不上) | tools/check_ci_ran.py | 闸门自身的用例 |
+| 让 CI 闸门放行『点名的那份不在名单里』 | tools/check_ci_ran.py | 闸门自身的用例 |
+| 让守卫的视野退回只剩两份核心套件 | tests/test_research_boundary.py | 守卫套件 |
+| 让名单的采集看不见条件块里的用例 | tests/test_research_boundary.py | 守卫套件 |
+| 把一份守卫套件从 CI 名单里改名 | tests/guard_roster.json | CI 名单 |
+| 只改守卫里的一个注释(无害改动) | tests/test_research_boundary.py | 守卫套件(**保持绿**) |
+
+这张表与 `tools/check_guard_mutations.py --verify` 的实测集合**必须一致**,
+而且是**双向**一致(第 49 轮 codex H2:此前只查「脚本里的每一条都在表里」,
+ADR **多写**一行 = 文档夸大,没人发现):
+
+- 脚本里有、表里没有 ⇒ 红;
+- 表里有、脚本里没有 ⇒ 红(文档多写/陈旧);
+- 两边各打印多少行,不一致时把差集逐条列出来。
+
+核对**只**看这张表所在的这一节(此前扫整份 ADR ⇒ 别的表里的一行也可能顶替本轮标签),
+并且**逐格**归一化:去掉反引号与成对的 `**`,**不去掉单个 `*`**
+(第 49 轮 codex M1:全局去星号会把 `except*` 削成 `except` ⇒ 标签只能绕开写,
+反而把归一化的缺陷固化成了「标签里不许有星号」)。
+
+口径与 `tools/check_mutations.py` **共用同一份实现**
+(`check_mutations.verify_mutation_table`)——此前两个脚本各写一份同名函数,
+其中一处有反向断言、另一处没有 ⇒ 同一个问题两个答案。
+
+只核对**集合**,不核对「红了几条」——那个数字随用例数变化,写进文档必然过期。
+
+#### 5. 后果域分档:这六个文件进「不可降级」(执行域改动)
+
+`tools/check_domain.py` 的不可降级清单补 6 条(分档器自己 + CI 侧那道闸门 + 它的名单 +
+闸门自身的用例 + 纪律守卫的变异脚手架)。理由写在 `docs/adr/20261114-consequence-domain-tiers.md`
+的「第 48 轮补记」里:这六个文件判的是「**缺陷能不能被发现**」,
+把它们降级 = 把「发现缺陷的能力」降级 = 削弱防线 ⇒ 按 §4 全套流程处理。
+每一条都配了「从清单里删掉它 ⇒ 必须有测试变红」的变异(`tools/check_mutations.py`)。
+
+#### 6. codex 的 Low:逐条处置
+
+| 编号 | 内容 | 处置 |
+|---|---|---|
+| L1 | 生产入口的硬依赖只按 `module == "vnpy_ctastrategy"` 精确匹配 ⇒ 生产代码改成 `from vnpy_ctastrategy.template import …` 就会把 31 条登记标记全判成「无理由」变红 | **已做**:改成按**根包名**比(`module.split(".")[0]`) |
+| L2 | `try` 的 `else:`/`finally:` 也算「被吞」,语义不准 | **已做**(随 MC2 一起):只有 `try` **体**里的调用算被保护,`orelse`/`finally` 不算;没有 handler 不算吞 |
+| L3 | 类形式的用例与类级 `pytestmark` 完全不在守卫视野里(潜伏洞) | **已做(用禁用而不是假装管住)**:新增守卫 `test_the_guarded_suites_do_not_hide_tests_inside_a_class`——两份套件里**不许**出现含测试用例的类;要用类写用例,先把守卫的视野补上(并同步名单) |
+| L4 | 可能读到上一轮的陈旧 XML | **已做**:三步都先 `rm -f` |
+| L5 | 文档写「4 条样板型」,实测是 **5** 条;且不是脚本实测出来的 | **已做**:更正为 5(见下),并把「期待入口拒绝」这一族纳入机器可读的名单核对 |
+| L6 | 第 46/47 轮的 M1~M10 变异集仓库内**没有实现**,不可复算 | **已做**:脚本化(第 3 节,20 条) |
+| L7 | 复核期间 `_calls_production_entry` 有过**两份定义**(旧版是死代码) | 第 47 轮之三已删;本轮复查**只有一份** |
+
+**L5 的更正**(此前写错的地方,逐处改):
+
+- 此前 ADR/CHANGELOG 写「codex 点名的 4 条『样板型』用例」——**实测是 5 条**:
+  `test_forward_ref_evaluate_is_refused_by_the_static_screen`、
+  `test_the_candidate_cannot_reach_the_framework_module_that_holds_the_switch`、
+  `test_the_candidate_cannot_reach_the_switch_through_numpy_attributes`、
+  `test_the_string_module_is_refused_even_when_the_config_adds_it_to_the_allowlist`、
+  `test_vnpy_alpha_is_refused_by_the_static_screen`。
+- 此前写「`PLATFORM_SKIPS` 有 4 条平台差异」——**实测是 5 条**(第 48 轮新增了
+  dbm 那一族:Windows 的 `dbm.dumb` 是纯 Python ⇒ 会发审计事件;POSIX 的 `dbm.ndbm/gdbm`
+  是 C 层 ⇒ 不发 ⇒ 该用例按平台跳过,理由登记在 `PLATFORM_SKIPS` 里)。
+- 此前写「登记过的平台跳过被改写也红」——**当时是夸大的**:旧实现只认字面 `skipif(True)`,
+  `skipif(1)` / `skipif(condition=True)` / 裸 `pytest.mark.skip` 实测**仍绿**。
+  本轮补全后这句话才成立。
+
+#### 7. 验证
+
+（第 48 轮实测数字;第 49 轮的实测数字见下面「第 49 轮」的 §7。）
+
+- `tests/test_research_boundary.py`:**93 passed**（纪律守卫本体）
+- `tests/test_fs_capability_closure.py`:**172 条**
+- `tests/test_check_domain.py`:**99 passed**
+- `tests/test_check_ci_ran.py`:**19 passed**
+- `tests/test_check_guard_mutations.py`:**17 passed**
+- `python tools/check_guard_mutations.py --verify`:**21 种变异全部符合预期**（20 红 + 1 绿）
+  且 ADR 集合一致
+- `python tools/check_mutations.py --verify`:**22 种变异全部被抓住**且 ADR 集合一致
+- CI 那份显式 ruff 清单:**All checks passed!**
+
+（与脚本 `--verify` 的集合核对口径一致：只比**集合**，不比「红了几条」——
+那个数字随用例数变化,写进文档必然过期。）
+
+#### 8. 残余(如实登记)
+
+- **codex 第 1 轮(Gemini)因免费配额 429 仍缺席**:G8 的第一轮外部审查还没补上。
+- 第 44 轮那句「32 条需要交易栈的用例在 CI 上仍然不跑」**仍然成立**:
+  本轮只是把「求值帧」那一族摘出来(第 46 轮),并没有把交易栈依赖摘干净。
+- 本轮**没有**动任何生产代码:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链、
+  沙盒筛查**全部未动**;改动只落在「守卫与闸门」这一层。
+- 纪律守卫的变异脚手架**慢**;它在 CI 上作为独立一步跑,
+  所以这一份 PR 的 CI 时间会明显变长——这是「规则可复算」的价格,不是意外。
+  （第 49 轮起**每条变异只跑见证那一条**,次数与耗时都降下来了,见下面 §5。）
+
+### 第 49 轮:「守卫的守卫」补齐——名单、见证用例、双向核对、逐格归一化
+
+#### 0. 这一轮的起点:codex 第 2 轮复核 35/50 的六条 must-close
+
+codex 第 2 轮复核把「纪律守卫」这一层判成 **35/50(需小修)**,并给出六条必须关掉的:
+H1(裸跳过装饰器看不见)、H2(ADR 核对只有**一个方向**)、M1(归一化全局去星号)、
+M2(条件块里的用例可以藏起来)、M3/M4(只数「红了几条」)、L1(同一个数字写着好几个值)。
+本轮**只补规则与用例**,不改任何生产代码(分支冻结规则不变)。
+
+#### 1. 守卫的视野补上「守卫工具自己」(MC1 的另一半)
+
+此前纪律守卫只看**两份核心防线套件**(`test_fs_capability_closure.py` /
+`test_research_boundary.py`)。而**三份守卫工具自己的用例**
+(`test_check_domain.py` / `test_check_ci_ran.py` / `test_check_guard_mutations.py`)
+各自守着一个**判定点**——分档器、「真的跑了吗」闸门、变异脚手架。
+它们**不在守卫的视野里**,于是:
+
+- 整份被模块级 `pytestmark` 一刀切跳过 ⇒ 守卫**看不出来**;
+- 某条守卫用例被删掉 ⇒ 守卫**看不出来**。
+
+也就是「**守卫的守卫自己没有被兜底**」(仓库自己的教训:新写的守卫工具自己也要有人守)。
+
+修法三处一起上:
+
+1. `tests/guard_roster.json` 的 `must_run` 扩到**五份**套件(机器可读名单);
+2. `tests/test_research_boundary.py` 的视野(`_guarded_suites()`)跟着扩到五份,
+   并加一条**字面量**写死五份的用例盯着它——写成「等于那个常量」的话,
+   守卫会**自己把自己的视野改小**而仍然全绿;
+3. `.github/workflows/research-guard.yml` 里给这三份**独立一步**:
+   跑完用 `tools/check_ci_ran.py` **逐套件点名核对**(没出现 / 出现却是 skipped ⇒ 红)。
+   为什么必须独立一步:整份被跳过时 pytest 的退出码**仍是 0** ⇒ CI 照样绿。
+
+> 「图找得到的归图,图找不到的归清单,两层都要有」——这里是清单层:
+> 判定点之间的关系图管不到「谁在 CI 上被点名」,只能靠机器可读名单兜。
+
+#### 2. H1:裸的跳过装饰器与运行期跳过,以前**完全看不见**
+
+两条洞,都是**死代码**级别的:
+
+- `_skip_calls()` 只收 `ast.Call`,而裸装饰器 `@pytest.mark.skip` 是 `ast.Attribute`
+  ⇒ **收不到**。后果:一条**已经登记**在 `PLATFORM_SKIPS` 的用例可以被加上裸装饰器
+  (⇒ 整条永远不跑),而纪律守卫**全绿**(实测:93 条全绿)。
+  登记的是「平台差异(有条件)」,裸装饰器是**无条件** ⇒ 一律不许。
+- `pytest.skip(...)`(运行期直接退出这条用例)那一支是**死分支**:
+  外层 `if isinstance(func, ast.Attribute)` 已经把 `func.attr == "skip"` 吃掉了,
+  `elif` 永远轮不到 ⇒ 运行期跳过**完全不可见**。
+
+修法:新增 `_bare_skip_marks()` 收裸装饰器;修掉死分支让运行期 `pytest.skip()` 被收集;
+两条规则各配一条**自检用例**(拿片段喂给探测器,断言探测器看得见)。
+
+> 静态判不出运行期跳过外面有没有条件 ⇒ 往严的那边倒(仓库一贯口径):
+> 平台差异请用 `@pytest.mark.skipif(条件)`。
+
+#### 3. H2 + M1:ADR 变异表的核对改成**双向**、**逐格**归一化、**只看那一节**
+
+三处口径问题:
+
+- **只有 script → ADR 一个方向**:ADR **多写**一行(文档比实现乐观)没人发现
+  ⇒ 现在两个方向都查,并打印**两边各多少行**,不一致时把差集逐条列出来。
+- **全局去星号**:`except*` 里的星号是**语法的一部分**,全局去掉 ⇒ 两边再也对不上。
+  ⇒ 归一化改成**逐格**、**只去反引号与成对的 `**`**,**不去掉单个 `*`**,
+  **也不去掉下划线**(`risk/live_admission.py` 这类路径里有它)。
+  连带更正:标签**可以**写回真实的 `except*` 了(此前为了绕开这个缺陷,
+  标签被写成「try-star 语法」,还把缺陷固化成了「标签里不许有星号」这条守卫——
+  现在那条守卫改成「**两侧归一化后必须相等**」,禁的仍然是**目的**而不是手段)。
+- **扫的是整份 ADR**:别的表里的一行也可能顶替本轮标签 ⇒ 收窄到**那一节**
+  (小节标题找不到 ⇒ 退出码 2,fail-closed,不许「扫不到就当通过」)。
+
+**两个脚本共用同一份实现**(`check_mutations.verify_mutation_table`):
+此前 `check_mutations.py` 与 `check_guard_mutations.py` 各写了一份同名函数,
+其中一处有反向断言、另一处没有 ⇒ **同一个问题两个答案**。
+
+#### 4. M2:条件块里定义的用例,以前可以**藏起来**
+
+名单的采集此前只扫模块**顶层**的函数定义 ⇒ 一条写在 `if False:`(或 `try:`)里的用例
+**既不会被 pytest 收集,也不会进名单** ⇒ **没有任何东西会发现它被藏起来了**。
+
+修法:采集递归进模块级的 `if`/`try`/`with`/`for`/`while` 块(不递归进函数体——
+测试函数里定义的辅助函数不算用例)。于是藏起来的用例会**进名单**,
+CI 侧那道「点名核对」发现它没被收集 ⇒ 红。配套:一条自检用例 + 一条变异
+(采集退回顶层 ⇒ 必须变红)。
+
+#### 5. M3 + M4:每条变异钉一个**见证用例**,并且只跑它
+
+此前脚本只数「红了几条」⇒ **走错原因的红**也算数(别的用例红了、
+或者名单过期让守卫用例本来就红)。修法:
+
+- 每条「应该变红」的变异都在脚本里**钉死一个见证 nodeid**(`WITNESSES`),
+  断言**那一条**出现在 FAILED 列表里;没有钉 ⇒ 退出码 2;
+- 见证 nodeid 指向的函数必须**真的存在**(改名了就要当场发现,而不是一直红着);
+- 绿对照(无害改动)不只看「没红」,还要**通过数与基线相同**;
+- 每次都检查 pytest 的**退出码**;
+- **每条变异只跑见证那一条**——此前每条变异都跑整份套件(二十多次全量,十几分钟),
+  现在是 24 次单条(约一分钟)。基线跑两次(两份套件),基线不绿 ⇒ 退出码 2。
+
+见证 nodeid 是**实测**出来的:对每条变异跑一遍,记下真正变红的 nodeid,
+挑那条**为这条规则而红**的用例钉住。
+
+#### 6. codex 的 Low:逐条处置
+
+| 编号 | 内容 | 处置 |
+|---|---|---|
+| L1 | 同一个数字在 ADR / CHANGELOG / workflow / PROJECTWIKI 里写着好几个值(20/21/22),ADR §7「验证」是空的 | **已做**:第 48 轮的 §7 填上实测数字;第 49 轮的数字统一成 **24 种变异**(纪律守卫)与 **22 种变异**(分档清单);workflow / PROJECTWIKI / CHANGELOG 同步;PROJECTWIKI 里那段重复的段落删掉 |
+| L2 | CI 闸门只按**函数名**配对 ⇒ 别的套件里的同名函数能顶替名单点名的用例 | **已做**:改成按**(模块, 函数名)**配对,并加用例 |
+| L3 | 「被包住」的判定对**嵌套函数**里的调用一律按「被包住」处理 ⇒ 可能**过度收紧**(把合法的防御性代码判成吞异常) | **登记为显式残余**(见下面 §8):静态判不准嵌套上下文,仓库一贯口径是**往严的那边倒**;收紧方向错误(误拒)比放宽方向错误(漏放)安全。**不做白名单**——白名单会让这条判定变成「可以点名豁免」,那是防线变松的方向 |
+| L4 | 名单/报告结构畸形时**抛栈**而不是给结论 | **已做**:结构校验 + `ValueError` 捕获 ⇒ 红并给结论行 |
+| L5 | `shutil.rmtree(..., ignore_errors=True)` 在 Windows 上留下 7 份残留副本 | **已做**:重试 + 强制改权限,还不行就把**路径报出来** |
+
+#### 7. 验证(第 49 轮实测)
+
+- `tests/test_research_boundary.py`:**97 passed**
+- `tests/test_fs_capability_closure.py`:**172 passed**
+- `tests/test_check_domain.py`:**99 passed**
+- `tests/test_check_ci_ran.py`:**23 passed**
+- `tests/test_check_guard_mutations.py`:**25 passed**
+- `python tools/check_guard_mutations.py --verify`:**24 种变异全部符合预期**
+  (23 红 + 1 绿),且 ADR 集合**双向**一致(两边各 24 行)
+- `python tools/check_mutations.py --verify`:**22 种变异全部被抓住**,
+  且 ADR 集合**双向**一致(两边各 22 行)
+- 名单(`tests/guard_roster.json`)点名的条数:closure 86 / boundary 64 /
+  ci_ran 22 / check_domain 32 / guard_mutations 25
+
+#### 8. 残余(如实登记)
+
+- **L3 的过度收紧**:「被包住」的判定把**嵌套函数**里的调用一律判成「被包住」。
+  这会让某些**合法**的防御性代码被当成吞异常(误拒)。**方向是安全的**(宁可误拒),
+  但确实存在误拒的可能 ⇒ 登记为残余,触发重估的条件:出现真实的误拒报告。
+- 「只跑见证那一条」的前提是**见证本身可靠**:见证 nodeid 钉死在脚本里,
+  改名会让脚手架当场红(有守卫盯着)。但如果某条规则的**真**判据变了
+  (而见证仍是旧的),脚本仍会绿——这是「见证钉死」这一族方法的**固有边界**。
+- 本轮**没有**动任何生产代码:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链、
+  沙盒筛查**全部未动**;改动只落在「守卫与闸门」这一层。
+
+
+### 第 50 轮:G8 第一轮自查读出来的两处「同一个问题两个答案」
+
+#### 0. 起点
+
+第 49 轮把纪律守卫的变异验证收口之后,G8 第一轮(`mcp__zen__codereview`)的
+**内部分析步**把 24 个文件读完并给出发现;但它的**外部专家验证步**这一次
+**因提供商的免费配额当场不可用**——`gemini-2.5-pro` 每日生成配额耗尽(429),
+`gemini-2.5-flash` 每分钟输入配额超限(429),`gemini-3-pro-preview` 与
+`gemini-2.0-flash` 已退役(404)。**如实登记:外部复核这一步本轮没有跑成**,
+不拿内部自查冒充外部复核。第二轮(codex CLI)照做(G8:两轮都做,第一轮没发现
+问题也要走第二轮)。
+
+外部模型没来,我自己逐行读脚手架时读出两处**真不对称**——两套脚手架是同一族
+工具,却对同一件事给了两个答案:
+
+#### 1. 洞一:临时副本的清理,两套脚手架口径不同
+
+- `tools/check_guard_mutations.py`(第 49 轮):`shutil.rmtree` 失败就**重试 3 次**
+  → 强制改权限 → 还不行就**把路径报出来**;
+- `tools/check_mutations.py`:**仍是老的 `shutil.rmtree(tmp, ignore_errors=True)`**
+  ——「忽略错误」等于"删不掉就算了"。
+
+后果:Windows 上文件被占用(索引器/杀软/git)时,分档脚手架照样在临时目录里
+**堆积整份仓库副本**(每份含 tools/tests/risk/scripts/docs,几十 MB),越攒越多。
+第 49 轮修的是**同族工具的同一个毛病**,却只修了一半。
+
+#### 2. 洞二:pytest 的结果,分档脚手架只看「FAILED 行数」
+
+- 纪律守卫那套:**既数 FAILED 行数,又看 pytest 退出码**;
+- 分档那套:**只看 FAILED 行数**。
+
+后果:变异把文件改成**语法错误**时,pytest 在**收集阶段**就炸 ⇒ 一条 FAILED
+都没有 ⇒ 被算成「探针没抓住」(退出码 1 = 守卫有洞)。其实那是**变异规格写错了**
+(退出码 2 = 环境不可用 / fail-closed)。两者在「红了」这件事上**无法区分**
+⇒ 报出来的结论是错的,而且错的方向会让人去查错的地方。
+
+#### 3. 处置(两处都收敛到「共用同一份实现」)
+
+| 洞 | 处置 | 落点 |
+|---|---|---|
+| 清理口径不同 | 实现搬进 `check_mutations.cleanup_temp_dir`(重试 → 强制改权限 → 报出路径),两套**共用这一份** | `tools/check_mutations.py`、`tools/check_guard_mutations.py` |
+| 退出码不看 | 新增 `check_mutations._run_outcome(failed, returncode)` → `'ok'` / `'spec_broken'`,三处调用点(基线 / 每条变异 / 额外探针)全用它 | `tools/check_mutations.py` |
+
+`_run_outcome` 的判据(逐条列死,免得以后又变):
+
+| failed | returncode | 结论 | 含义 |
+|---|---|---|---|
+| 0 | 0 | ok | 全绿 |
+| >0 | 1 | ok | **红,是探针在工作** |
+| 0 | 1 | spec_broken | 退出码 1 却一条 FAILED 没有 ⇒ 收集阶段炸了 |
+| 任意 | ≥2 | spec_broken | 中断 / 用法错误 / 内部错误 |
+
+**为什么值得单独开一轮**:这正是仓库教训「同一个问题两个答案」——第 49 轮刚把
+ADR 核对的口径从「两份各写一份」收敛成「共用一份实现」,同一个毛病在**清理**
+与**退出码**这两处又长了出来。凡是"两套同族工具",就必须逐项对一遍口径。
+
+#### 4. 双向探针(5 条,落在 `tests/test_check_domain.py`)
+
+| 用例 | 放行侧 | 拦截侧 |
+|---|---|---|
+| `test_run_outcome_separates_a_broken_spec_from_a_caught_mutation` | (0,0) 与 (3,1) ⇒ ok | (0,1) 与 (0,2)/(0,4) ⇒ spec_broken |
+| `test_run_outcome_matches_what_pytest_actually_does` | 真的造一条失败的用例 ⇒ 退出码 1 且有 FAILED ⇒ ok | 真的造一份**语法错误**的文件 ⇒ 退出码非 0 且**一条 FAILED 都没有** ⇒ spec_broken |
+| `test_cleanup_temp_dir_removes_the_copy` | 副本真被删掉 | — |
+| `test_cleanup_temp_dir_reports_the_path_it_could_not_remove` | — | 删不掉时**必须把路径报出来**(不许默默吞掉) |
+| `test_both_harnesses_share_one_cleanup_implementation` | 两套脚手架指向**同一份实现** | — |
+
+第 2 条是**实测**而不是静态推理:真的落一份语法错误的文件、真的跑一遍 pytest,
+让 pytest 自己说出退出码——仓库教训「纯静态推理必漏」。
+
+#### 5. 验证(第 50 轮实测)
+
+- `tests/test_check_domain.py`:**104 passed**(第 49 轮 99 条 + 本轮 5 条)
+- `tests/test_check_guard_mutations.py`:**25 passed**;
+  `tests/test_check_ci_ran.py`:**23 passed**;
+  `tests/test_research_boundary.py`:**97 passed**;
+  `tests/test_fs_capability_closure.py`:**172 passed**
+- `python tools/check_guard_mutations.py --verify`:**24 种变异全部符合预期**
+  (23 红 + 1 绿),ADR 集合双向一致(两边各 24 行)
+- `python tools/check_mutations.py --verify`:**22 种变异全部被抓住**,
+  ADR 集合双向一致(两边各 22 行)
+- 名单(`tests/guard_roster.json`)点名的条数:closure 86 / boundary 64 /
+  ci_ran 22 / check_domain **37** / guard_mutations 25
+- ruff(CI 精确清单):All checks passed
+
+#### 6. 残余(如实登记)
+
+- **外部专家复核这一轮没跑成**(提供商配额 429 / 模型退役 404)。第二轮 codex
+  CLI 已补上;外部专家这一路要么等配额窗口,要么换提供商——**不假装跑过**。
+- `check_guard_mutations._run_tests` 的 errors 判定用
+  `" errors" in line and "error" in line.lower()` ⇒ 任何用例输出里含 "errors"
+  会被误判成「收集错误」⇒ 退出码 2。方向是 fail-closed(只是噪声),登记为残余。
+- `check_mutations.table_rows_in_section` 假定每个表格组的**第一行是表头**并跳过
+  ⇒ 若某节里出现无表头的表格,首行数据会被丢掉。方向是**报红**(两向差集都
+  失配),不是假绿;登记为残余。
+- `check_ci_ran._load_report` 的 total/skipped/failed 取自 testsuite **属性**,
+  与 `iter("testcase")` 得到的 case 列表**可能不一致**(报告由别的工具生成时)
+  ⇒ 计数口径依赖报告自洽。pytest 自己写的报告自洽;登记为残余。
+- 本轮**仍然没有动任何生产代码**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链、
+  沙盒筛查**全部未动**;改动只落在「守卫与闸门」这一层。

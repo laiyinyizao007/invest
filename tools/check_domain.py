@@ -197,6 +197,20 @@ NEVER_DOWNGRADE = (
     # 准确性夹具也没点名全部判定点。
     "tools/verdict_graph.py",
     "tools/check_mutations.py",
+    # 分档器**自己**:它拥有「什么算执行域」这个判定点。
+    # (默认拒绝已经让它落进执行域,但那样它就还能被塞进研究白名单——
+    #  不可降级优先于研究白名单,列在这里才真正堵住那个口子。)
+    "tools/check_domain.py",
+    # 第 48 轮:CI 侧「真的跑了吗」闸门 + 它的名单 + 守卫自己的用例。
+    # 这三样共同决定「一条防线没跑」会不会被发现 = 改它们 = 改检出能力。
+    "tools/check_ci_ran.py",
+    "tests/guard_roster.json",
+    "tests/test_check_ci_ran.py",
+    # 第 48 轮:纪律守卫的变异验证脚手架(把"守卫松了"变成可复算的检查)。
+    "tools/check_guard_mutations.py",
+    # 上面那个脚手架**自己的**守卫用例:守卫工具的守卫也要有人守
+    # (仓库教训:新写的守卫工具自己也要有人守)。
+    "tests/test_check_guard_mutations.py",
     # 防线不变量与门槛相关的用例:改断言 = 削弱检出能力
     "tests/test_research_boundary.py",
     "tests/test_research_config.py",

@@ -1428,7 +1428,37 @@ def test_production_path_refuses_import_module_and_leaves_framework_modules_unto
 
 # ---- 没有 open 事件的写原语 ----
 
+def test_sqlite3_connects_are_denied_outside_the_allowed_directory(tmp_path):
+    """sqlite3 走的是 **C 层**的写,不发 `open` 事件 ⇒ 靠**自己的**审计事件判(平台无关)。
+
+    第 48 轮拆出来的**平台无关**那一半:`sqlite3.connect` 的审计事件在所有平台上都会发,
+    所以这条规则在 Linux CI 上**真跑**(第 47 轮之后 CI 第一次跑这份套件时,同族的 dbm 用例红了)。
+    """
+    import sqlite3
+    with rs.candidate_window():
+        with pytest.raises(OSError) as info:
+            sqlite3.connect(str(tmp_path / "x.db"))
+        chain_rules, exc = [], info.value
+        while exc is not None:
+            if isinstance(exc, rs.AuditDenied):
+                chain_rules.append(exc.rule)
+            exc = exc.__cause__ or exc.__context__
+        assert chain_rules and set(chain_rules) <= {"audit:sqlite3-connect"}, chain_rules
+    assert [p.name for p in tmp_path.iterdir()] == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="POSIX 上 dbm 的默认后端是 C 实现(ndbm/gdbm),"
+                                            "写入在 C 层发生、不发 Python 审计事件 ⇒ 这条规则在 POSIX 上"
+                                            "不生效(真实缺口已登记为 Issue #51);Windows 上默认后端是纯 Python "
+                                            "的 dbm.dumb ⇒ 审计事件会触发")
 def test_sqlite3_backed_dbm_and_shelve_are_denied_outside_the_allowed_directory(tmp_path):
+    """dbm/shelve 的写最终落到 `open`(纯 Python 后端)⇒ 被 `audit:open-write` 拒。
+
+    **平台边界(第 48 轮实测,如实登记)**:Windows 上 dbm 的默认后端是 `dbm.dumb`(**纯 Python**)⇒
+    写文件会发 `open` 审计事件 ⇒ 这条规则**生效**;POSIX 上默认后端是 C 实现(`dbm.ndbm`/`dbm.gnu`)⇒
+    写入在 C 层发生,**不发** Python 审计事件 ⇒ 规则**不生效**(候选能在窗口外留下 dbm 文件)。
+    这是沙盒的**真实缺口**,不是用例写错——已登记为 Issue #51,本条在 POSIX 上按平台跳过。
+    """
     import dbm
     import shelve
     with rs.candidate_window():
@@ -2345,19 +2375,43 @@ def test_a_ledger_whose_anchor_total_does_not_match_is_refused(tmp_path):
 # ---------- H3:"按名求值的执行器"按**值的来源**判,再导出也逃不掉 ----------
 
 def test_the_evaluator_rule_catches_a_reexported_get_type_hints():
-    """`typing_extensions.get_type_hints` 与 `typing.get_type_hints` 是**同一个函数对象**。
+    """再导出的「按名求值的执行器」也拒——但**平台无关**。
 
-    按**访问路径**判会漏它("typing_extensions.get_type_hints" 不在名单里);
+    按**访问路径**判会漏再导出("typing_extensions.get_type_hints" 不在名单里);
     此前它只是因为"typing_extensions 本身被导入门挡住"才没出事——那是**别的规则**兜着。
-    现在按**值的来源**判(`typing.get_type_hints`),再导出也拒(第 43 轮,codex 的 H3)。"""
-    import typing
-    import typing_extensions
+    现在按**值的来源**判(`typing.get_type_hints`),再导出也拒(第 43 轮,codex 的 H3)。
 
-    assert typing_extensions.get_type_hints is typing.get_type_hints
-    view = rs._view_for(typing_extensions)
+    **为什么不用 `typing_extensions` 当探针**(第 48 轮修正):`typing_extensions.get_type_hints is
+    typing.get_type_hints` 这条**前提本身是平台相关的**——实测 Windows/3.13 上成立,
+    Linux/3.12 上**不成立**(那边 `typing_extensions` 不是 `typing` 的再导出)。
+    把它当断言 ⇒ 那条用例在 Linux CI 上必然红(第 47 轮之后 CI 第一次跑这份套件就红了),
+    而红的原因是**探针的前提不成立**,不是规则坏了。
+
+    所以探针改成**合成一个再导出模块**:把 `typing.get_type_hints` 原样挂到一个自造模块上,
+    访问路径是"fake_reexport_module.get_type_hints"(不在名单里),拿到的**值**的来源却是
+    `typing.get_type_hints` ⇒ 按来源判必须拒。这样**任何平台上的前提都成立**。
+    """
+    import types
+    import typing
+
+    fake = types.ModuleType("fake_reexport_module")
+    fake.get_type_hints = typing.get_type_hints
+    view = rs._view_for(fake)
     with pytest.raises(AttributeError) as info:
-        rs._check_object_rules(view, "get_type_hints", typing_extensions.get_type_hints)
+        rs._check_object_rules(view, "get_type_hints", typing.get_type_hints)
     assert "按名求值的执行器" in str(info.value), str(info.value)
+
+    # 真·再导出的那一条(平台**成立**时才断言):`typing_extensions` 在某些平台上
+    # 确实是 `typing` 的再导出,那就把它也钉住;不在(前提不成立)就不拿它当断言。
+    try:
+        import typing_extensions
+    except ImportError:                                  # pragma: no cover - 环境没装
+        return
+    if typing_extensions.get_type_hints is typing.get_type_hints:
+        view2 = rs._view_for(typing_extensions)
+        with pytest.raises(AttributeError) as info2:
+            rs._check_object_rules(view2, "get_type_hints", typing_extensions.get_type_hints)
+        assert "按名求值的执行器" in str(info2.value), str(info2.value)
 
 
 def test_a_harmless_typing_member_is_still_reachable():

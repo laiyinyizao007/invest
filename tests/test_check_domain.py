@@ -407,6 +407,14 @@ def test_critical_defense_files_are_never_downgrade() -> None:
         "risk/ledger_chain.py",
         "risk/ledger_admin.py",
         "scripts/research_ledger.py",
+        # 第 48 轮:分档器自身 + CI 侧「真的跑了吗」闸门这一族。
+        # 它们共同决定「一条防线没跑」会不会被发现——
+        # 改它们 = 改检出能力(降级到研究域就能绕开完整流程)。
+        "tools/check_domain.py",
+        "tools/check_ci_ran.py",
+        "tools/check_guard_mutations.py",
+        "tests/guard_roster.json",
+        "tests/test_check_ci_ran.py",
     ]
     for path in critical:
         assert cd.classify(path)[0] == "never_downgrade", path
@@ -831,38 +839,50 @@ def test_mutation_harness_detects_wrong_adr_numbers(tmp_path: Path) -> None:
     """
     import check_mutations as cm
 
+    def _adr(row: str) -> str:
+        """造一份带**小节标题**的 ADR(第 49 轮:核对只看那一节)。"""
+        if not row.startswith("|"):
+            row = "| " + row
+        return ("### 探针的变异验证\n\n| 变异 | 条数 |\n|---|---|\n%s\n" % row)
+
     results = [("某条变异", 3)]
     good = tmp_path / "good.md"
-    good.write_text("| 某条变异 | `risk/x.py` |\n", encoding="utf-8")
+    good.write_text(_adr("某条变异 | `risk/x.py` |"), encoding="utf-8")
     assert cm._verify_adr(results, good) == 0, "集合对上时必须通过"
 
     # 表里缺这一行 → 必须失败(否则就是「静默跳过 → 假绿灯」)
     missing = tmp_path / "missing.md"
-    missing.write_text("| 别的行 | `risk/x.py` |\n", encoding="utf-8")
+    missing.write_text(_adr("别的行 | `risk/x.py` |"), encoding="utf-8")
     assert cm._verify_adr(results, missing) == 1, "ADR 缺行时必须失败"
 
     # 标签对不上(改了一个字)→ 必须失败。
     # 注意不能用「某条变异了」这种**超集**写法:子串匹配会把它当成命中。
     typo = tmp_path / "typo.md"
-    typo.write_text("| 另条变异 | `risk/x.py` |\n", encoding="utf-8")
+    typo.write_text(_adr("另条变异 | `risk/x.py` |"), encoding="utf-8")
     assert cm._verify_adr(results, typo) == 1, "标签对不上时必须失败"
+
+    # **ADR 多写一行也必须红**(第 49 轮 codex H2):
+    # 此前只查「脚本里的每一条都在表里」⇒ 文档比实现乐观(夸大)没人发现。
+    extra = tmp_path / "extra.md"
+    extra.write_text(_adr("| 某条变异 | 3 |\n| 多出来的一行 | 3 |"), encoding="utf-8")
+    assert cm._verify_adr(results, extra) == 1, "ADR 多写一行时必须失败"
 
     # **超集标签也不许命中**:「某条变异了」不是「某条变异」
     superstr = tmp_path / "superstr.md"
-    superstr.write_text("| 某条变异了 | `risk/x.py` |\n", encoding="utf-8")
+    superstr.write_text(_adr("某条变异了 | `risk/x.py` |"), encoding="utf-8")
     assert cm._verify_adr(results, superstr) == 1, "超集标签不该被当成命中"
 
     # **Markdown 强调号不能影响匹配**:ADR 的行里有「研究**目录**白名单」这种加粗,
     # 匹配前必须去掉 —— 否则「匹配不上 → 静默跳过 → 假绿灯」又回来了
     # (CI 上真的发生过一次:数字全对,只有这一行的加粗让标签对不上)。
     bold = tmp_path / "bold.md"
-    bold.write_text("| 某条**变异** | 3 |\n", encoding="utf-8")
+    bold.write_text(_adr("某条**变异** | 3 |"), encoding="utf-8")
     assert cm._verify_adr([("某条变异", 3)], bold) == 0, "加粗标记不该影响匹配"
 
     # **下划线不能被去掉**:`risk/live_admission.py` 这类路径里有它,
     # 归一化时去掉 `_` 会把路径改了(实测:去掉后八行全部对不上)。
     underscore = tmp_path / "underscore.md"
-    underscore.write_text("| 把 risk/live_admission.py 移出不可降级 | 3 |\n", encoding="utf-8")
+    underscore.write_text(_adr("把 risk/live_admission.py 移出不可降级 | 3 |"), encoding="utf-8")
     assert cm._verify_adr([("把 risk/live_admission.py 移出不可降级", 3)],
                            underscore) == 0, "路径里的下划线不能被归一化吃掉"
 
@@ -938,3 +958,115 @@ def test_no_change_path_prints_a_conclusion_line() -> None:
         )
     # 无论退出码是什么,都**不能**是 traceback(崩溃会伪装成 exit 1)
     assert "Traceback" not in proc.stderr, proc.stderr
+
+
+# --------------------------------------------------------------------------
+# 第 50 轮:分档脚手架自己那两条洞(临时副本清理 + pytest 退出码)
+# --------------------------------------------------------------------------
+
+def test_run_outcome_separates_a_broken_spec_from_a_caught_mutation() -> None:
+    """「收集阶段就炸」与「探针没抓住」必须**分得开**(第 50 轮)。
+
+    此前分档脚手架只数 FAILED 行数:变异把文件改成语法错误时 pytest 在**收集阶段**
+    就炸 ⇒ 一条 FAILED 都没有 ⇒ 被算成「探针没抓住」(守卫有洞,退出码 1)。
+    其实那是**变异规格写错了**(退出码 2)。两者在「红了」这件事上无法区分。
+
+    双向探针:
+    - 放行侧:退出码 1 且**有** FAILED ⇒ ok(红,是探针在工作);
+    - 放行侧:退出码 0 且没有失败 ⇒ ok(绿);
+    - 拦截侧:退出码 1 但**没有** FAILED ⇒ spec_broken;
+    - 拦截侧:退出码 ≥ 2 ⇒ spec_broken。
+    """
+    import check_mutations as cm
+
+    assert cm._run_outcome(0, 0) == "ok", "全绿必须是 ok"
+    assert cm._run_outcome(3, 1) == "ok", "有 FAILED 且退出码 1 ⇒ 探针在工作"
+    assert cm._run_outcome(0, 1) == "spec_broken", "退出码 1 却一条 FAILED 没有 ⇒ 收集阶段炸了"
+    assert cm._run_outcome(0, 2) == "spec_broken", "退出码 ≥ 2 ⇒ 规格/环境有问题"
+    assert cm._run_outcome(0, 4) == "spec_broken", "用法错误(退出码 4)也算规格问题"
+
+
+def test_run_outcome_matches_what_pytest_actually_does(tmp_path: Path) -> None:
+    """**实测**校准上一条:真的造一份语法错误的测试文件,跑一遍 pytest 看退出码。
+
+    静态推理必漏(仓库教训),所以这里让 pytest 自己说话:
+    - 语法错误 ⇒ 退出码非 0 且**一条 FAILED 都没有** ⇒ 必须判成 spec_broken;
+    - 一条真的失败的用例 ⇒ 退出码 1 且有 FAILED ⇒ 必须判成 ok。
+
+    (**不用** `cm._run_tests`:它跑的是固定的那份测试文件,不是我们造的文件。)
+    """
+    import check_mutations as cm
+
+    def _run(path: Path) -> tuple[int, int]:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", path.name, "-q", "-p", "no:cacheprovider"],
+            capture_output=True, text=True, cwd=str(tmp_path),
+            env={**os.environ, "PYTHONUTF8": "1"},
+            encoding="utf-8", errors="replace",
+        )
+        failed = len([line for line in proc.stdout.splitlines() if line.startswith("FAILED")])
+        return failed, proc.returncode
+
+    broken = tmp_path / "broken_test.py"
+    broken.write_text("def test_x(:\n    pass\n", encoding="utf-8")
+    failed, rc = _run(broken)
+    assert failed == 0, "收集失败不该有 FAILED 行"
+    assert rc != 0, "语法错误时 pytest 必须非 0 退出"
+    assert cm._run_outcome(failed, rc) == "spec_broken", "收集失败必须归到 spec_broken"
+
+    failing = tmp_path / "failing_test.py"
+    failing.write_text("def test_x():\n    assert False\n", encoding="utf-8")
+    failed, rc = _run(failing)
+    assert failed >= 1, "失败的用例必须被数出来"
+    assert rc == 1, "有失败时 pytest 退出码是 1"
+    assert cm._run_outcome(failed, rc) == "ok", "探针抓到失败 ⇒ ok"
+
+
+def test_cleanup_temp_dir_removes_the_copy(tmp_path: Path) -> None:
+    """放行侧:临时副本**必须真的被删掉**。
+
+    此前是 `shutil.rmtree(tmp, ignore_errors=True)`——**忽略错误**等于"删不掉就算了":
+    Windows 上文件被占用(索引器/杀软/git)时会留下一份份仓库副本在临时目录里,
+    越攒越多。这条用例把「真的删掉了」钉住。
+    """
+    import check_mutations as cm
+
+    target = tmp_path / "copy"
+    (target / "sub").mkdir(parents=True)
+    (target / "sub" / "a.txt").write_text("x", encoding="utf-8")
+    cm.cleanup_temp_dir(target)
+    assert not target.exists(), "临时副本必须被删掉"
+
+
+def test_cleanup_temp_dir_reports_the_path_it_could_not_remove(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """拦截侧:删不掉时**必须把路径报出来**(让人能自己删),而不是默默吞掉。
+
+    双向探针的另一侧:放行侧证明「能删」,这一侧证明「删不掉时不装没事」。
+    """
+    import check_mutations as cm
+
+    target = tmp_path / "stuck"
+    target.mkdir()
+
+    def _always_fails(*_args, **_kwargs):
+        raise OSError("文件被占用")
+
+    monkeypatch.setattr(cm.shutil, "rmtree", _always_fails)
+    cm.cleanup_temp_dir(target)
+    captured = capsys.readouterr()
+    assert str(target) in captured.err, (
+        "删不掉时必须把路径报出来(否则临时副本会越攒越多):%r" % captured.err)
+
+
+def test_both_harnesses_share_one_cleanup_implementation() -> None:
+    """两个脚手架**必须共用同一份**清理实现(第 50 轮)。
+
+    此前纪律守卫那套有重试+报错,分档这套还是老的 `ignore_errors=True`
+    ⇒ 同一个问题两个答案 ⇒ 迟早只改一边(仓库教训:「同一个问题两个答案」)。
+    """
+    import check_guard_mutations as cgm
+    import check_mutations as cm
+
+    assert cgm.cleanup_temp_dir is cm.cleanup_temp_dir, (
+        "两个脚手架必须共用同一份清理实现")

@@ -92,11 +92,15 @@ jobs:
             tools/check_domain.py \
             tools/verdict_graph.py \
             tools/check_mutations.py \
+            tools/check_ci_ran.py \
+            tools/check_guard_mutations.py \
             dashboard/__init__.py \
             dashboard/safe.py \
             notify \
             risk \
             tests/test_check_domain.py \
+            tests/test_check_ci_ran.py \
+            tests/test_check_guard_mutations.py \
             tests/test_dashboard_app.py \
             tests/test_dashboard_collect_more.py \
             tests/test_constitution_round11.py \
@@ -133,7 +137,19 @@ jobs:
           # (第 12 轮 codex 的 L5:声明的依赖与被测的依赖长期不一致,
           #  改了这个文件 CI 却不会发现)。pytest 单独钉版本(它不在那个文件里)。
           python -m pip install --quiet -r requirements-research.txt pytest==8.3.4
-          python -m pytest -p no:cacheprovider -q tests/test_research_boundary.py
+          # `--junitxml` + `tools/check_ci_ran.py`(第 48 轮,codex 第 2 轮复核的 H1/MC1):
+          # 这一步此前**没有** CI 级兜底——纪律守卫整份被跳过,pytest 退出码仍是 0,
+          # 这一步照样绿。现在:一条没跑 / 全被跳过 / 名单点名的用例没跑或被跳过 ⇒ 红。
+          # 名单在 tests/guard_roster.json(与守卫侧共读同一份)。
+          #
+          # 先删掉上一轮可能残留的 XML(codex 第 2 轮复核的 L4):自托管 runner 的
+          # 临时目录不一定每次都清干净——pytest 崩在写文件之前时,闸门会去读
+          # **上一轮的陈旧报告**,看着全绿其实什么都没跑。
+          rm -f "$RUNNER_TEMP/boundary.xml"
+          python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/boundary.xml" \
+            tests/test_research_boundary.py
+          python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/boundary.xml" \
+            --roster tests/guard_roster.json --suite tests/test_research_boundary.py
 
       # 核心防线套件(Issue #31):候选能力收口。它此前**一次都没在 CI 上跑过**——
       # 文件头 `import bootstrap` 会拖进 vnpy,而这个 job 只装 numpy/pandas/mcp/pyyaml,
@@ -155,9 +171,15 @@ jobs:
           # 第 46 轮(codex 第二轮 M1):模块级一行 `pytestmark = skipif(True)`
           # 就能让这一步绿着不跑。这里从报告里读"跑了多少条":
           # 一条没跑 / 全被跳过 / 有失败 ⇒ fail-closed。
+          rm -f "$RUNNER_TEMP/closure.xml"
           python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/closure.xml" \
             tests/test_fs_capability_closure.py
-          python -c "import sys,xml.etree.ElementTree as ET;r=ET.parse(sys.argv[1]).getroot();s=[r] if r.tag=='testsuite' else list(r.iter('testsuite'));t=sum(int(x.get('tests',0)) for x in s);k=sum(int(x.get('skipped',0)) for x in s);f=sum(int(x.get('failures',0))+int(x.get('errors',0)) for x in s);print('tests=%d skipped=%d failed=%d'%(t,k,f));sys.exit(1) if (t==0 or k==t or f>0) else None" "$RUNNER_TEMP/closure.xml"
+          # 第 48 轮:内联的那段 `python -c` 换成本仓库的闸门工具——
+          # 它的判据更多(除了总数/全跳过/有失败,还按**名单**逐条核对:
+          # 名单里的用例没出现,或出现了却是 skipped ⇒ 红)。
+          # 名单在 tests/guard_roster.json,与守卫侧共读同一份。
+          python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/closure.xml" \
+            --roster tests/guard_roster.json --suite tests/test_fs_capability_closure.py
 
       # 并集回归套件:main(#22 导入白名单 + 模块代理)与 #26(按路径的导入裁决 +
       # 对象层)加固**同一个**沙盒后的合流行为。**本分支也改 research_sandbox**,
@@ -170,11 +192,39 @@ jobs:
         run: |
           # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好,这里不重复装。
           # 同样的兜底断言(第 46 轮):全被跳过 ⇒ 这一步不能算绿。
+          rm -f "$RUNNER_TEMP/union.xml"
           python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/union.xml" \
             tests/test_merge_main_sandbox_union.py
-          python -c "import sys,xml.etree.ElementTree as ET;r=ET.parse(sys.argv[1]).getroot();s=[r] if r.tag=='testsuite' else list(r.iter('testsuite'));t=sum(int(x.get('tests',0)) for x in s);k=sum(int(x.get('skipped',0)) for x in s);f=sum(int(x.get('failures',0))+int(x.get('errors',0)) for x in s);print('tests=%d skipped=%d failed=%d'%(t,k,f));sys.exit(1) if (t==0 or k==t or f>0) else None" "$RUNNER_TEMP/union.xml"
+          # 第 48 轮:同样换成仓库里的闸门工具(判据见上面的说明)。
+          # 这份套件**不在**名单里(它有按依赖跳过的用例:缺 matplotlib/psutil),
+          # 所以这一步只做全局核对(一条没跑 / 全被跳过 / 有失败 ⇒ 红)。
+          python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/union.xml" \
+            --roster tests/guard_roster.json --suite tests/test_merge_main_sandbox_union.py \
+            --allow-unlisted-suite
 
-      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置/分档器)
+      # 守卫工具**自己**的用例(第 49 轮):它们各自守着一个判定点
+      # (分档器 / 「真的跑了吗」闸门 / 变异脚手架)。
+      #
+      # 为什么单独一步:**整份被跳过**时 pytest 的退出码仍是 0 ⇒ CI 照样绿
+      # (与第 46~47 轮消灭的失败模式同类)。此前这三份不在
+      # `tests/guard_roster.json` 里 ⇒ CI 侧那道「点名核对」碰不到它们
+      # ⇒ **守卫的守卫自己没有被兜底**。
+      # 现在:名单点名逐条核对(没出现 / 出现却是 skipped ⇒ 红)。
+      - name: 守卫工具自己的用例(分档器 / CI 闸门 / 变异脚手架)
+        run: |
+          # 依赖(requirements-research.txt + pytest)已由上面「边界不变量」那一步装好。
+          rm -f "$RUNNER_TEMP/guards.xml"
+          python -m pytest -p no:cacheprovider -q --junitxml="$RUNNER_TEMP/guards.xml" \
+            tests/test_check_domain.py \
+            tests/test_check_ci_ran.py \
+            tests/test_check_guard_mutations.py
+          # 一份报告、三道点名核对(每道只看自己那份套件的条目)。
+          for suite in tests/test_check_domain.py tests/test_check_ci_ran.py tests/test_check_guard_mutations.py; do
+            python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/guards.xml" \
+              --roster tests/guard_roster.json --suite "$suite"
+          done
+
+      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
 
         run: |
           # `--continue-on-collection-errors`:某个文件在**收集阶段**报错时,pytest 会以退出码 1 结束
@@ -182,11 +232,10 @@ jobs:
           # 但**其余文件仍然要跑**(第 11 轮 codex 的 F9)。不加这个开关,一个文件坏掉就把这一整步的
           # 研究侧测试全废掉——闸门看上去配好了,实际没跑几个。
           #
-          # test_check_domain.py 也在这里:分档器是**流程闸门**,它自己的清单一旦失准
-          # (把执行域文件误判成研究域),后面所有分档都会跟着错。它只依赖标准库 +
-          # git,不装交易环境也能跑(第 12 轮 codex 的教训:依赖声明与实际依赖必须一致)。
+          # 分档器的用例(test_check_domain.py)曾在这里;第 49 轮把它们挪到
+          # 上面「守卫工具自己的用例」那一步——那里有**点名核对**的兜底,
+          # 这里只有 pytest 的退出码(整份被跳过时退出码仍是 0)。
           python -m pytest -p no:cacheprovider --continue-on-collection-errors -q \
-            tests/test_check_domain.py \
             tests/test_research_config.py \
             tests/test_research_sandbox.py \
             tests/test_research_gateway.py \
@@ -252,3 +301,21 @@ jobs:
       - name: 分档清单的变异验证(每个清单改动都必须被抓住)
         run: |
           python tools/check_mutations.py --verify
+
+      # 纪律守卫自己的变异验证(第 48 轮,codex 第 2 轮复核的 L6)。
+      #
+      # 为什么要有这一步:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异」
+      # **仓库里没有实现**——那是手工拿反例去撞守卫,不可复算、别人也跑不了。
+      # 「写下了但没人跑」等于没有防线,所以这一步把它**脚本化**:
+      # `tools/check_guard_mutations.py` 在**仓库副本**上逐个施加 24 种变异
+      # (模块级一刀切跳过 / 别名跳过 / 无条件跳过 / 裸跳过 / 名单被摘 /
+      #  conftest 改收集 / 守卫视野变窄 / 名单采集漏条件块 / …),
+      # 每一种都必须让**钉死的见证用例**变红;其中一条是**无害的注释改动**,必须**保持绿**
+      # (证明这份脚本不是"永远红",空转的见证不算见证)。
+      #
+      # 第 49 轮起每条变异**只跑见证那一条**(此前每条都跑整份套件):
+      # 26 次 pytest(2 次基线 + 24 次变异),约一分钟。
+      # 这是**唯一**能证明纪律守卫没被"悄悄放松"的检查。
+      - name: 纪律守卫的变异验证(每条守卫松了都必须被抓)
+        run: |
+          python tools/check_guard_mutations.py --verify

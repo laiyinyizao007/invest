@@ -35,9 +35,11 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +95,27 @@ MUTATIONS: tuple[Mutation, ...] = (
     ("把 tests/test_research_mcp.py 移出不可降级",
      CD_REL, '"tests/test_research_mcp.py",', '    # (moved by mutation)',
      "tests/test_research_mcp.py", "never_downgrade"),
+    # 第 48 轮:分档器自身与 CI 侧「真的跑了吗」闸门这一族。
+    # 它们共同决定「一条防线没跑」会不会被发现——把它们降级到研究域,
+    # 就等于让"削弱检出能力"的改动免走完整流程。
+    ("把 tools/check_domain.py 移出不可降级",
+     CD_REL, '"tools/check_domain.py",', '    # (moved by mutation)',
+     "tools/check_domain.py", "never_downgrade"),
+    ("把 tools/check_ci_ran.py 移出不可降级",
+     CD_REL, '"tools/check_ci_ran.py",', '    # (moved by mutation)',
+     "tools/check_ci_ran.py", "never_downgrade"),
+    ("把 tools/check_guard_mutations.py 移出不可降级",
+     CD_REL, '"tools/check_guard_mutations.py",', '    # (moved by mutation)',
+     "tools/check_guard_mutations.py", "never_downgrade"),
+    ("把 tests/guard_roster.json 移出不可降级",
+     CD_REL, '"tests/guard_roster.json",', '    # (moved by mutation)',
+     "tests/guard_roster.json", "never_downgrade"),
+    ("把 tests/test_check_ci_ran.py 移出不可降级",
+     CD_REL, '"tests/test_check_ci_ran.py",', '    # (moved by mutation)',
+     "tests/test_check_ci_ran.py", "never_downgrade"),
+    ("把 tests/test_check_guard_mutations.py 移出不可降级",
+     CD_REL, '"tests/test_check_guard_mutations.py",', '    # (moved by mutation)',
+     "tests/test_check_guard_mutations.py", "never_downgrade"),
     ("把 scripts/optimize.py 移出研究白名单(落回默认拒绝)",
      CD_REL, '"scripts/optimize.py",', '    # (moved by mutation)',
      "scripts/optimize.py", "research"),
@@ -132,7 +155,58 @@ def _reconfigure_stdio() -> None:
             pass
 
 
-def _run_tests(cwd: Path) -> tuple[int, str]:
+def cleanup_temp_dir(path: Path) -> None:
+    """删掉临时副本(第 50 轮:与纪律守卫那套**共用**这一份)。
+
+    此前是 `shutil.rmtree(tmp, ignore_errors=True)`——**忽略错误**等于"删不掉就算了":
+    Windows 上文件被占用(索引器/杀软/git)时会**留下仓库副本**在临时目录里,越攒越多。
+    现在:重试几次 ⇒ 仍不行就**把路径报出来**(让人能自己删)。
+    """
+    for attempt in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError:
+            time.sleep(0.5 * (attempt + 1))
+
+    def _force(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    try:
+        try:
+            shutil.rmtree(path, onerror=_force)
+        except TypeError:          # Python 3.12+ 把 onerror 改名成 onexc
+            shutil.rmtree(path, onexc=lambda f, t, e: _force(f, t, e))
+    except OSError as exc:
+        print("[提醒] 临时副本没删干净(Windows 上常见:文件被占用):%s(%s)" % (path, exc),
+              file=sys.stderr)
+
+
+def _run_outcome(failed: int, returncode: int) -> str:
+    """把一次 pytest 的结果分类(第 50 轮):'ok' 或 'spec_broken'。
+
+    **为什么要分这一类**:pytest 的退出码分不出「用例失败」与「收集阶段就炸了」。
+    收集阶段炸掉时**一条 FAILED 都没有**(失败数 = 0)⇒ 此前会把它算成
+    「探针没抓住」(守卫有洞)。其实那是**变异规格写错了**(把文件改成语法错误),
+    两者在「红了」这件事上无法区分 ⇒ 现在分开:spec_broken ⇒ 退出码 2。
+
+    - 退出码 0 且没有失败 ⇒ ok(绿);
+    - 退出码 1 且**有** FAILED ⇒ ok(红,是探针在工作);
+    - 退出码 1 但**没有** FAILED ⇒ spec_broken(收集阶段炸了);
+    - 退出码 ≥ 2 ⇒ spec_broken(中断/用法错误/内部错误)。
+    """
+    if returncode not in (0, 1):
+        return "spec_broken"
+    if returncode == 1 and failed == 0:
+        return "spec_broken"
+    return "ok"
+
+
+def _run_tests(cwd: Path) -> tuple[int, str, int]:
     """跑本文件的测试,返回 (FAILED 行数, 完整输出)。
 
     **必须显式 encoding="utf-8"**:子进程被 PYTHONUTF8=1 逼着吐 UTF-8,
@@ -152,7 +226,9 @@ def _run_tests(cwd: Path) -> tuple[int, str]:
         encoding="utf-8", errors="replace",
     )
     failed = [line for line in proc.stdout.splitlines() if line.startswith("FAILED")]
-    return len(failed), proc.stdout
+    # **退出码也要返回**(第 50 轮):此前只看 FAILED 行数 ⇒
+    # pytest 在**收集阶段**就炸时(一条 FAILED 都没有)会被当成"基线全绿"。
+    return len(failed), proc.stdout, proc.returncode
 
 
 def _copy_repo(dest: Path) -> None:
@@ -236,9 +312,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _copy_repo(repo)
 
-        baseline, out = _run_tests(repo)
-        if baseline != 0:
-            print("基线就有测试失败,变异验证无从谈起:", file=sys.stderr)
+        baseline, out, base_rc = _run_tests(repo)
+        if baseline != 0 or base_rc != 0:
+            print("基线就有测试失败(或 pytest 退出码非 0,例如收集阶段就炸了),"
+                  "变异验证无从谈起:", file=sys.stderr)
             print(out[-1500:], file=sys.stderr)
             return 2
         print("基线(未变异):全绿")
@@ -258,8 +335,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  [跳过] {label}:{msg}", file=sys.stderr)
                 return 2
             after = _tier_of(repo, witness)
-            n, _ = _run_tests(repo)
+            n, _, rc = _run_tests(repo)
             (repo / rel).write_text(orig, encoding="utf-8")
+
+            if _run_outcome(n, rc) == "spec_broken":
+                # **收集阶段就炸**:pytest 退出码非 0 且一条 FAILED 都没有
+                # ⇒ 不是"探针没抓住"(那是守卫有洞),而是**变异规格写错了**
+                # ⇒ 退出码 2(fail-closed,与纪律守卫那套同一口径)。
+                print(f"  [跳过] {label}:pytest 退出码 {rc} 且没有 FAILED ⇒ "
+                      f"变异把文件改到收集阶段就报错了(变异规格写错了)", file=sys.stderr)
+                return 2
 
             if before == after:
                 # **空操作变异**:判定结果没变 → 这一行等于没测。
@@ -275,8 +360,12 @@ def main(argv: list[str] | None = None) -> int:
         # 额外场景:新建一个拥有判定点的文件(未入库)
         new_file = repo / "risk" / "zz_new_gate_probe.py"
         new_file.write_text(EXTRA_PROBE, encoding="utf-8")
-        n, _ = _run_tests(repo)
+        n, _, rc = _run_tests(repo)
         new_file.unlink()
+        if _run_outcome(n, rc) == "spec_broken":
+            print(f"  [跳过] {EXTRA_PROBE_LABEL}:pytest 退出码 {rc} 且没有 FAILED ⇒ "
+                  f"探针场景本身有问题(环境不可用)", file=sys.stderr)
+            return 2
         results.append((EXTRA_PROBE_LABEL, n))
         print(f"  [{'OK ' if n > 0 else '!! '}{n:2d} 条红] {EXTRA_PROBE_LABEL}")
 
@@ -293,67 +382,108 @@ def main(argv: list[str] | None = None) -> int:
             return _verify_adr(results)
         return 0
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        cleanup_temp_dir(tmp)
+
+
+# --------------------------------------------------------------------------
+# ADR 变异表的核对(两个脚本**共用**这一份口径)
+# --------------------------------------------------------------------------
+
+def normalize_cell(cell: str) -> str:
+    """**逐格**归一化:去掉反引号与成对的 `**`。
+
+    **不去掉单个 `*`**——`except*` 里那个星号是**语法的一部分**,
+    去掉它两侧就再也对不上(第 48 轮实测:全局去星号 ⇒ `except*` 被削成 `except`,
+    于是标签只能改写成不含星号的说法 ⇒ **掩盖了归一化的缺陷**,
+    还把它固化成了「标签里不许有星号」这条守卫——codex 第 2 轮 M1)。
+
+    同理**不能**去掉下划线:`risk/live_admission.py` 这类路径里有它,
+    去掉就把路径改了。
+    """
+    return cell.replace("`", "").replace("**", "").strip()
+
+
+def table_rows_in_section(adr_text: str, section_anchor: str) -> list[str]:
+    """取出某一节里所有表格的**第一格**(跳过表头与分隔行)。
+
+    **只看那一节**(此前扫的是整份 ADR ⇒ 别的表里的一行也可能顶替本轮标签,
+    匹配过松);**跳过表头**(markdown 表格的第一行是表头,不是变异)。
+    """
+    lines = adr_text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#") and section_anchor in line:
+            start = index
+            break
+    if start is None:
+        return []
+    first_cells: list[str] = []
+    group: list[list[str]] = []
+    for line in lines[start + 1:]:
+        if line.lstrip().startswith("#"):
+            break
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+            if cells and not all(set(cell) <= set("-: ") for cell in cells):
+                group.append(cells)
+            continue
+        if group:                      # 表格结束 ⇒ 结算这一组
+            first_cells.extend(cell[0] for cell in group[1:] if cell)
+            group = []
+    if group:
+        first_cells.extend(cell[0] for cell in group[1:] if cell)
+    return first_cells
+
+
+def verify_mutation_table(labels, adr_path: Path, section_anchor: str) -> int:
+    """核对 ADR 里那张变异表与脚本的变异集合(**双向**)。
+
+    **双向**(codex 第 2 轮 H2):此前只查「脚本里的每一条都在表里」,
+    ADR **多写**一行(文档夸大)没人发现 ⇒ 现在两个方向都查,
+    并打印**两边各多少行**。
+
+    只核对**集合**,不核对「每种变异红了几条」——那个数字随用例数变化,
+    写进文档必然过期。
+
+    退出码:0 一致 / 1 不一致 / 2 环境不可用(ADR 读不到、锚点找不到)。
+    """
+    if not adr_path.exists():
+        print("[FAIL] ADR 不存在:%s" % adr_path, file=sys.stderr)
+        return 2
+    adr_text = adr_path.read_text(encoding="utf-8")
+    cells = table_rows_in_section(adr_text, section_anchor)
+    if not cells:
+        print("[FAIL] ADR 里找不到「%s」那一节(或那一节里没有表格):%s"
+              % (section_anchor, adr_path), file=sys.stderr)
+        return 2
+    listed = {normalize_cell(cell) for cell in cells}
+    wanted = {normalize_cell(label) for label in labels}
+    bad: list[str] = []
+    for label in sorted(wanted - listed):
+        bad.append("脚本里有、ADR 表里没有:「%s」" % label)
+    for cell in sorted(listed - wanted):
+        bad.append("ADR 表里有、脚本里没有:「%s」(文档多写/陈旧 ⇒ 会夸大)" % cell)
+    if bad:
+        print("ADR 里的变异表与脚本不一致:", file=sys.stderr)
+        for line in bad:
+            print("  - %s" % line, file=sys.stderr)
+        print("  (ADR 表 %d 行 vs 脚本 %d 条)" % (len(listed), len(wanted)), file=sys.stderr)
+        return 1
+    print("ADR 里列出的变异集合与脚本一致(两边各 %d 行,逐条对上)。" % len(wanted))
+    return 0
 
 
 def _verify_adr(results: list[tuple[str, int]], adr_path: Path | None = None) -> int:
-    """核对 ADR 里的**变异集合**与实测是否一致。
+    """核对 ADR 里的**变异集合**与实测是否一致(第 49 轮:口径搬到共用函数)。
 
-    **只核对「集合」,不核对「每种变异红了几条」**:那个数字随本文件的用例数
-    变化(每加一条用例就变),写进文档必然过期——CI 上已经因此红过两次
-    (一次数字对不上、一次标签对不上)。有意义且稳定的只有两件事,
-    都由脚本在 CI 上每次实跑:每种变异都被抓住、每种变异都真的翻转了判定。
-
-    **匹配前必须去掉 Markdown 反引号与强调号**:ADR 的行里写的是
-    `| 把整个 scripts/ 放进研究**目录**白名单 | ... |`,脚本里的标签没有那些标记——
-    直接 `in` 匹配**一个都命中不了**,于是恒打印「一致」→ 纯假绿灯
-    (第 3 轮的 Critical-2,CI 上真的发生过)。
-
-    **不能**去掉下划线:`risk/live_admission.py` 这类路径里有它,
-    去掉就把路径改了(实测:去掉后八行全部对不上)。
-
-    **还必须断言行数齐全**:找不到标签不能只跳过——那正是「守护静默失效」的样子。
-
-    **按整格比对,不用子串**:`in` 会让「某条变异了」匹配上标签「某条变异」——
-    那样「标签写错一个字」这种失准就检测不出来(实测踩过)。
+    **双向**(script → ADR 与 ADR → script 两个方向都查)、
+    **只看那一节**的表格、**逐格**归一化(不去掉单个 `*`)——
+    见 `verify_mutation_table` 的说明(第 49 轮 codex H2/M1)。
     """
     adr = adr_path or (ROOT / "docs" / "adr" / "20261114-consequence-domain-tiers.md")
-    if not adr.exists():
-        print("ADR 不存在,跳过核对", file=sys.stderr)
-        return 2
-    # 归一化:去掉反引号与 Markdown 强调号。
-    # **必须**去掉强调号——ADR 的行里有「研究**目录**白名单」这种加粗,
-    # 留着它就与脚本标签差两个字符,又变成「匹配不上 → 静默跳过 → 假绿灯」。
-    # **不能**去掉下划线:`risk/live_admission.py` 这类路径里有它,
-    # 去掉就把路径改了(实测:去掉 `_` 后八行全部对不上)。
-    normalized = adr.read_text(encoding="utf-8")
-    for mark in ("`", "*"):
-        normalized = normalized.replace(mark, "")
-    bad: list[str] = []
-    matched = 0
-    # 按**整格**比对,不用子串:`in` 会让「某条变异了」匹配上标签「某条变异」——
-    # 那样「标签写错了一个字」这种失准就检测不出来(实测踩过)。
-    listed: set[str] = set()
-    for line in normalized.splitlines():
-        if not line.strip().startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if cells:
-            listed.add(cells[0])
-    for label, _n in results:
-        if label in listed:
-            matched += 1
-        else:
-            bad.append(f"ADR 表里没有「{label}」这一行")
-    if matched != len(results):
-        bad.append(f"ADR 表只匹配到 {matched} 行,实测有 {len(results)} 种变异")
-    if bad:
-        print("ADR 里的变异表与实测不符:", file=sys.stderr)
-        for line in bad:
-            print(f"  - {line}", file=sys.stderr)
-        return 1
-    print(f"ADR 里列出的变异集合与脚本一致({matched} 行全部对上)。")
-    return 0
+    labels = [label for label, _n in results]
+    return verify_mutation_table(labels, adr, "探针的变异验证")
 
 
 if __name__ == "__main__":

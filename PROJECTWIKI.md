@@ -204,6 +204,41 @@ flowchart LR
 - `scripts/collect_reject_texts.py`:采集 SimNow 真实废单文本,校准关键词表。
 - `scripts/unattended_report.py`:无人值守每日证据表与验收清单、Webhook 连通性自检。
 - `scripts/collect_terminal_info.py`、`scripts/penetration_check.py`:穿透式监管的终端信息采集与看穿式测试环境演练(脱敏报告)。
+- **纪律闸门(自己也有洞,所以每个都配了变异验证)**:
+  - `tools/check_ci_ran.py` + `tests/guard_roster.json`:CI 侧的「**真的跑了吗**」闸门。
+    pytest 的退出码分不出「全跑了」与「整份被跳过」,所以每个关键步骤都出 `--junitxml`,
+    再由这个工具核对:一条没跑 / 全被跳过 / 有失败 ⇒ 红;**名单里点名的用例**没出现在报告里、
+    或出现了却是 skipped ⇒ 红。名单是机器可读的(`must_run`:套件路径 → 用例名),
+    守卫侧(`tests/test_research_boundary.py`)与 CI 侧共读同一份,三个方向互相校验
+    (陈旧 / 漏登记 / 登记了却会被跳过)。**新增或改名关键用例必须同步这份名单**。
+    **点名的那份套件不在名单里(或名单里那一条是空的)⇒ 红**(静默降级:点名核对一条都
+    做不了 ⇒ 闸门只剩「看总数」);确实不需要名单的套件必须**显式**加
+    `--allow-unlisted-suite`(并集回归那份就是)。
+    名单里有**五份**套件(第 49 轮起):两份核心防线套件 + **三份「守卫工具自己」的用例**
+    (分档器 / 「真的跑了吗」闸门 / 变异脚手架)——后三份此前不在名单里 ⇒
+    整份被跳过、或某条守卫用例被删掉,CI 都看不出来。
+  - `tools/check_guard_mutations.py`:纪律守卫**自己的**变异验证——在仓库副本上逐个施加 24 种
+    变异(模块级一刀切跳过 / 别名跳过 / 无条件跳过 / **裸跳过** / 名单被摘 /
+    conftest 改收集 / **守卫视野变窄** / **名单采集漏条件块** / …),
+    每种都必须让**钉死的见证用例**变红(第 49 轮:此前只数「红了几条」⇒ 走错原因的红也算数);
+    其中一条是**无害的注释改动**,必须**保持绿**且**通过数与基线相同**
+    (证明脚本不是「永远红」,空转的见证不算见证)。基线不绿或变异把文件改到收集阶段报错 ⇒ 退出码 2
+    (环境/规格问题,与「守卫有洞」分开说)。每条变异**只跑见证那一条** ⇒ 26 次 pytest、约一分钟。
+  - `tests/test_check_guard_mutations.py`:上面那个脚手架**自己的**守卫(25 条):标签唯一 /
+    **两侧归一化后必须相等**(标签**可以**带单个 `*`——`except*` 是语法的一部分)/
+    每条锚点在当前仓库唯一命中 / **每条变异都钉了见证用例**且见证指向的函数真的存在 /
+    **跨行锚点**能落地(钉死脚本第一版那个洞)/ CRLF 与 LF 各自保持 /
+    **真实 ADR 表与脚本标签逐条对上**(秒级关卡:整套变异要十几分钟,标签对不上却在第 0 秒
+    就能发现——上一版就是拖到跑完全部变异才暴露的)。
+  - `tools/check_mutations.py`:分档清单的变异验证(`--verify` 还会核对 ADR 表格里的变异集合)。
+    **第 50 轮**:它与上面那个脚手架是**同族工具**,此前却对同一件事给了两个答案——
+    ①**临时副本清理**:上面那套是「重试 3 次 → 强制改权限 → 报出路径」,这套还是老的
+    `ignore_errors=True`(Windows 上照样堆积整份仓库副本);②**pytest 的结果**:上面那套
+    **既数 FAILED 又看退出码**,这套**只数 FAILED** ⇒ 变异把文件改成语法错误时 pytest 在
+    **收集阶段**就炸(一条 FAILED 都没有)⇒ 被算成「探针没抓住」(退出码 1),实际是
+    **变异规格写错了**(应退出码 2)。现改为**共用同一份**:`cleanup_temp_dir`(清理)与
+    `_run_outcome`(退出码分类 `ok` / `spec_broken`);用例钉住「两边共用同一份」与
+    「收集失败必须归到 spec_broken」(**实测**校准,不靠静态推理)。
 - `scripts/broker_test.py`、`scripts/broker_evidence.py`、`scripts/broker_report.py`:国信测试报告的取证运行器(18 项,证据渲染成图;每次运行向 `connection.json` 留痕实际连接的环境)、证据模型与渲染、docx 报告生成器(lxml 填国信原模板,不默认勾通过,不碰国信填写区)。
   取证运行器的硬约束:**发单前统一过空仓闸门**(有持仓一笔不发)、演示委托用唯一价格(不污染重复报单计数)、测试前置地址靠人工确认(脚本无法判别)、异常也清场(解除暂停标志、还原阈值)。
 - 标记区重写约定(演练/采集/无人值守报告共用):见 `docs/modules.md`「标记区重写的共同约定」。
@@ -336,6 +371,13 @@ sequenceDiagram
   代码改动,不是随手一句话。白名单由 `tools/verdict_graph.py` 的函数级 AST 分析盯着:
   任何自己拥有判定点(`check_gate` / `record_approval` / `screen_source` 等)的文件都必须判为
   不可降级,新增此类文件会让 `tests/test_check_domain.py` 的全仓不变量立刻变红。
+- **纪律守卫改了就跑变异验证**:`python tools/check_guard_mutations.py --verify`
+  (守卫松了必须被抓;它同时核对 ADR 里的变异集合)与 `python tools/check_mutations.py --verify`
+  (分档清单同上)。两者都在**仓库副本**上做,真工作树不动,但**慢**(各跑二十来次 pytest)——
+  这是「规则可复算」的价格。改动 `tests/test_research_boundary.py`、`tests/guard_roster.json`
+  或两份核心套件的用例集合后,必须重跑并同步 ADR 与 `tests/guard_roster.json`。
+  改了 `tools/check_guard_mutations.py` 里的**标签**必须同步 ADR 表格那一行(逐字一致,
+  且标签里不许带 `*` 或反引号——ADR 核对会先去掉它们)。
 - 临时文件:pip 异常中断会在 `%TEMP%` 残留 `pip-unpack-*`,可手动清理。
 - **本机网络**:走本地代理(127.0.0.1:7897)下载 PyPI/Docker 镜像这类大文件只有约 20 KB/s,直连约 4.7 MB/s。pip 安装与镜像拉取应绕过代理(`NO_PROXY=*`;WSL 里还要 `unset http_proxy https_proxy` 并忽略 pip 的旧代理配置)。
 - 运行与部署:见 `docs/runbook-simnow.md`、`docs/live-readiness.md`、`docker-compose.yml`;宿主机挂载目录需让 uid 1000 可写。
