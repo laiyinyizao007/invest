@@ -3405,3 +3405,89 @@ main 带来的两份研究侧用例此前**不在任何 CI 步骤里**:
 - 两份依赖 vnpy 的批准装载用例**仍不在研究侧 CI 里**(见第 3 节)⇒ 归交易侧那条线。
 - 本轮**仍然没有动任何生产代码的判定口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、
   批准链的**写入与研究侧读取**、沙盒筛查**全部未动**。
+
+---
+
+### 第 52 轮:codex 第 2 轮复核——收菜那道关口**没有核链**(H1)
+
+#### 0. 这一轮为什么发生
+
+第 51 轮把 `origin/main` 并进来之后,做了一轮 codex 深度复核(G8 第二轮)。
+复核的 **H1** 指出:**收菜(`scripts/research_collect.py`)读批准账本时没有核哈希链**——
+它调的是 `risk/approval_ledger.load_approvals`,那份**只解析 JSON、不核链**。
+
+同一条链上于是有个缺口:
+
+| 环节 | 读法 | 核链? |
+|---|---|---|
+| 批准(`scripts/research_api.py:266`) | `rs._load_approvals` | ✅ |
+| **收菜(`scripts/research_collect.py`)** | `approval_ledger.load_approvals` | ❌ |
+| 装载(`risk/approved_guard.py:280`) | `approval_ledger.load_approvals` | ❌(运行侧,见第 4 节) |
+
+⇒ **改写过账本(改内容 / 回滚 / 删行 / 塞进一条自洽的记录)仍能收菜**。
+收菜是把代码送进「运行时唯一认的目录」的**最后一道关口**——
+它比批准环节更靠近真钱,却比批准环节**更松**。这是**明确的放松**,不能留。
+
+#### 1. 更正第 51 轮的残余登记(原文保留,只为留痕)
+
+第 51 轮 §1 与 §5 把这条残余登记成「**运行侧**那条读法不核链」——
+**漏了收菜这条研究侧路径**。研究侧当时有**两条**读法
+(`research_api.py` 核链、`research_collect.py` 不核链),登记只写了运行侧那一条。
+
+**更正后的口径**:
+- **研究侧收菜**:本轮已闭环(第 2 节);
+- **运行侧装载**(`risk/approved_guard.py`):仍不核链 ⇒ Issue #29 待办(第 4 节)。
+
+> 这条残余**不是第 51 轮的合并造成的**:`scripts/research_collect.py` 是 main(#34,
+> `9a50556`)带来的文件,它**从第一版起**就调不核链的那份读法。
+> 合并只是把两条读法摆到了一起,才让它被看见。
+
+#### 2. 处置:收菜与「列出」改走核链读法
+
+`scripts/research_collect.py` 新增 `_verified_ledger()`,内部调 `rs._load_approvals`
+(与批准环节**同一条**读法),核链失败(链断 / 回滚 / 截断 / 多出未经合法写入路径的记录 /
+无链字段的旧账本)⇒ 一律 `CollectError`,退出码 2(fail-closed,**不做任何降级**)。
+
+两个调用点都改了:`collect_job`(收菜)与 `list_job`(列出)。
+`list` 也改的理由:它报的是「账本命中: 是/否」——
+核不过还照报,就等于把**未核验**的内容说成「已批准」。
+
+**没动的**:`risk/approval_ledger.py` 本身(运行侧那条读法)——按第 4 节留给 Issue #29。
+
+#### 3. 验证(第 52 轮实测)
+
+**用例**(`tests/test_research_collect.py`,20 条全绿):新加了 5 条,
+把三种改写方式各钉一条 + 一条「列出也核链」+ 一条**接线探针**
+(钉的是"读法本身"——换成不核链的那份就红):
+
+| 用例 | 钉的是什么 |
+|---|---|
+| `..._whose_record_was_tampered_with` | 记录内容被改(哈希对不上)⇒ 拒绝 |
+| `..._ledger_that_was_rolled_back` | 末条被删(账本比锚点短)⇒ 拒绝 |
+| `..._ledger_without_chain_fields` | 无链字段的旧账本/外部写入 ⇒ 不采信 |
+| `list_refuses_when_the_ledger_chain_is_broken` | 核不过时 `list` 不许报「账本命中」 |
+| `..._use_the_chain_verified_reader` | 接线:不许调不核链的那份(双向) |
+
+**fixture 也改了**:原来 `_approve()` 直接往账本 JSON 里塞 `{name, at}`——
+那正是**没有链字段的旧账本**。现在走 `rs.record_approval`(写链 + 写锚点),
+产出的才是**真正会被批准环节认**的那种账本。
+(旧 fixture 写法在新读法下会被直接拒——这本身就是 fixture 在说真话。)
+
+**变异验证**(证明这批探针不是空转的;脚本见 `%TEMP%/mut_collect_chain.py`,
+跑完自动还原并逐字节比对):
+
+| 变异 | 结果 |
+|---|---|
+| M1 把 `rs._load_approvals` 换回 `approval_ledger.load_approvals` | **5 failed**,15 passed ⇒ 探针抓到了 |
+| M2 在 `_verified_ledger` 里 catch 住 `SandboxError` 后**退回不核链的读法**(fail-open) | **4 failed**,16 passed ⇒ 探针抓到了 |
+| 还原 | **20 passed**,文件与变异前逐字节一致 |
+
+#### 4. 残余(如实登记)
+
+- **运行侧装载**(`risk/approved_guard.py`)仍用不核链的 `approval_ledger.load_approvals`
+  ⇒ Issue #29 待办(运行侧也要核链)。按第 51 轮的口径:
+  **在此之前不合并运行侧改动**。它另有两道独立记录(「已收菜」记录 + 晋级门槛通过记录)
+  要求**同时**命中,不是单点失守。
+- 本轮**没有动任何判定口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、
+  批准链的**写入**、沙盒筛查**全部未动**。改的只是**读账本时核不核链**。
+

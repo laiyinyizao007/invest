@@ -447,6 +447,26 @@
       (研究侧刻意不依赖交易栈),只记一笔,归交易侧那条线。
     - **验证**:104 / 20 passed + 1 skipped(按环境跳过,不是静默吞掉)/
       纪律守卫 24 种全符合预期、分档 22 种全被抓住;工作流 YAML 解析通过。
+  - **第 52 轮(codex 第 2 轮复核的 H1:收菜那道关口没有核链)**:
+    - **缺口**:收菜(`scripts/research_collect.py`)读批准账本调的是
+      `risk/approval_ledger.load_approvals`——**只解析 JSON、不核哈希链**。
+      于是同一条链上:批准环节(`research_api.py`)核链、**收菜环节不核链**
+      ⇒ **改写过账本(改内容 / 回滚 / 删行 / 塞进一条自洽的记录)仍能收菜**。
+      收菜比批准更靠近真钱,却比批准**更松**——这是明确的放松。
+      (这条缺口来自 main #34 的 `9a50556`,**不是**本分支合并造成的;
+      合并只是把两条读法摆到了一起,才让它被看见。)
+    - **处置**:`scripts/research_collect.py` 新增 `_verified_ledger()`,改走 `rs._load_approvals`
+      (与批准环节同一条读法);核链失败(链断 / 回滚 / 截断 / 无链字段)一律 `CollectError`、
+      退出码 2、**不做任何降级**。`collect_job` 与 `list_job` 都改了
+      (`list` 核不过还照报「账本命中」= 把未核验的内容说成已批准)。
+    - **更正第 51 轮的残余登记**:它只写了「运行侧那条读法不核链」,**漏了收菜这条研究侧路径**;
+      更正后:研究侧收菜本轮闭环,运行侧装载(`risk/approved_guard.py`)仍不核链 ⇒ Issue #29 待办。
+    - **用例**:`tests/test_research_collect.py` 新增 5 条(改内容 / 回滚 / 无链字段 /
+      `list` 核不过 / 接线探针),20 passed。fixture 也改了——原来直接往账本 JSON 里塞
+      `{name, at}`(那正是**没有链字段的旧账本**),现在走 `rs.record_approval`(写链 + 写锚点)。
+    - **变异验证**(证明探针不是空转的):M1 换回不核链的读法 ⇒ **5 failed**;
+      M2 核链失败时**退回**不核链的读法(fail-open)⇒ **4 failed**;还原 ⇒ 20 passed、文件逐字节一致。
+    - **没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的**写入**、沙盒筛查**全部未动**。
 - **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
   却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
