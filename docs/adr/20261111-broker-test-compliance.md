@@ -289,7 +289,7 @@ G8 双轮审查的第一轮(Gemini/zen codereview)通过,第二轮 codex CLI 给
 - **L8**——穿透自检仍用本机本地时间判「在不在交易时段」,与 `broker_test.py` 同一口径两个基准
   ⇒ 宿主机非北京时可能把「盘中没收到 Tick」从 FAIL 降级成 WARN。改用 `beijing_now()`。
 - 补 17 个回归用例(`tests/test_broker_test.py` 102 个、`tests/test_flatten_positions.py` 46 个、
-  `tests/test_account_guard.py` 90 个、`tests/test_discipline.py` 22 个、`tests/test_runtime.py` 72 个):
+  `tests/test_account_guard.py` 93 个、`tests/test_discipline.py` 22 个、`tests/test_runtime.py` 72 个):
   旧状态文件的 local 偏移读回来瞬时值不变、旧文件证明不了冷却期已过 ⇒ 保守拒绝、
   旧文件的「本地时间」标记跟着文件一起存、T6 不在别的规则拦单时断言阈值拦住了委托、
   重复报单失败时摘要里有原因、废单不能说可能仍挂在柜台上、连接记录的时间戳是北京时间、
@@ -339,6 +339,10 @@ G8 双轮审查的第一轮(Gemini/zen codereview)通过,第二轮 codex CLI 给
 6. **L8(Low)——重复报单的原因串重复措辞**（「重复报单:重复报单没有被拦截」）。
    改法:`step_duplicate` 返回**不带前缀**的原因,由 P3.1 统一补「重复报单:」,
    与同段「报单:…」「撤单:…」的格式对齐。
+
+补的回归用例(`tests/test_account_guard.py` 由 90 个增至 93 个):
+`state_version` 是垃圾值时按旧文件处理(不抛异常、不误触硬锁定)、
+T6 两条归因用例补「判定仍是 FAIL」的断言、重复报单原因串的两种结论文案。
 
 验证:全量 pytest **2883 passed / 5 skipped**,仅 `tests/test_dashboard_boundaries.py` 的 2 失败 + 5 错误
 (本隔离环境缺 `fastapi`/`uvicorn`,改动前就红,与本批无关);本批差异覆盖率 **97.4%**
