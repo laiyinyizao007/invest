@@ -62,7 +62,9 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 TEMPLATE_NAME = "国信期货有限责任公司外部接入系统技术测试报告20260717.docx"
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN, EXIT_CRASH = 0, 1, 2, 3, 4
-TEST_TIMEOUT = 1800        # 取证运行上限(200 笔稳定运行 + 各项等待,30 分钟足够)
+TEST_TIMEOUT = 2400        # 取证运行上限(200 笔稳定运行 + 各项等待,40 分钟足够)
+# 连接超时已经统一放宽到 300 秒(柜台的合约表查询实测要 90 秒以上),
+# 这里必须留出余量:整个取证跑不完就会**不生成报告**(一键流程只对 0/1 出报告)。
 REPORT_TIMEOUT = 300       # 出报告上限
 # 这些键一旦在进程环境里出现,就会覆盖 .env 里的同名值(dotenv override=False),
 # 所以它们必须参与「生效环境」的一致性校验。

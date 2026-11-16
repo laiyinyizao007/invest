@@ -1,6 +1,8 @@
 """国信取证运行器的步骤测试:假网关 + 同步事件引擎 + **真实**风控规则(不联网、不连 CTP)。"""
+import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -115,6 +117,49 @@ def test_threshold_covers_all_three_metrics_in_session(env):
     assert (daily.total_order_limit, daily.total_cancel_limit) == limits         # 阈值已还原
     titles = [a["message"] for a in env.alerts if a["title"] == "风控阈值触发"]
     assert any("汇总委托笔数" in t for t in titles) and any("汇总撤单笔数" in t for t in titles)
+
+
+def test_a_stalled_counter_makes_the_threshold_step_inconclusive_not_failed(env, monkeypatch):
+    """计数没推进 = 演示**不可靠**,不能写成「阈值失灵」(FAIL)。
+
+    计数是**异步**更新的(委托回报到达才 +1),没推进时我们根本不知道第二笔到底
+    会不会被拦 —— 那是"没法判定",不是"判定为失败"。证据写错方向会误导整改。
+    """
+    monkeypatch.setattr(bt, "wait_counter_at_least", lambda *a, **k: False)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.status
+    assert "计数未推进" in p31.summary
+    assert item(env, "T6").status == be.SKIP
+    assert any("计数在 5 秒内没有推进" in line for s in p31.shots for line in s.lines)
+
+
+def test_the_cancel_metric_only_judges_its_counter_after_the_cancel(env, monkeypatch):
+    """撤单指标的计数判断必须放在**撤单之后**。
+
+    「汇总撤单笔数」只在**撤单回报**到达后才 +1(`DailyLimitRule.on_order`),
+    在撤单之前等它必然等不到 → 这一项会永远判「计数未推进」(SKIP)。
+
+    这个缺陷在假件里是**看不出来**的:假件的时钟每 pump 一次跳 1 秒,
+    挂单超时会被风控自动撤掉,撤单计数提前推了上去,于是"等计数"总能等到。
+    所以这里把挂单超时调到极大(不让风控自动撤单),再盯「等待发生的时机」。
+    """
+    env.rule.stale_order_seconds = 10 ** 6          # 挡住「挂单超时自动撤单」这个干扰项
+    seen: list[tuple[str, int]] = []
+    real = bt.wait_counter_at_least
+
+    def spy(ctx, rule, attr, target, timeout):
+        seen.append((attr, len(env.gw.cancel_requests)))
+        return real(ctx, rule, attr, target, timeout)
+
+    monkeypatch.setattr(bt, "wait_counter_at_least", spy)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    cancel_waits = [n for attr, n in seen if attr == "total_cancel_count"]
+    assert cancel_waits, "撤单指标应当等待撤单计数推进"
+    assert min(cancel_waits) >= 1, "撤单计数只能在撤单回报之后判断推进"
+    assert item(env, "P3.1").status == be.PASS, item(env, "P3.1").summary
 
 
 def test_threshold_cancel_metric_is_skipped_off_session(tmp_path):
@@ -288,8 +333,11 @@ def test_counter_errors_bypass_local_risk_and_capture_broker_text(tmp_path):
         ev = e.book.items["P4.2"]
         assert [s.label for s in ev.shots] == ["无足够资金开仓", "无仓位可平", "市场状态不允许"]
         assert ev.status == be.PASS, ev.summary
-        assert "资金不足" in ev.shots[0].lines[2]
-        assert len(e.gw.sent) == 3                                              # 直发,没有经过本地风控拦截
+        assert "资金不足" in ev.shots[1].lines[2]        # 柜台错误文本确实被采到了
+        # 「无足够资金开仓」**故意不发**:要么柜台直接接受(真开大仓),要么跌停价以下触发硬拒绝
+        # 把账户锁成当日禁止开仓(2026-11-16 夜盘实测:200 笔只放行 9 笔)。
+        assert len(e.gw.sent) == 2                                              # 直发,没有经过本地风控拦截
+        assert "专用小资金账户补测" in ev.summary
     finally:
         e.main.close()
 
@@ -299,14 +347,20 @@ def test_counter_errors_in_session_cannot_demo_market_state(env):
     env.gw.reject_text = "CTP:资金不足"
     bt.step_counter_errors(env.ctx, env.book)
     ev = item(env, "P4.2")
-    assert ev.status == be.SKIP and "非交易时段补测" in ev.summary and "非交易时段" in ev.shots[2].lines[0]
+    # 「无仓位可平」这一项演示到了(真收到了柜台错误文本)→ 本项算通过;
+    # 没能演示的两个场景按「需补测」记在说明里,不能当成失败,也不能当没这回事。
+    assert ev.status == be.PASS, ev.summary
+    assert "非交易时段补测" in ev.summary and "专用小资金账户补测" in ev.summary
+    assert "非交易时段" in ev.shots[2].lines[0]
 
 
-def test_counter_errors_fail_when_broker_does_not_complain_about_funds(env):
-    env.gw.mode = "reject"
-    env.gw.reject_text = "CTP:别的错误"
+def test_counter_errors_fail_when_no_broker_text_arrives(env):
+    """柜台没给任何错误文本 → 这一项就是没演示到,必须判失败(不能含糊过去)。"""
+    env.gw.mode = "accept"
     bt.step_counter_errors(env.ctx, env.book)
-    assert item(env, "P4.2").status == be.FAIL and "资金" in item(env, "P4.2").summary
+    ev = item(env, "P4.2")
+    assert ev.status == be.FAIL, ev.summary
+    assert "未收到柜台错误文本" in ev.shots[1].lines[2]
 
 
 # ---------- 其他步骤 ----------
@@ -738,3 +792,131 @@ def test_exit_code_separates_incomplete_evidence_from_failed_items():
     assert bt.exit_code_for(True, [], ["⚠⚠ 留有持仓"], [ok]) == bt.EXIT_FAILED
     assert bt.exit_code_for(True, [], [], [ok, bad]) == bt.EXIT_FAILED
     assert bt.exit_code_for(True, [], [], [ok]) == bt.EXIT_OK
+
+
+# ---------- 账户锁定:不要白跑一次登录 ----------
+
+def test_locked_state_note_reads_the_isolated_guard_state(tmp_path):
+    """锁定状态下开仓委托会被本地风控全部拦下,取证会白跑一次券商登录额度。"""
+    from risk.account_guard import trading_day
+    state = tmp_path / "guard.json"
+    day = trading_day(bt.beijing_now()).isoformat()
+
+    state.write_text(json.dumps({"hard_locked": True, "hard_reason": "权益回撤"}), encoding="utf-8")
+    note = bt.locked_state_note(state)
+    assert "硬锁定" in note and "权益回撤" in note
+
+    state.write_text(json.dumps({"hard_locked": False, "daily_locked_day": day}), encoding="utf-8")
+    note = bt.locked_state_note(state)
+    assert "当日锁定" in note and day in note
+
+    state.write_text(json.dumps({"hard_locked": False, "daily_locked_day": "2000-01-01"}), encoding="utf-8")
+    assert bt.locked_state_note(state) == ""            # 旧交易日的锁定已经过期
+
+    assert bt.locked_state_note(tmp_path / "missing.json") == ""   # 读不到状态文件就当没有状态
+
+
+def test_main_refuses_to_connect_when_the_account_is_locked(monkeypatch, capsys, tmp_path):
+    """账户被锁 → 直接拒绝连接,不消耗一次登录(国信会查登录次数)。"""
+    _guoxin_env(monkeypatch, BROKER_TEST_ALLOWED_TD="121.13.218.19:41285",
+                BROKER_TEST_ALLOWED_MD="121.13.218.19:41293")
+    from risk.account_guard import trading_day
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "guard.json").write_text(
+        json.dumps({"hard_locked": False, "daily_locked_day": trading_day(bt.beijing_now()).isoformat()}),
+        encoding="utf-8")
+    monkeypatch.setattr(bt, "BT_ROOT", tmp_path)
+    assert bt.main(["--confirm-broker-test"]) == bt.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "拒绝连接" in err and "当日锁定" in err
+
+
+def test_stability_is_skipped_when_the_account_is_locked(env):
+    """账户锁定时 200 笔一笔都发不出去,证据只会显示「放行 0 笔」——直接判成需补测。"""
+    from risk.account_guard import trading_day
+    env.rule.guard.daily_locked_day = trading_day(bt.beijing_now())
+    env.ctx.stability_interval = 0
+    bt.step_stability(env.ctx, env.book, total=5)
+    ev = item(env, "P1.3")
+    assert ev.status == be.SKIP and "DAILY_LOCKED" in ev.summary
+    assert env.gw.sent == []
+
+
+# ---------- 阈值对照:计数是异步更新的 ----------
+
+def test_the_over_limit_order_is_only_sent_after_the_counter_advanced(env, monkeypatch):
+    """报单计数在**委托回报事件**里异步更新。
+
+    不等计数涨上去就发第二笔,第二笔会因为计数还停在旧值而被放行 ——
+    2026-11-16 夜盘实测就是这样把「超过阈值的委托」放过去的。
+    """
+    trace: list[tuple] = []
+    real_wait = bt.wait_counter_at_least
+    real_send = bt.send
+
+    def fake_wait(ctx, rule, attr, target, timeout):
+        trace.append(("wait", attr, target))
+        return real_wait(ctx, rule, attr, target, timeout)
+
+    def fake_send(ctx, req):
+        trace.append(("send",))
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "wait_counter_at_least", fake_wait)
+    monkeypatch.setattr(bt, "send", fake_send)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    start = len(trace)                                  # 只看阈值对照这一步的次序
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    kinds = [t[0] for t in trace[start:]]
+    assert kinds.count("send") >= 2                    # 阈值内一笔 + 超阈值一笔
+    assert kinds.count("wait") >= 1
+    # 次序必须是「阈值内那笔 → **等计数推进** → 超阈值那笔」:
+    # 计数没涨上去就发第二笔,第二笔会被放行(2026-11-16 夜盘实测)。
+    first_send = kinds.index("send")
+    second_send = kinds.index("send", first_send + 1)
+    assert first_send < kinds.index("wait") < second_send
+
+
+def test_wait_counter_at_least_reports_a_stalled_counter():
+    """计数没推进时要如实返回 False —— 上面那句「对照不可靠」的告警才有依据。"""
+
+    class _Rule:
+        total_order_count = 0
+
+    class _Ctx:
+        def wait_until(self, predicate, timeout, step=0.2):
+            for _ in range(3):
+                if predicate():
+                    return True
+            return False
+
+    rule = _Rule()
+    assert bt.wait_counter_at_least(_Ctx(), rule, "total_order_count", 1, 5.0) is False
+    assert bt.counter_value(rule, "total_order_count") == 0
+    assert bt.counter_value(rule, "不存在的计数器") == 0
+
+
+def test_settle_counter_gives_up_instead_of_hanging():
+    """计数一直不稳定时,`settle_counter` 到点就返回 —— 不能把取证流程挂死。"""
+
+    class _Jumpy:
+        """每次读都变一个值:永远等不到「连续 1 秒不变」。"""
+
+        def __init__(self) -> None:
+            self._n = 0
+
+        @property
+        def total_order_count(self) -> int:
+            self._n += 1
+            return self._n
+
+    class _Ctx:
+        def sleep(self, _s: float) -> None:
+            return None
+
+    started = time.monotonic()
+    value = bt.settle_counter(_Ctx(), _Jumpy(), "total_order_count", timeout=0.3)
+    assert time.monotonic() - started < 5.0
+    assert value >= 1

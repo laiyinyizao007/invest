@@ -93,7 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="", help="测试合约,如 c2701.DCE(默认取 .env 的 LIVE_VT_SYMBOL)")
     parser.add_argument("--confirm-broker-test", action="store_true", help="确认目标是期货公司的测试环境")
     parser.add_argument("--with-order", action="store_true", help="交易时段内报一张跌停价买单并撤销")
-    parser.add_argument("--connect-timeout", type=float, default=120.0, help="等待登录全流程的最长时间(秒)")
+    parser.add_argument("--connect-timeout", type=float, default=300.0,
+                        help="等待登录全流程(含合约表查询)的最长时间(秒);柜台的合约表查询实测要 90 秒以上")
     parser.add_argument("--tick-timeout", type=float, default=30.0, help="等待 Tick 的最长时间(秒)")
     parser.add_argument("--position-wait", type=float, default=8.0, help="持仓查询等待窗口(秒)")
     parser.add_argument("--out-dir", default="", help=f"报告目录(默认 {REPORT_DIR})")

@@ -678,3 +678,27 @@ def test_the_whitelist_is_bound_to_the_broker_id(monkeypatch, tmp_path, capsys):
     assert f.run(_args()) == f.EXIT_CONFIG
     err = capsys.readouterr().err
     assert "182.254.243.31:30001" in err and "已丢弃" in err
+
+
+def test_duplicate_position_rows_produce_only_one_close_order():
+    """同一窗口落进两次快照时,只能出一张平仓单。
+
+    2026-11-16 实测:SimNow 采集窗口里落进两行 `c2701.DCE Long 3`
+    (我们主动查的那次 + 网关约每 4 秒自动查的那次),
+    平仓计划照抄就是**两张 3 手平多单** —— 3 手持仓被平 6 手,超平会被柜台整单拒
+    (错误码 30「CTP:平仓量超过持仓量」)。
+    """
+    pos = _pos("c2701", Exchange.DCE, Direction.LONG, 3)
+    plans = plan_closes([pos, pos], {"c2701.DCE": (2185.0, 2186.0, 2185.0)})
+    assert len(plans) == 1
+    assert plans[0].volume == 3
+    assert plans[0].direction == Direction.SHORT
+
+
+def test_a_shrinking_snapshot_does_not_plan_the_stale_volume():
+    """两次快照之间持仓变小:按最后一次快照算,不能按更旧、更大的那个数平。"""
+    stale = _pos("c2701", Exchange.DCE, Direction.LONG, 3)
+    fresh = _pos("c2701", Exchange.DCE, Direction.LONG, 1)
+    plans = plan_closes([stale, fresh], {"c2701.DCE": (2185.0, 2186.0, 2185.0)})
+    assert len(plans) == 1
+    assert plans[0].volume == 1

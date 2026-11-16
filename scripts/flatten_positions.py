@@ -49,7 +49,7 @@ FLATTEN_ROOT = bootstrap.ROOT / ".vntrader_flatten"
 ISOLATED = bootstrap.isolate_state(FLATTEN_ROOT.name)
 
 from ctp_tools.broker_targets import allowed_for_broker, resolve_allowed  # noqa: E402
-from ctp_tools.collector import Collector, close_engine, query_positions  # noqa: E402
+from ctp_tools.collector import Collector, close_engine, merge_position_rows, query_positions  # noqa: E402
 from ctp_tools.penetration import check_target, mask_account  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
@@ -152,6 +152,12 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]],
       见 `split_is_reliable`;这类持仓由 `manual_positions()` 列出来交给人工。
     """
     priceticks = priceticks or {}
+    # 同一个 (合约, 方向) 只出一张单:一次查询窗口里可能出现**两次快照**的两行
+    # (我们主动查的那次 + 网关约每 4 秒自动查的那次,2026-11-16 实测),
+    # 两张单会各平一手 —— 3 手持仓就变成 6 手平仓单,超量的平仓单会被柜台整单拒绝
+    # (错误码 30「平仓量超过持仓量」),仓位没平掉,取证流程照样卡住。
+    # 这里再合一次是**发单前的最后一道闸**:上游合过了也要自己合。
+    positions = merge_position_rows(positions)
     plans: list[ClosePlan] = []
     for pos in positions:
         volume = int(getattr(pos, "volume", 0) or 0)
@@ -255,8 +261,10 @@ def reconcile_filled(initial: list, remaining: list, results: list) -> tuple[boo
         return int(getattr(pos, "volume", 0) or 0)
 
     # 键 = (合约, 持仓方向):双向持仓(多空同时有)不能互相覆盖。
-    initial_vol = {key_of(p): vol_of(p) for p in initial if vol_of(p) > 0}
-    left_vol = {key_of(p): vol_of(p) for p in remaining if vol_of(p) > 0}
+    # 两侧都先走 `merge_position_rows`:发单计划与事后对账必须用**同一套**口径,
+    # 否则会出现"计划按 5 手、对账按 3 手"这种自相矛盾的行数(2026-11-16 codex 复核提出)。
+    initial_vol = {key_of(p): vol_of(p) for p in merge_position_rows(initial) if vol_of(p) > 0}
+    left_vol = {key_of(p): vol_of(p) for p in merge_position_rows(remaining) if vol_of(p) > 0}
     # 平仓单的方向与持仓方向相反:卖出(空)平的是多头。
     opposite = {Direction.SHORT.value: Direction.LONG.value, Direction.LONG.value: Direction.SHORT.value}
     traded: dict[tuple[str, str], int] = {}
@@ -603,7 +611,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="", help="额外订阅这个合约的行情(默认取 .env 的 LIVE_VT_SYMBOL);"
                                                     "**平仓范围不受它影响**:本工具平的是账户里的全部持仓")
     parser.add_argument("--confirm-flatten", action="store_true", help="确认真的要发出平仓委托")
-    parser.add_argument("--connect-timeout", type=float, default=180.0)
+    parser.add_argument("--connect-timeout", type=float, default=300.0,
+                        help="等待合约表就绪的最长时间(秒);柜台的合约表查询实测要 90 秒以上")
     parser.add_argument("--position-wait", type=float, default=15.0)
     parser.add_argument("--tick-wait", type=float, default=20.0)
     parser.add_argument("--fill-timeout", type=float, default=30.0)

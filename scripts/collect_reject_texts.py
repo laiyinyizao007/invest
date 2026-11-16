@@ -62,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--symbol", default="", help="要测试的合约,如 c2701.DCE(默认取 .env 的 LIVE_VT_SYMBOL)")
     parser.add_argument("--out", default="", help="把结果写到这个 Markdown 文件(默认只打印)")
-    parser.add_argument("--connect-timeout", type=float, default=180.0, help="等待合约与账户到位的最长时间(秒)")
+    parser.add_argument("--connect-timeout", type=float, default=300.0,
+                        help="等待合约与账户到位的最长时间(秒)。国信测试前置实测合约表查询"
+                             "要 90 秒以上,180 秒不够用")
     parser.add_argument("--position-check-timeout", type=float, default=15.0,
                         help="发单前查询持仓的最长等待(秒)。CTP 的持仓回报是异步的,"
                              "必须等满这个窗口才能确认账户真的空仓")

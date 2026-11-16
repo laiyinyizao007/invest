@@ -30,6 +30,10 @@ DAY_SESSION_WINDOWS = ((9 * 60, 10 * 60 + 15), (10 * 60 + 30, 11 * 60 + 30), (13
 NIGHT_SESSION_START = 21 * 60          # 21:00
 NIGHT_SESSION_END = 2 * 60 + 30         # 次日 02:30(最晚的品种)
 
+# 持仓回报「分批」的间隔阈值(秒):一次查询回报的行是连续推来的,两次回报之间
+# 至少隔一个网络往返。取 0.3 秒:远小于一个往返,又宽到能容忍事件循环的抖动。
+POSITION_BATCH_GAP = 0.3
+
 
 def in_trading_session(dt: datetime) -> bool:
     """是否可能处于交易时段(保守判断)。
@@ -79,6 +83,18 @@ class Collector:
     # 事件引擎把 traceback 写成一条日志,措辞是英文)。
     ERROR_MARKERS = ("失败", "错误", "被拒绝", "拒绝", "不支持", "非法", "超限", "不足", "不存在",
                      "状态更新", "Traceback", "Error:")
+    # 只收**交易网关**的错误日志:本地风控的预警/拒绝日志同样是 ERROR 级别
+    # (trading/guard_rule.py 的 `_alert` 就写成 LogData(level=ERROR)),
+    # 混进来会让"柜台错误提示"取到风控文案而不是柜台的拒单原因
+    # (实测 2026-11-16 夜盘,P4.2 取到的是本地风控的「风控阈值触发」)。
+    # 与 `trading/guard_rule.py:_on_log` 是同一条思路(网关名白名单),但这里**更严**:
+    # 那边只按网关名过滤,这边还额外收了「没有网关名的 traceback」(见 TRACEBACK_MARKERS)。
+    ERROR_GATEWAYS: tuple[str, ...] = ("CTP",)
+    # 事件引擎自己写的 traceback **没有网关名**(vnpy 的 `EventEngine.on_exception` 用
+    # `LogData(msg=traceback.format_exc(), level=ERROR)`,gateway_name 为空),
+    # 那是网关回调线程里的异常(比如 vnpy_ctp 对不存在的合约抛 KeyError)——也算柜台侧的证据,
+    # 不能被上面的「只收交易网关」一起滤掉。
+    TRACEBACK_MARKERS: tuple[str, ...] = ("Traceback", "Error:")
 
     def __init__(self) -> None:
         self.errors: list[tuple[float, str]] = []
@@ -91,6 +107,13 @@ class Collector:
         # **持仓查询回报的行**(不是 OMS 快照,见 `query_positions` 的说明):
         # 网关每次查询回报只推送**本次返回的**行,已平掉的合约不会再出现。
         self.position_rows: list = []
+        # 每行的到达时刻(下标 → 时刻):用来把行按「查询回报」分批。
+        # 用**下标做键**而不是并行列表:有人绕过 `on_position` 直接往 `position_rows`
+        # 里塞行时,并行列表会与行数错位(时刻张冠李戴),下标做键则是「查不到就
+        # 不分批」——宁可少一层判据,也不能把行丢掉(丢掉 = 以为账户空仓 = 会去发单)。
+        self.position_times: dict[int, float] = {}
+        # 合并前的原始行数(由 `query_positions` 写):留痕用,不参与任何平仓计算
+        self.position_rows_raw = 0
         # 账户资金回报计数:持仓查询「没有行」时,用它证明柜台确实在应答(见 query_positions)
         self.account_count = 0
         # 事件线程写、主线程读:用一把锁把列表的读取变成一致的快照
@@ -104,6 +127,40 @@ class Collector:
         """
         with self.lock:
             self.position_rows.append(event.data)
+            self.position_times[len(self.position_rows) - 1] = self.now()
+
+    def now(self) -> float:
+        """取当前时刻(单独一个方法是为了让测试能控制时间)。"""
+        return time.monotonic()
+
+    def position_batches_since(self, mark: int) -> list[list]:
+        """把 `mark` 之后收到的持仓行按「查询回报」分批。
+
+        一次查询回报的行是**连续推来的**(网关在一个回调里 for 循环推完),
+        两次回报之间至少隔一个网络往返。所以按到达时间的间隔分批:
+        间隔超过 `POSITION_BATCH_GAP` 就当作新的一次回报。
+
+        拿不到到达时刻的行(绕过 `on_position` 直接塞进 `position_rows` 的)→ **整段当一批**:
+        分不了批就等于没有「最新一批」这个概念,退回旧行为(不丢行)。
+        丢行 = 以为账户空仓 = 会去发单,所以这一层只能保守。
+        """
+        with self.lock:
+            rows = list(self.position_rows[mark:])
+            times = [self.position_times.get(i) for i in range(mark, mark + len(rows))]
+        if any(t is None for t in times):
+            return [rows] if rows else []
+        batches: list[list] = []
+        current: list = []
+        last_t: float | None = None
+        for row, t in zip(rows, times):
+            if last_t is not None and t - last_t > POSITION_BATCH_GAP:
+                batches.append(current)
+                current = []
+            current.append(row)
+            last_t = t
+        if current:
+            batches.append(current)
+        return batches
 
     def on_account(self, event: Event) -> None:
         with self.lock:
@@ -125,8 +182,25 @@ class Collector:
             self.log_lines.append(log.msg)
             if "登录失败" in log.msg:
                 self.login_failures.append(log.msg)
+            if not self.is_counter_error(log):
+                return
             if log.level >= ERROR or any(k in log.msg for k in self.ERROR_MARKERS):
                 self.errors.append((time.monotonic(), log.msg))
+
+    def is_counter_error(self, log: LogData) -> bool:
+        """这条日志算不算**柜台侧**的错误。
+
+        两条判据(都要):
+        - 来自交易网关(`ERROR_GATEWAYS`),或者
+        - 是事件引擎写的 traceback(没有网关名,见 `TRACEBACK_MARKERS`);
+        本地风控/运行时的 ERROR 日志(gateway_name 是 `RiskManager` 之类)不算 ——
+        实测 2026-11-16 夜盘,P4.2 取到的「柜台错误提示」就是本地风控的「风控阈值触发」。
+        """
+        if log.gateway_name in self.ERROR_GATEWAYS:
+            return True
+        if not log.gateway_name and any(k in log.msg for k in self.TRACEBACK_MARKERS):
+            return True
+        return False
 
     def login_failed(self) -> str:
         """最近的登录失败文本(没有则空串)。"""
@@ -394,6 +468,114 @@ def trade_live(main_engine) -> bool:
     return bool(td_api.login_status)
 
 
+def position_key(row) -> tuple[str, str] | None:
+    """取一行的 (合约, 方向) 键;认不出来就返回 None。
+
+    方向统一取 `direction.value`(字符串),所以 `Direction.LONG` 与裸字符串 `"Long"`
+    会归到同一个键 —— 同一进程里 vn.py 的 `Direction.LONG.value` 就是 `"Long"`。
+    """
+    symbol = str(getattr(row, "vt_symbol", "") or "")
+    direction = getattr(row, "direction", None)
+    if not symbol or direction is None:
+        return None
+    return symbol, str(getattr(direction, "value", direction))
+
+
+def select_latest_snapshot(batches: list[list]) -> list:
+    """从若干批持仓回报里挑出**最新一次查询回报**的行。
+
+    背景:一次持仓查询的回报是**一批行**,但采集窗口里可能落进两批(我们主动查的
+    那次 + 网关约每 4 秒自动查的那次)。柜台对**已经平掉**的合约不会再推持仓事件,
+    所以后一批快照里**消失**的键 = 那个合约已经平掉了。
+
+    判据(刻意保守):
+    - 只有一批 → 就是最新快照,全要;
+    - 多批,且**最后一批的键集合是紧邻前一批的子集** → 说明最后一批是**完整的新快照**
+      (有持仓被平掉了,又没冒出新键)→ 只留最后一批;
+    - 否则 → **判不出来**(最可能是同一次回报被事件循环卡顿切成了两批)→ 保留全部键。
+      宁可多留一行(多平一手会被柜台整单拒),也不能少平一手。
+
+    为什么只跟**紧邻的前一批**比(而不是跟前面所有批的并集比):
+    一次回报内部各行的 (合约, 方向) 键是**互不相同**的(网关用键去重),所以
+    「被切成两半的同一次回报」的两批键集合**必然不相交** → 拿不相交的前一批去比,
+    永远判不出「子集」→ 不会误丢。而如果跟前一批的并集比,「前一批恰好是更早的一次快照」
+    就会让**同一次回报被切成三批**的情形(第一批={A,B}、第二批={A}、第三批={B})
+    判成「最后一批 ⊆ 并集」→ 丢掉还在的 A(去平一个已经平掉的合约方向 ⇒ 少平)。
+    与紧邻前一批比,这种情形会被判成「不相交 → 保留全部」,方向安全。
+
+    盲区(必须知道):空快照推不出任何行,所以「后一批是空的」这种情况**看不出来**。
+    这一条由调用方的「轮询到空为止」兜住:每次查询都重新记 mark,旧批次不会一直
+    留在窗口里(见 `scripts/flatten_positions.py` 的收尾轮询)。
+    """
+    if not batches:
+        return []
+    if len(batches) == 1:
+        return list(batches[0])
+    last_keys = {key for key in (position_key(p) for p in batches[-1]) if key}
+    prev_keys = {key for key in (position_key(p) for p in batches[-2]) if key}
+    if last_keys and last_keys <= prev_keys:
+        return list(batches[-1])
+    return [row for batch in batches for row in batch]
+
+
+def merge_position_rows(rows: list) -> list:
+    """把**同一个 (合约, 方向) 的多行**合并成一行,取**最后一次出现**的那行。
+
+    为什么会出现多行(2026-11-16 夜盘实测,已核对 `vnpy_ctp` 源码):
+    - `vnpy_ctp` 的 `onRspQryInvestorPosition` 用 `(InstrumentID, PosiDirection)` 做键、
+      在 `last=True` 时推送字典的值然后 `self.positions.clear()`(ctp_gateway.py:551/591-595),
+      所以**一次回报不可能推出两行同键**;
+    - 但网关自己会**定期自动查持仓**:`process_timer_event` 每 2 秒轮一次
+      `query_functions = [query_account, query_position]`(ctp_gateway.py:229-245),
+      即约每 4 秒一次自动查询;
+    - 采集器把持仓回报记成**没有请求/响应边界的平铺列表**,于是「我们主动查的那次」
+      与「网关自动查的那次」的两份快照被混进同一个窗口 → 同一个 (合约, 方向) 出现两行。
+      实测表现为**间歇性**(留痕 `data/flatten/flatten-20261116-213827.json` 两行,
+      而 `-215520/-215903` 各一行),这正是定时器竞态的特征,不是柜台固定重复回报。
+
+    取**最后一次**那行,而不是成交量最大的:
+    - 两行来自**两次快照**,快照之间持仓可能变小(例如刚平掉 2 手)。取 max 就是
+      **故意挑一个更旧、更大的数**去平 —— 方向和"超平才真金白银"相反;
+    - 取最后一次 = 平仓量 ≤ 最近一次快照看到的持仓量,这是我们唯一能守住的单向不变量。
+
+    这个不变量有个前提:**到达顺序 = 时间顺序**。CTP 的每条流是 FIFO 的,响应按请求
+    顺序回来,每次响应反映的是响应那一刻的状态 → 到达顺序就是新旧顺序,成立。
+    如果哪天真出现乱序(比如回报被重放),这里会退化成"取最后一次到达的",
+    仍然不会求和、不会取大,最坏情况是取到一个更旧的数(保守方向:可能少平,不超平)。
+
+    **绝不能求和**:两份快照求和会把平仓量翻倍(3 手 → 平 6 手)。超量的平仓单
+    会被柜台**整单拒绝**(实测错误码 30「CTP:平仓量超过持仓量」),不会开出反向仓位,
+    但整单被拒意味着仓位没平掉,取证流程照样卡住。
+
+    同一次回报内的多笔持仓(投机 + 套保)不用在这里操心:`vnpy_ctp` 的键不含 HedgeFlag,
+    会在同一次回报里先**累加**(`position.volume += data["Position"]`, ctp_gateway.py:577)
+    再推一行,所以那种情况我们只看到一行、量已经是合计值。
+    """
+    latest: dict[tuple[str, str], object] = {}
+    order: list[tuple[str, str]] = []
+    for row in rows:
+        key = position_key(row)
+        if key is None:
+            continue                       # 认不出键的行不能合并(也不能安全地平):宁可漏掉,不要凭空造一个键
+        if key not in latest:
+            order.append(key)
+        latest[key] = row                 # 后出现的覆盖先出现的 = 取最后一次快照
+    return [latest[key] for key in order]
+
+
+def _latest_snapshot_rows(collector, mark: int, rows: list) -> list:
+    """挑出最新一批回报的行。
+
+    采集器支持分批(`position_batches_since`)时按「子集」判据挑;
+    只提供 `positions_since` 的老接口/测试替身 → 当成一批(等价于旧行为,只是少了
+    「平掉的合约自动消失」这一层)。
+    """
+    batches = getattr(collector, "position_batches_since", None)
+    if batches is None:
+        return rows
+    return select_latest_snapshot(batches(mark))
+
+
 def query_positions(main_engine, collector, wait: float = 5.0,
                     quiet: float = 1.2) -> tuple[list, str]:
     """按「**本次查询回报返回的行**」取持仓,而不是 OMS 快照。
@@ -414,6 +596,13 @@ def query_positions(main_engine, collector, wait: float = 5.0,
     - "empty":没有收到行,但通道在线(CTP 对空账户**不推送任何持仓事件**,
       所以「没有行」在通道在线时就是「没有持仓」);
     - "untrusted":查询发不出去或通道不在线 —— 这时说什么都是猜。
+
+    返回的行按 (合约, 方向) 合并过(见 `merge_position_rows`):同一 (合约, 方向) 在
+    一个窗口里可能出现**两次快照**的两行(我们主动查的那次 + 网关约每 4 秒自动查的
+    那次),这里只给**最后一次快照**那一行,调用方不会因为重复快照而多平一手。
+    两批快照还会先过 `select_latest_snapshot`:后一批里**消失**的合约 = 已经平掉了,
+    不该再去平(否则柜台整单拒)。合并前的原始行数记在 `collector.position_rows_raw`,
+    供留痕区分"真的多了一行"与"合并掉了"。
     """
     gateway = main_engine.get_gateway("CTP")
     mark = collector.mark_positions()
@@ -434,7 +623,10 @@ def query_positions(main_engine, collector, wait: float = 5.0,
                 if len(more) > len(rows):
                     rows = more
                     end = time.monotonic() + quiet
-            return rows, "ok"
+            collector.position_rows_raw = len(rows)      # 留痕:合并前几行 → 合并后几项
+            # 窗口里可能落进两批(我们主动查的那次 + 网关自动查的那次):
+            # 先挑出**最新一批**(后一批里消失的合约 = 已经平掉了),再按 (合约,方向) 合并。
+            return merge_position_rows(_latest_snapshot_rows(collector, mark, rows)), "ok"
         time.sleep(0.1)
     if not trade_live(main_engine):
         return [], "untrusted"
