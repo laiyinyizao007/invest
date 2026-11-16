@@ -17,6 +17,11 @@ from strategies.trend_atr_strategy import TrendAtrStrategy
 class TrendAtr15mStrategy(TrendAtrStrategy):
     """"""
 
+    # 本骨架**仅支持研究回测**:`on_tick` 直接抛异常(见下),不能上实盘/模拟盘。
+    # 这个标记给运行时装载用:`risk/approved_guard.py` 看到它就拒绝在交易运行时里装载
+    # ——否则策略会在实盘第一根 tick 上抛异常并静默死掉(失败方向安全,但信息误导)。
+    research_only = True
+
     def on_init(self) -> None:
         pass                                    # 回放数据由引擎直接给出,不做数据库预热
 
