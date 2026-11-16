@@ -114,6 +114,8 @@ jobs:
             tests/test_research_gate.py \
             tests/test_research_gateway.py \
             tests/test_research_grid.py \
+            tests/test_approval_ledger.py \
+            tests/test_research_collect.py \
             tests/test_research_mcp.py \
             tests/test_research_sandbox.py \
             tests/test_segment_ledger.py
@@ -235,6 +237,14 @@ jobs:
           # 分档器的用例(test_check_domain.py)曾在这里;第 49 轮把它们挪到
           # 上面「守卫工具自己的用例」那一步——那里有**点名核对**的兜底,
           # 这里只有 pytest 的退出码(整份被跳过时退出码仍是 0)。
+          #
+          # 第 51 轮:main(#34/#35)带来的两份研究侧用例此前**不在任何 CI 步骤里**——
+          # 「批准账本只读模块」与「收菜」这两道防线的用例**一次都没在 CI 上跑过**。
+          # 这两份只 import risk/scripts 模块(不碰 vnpy)⇒ 可以进这个 research-only runner。
+          # **不进来的两份**:`tests/test_approved_loading.py` 与
+          # `tests/test_strategy_skeleton_contract.py`——它们 import `bootstrap`,
+          # 会把 vnpy 交易栈拖进来 ⇒ 这个 job 装不了(也不该装:研究侧刻意不依赖交易栈);
+          # 那两份属于交易侧,归实盘那条线。
           python -m pytest -p no:cacheprovider --continue-on-collection-errors -q \
             tests/test_research_config.py \
             tests/test_research_sandbox.py \
@@ -243,7 +253,9 @@ jobs:
             tests/test_research_api.py \
             tests/test_research_mcp.py \
             tests/test_research_gate.py \
-            tests/test_research_grid.py
+            tests/test_research_grid.py \
+            tests/test_approval_ledger.py \
+            tests/test_research_collect.py
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #

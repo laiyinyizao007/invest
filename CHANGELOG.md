@@ -431,6 +431,22 @@
       `gemini-3-pro-preview` 与 `gemini-2.0-flash` 已退役 404)⇒ **不拿内部自查冒充
       外部复核**;第二轮 codex CLI 照做(G8:两轮都做)。另有三条低危残余(errors 关键词
       误判成收集错误、无表头表格的首行被丢、junit 计数依赖报告自洽)登记在 ADR 第 50 轮 §6。
+  - **第 51 轮(把 main 并进来:一处不许削弱的冲突裁决 + CI 里两条漏接的防线)**:
+    合并 `origin/main`(#34 沙盒闭合状态机、#37 两道门)。判定标准只有一条:**不许削弱**。
+    - **冲突裁决**:`scripts/research_sandbox.py` 里两份「读批准账本」——main(#34)抽出的
+      `risk/approval_ledger.load_approvals` **不核哈希链**,本分支(#31)的 `_load_approvals` **核链**
+      ⇒ 保留本分支的链校验实现(main 那份只用它的 `file_sha256`,逐字等价)。
+      直接改用 main 那份 = 一条防线在一次例行合并里被放松 ⇒ 按「任何削弱型改动一律升档」拒绝。
+      **残余**:运行侧那条读法**不核链**(不是本次合并造成的),已登记为 Issue #29 待办。
+    - **守卫当场抓到一处数字过期**:合并带进 main 的 CHANGELOG 一行「99 条动态探针」,
+      合并后实际 104 条 ⇒ `test_documented_test_count_matches_reality` 立刻红
+      ⇒ 已把那行改写成不含手写条数的说法(仓库口径:数字由脚本实测,文档只引用)。
+    - **CI 补接线**:`tests/test_approval_ledger.py` 与 `tests/test_research_collect.py`
+      (main 带来的两道防线的用例)此前**不在任何 CI 步骤里**⇒ 已接进「研究侧其余测试」并进 ruff 清单;
+      另两份依赖 vnpy 的(`test_approved_loading` / `test_strategy_skeleton_contract`)明确**不接**
+      (研究侧刻意不依赖交易栈),只记一笔,归交易侧那条线。
+    - **验证**:104 / 20 passed + 1 skipped(按环境跳过,不是静默吞掉)/
+      纪律守卫 24 种全符合预期、分档 22 种全被抓住;工作流 YAML 解析通过。
 - **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
   却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
@@ -649,7 +665,8 @@
 
 - **合并 main 的「后果域分档」并按新分档器补齐不可降级清单**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。main 上新增了项目级 `CLAUDE.md`(按后果域分档)、
-  `tools/check_domain.py`(机器可判的分档器)、`tests/test_check_domain.py`(99 条动态探针)与
+  `tools/check_domain.py`(机器可判的分档器)、`tests/test_check_domain.py`(动态探针;条数由
+  该文件自己的守卫实测,见下方各轮的实测数字)与
   变异验证关卡。本分支的改动按新分档器判定为**执行域**——`risk/live_admission.py` 与
   `scripts/record_promotion.py` 属真钱链路判定点、`trading/` 与 `scripts/run_headless.py` 接真实委托
   ——而这一轮全程走的就是执行域流程(P2 的 plan.md 经 plan-down、结构化确认块、6/6 清单、
