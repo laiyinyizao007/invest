@@ -185,11 +185,13 @@ def test_evaluation_passes_the_plateau_verdict_into_the_gate():
 
 
 def test_evaluation_requires_a_declared_grid():
+    """没有声明 param_grid 是**声明期**的问题:结果里带阶段=声明期,原文可见。"""
     class NoGrid:
         parameters = ["a"]
 
-    with pytest.raises(rg.GridError, match="param_grid"):
-        evaluate(candidate_cls=NoGrid)
+    result = evaluate(candidate_cls=NoGrid)
+    assert result["error"]["phase"] == "declaration"
+    assert "param_grid" in result["error"]["message"]
 
 
 def test_evaluation_result_trims_the_score_table_but_keeps_the_verdict():
@@ -228,7 +230,8 @@ def test_evaluation_counts_this_runs_grid_cells_on_top_of_prior_trials():
     result = evaluate(prior_trials=10)
 
     assert result["metrics"]["n_trials"] == 10 + 27                       # 3x3x3 = 27 个格子
-    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert {k: result["trials"][k] for k in ("prior", "grid_cells", "total")} == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert len(result["trials"]["cell_sharpes"]) <= 27          # 只有往返笔数够的有效格子入样本
 
 
 def test_evaluation_without_prior_trials_fails_closed():
@@ -243,4 +246,246 @@ def test_selection_only_failure_still_reports_the_cells_it_consumed():
     result = evaluate(runner=make_runner(trips=3), prior_trials=10)
 
     assert result["passed"] is False
-    assert result["trials"] == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert {k: result["trials"][k] for k in ("prior", "grid_cells", "total")} == {"prior": 10, "grid_cells": 27, "total": 37}
+    assert len(result["trials"]["cell_sharpes"]) <= 27          # 只有往返笔数够的有效格子入样本
+
+
+# ---------- 阶段 3:DSR 的经验方差(V = max(V_经验, 1/(T-1)),只能更严) ----------
+
+def _wide_variances(n=6, level=0.006):
+    """偏大的各次评估格子夏普方差(明显大于这套假数据的理论值 1/(T-1) ≈ 0.0042,但又不至于让 DSR 下溢成 0)。"""
+    return [level * (1 + 0.1 * i) for i in range(n)]
+
+
+def test_gate_without_prior_history_reports_insufficient_samples():
+    """没有账本样本时 DSR 退回理论值——这件事要写进结果,不得静默。"""
+    result = run(prior_trials=300)
+    assert result["dsr_variance"]["basis"] == "insufficient_samples"
+    assert result["dsr_variance"]["n_evaluations"] == 0
+
+
+def test_gate_with_a_dispersed_history_is_stricter_and_says_so():
+    # 温和的候选(日夏普约 0.12):DSR 不会被饱和在 1.0,才看得出 V 变大之后的差别
+    mild = make_runner(candidate_pnl=-0.9)
+    loose = run(prior_trials=300, runner=mild)["metrics"]["dsr"]
+    result = run(prior_trials=300, runner=mild, run_variances=_wide_variances())
+    assert result["dsr_variance"]["basis"] == "empirical"
+    assert 0.0 < result["metrics"]["dsr"] < loose < 1.0
+
+
+def test_gate_with_too_few_prior_evaluations_falls_back_to_theory_and_equals_the_old_dsr():
+    result = run(prior_trials=300, run_variances=_wide_variances(n=2))
+    assert result["dsr_variance"]["basis"] == "insufficient_samples"
+    assert result["metrics"]["dsr"] == run(prior_trials=300)["metrics"]["dsr"]
+
+
+def test_evaluation_folds_this_runs_own_variance_into_the_history():
+    """本次评估自己扫过的格子也是一次评估:它的方差并入先验之后再取中位数。"""
+    result = evaluate(prior_trials=10, run_variances=_wide_variances(n=2))           # 先验 2 次 + 本次 = 3 次
+    assert result["dsr_variance"]["n_evaluations"] == 3
+    assert result["dsr_variance"]["basis"] in ("empirical", "theory")
+
+
+def test_evaluation_with_a_history_never_has_a_higher_dsr_than_without():
+    base = evaluate(prior_trials=10)["metrics"]["dsr"]
+    with_history = evaluate(prior_trials=10, run_variances=_wide_variances())["metrics"]["dsr"]
+    assert with_history <= base + 1e-12
+
+
+def test_one_poisoned_evaluation_in_the_history_does_not_zero_the_dsr():
+    """第 15 轮 codex 的 Critical:一次网格极端分裂的评估(方差 0.279)混进历史,不得让此后每个候选的 DSR 恒为 0。"""
+    mild = make_runner(candidate_pnl=-0.9)
+    honest = [0.0004, 0.0005, 0.0003, 0.0006, 0.0004]
+    clean = run(prior_trials=300, runner=mild, run_variances=honest)["metrics"]["dsr"]
+    poisoned = run(prior_trials=300, runner=mild, run_variances=honest + [0.279])["metrics"]["dsr"]
+    assert clean > 0.0 and poisoned == pytest.approx(clean, rel=0.2)
+
+
+def test_cell_sharpes_are_daily_not_annualized():
+    """入账本的是日夏普(= 年化 / √240),与 DSR 同一口径;否则 V 会被放大 240 倍而把一切卡死。"""
+    import math
+
+    import research_grid as rgrid
+    from risk import candidate_eval as ce
+    mild = make_runner(candidate_pnl=-0.9)
+    result = evaluate(prior_trials=10, runner=mild)
+    selection = rgrid.select_params(candidate_cls=GridCand, grid=GridCand.param_grid, bars=EVAL_BARS, runner=mild,
+                                    capital=10_000, max_cells=100, min_round_trips=10, window=SELECT)
+    expected = [s / math.sqrt(ce.TRADING_DAYS_PER_YEAR) for s in selection["cell_sharpes"]]
+    assert result["trials"]["cell_sharpes"] == pytest.approx(expected)
+    assert expected and all(abs(s) < 1.0 for s in expected)
+
+
+def test_extreme_cell_sharpes_are_clamped_so_one_outlier_cannot_void_the_whole_batch():
+    """真实网格里偶有极端格子(几笔全盈利)夏普极大:限幅到上限,整批样本才不会被父进程当成越界丢掉。"""
+    from risk.dsr import MAX_TRIAL_SHARPE
+    result = evaluate(prior_trials=10)                                   # 这个假执行器的夏普极大(日夏普远超 1)
+    sharpes = result["trials"]["cell_sharpes"]
+    assert sharpes and all(abs(s) <= MAX_TRIAL_SHARPE for s in sharpes)
+    assert max(sharpes) == MAX_TRIAL_SHARPE
+
+
+# ---------- 阶段 3:热力图随评估一起产出,但不进摘要 ----------
+
+def test_the_evaluation_carries_a_valid_heatmap_for_the_dashboard():
+    from risk.heatmap import validate_heatmap
+    result = evaluate(prior_trials=10)
+    validate_heatmap(result["heatmap"])
+    assert result["heatmap"]["source"] == "selection"
+    assert len(result["heatmap"]["scores"]) == 27
+
+
+def test_the_full_score_table_stays_out_of_the_selection_summary():
+    """摘要是给外层看的:完整得分表只在 heatmap 里(父进程会把它拿出来单独落盘)。"""
+    result = evaluate(prior_trials=10)
+    assert "plateau" not in result["selection"] and "cell_sharpes" not in result["selection"]
+    assert "scores" not in result["selection"]
+
+
+def test_a_selection_only_failure_still_carries_the_heatmap():
+    result = evaluate(runner=make_runner(trips=3), prior_trials=10)
+    assert result["kind_detail"] == "selection-only" and result["heatmap"]["on_plateau"] is False
+    assert all(row[3] == "-inf" for row in result["heatmap"]["scores"])        # 往返笔数不够:每个格子都无效
+
+
+# ---------- 阶段 3:选参窗口的行为描述符、格子、结构化诊断、适应度 ----------
+
+def _runner_with_behavior(hold=10, **kw):
+    base = make_runner(**kw)
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        out = base(strategy_class, setting, bars, cost_multiplier)
+        out["hold_bars"] = [hold] * out["round_trips"]
+        out["trade_pnls"] = [3.0, -1.0, 2.0, -2.0] * (out["round_trips"] // 4)
+        return out
+    return runner
+
+
+def test_the_evaluation_reports_the_cell_from_the_selection_window_behavior():
+    from risk.behavior import ALL_CELLS
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=10))
+    assert result["cell"] in ALL_CELLS
+    assert result["behavior"]["avg_hold_bars"] == 10.0 and result["behavior"]["round_trips"] == 100
+    assert result["behavior"]["n_bars"] == 3                                     # 选参窗口里的 K 线根数,不是验证窗口的
+    assert result["cell"] == "H0F3"                                              # 平均持仓 10 根 ≤ 16;100 笔/3 根 K 线 ≥ 4/100 根
+
+
+def test_a_different_holding_period_lands_in_a_different_cell():
+    short = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=5))["cell"]
+    long = evaluate(prior_trials=10, runner=_runner_with_behavior(hold=300))["cell"]
+    assert short.startswith("H0") and long.startswith("H3") and short[2:] == long[2:]
+
+
+def test_without_holding_information_the_cell_is_none_rather_than_a_guess():
+    """旧执行器/假执行器不回传持仓根数:不猜格子,但适应度与结构化诊断照常给出。"""
+    result = evaluate(prior_trials=10)
+    assert result["cell"] is None and result["behavior"]["avg_hold_bars"] is None
+    assert isinstance(result["fitness"], float)
+
+
+def test_the_selection_diagnosis_is_structured_and_contains_no_free_text():
+    import json
+
+    from risk.structured_diagnosis import validate
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert validate(result["selection_diagnosis"])
+    text = json.dumps(result["selection_diagnosis"], ensure_ascii=False)
+    assert not any("一" <= ch <= "鿿" for ch in text) and "note" not in text
+
+
+def test_the_fitness_is_the_selection_window_smoothed_sharpe_not_a_validation_number():
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert result["fitness"] == result["selection"]["best_smoothed"]
+
+
+def test_a_selection_failure_has_no_cell_and_no_fitness():
+    result = evaluate(runner=make_runner(trips=3), prior_trials=10)
+    assert result["kind_detail"] == "selection-only"
+    assert result["cell"] is None and result["fitness"] is None and result["selection_diagnosis"] is None
+
+
+def test_the_best_cell_detail_stays_out_of_the_selection_summary():
+    """摘要是给外层看的:最佳格子的逐笔盈亏等明细只在引擎一侧用,不进摘要。"""
+    result = evaluate(prior_trials=10, runner=_runner_with_behavior())
+    assert "best_detail" not in result["selection"]
+
+
+# ---------- 阶段 3(第 15 轮 codex 的 Critical):报错带"阶段"标记,验证窗口回放里的报错原文不外传 ----------
+
+def _raising_runner(where, message="close=2728.0"):
+    """在指定的窗口里抛错的执行器:`select` 在选参窗口(3 根 K 线)里抛,`validate` 在验证窗口里抛。"""
+    base = make_runner()
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        in_select = len(bars) == 3 and strategy_class.__name__ == "GridCand"
+        if (where == "select" and in_select) or (where == "validate" and not in_select):
+            raise ValueError(message)
+        return base(strategy_class, setting, bars, cost_multiplier)
+    return runner
+
+
+def test_an_error_in_the_selection_window_is_reported_as_selection():
+    """选参窗口里的错:阶段=选参期(进化回路放开的那一层)。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("select"))
+    assert result["error"]["phase"] == "selection"
+    assert result["error"]["type"] == "ValueError"
+
+
+def test_an_error_while_replaying_the_validation_windows_is_reported_as_validation():
+    """验证窗口里的错:阶段=验证期(原文不外放)。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["phase"] == "validation"
+
+
+def test_a_grid_declaration_error_is_reported_as_declaration():
+    class NoGrid:
+        parameters = ["a", "b", "c"]
+
+    result = rg.run_evaluation(candidate_cls=NoGrid, bars=EVAL_BARS, runner=make_runner(), random_cls=Rand, random_runs=3,
+                               capital=10_000, max_cells=100, min_round_trips=10, select_window=SELECT,
+                               validation_windows=[W1, W2], prior_trials=1)
+    assert result["error"]["phase"] == "declaration"
+
+
+def test_run_gate_alone_reports_its_errors_as_validation_because_its_whole_run_is_the_validation_window():
+    result = run(runner=_raising_runner("validate"), prior_trials=5)
+    assert result["error"]["phase"] == "validation"
+
+
+def test_the_innermost_phase_wins():
+    """从 run_gate 里抛出的错是验证期,不会被外层的 run_evaluation 改标成选参期。"""
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["phase"] == "validation"
+
+
+def test_reporting_the_phase_does_not_change_the_error_type_or_message():
+    result = evaluate(prior_trials=10, runner=_raising_runner("validate"))
+    assert result["error"]["type"] == "ValueError"
+    assert "close=2728.0" in result["error"]["message"]
+
+
+def test_a_candidate_cannot_forge_the_phase_by_tagging_its_own_exception():
+    """**伪造阶段**无效:候选给异常挂 `invest_phase="selection"`,阶段仍由框架决定。
+
+    旧协议把阶段挂在异常对象上,而打标记的逻辑"只补不改",候选自己挂的标记会被保留——
+    于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+    (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价)。"""
+    base = make_runner()
+
+    def runner(strategy_class, setting, bars, cost_multiplier):
+        if len(bars) != 3 and strategy_class.__name__ == "GridCand":
+            exc = ValueError("close=2728.0")
+            exc.invest_phase = "selection"              # 候选伪造:把自己说成选参期
+            raise exc
+        return base(strategy_class, setting, bars, cost_multiplier)
+
+    result = evaluate(prior_trials=10, runner=runner)
+    assert result["error"]["phase"] == "validation"    # 框架说了算,不是候选
+    assert result["error"]["message"].startswith("close=")
+
+
+def test_the_framework_own_invariant_failures_are_still_raised_loudly():
+    """框架自己的错(窗口混进测试段 K 线)照旧抛异常——那不是候选的问题,不能被吞成"候选失败了"。"""
+    leaked = BARS + [bar(datetime(2024, 1, 2, 9, 0))]
+    with pytest.raises(ValueError, match="测试段"):
+        run(bars=leaked, windows=[("W9", datetime(2023, 7, 1), datetime(2024, 3, 1))])

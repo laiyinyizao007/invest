@@ -1,9 +1,13 @@
 """研究沙盒 CLI:拒绝路径与输出契约(真实回测由人工在有数据的机器上验证)。"""
+import hashlib
+import hmac
 import importlib.util
 import io
 import json
 import re
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +35,53 @@ def fake_subprocess(monkeypatch, popen):
     # 只替换 research_api 看到的 subprocess,不碰全局模块(vnpy/asyncio 导入期间也会用到 Popen)
     monkeypatch.setattr(api, "subprocess", SimpleNamespace(
         Popen=popen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired, run=subprocess.run))
+
+
+def write_child_result(handoff_line: str, body: dict) -> None:
+    """模拟子进程:把结果写进父进程给的随机文件,并附上**正确**的 MAC。"""
+    handoff = json.loads(handoff_line)
+    payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    mac = hmac.new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    path = Path(handoff["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mac": mac, "body": payload}, ensure_ascii=False), encoding="utf-8")
+
+
+class FakeChild:
+    """假子进程:按父进程交给它的交接单把结果写回去(带正确的 MAC)。
+
+    `stdout` 里的内容**只是日志**——父进程不再从 stdout 里取结果,这一点由用例断言。"""
+
+    def __init__(self, body=None, returncode=0, stdout="", stderr="", tamper=None):
+        self.body = body
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.tamper = tamper          # 可选:收到交接单后回调(handoff),用来伪造/篡改结果文件
+
+    def communicate(self, timeout=None, input=None):
+        if self.body is not None and input:
+            write_child_result(input, self.body)
+            if self.tamper is not None:
+                self.tamper(json.loads(input))
+        return self.stdout, self.stderr
+
+
+def child_capture(monkeypatch, tmp_path, func, args):
+    """在进程内跑一个子入口:给它一份交接单,再把写回的结果读出来。
+
+    返回 (退出码, 结果字典)。子入口现在把结果写进**父进程建的随机文件**,不再打 stdout。
+    交接单按**真实路径**喂给入口(走 stdin):入口的引用在闭包里,改模块属性改不动它,
+    而且指纹会比对入口本身 —— 改模块属性只会让框架响亮地拒绝,不是"注入成功"。"""
+    import io
+    handoff = {"path": str(tmp_path / "child_result.json"), "key": "k" * 64, "dir": str(tmp_path)}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(handoff) + "\n"))
+    code = func(args)
+    payload = {}
+    path = Path(handoff["path"])
+    if path.exists():
+        payload = json.loads(json.loads(path.read_text(encoding="utf-8"))["body"])
+    return code, payload
 
 
 @pytest.fixture
@@ -98,7 +149,7 @@ def test_backtest_child_gets_scrubbed_environment(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "boom"
 
     def fake_popen(cmd, **kw):
@@ -119,8 +170,9 @@ def test_backtest_success_writes_result_with_diagnosis_and_hash(tree, monkeypatc
     class FakeProc:
         returncode = 0
 
-        def communicate(self, timeout=None):
-            return "noise\n" + api.CHILD_MARK + json.dumps({"stats": stats, "pnls": [1, -1, 1]}) + "\n", ""
+        def communicate(self, timeout=None, input=None):
+            write_child_result(input, {"stats": stats, "pnls": [1, -1, 1]})
+            return "noise\n", ""
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
@@ -200,8 +252,9 @@ def test_gate_success_saves_result_without_exposing_test_segment(tree, monkeypat
     class FakeProc:
         returncode = 0
 
-        def communicate(self, timeout=None):
-            return api.CHILD_MARK + json.dumps(body) + "\n", ""
+        def communicate(self, timeout=None, input=None):
+            write_child_result(input, body)
+            return "", ""
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
 
@@ -319,7 +372,7 @@ def test_approve_stdout_is_pure_json(tree, monkeypatch, capsys):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "boom"
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
@@ -350,7 +403,7 @@ def test_confirm_reviewed_flag_records_the_approval(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "x"
 
     fake_subprocess(monkeypatch, lambda *a, **k: FakeProc())
@@ -389,7 +442,7 @@ def test_defaults_come_from_config_and_cli_flags_override(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             seen["timeout"] = timeout
             return "", "x"
 
@@ -443,7 +496,7 @@ def test_parent_passes_the_approved_hash_to_children(tree, monkeypatch):
     class FakeProc:
         returncode = 1
 
-        def communicate(self, timeout=None):
+        def communicate(self, timeout=None, input=None):
             return "", "x"
 
     def popen(cmd, **kw):
@@ -462,15 +515,15 @@ def test_describe_error_keeps_type_and_message_but_drops_paths_and_truncates():
     text = ("回测中策略抛出异常:" + chr(10) + "Traceback (most recent call last):" + chr(10) + "  File \"/app/pending_strategies/x.py\", line 9" + chr(10)
             + "ValueError: too many values to unpack (expected 3) in C:/Users/me/secret/x.py")
 
-    out = api.describe_error(RuntimeError(text))
+    out = api.describe_error(RuntimeError(text), api.PHASE_VALIDATION)
 
     assert out["type"] == "ValueError" and "too many values to unpack" in out["message"]
     assert "C:" not in out["message"] and "/app/" not in out["message"] and len(out["message"]) <= 200
 
 
 def test_describe_error_falls_back_to_exception_type_for_plain_errors():
-    assert api.describe_error(KeyError("boom"))["type"] == "KeyError"
-    long = api.describe_error(RuntimeError("x" * 1000))
+    assert api.describe_error(KeyError("boom"), api.PHASE_VALIDATION)["type"] == "KeyError"
+    long = api.describe_error(RuntimeError("x" * 1000), api.PHASE_VALIDATION)
     assert len(long["message"]) <= 200
 
 
@@ -923,10 +976,20 @@ def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree,
 
 
 def test_all_three_child_entrypoints_go_through_the_same_validation_function(tree, monkeypatch):
-    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。"""
+    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。
+
+    第 32 轮:入口改成"闭包包一层"(回传走闭包单元里的 emit,候选改模块属性骗不过它),
+    于是入口本身只是一层壳 —— 壳里**真的**执行的处理函数要能被静态核对到,
+    而且要能证明"壳委派的就是被核对的那个函数"(否则核对的是一个没人执行的副本)。"""
     import inspect
     for name in ("run_child", "run_evaluate_child", "run_gate_child"):
-        source = inspect.getsource(getattr(api, name))
+        entry = getattr(api, name)
+        handler = getattr(entry, "handler", None)
+        assert handler is not None, f"{name} 没有暴露处理函数,静态核对失效"
+        # 壳必须真的委派给被核对的那个处理函数
+        closed = [cell.cell_contents for cell in (entry.__closure__ or ())]
+        assert handler in closed, f"{name} 委派的不是被核对的那个处理函数"
+        source = inspect.getsource(handler)
         assert "import_candidate(" in source, f"{name} 没走统一入口"
         assert "check_candidate_class(" not in source, f"{name} 仍在自己做校验,会漏"
 
@@ -1030,11 +1093,9 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     approve(path)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
-    code = api.run_evaluate_child(args)
-    out = capsys.readouterr().out
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
 
     assert code == api.EXIT_OK
-    payload = json.loads(out.split(api.CHILD_MARK)[-1])
     assert "error" not in payload, payload
     assert payload["passed"] is True
     assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]
@@ -1127,10 +1188,8 @@ def test_an_import_time_error_comes_back_as_a_structured_error(tree, monkeypatch
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
                                           "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
-    code = api.run_evaluate_child(args)
-    out = capsys.readouterr().out
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
     assert code == api.EXIT_OK
-    payload = json.loads(out.split(api.CHILD_MARK)[-1])
     assert "error" in payload, payload
 
 
@@ -1182,13 +1241,34 @@ def test_a_child_refusal_reaches_the_caller_with_its_reason():
     """子进程的"拒绝"必须原样传到父层。
 
     早先一律压成"回测失败(退出码 3)",于是子入口里那些拒绝的原因只进了本机 stderr,
-    永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。"""
+    永远进不了返回给调用方的结果——而那条通道正是为"把诊断送回去"设计的。
+
+    第 31 轮加了一层:只有**框架自己写的**那行(带 `[框架]` 标记)才会被回传 ——
+    候选与框架同进程,它 print 的内容不能顶替框架的结论(见
+    tests/test_child_result_channel.py::test_only_the_frameworks_own_lines_are_relayed_back_as_the_reason)。"""
     import sys
 
+    script = ("import sys; sys.stderr.write(%r + '参数 risk_budget 属于受保护项\\n'); sys.exit(2)"
+              % api.FRAMEWORK_TAG)
     with pytest.raises(api.JobError) as excinfo:
-        api.spawn_child([sys.executable, "-c", "import sys; sys.stderr.write('参数 risk_budget 属于受保护项'); sys.exit(2)"], 30)
+        api.spawn_child([sys.executable, "-c", script], 30)
     assert excinfo.value.code == api.EXIT_REFUSED
     assert "risk_budget" in excinfo.value.message
+
+
+def test_a_candidate_written_refusal_reason_is_not_relayed_as_the_frameworks_own():
+    """反向:候选自己 print 的"拒绝原因"不被当成框架的结论回传。
+
+    候选与框架同进程,它的 print 走同一条 stderr;以前父层取"最后一行非空输出",
+    候选只要在被拒之后打印一行就能顶替框架的结论(也能把验证窗口的数字塞进去)。"""
+    import sys
+
+    script = "import sys; sys.stderr.write('close=2728.0 是验证窗口的收盘价\\n'); sys.exit(2)"
+    with pytest.raises(api.JobError) as excinfo:
+        api.spawn_child([sys.executable, "-c", script], 30)
+    assert excinfo.value.code == api.EXIT_REFUSED
+    assert "2728.0" not in excinfo.value.message
+    assert "拒绝执行" in excinfo.value.message
 
 
 @requires_trading_stack
@@ -1312,6 +1392,166 @@ def test_the_plain_module_monkey_patch_is_refused_by_the_static_layer(tree, monk
     with pytest.raises(api.JobError) as exc:
         api.import_candidate(path, "S", api.rs.file_sha256(path))
     assert "静态筛查未通过" in str(exc.value)
+
+
+# ---------- 第 32 轮(复审):评估输入在候选导入之前取定 ----------
+
+def _install_fake_evaluation_modules(monkeypatch, windows_factory):
+    """装一套假的 wf / backtest_lib / research_gate,返回 (wf 模块, 记录 run_evaluation 实参的字典)。"""
+    import sys
+    import types as pytypes
+    seen = {}
+
+    def fake_run_evaluation(**kw):
+        seen.update(kw)
+        return {"passed": True, "sharpe": 1.0}
+
+    wf = pytypes.ModuleType("walk_forward_optimizer")
+    wf.DATA_FILE = "x.csv"
+    wf.SYMBOL = "c2701.DCE"
+    wf.KEY = "CADJ"
+    wf.build_windows = windows_factory
+    bl = pytypes.ModuleType("backtest_lib")
+    bl.DEFAULT_CAPITAL = 100000.0
+    bl.load_bars_csv = lambda *a, **k: []
+    rg = pytypes.ModuleType("research_gate")
+    rg.engine_runner = lambda key: (lambda *a, **k: None)
+    rg.run_evaluation = fake_run_evaluation
+    rnd = pytypes.ModuleType("strategies.random_entry_15m_strategy")
+    rnd.RandomEntry15mStrategy = object
+    for name, mod in (("walk_forward_optimizer", wf), ("backtest_lib", bl), ("research_gate", rg),
+                      ("strategies.random_entry_15m_strategy", rnd)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return wf, seen
+
+
+class _Win:
+    def __init__(self, name, train_start, train_end, valid_start, valid_end):
+        self.name, self.train_start, self.train_end = name, train_start, train_end
+        self.valid_start, self.valid_end = valid_start, valid_end
+
+
+def _allow_test_only_imports(monkeypatch, *modules):
+    """合并 main #22 的导入白名单后,候选不能再直接 `import walk_forward_optimizer` / `research_api`。
+    这两条用例要模拟的是"候选在**导入期**改写框架模块的属性"(同进程反射到的结果),
+    所以仅在测试里把这几个模块加进白名单,让候选能跑到改写那一步;生产配置不动。
+    白名单本身的放行/拦截另有用例(tests/test_research_sandbox.py、test_sandbox_round25_rules.py)。"""
+    real_load = api.rc.load
+
+    def load(*a, **k):
+        cfg = real_load(*a, **k)
+        cfg["screening"]["allowed_modules"] = list(cfg["screening"]["allowed_modules"]) + list(modules)
+        return cfg
+    monkeypatch.setattr(api.rc, "load", load)
+
+
+@requires_trading_stack
+def test_a_candidate_cannot_change_the_validation_windows_by_rebinding_the_builder(tree, monkeypatch):
+    """候选在导入期改写 `wf.build_windows`,想让"样本外"变成选参窗口(样本内)→ 框架用的仍是导入前取定的窗口。
+
+    第 32 轮 codex 复审实测:此前窗口在候选导入**之后**才读,验证窗口 == 选参窗口。"""
+    # 合并 main #26 后候选已不能 `import walk_forward_optimizer`(仓库路径守卫直接拒;见
+    # test_candidate_cannot_import_walk_forward_directly)。"在导入期改写 wf"现在只剩"经帧反射拿到
+    # 模块"这一条(已登记残余),所以下面用导入期钩子**模拟**那次改写:在真正的 import_candidate
+    # 之前把 wf 改掉,断言框架用的仍是导入**前**取定的输入。
+    body = ("from vnpy_ctastrategy import CtaTemplate\n"
+            "class S(CtaTemplate):\n"
+            "    pass\n")
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    _, seen = _install_fake_evaluation_modules(
+        monkeypatch, lambda: [_Win("W1", 1, 2, 3, 4)])
+    loaded = {}
+    real_import = api.import_candidate
+
+    def hostile_import(path_, cls_name, sha):
+        import walk_forward_optimizer as wf_mod            # 测试代码(不经沙盒)里模拟候选的改写
+        evil = _Win("EVIL", 1, 2, 1, 2)
+        wf_mod.build_windows = lambda: [evil]
+        wf_mod.DATA_FILE = "attacker.csv"
+        return real_import(path_, cls_name, sha)
+    monkeypatch.setattr(api, "import_candidate", hostile_import)
+    import backtest_lib
+    monkeypatch.setattr(backtest_lib, "load_bars_csv", lambda path, *a, **k: loaded.setdefault("path", path) and [])
+
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_OK, payload
+    assert "error" not in payload, payload
+    assert seen["select_window"] == (1, 2)
+    assert seen["validation_windows"] == [("W1", 3, 4)], "验证窗口必须是导入前取定的那一份"
+    assert loaded["path"] == "x.csv", "数据文件必须是导入前取定的那一份"
+
+
+def test_candidate_cannot_import_walk_forward_directly(tree, monkeypatch):
+    """放行/拦截的另一半:候选直接 `import walk_forward_optimizer` 被 main #26 的仓库路径守卫拒绝。"""
+    body = ("import walk_forward_optimizer as wf\n"
+            "from vnpy_ctastrategy import CtaTemplate\n"
+            "class S(CtaTemplate):\n"
+            "    pass\n")
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    _allow_test_only_imports(monkeypatch, "walk_forward_optimizer")      # 先过静态白名单,才轮到运行期的路径守卫
+    _install_fake_evaluation_modules(monkeypatch, lambda: [_Win("W1", 1, 2, 3, 4)])
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    approve(path)
+    with pytest.raises(Exception) as exc:
+        api.import_candidate(path, "S", api.rs.file_sha256(path))
+    assert "walk_forward_optimizer" in str(exc.value)
+
+
+@requires_trading_stack
+def test_windows_where_validation_is_not_after_selection_are_refused(tree, monkeypatch, capsys):
+    """窗口不变量自己复查(不信任 `wf.Window.__post_init__`):验证窗口必须晚于选参窗口的结束。"""
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text("from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    _install_fake_evaluation_modules(monkeypatch, lambda: [_Win("W1", 1, 5, 3, 4)])    # 验证开始 3 <= 选参结束 5
+
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_REFUSED
+    assert "验证窗口晚于选参窗口" in capsys.readouterr().err
+
+
+@requires_trading_stack
+def test_a_candidate_cannot_raise_the_grid_cap_by_mutating_the_config_after_the_import(tree, monkeypatch):
+    """上限在候选导入前取成局部整数:导入期改写配置字典(哪怕经帧反射拿到它)也改不动评估用的上限。
+
+    第 33 轮 codex 实测:`cfg` 虽在导入前取了,但 `cfg["grid"]["max_cells"]` 在导入之后的调用点才求值,
+    候选把 343 改成 10^9 立刻生效 → 子进程实扫远多于账本记的格子 = 悄悄放松 DSR ≥ 0.95。"""
+    import copy
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text("from vnpy_ctastrategy import CtaTemplate\nclass S(CtaTemplate):\n    pass\n", encoding="utf-8")
+    _, seen = _install_fake_evaluation_modules(monkeypatch, lambda: [_Win("W1", 1, 2, 3, 4)])
+    cfg = copy.deepcopy(api.rc.load())
+    original_cap = cfg["grid"]["max_cells"]
+    monkeypatch.setattr(api.rc, "load", lambda *a, **k: cfg)
+
+    def evil_import(path_, cls_name, sha):
+        cfg["grid"]["max_cells"] = 10 ** 9            # 候选在导入期改写配置字典
+        cfg["grid"]["min_round_trips"] = 0
+
+        class S:
+            pass
+        return S
+
+    monkeypatch.setattr(api, "import_candidate", evil_import)
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S",
+                                          "--random-runs", "20", "--sha256", api.rs.file_sha256(path)])
+    code, payload = child_capture(monkeypatch, tree, api.run_evaluate_child, args)
+
+    assert code == api.EXIT_OK, payload
+    assert seen["max_cells"] == original_cap, "上限必须是导入前取定的那个整数"
+    assert seen["min_round_trips"] != 0
 
 
 def test_a_hanging_child_is_killed_on_timeout():

@@ -31,6 +31,9 @@ from typing import Callable
 import research_config as rc
 import research_console as rconsole
 import research_sandbox as rs
+from risk.ladder import Ladder, LadderError, LadderExhausted, anchor_path_for
+from risk.outward import (OutwardError, OutwardOrphaned, OutwardTampered, OutwardUnavailable, RevealStore,
+                          reveal)
 from risk.trial_ledger import TrialLedgerError, record_trials
 
 ROUTES = {
@@ -46,6 +49,15 @@ CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 MIN_TOKEN_LENGTH = 32
 MAX_TRACE_FAILURES = 8
 MAX_TRACE_TEXT = 300
+LADDER_EXHAUSTED = ("验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,需要人工续期"
+                    "(选参窗口的信息、/research/feedback 里已揭示过的结果不受影响)")
+LADDER_UNAVAILABLE = "梯子状态或揭示存档不可用(fail-closed):拒绝给出任何验证窗口的信息,请人工检查"
+ORPHANED_BY_RESET = ("这条结果的验证窗口信息已被一次人工梯子重置作废:重置会清零 best 与查询数,"
+                     "已经泄漏出去的信息收不回来,该 run 需要重新评估才能再被揭示")
+PHASE_LABELS = {"declaration": "声明期", "selection": "选参窗口回放", "validation": "验证窗口回放"}
+RESULT_KINDS = ("evaluate", "gate", "backtest")      # 只有这几种 JSON 是"运行结果";results 目录里别的 *.json 不是
+VALID_SEGMENT_REFUSED = ("验证段的回测不能经网关直接读取:它会绕过梯子直接给出验证窗口的完整统计。"
+                         "验证窗口的成绩只经 /research/evaluate(或 /research/gate)按梯子量化后给出")
 MAX_PENDING_NAMES = 50
 
 
@@ -401,6 +413,77 @@ class GatewayApp:
             return status, PlainText(f"{payload.get('report', '')}\n\n(run_id: {payload.get('run_id', '?')})")
         return status, payload
 
+    # ---- 对外揭示(risk/outward.py):外层看到的一切都从这里过 ----
+    def _ladder(self) -> Ladder:
+        # 放进子目录:`list_results` 按 `*.json` 列 run,梯子状态与结果混放会被当成一个"结果"(自查发现)
+        return Ladder(Path(self.paths["results_dir"]) / "ladder" / "ladder.json",
+                      anchor=anchor_path_for(self.paths["results_dir"]))
+
+    def _reveal_store(self) -> RevealStore:
+        return RevealStore(Path(self.paths["results_dir"]) / "outward")
+
+    def _ladder_precheck(self):
+        """跑会产生验证窗口数字的作业**之前**先看梯子还有没有查询:用尽了就不必白跑一次(也不白耗试验次数)。"""
+        try:
+            left = self._ladder().status()["queries_left"]
+        except LadderError:
+            return 500, {"error": LADDER_UNAVAILABLE}
+        return (429, {"error": LADDER_EXHAUSTED}) if left <= 0 else None
+
+    def _reveal(self, result: dict, *, allow_query: bool = True, skip_bad_result: bool = False,
+                ladder=None, store=None):
+        """落盘结果 → 净化视图。梯子用尽 429;梯子/存档损坏 500(fail-closed,不放出任何验证窗口信息)。
+
+        `skip_bad_result`(批量接口 `/feedback` 用,第 17 轮 M2):**单个**结果/存档不合法只跳过这一个(返回 None),
+        梯子本身不可用仍然整体 500——一份坏结果文件不该让进化回路唯一的诊断通道整体下线。
+
+        **但跳过必须有信号**(第 19 轮 codex 的 H1):跳过时在 stderr 记一行,并把原因分类返回给调用方。
+        分两类:
+        - `OutwardTampered`(揭示存档被改过):**篡改信号**,必须计数上报,不能和"没有失败"长得一样;
+        - `OutwardError`(结果本身不合法):这一条没法揭示,跳过它,通道继续。
+        两者都不再与"从未揭示过"(None)共用同一个语义。
+
+        `ladder`/`store` 可由调用方传入**已读好的快照**(第 19 轮 L3):批量接口一次只读一次梯子。"""
+        try:
+            view = reveal(result, ladder=ladder if ladder is not None else self._ladder(),
+                          store=store if store is not None else self._reveal_store(), allow_query=allow_query)
+        except LadderExhausted:
+            return 429, {"error": LADDER_EXHAUSTED}, None
+        except LadderError:
+            return 500, {"error": LADDER_UNAVAILABLE}, None
+        except OutwardTampered as exc:
+            print(f"揭示存档被篡改,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "tampered"
+        except OutwardOrphaned as exc:
+            # 一次**合法的人工重置**不是安全事件(第 20 轮 codex 的 H2)。
+            # 但被孤立的 run 一样读不出数据:这里只把"为什么读不出"说准,不放行任何信息。
+            print(f"结果已被人工重置孤立,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 410, {"error": ORPHANED_BY_RESET}, None
+            return 200, None, "orphaned_by_reset"
+        except OutwardUnavailable as exc:
+            # 读不到/写不进是**可用性**故障:既不是篡改,也不是结果不合法(第 20 轮 codex 的 M2/M3)。
+            # 单列一类,运维才知道该去查磁盘/权限,而不是去查结果文件。
+            print(f"揭示存档暂时不可用,已跳过并计数: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "unavailable"
+        except OutwardError as exc:
+            print(f"结果不合法,已跳过: {exc}", file=sys.stderr)
+            if not skip_bad_result:
+                return 500, {"error": LADDER_UNAVAILABLE}, None
+            return 200, None, "invalid_result"
+        return 200, view, None
+
+    def _reveal_outcome(self, outcome: tuple):
+        status, payload = outcome
+        if status != 200 or not isinstance(payload, dict):
+            return outcome                                   # 作业层的错误原样返回(不含验证窗口信息)
+        status, view, _ = self._reveal(payload)
+        return status, view
+
     def _run_job(self, func, **kwargs):
         import research_api as api
         if not self._busy.acquire(blocking=False):
@@ -424,11 +507,13 @@ class GatewayApp:
             return 400, {"error": "strategy/class/key/segment 必须是字符串,class 必须是合法标识符"}
         if key not in rs.KEYS or segment not in rs.SEGMENTS:
             return 400, {"error": f"key 只能是 {list(rs.KEYS)},segment 只能是 {list(rs.SEGMENTS)}"}
+        if segment == "valid":
+            return 403, {"error": VALID_SEGMENT_REFUSED}
         params = _lenient_object(data.get("params"), "params") or {}
         view = _view(data)
         # confirm 固定为 False:批准只能由本机 CLI 触发,请求体里的同名字段被忽略
-        return self._shape(self._run_job(self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment,
-                                         params=params, confirm=False), view)
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.backtest_job, strategy=strategy, cls=cls, key=key, segment=segment, params=params, confirm=False)), view)
 
     def _gate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -441,8 +526,12 @@ class GatewayApp:
         if plateau_data is not None:
             plateau = self.jobs.plateau_from_data(plateau_data)
         view = _view(data)
-        return self._shape(self._run_job(self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
-                                         random_runs=random_runs, confirm=False), view)
+        refused = self._ladder_precheck()
+        if refused:
+            return refused
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.gate_job, strategy=strategy, cls=cls, params=params, plateau=plateau,
+            random_runs=random_runs, confirm=False)), view)
 
     def _evaluate(self, data, _params):
         strategy, cls = data.get("strategy"), data.get("class")
@@ -451,19 +540,42 @@ class GatewayApp:
         random_runs = _lenient_int(data.get("random_runs"), "random_runs")
         # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
         view = _view(data)
-        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False), view)
+        extra = {}
+        if data.get("campaign") not in (None, ""):
+            # 战役信息(谱系台账用):{campaign_id, parent_sha256, generation}。形状与取值由作业层严格校验;
+            # 这里只负责把"JSON 字符串形式的对象"(毕昇工具节点把所有参数当字符串传)还原成对象
+            campaign = _lenient_object(data.get("campaign"), "campaign")
+            if campaign is None:
+                return 400, {"error": "campaign 必须是对象或其 JSON 字符串"}
+            if isinstance(campaign.get("generation"), str):
+                campaign["generation"] = _lenient_int(campaign["generation"], "campaign.generation")
+            extra["campaign"] = campaign
+        refused = self._ladder_precheck()
+        if refused:
+            return refused
+        return self._shape(self._reveal_outcome(self._run_job(
+            self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False, **extra)), view)
 
     def _results(self, _data, params):
         run_id = params["run_id"]
         if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
             return 400, {"error": "非法的 run_id"}
         try:
-            return 200, rs.load_result(run_id, self.paths["results_dir"])
+            result = rs.load_result(run_id, self.paths["results_dir"])
         except rs.SandboxError:
             return 404, {"error": "没有这条结果"}
+        if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
+            return 404, {"error": "没有这条结果"}            # results 目录里不是运行结果的 *.json(审批记录等)不外露
+        # 落盘的是给人看的完整记录;外层只看净化视图。第一次读到带验证窗口数字的 run 才消耗一次梯子查询,之后回放
+        status, view, _ = self._reveal(result)
+        return status, view
 
     def _feedback(self, _data, _params):
         """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
+
+        只取**已经向外层揭示过**的 run(或根本没有验证窗口数字的 run):一次 `/feedback` 要扫很多 run,
+        不能让一次读取悄悄烧掉一批梯子查询,也不能把从未揭示过的验证窗口数字带出去。
+        失败原因是门槛检查项的稳定 ID,不是带验证窗口数字的中文句子。
 
         另外回一份**已有候选的文件名**:起名那一步要避开它们。
         少了这一段,同一个研究想法重跑会撞名 → 网关 409 → 整条工作流中止,
@@ -471,30 +583,73 @@ class GatewayApp:
         只给文件名(且只给符合命名规则的),不给路径、不给源码、不给内容。"""
         limit = self.cfg["feedback"]["limit"]
         traces = []
+        # 跳过必须**看得见**(第 19 轮 codex 的 H1):此前跳过坏结果/坏存档时响应里没有任何提示,
+        # 外层与运维分不清"没有失败"和"失败被藏了"。现在计数并分类上报(只给计数与分类,不给内容)。
+        skipped = {"tampered": 0, "invalid_result": 0, "unreadable": 0, "orphaned_by_reset": 0, "unavailable": 0}
+        # 一次只读一次梯子(第 19 轮 L3):此前每扫一个结果就重读并重校验整条日志。
+        # 更正口径(第 21 轮 codex 的 M3):**梯子日志**仍然只读一次,但变更令牌
+        # 每条结果要读一次**头指针**(独立的小文件),所以"一次只读一次梯子"不准确。
+        # 同一次请求只用**一个**梯子实例(第 21 轮 codex 的 L4):此前为读孤立名单
+        # 又 new 了一个 Ladder,等于每请求多解析一次重置日志,且与快照不是同一时刻。
+        try:
+            real_ladder = self._ladder()
+            ladder = real_ladder.snapshot()
+        except LadderError:
+            return 500, {"error": LADDER_UNAVAILABLE}
+        store = self._reveal_store()
+        try:
+            orphaned = real_ladder.orphaned_run_id_set()
+        except LadderError:
+            orphaned = set()
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
             try:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
+                skipped["unreadable"] += 1
                 continue
-            failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
-            diagnosis = result.get("diagnosis") or {}
-            weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
-            error = result.get("error")
-            if result.get("status") == "strategy_error" and isinstance(error, dict):
-                failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
-            failed = bool(failures) if (result.get("kind") in ("gate", "evaluate") or failures) else weakest is not None
+            if not isinstance(result, dict) or result.get("kind") not in RESULT_KINDS:
+                continue
+            status, view, reason = self._reveal(result, allow_query=False, skip_bad_result=True,
+                                                ladder=ladder, store=store)
+            if status != 200:
+                return status, view
+            if view is None:                                    # 跳过了这个 run:必须说清为什么
+                # "被 reset 孤立"既不是"从未揭示过",也不是"被篡改"——reset 把梯子清空了,
+                # 历史 run 因此永远读不出来(回放时梯子里查无此 run,若当成篡改就是**误报**)。
+                # 这三种情况必须分开计数,否则 reset 一执行,诊断通道就静默变空,
+                # 或者一次正常的人工重置就被记成安全事件(第 19 轮 codex 的 H1)。
+                #
+                # **异常自己的判定排在名单前面**(第 21 轮 codex 的 Medium-1):
+                # 孤立名单是无哈希链的普通文本,可以伪造。此前先查名单,
+                # 于是一条伪造的 reset 记录就能把真正的篡改计数器压成 0——
+                # 数据确实不放行,但 `skipped.tampered` 是运维面板上**唯一的**篡改信号。
+                # 名单只用于"异常没给出判定"时的兜底分类。
+                if reason is not None:
+                    skipped[reason] += 1
+                elif run_id in orphaned:
+                    skipped["orphaned_by_reset"] += 1
+                continue
+            error = view.get("error") if isinstance(view.get("error"), dict) else None
+            if view.get("status") == "strategy_error" and error:
+                detail = str(error.get("message") or "报错原文仅人可见")[:MAX_TRACE_TEXT]      # 验证窗口回放里的原文已在视图里去掉
+                where = PHASE_LABELS.get(error.get("phase")) or (
+                    "训练段回测" if view.get("kind") == "backtest" and error.get("message") else "验证窗口回放")
+                failures = [f"策略运行报错({error.get('type') or '自定义异常'},{where}): {detail}"]
+            else:
+                failures = list(view.get("failed_checks") or [])[:MAX_TRACE_FAILURES]
+            failed = view.get("status") == "strategy_error" or (view.get("kind") in ("gate", "evaluate") and not view.get("passed"))
             if not failed:
                 continue
-            cls = result.get("class")
+            diagnosis = view.get("selection_diagnosis") if isinstance(view.get("selection_diagnosis"), dict) else {}
             traces.append({
-                "run_id": run_id, "kind": result.get("kind"), "key": result.get("key"),
-                "class": cls if isinstance(cls, str) and CLASS_NAME.match(cls) else None,
-                "weakest": weakest if isinstance(weakest, str) else None, "failures": failures,
-                "summary": str(diagnosis.get("summary", ""))[:MAX_TRACE_TEXT] if isinstance(diagnosis, dict) else "",
+                "run_id": run_id, "kind": view.get("kind"), "class": view.get("class"),
+                "weakest": diagnosis.get("weakest"), "failures": failures,
+                "summary": str(view.get("report", ""))[:MAX_TRACE_TEXT * 2],
             })
             if len(traces) >= limit:
                 break
-        return 200, {"limit": limit, "pending_candidates": self._pending_names(), "traces": traces}
+        return 200, {"limit": limit, "pending_candidates": self._pending_names(), "traces": traces,
+                     "skipped": skipped, "skipped_total": sum(skipped.values())}
 
     def _pending_names(self) -> list[str]:
         """已有候选的文件名(新到旧)。只回文件名,且只回符合命名规则的那些。

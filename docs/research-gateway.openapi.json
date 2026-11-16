@@ -95,7 +95,7 @@
     "/research/backtest": {
       "post": {
         "operationId": "run_backtest",
-        "summary": "在训练或验证段做沙盒回测(日线 CADJ/MAADJ)。仅运行已被人批准的代码;返回绩效与诊断书。",
+        "summary": "在训练段做沙盒回测(日线 CADJ/MAADJ)。仅运行已被人批准的代码;返回训练段的绩效统计。**验证段(segment=valid)被拒绝(403)**:它会绕过梯子直接给出验证窗口的完整统计,验证窗口的成绩只经 /research/evaluate 与 /research/gate 按梯子量化后给出。",
         "requestBody": {
           "required": true,
           "content": {
@@ -150,10 +150,10 @@
         },
         "responses": {
           "200": {
-            "description": "绩效 + 四维诊断书(回撤/次数/连亏/夏普)"
+            "description": "训练段的净化视图:stats(白名单统计量)、report;候选自身出错时 status=strategy_error 及 error"
           },
           "403": {
-            "description": "代码尚未被人批准"
+            "description": "代码尚未被人批准;或请求了验证段(segment=valid)——验证窗口的成绩只经梯子给出"
           },
           "409": {
             "description": "已有作业在运行"
@@ -202,7 +202,7 @@
                       "report",
                       "text"
                     ],
-                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回完整结果。出错时一律返回 JSON"
+                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回净化视图(不是落盘的完整记录)。出错时一律返回 JSON"
                   }
                 }
               }
@@ -211,7 +211,7 @@
         },
         "responses": {
           "200": {
-            "description": "passed、failures、metrics、windows、diagnosis、protocol_notice"
+            "description": "外层看到的是**净化视图**,不是落盘的完整记录(那份只给人看):只含白名单字段,没有自由文本;失败原因是门槛检查项的稳定 ID(failed_checks),不是带验证窗口数字的句子;验证窗口的夏普只以梯子量化后的值出现(ladder.reported_sharpe,步长 1.10,每个 run 至多消耗一次查询)。evaluate 另含选参窗口(放开)的 selection、cell/behavior(行为格子)、selection_diagnosis(结构化诊断:枚举 + 0–1 数值)、fitness;候选自身出错时 status=strategy_error 及 error"
           },
           "403": {
             "description": "代码尚未被人批准"
@@ -221,6 +221,12 @@
           },
           "504": {
             "description": "超时"
+          },
+          "429": {
+            "description": "验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,也不会运行作业;需要人工续期"
+          },
+          "500": {
+            "description": "梯子状态或揭示存档损坏(fail-closed):拒绝给出任何验证窗口的信息"
           }
         }
       }
@@ -228,10 +234,13 @@
     "/research/feedback": {
       "get": {
         "operationId": "get_recent_failures",
-        "summary": "最近若干次失败的结构化 Trace(条数由服务端配置限定,默认 3)。只含固定字段。",
+        "summary": "最近若干次失败的结构化 Trace(条数由服务端配置限定,默认 3)。只含固定字段;只取**已经向外层揭示过**的 run(不会偷偷揭示新的、也不会消耗梯子查询);失败原因是门槛检查项的稳定 ID。",
         "responses": {
           "200": {
-            "description": "traces 列表"
+            "description": "traces 列表。响应里另有 `skipped` 分类计数与 `skipped_total`,说明有多少条结果没有进 traces 以及**为什么**:`tampered`(揭示存档被改过——篡改信号)、`invalid_result`(结果本身不合法)、`unavailable`(揭示存档暂时读不到/写不进——可用性故障,不是篡改)、`unreadable`(结果文件读不出来)、`orphaned_by_reset`(被一次人工梯子重置孤立——不是安全事件)。"
+          },
+          "500": {
+            "description": "揭示存档损坏(fail-closed)"
           }
         }
       }
@@ -239,7 +248,7 @@
     "/research/results/{run_id}": {
       "get": {
         "operationId": "get_result",
-        "summary": "读取一次回测或门槛评估的完整结果。",
+        "summary": "读取一次运行结果的**净化视图**(落盘的完整记录只给人看)。第一次读到带验证窗口数字的 run 才消耗一次梯子查询并存档,之后重复读取回放当时的视图,不再查询。",
         "parameters": [
           {
             "name": "run_id",
@@ -252,10 +261,19 @@
         ],
         "responses": {
           "200": {
-            "description": "结果"
+            "description": "外层看到的是**净化视图**,不是落盘的完整记录(那份只给人看):只含白名单字段,没有自由文本;失败原因是门槛检查项的稳定 ID(failed_checks),不是带验证窗口数字的句子;验证窗口的夏普只以梯子量化后的值出现(ladder.reported_sharpe,步长 1.10,每个 run 至多消耗一次查询)"
           },
           "404": {
             "description": "不存在"
+          },
+          "410": {
+            "description": "这个 run 被一次**人工梯子重置**孤立了(重置会清零 best 与查询数、并作废全部历史揭示存档):它的验证窗口信息不再给出,需要重新评估才能再被揭示。重置不是安全事件,所以这里不回 500。"
+          },
+          "429": {
+            "description": "该 run 从未向外层揭示过,而梯子的查询预算已用尽"
+          },
+          "500": {
+            "description": "梯子状态或揭示存档损坏(fail-closed)"
           }
         }
       }
@@ -293,7 +311,7 @@
                       "report",
                       "text"
                     ],
-                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回完整结果。出错时一律返回 JSON"
+                    "description": "report:只返回 {run_id, passed, status, report}(JSON);text:只返回纯文本中文报告(适合工作流结果节点直接展示);不填返回净化视图(不是落盘的完整记录)。出错时一律返回 JSON"
                   }
                 }
               }
@@ -302,7 +320,7 @@
         },
         "responses": {
           "200": {
-            "description": "passed、failures、params(选出的参数)、selection(选参摘要:有效格子数、是否在高原)、metrics、windows、diagnosis;候选自身出错时 status=strategy_error 及 error"
+            "description": "外层看到的是**净化视图**,不是落盘的完整记录(那份只给人看):只含白名单字段,没有自由文本;失败原因是门槛检查项的稳定 ID(failed_checks),不是带验证窗口数字的句子;验证窗口的夏普只以梯子量化后的值出现(ladder.reported_sharpe,步长 1.10,每个 run 至多消耗一次查询)。evaluate 另含选参窗口(放开)的 selection、cell/behavior(行为格子)、selection_diagnosis(结构化诊断:枚举 + 0–1 数值)、fitness;候选自身出错时 status=strategy_error 及 error"
           },
           "403": {
             "description": "代码尚未被人批准"
@@ -312,6 +330,12 @@
           },
           "504": {
             "description": "超时"
+          },
+          "429": {
+            "description": "验证窗口的梯子查询预算已用尽:不再给出任何验证窗口的信息,也不会运行作业;需要人工续期"
+          },
+          "500": {
+            "description": "梯子状态或揭示存档损坏(fail-closed):拒绝给出任何验证窗口的信息"
           }
         }
       }

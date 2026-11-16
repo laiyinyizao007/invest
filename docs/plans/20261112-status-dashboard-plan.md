@@ -150,9 +150,9 @@ ADR:`docs/adr/20261113-evolution-dashboard.md`。
   `01-product-spec.md` §9.5、`02-api-contract.md`、`04-phases.md`、`06-design-system.md` 组件清单、
   `07-lovable-prompts.md` 新增 P15–P17、`README.md` 阅读顺序与现状。
 - [x] **E6 路由注册**:6 个接口按『契约先行、路由随阶段上线』的约定,用配置开关 `evolution.enabled` 实现:为真时才注册进 `dashboard/app.py`,默认关闭(阶段①的路由严格只注册阶段①接口,这条不变);`GET /api/meta` 的 `capabilities.evolution` 随之告诉前端是否显示入口。台账损坏返回 503(数据不可信)而不是 404(没有数据),两者可区分。
-- [ ] **E7 引擎侧数据**:台账 `data/research/evolution/<campaign>.jsonl` 与热力图 `data/research/heatmaps/<run_id>.json` 由引擎会话阶段 3 产出(已与其对齐格式)。
+- [x] **E7 引擎侧数据(写入端)**:台账 `data/research/evolution/<campaign>.jsonl` 与热力图 `data/research/heatmaps/<run_id>.json` 的写入端已由阶段 3 实现(2026-11-13,`risk/lineage.py`、`risk/heatmap.py`),格式与读取侧同口径并有契约测试。
 
-**当前状态**:读取侧与前端文档就绪,**数据还没有**——线上取不到是如实状态,前端用示例数据开发。
+**当前状态**:读取侧、写入端与前端文档都就绪,但**还没有真实战役跑过**(毕昇模型配额仍卡着)——线上取不到真实数据是如实状态,前端用示例数据开发。
 
 ## 后续阶段(只登记)
 

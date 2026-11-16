@@ -14,13 +14,20 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import atexit
 import hashlib
+import hmac
 import importlib.util
 import json
+import math
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import types
 from datetime import datetime
@@ -29,13 +36,36 @@ from pathlib import Path
 import research_config as rc
 import research_console as rconsole
 import research_sandbox as rs
-from research_grid import MIN_AXIS_VALUES
+from research_grid import MAX_AXIS_VALUES, MIN_GRID_CELLS
 from risk import constitution as const
 from risk.report import backtest_stats_row, render_report
-from risk.trial_ledger import TrialLedgerError, record_trials, total_trials
+from risk.candidate_eval import TRADING_DAYS_PER_YEAR
+from risk.dsr import MAX_RUNS_USED
+from risk import lineage
+from risk.heatmap import HeatmapError, save_heatmap, validate_heatmap
+from risk.trial_ledger import (TrialLedgerError, grid_run_variances, record_sharpes, record_trials, total_trials,
+                               valid_trial_sharpes)
 
-CHILD_MARK = "RESEARCH_RESULT_JSON:"
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED, EXIT_TIMEOUT = 0, 2, 3, 124
+
+# 阶段(与 scripts/research_gate.py 的同名常量保持一致;有一处用例锁定两者相等)。
+# 阶段**只由框架决定**,决定之后写进结果字典,候选没有通道能改它(见 describe_error)。
+PHASE_DECLARATION = "declaration"      # 声明期:我们自己写的消息(网格声明、类校验)
+PHASE_SELECTION = "selection"          # 选参窗口回放:进化回路放开的那一层
+PHASE_VALIDATION = "validation"        # 验证窗口回放:**报错原文不外传**
+PHASES = (PHASE_DECLARATION, PHASE_SELECTION, PHASE_VALIDATION)
+
+# 子进程结果的年化夏普合理上界:超过它的结果一律拒绝采信(伪造的兜底,不是策略门槛)。
+# 真实策略的年化夏普在个位数;50 已经宽松到不可能是误伤。
+MAX_ABS_OOS_SHARPE = 50.0
+# 子进程结果文件的大小上限:父进程读它之前先看大小。
+# 候选能回传任意长的数组(比如百万条 pnl),没有上限时父进程会把它整个读进内存——
+# 沙盒不给子进程设资源上限,所以这条是父进程侧唯一的兜底(fail-closed:超限即拒绝采信)。
+# 4 MB 对真实结果绰绰有余:回测结果只有 trade 级 pnl 与一行 stats,门槛结果只有汇总指标。
+MAX_RESULT_BYTES = 4 * 1024 * 1024
+# 逐笔盈亏(pnls)的条数上限:15 分钟周期下训练段全量回测也就几万笔,20 万条绰绰有余。
+# 结果文件本身还有 4 MB 上限(约 50 万个数字),这条是更贴近"业务合理性"的一道。
+MAX_PNL_ROWS = 200_000
 # gate 无法验证候选参数是怎么选出来的,只能提醒:参数若参考过验证窗口(2022-07 ~ 2023-12)的表现,该窗口就不再是样本外
 PROTOCOL_NOTICE = ("样本外有效的前提:候选参数与 --plateau-file 必须在没看过滚动验证窗口(2022-07-01 ~ 2023-12-31)的情况下选定;"
                    "optimize_15m.py 默认的训练段(至 2022-12)与验证段(2023)都与这些窗口重叠;请用 optimize_15m.py --select-only(训练段止于 2022-06-30)选参。")
@@ -80,7 +110,12 @@ def emit(obj) -> None:
 
 
 def refuse(message: str) -> int:
-    print(f"拒绝: {message}", file=sys.stderr)
+    """拒绝并给出原因。
+
+    走 `say_refusal`(带 `[框架]` 标记):子进程侧的这个函数也会被用到
+    (例如配置非法 → `main()` 的 ConfigError 分支),此前那里写的是**无标记**的
+    "拒绝: ..." → 父层只认带标记的行 → 回传退化成"原因见本机日志",诊断全丢。"""
+    say_refusal(f"拒绝: {message}")
     return EXIT_REFUSED
 
 
@@ -96,12 +131,23 @@ def kill_tree(proc: subprocess.Popen) -> None:
 _EXC_LINE = re.compile(r"^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))\b:?\s*(.*)$")
 
 
-def describe_error(exc: BaseException) -> dict:
-    """把策略运行时异常压成 {type, message}:取 traceback 末尾的异常行,洗掉敏感内容,截断到 200 字符。
+def describe_error(exc: BaseException, phase: str) -> dict:
+    """把策略运行时异常压成 {type, message, phase}:取 traceback 末尾的异常行,抹掉本机路径,截断到 200 字符。
 
-    注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,
-    所以限长并只保留可打印字符;清洗走共享口径 `rs.scrub_text`(本机路径、哈希、凭据、批准命令),
-    免得这里再有一套更弱的正则(第 7 轮 codex 的 F5)。"""
+    注意 message 可能含已批准代码里 raise 出来的文本,属于「会进入 LLM 上下文的外部文本」,所以限长并只保留可打印字符。
+
+    `phase` **必须由调用点显式给出**,而且只能取 PHASES 里的值:
+    - 阶段**绝不**从异常对象上读:候选可以给自己的异常挂 `invest_phase="selection"`,
+      旧实现"只补不改"就会保留它,于是验证窗口的报错原文被当成选参期的消息放出去,而梯子一次都没扣
+      (第 22 轮 codex 的 High,实测消息里带出了验证窗口的收盘价);
+    - 阶段**也绝不**按异常类名推断(第 27 轮 codex 的 Medium-2):旧实现有
+      `name == "GridError" ⇒ declaration` 这条兜底,而异常类名是**候选自己起的名字**——
+      候选只要在验证窗口回放里 `raise GridError("close=2728.0")`,验证窗口的数字就被当成
+      "我们自己写的声明期消息"放了出去(实测 view.error.phase == "declaration")。
+      框架自己的 GridError 由 research_gate 的调用点**显式**传 PHASE_DECLARATION。
+    - 传进来的阶段不在 PHASES 里(调用点写错了)→ 按验证窗口处理(fail-closed:原文不放行)。
+
+    清洗走共享口径 `rs.scrub_text`(本机路径、哈希、凭据、批准命令),免得这里再有一套更弱的正则(第 7 轮 codex 的 F5)。"""
     text = str(exc)
     name, msg = type(exc).__name__, text
     for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
@@ -111,7 +157,9 @@ def describe_error(exc: BaseException) -> dict:
             break
     msg = rs.scrub_text(msg)
     msg = "".join(ch for ch in msg if ch.isprintable())[:200]
-    return {"type": name.split(".")[-1], "message": msg}
+    if phase not in PHASES:
+        phase = PHASE_VALIDATION                       # 阶段不明 = 按验证窗口处理(fail-closed)
+    return {"type": name.split(".")[-1], "message": msg, "phase": phase}
 
 
 def trials_path(paths: dict) -> Path:
@@ -126,7 +174,68 @@ def prior_trials(paths: dict) -> int:
         raise JobError(EXIT_REFUSED, str(exc)) from exc
 
 
-MIN_GRID_CELLS = MIN_AXIS_VALUES ** 3     # 合法网格至少 3 个参数 × 每个 ≥3 个取值
+def take_heatmap(body: dict) -> tuple[dict | None, str | None]:
+    """把热力图从作业结果里**拿出来**(它不并入落盘的结果,更不并入给外层的响应),并校验。
+
+    正文来自候选所在的子进程,不可信:不合法就丢弃并说明,不让一份坏图挡住整个评估结果。"""
+    heatmap = body.pop("heatmap", None)
+    if heatmap is None:
+        return None, None
+    try:
+        validate_heatmap(heatmap)
+    except HeatmapError as exc:
+        return None, f"热力图被丢弃: {exc}"
+    return heatmap, None
+
+
+def save_job_heatmap(paths: dict, run_id: str, heatmap: dict) -> None:
+    """结果已落盘、run_id 已确定之后,把热力图另存给面板。写不进去就大声失败:缺失的图不能让面板显示成正常。"""
+    try:
+        save_heatmap(Path(paths["results_dir"]) / "heatmaps", run_id, heatmap)
+    except HeatmapError as exc:
+        raise JobError(EXIT_FAILED, f"结果已保存(run_id={run_id}),但热力图写入失败: {exc}") from exc
+
+
+def prior_run_variances(paths: dict) -> list[float]:
+    """账本里最近各次评估的格子夏普方差,供子进程算 DSR 的经验方差(取中位数)。账本损坏则拒绝作业(fail-closed)。"""
+    try:
+        return grid_run_variances(trials_path(paths))
+    except TrialLedgerError as exc:
+        raise JobError(EXIT_REFUSED, str(exc)) from exc
+
+
+def run_variances_argv(variances: list[float]) -> list[str]:
+    """把先验方差列表变成子进程命令行参数(JSON,repr 保证浮点数无损往返;至多 MAX_RUNS_USED 个)。"""
+    return ["--prior-run-variances", json.dumps([float(v) for v in variances[-MAX_RUNS_USED:]])]
+
+
+def record_job_sharpes(paths: dict, body: dict) -> None:
+    """作业**成功返回后**把本次的逐试验夏普写进账本(不计入试验次数),并把它们从结果里拿掉。
+
+    - 网格里每个有效格子的日夏普(`trials.cell_sharpes`)记为 grid;门槛评估的池化样本外日夏普记为 gate;
+    - 样本可能来自候选进程:**整批校验**,有一个坏值就整批丢弃(不是只信剩下的),并在结果里写明丢弃;
+    - 写不进账本就拒绝(fail-closed):少记样本只会让 V 退回理论值,但不能让它**静默**少记。"""
+    trials = body.get("trials")
+    if isinstance(trials, dict) and "cell_sharpes" in trials:
+        raw = trials.pop("cell_sharpes")
+        clean = valid_trial_sharpes(raw) if raw else None
+        if raw and clean is None:
+            trials["cell_sharpes_dropped"] = "整批丢弃:含非有限数或超出上限的值"
+        elif clean:
+            try:
+                record_sharpes(trials_path(paths), "grid", clean, at=time.time())
+            except TrialLedgerError as exc:
+                raise JobError(EXIT_REFUSED, str(exc)) from exc
+    metrics = body.get("metrics")
+    oos = metrics.get("oos_sharpe") if isinstance(metrics, dict) else None
+    if isinstance(oos, (int, float)) and not isinstance(oos, bool) and math.isfinite(oos):
+        daily = valid_trial_sharpes([oos / math.sqrt(TRADING_DAYS_PER_YEAR)])
+        if daily:
+            try:
+                record_sharpes(trials_path(paths), "gate", daily, at=time.time())
+            except TrialLedgerError as exc:
+                raise JobError(EXIT_REFUSED, str(exc)) from exc
+
 
 
 def charge_trials(paths: dict, kind: str, count: int) -> int:
@@ -145,6 +254,102 @@ def top_up_grid_trials(paths: dict, body: dict) -> None:
     cells = trials.get("grid_cells")
     if isinstance(cells, int) and not isinstance(cells, bool) and cells > MIN_GRID_CELLS:
         charge_trials(paths, "grid_cell", cells - MIN_GRID_CELLS)
+
+
+def declared_grid_cells(source: str) -> int | None:
+    """从候选源码里**静态**读出 `param_grid` 声明的格子数。
+
+    返回值三种:
+    - `int`(≥1):认得字面量网格 —— class 里的 `param_grid = {"a": [1, 2, 3], ...}`
+      (dict 的值必须是 list/tuple);
+    - `None`:**有** `param_grid` 但读不出格子数(动态算出来的)—— 父进程不导入候选代码
+      (导入本身就是被审的对象),只能静态地看,子进程才算得准;
+    - `0`:**没有** `param_grid` —— 这一轮只跑单一配置,没有网格可扫。
+
+    用途:子进程**中途死掉**(超时/崩溃/被杀)时,没人回报它扫过了多少格子,
+    记账只能取一个**保守值**(见 `conservative_grid_cells`)。"""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    # class 体里的赋值(网格通常声明在这里)
+    class_body_ids = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for stmt in node.body:
+                class_body_ids.add(id(stmt))
+    sizes: list[int] = []
+    unknown = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):          # 带注解的写法: param_grid: dict = {...}
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        # 目标名要**递归**取:`param_grid, x = {...}, 1` 的目标是一个 ast.Tuple,
+        # 只看最外层会以为"没有 param_grid" → 当成没网格 → 只记 27 格 → 少记试验次数。
+        target_names = {n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)}
+        if "param_grid" not in target_names:
+            continue
+        if id(node) not in class_body_ids or not isinstance(value, ast.Dict) or not value.keys:
+            unknown = True                      # 类外的、或不是字面量 dict → 读不准
+            continue
+        total = 1
+        for item in value.values:
+            if not isinstance(item, (ast.List, ast.Tuple)):
+                unknown = True
+                break
+            if not 1 <= len(item.elts) <= MAX_AXIS_VALUES:
+                unknown = True
+                break
+            total *= len(item.elts)
+        if not unknown:
+            sizes.append(total)
+    if unknown:
+        return None
+    # **fail-closed 兜底**(第 32 轮 codex 复审的 Critical):上面只认"类体里的字面量赋值",
+    # 其它写法会被**静默忽略** —— 类外 `S.param_grid = {...}`(目标是 Attribute)、
+    # `param_grid |= {...}`(AugAssign)、`param_grid.update({...})`(调用)、字符串键……
+    # 声明小网格、再用这些写法塞进大网格,子进程中途死掉就只记 27 格(实测少记 316)。
+    # 所以:`param_grid` 在源码里**出现的次数**必须正好等于"被认出的那几条字面量赋值"的次数,
+    # 多出来的任何一次出现(读/写/属性/字符串/关键字)一律当"读不出",走保守上限。
+    # 代价:候选只是**读** `self.param_grid` 也会走保守值 —— 只影响"中途死掉"那条路,方向是更严。
+    mentions = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "param_grid":
+            mentions += 1
+        elif isinstance(node, ast.Attribute) and node.attr == "param_grid":
+            mentions += 1
+        elif isinstance(node, ast.Constant) and node.value == "param_grid":
+            mentions += 1
+        elif isinstance(node, (ast.keyword, ast.arg)) and getattr(node, "arg", None) == "param_grid":
+            mentions += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "param_grid":
+            mentions += 1
+    if mentions != len(sizes):
+        return None
+    if not sizes:
+        return 0
+    return max(sizes)
+
+
+def conservative_grid_cells(source: str, max_cells: int) -> int:
+    """子进程没回报格子数时,按**保守方向**记账:少记 = 放松 DSR,多记 = 更严。
+
+    - 声明的网格静态读得出 → 用它(上限截到 `max_cells`);
+    - 有网格但读不出(动态)→ 用配置上限 `max_cells`:那一轮最多也就扫这么多格子;
+    - 没有网格 → 单一配置,按最小网格 `MIN_GRID_CELLS` 记(预扣的那份已经覆盖,不再补记)。
+
+    绝不用 0,也不退还预扣的最小网格。"""
+    declared = declared_grid_cells(source)
+    if declared is None:
+        return max(int(max_cells), MIN_GRID_CELLS)
+    if declared == 0:
+        return MIN_GRID_CELLS
+    return max(min(declared, int(max_cells)), MIN_GRID_CELLS)
 
 
 class JobError(Exception):
@@ -169,46 +374,224 @@ class CandidateError(Exception):
         self.detail = detail
 
 
+FRAMEWORK_TAG = "[框架]"
+
+
+def say_refusal(message: str) -> None:
+    """框架自己写的拒绝原因,带一个固定标记后写进 stderr。
+
+    候选与框架**同进程**:候选的 print 走的是同一条 stderr。父层以前取"最后一行非空输出",
+    于是候选只要在自己被拒绝之后打印一行,就能顶替框架的结论;它也可以把验证窗口的
+    数字写进 stderr,让那串数字被当成"框架的拒绝原因"传回调用方/LLM。
+    现在:框架写的原因带标记,父层**只回传带标记的行**。
+
+    这层的**真实边界**(别把它当成安全边界):候选与框架同进程,它完全可以自己打一行
+    带同样标记的文本 —— 标记挡的是"误顶替"(候选随口打印与候选蓄意伪造是两回事)。
+    真正挡得住"候选伪造框架结论"的是候选独立进程化(已登记为后续工作)。
+
+    **整条原因写成一行**(第 32 轮):2a3901f 的旧实现是整条消息只在**开头**打一个标记,
+    多行消息的后续行没有标记,父层取"带标记的行"时只剩第一行,细节(是哪一条)丢了。
+    现在:换行折成" | "写成**一行**(不用" / ":路径脱敏正则会把它吃成 <路径>),
+    父层只取**第一行**带标记的行 → 框架先写的那行赢,候选在退出时补打的行排在后面不被采信。"""
+    text = " | ".join(part.strip() for part in str(message).splitlines() if part.strip())
+    print(f"{FRAMEWORK_TAG} {text}", file=sys.stderr)
+
+
 def _child_reason(stderr: str) -> str:
-    """从子进程的 stderr 里取出拒绝原因(最后一行非空输出)。
+    """从子进程的 stderr 里取出**框架自己写的**拒绝原因(带标记的那一行)。
 
     子进程的"拒绝"(退出码 2)必须**原样传到父层**:早先一律压成"回测失败(退出码 3)",
     于是子入口里那些拒绝(受保护参数、路径越界、审批缺失)的原因只进了本机 stderr,
     永远进不了返回给调用方/LLM 的结果里——而那条通道正是为"把诊断送回去"设计的。
 
-    回传前走**唯一**的清洗口径 `rs.scrub_text`:本机路径、凭据、哈希、批准命令都盖掉。
-    早先这里自带三套正则(盘符/POSIX/引号),是第四套口径,迟早与主线漂移
-    (第 10 轮 codex 的 Low)。
-    语义变化(第 10 轮 codex 的 Low):旧实现会把引号里的**一切**整段替换成 `<路径>`;
-    现在统一走 `rs.scrub_text`,只认路径/哈希/凭据这些**形态**,引号里的普通文本不再被吞
-    (写在这里免得日后当成回归)。
-    """
-    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
-    if not lines:
+    只认带 `[框架]` 标记的行(见 `say_refusal`):候选与框架同进程,它自己 print 的内容
+    一律不当作框架的结论 —— 既顶替不了,也借这条通道把验证窗口的数字传出去。
+
+    回传前把本机路径替换掉:父层对调用方的承诺是"message 不含本机路径与密钥"。
+
+    **取第一行带标记的行**(第 32 轮):此前取的是**最后**一行带标记的行 ——
+    候选可以注册 atexit 钩子(atexit 不在禁用名单里),在**框架写完原因之后**再打一行
+    带同样标记的文本,于是候选那行**排到最后**、被优先回传。
+    改成"第一行"之后,框架自己那行(先写的)赢。
+    (框架自己把多行原因折成一行写,见 `say_refusal` —— 细节在这一行里,不会因为只取一行而丢。)
+
+    **已登记的残余**:候选在**框架拒绝之前**就打了一行带标记的文本时,父层取到的**就是候选那行**
+    (是"取错",不是"取不到"),验证窗口的数字也可能借此外传 —— 同进程内无法区分谁写的,
+    彻底闭合靠候选独立进程化。"""
+    tagged: list[str] = []
+    for line in (stderr or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(FRAMEWORK_TAG):
+            tagged.append(stripped[len(FRAMEWORK_TAG):].strip())
+            break
+    if not tagged:
         return "子进程拒绝执行(原因见本机日志)"
-    return rs.scrub_text(lines[-1])[:200]
+    reason = tagged[0]
+    # 回传前走**唯一**的清洗口径 `rs.scrub_text`(本机路径、凭据、哈希、批准命令都盖掉;第 10 轮 codex 的 Low:
+    # 不再自带第四套正则)。语义变化:引号里的普通文本不再被整段吞成 <路径>,只认路径/哈希/凭据形态。
+    reason = rs.scrub_text(reason)
+    return reason[:200]
+
+
+# ---------------- 子进程结果通道 ----------------
+# 结果**不走 stdout**。
+#
+# 早先的约定是:子进程把结果打成一行 `RESEARCH_RESULT_JSON:{...}`,父进程取 stdout 里
+# **最后**一行以这个前缀开头的行。stdout 是候选自己的地盘——候选可以随便 print,
+# 也可以注册 atexit 钩子(atexit 不在沙盒的禁用模块名单里)在框架打印之后再打一行,
+# 于是候选伪造的那一行会**赢**(第 27 轮 codex 的 Critical)。
+#
+# 现在:父进程造一份**每次作业都不一样**的交接单(随机临时目录 + 随机结果文件路径 + 随机 MAC 密钥),
+# 经子进程的 stdin 交给子进程;子进程把结果写进那个文件并附上 MAC;父进程**验签**通过才采信,
+# 对不上就 fail-closed(stderr 留证据)。stdout 只当日志。
+#
+# 残余(诚实登记,见 ADR 第 27 轮):候选代码与框架代码在**同一个子进程**里跑,
+# 候选若能反射到运行时(拿到 sys、翻到帧的局部变量),仍可能读到交接单并伪造结果。
+# 要彻底堵住,得让候选在**另一个进程**里执行、由框架进程独立汇总——那是架构改动,已登记为后续工作。
+# 现在能堵住的是**盲伪造**:不知道随机路径与随机密钥的伪造(含 atexit 打印那一行)一律被验签拒绝。
+#
+# 写结果用到的运行时对象在**模块导入时**(候选还没跑)按进 `_make_channel` 的闭包单元里
+# (不是模块全局:期望值若也是模块全局,候选把两边一起改写,检查就静音了)。
+
+
+def _make_handoff() -> dict:
+    """父进程造交接单:随机临时目录 + 随机结果文件路径 + 随机 MAC 密钥。"""
+    tmpdir = Path(tempfile.mkdtemp(prefix="research-result-"))
+    return {"path": str(tmpdir / "result.json"), "key": secrets.token_hex(32), "dir": str(tmpdir)}
+
+
+def _discard_handoff(handoff: dict) -> None:
+    """结果读走之后清掉临时目录(读失败也要清)。"""
+    try:
+        shutil.rmtree(handoff.get("dir", ""), ignore_errors=True)
+    except OSError:
+        pass
+
+
+def check_result_bounds(body: dict) -> None:
+    """结果里的数字必须站得住:验证窗口的夏普超出合理上界 → 拒绝采信(伪造的兜底)。
+
+    验签挡的是"结果被人换过";这里挡的是"结果里的数字本身不合理"(例如被编排成 oos_sharpe=1e9)。
+    策略门槛(夏普上界、DSR)一律不放宽——这里只是把明显不成立的结果挡在门外。
+
+    **几种结果形状都要查**(漏一种形状 = 留一个"数字明显不成立却照样被采信"的口子):
+    - 门槛/评估作业:`metrics.oos_sharpe` / `metrics.stress_sharpe`;
+    - 选参窗口汇总:`selection.best_sharpe` / `selection.best_smoothed`;
+    - **回测**作业:`stats.sharpe`(第 27 轮 codex 的 Critical 伪造的正是这个形状)。
+
+    另有两类"数字站不住"的形态:
+    - `stats` 里的非夏普数字(回撤额、成交笔数…)**只查是不是有限数**:回撤额本来就可能
+      远大于夏普上界,拿夏普的上界去卡它会误杀正常结果;但 NaN/Inf 会顺着下游计算传下去;
+    - `pnls`(逐笔盈亏):每一笔都得是有限数字,且条数有上限(结果文件本身也有 4 MB 上限)。"""
+    def out_of_range(label: str, value) -> None:
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or abs(value) > MAX_ABS_OOS_SHARPE):
+            raise JobError(EXIT_FAILED, f"子进程回传的 {label} 超出合理范围,已拒绝采信")
+
+    def not_finite(label: str, value) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise JobError(EXIT_FAILED, f"子进程回传的 {label} 不是有限数字,已拒绝采信")
+
+    metrics = body.get("metrics")
+    if isinstance(metrics, dict):
+        for key in ("oos_sharpe", "stress_sharpe"):
+            value = metrics.get(key)
+            if value is None:
+                continue
+            out_of_range(key, value)
+    selection = body.get("selection")
+    if isinstance(selection, dict):
+        for key in ("best_sharpe", "best_smoothed"):
+            value = selection.get(key)
+            if value is None:
+                continue
+            out_of_range(f"selection.{key}", value)
+    stats = body.get("stats")
+    if isinstance(stats, dict):
+        for key, value in stats.items():
+            if key == "sharpe":
+                if value is not None:
+                    out_of_range("stats.sharpe", value)
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue                                   # 非数字的字段不归这一层管
+            not_finite(f"stats.{key}", value)
+    pnls = body.get("pnls")
+    if pnls is not None:
+        if not isinstance(pnls, list):
+            raise JobError(EXIT_FAILED, "子进程回传的 pnls 不是列表,已拒绝采信")
+        if len(pnls) > MAX_PNL_ROWS:
+            raise JobError(EXIT_FAILED, "子进程回传的 pnls 条数过多,已拒绝采信")
+        for index, value in enumerate(pnls):
+            not_finite(f"pnls[{index}]", value)
+
+
+def _read_child_result(handoff: dict) -> dict:
+    """读回子进程写的结果并**验签**。签名对不上 = 结果被换过 → 拒绝采信(fail-closed)。"""
+    path = Path(handoff["path"])
+    try:
+        size = path.stat().st_size
+    except OSError:
+        raise JobError(EXIT_FAILED, "子进程没有回传结果(结果文件缺失)")
+    if size > MAX_RESULT_BYTES:
+        raise JobError(EXIT_FAILED, "子进程结果文件过大,已拒绝采信")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        raise JobError(EXIT_FAILED, "子进程没有回传结果(结果文件缺失)")
+    try:
+        envelope = json.loads(raw)
+        body_text, mac = envelope["body"], envelope["mac"]
+    except (ValueError, KeyError, TypeError):
+        raise JobError(EXIT_FAILED, "子进程结果信封不合法")
+    if not isinstance(body_text, str) or not isinstance(mac, str):
+        raise JobError(EXIT_FAILED, "子进程结果信封不合法")
+    expected = hmac.new(handoff["key"].encode("utf-8"), body_text.encode("utf-8"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, mac):
+        raise JobError(EXIT_FAILED, "子进程结果校验失败(疑似被伪造),已拒绝采信")
+    try:
+        body = json.loads(body_text)
+    except ValueError:
+        raise JobError(EXIT_FAILED, "子进程结果不是合法 JSON")
+    if not isinstance(body, dict):
+        raise JobError(EXIT_FAILED, "子进程结果不是 JSON 对象")
+    check_result_bounds(body)
+    return body
 
 
 def spawn_child(cmd: list[str], timeout: float) -> dict:
-    """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", cwd=rc.CODE_ROOT, env=rs.sandbox_env(os.environ))
+    """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。
+
+    结果通道见上方说明:交接单经 stdin 交给子进程,结果写进随机文件并附 MAC,父进程验签后才采信。
+    stdout 只是日志(候选爱打印什么打印什么),不再参与结果的判定。"""
+    handoff = _make_handoff()
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc)
-        proc.communicate()
-        raise JobError(EXIT_TIMEOUT, f"超过 {timeout}s,已终止")
-    line = next((ln for ln in reversed(stdout.splitlines()) if ln.startswith(CHILD_MARK)), None)
-    if proc.returncode != 0 or line is None:
-        # 详细输出只留在本机 stderr;回传给调用方的 message 不含子进程原始输出(可能含本机路径)
-        print("失败:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
+        # 子进程一律用 UTF-8 说话:stderr 的拒绝原因带中文标记,stdin 的交接单里
+        # 可能含中文路径;不钉死编码的话,Windows 上子进程会按本地代码页(cp1252/cp936)
+        # 读写 —— 中文被转义成 \\uXXXX,标记失效,中文路径的交接单也会读坏。
+        env = rs.sandbox_env(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace", cwd=rc.CODE_ROOT,
+                                env=env)
+        try:
+            stdout, stderr = proc.communicate(input=json.dumps(handoff, ensure_ascii=False) + "\n", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            proc.communicate()
+            raise JobError(EXIT_TIMEOUT, f"超过 {timeout}s,已终止")
         if proc.returncode == EXIT_REFUSED:
             # 子进程的"拒绝"要**原样传到父层**,不能一律压成"回测失败":
             # 子入口自己复查的那些项(受保护参数、路径越界、审批缺失)的原因必须能回到调用方。
+            print("拒绝:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
             raise JobError(EXIT_REFUSED, "拒绝执行:" + _child_reason(stderr))
-        raise JobError(EXIT_FAILED, "回测失败(详情见本机日志)")
-    return json.loads(line[len(CHILD_MARK):])
+        if proc.returncode != 0:
+            # 详细输出只留在本机 stderr;回传给调用方的 message 不含子进程原始输出(可能含本机路径)
+            print("失败:" + chr(10) + (stderr or stdout)[-1500:], file=sys.stderr)
+            raise JobError(EXIT_FAILED, "回测失败(详情见本机日志)")
+        return _read_child_result(handoff)
+    finally:
+        _discard_handoff(handoff)
 
 
 # **这条消息会经网关回到模型**,所以里面不能有批准命令(第 6 轮 codex 的 M2/B 的 M):
@@ -345,6 +728,29 @@ def child_int_args(args) -> tuple[int, int]:
         if isinstance(prior, bool) or not isinstance(prior, int) or prior < 0:
             raise JobError(EXIT_REFUSED, "--prior-trials 必须是非负整数")
     return random_runs, prior
+
+
+def child_run_variances(args) -> list[float] | None:
+    """子进程自己校验先验方差列表 `--prior-run-variances`(JSON 数组)。
+
+    它也是调用方给的值,不能假设父进程查过。这些数进的是 DSR 的 V,而 V 取 max(中位数, 理论值),只能更严;
+    但仍要卡住范围:个数 ≤ MAX_RUNS_USED,每个是 [0, 1] 内的有限数(格子日夏普限幅在 ±1 以内,方差不可能更大)。
+    返回 None 表示没给(DSR 按"样本不足"退回理论值,并在结果里写明)。"""
+    raw = getattr(args, "prior_run_variances", None)
+    if raw is None:
+        return None
+    if not isinstance(raw, str):                       # 命令行参数一定是 str;bytes/数字之类一律拒
+        raise JobError(EXIT_REFUSED, "--prior-run-variances 必须是 JSON 数组字符串")
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise JobError(EXIT_REFUSED, "--prior-run-variances 必须是 JSON 数组") from exc
+    if not isinstance(values, list) or len(values) > MAX_RUNS_USED:
+        raise JobError(EXIT_REFUSED, f"--prior-run-variances 必须是个数 ≤ {MAX_RUNS_USED} 的数组")
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise JobError(EXIT_REFUSED, "--prior-run-variances 里每个数必须是 [0, 1] 内的有限数")
+    return [float(v) for v in values]
 
 
 def child_file(path: Path) -> Path:
@@ -490,7 +896,7 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
-        raise CandidateError(describe_error(exc)) from exc
+        raise CandidateError(describe_error(exc, PHASE_DECLARATION)) from exc
     # 第二个实参**当场**拍:必须是"这一次调用"的新快照,不能是提前存好的变量或它的拷贝
     # (宪法历史守卫按这条核对执行点:拿拷贝比对,指纹必然一致,第四层形同虚设)。
     tampered = const.check_protected_state(protected_before, const.snapshot_protected_state())
@@ -728,13 +1134,16 @@ def gate_job(*, strategy: str, cls: str, params: dict, plateau: tuple[bool, str]
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
+    variances = prior_run_variances(paths)
     trials = charge_trials(paths, "gate_run", 1)      # 这次门槛评估本身算一次试验(先记账再跑,失败不退),账本为空也不给 0
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_gate_child", "--file", str(path), "--cls", cls,
            "--params", json.dumps(params), "--random-runs", str(random_runs),
            "--on-plateau", "1" if on_plateau else "0", "--sha256", strategy_sha,
-           "--prior-trials", str(trials)]
+           "--prior-trials", str(trials), *run_variances_argv(variances)]
     body = spawn_child(cmd, timeout)
+    if "error" not in body:
+        record_job_sharpes(paths, body)
     if "error" in body:
         result = {"kind": "gate", "status": "strategy_error", "passed": False, "strategy_file": path.name,
                   "strategy_sha256": strategy_sha, "class": cls, "key": "C15",
@@ -761,11 +1170,38 @@ def save_with_report(result: dict, paths: dict) -> None:
     result["run_id"] = rs.save_result(result, paths["results_dir"])
 
 
+def check_campaign(campaign) -> dict | None:
+    """校验战役信息 {campaign_id, parent_sha256, generation}(都是调用方给的,不可信)。没有则返回 None。"""
+    if campaign is None:
+        return None
+    if not isinstance(campaign, dict) or set(campaign) - {"campaign_id", "parent_sha256", "generation"}:
+        raise JobError(EXIT_REFUSED, "campaign 只接受 campaign_id / parent_sha256 / generation 三个字段")
+    campaign_id, parent, generation = campaign.get("campaign_id"), campaign.get("parent_sha256"), campaign.get("generation")
+    if not isinstance(campaign_id, str) or not lineage.CAMPAIGN_ID.fullmatch(campaign_id):
+        raise JobError(EXIT_REFUSED, "campaign_id 不合法(字母数字开头,可含 . _ -,至多 64 个字符)")
+    if parent is not None and (not isinstance(parent, str) or not lineage.SHA256.fullmatch(parent)):
+        raise JobError(EXIT_REFUSED, "parent_sha256 必须是 64 位小写十六进制或不填")
+    if isinstance(generation, bool) or not isinstance(generation, int) or not 0 <= generation <= lineage.MAX_GENERATION:
+        raise JobError(EXIT_REFUSED, "generation 必须是非负整数")
+    return {"campaign_id": campaign_id, "parent_sha256": parent, "generation": generation}
+
+
+def record_lineage(paths: dict, campaign: dict, result: dict, source: str) -> None:
+    """结果已落盘之后把它记进谱系台账。写不进去就大声失败:缺失的台账记录不能让进化曲线显示成正常。"""
+    try:
+        record = lineage.record_from_result(result, source, parent_sha256=campaign["parent_sha256"],
+                                            generation=campaign["generation"])
+        lineage.append_record(Path(paths["results_dir"]) / "evolution", campaign["campaign_id"], record)
+    except lineage.LineageError as exc:
+        raise JobError(EXIT_FAILED, f"结果已保存(run_id={result.get('run_id')}),但谱系台账写入失败: {exc}") from exc
+
+
 def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
-                 confirm: bool = False) -> dict:
+                 confirm: bool = False, campaign: dict | None = None) -> dict:
     """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
     再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。"""
     cfg, paths = settings()
+    campaign = check_campaign(campaign)                  # 先查:战役信息不合法就不必白跑一次
     timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
     random_runs = random_runs if random_runs is not None else cfg["gate"]["random_runs"]
     path = resolve_strategy(strategy, cfg)
@@ -781,21 +1217,50 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
+    variances = prior_run_variances(paths)        # 同样先读:本次的夏普是作业跑完才有的,不能进自己的先验
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior)]
-    body = spawn_child(cmd, timeout)
+           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior),
+           *run_variances_argv(variances)]
+    try:
+        body = spawn_child(cmd, timeout)
+    except JobError as exc:
+        # 子进程**中途死掉**(超时/崩溃/被杀):没人回报它扫过了多少格子。
+        # 此前这条路上补记完全不发生 → 账本只留预扣的 27 格,而那一轮最多已扫 max_cells 格,
+        # 少记最多 316 次试验 → DSR 的 N 偏小 = 悄悄放松已锁定的 DSR ≥ 0.95(ADR 第 9 条)。
+        # 现在按**保守值**补记:宁可多记(更严),不可少记。
+        #
+        # 但"**拒绝**"(退出码 2)不算死掉:子进程是在自己的检查点(路径/审批/参数/导入)
+        # 上拒的,**一个格子都没扫**。那种情况下按网格补记就是凭空多记试验次数
+        # (DSR 被算得更严,严到把正常候选也挡掉)——不补记,但预扣的那 27 格也不退。
+        if exc.code != EXIT_REFUSED:
+            top_up_grid_trials(paths, {"trials": {"grid_cells": conservative_grid_cells(source, cfg["grid"]["max_cells"])}})
+        raise
+    heatmap, heatmap_note = None, None
+    # 格子数补记**不论成败**:失败的一轮同样消耗了试验(ADR 第 9 条)。
+    # 早先只在成功时补记,于是"扫了很多格子却在验证期失败"的轮次少记格子数,
+    # 后续的 DSR 少算试验次数 = 悄悄放松已锁定的 DSR ≥ 0.95。
+    top_up_grid_trials(paths, body)
     if "error" not in body:
-        top_up_grid_trials(paths, body)
+        record_job_sharpes(paths, body)
+        heatmap, heatmap_note = take_heatmap(body)
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
             "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
     if "error" in body:
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
+        if isinstance(body.get("trials"), dict):
+            result["trials"] = body["trials"]              # 失败的一轮用掉的试验次数要看得见
     else:
         result = {**base, **body}
+        if heatmap_note:
+            result["heatmap_note"] = heatmap_note
     save_with_report(result, paths)
+    if heatmap is not None:
+        save_job_heatmap(paths, result["run_id"], heatmap)
+    if campaign is not None:
+        record_lineage(paths, campaign, result, source)
     return result
 
 
@@ -858,118 +1323,272 @@ def cmd_gate(args) -> int:
     return run_cli_job(job)
 
 
-def run_gate_child(args) -> int:
+def _child_handoff() -> dict:
+    """子进程在**写结果的那一刻**才从 stdin 读父进程的交接单。
+
+    交接单走 stdin(不是环境变量):环境变量会原样进入子进程,候选 `os.environ` 就能摸到。
+
+    **但要说准这一层的真实边界**(第 30 轮 codex 实测后更正):
+    候选与框架**同进程**,它自己也能读 `sys.stdin` —— 候选若先读走交接单,
+    它同时拿到了结果文件的路径和 MAC 密钥,就能写出**父进程验签通过**的结果。
+    所以 MAC 验的是"通道没被截断/改写",**验不出结果的真实性**;
+    "拿不到交接单时盲伪造会被拒"成立,"偷到交接单就伪造不了"**不成立**。
+    彻底闭合要靠候选独立进程化(已登记为后续工作),不是靠这一层。"""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            raise OSError("没有可读的 stdin")
+        line = sys.stdin.readline()
+    except (OSError, ValueError):
+        raise JobError(EXIT_REFUSED, "缺少父进程交接单:子入口只能由父进程拉起")
+    try:
+        handoff = json.loads(line)
+    except ValueError:
+        raise JobError(EXIT_REFUSED, "父进程交接单不是合法 JSON")
+    if (not isinstance(handoff, dict) or not isinstance(handoff.get("path"), str)
+            or not isinstance(handoff.get("key"), str) or not handoff["key"]):
+        raise JobError(EXIT_REFUSED, "父进程交接单不合法")
+    return handoff
+
+
+# 通道**自己的入口**要按住,而且要按住得**真的挡得住**(第 30~32 轮 codex 逐轮实测):
+#   - 入口存成模块级常量不行:候选改 `api._EMIT_RESULT = 假函数` 一样生效;
+#   - 指纹的"被比的"与"期望的"若都是模块全局也不行:候选两边一起改,检查就静音;
+#   - 调用点查模块全局也不行:候选换掉它,整段指纹检查压根不执行。
+# 现在:入口与指纹的期望值都在 `_make_channel` / `_make_child_entry` 的闭包单元里,
+# 候选改模块属性 → 要么改不到(写的去向),要么被指纹逮到并**响亮地失败**(退出码 2)。
+def _clear_atexit(clear) -> None:
+    """清掉候选注册的 atexit 钩子。
+
+    结果写完就退出:钩子若还能跑,就只剩"事后篡改"的机会(候选可以顺手把结果文件改掉)。
+    框架自己在这条路径上没有必须执行的 atexit,所以整体清空是安全的。
+    `clear` 是**闭包里按住的那个** `atexit._clear`:候选把模块属性换成空函数也取消不了这一步。"""
+    try:
+        clear()
+    except Exception:                                    # noqa: BLE001 - 清不掉就清不掉,验签照样兜着
+        pass
+
+
+def _make_channel(handoff_reader):
+    """生成结果通道的两个入口:`(emit_result, emit_or_fail)`。
+
+    **指纹比对的两侧都得改不动**(第 32 轮 codex 复审的 High):此前"期望值"一侧
+    (`_JSON_DUMPS`、`_EMIT_RESULT`、`_ORIGINAL_HANDOFF_READER`……)是模块全局,
+    候选把"被比的"与"期望的"**一起**改写,检查就静音了;静音之后再劫持 `json.dumps`,
+    框架自己会在伪造的 payload 上算出**真 MAC**(真子进程实测:父层验签通过、采信)。
+    现在:期望值全部在本函数的局部变量里(闭包单元),候选改模块属性改不到;
+    payload 与 MAC 也用闭包里按住的那份序列化器/哈希算,不再查可被劫持的全局。
+
+    内层函数**不叫** `emit_result`:同名的话,函数体里的 `emit_result` 会解析到外层作用域
+    的局部名(闭包单元)而不是模块全局,指纹比对就成了"自己比自己"。"""
+    json_dumps, json_loads, hmac_new = json.dumps, json.loads, hmac.new
+    sha256, os_replace, write_text = hashlib.sha256, os.replace, Path.write_text
+    atexit_clear = atexit._clear
+    expected: dict = {}
+
+    def _tampered() -> bool:
+        return (json.dumps is not json_dumps or json.loads is not json_loads or hmac.new is not hmac_new
+                or hashlib.sha256 is not sha256 or os.replace is not os_replace
+                or Path.write_text is not write_text or atexit._clear is not atexit_clear
+                or emit_result is not expected["write"] or _emit_or_fail is not expected["emit"]
+                or _child_handoff is not handoff_reader)
+
+    def _write(body: dict) -> None:
+        """把结果写进父进程建的随机文件,并附上 MAC。stdout 只是日志,不是结果通道。"""
+        if _tampered():
+            raise JobError(EXIT_REFUSED, "写结果前发现运行时对象被改写,拒绝回传结果")
+        handoff = handoff_reader()
+        # 真结果已经算好了,现在把候选注册的 atexit 钩子清掉:钩子是在进程退出时跑的,
+        # 不清掉的话它能在**结果写完之后**再改一次那个文件。清空只影响这一个子进程。
+        _clear_atexit(atexit_clear)
+        payload = json_dumps(body, ensure_ascii=False, sort_keys=True)
+        mac = hmac_new(handoff["key"].encode("utf-8"), payload.encode("utf-8"), sha256).hexdigest()
+        path = Path(handoff["path"])
+        envelope = json_dumps({"mac": mac, "body": payload}, ensure_ascii=False)
+        tmp = path.with_name(path.name + ".tmp")
+        write_text(tmp, envelope, encoding="utf-8")
+        os_replace(tmp, path)
+
+    def _emit_or_fail(body: dict) -> int:
+        """把结果写回去;写不回去(没有交接单、信封坏了)就**响亮地失败**,不静默退出 0。
+        `_write` 在闭包单元里:候选把 `api.emit_result` 换成空函数,指纹检查照样会执行。"""
+        try:
+            _write(body)
+        except JobError as exc:
+            say_refusal(exc.message)
+            return exc.code
+        return EXIT_OK
+
+    expected["write"], expected["emit"] = _write, _emit_or_fail
+    return _write, _emit_or_fail
+
+
+emit_result, _emit_or_fail = _make_channel(_child_handoff)
+_EMIT_OR_FAIL = _emit_or_fail
+
+
+def _make_child_entry(handler, emit):
+    """把子进程入口包一层:`emit` 进闭包单元 —— 入口内部用的始终是**导入时捕获的那一份**。
+
+    第 32 轮 codex 实测:此前调用点查的是**模块全局** `_EMIT_OR_FAIL`,
+    候选 `api._EMIT_OR_FAIL = 假函数` 之后:
+      - 整段指纹检查**根本不执行**(指纹在 writer 体内,假函数压根不调它);
+      - 父进程照常采信假结果,退出码 0。
+    改成闭包单元之后:候选改模块属性 → 指纹检查照样会跑 → **响亮地失败**(退出码 2),
+    写结果的去向也不受它摆布。
+
+    `handler` 的签名是 `handler(args, emit)`:回传一律走传进来的 `emit`,
+    不再查模块全局。"""
+    def _entry(args):
+        return handler(args, emit)
+    _entry.handler = handler       # 静态核对用:入口真正执行的是哪个处理函数
+    return _entry
+
+
+def _handle_gate_child(args, emit) -> int:
     """子进程:在 15 分钟玉米数据的滚动验证段上做门槛评估。测试段不可达(research_gate 内断言)。"""
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_gate
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入之后才用到的框架函数,先绑成局部名(见 _handle_backtest_child 的说明)
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
         random_runs, prior_trials = child_int_args(args)
+        run_variances = child_run_variances(args)
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
     if args.on_plateau not in ("0", "1"):
-        print("--on-plateau 只能是 0 或 1", file=sys.stderr)
+        say("--on-plateau 只能是 0 或 1")
         return EXIT_REFUSED
+    # 评估输入(数据文件、品种、键、滚动窗口)在**候选导入之前**取成不可变的局部值:
+    # 此前这些都在导入之后才读 `wf.*`,候选改写 `wf.build_windows`/`wf.Window` 就能自己决定
+    # "样本外"是哪一段、用哪份数据(第 32 轮 codex 复审实测:验证窗口被换成了选参窗口)。
+    data_file, symbol, key = wf.DATA_FILE, wf.SYMBOL, wf.KEY
+    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
-        return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
+        return emit({"error": exc.detail})
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     try:
         result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
+                          runner=engine_runner(key), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
                           data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=prior_trials)
+                          prior_trials=prior_trials, run_variances=run_variances)
     except Exception as exc:
-        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
-        return EXIT_OK
-    print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
-    return EXIT_OK
+        # 门槛评估跑在滚动**验证窗口**上:这一层的报错原文不外传(阶段=validation)
+        return emit({"error": describe(exc, PHASE_VALIDATION)})
+    return emit(result)
 
 
-def run_evaluate_child(args) -> int:
+def _handle_evaluate_child(args, emit) -> int:
     """子进程：加载候选，读取其 param_grid，在选参窗口选参，再在滚动验证窗口做门槛评估。测试段不可达。"""
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_evaluation
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from vnpy.trader.constant import Exchange
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入之后才用到的框架函数,先绑成局部名(见 _handle_backtest_child 的说明)
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
+        run_variances = child_run_variances(args)
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
+    # 评估输入在**候选导入之前**取成不可变的局部值(见 _handle_gate_child 的说明)。
+    data_file, symbol, key = wf.DATA_FILE, wf.SYMBOL, wf.KEY
+    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
+    # 上限要在导入前取成**局部整数**:`cfg` 是个可变字典,调用点若在导入之后才 `cfg["grid"][...]`,
+    # 候选改写它(codex 第 33 轮实测经帧反射把 343 改成 10^9)就立刻生效。
+    max_cells = int(cfg["grid"]["max_cells"])
+    min_round_trips = int(cfg["grid"]["min_round_trips"])
+    windows = [(w.name, w.train_start, w.train_end, w.valid_start, w.valid_end) for w in wf.build_windows()]
+    # 窗口不变量自己复查,不信任 `wf.Window.__post_init__`:验证窗口必须整体晚于选参窗口的结束。
+    select_window = (windows[0][1], windows[0][2])
+    if any(valid_start <= select_window[1] for _, _, _, valid_start, _ in windows):
+        say("滚动窗口不满足\"验证窗口晚于选参窗口\",拒绝评估")
+        return EXIT_REFUSED
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
-        return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = wf.build_windows()
-    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
+        return emit({"error": exc.detail})
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     try:
         result = run_evaluation(
-            candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
-            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
-            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
-    except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
-        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
-        return EXIT_OK
-    print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
-    return EXIT_OK
+            candidate_cls=candidate, bars=bars, runner=engine_runner(key), random_cls=RandomEntry15mStrategy,
+            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=max_cells,
+            min_round_trips=min_round_trips, select_window=select_window,
+            validation_windows=[(name, vs, ve) for name, _, _, vs, ve in windows], prior_trials=prior_trials,
+            run_variances=run_variances)
+    except Exception as exc:
+        # 评估跑在**验证窗口**上(选参窗口里的错由 research_gate 自己分段并显式给阶段);
+        # 这里兜住的是框架侧的意外异常,按验证窗口处理(fail-closed:原文不外传)
+        return emit({"error": describe(exc, PHASE_VALIDATION)})
+    return emit(result)
 
 
-def run_child(args) -> int:
+def _handle_backtest_child(args, emit) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
+    say = say_refusal            # 候选改模块属性也改不到这里:拒绝原因不能被它静音
+    # 候选导入**之后**才用到的框架函数,先绑成局部名:候选改模块属性
+    # (`api.backtest_stats_row = 假函数`)改不到局部名 —— 结果的"生产者"不能由候选摆布。
+    # (第 32 轮 codex 指出:本轮按住的只是"写出去向"与"检查本身",没按住"内容")
+    stats_row = backtest_stats_row
+    round_trip_pnls = rs.round_trip_pnls
+    describe = describe_error
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         params = child_params(args)           # 先查参数:比载入候选更便宜,也让"绕过父入口"这条路走不通
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
     try:
         start, end = rs.segment_window(args.key, args.segment)
     except rs.SandboxError as exc:
         # 测试段/未知品种在这里被拒:退出码必须是"拒绝"(2),不能是未捕获异常的 1
-        print(str(exc), file=sys.stderr)
+        say(str(exc))
         return EXIT_REFUSED
     try:
         strategy_class = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
-        print(exc.message, file=sys.stderr)
+        say(exc.message)
         return exc.code
     except CandidateError as exc:
-        print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
-        return EXIT_OK
+        return emit({"error": exc.detail})
     try:
         stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
-        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
-        return EXIT_OK
-    row = backtest_stats_row(stats)          # 投影规则见 risk/report.py:面板校验用的是同一份
-    pnls = rs.round_trip_pnls(trades, INSTRUMENTS[args.key].size)
-    print(CHILD_MARK + json.dumps({"stats": row, "pnls": pnls}))
-    return EXIT_OK
+        # 阶段由**段**决定:训练段就是选参窗口那一层(放开),验证段按验证窗口处理(原文不外传)
+        phase = PHASE_SELECTION if args.segment == "train" else PHASE_VALIDATION
+        return emit({"error": describe(exc, phase)})
+    row = stats_row(stats)                  # 投影规则见 risk/report.py:面板校验用的是同一份
+    pnls = round_trip_pnls(trades, INSTRUMENTS[args.key].size)
+    return emit({"stats": row, "pnls": pnls})
+
+
+# 三个子进程入口:回传走**闭包单元**里的那份 emit,候选改模块属性骗不过它(见 _make_child_entry)。
+run_gate_child = _make_child_entry(_handle_gate_child, _EMIT_OR_FAIL)
+run_evaluate_child = _make_child_entry(_handle_evaluate_child, _EMIT_OR_FAIL)
+run_child = _make_child_entry(_handle_backtest_child, _EMIT_OR_FAIL)
 
 
 # ---------- results ----------
@@ -981,6 +1600,11 @@ def cmd_results(args) -> int:
     except rs.SandboxError as exc:
         return refuse(str(exc))
     return EXIT_OK
+
+
+def _add_run_variance_args(parser: argparse.ArgumentParser) -> None:
+    """内部子命令的先验方差列表(见 child_run_variances):JSON 数组字符串。"""
+    parser.add_argument("--prior-run-variances", default=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1035,12 +1659,14 @@ def build_parser() -> argparse.ArgumentParser:
     gchild.add_argument("--on-plateau", required=True, choices=("0", "1"))
     gchild.add_argument("--random-runs", type=int, required=True)
     gchild.add_argument("--prior-trials", type=int, default=None)
+    _add_run_variance_args(gchild)
     gchild.set_defaults(func=run_gate_child)
     echild = sub.add_parser("_evaluate_child")  # 内部使用
     for name in ("file", "cls", "sha256"):
         echild.add_argument(f"--{name}", required=True)
     echild.add_argument("--random-runs", type=int, required=True)
     echild.add_argument("--prior-trials", type=int, default=None)
+    _add_run_variance_args(echild)
     echild.set_defaults(func=run_evaluate_child)
     return parser
 

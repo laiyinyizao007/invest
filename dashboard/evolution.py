@@ -105,7 +105,7 @@ def parse_record(row: Any) -> Record:
         generation=generation,
         candidate_sha256=sha,
         parent_sha256=parent,
-        run_id=_text(row.get("run_id"), 32),
+        run_id=_text(row.get("run_id"), 64),
         status=_text(row.get("status"), 64),
         sharpe=_num(row.get("sharpe")),
         total_return=_num(row.get("total_return")),
