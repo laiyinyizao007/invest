@@ -1161,6 +1161,12 @@ def site_package_roots() -> tuple[Path, ...]:
 # 而这里传的是一个仓库内的文件路径(不是秘密),并且子进程要靠它拿到
 # 「候选开跑之前」的基准。
 SITE_SNAPSHOT_ENV = "RESEARCH_SITE_SNAPSHOT"
+# 快照文件的哈希:父进程算出、经环境变量传给子进程。
+# **为什么需要**:快照文件落在系统临时目录,那是**候选可写**的——
+# 候选在上一轮把文件改掉,下一轮就会读到伪造的快照(里面有它自己写的模块)。
+# 哈希由父进程算(候选改不了父进程的环境),子进程读到文件后先核对哈希,
+# 对不上就当「没有基准」→ fail-closed(一律拒)。
+SITE_SNAPSHOT_SHA_ENV = "RESEARCH_SITE_SNAPSHOT_SHA256"
 
 # 站点包快照缓存:键 = 站点包根,值 = {绝对路径(规范化字符串): (mtime_ns, size)}。
 _SITE_SNAPSHOT_CACHE: dict[str, dict[str, tuple[int, int]]] = {}
@@ -1268,7 +1274,14 @@ class RepoImportGuard:
         env_path = os.environ.get(SITE_SNAPSHOT_ENV)
         if env_path:
             # 父进程拍的那份(生产路径:research_api.spawn_child 经环境变量传下来)
-            self.site_snapshot = read_site_snapshot(Path(env_path))
+            snapshot = read_site_snapshot(Path(env_path))
+            # **核对哈希**:快照文件在系统临时目录,那是候选可写的地方——
+            # 候选改了它,下一轮就会读到伪造的快照。哈希由父进程算并经环境变量传下来,
+            # 候选改不了父进程的环境。对不上 → 当作「没有基准」→ fail-closed。
+            expected = os.environ.get(SITE_SNAPSHOT_SHA_ENV, "")
+            if expected and file_sha256(Path(env_path)) != expected:
+                snapshot = {}
+            self.site_snapshot = snapshot
         else:
             # 父进程没给(例如测试直接在进程内跑候选)→ 用**本进程的第一份**快照:
             # snapshot_site_files 按站点包根做**进程级**缓存,所以这份是

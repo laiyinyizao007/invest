@@ -54,6 +54,9 @@ tests/test_research_api.py::test_a_candidate_that_rewrites_a_framework_object_at
    **父进程不是候选执行的**(候选永远跑在子进程里),所以这份快照**不在候选的控制之下**。
    父进程没给时(例如测试直接在进程内跑候选),退回**本进程的第一份**快照 ——
    同样在候选开跑之前。
+   **快照文件本身也在候选可写的目录里**(系统临时目录),所以父进程还把**它的哈希**
+   经环境变量一起传下来:子进程读到文件先核对哈希,对不上就当「没有基准」→ fail-closed。
+   (哈希由父进程算,候选改不了父进程的环境。)
 4. 新增 `_is_site_package(resolved)` 与 `_outside_repo(resolved)`:
    **仓库之外 = 物理上不在仓库根之下 _或_ 它是「候选开跑之前就装好的站点包文件」**。
    「装好的」= 在快照里 **且** (mtime, size) 都没变。
@@ -96,8 +99,10 @@ tests/test_research_api.py::test_a_candidate_that_rewrites_a_framework_object_at
 | 仓库外的站点包 → 仍允许(回归) | 放行 |
 | 仓库自己的 `risk/evil`、`scripts/framework` → 仍被拒 | 拦截 |
 | 候选往站点包里**写出来**的模块 → 仍被拒 | 拦截 |
+| 基准算不出来(站点包根一个都发现不了)→ 仍被拒 | 拦截 |
 | **跨轮次**:第 1 轮写的,第 2 轮(新守卫)导 → 仍被拒 | 拦截 |
 | 装好的站点包文件**被改写** → 仍被拒 | 拦截 |
+| 候选**伪造快照文件** → 守卫不采信(fail-closed) | 拦截 |
 | `site_package_roots()` 真的能取到根(API 存在性探针) | — |
 
 **同一份用例在修复前是红的**(3 failed / 6 passed),而且红的理由正是那道误分类

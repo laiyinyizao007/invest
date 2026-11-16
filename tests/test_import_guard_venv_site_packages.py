@@ -280,6 +280,32 @@ def test_when_the_baseline_cannot_be_computed_the_site_package_is_refused(
     assert reason is not None, "没有基准却放行了 —— 不是 fail-closed"
 
 
+def test_a_tampered_snapshot_file_is_refused(
+    repo: Path, snapshot_env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拦截:候选**伪造快照文件** → 守卫不采信(fail-closed)。
+
+    快照文件落在系统临时目录,那是**候选可写**的地方:候选在上一轮把文件
+    改掉(把自己的模块加进快照),下一轮就会读到一份「说自己装好了」的清单。
+    哈希由**父进程**算并经环境变量传下来,候选改不了父进程的环境,
+    所以对不上哈希就当「没有基准」→ 仓库内的站点包一律拒。
+    """
+    import json
+
+    # 候选把自己写的模块加进快照,再把文件替换掉
+    forged = json.loads(snapshot_env.read_text(encoding="utf-8"))
+    planted = repo / ".venv" / "Lib" / "site-packages" / "forged.py"
+    marker = "MARKER = 1\n"
+    planted.write_text(marker, encoding="utf-8")
+    forged[os.path.normpath(str(planted.resolve()))] = [0, len(marker)]
+    snapshot_env.write_text(json.dumps(forged), encoding="utf-8")
+    # 环境变量里的哈希仍是父进程算的那份 → 对不上
+    monkeypatch.setenv(SNAPSHOT_ENV, str(snapshot_env))
+    guard = _guard(repo)
+    reason = guard.check("forged")
+    assert reason is not None, "伪造的快照文件被采信了 —— 候选可以给自己写后门"
+
+
 def test_a_repo_module_written_during_the_run_is_still_refused(
     repo: Path, snapshot_env,
 ) -> None:

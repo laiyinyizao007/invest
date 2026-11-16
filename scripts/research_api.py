@@ -220,7 +220,11 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
     # 传出去,而这里传的是仓库内一个文件路径(不是秘密),
     # 子进程要靠它拿到「候选开跑之前」的基准。
     env = rs.sandbox_env(os.environ)
-    env[rs.SITE_SNAPSHOT_ENV] = str(site_snapshot_path())
+    snapshot_path = site_snapshot_path()
+    env[rs.SITE_SNAPSHOT_ENV] = str(snapshot_path)
+    # 快照文件的哈希也一起给:文件在系统临时目录(候选可写),候选改了它,
+    # 下一轮就会读到伪造的快照。哈希由父进程算,候选改不了父进程的环境。
+    env[rs.SITE_SNAPSHOT_SHA_ENV] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                             errors="replace", cwd=rc.CODE_ROOT, env=env)
     try:
