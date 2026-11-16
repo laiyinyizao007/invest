@@ -55,7 +55,9 @@ import pause_trading  # noqa: E402
 from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
-from ctp_tools.collector import Collector, build_cases, check_positions, close_engine, in_trading_session  # noqa: E402
+from ctp_tools.collector import (  # noqa: E402
+    Collector, build_cases, check_positions, close_engine, direction_text, in_trading_session,
+)
 from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, resolve_allowed_for_broker  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
@@ -113,7 +115,6 @@ class Ctx:
     failed_steps: list[str] = field(default_factory=list)      # 抛了异常的步骤:证据不完整,main 据此返回崩溃码
     trades: list = field(default_factory=list)
     notifier: object | None = None
-    state_dir: Path = BT_ROOT / "state"
     pump: Callable[[], None] = lambda: None       # 测试里用来推进定时器;真实运行里定时器自己在跑
     sleep: Callable[[float], None] = time.sleep
     contract: object | None = None
@@ -241,10 +242,28 @@ def send(ctx: Ctx, req: OrderRequest) -> str:
 
 
 def cancel_active(ctx: Ctx, vt_orderids: list[str]) -> None:
+    """撤掉还挂着的委托,并**等到终态**。
+
+    等终态有两个用处:
+    - 撤单回报到达后,风控的「汇总撤单笔数」才 +1。不等的话,下一项指标的计数**基数**
+      可能取到旧值(还有撤单回报在路上)→ 阈值对照拿旧基数去比,结论不可靠
+      (2026-11-16 codex 复核提出:基数取旧会让「阈值内」那一笔被直接拦下)。
+    - 撤单请求发出 ≠ 撤成功:还挂着的单会变成"晚到的成交"。
+    """
     for oid in vt_orderids:
         order = ctx.collector.order_of(oid)
         if order is not None and order.is_active():
             ctx.main_engine.cancel_order(order.create_cancel_request(), ctx.gateway_name)
+
+    def all_terminal() -> bool:
+        for oid in vt_orderids:
+            order = ctx.collector.order_of(oid)
+            if order is not None and order.is_active():
+                return False
+        return True
+
+    if vt_orderids:
+        ctx.wait_until(all_terminal, ctx.cancel_wait)
 
 
 # ======================= 计数器等待 =======================
@@ -264,17 +283,18 @@ def settle_counter(ctx: Ctx, rule, attr: str, timeout: float = 5.0) -> int:
     """读计数**之前**先等它稳定下来(连续 1 秒不变才算数)。
 
     刚撤掉的委托可能还在路上,基数取早了,「阈值内」的那一笔会被直接拦下,对照就做不成。
+    「稳定 1 秒」按**真实时间**算(`time.monotonic()` 的差),不按循环次数折算 ——
+    折算出来的是「转了 10 圈」,机器慢一点就变成 3 秒,口径会飘。
     """
     deadline = time.monotonic() + timeout
-    last, stable = -1, 0.0
+    last, stable_since = -1, 0.0
     while time.monotonic() < deadline:
         cur = counter_value(rule, attr)
-        if cur == last:
-            stable += 0.1
-            if stable >= 1.0:
-                return cur
-        else:
-            last, stable = cur, 0.0
+        now = time.monotonic()
+        if cur != last:
+            last, stable_since = cur, now
+        elif now - stable_since >= 1.0:
+            return cur
         ctx.sleep(0.1)
     return counter_value(rule, attr)
 
@@ -301,11 +321,22 @@ def locked_state_note(state_file: Path) -> str:
     锁定状态下开仓委托会被本地风控**全部**拦下:200 笔稳定运行一笔都发不出去,
     这一轮取证白费一次券商登录额度(国信会查登录次数),证据还只剩一堆"被拦下"。
     返回空串 = 没锁,可以跑。
+
+    **状态文件损坏 = 判不出来** → 按「可能锁着」处理(拒绝跑),而不是当成「没锁」。
+    文件**不存在**是头一次跑的正常情况(还没有状态),那种才放行。
+    读不出来还照跑的后果:风控按锁定状态把委托全拦下,白费一次登录额度,
+    证据只剩一堆"被拦下",还容易被人当成"阈值失灵"。
     """
     try:
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-    except Exception:   # noqa: BLE001  读不到状态文件就当没有状态:能不能交易由风控自己判,这里只做省登录的提示
-        return ""
+        raw = state_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""                          # 从来没锁过:没有状态文件,正常
+    except OSError as exc:
+        return f"账户风控状态文件读不出来({exc}),无法确认是否被锁,先修好再跑"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "账户风控状态文件损坏,无法确认是否被锁(可能锁着),先修好或删掉该文件再跑"
     if data.get("hard_locked"):
         return (f"账户处于硬锁定状态({data.get('hard_reason') or '原因未记录'}),"
                 "取证委托会被本地风控全部拦下,请先人工解锁再跑")
@@ -396,7 +427,7 @@ def step_basic_trade(ctx: Ctx, book: Book) -> None:
         close_lines.append("⚠ 平仓后交易通道不在线,持仓查询不可信,无法确认账户已空,请人工核对")
     else:
         close_lines.append("平仓后账户空仓")
-    trade_lines = [ctx.clean(f"成交回报 {t.vt_symbol} {t.direction.value}{t.offset.value} {t.volume}@{t.price} 成交号 {t.tradeid}")
+    trade_lines = [ctx.clean(f"成交回报 {t.vt_symbol} {direction_text(t.direction)}{t.offset.value} {t.volume}@{t.price} 成交号 {t.tradeid}")
                    for t in ctx.trades[-4:]] or ["(未收到成交回报)"]
     everything = open_ok and close_ok and flat
     book.add("T3", PASS if everything else FAIL, "" if everything else "平仓未完成或未回到空仓", [Shot("", open_lines + close_lines)], started)
@@ -509,7 +540,17 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         set_limit(limit)
         lines.append(f"设置{label}阈值 = {limit}(当前已有 {base})")
         advanced = False
+        cancel_confirmed: bool | None = None     # 撤单指标:我们**自己**那张单撤成功了吗
+        stale_base = False                          # 计数基数取旧 → 对照做不成
+        a = b = ""
+        alerts: list[dict] = []
         try:
+            # 设完阈值**重新读一次**计数:此刻计数已经 ≥ 阈值 = 刚才那个基数取旧了
+            # (有别的委托回报在途中)→ 这一轮对照做不成 → 判不出来(SKIP),不是「阈值失灵」。
+            now_count = count_of(counter_attr)
+            if now_count >= limit:
+                stale_base = True
+                lines.append(f"⚠ 设置阈值时计数已经是 {now_count}(≥ 阈值 {limit}),基数取旧了,本次对照不可靠")
             a = send(ctx, make_req(ctx, price=probe_price(ctx)))
             if a:
                 made.append(a)
@@ -522,11 +563,15 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 它只在**撤单回报**到达后才 +1 —— 发委托时它一动不动,这时候先等它
             # 是白等 5 秒,还会把「计数没推进」这个结论安错地方(撤单指标就永远 SKIP 了)。
             # 所以撤单指标的推进判断放到撤单之后(见下面)。
-            advanced = False
             if not need_cancel:
                 advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, 5.0)
                 if not advanced:
                     lines.append(f"⚠ {label}计数在 5 秒内没有推进(仍为 {count_of(counter_attr)}),下面的对照不可靠")
+                elif count_of(counter_attr) > base + 1:
+                    # 一次跳了不止 +1 = 有**别的**委托回报混进来了 → 基数不可信 → 判不出来。
+                    stale_base = True
+                    lines.append(f"⚠ {label}计数一次跳到 {count_of(counter_attr)}(不止 +1),"
+                                 "有别的委托回报混进来,本次对照不可靠")
             if need_cancel and a:
                 order_a = ctx.collector.order_of(a)
                 if order_a is not None:
@@ -534,7 +579,10 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                 cancelled = ctx.wait_until(lambda: ctx.collector.order_of(a) is not None and not ctx.collector.order_of(a).is_active(),
                                            ctx.cancel_wait)
                 final = ctx.collector.order_of(a)
-                if cancelled and final is not None and final.status == Status.CANCELLED:
+                # 撤单**确认**才算数:撤单请求发出 ≠ 撤成功。没确认就说明这一轮的触发
+                # 不是我们想要的那次 → 判不出来(SKIP),不能算「阈值生效」。
+                cancel_confirmed = bool(cancelled and final is not None and final.status == Status.CANCELLED)
+                if cancel_confirmed:
                     lines.append("已撤销该委托,累计撤单数达到阈值")
                 else:
                     lines.append(f"⚠ 撤单未确认(终态 {final.status.value if final else '无回报'}),撤单计数没有达到阈值")
@@ -555,12 +603,15 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         finally:
             restore()                      # 无论如何还原阈值并撤掉演示委托,不留下挂单
             cancel_active(ctx, made)
-        ok = bool(a) and not b and bool(alerts)
+        ok = bool(a) and not b and bool(alerts) and not stale_base and (not need_cancel or cancel_confirmed)
         oks.append(ok)
-        # 「判不出来」只认一种情况:**委托发出去了,但计数没推进**(回报没到/没回)。
+        # 「判不出来」有三种:①委托发出去了但计数没推进(回报没到/没回);
+        # ②计数**基数取旧**(有别的回报混进来)—— 拿旧基数比出来的结论不算数;
+        # ③撤单指标里**我们自己的撤单没确认** —— 触发不是我们想要的那一次。
         # 委托压根没发出去(a 为空)不是判不出来,是实打实的失败(阈值内就被拦了)——
         # 把它混进 SKIP 就是把失败洗成「没法测」。
-        stall_flags.append(bool(a) and not advanced)
+        stall_flags.append((bool(a) and not advanced) or stale_base
+                           or (need_cancel and bool(a) and not cancel_confirmed))
         shots.append(Shot(label, lines))
 
     if daily is None:
@@ -678,7 +729,7 @@ def step_counter_errors(ctx: Ctx, book: Book) -> None:
         order = ctx.collector.wait_order_final(oid, timeout=8.0) if oid else None
         text = ctx.collector.wait_error(ts, timeout=5.0, since=since)
         ok = bool(text) and (not expect or expect in text)
-        shots.append(Shot(label, [ctx.clean(f"直发委托(绕过本地风控):{req.symbol} {req.direction.value}{req.offset.value} {req.volume}手 @ {req.price}"),
+        shots.append(Shot(label, [ctx.clean(f"直发委托(绕过本地风控):{req.symbol} {direction_text(req.direction)}{req.offset.value} {req.volume}手 @ {req.price}"),
                                   ctx.clean(f"委托终态:{order.status.value if order else '无回报'}"),
                                   ctx.clean(f"柜台错误提示:{text or '(未收到柜台错误文本)'}")]))
         if not ok and expect:

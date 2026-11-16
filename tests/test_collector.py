@@ -19,7 +19,7 @@ from vnpy.trader.logger import ERROR
 from vnpy.trader.object import LogData, PositionData
 
 from ctp_tools.collector import (
-    Collector, merge_position_rows, position_key, query_positions, select_latest_snapshot,
+    Collector, direction_text, merge_position_rows, position_key, query_positions, select_latest_snapshot,
 )
 
 
@@ -206,12 +206,66 @@ def test_an_empty_last_batch_keeps_the_earlier_rows():
     assert select_latest_snapshot([old, []]) == old
 
 
+class _FakeDirection:
+    """假装是 vn.py 的 Direction:枚举名固定,`.value` 随 locale 变。"""
+
+    def __init__(self, name: str, value: str) -> None:
+        self.name = name
+        self.value = value
+
+
 def test_position_key_treats_a_bare_direction_string_the_same_as_the_enum():
-    """方向统一取 `direction.value`,裸字符串与枚举归到同一个键。"""
-    assert position_key(_pos("c2701", Direction.LONG, 3)) == ("c2701.DCE", "Long")
+    """方向统一取**语言无关的枚举名**:枚举、"Long"、"多" 都归到同一个键 'LONG'。"""
+    assert position_key(_pos("c2701", Direction.LONG, 3)) == ("c2701.DCE", "LONG")
     row = SimpleNamespace(vt_symbol="c2701.DCE", direction="Long", volume=3)
-    assert position_key(row) == ("c2701.DCE", "Long")
+    assert position_key(row) == ("c2701.DCE", "LONG")
+    row_cn = SimpleNamespace(vt_symbol="c2701.DCE", direction="多", volume=3)
+    assert position_key(row_cn) == ("c2701.DCE", "LONG")
     assert position_key(SimpleNamespace(vt_symbol="", direction=None)) is None
+
+
+def test_a_row_without_a_usable_direction_is_dropped():
+    """方向认不出来(空字符串)→ 没有键 → 不能合并,也不能安全地平。"""
+    assert position_key(SimpleNamespace(vt_symbol="c2701.DCE", direction="", volume=3)) is None
+
+
+def test_an_unknown_direction_is_kept_as_its_own_key():
+    """认不出来的方向**不丢行**,原样(大写)当键:宁可多一行,也不能凭空合并。
+
+    它不会变成平仓单:`plan_closes` 只认 LONG/SHORT,别的方向直接跳过(交人工)。
+    """
+    assert position_key(SimpleNamespace(vt_symbol="c2701.DCE", direction="weird", volume=3)) == ("c2701.DCE", "WEIRD")
+
+
+def test_the_key_does_not_depend_on_the_translated_value():
+    """`.value` 是 gettext 翻译过的(英文 'Long' / 中文 '多'),键只能认枚举名。
+
+    vn.py 的 `Direction.LONG = _("多")`:英文 locale 下 value 是 'Long',中文 locale 下是 '多'。
+    拿 value 当合并键 = 同一份持仓在不同 locale 的机器上归出不同的键 → 合并漏行 →
+    该平的没平(少平)或去平一个不存在的方向(超平被柜台整单拒)。
+    """
+    en = SimpleNamespace(vt_symbol="c2701.DCE", direction=_FakeDirection("LONG", "Long"), volume=3)
+    cn = SimpleNamespace(vt_symbol="c2701.DCE", direction=_FakeDirection("LONG", "多"), volume=3)
+    assert position_key(en) == position_key(cn) == ("c2701.DCE", "LONG")
+
+
+def test_positions_from_two_locales_merge_into_one_row():
+    """两种 locale 采到的**同一笔**持仓必须合并成一行,不能变成两行各平一手。"""
+    en = SimpleNamespace(vt_symbol="c2701.DCE", direction=_FakeDirection("LONG", "Long"), volume=3)
+    cn = SimpleNamespace(vt_symbol="c2701.DCE", direction=_FakeDirection("LONG", "多"), volume=3)
+    merged = merge_position_rows([en, cn])
+    assert len(merged) == 1
+    assert merged[0].volume == 3
+
+
+def test_the_direction_text_is_chinese_whatever_the_locale():
+    """给人看的文案固定中文:报告交到国信手里,不能因为机器 locale 不同变成英文。"""
+    assert direction_text(_FakeDirection("LONG", "Long")) == "多"
+    assert direction_text(_FakeDirection("SHORT", "Short")) == "空"
+    assert direction_text(_FakeDirection("NET", "Net")) == "净"
+    assert direction_text(Direction.LONG) == "多"
+    assert direction_text("LONG") == "多"
+    assert direction_text("") == ""
 
 
 def test_batches_are_split_by_the_gap_between_reports():

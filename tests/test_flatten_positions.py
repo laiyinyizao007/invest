@@ -230,7 +230,7 @@ def test_two_sided_positions_are_reconciled_per_direction():
     assert ok and problems == []
     # 空头那 3 手没平掉:必须点名是哪个方向
     ok, problems = reconcile_filled(initial, [], results[:1])
-    assert not ok and "c2601.DCE Short" in problems[0]
+    assert not ok and "c2601.DCE 空" in problems[0]
 
 
 # ---------- 撤单要等到终态 ----------
@@ -565,6 +565,23 @@ def test_a_dry_run_only_prints_the_plan(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert "计划:卖出平仓 c2701.DCE 3 手" in out
     assert "未加 --confirm-flatten" in out
+
+
+def test_a_short_position_is_flagged_for_a_direction_check(monkeypatch, tmp_path, capsys):
+    """柜台报空头 → 计划是「买入平仓」→ 必须点名提示人工核对方向。
+
+    为什么:CTP 网关把**净持仓账户的净多**也报成空头(PosiDirection=净 → Direction.SHORT,
+    见 vnpy_ctp 的 DIRECTION_CTP2VT:键 '1' 与 D_Sell 撞车)。那种情况下这单是**加仓**。
+    双边持仓账户不受影响,但两者在 vnpy 侧长得一样,代码里分不出来 → 交给人核对。
+    """
+    import flatten_positions as f
+
+    pos = _pos("c2701", Exchange.DCE, Direction.SHORT, 3)
+    pos.vt_symbol = "c2701.DCE"
+    _install_fakes(monkeypatch, tmp_path, positions=[pos])
+    assert f.run(_args(tick_wait=0.0)) == f.EXIT_OK
+    err = capsys.readouterr().err
+    assert "买入平仓" in err and "加仓" in err
 
 
 def test_a_position_without_a_reliable_split_goes_to_a_human(monkeypatch, tmp_path, capsys):

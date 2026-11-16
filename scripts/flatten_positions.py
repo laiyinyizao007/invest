@@ -49,7 +49,9 @@ FLATTEN_ROOT = bootstrap.ROOT / ".vntrader_flatten"
 ISOLATED = bootstrap.isolate_state(FLATTEN_ROOT.name)
 
 from ctp_tools.broker_targets import allowed_for_broker, resolve_allowed  # noqa: E402
-from ctp_tools.collector import Collector, close_engine, merge_position_rows, query_positions  # noqa: E402
+from ctp_tools.collector import (  # noqa: E402
+    Collector, close_engine, direction_text, merge_position_rows, normalize_direction, query_positions,
+)
 from ctp_tools.penetration import check_target, mask_account  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
@@ -89,7 +91,7 @@ class ClosePlan:
 
     def to_dict(self) -> dict:
         return {"vt_symbol": self.vt_symbol, "code": self.code, "exchange": self.exchange.value,
-                "direction": self.direction.value, "offset": self.offset.value,
+                "direction": direction_text(self.direction), "offset": self.offset.value,
                 "volume": self.volume, "price": self.price, "reason": self.reason}
 
 
@@ -146,8 +148,13 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]],
 
     - 平多(持仓方向 LONG)→ 卖出(SHORT),挂在**买一**上主动打买盘;
     - 平空(持仓方向 SHORT)→ 买入(LONG),挂在**卖一**上主动打卖盘;
-    - 方向是 NET(净持仓账户)→ **不猜**:净持仓回报里没有多空之分,
-      猜错方向就是"平仓变成开仓",直接放弃并让调用方报错;
+    - 方向是 NET → **不猜**:方向不明就放弃,交给上层报错。
+      注意:CTP 网关**不会**回报 NET —— `vnpy_ctp` 的 `DIRECTION_CTP2VT` 是从
+      `DIRECTION_VT2CTP` 反推的,键 '1'(PosiDirection=净)与 D_Sell 撞车,
+      于是**净持仓账户的净多会被报成 `Direction.SHORT`**(ctp_gateway.py 的
+      `DIRECTION_CTP2VT[data["PosiDirection"]]`)。双边持仓账户不受影响。
+      所以"平空"这一路在净持仓账户上可能是**加仓**——这个盲区没法在代码里判掉,
+      只能由人在发单前拿交易客户端核对方向(见 `run()` 里的提示)。
     - 今昨仓拆分不可信(上期所/能源中心的纯今仓与混合仓)→ **不生成单**,
       见 `split_is_reliable`;这类持仓由 `manual_positions()` 列出来交给人工。
     """
@@ -208,7 +215,7 @@ def manual_positions(positions: list) -> list[str]:
         if int(getattr(pos, "volume", 0) or 0) <= 0:
             continue
         if not split_is_reliable(pos):
-            out.append(f"{pos.vt_symbol} {pos.direction.value} {pos.volume} 手"
+            out.append(f"{pos.vt_symbol} {direction_text(pos.direction)} {pos.volume} 手"
                        "(上期所/能源中心的今昨仓拆不出来,自动平仓会被柜台拒单,请人工平仓)")
     return out
 
@@ -255,7 +262,10 @@ def reconcile_filled(initial: list, remaining: list, results: list) -> tuple[boo
     """
     def key_of(pos) -> tuple[str, str]:
         direction = getattr(pos, "direction", None)
-        return pos.vt_symbol, getattr(direction, "value", str(direction))
+        # 方向用**语言无关的枚举名**当键:vn.py 的 Direction 走 gettext,`.value`
+        # 随 locale 变(英文 'Long' / 中文 '多'),拿它当键会让同一份持仓在两台机器上
+        # 归出不同的键 → 对账两边对不上 → 报假差异。
+        return pos.vt_symbol, normalize_direction(direction) or str(direction)
 
     def vol_of(pos) -> int:
         return int(getattr(pos, "volume", 0) or 0)
@@ -266,15 +276,18 @@ def reconcile_filled(initial: list, remaining: list, results: list) -> tuple[boo
     initial_vol = {key_of(p): vol_of(p) for p in merge_position_rows(initial) if vol_of(p) > 0}
     left_vol = {key_of(p): vol_of(p) for p in merge_position_rows(remaining) if vol_of(p) > 0}
     # 平仓单的方向与持仓方向相反:卖出(空)平的是多头。
-    opposite = {Direction.SHORT.value: Direction.LONG.value, Direction.LONG.value: Direction.SHORT.value}
+    # 留痕里的方向可能是旧格式的英文文案('Long'/'Short')或新的中文('多'/'空'),
+    # 两种都要认得 → 统一先归一成枚举名。
+    opposite = {normalize_direction(Direction.SHORT): normalize_direction(Direction.LONG),
+                normalize_direction(Direction.LONG): normalize_direction(Direction.SHORT)}
     traded: dict[tuple[str, str], int] = {}
     for item in results:
-        close_dir = item.get("direction", "")
+        close_dir = normalize_direction(item.get("direction", "")) or item.get("direction", "")
         key = (item.get("vt_symbol", ""), opposite.get(close_dir, close_dir))
         traded[key] = traded.get(key, 0) + int(item.get("成交手数", 0) or 0)
     problems: list[str] = []
     for key, expected in initial_vol.items():
-        symbol = f"{key[0]} {key[1]}"
+        symbol = f"{key[0]} {direction_text(key[1])}"
         left = left_vol.get(key, 0)
         done = traded.get(key, 0)
         if left > 0:
@@ -290,7 +303,7 @@ def reconcile_filled(initial: list, remaining: list, results: list) -> tuple[boo
     # 初始快照里没有、但现在冒出来的持仓(快照被截断/期间有人开了新仓):同样不能报「已平空」。
     for key, left in left_vol.items():
         if key not in initial_vol:
-            problems.append(f"{key[0]} {key[1]} 出现初始快照之外的持仓 {left} 手"
+            problems.append(f"{key[0]} {direction_text(key[1])} 出现初始快照之外的持仓 {left} 手"
                             f"(快照不完整或期间有其他操作),请人工核对柜台")
     return (not problems), problems
 
@@ -443,7 +456,7 @@ def run(args: argparse.Namespace) -> int:
             # CTP 对空账户**不推送任何持仓事件**,所以「没有行」可能是
             # 「账户真的空」,也可能是「回报还没到」。再查一轮才下结论。
             positions, trusted = _wait_positions(main_engine, collector, args.position_wait)
-        held = [f"{p.vt_symbol} {p.direction.value} {p.volume}" for p in positions]
+        held = [f"{p.vt_symbol} {direction_text(p.direction)} {p.volume}" for p in positions]
         record["持仓"] = held
         if not trusted:
             # 「查不到」不是「没有」:连接断了或查询没有回报,这时说什么都是猜。
@@ -496,6 +509,16 @@ def run(args: argparse.Namespace) -> int:
         for plan in plans:
             print(f"  计划:{'卖出' if plan.direction == Direction.SHORT else '买入'}平仓 {plan.vt_symbol} "
                   f"{plan.volume} 手 @ {plan.price} ({plan.offset.value},{plan.reason})")
+        # 「买入平仓」对应的是柜台回报的**空头**持仓。要点名的原因:CTP 网关把
+        # 净持仓账户的**净多**也报成空头(PosiDirection=净 → Direction.SHORT),
+        # 那种情况下这单是**加仓**。双边持仓账户不受影响,但我们分不出这两种情况
+        # → 交给人在 --confirm-flatten 之前拿交易客户端核对方向。
+        if any(p.direction == Direction.LONG for p in plans):
+            print("⚠ 上面的「买入平仓」对应柜台回报的**空头**持仓。注意:净持仓账户的净多"
+                  "会被 vnpy_ctp 报成空头,那种情况下这单是加仓。请先在交易客户端核对方向,"
+                  "再决定要不要 --confirm-flatten。", file=sys.stderr)
+            record["方向核对提示"] = ("柜台回报空头持仓;净持仓账户的净多也会被报成空头,"
+                                     "已提示人工在发单前核对方向")
         record["计划"] = [p.to_dict() for p in plans]
         # 没有行情就定不出价:非交易时段订阅不到 Tick,挂出来的委托会被拒,
         # 挂在柜台上的单还可能变成"晚到的成交"。这里直接拒绝,让操作者到交易时段再跑。
@@ -550,7 +573,7 @@ def run(args: argparse.Namespace) -> int:
             if not after or not after_trusted or time.monotonic() >= deadline:
                 break
             time.sleep(1.0)
-        left = [f"{p.vt_symbol} {p.direction.value} {p.volume}" for p in after]
+        left = [f"{p.vt_symbol} {direction_text(p.direction)} {p.volume}" for p in after]
         record["收尾持仓"] = left
         print(f"收尾检查:剩余持仓 {len(left)} 项:{left if left else '(空)'}")
         if not after_trusted:

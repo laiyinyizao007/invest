@@ -468,17 +468,71 @@ def trade_live(main_engine) -> bool:
     return bool(td_api.login_status)
 
 
+# vn.py 的 `Direction` 是**被 gettext 翻译过**的枚举(`LONG = _("多")`):
+# 英文 locale 下 `Direction.LONG.value == 'Long'`,中文/`C` locale 下是 `'多'`。
+# 实测三种 locale(en_US.UTF-8 / zh_CN.UTF-8 / C)给出三种文案。
+# 所以:
+#   - **键**一律用**枚举名**('LONG'/'SHORT'/'NET')—— 与语言无关,机器换 locale 键不变;
+#   - **给人看的文案**用固定中文('多'/'空'/'净')—— 报告交到国信手里,不能因为
+#     跑报告的机器 locale 不同就变成英文。
+# 仓库里既有的做法也是用枚举名(`scripts/research_sandbox.py`:
+# 「用枚举名:value 的文案随 vnpy 版本/语言变化」)。
+_DIRECTION_NAMES = {"多": "LONG", "空": "SHORT", "净": "NET"}
+_DIRECTION_TEXTS = {"LONG": "多", "SHORT": "空", "NET": "净"}
+
+
+def normalize_direction(direction) -> str | None:
+    """把方向归一成**语言无关**的枚举名('LONG'/'SHORT'/'NET');认不出来就返回 None。
+
+    为什么不能用 `direction.value`:见上面 `_DIRECTION_NAMES` 的注释 —— 那个值随 locale 变,
+    拿它当合并键就等于「同一份持仓在不同机器上归出不同的键」→ 合并漏行 → 该平的没平。
+
+    裸字符串输入(测试替身、离线留痕)按「先当枚举名、再当枚举值、最后当中文文案」认:
+      'LONG' → LONG;  'Long' → LONG;  '多' → LONG。
+    实在认不出来的原样大写保留(仍与语言无关),不丢行。
+    """
+    name = getattr(direction, "name", None)
+    if isinstance(name, str) and name:
+        return name.upper()
+    text = str(direction or "").strip()
+    if not text:
+        return None
+    if text in _DIRECTION_NAMES:
+        return _DIRECTION_NAMES[text]
+    try:
+        return Direction[text].name          # 枚举名:'LONG'
+    except KeyError:
+        pass
+    try:
+        return Direction(text).name          # 枚举值:'Long'(英文 locale)
+    except ValueError:
+        pass
+    return text.upper()
+
+
+def direction_text(direction) -> str:
+    """方向的中文文案(固定 '多'/'空'/'净'),与跑报告的机器 locale 无关。"""
+    name = normalize_direction(direction)
+    if not name:
+        return ""
+    return _DIRECTION_TEXTS.get(name, name)
+
+
 def position_key(row) -> tuple[str, str] | None:
     """取一行的 (合约, 方向) 键;认不出来就返回 None。
 
-    方向统一取 `direction.value`(字符串),所以 `Direction.LONG` 与裸字符串 `"Long"`
-    会归到同一个键 —— 同一进程里 vn.py 的 `Direction.LONG.value` 就是 `"Long"`。
+    方向用 `normalize_direction()` 归一(枚举名),所以 `Direction.LONG`、裸字符串
+    `"Long"`、裸字符串 `"多"` 会归到同一个键 `'LONG'`,而且**换台 locale 不同的
+    机器也归到同一个键** —— 键随语言变的话,合并会漏行(该平的没平)。
     """
     symbol = str(getattr(row, "vt_symbol", "") or "")
     direction = getattr(row, "direction", None)
     if not symbol or direction is None:
         return None
-    return symbol, str(getattr(direction, "value", direction))
+    name = normalize_direction(direction)
+    if not name:
+        return None
+    return symbol, name
 
 
 def select_latest_snapshot(batches: list[list]) -> list:
@@ -693,7 +747,7 @@ def check_positions(main_engine, wait: float = 3.0,
     deadline = time.monotonic() + wait
     found: list[str] = []
     while time.monotonic() < deadline:
-        found = [f"{p.vt_symbol} {p.direction.value} {p.volume}"
+        found = [f"{p.vt_symbol} {direction_text(p.direction)} {p.volume}"
                  for p in main_engine.get_all_positions() if p.volume > 0]
         if found and early_exit:
             break
@@ -713,7 +767,7 @@ def _check_positions_by_query(main_engine, wait: float, collector) -> tuple[list
     for _round in range(2):
         rows, status = query_positions(main_engine, collector, wait=round_wait)
         if status == "ok":
-            found = [f"{p.vt_symbol} {p.direction.value} {p.volume}"
+            found = [f"{p.vt_symbol} {direction_text(p.direction)} {p.volume}"
                      for p in rows if getattr(p, "volume", 0) > 0]
             return found, trade_live(main_engine)
         if status == "untrusted":

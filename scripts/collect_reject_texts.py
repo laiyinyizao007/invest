@@ -53,7 +53,7 @@ from trading.runtime import build_ctp_setting
 # SimNow 地址白名单放在 scripts/simnow_guard.py,采集脚本与演练脚本共用同一套约束。
 from ctp_tools.simnow import SIMNOW_TD_ADDRESSES, check_simnow_address, normalize_address
 from ctp_tools.collector import (
-    Case, Collector, build_cases, check_positions, close_engine, in_trading_session,
+    Case, Collector, build_cases, check_positions, close_engine, direction_text, in_trading_session,
     reference_price, symbol_has_position, write_collected, positions_of_symbol,
     BEGIN_MARK, END_MARK,
 )
@@ -221,7 +221,7 @@ def _collect(args, symbol: str, gateway_setting, event_engine, main_engine, coll
             # vn.py 的 CTP 网关对"合约不存在"会自己抛 KeyError(在 onRspOrderInsert 里),
             # 根本走不到 CTP 的错误文本 —— 这本身就是要记录的观察结果。
             results.append(Case(name=name,
-                                detail=f"{req.symbol} {req.direction.value} {req.offset.value} {req.volume}@{req.price}",
+                                detail=f"{req.symbol} {direction_text(req.direction)} {req.offset.value} {req.volume}@{req.price}",
                                 error_text=f"[网关自身异常] {type(exc).__name__}: {exc}",
                                 order_status="发单异常"))
             print(f"  {name}: 发单异常 {type(exc).__name__}: {exc}")
@@ -231,7 +231,7 @@ def _collect(args, symbol: str, gateway_setting, event_engine, main_engine, coll
         text = collector.wait_error(ts, timeout=5.0, since=since)
         results.append(Case(
             name=name,
-            detail=f"{req.symbol} {req.direction.value} {req.offset.value} {req.volume}@{req.price}",
+            detail=f"{req.symbol} {direction_text(req.direction)} {req.offset.value} {req.volume}@{req.price}",
             error_text=text,
             order_status=order.status.value if order else "无终态回报",
             order_id=vt_orderid,

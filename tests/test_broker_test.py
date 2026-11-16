@@ -51,7 +51,7 @@ class Env:
         self.gw.push_tick()
         self.gw.push_account(10_000)
         self.ctx = bt.Ctx(main_engine=self.main, risk_engine=self.risk, collector=self.collector, symbol="c2601.DCE",
-                          gateway_name="CTP", alerts=self.alerts, trades=self.trades, state_dir=tmp_path / "state",
+                          gateway_name="CTP", alerts=self.alerts, trades=self.trades,
                           pump=self.pump, sleep=lambda s: None, in_session=in_session, position_wait=0.2)
         self.ctx.contract = self.collector.contract_of("c2601.DCE")
         self.ctx.tick = self.collector.tick_of("c2601.DCE")
@@ -160,6 +160,126 @@ def test_the_cancel_metric_only_judges_its_counter_after_the_cancel(env, monkeyp
     assert cancel_waits, "撤单指标应当等待撤单计数推进"
     assert min(cancel_waits) >= 1, "撤单计数只能在撤单回报之后判断推进"
     assert item(env, "P3.1").status == be.PASS, item(env, "P3.1").summary
+
+
+def test_a_stale_counter_base_makes_the_threshold_step_inconclusive(env, monkeypatch):
+    """计数**基数取旧** → 对照做不成 → 判不出来(SKIP),不能报成「阈值失灵」。
+
+    场景:设置阈值时计数已经被别的委托回报推过了阈值(基数是旧的)。这时
+    「阈值内的那一笔」被拦下是**必然**的,不是阈值没生效 —— 拿旧基数比出来的
+    结论不算数,只能记「判不出来」。
+    """
+    real = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real(ctx, rule, attr, timeout) - 1, 0)     # 故意报旧一笔
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert any("基数取旧" in line for s in p31.shots for line in s.lines)
+
+
+def test_an_unconfirmed_cancel_makes_the_cancel_metric_inconclusive(env, monkeypatch):
+    """我们自己的撤单**没确认** → 判不出来(SKIP),不能报成「阈值生效」。
+
+    场景:撤单请求没生效(柜台没撤),但**别的**撤单回报把计数推过了阈值 ——
+    这时"超过阈值的委托被拦住"确实发生了,可它不是我们要演示的那一次触发
+    (我们那张单还挂在柜台上,迟早成交)→ 只能记「判不出来」。
+    """
+    env.ctx.cancel_wait = 0.5
+    env.gw.cancel_works = False                     # 我们的撤单请求不生效
+    real_wait = bt.wait_counter_at_least
+
+    def fake_wait(ctx, rule, attr, target, timeout):
+        if attr == "total_cancel_count":
+            rule.total_cancel_count = max(rule.total_cancel_count, target)   # 别的撤单回报把计数推上去
+            return True
+        return real_wait(ctx, rule, attr, target, timeout)
+
+    monkeypatch.setattr(bt, "wait_counter_at_least", fake_wait)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert any("撤单未确认" in line for s in p31.shots for line in s.lines)
+
+
+def test_cancel_active_waits_until_the_order_reaches_a_terminal_state(env, monkeypatch):
+    """撤单请求发出 ≠ 撤成功:撤完必须等到终态。
+
+    不等终态的后果有两个:①单子还挂在柜台上,会变成"晚到的成交";
+    ②撤单回报还没到,风控的撤单计数还没 +1 → 下一项指标拿到的**计数基数是旧的**。
+    """
+    pending: list = []
+    real_cancel = env.gw.cancel_order
+
+    def delayed_cancel(req):
+        pending.append(req)                      # 柜台回报是异步的:先收下请求
+
+    monkeypatch.setattr(env.gw, "cancel_order", delayed_cancel)
+
+    def pump_and_apply():
+        env.pump()
+        while pending:
+            real_cancel(pending.pop(0))          # 下一次事件循环才真正撤掉
+
+    env.ctx.pump = pump_and_apply
+    oid = env.main.send_order(bt.make_req(env.ctx, price=2200.0), "CTP")
+    assert oid
+    bt.cancel_active(env.ctx, [oid])
+    order = env.collector.order_of(oid)
+    assert order is not None and not order.is_active(), "撤单后必须等到终态"
+
+
+def test_a_counter_that_jumps_by_more_than_one_is_inconclusive(env, monkeypatch):
+    """计数一次跳不止 +1 = 有**别的**委托回报混进来 → 基数不可信 → 判不出来(SKIP)。"""
+    real = bt.wait_counter_at_least
+
+    def jumpy(ctx, rule, attr, target, timeout):
+        if attr == "total_order_count":
+            rule.total_order_count = max(rule.total_order_count, target + 1)   # 别的回报也到了
+            return True
+        return real(ctx, rule, attr, target, timeout)
+
+    monkeypatch.setattr(bt, "wait_counter_at_least", jumpy)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert any("不止 +1" in line for s in p31.shots for line in s.lines)
+
+
+def test_a_missing_state_file_means_not_locked(tmp_path):
+    """没有状态文件 = 从来没锁过(头一次跑),放行。"""
+    assert bt.locked_state_note(tmp_path / "state" / "guard.json") == ""
+
+
+def test_a_corrupt_state_file_is_not_treated_as_unlocked(tmp_path):
+    """状态文件损坏 = 判不出来 → 拒绝跑,不能当成「没锁」。
+
+    当成「没锁」照跑的后果:风控按锁定状态把委托全拦下,白费一次券商登录额度,
+    证据只剩一堆「被拦下」。
+    """
+    state = tmp_path / "guard.json"
+    state.write_text("{这不是 JSON", encoding="utf-8")
+    note = bt.locked_state_note(state)
+    assert note and "损坏" in note
+
+
+def test_an_unreadable_state_file_is_not_treated_as_unlocked(tmp_path, monkeypatch):
+    """状态文件读不出来(权限/占用)同样判不出来 → 拒绝跑。"""
+    state = tmp_path / "guard.json"
+    state.write_text("{}", encoding="utf-8")
+
+    def boom(self, *args, **kwargs):
+        raise OSError("文件被另一个进程占用")
+
+    monkeypatch.setattr(Path, "read_text", boom)
+    note = bt.locked_state_note(state)
+    assert note and "读不出来" in note
 
 
 def test_threshold_cancel_metric_is_skipped_off_session(tmp_path):
