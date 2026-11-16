@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import base64
-import binascii
 import hashlib
 import importlib.util
 import json
@@ -1158,92 +1156,90 @@ def site_package_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
-# 站点包的安装记录缓存:键 = 站点包根,值 = {绝对路径(规范化字符串): (sha256 十六进制, size)}。
-# **模块级缓存**:守卫是每个子进程重建一次的,索引跟着重建就太贵了
-# (实测一个 venv 的 site-packages 有 8.5 万个文件,逐个 Path.resolve() 要几十秒)。
-_SITE_RECORDS_CACHE: dict[str, dict[str, tuple[str | None, int]]] = {}
+# 站点包快照的环境变量名:父进程把快照文件路径经它交给子进程。
+# **刻意不走 sandbox_env 的白名单**:白名单是为了不把**凭据**传出去,
+# 而这里传的是一个仓库内的文件路径(不是秘密),并且子进程要靠它拿到
+# 「候选开跑之前」的基准。
+SITE_SNAPSHOT_ENV = "RESEARCH_SITE_SNAPSHOT"
+
+# 站点包快照缓存:键 = 站点包根,值 = {绝对路径(规范化字符串): (mtime_ns, size)}。
+_SITE_SNAPSHOT_CACHE: dict[str, dict[str, tuple[int, int]]] = {}
 
 
-def installed_site_files(roots: Sequence[Path]) -> dict[str, tuple[str | None, int]]:
-    """站点包的**安装记录**:绝对路径(规范化字符串) -> (sha256 十六进制, size)。
+def snapshot_site_files(roots: Sequence[Path]) -> dict[str, tuple[int, int]]:
+    """站点包根下**全部 .py 文件**的 (mtime_ns, size) 快照。
 
-    从各发行版的 `*.dist-info/RECORD` 读(pip 安装时写下的清单,带每个文件的大小与哈希)。
+    **谁拍的**:父进程——**在任何候选跑之前**。候选永远跑在子进程里,
+    父进程的代码不是候选执行的,所以它拍出来的快照**不在候选的控制之下**。
 
-    **为什么需要它**(Issue #47 的收尾,codex 第 4 轮复核的 H1):
-    站点包那一支原本只有「mtime 早于本轮起点」这一道检查,而守卫是**每个子进程重建一次**
-    (`research_api.py` 每轮 `started_at_ns = time.time_ns()`),
-    于是候选**第 1 轮**写进站点包的辅助模块,**第 2 轮**就能导入它并被执行
-    (实测:白名单里的真实包 `numpy`,辅助模块拿到真内建)。
-    仓库自己早就证过「只比 mtime 不可靠」(`_changed()` 的注释:
-    「改写内容再把 mtime 还原」能骗过),受信目录正因如此补了 sha256 + 仓库提交基准。
-    安装记录就是站点包的**「提交基准」等价物**:
-    - 不在记录里 → 安装之后才出现的文件(候选写的就是这种)→ 不算第三方库;
-    - 在记录里但大小/哈希变了 → 被改写过 → 不算第三方库。
+    **为什么必须是父进程拍的**(第 4 轮 codex 复核的 C1):
+    守卫是**每个子进程重建一次**的(`research_api.py` 每轮刷新 `started_at_ns`),
+    子进程自己拍的快照会**包含上一轮候选写进去的文件**——那就是候选自己的
+    「自证」。仓库对受信目录用的是 **git 提交基准**(树外),站点包在树内,
+    唯一树外的基准就是父进程的快照。
 
-    **性能**:索引按站点包根**模块级缓存**(一次进程只建一次),
-    且**不对每个条目调 Path.resolve()**(那要几万次文件系统调用)。
-    取不到(没有 RECORD / 解析不了)→ 返回空字典 —— 调用方据此退回
-    「仓库内一切拒」的**字面口径**(fail-closed),不会退成「站点包一律放行」。
+    **为什么不记哈希**:一个 venv 的 site-packages 有 8 千多个 .py、几百 MB,
+    逐个哈希实测 >120s(父进程每个作业付一次,太贵);只 stat 则是 1.6s。
+    代价:候选若能**改回 mtime**(需要 `os.utime`,而 `os` 按名字与 `X.os` 任一深度
+    都被禁)就能骗过 mtime —— 这条残余如实登记在 ADR 的「已知局限」里。
+    **「候选新写一个文件」这条主逃逸是挡住的**(不在父进程快照里 → 拒),
+    那正是第 4 轮 codex 复现的那条。
     """
-    merged: dict[str, tuple[str | None, int]] = {}
+    merged: dict[str, tuple[int, int]] = {}
     for root in roots:
         key = str(root)
-        cached = _SITE_RECORDS_CACHE.get(key)
+        cached = _SITE_SNAPSHOT_CACHE.get(key)
         if cached is None:
-            cached = _read_site_records(root)
-            _SITE_RECORDS_CACHE[key] = cached
+            cached = _snapshot_one_root(root)
+            _SITE_SNAPSHOT_CACHE[key] = cached
         merged.update(cached)
     return merged
 
 
-def _read_site_records(root: Path) -> dict[str, tuple[str | None, int]]:
-    """读一个站点包根下的全部 `*.dist-info/RECORD`。"""
-    records: dict[str, tuple[str | None, int]] = {}
+def _snapshot_one_root(root: Path) -> dict[str, tuple[int, int]]:
+    """一个站点包根的 (mtime_ns, size) 快照。"""
+    snapshot: dict[str, tuple[int, int]] = {}
     if not root.is_dir():
-        return records
+        return snapshot
     try:
-        dist_infos = sorted(root.glob("*.dist-info"))
+        paths = list(root.rglob("*.py"))
     except OSError:
-        return records
-    base = str(root)
-    for dist_info in dist_infos:
-        record = dist_info / "RECORD"
+        return snapshot
+    for path in paths:
         try:
-            text = record.read_text(encoding="utf-8", errors="replace")
+            stat = path.stat()
         except OSError:
             continue
-        for line in text.splitlines():
-            parts = line.split(",")
-            if not parts or not parts[0]:
-                continue
-            rel = parts[0].strip()
-            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
-                continue
-            digest = parts[1].strip() if len(parts) > 1 else ""
-            size = parts[2].strip() if len(parts) > 2 else ""
-            # sha: None = RECORD 里没记摘要(脚本、__pycache__ 这类条目);
-            #      ""   = 记了但**解不开** → 视为「不是可信的安装记录」;
-            #      十六进制 = 可直接和 file_sha256() 比。
-            sha: str | None = None
-            if digest.startswith("sha256="):
-                # RECORD 里是 urlsafe-base64 的原始摘要,这里换成十六进制
-                # ——好和 file_sha256() 的输出直接比。
-                raw = digest[len("sha256="):]
-                try:
-                    padding = "=" * (-len(raw) % 4)
-                    sha = base64.urlsafe_b64decode(raw + padding).hex()
-                except (ValueError, binascii.Error):
-                    # 解不开就**别装作没记**:空串会被判成「不可信」(见 _is_site_package),
-                    # 绝不能悄悄退化成「只比大小」。
-                    sha = ""
+        snapshot[os.path.normpath(str(path.resolve()))] = (stat.st_mtime_ns, stat.st_size)
+    return snapshot
+
+
+def write_site_snapshot(snapshot: Mapping[str, tuple[int, int]]) -> Path:
+    """把快照写到临时文件,返回路径(父进程用)。"""
+    import tempfile
+
+    handle, name = tempfile.mkstemp(prefix="site_snapshot_", suffix=".json")
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump({key: list(value) for key, value in snapshot.items()}, stream)
+    return Path(name)
+
+
+def read_site_snapshot(path: Path) -> dict[str, tuple[int, int]]:
+    """读回快照(子进程用)。读不到就是空字典(fail-closed:一律拒)。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)) and len(value) == 2:
             try:
-                size_int = int(size) if size else 0
-            except ValueError:
-                size_int = 0
-            # **不调 resolve()**:几万次文件系统调用太贵。根已经是解析过的,
-            # RECORD 里的相对路径也不含 ".."(上面滤掉了),拼起来就是最终路径。
-            records[os.path.normpath(os.path.join(base, rel))] = (sha, size_int)
-    return records
+                out[str(key)] = (int(value[0]), int(value[1]))
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 class RepoImportGuard:
@@ -1265,9 +1261,21 @@ class RepoImportGuard:
         # 站点包根(Issue #47):判「这个模块算不算仓库之外的第三方库」时要用。
         # 取不到就是空元组 —— 那时分类退回到原来的字面口径(fail-closed)。
         self.site_roots = site_package_roots()
-        # 站点包的**安装记录**(路径 -> (sha256 十六进制, size))。
-        # 取不到就是空字典 —— 那时仓库内的站点包文件一律按「仓库内模块」拒(fail-closed)。
-        self.site_installed = installed_site_files(self.site_roots)
+        # 站点包快照:**父进程**在任何候选跑之前拍的(候选永远跑在子进程里,
+        # 父进程的代码不是候选执行的 → 快照不在候选的控制之下)。
+        # 子进程经环境变量拿到快照文件路径;拿不到就是空字典 →
+        # 仓库内的站点包文件一律按「仓库内模块」拒(fail-closed)。
+        env_path = os.environ.get(SITE_SNAPSHOT_ENV)
+        if env_path:
+            # 父进程拍的那份(生产路径:research_api.spawn_child 经环境变量传下来)
+            self.site_snapshot = read_site_snapshot(Path(env_path))
+        else:
+            # 父进程没给(例如测试直接在进程内跑候选)→ 用**本进程的第一份**快照:
+            # snapshot_site_files 按站点包根做**进程级**缓存,所以这份是
+            # 「本进程里第一个候选开跑之前」的状态,同样在候选的控制之外。
+            internal = [root for root in self.site_roots
+                        if root == self.repo_root or self.repo_root in root.parents]
+            self.site_snapshot = snapshot_site_files(internal)
         self.snapshot = dict(snapshot or {})
         self.started_at_ns = started_at_ns if started_at_ns is not None else time.time_ns()
         # 受信目录要不要与**仓库提交**核对(第 25 轮 codex 的 Critical 1)。
@@ -1334,49 +1342,45 @@ class RepoImportGuard:
         return False
 
     def _is_site_package(self, resolved: Path) -> bool:
-        """这个路径是不是**站点包里安装好的第三方库文件**。
+        """这个路径是不是**候选开跑之前就装好的**站点包文件。
 
-        判据两条,都要成立:
+        判据三条,都要成立:
         ①它在某个站点包根之下(本仓库的 venv 就在仓库根之内,`.venv/`);
-        ②它在**安装记录**(`*.dist-info/RECORD`)里,且**内容没被改过**。
+        ②它在**父进程拍的快照**里(候选开跑之前就在);
+        ③它此后**没被改过**(mtime 与大小都对得上)。
 
-        **为什么②不能省**(codex 第 4 轮复核的 H1):守卫是**每个子进程重建一次**
-        (`research_api.py` 每轮刷新 `started_at_ns`),站点包那一支原本只有
-        「mtime 早于本轮起点」这一道检查 —— 于是候选**第 1 轮**写进站点包的辅助模块,
-        **第 2 轮**就能导入它并被执行(实测:白名单里的真实包 `numpy`,辅助模块拿到真内建)。
-        仓库自己早就证过「只比 mtime 不可靠」(`_changed()` 的注释:
-        「改写内容再把 mtime 还原」能骗过),受信目录正因如此补了 sha256 + 仓库提交基准。
-        安装记录就是站点包的**「提交基准」等价物**。
+        **为什么快照必须由父进程拍**(第 4 轮 codex 复核的 C1):
+        守卫是**每个子进程重建一次**的,子进程自己拍的快照会**包含上一轮候选
+        写进去的文件**——那就是候选自己的「自证」。实测:候选第 1 轮往站点包写
+        一个辅助模块,第 2 轮就能导入并拿到真内建。
+        仓库对受信目录用的是 **git 提交基准**(树外),站点包在树内,
+        唯一树外的基准就是父进程的快照。
 
-        装记录取不到(没有 RECORD / 解析不了)→ 判 False → 仍按「仓库内模块」拒(fail-closed)。
+        **为什么不记哈希**:一个 venv 的 site-packages 有 8 千多个 .py、几百 MB,
+        逐个哈希实测 >120s(父进程每个作业付一次,太贵);只 stat 是 1.6s。
+        代价如实登记(ADR 的「已知局限」):候选若能**改回 mtime**(需要 `os.utime`,
+        而 `os` 按名字与 `X.os` 任一深度都被禁)就能骗过 mtime 这道检查。
+        **「候选新写一个文件」这条主逃逸是挡住的**——那正是被复现的那条。
         """
         if not any(resolved == root or root in resolved.parents for root in self.site_roots):
             return False
         key = os.path.normpath(str(resolved))
-        known = self.site_installed.get(key)
-        if known is None:
-            # RECORD 记的是**文件**;而「包位置」那一支拿到的是**目录**。
-            # 目录算不算装上去的,看它的 __init__.py 在不在记录里。
-            known = self.site_installed.get(key + os.sep + "__init__.py")
-        if known is None:
-            # 不在安装记录里 = 安装之后才出现的文件(候选写的就是这种)→ 不算第三方库
-            return False
-        sha, size = known
-        if sha == "":
-            # RECORD 里记了摘要却解不开 → 这条记录不可信,当「不是装上去的」处理
-            return False
-        # **要核对的那个文件**:RECORD 记的是文件;而「包位置」那一支拿到的是目录。
-        # 对目录就核对它的 __init__.py(目录本身没有内容哈希,也比不了大小)。
+        # 快照记的是**文件**;而「包位置」那一支拿到的是**目录**。
+        # 目录算不算装好的,看它的 __init__.py 在不在快照里。
         target = resolved
         if target.is_dir():
             target = target / "__init__.py"
+            key = os.path.normpath(str(target))
+        known = self.site_snapshot.get(key)
+        if known is None:
+            # 父进程的快照里没有 = 候选开跑之后才出现的文件 → 不算装好的
+            return False
+        mtime_ns, size = known
         try:
             stat = target.stat()
         except OSError:
             return False
-        if size and stat.st_size != size:
-            return False
-        if sha and file_sha256(target) != sha:
+        if stat.st_mtime_ns != mtime_ns or stat.st_size != size:
             return False
         return True
 

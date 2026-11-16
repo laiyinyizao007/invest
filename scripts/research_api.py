@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import importlib.util
 import json
@@ -189,10 +190,39 @@ def _child_reason(stderr: str) -> str:
     return rs.scrub_text(lines[-1])[:200]
 
 
+# 站点包快照文件路径:**父进程**在第一次起子进程之前拍好(候选永远跑在子进程里,
+# 父进程的代码不是候选执行的 → 快照不在候选的控制之下)。
+# 见 scripts/research_sandbox.py::snapshot_site_files 的说明(第 4 轮 codex 复核的 C1)。
+_SITE_SNAPSHOT_PATH: Path | None = None
+
+
+def site_snapshot_path() -> Path:
+    """站点包快照的文件路径(每个父进程只拍一次)。
+
+    只拍**仓库内**的站点包根:仓库外的站点包按原口径处理(物理上就在仓库之外,
+    走「预先存在」那一支),本次不动那条——它是既有洞,登记在 Issue #49。
+    """
+    global _SITE_SNAPSHOT_PATH
+    if _SITE_SNAPSHOT_PATH is None:
+        code_root = rc.CODE_ROOT.resolve()
+        roots = [root for root in rs.site_package_roots()
+                  if root == code_root or code_root in root.parents]
+        snapshot = rs.snapshot_site_files(roots)
+        _SITE_SNAPSHOT_PATH = rs.write_site_snapshot(snapshot)
+        atexit.register(lambda: _SITE_SNAPSHOT_PATH.unlink(missing_ok=True)
+                        if _SITE_SNAPSHOT_PATH else None)
+    return _SITE_SNAPSHOT_PATH
+
+
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
+    # 快照路径**刻意**绕过 sandbox_env 的白名单:白名单是为了不把**凭据**
+    # 传出去,而这里传的是仓库内一个文件路径(不是秘密),
+    # 子进程要靠它拿到「候选开跑之前」的基准。
+    env = rs.sandbox_env(os.environ)
+    env[rs.SITE_SNAPSHOT_ENV] = str(site_snapshot_path())
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", cwd=rc.CODE_ROOT, env=rs.sandbox_env(os.environ))
+                            errors="replace", cwd=rc.CODE_ROOT, env=env)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
