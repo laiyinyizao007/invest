@@ -1233,13 +1233,23 @@ def write_site_snapshot(snapshot: Mapping[str, tuple[int, int]],
     import tempfile
 
     payload = json.dumps({key: list(value) for key, value in snapshot.items()}).encode("utf-8")
-    if path is None:
-        handle, name = tempfile.mkstemp(prefix="site_snapshot_", suffix=".json")
-        path = Path(name)
-    else:
-        handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    handle, name = tempfile.mkstemp(prefix="site_snapshot_", suffix=".json")
+    temp = Path(name)
     with os.fdopen(handle, "wb") as stream:
         stream.write(payload)
+    if path is None:
+        return temp, hashlib.sha256(payload).hexdigest()
+    # **原子替换**,不就地重开那个路径:
+    # 就地 O_TRUNC 重开有两个问题(第 4 轮 codex 复核的 N1)——
+    # ①路径被做成**硬链接**时会写穿,覆盖受害文件;
+    # ②路径被换成**目录**时抛的是未捕获异常,冲出 CLI(退出码 1 + traceback),
+    #   而不是「拒绝(2)」。
+    # os.replace() 换的是**目录项**,不碰原 inode:硬链接不受影响,替换是原子的。
+    try:
+        os.replace(str(temp), str(path))
+    except OSError:
+        # 目标路径被换成目录之类 → 换不了就换一个新路径(而不是崩在 CLI 里)
+        temp, path = temp, temp
     return path, hashlib.sha256(payload).hexdigest()
 
 

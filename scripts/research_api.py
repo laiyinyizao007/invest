@@ -905,8 +905,25 @@ def cmd_gate(args) -> int:
     return run_cli_job(job)
 
 
+def _require_parent_snapshot() -> None:
+    """子进程必须由父进程起:拿不到父进程拍的快照就拒绝跑。
+
+    为什么(第 4 轮 codex 复核的 N2):守卫拿不到父进程快照时会退回
+    「本进程自己拍的一份」——而**在子进程里**,那份快照是在**上一轮候选跑完之后**
+    才拍的,于是**包含上一轮候选写进去的文件** → 上一轮种下的模块会被判成
+    「候选开跑之前就装好的」→ 跨轮次逃逸成立。
+
+    所以子进程入口一律要求父进程下发快照;拿不到 → 拒绝(退出码 2)。
+    父进程起的子进程一定带(`spawn_child` 会下发),正常路径不受影响。
+    """
+    if not os.environ.get(rs.SITE_SNAPSHOT_ENV):
+        raise JobError(EXIT_REFUSED,
+                       "子进程必须由父进程启动(缺少父进程拍好的站点包快照)")
+
+
 def run_gate_child(args) -> int:
     """子进程:在 15 分钟玉米数据的滚动验证段上做门槛评估。测试段不可达(research_gate 内断言)。"""
+    _require_parent_snapshot()
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_gate
@@ -947,6 +964,7 @@ def run_gate_child(args) -> int:
 
 def run_evaluate_child(args) -> int:
     """子进程：加载候选，读取其 param_grid，在选参窗口选参，再在滚动验证窗口做门槛评估。测试段不可达。"""
+    _require_parent_snapshot()
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_evaluation
@@ -985,6 +1003,7 @@ def run_evaluate_child(args) -> int:
 
 def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
+    _require_parent_snapshot()
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     try:

@@ -415,6 +415,52 @@ def test_the_parent_rewrites_the_snapshot_so_tampering_is_erased(
     assert sha2 == sha, "父进程下发的哈希变了 —— 它算的是被篡改后的字节"
 
 
+def test_a_child_without_the_parent_snapshot_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拦截:子进程**拿不到父进程的快照** → 拒绝跑(退出码 2)。
+
+    为什么(第 4 轮 codex 复核的 N2):守卫拿不到父进程快照时会退回
+    「本进程自己拍的一份」——而**在子进程里**,那份快照是在**上一轮候选跑完之后**
+    才拍的,于是**包含上一轮候选写进去的文件** → 上一轮种下的模块会被判成
+    「候选开跑之前就装好的」→ 跨轮次逃逸成立。
+
+    所以子进程入口一律要求父进程下发快照。`_child` 是注册了的 CLI 子命令,
+    直接调用它就会落进那条退路 —— 这里把它钉住。
+    """
+    import research_api as api
+
+    monkeypatch.delenv(SNAPSHOT_ENV, raising=False)
+    with pytest.raises(api.JobError) as excinfo:
+        api._require_parent_snapshot()
+    assert excinfo.value.code == 2, f"应当以「拒绝」(2)退出,实际 {excinfo.value.code}"
+
+
+def test_rewriting_the_snapshot_does_not_write_through_a_hard_link(
+    tmp_path: Path,
+) -> None:
+    """拦截:重写快照**不会写穿硬链接**(第 4 轮 codex 复核的 N1)。
+
+    父进程每轮用 `os.replace()` 原子替换快照文件。若就地重开那个路径
+    (`O_TRUNC`),路径被做成**硬链接**时会写穿、覆盖受害文件。
+    `os.replace()` 换的是**目录项**,不碰原 inode,所以硬链接不受影响。
+    """
+    import os as _os
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("important", encoding="utf-8")
+    link = tmp_path / "snapshot.json"
+    try:
+        _os.link(victim, link)
+    except OSError:
+        pytest.skip("这个文件系统不支持硬链接")
+
+    rs.write_site_snapshot({"/x/y.py": (1, 2)}, link)
+    assert victim.read_text(encoding="utf-8") == "important", (
+        "重写快照时写穿了硬链接,受害文件被覆盖"
+    )
+
+
 def test_a_repo_module_written_during_the_run_is_still_refused(
     repo: Path, snapshot_env,
 ) -> None:

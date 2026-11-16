@@ -33,6 +33,30 @@ def fake_subprocess(monkeypatch, popen):
         Popen=popen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired, run=subprocess.run))
 
 
+@pytest.fixture(autouse=True)
+def parent_snapshot(monkeypatch, tmp_path):
+    """父进程拍好的站点包快照(生产上由 `research_api.spawn_child` 下发)。
+
+    **为什么要在这里造**:子进程入口(`_child` / `_gate_child` / `_evaluate_child`)
+    一律要求父进程下发的快照 —— 没有它就拒绝(退出码 2)。理由:守卫拿不到父进程
+    快照时会退回「本进程自己拍的一份」,而**在子进程里**那份是在**上一轮候选跑完之后**
+    才拍的,包含上一轮候选写进站点包的文件 → 上一轮种下的模块会被放行
+    (第 4 轮 codex 复核的 N2)。
+
+    这些用例直接调子入口,等于**替父进程跑**,所以得把父进程会给的东西给足。
+    快照内容是空的:仓库**外**的站点包按物理位置放行(不查快照),
+    仓库内的按快照判 —— 与生产一致。
+    """
+    import hashlib
+
+    path = tmp_path / "site_snapshot.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(api.rs.SITE_SNAPSHOT_ENV, str(path))
+    monkeypatch.setenv(api.rs.SITE_SNAPSHOT_SHA_ENV,
+                       hashlib.sha256(path.read_bytes()).hexdigest())
+    return path
+
+
 @pytest.fixture
 def tree(tmp_path, monkeypatch):
     (tmp_path / "pending_strategies").mkdir()
