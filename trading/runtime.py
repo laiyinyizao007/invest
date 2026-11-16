@@ -30,7 +30,8 @@ from vnpy.event import Event, EventEngine
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.event import EVENT_LOG, EVENT_TICK, EVENT_TIMER, EVENT_TRADE
 from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.logger import ERROR
+from logging import ERROR  # 标准库的级别常量:不要从 vnpy.trader.logger 引,
+# 那会把日志模块(在导入时就按 TEMP_DIR 建好文件 sink)提前拉进来,隔离目录就名不副实了
 from vnpy.trader.utility import get_file_path
 from vnpy_ctastrategy import CtaStrategyApp
 

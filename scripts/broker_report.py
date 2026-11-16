@@ -1,11 +1,12 @@
-"""把取证结果填进国信《外部接入系统技术测试报告》模板(docx),生成「穿透式测试 + 程序化测试」报告。
+"""把取证结果填进国信《外部接入系统技术测试报告》模板(docx),生成「外部接入系统测试 + 程序化补充测试」报告(国信 20260717 版模板)。
 
 用法(项目根目录):
     python scripts/broker_report.py --template <国信模板.docx> --evidence data/broker_test/<时间戳>
     python scripts/broker_report.py --template <模板> --evidence <目录> --out <输出.docx>
 
 做法:直接用 lxml 改 docx 的 XML,**不引入新依赖**;以单元格文字定位表格行(不写死下标),模板改版时更稳。
-- 填写:封面占位、测试接入信息、测试记录(正常/异常)、程序化测试总结与 11 项结果、各项证据图;
+- 填写:封面占位、测试接入信息、两部分的测试结果(1.1/1.2/2.1 与 3.1–7.1)、2.1 稳定运行的「耗时约 N 秒」、各项证据图;
+- 只支持 20260717 版模板(单文档两部分,无穿透专章);旧版模板会明确报错,不会按旧编号错填;
 - **绝不默认勾通过**:模板里预勾选的结果一律重置,只有取证结果为 PASS 才勾「通过/正常」;选测项未测勾「未测试」;
   必测项没有 PASS 时留空并在终端列出"报告里还缺什么";
 - **不碰国信填写区**:「信息科技中心评估意见」「测试评估」「测试人员(国信期货)」等表格原样保留;
@@ -13,6 +14,7 @@
 模板含国信测试环境的 IP/端口,**不入库**,用 --template 传路径(或环境变量 BROKER_REPORT_TEMPLATE)。
 """
 import argparse
+import json
 import os
 import re
 import struct
@@ -31,7 +33,10 @@ import bootstrap  # noqa: F401
 
 from lxml import etree
 
-from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, Evidence, load_evidence
+from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
+from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
+from ctp_tools.profile import load_profile  # noqa: E402
+from ctp_tools.simnow import normalize_address  # noqa: E402
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -304,12 +309,19 @@ class Outcome:
     warnings: list[str] = field(default_factory=list)
 
 
+COVER2 = "程序化补充测试报告"
+EXTERNAL_ITEMS = ("P1.1", "P1.2", "P1.3")              # 「外部接入系统测试」部分(模板 1.1/1.2/2.1);其余为程序化补充测试
+SECTION_NO = {no: item for item, no in TEMPLATE_NO.items()}
+HEADING = re.compile(r"^([1-7])\.([1-9])(?!\d)")
+
+
 def split_parts(doc: Docx) -> tuple[int, int, int]:
-    """返回 (穿透部分起点, 程序化部分起点, 文末):以第二封面「程序化测试报告」为界。"""
+    """返回 (外部接入部分起点, 程序化补充部分起点, 文末):以第二封面「程序化补充测试报告」为界。"""
     kids = children(doc.body)
-    boundary = next((i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip() == "程序化测试报告"), None)
+    boundary = next((i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip() == COVER2), None)
     if boundary is None:
-        raise ValueError("模板里找不到「程序化测试报告」封面,无法区分两部分——模板版式可能改了")
+        raise ValueError(f"模板里找不到「{COVER2}」封面,无法区分两部分——本脚本只支持国信 20260717 版模板"
+                         "(外部接入 1.1/1.2/2.1 + 程序化补充 3.1–7.1),旧版模板的章节编号不同,不能按新编号填")
     return 0, boundary, len(kids)
 
 
@@ -326,50 +338,6 @@ def result_choice(ev: Evidence | None, item: str, *, three_way: bool) -> str | N
     if three_way and not is_mandatory(item):
         return "未测试"
     return None
-
-
-def fill_penetration(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, start: int, end: int) -> None:
-    tables = tables_in(doc.body, start, end)
-    for label, value in (("测试账户", ctx.account), ("测试系统名称", ctx.system_name), ("AppID/RelayAppID", ctx.app_id)):
-        hit = find_row_in_tables(tables, label)
-        if hit:
-            set_cell_text(hit[1][1], value)
-        else:
-            outcome.warnings.append(f"穿透报告:找不到「{label}」行")
-    for label, selected in (("AppID类型", {"直连的交易者"}), ("测试接入系统名称", {ctx.access_system}),
-                            ("软件功能", set(ctx.functions))):
-        hit = find_row_in_tables(tables, label)
-        if hit:
-            set_checks(hit[1][1], selected)
-    hit = find_row_in_tables(tables, "联系方式")
-    if hit:
-        set_cell_text(hit[1][1], " / ".join(x for x in (ctx.contact_name, ctx.contact_phone, ctx.contact_email) if x))
-    # 测试记录 ①–⑦:行内「正常」「异常:」两个勾选
-    for item, label in (("T1", "①"), ("T2", "②"), ("T3", "③"), ("T4", "④"), ("T5", "⑤"), ("T6", "⑥"), ("T7", "⑦")):
-        hit = find_row_in_tables(tables, label)
-        if not hit:
-            outcome.warnings.append(f"穿透报告:找不到「{label}」行")
-            continue
-        _, cells, col = hit
-        ev = evs.get(item)
-        normal, abnormal = cells[col + 1], cells[col + 2]
-        set_checks(normal, {"正常"} if ev is not None and ev.status == PASS else set())
-        set_checks(abnormal, {"异常"} if ev is not None and ev.status == FAIL else set())
-        if ev is not None and ev.status == FAIL:
-            append_text(abnormal, ev.summary)
-        if ev is None or ev.status != PASS:
-            outcome.missing.append(f"穿透 {ITEMS[item]}:{_status_note(ev)}")
-    # 证据图:统一放在「请按序号附截图」之后,逐张加标题
-    kids = children(doc.body)[start:end]
-    anchor = next((el for el in kids if el.tag == P and "请按序号附截图" in text_of(el)), None)
-    if anchor is None:
-        outcome.warnings.append("穿透报告:找不到「请按序号附截图」锚点,证据图未插入")
-        return
-    last = anchor
-    for item in ("T1", "T3", "T4", "T5", "T2", "T6", "T7"):
-        ev = evs.get(item)
-        for shot in (ev.shots if ev else []):
-            last = _insert_shot(doc, last, ev, shot, caption=f"{ITEMS[item]}" + (f" · {shot.label}" if shot.label else ""))
 
 
 def _status_note(ev: Evidence | None) -> str:
@@ -402,13 +370,31 @@ def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
     return pic
 
 
-def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, start: int, end: int) -> None:
-    tables = tables_in(doc.body, start, end)
+def find_numbered_row(table, number: str):
+    """按章节编号找行:编号后不能紧跟数字(「1.1」不能命中「1.10」)。"""
+    pattern = re.compile(rf"^{re.escape(number)}(?!\d)")
+    for tr in table.findall(TR):
+        cells = tr.findall(TC)
+        for idx, tc in enumerate(cells):
+            if pattern.match(text_of(tc).strip()):
+                return tr, cells, idx
+    return None
+
+
+def _results_table(tables: list):
+    for table in tables:
+        if find_row(table, "1.1") and find_row(table, "测试结论"):
+            return table
+    return None
+
+
+def fill_report(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, boundary: int, end: int) -> None:
+    tables = tables_in(doc.body, 0, end)
 
     def cell_at(label: str, col_offset: int = 1):
         hit = find_row_in_tables(tables, label)
         if not hit:
-            outcome.warnings.append(f"程序化报告:找不到「{label}」行")
+            outcome.warnings.append(f"报告:找不到「{label}」行")
             return None
         return hit[1][hit[2] + col_offset] if hit[2] + col_offset < len(hit[1]) else None
 
@@ -431,6 +417,9 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
     cell = cell_at("交易信息系统名称")
     if cell is not None:
         set_checks(cell, {ctx.access_system})
+    cell = cell_at("测试系统功能")
+    if cell is not None:
+        set_checks(cell, set(ctx.functions))
     for label, value in (("名称", ctx.submitter_name), ("联系人", ctx.contact_name)):
         hit = find_row_in_tables(tables, label)
         if hit and hit[2] + 1 < len(hit[1]) and text_of(hit[1][hit[2] + 1]).strip() == "":
@@ -441,55 +430,75 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
         set_cell_text(cells[hit[2] + 1], ctx.contact_phone)
         if hit[2] + 3 < len(cells):
             set_cell_text(cells[hit[2] + 3], ctx.contact_email)
-    cell = cell_at("程序化交易系统")
+    cell = cell_at("测试系统设备")
     if cell is not None:
         set_cell_text(cell, f"测试机型号:{ctx.machine} 操作系统:{ctx.os_name} CPU:{ctx.cpu} 内存:{ctx.memory} 硬盘:{ctx.disk}")
 
-    # 11 项结果
-    prefixes = {"P1.1": "1.1", "P1.2": "1.2", "P2.1": "2.1", "P2.2": "2.2", "P2.3": "2.3", "P3.1": "3.1",
-                "P4.1": "4.1", "P4.2": "4.2", "P5.1": "5.1", "P5.2": "5.2", "P6.1": "6.1"}
-    all_mandatory_pass = True
-    for item, prefix in prefixes.items():
-        hit = find_row_in_tables(tables, prefix)
-        if not hit:
-            outcome.warnings.append(f"程序化报告:找不到「{prefix}」结果行")
-            continue
-        cells, col = hit[1], hit[2]
-        ev = evs.get(item)
-        choice = result_choice(ev, item, three_way=True)
-        set_checks(cells[col + 1], {choice} if choice else set())
-        if is_mandatory(item) and (ev is None or ev.status != PASS):
-            all_mandatory_pass = False
-            outcome.missing.append(f"程序化 {ITEMS[item]}:{_status_note(ev)}")
-    optional_failed = [i for i in OPTIONAL_ITEMS if evs.get(i) is not None and evs[i].status == FAIL]
-    hit = find_row_in_tables(tables, "测试结论")
-    if hit:
-        set_checks(hit[1][hit[2] + 1], {"通过"} if all_mandatory_pass and not optional_failed else set())
-    if not all_mandatory_pass:
-        outcome.missing.append("程序化 测试结论:必测项未全部通过,未勾「通过」")
-    if optional_failed:
-        outcome.missing.append(f"程序化 测试结论:选测项 {', '.join(sorted(optional_failed))} 未通过,未勾「通过」,需人工判断")
+    # 测试结果:按模板编号(1.1…7.1)在结果表里定位,内部 ID → 编号见 TEMPLATE_NO
+    results = _results_table(tables)
+    if results is None:
+        outcome.warnings.append("报告:找不到测试结果表(含「1.1」与「测试结论」行)")
+    else:
+        passed = {"external": True, "programmatic": True}
+        for item, number in TEMPLATE_NO.items():
+            part = "external" if item in EXTERNAL_ITEMS else "programmatic"
+            hit = find_numbered_row(results, number)
+            if not hit:
+                outcome.warnings.append(f"报告:找不到「{number}」结果行")
+                if is_mandatory(item):                 # 必测项的行都找不到:结论不可判定,绝不能勾「通过」
+                    passed[part] = False
+                    outcome.missing.append(f"{ITEMS[item]}:模板里找不到「{number}」结果行,结论不可判定")
+                continue
+            cells, col = hit[1], hit[2]
+            ev = evs.get(item)
+            choice = result_choice(ev, item, three_way=not is_mandatory(item))
+            set_checks(cells[col + 1], {choice} if choice else set())
+            if is_mandatory(item) and (ev is None or ev.status != PASS):
+                passed[part] = False
+                outcome.missing.append(f"{ITEMS[item]}:{_status_note(ev)}")
+        optional_failed = sorted(i for i in OPTIONAL_ITEMS if evs.get(i) is not None and evs[i].status == FAIL)
+        if optional_failed:
+            passed["programmatic"] = False
+        conclusions = [tr.findall(TC) for tr in results.findall(TR) if text_of(tr.findall(TC)[0]).strip().startswith("测试结论")]
+        if len(conclusions) != 2:
+            outcome.warnings.append(f"报告:应有 2 个「测试结论」行(外部接入、程序化补充),实际 {len(conclusions)} 个,结论栏未勾")
+        else:
+            for cells, part in zip(conclusions, ("external", "programmatic")):
+                set_checks(cells[1], {"通过"} if passed[part] else set())
+        if not passed["external"]:
+            outcome.missing.append("外部接入 测试结论:必测项未全部通过,未勾「通过」")
+        if not passed["programmatic"]:
+            outcome.missing.append("程序化补充 测试结论:必测项未全部通过,未勾「通过」")
+        if optional_failed:
+            outcome.missing.append(f"程序化补充 测试结论:选测项 {', '.join(optional_failed)} 未通过,未勾「通过」,需人工判断")
+        for label in ("采集信息的完整性", "采集信息的正确性"):       # 模板预勾选了「通过」:是否通过由国信评估,本脚本一律重置、不代勾
+            hit = find_row(results, label)
+            if hit:
+                set_checks(hit[1][hit[2] + 1], set())
+        outcome.missing.append("看穿式采集(完整性/正确性):不由本脚本勾选,以国信对采集结果的评估为准(模板预勾选的「通过」已重置)")
 
-    # 证据图:按各项小标题锚点插入
+    # 证据图:两部分各自从「测试总结报告证明材料」标题起,按各项小标题锚点插入
     kids = children(doc.body)
-    section_start = next((i for i in range(start, end) if kids[i].tag == P and "测试总结报告证明材料" in text_of(kids[i])), None)
-    if section_start is None:
-        outcome.warnings.append("程序化报告:找不到「测试总结报告证明材料」,证据图未插入")
+    proofs = [i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip().startswith("测试总结报告证明材料")]
+    first = next((i for i in proofs if i < boundary), None)
+    second = next((i for i in proofs if i > boundary), None)
+    if first is None or second is None:
+        outcome.warnings.append("报告:找不到两处「测试总结报告证明材料」标题,证据图未插入")
         return
-    # 证明材料标题自己也含「测试系统功能测试指引」字样,所以从下一段起找、且要求以它开头(正文里那段「测试系统功能测试指引:摘自…」)
-    guide = next((i for i in range(section_start + 1, end) if kids[i].tag == P and text_of(kids[i]).strip().startswith("测试系统功能测试指引")), end)
-    heading = re.compile(r"^([1-6])\.([1-9])")
+    # 第二处标题自己也含「测试系统功能测试指引」字样,所以从下一段起找、且要求以它开头(正文里那段「测试系统功能测试指引:摘自…」)
+    guide = next((i for i in range(second + 1, end) if kids[i].tag == P and text_of(kids[i]).strip().startswith("测试系统功能测试指引")), end)
     regions: dict[str, list] = {}
-    current = None
-    for el in kids[section_start:guide]:
-        if el.tag != P:
-            continue
-        m = heading.match(text_of(el).strip())
-        if m:
-            current = f"P{m.group(1)}.{m.group(2)}"
-            regions[current] = [el]
-        elif current:
-            regions[current].append(el)
+    for lo, hi in ((first, boundary), (second, guide)):
+        current = None
+        for el in kids[lo:hi]:
+            if el.tag != P:
+                continue
+            m = HEADING.match(text_of(el).strip())
+            if m and f"{m.group(1)}.{m.group(2)}" in SECTION_NO:
+                current = SECTION_NO[f"{m.group(1)}.{m.group(2)}"]
+                regions[current] = [el]
+            elif current:
+                regions[current].append(el)
     for item, paras in regions.items():
         ev = evs.get(item)
         if ev is None:
@@ -500,6 +509,54 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
             anchor = next((p for p in paras[1:] if shot.label and shot.label in text_of(p)), default_anchor)
             base = last_after.get(id(anchor), anchor)
             last_after[id(anchor)] = _insert_shot(doc, base, ev, shot)
+    _fill_stability_seconds(evs.get("P1.3"), regions.get("P1.3"), outcome)
+
+
+def _fill_stability_seconds(ev: Evidence | None, paras: list | None, outcome: Outcome) -> None:
+    """2.1 稳定运行:把「持续下单200笔,耗时约     秒」的空格换成取证实测的秒数(没有实测值就保持空白并报缺)。"""
+    if ev is None or ev.status not in (PASS, FAIL):
+        return
+    orders, seconds = ev.metrics.get("orders"), ev.metrics.get("elapsed_seconds")
+    if not orders or seconds is None:
+        outcome.missing.append("2.1 稳定运行:证据里没有下单笔数/耗时,「耗时约 N 秒」需人工填写")
+        return
+    target = next((p for p in (paras or []) if f"持续下单{orders}笔" in re.sub(r"\s", "", text_of(p))), None)
+    if target is None:
+        outcome.warnings.append(f"报告:2.1 里找不到「持续下单{orders}笔」段落,耗时未填")
+        return
+    text = text_of(target)
+    filled, n = re.subn(r"(耗时约)\s*(秒)", rf"\1 {seconds:g} \2", text, count=1)
+    if n == 0:
+        outcome.warnings.append("报告:2.1 段落里找不到「耗时约 秒」填空,耗时未填")
+        return
+    set_paragraph_text(target, filled)
+
+
+def add_banner(doc: Docx, text: str) -> None:
+    """在正文最前面插一段醒目的提示(预演报告用)。
+
+    模板正文里预填的是国信的 BrokerID/前置地址,预演跑在 SimNow 上时,不加提示就会变成
+    一份「自称国信环境」的报告,存在误交的风险。
+    """
+    body = doc.body
+    p = etree.Element(P)
+    ppr = etree.SubElement(p, PPR)
+    jc = etree.SubElement(ppr, w("jc"))
+    jc.set(w("val"), "center")
+    run = etree.SubElement(p, R)
+    rpr = etree.SubElement(run, RPR)
+    etree.SubElement(rpr, w("b"))
+    color = etree.SubElement(rpr, w("color"))
+    color.set(w("val"), "C00000")
+    sz = etree.SubElement(rpr, w("sz"))
+    sz.set(w("val"), "32")
+    t = etree.SubElement(run, T)
+    t.text = text
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    if len(body):
+        body[0].addprevious(p)
+    else:
+        body.append(p)
 
 
 def fill_covers(doc: Docx, ctx: ReportContext) -> None:
@@ -511,16 +568,16 @@ def fill_covers(doc: Docx, ctx: ReportContext) -> None:
 
 
 def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: ReportContext,
-                 evidences: dict[str, Evidence] | None = None) -> Outcome:
+                 evidences: dict[str, Evidence] | None = None, watermark: str = "") -> Outcome:
     doc = Docx(template)
     doc.evidence_dir = evidence_dir
     evs = evidences if evidences is not None else load_evidence(evidence_dir)
     outcome = Outcome(path=out_path)
-    start, boundary, end = split_parts(doc)
-    # 先填程序化部分(后半),再填穿透部分:插入图片会改变 body 下标,从后往前填不影响前半部分的下标
-    fill_programmatic(doc, ctx, evs, outcome, boundary, end)
-    fill_penetration(doc, ctx, evs, outcome, start, boundary)
+    _, boundary, end = split_parts(doc)
+    fill_report(doc, ctx, evs, outcome, boundary, end)
     fill_covers(doc, ctx)
+    if watermark:
+        add_banner(doc, watermark)
     for missing_image in doc.missing_images:
         outcome.warnings.append(f"证据图缺失,未插入:{missing_image}")
         outcome.missing.append(f"证据图缺失:{missing_image}")
@@ -528,7 +585,7 @@ def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: Report
                          ("联系人", ctx.contact_name), ("联系电话", ctx.contact_phone)):
         if not value:
             outcome.missing.append(f"{label} 没有提供,对应栏留空")
-    outcome.missing.append("签字/盖章栏(穿透报告「测试人签字」、程序化报告「提测方签字/盖章」)需人工签字盖章")
+    outcome.missing.append("签字/盖章栏(第五页提测方签字、法人户盖章四处:第五页、两份报告首页、骑缝章)需人工签字盖章")
     doc.save(out_path)
     return outcome
 
@@ -554,13 +611,37 @@ def context_from_env(env, info: dict | None = None) -> ReportContext:
     )
 
 
+def non_guoxin_connections(evidence_dir: Path) -> list[str]:
+    """证据目录里记录了「不是国信测试环境」的连接记录(预演/其它环境),返回可读描述。"""
+    path = evidence_dir / "connection.json"
+    if not path.exists():
+        return []
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(records, dict):
+        records = [records]
+    bad = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        broker_id = str(record.get("broker_id", ""))
+        front = normalize_address(str(record.get("trade_front", "")))
+        if broker_id != GUOXIN_TEST_BROKER_ID or front not in GUOXIN_TEST_TD:
+            bad.append(f"BrokerID={broker_id} 交易前置={front or '未知'}")
+    return bad
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--template", type=Path, default=os.environ.get("BROKER_REPORT_TEMPLATE") or None,
                         help="国信模板 docx(不入库;也可用环境变量 BROKER_REPORT_TEMPLATE)")
     parser.add_argument("--evidence", type=Path, required=True, help="broker_test.py 生成的证据目录")
     parser.add_argument("--out", type=Path, default=None, help="输出 docx(默认在证据目录里)")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin)取账号/AppID 等;默认用项目 .env")
     parser.add_argument("--no-terminal-info", action="store_true", help="不采集本机终端信息(机型/CPU/内存/硬盘栏留空)")
+    parser.add_argument("--watermark", default="", help="在正文最前面插入的提示文字(预演报告用它标明不可提交国信)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
@@ -570,14 +651,35 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.evidence / "evidence.json").exists():
         print(f"证据目录里没有 evidence.json:{args.evidence}。请先运行 scripts/broker_test.py。", file=sys.stderr)
         return 2
-    bootstrap.load_env()
+    # 配置解析只走 ctp_tools.profile(档案 > .env > 进程环境),与取证/清场/探针一致。
+    try:
+        _profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if _profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断报告里该填哪个账户,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for _conflict in _profile.hard_conflicts:
+            print(f"  - {_conflict}", file=sys.stderr)
+        return 2
+    for _note in _profile.notes:
+        print(f"⚠ {_note}(已按档案取值)", file=sys.stderr)
     info = None
     if not args.no_terminal_info and sys.platform == "win32":
         import collect_terminal_info
         info = collect_terminal_info.collect()
-    ctx = context_from_env(os.environ, info)
+    ctx = context_from_env(_profile.env, info)
     out = args.out or (args.evidence / f"国信外部接入系统技术测试报告-{ctx.app_id or 'noappid'}.docx")
-    outcome = build_report(Path(args.template), args.evidence, out, ctx)
+    if args.out is None:
+        # 正式报告名 + 模板正文里预填的国信 BrokerID/前置 = 一份「自称国信环境」的文件。
+        # 证据不是国信环境(预演等)时,拒绝用正式文件名。
+        bad = non_guoxin_connections(args.evidence)
+        if bad:
+            print(f"拒绝用正式报告文件名:证据里的连接不是国信测试环境({'; '.join(bad)})。"
+                  "预演或其它环境的证据请用 --out 指定带「预演」字样的文件名。", file=sys.stderr)
+            return 2
+    outcome = build_report(Path(args.template), args.evidence, out, ctx, watermark=args.watermark)
     print(f"报告已生成:{outcome.path}")
     for line in outcome.warnings:
         print(f"  ⚠ {line}", file=sys.stderr)

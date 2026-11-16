@@ -8,6 +8,10 @@
 .vntrader_decoupling/
 # 国信测试取证运行器的隔离状态目录
 .vntrader_brokertest/
+# 清场工具(平仓)的隔离状态目录
+.vntrader_flatten/
+# 只读探针的隔离状态目录
+.vntrader_probe/
 # 行情录制独立数据库与运行状态
 .vntrader_record/
 .ops/recording/
@@ -44,14 +48,22 @@ tools/bisheng/v3_ids.json
 runtime/
 
 .env.*.bak
+# 环境档案与备份(含账号/密码/授权码/webhook token):.env.guoxin / .env.simnow / .env.prev.* 全部不入库
+.env.*
+!.env.example
 
 # 含设备序列号/MAC/测试环境 IP 的本机产物与券商原始文件,不入库
 terminal-info.txt
 docs/API--*/
 docs/*外部接入系统技术测试报告*.docx
+# 客户原始资料压缩包(含测试环境 IP 与券商文件),不入库
+docs/*.rar
 
 # 研究沙盒镜像的离线轮子(体积大,由 fetch_wheels.sh 生成)
 docker/research/wheelhouse/
+
+# 一次性探针脚本(临时用,不进版本库)
+_iso_test.py
 
 # 压缩包不入库:券商发来的 API 文件包、导出物都放本机。
 # (原先只有 `docs/API--*/` 匹配目录,不匹配文件,两个 .rar 因此被 `git add -A docs` 带进了提交。)
