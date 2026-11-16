@@ -57,6 +57,8 @@ from check_mutations import (  # noqa: E402
 BOUNDARY = "tests/test_research_boundary.py"
 CLOSURE = "tests/test_fs_capability_closure.py"
 TOOL_TEST = "tests/test_check_ci_ran.py"
+# 第 54 轮:接线类变异改的是 **workflow 本身**(不是守卫源码)
+WORKFLOW = ".github/workflows/research-guard.yml"
 
 # 多行替换用拼接,不写转义序列——避免"源码里到底是几个反斜杠"这种歧义
 # (本文件第一版就栽在这儿:转义写错 ⇒ 整个文件被替换成一行 ⇒ 变异"全红"但毫无意义)。
@@ -221,8 +223,14 @@ MUTATIONS = (
     _mutation(
         "让 CI 闸门放行『名单点名的用例被跳过』",
         "tools/check_ci_ran.py",
-        ("        for case in matched:" + NL + "            if _is_skipped(case):",
-         "        for case in matched:" + NL + "            if False and _is_skipped(case):"),
+        # 第 54 轮:锚点跟着工具的现状更新(此前是 `if _is_skipped(case):`,
+        # 现在多了一个「允许跳过」的条件:`and name not in skip_ok`)。
+        # 锚点写错 ⇒ 命中 0 次 ⇒ 脚手架判「变异规格写错了」(退出码 2),
+        # **不是**「守卫有洞」——这个区分是脚手架 fail-closed 的关键。
+        ("            for case in matched:" + NL +
+         "                if _is_skipped(case) and name not in skip_ok:",
+         "            for case in matched:" + NL +
+         "                if False and _is_skipped(case) and name not in skip_ok:"),
         targets=[TOOL_TEST],
     ),
     _mutation(
@@ -272,12 +280,105 @@ MUTATIONS = (
          "                for extra in (getattr(node, \"orelse\", None), getattr(node, \"finalbody\", None)):"),
     ),
 
+    # ---- 第 54 轮:CI **接线**那一族(codex 第 2 轮 H1/H2/H3/H5) ----
+    #
+    # 这一族改的是 `.github/workflows/research-guard.yml` 本身——
+    # 此前接线类缺陷(H1~H5)**没有任何变异验证**:第 53 轮写下的守卫
+    # 若哪天被放松(比如把 `|| true` 加回去),CI 不会红,ADR 里那条结论
+    # 也就变成了一句没人复核的话(codex 第 2 轮 M4:证据只活在 %TEMP%)。
+    # 现在每一条旁路都有**一条变异**把它变红,且**钉死见证用例**。
+    _mutation(
+        "在闸门命令后面接一个恒真后缀(判红也不算失败)",
+        WORKFLOW,
+        ("            --roster tests/guard_roster.json --suite tests/test_research_boundary.py",
+         "            --roster tests/guard_roster.json --suite tests/test_research_boundary.py || true"),
+    ),
+    _mutation(
+        "在闸门调用之前加 `set +e`",
+        WORKFLOW,
+        ('          rm -f "$RUNNER_TEMP/boundary.xml"',
+         _lines("          set +e",
+                '          rm -f "$RUNNER_TEMP/boundary.xml"')),
+    ),
+    _mutation(
+        "在闸门调用之后加 `exit 0`(强制判成功)",
+        WORKFLOW,
+        ("          python tools/check_ci_ran.py --junitxml=\"$RUNNER_TEMP/boundary.xml\" \\\n"
+         "            --roster tests/guard_roster.json --suite tests/test_research_boundary.py",
+         "          python tools/check_ci_ran.py --junitxml=\"$RUNNER_TEMP/boundary.xml\" \\\n"
+         "            --roster tests/guard_roster.json --suite tests/test_research_boundary.py\n"
+         "          exit 0"),
+    ),
+    _mutation(
+        "给那一步加 `continue-on-error: true`(红了也不算数)",
+        WORKFLOW,
+        ("      - name: 研究侧边界不变量(批准唯一写入者 / Preset 边界 / 工具目录 / 不 import vnpy)\n"
+         "        run: |",
+         "      - name: 研究侧边界不变量(批准唯一写入者 / Preset 边界 / 工具目录 / 不 import vnpy)\n"
+         "        continue-on-error: true\n"
+         "        run: |"),
+    ),
+    _mutation(
+        "给整个 job 加 `if: false`(这一步压根不跑)",
+        WORKFLOW,
+        ("  research:\n    runs-on: ubuntu-latest",
+         "  research:\n    if: false\n    runs-on: ubuntu-latest"),
+    ),
+    _mutation(
+        "把闸门点名的套件换成**同一份报告里另一份**套件",
+        WORKFLOW,
+        ('              --roster tests/guard_roster.json --suite "$suite" \\',
+         "              --roster tests/guard_roster.json --suite tests/test_research_config.py \\"),
+    ),
+    _mutation(
+        "把 CI 循环里的一份套件从 pytest 调用里删掉",
+        WORKFLOW,
+        ('            --junitxml="$RUNNER_TEMP/research_rest.xml" \\\n'
+         "            tests/test_research_config.py \\",
+         '            --junitxml="$RUNNER_TEMP/research_rest.xml" \\'),
+    ),
+    _mutation(
+        "把删报告的 `rm -f` 挪进注释里(命令根本不执行)",
+        WORKFLOW,
+        ('          rm -f "$RUNNER_TEMP/boundary.xml"',
+         '          # rm -f "$RUNNER_TEMP/boundary.xml"'),
+    ),
+    _mutation(
+        "把删报告的 `rm -f` 挪进 `if false` 里(命令根本不执行)",
+        WORKFLOW,
+        ('          rm -f "$RUNNER_TEMP/boundary.xml"',
+         '          if false; then rm -f "$RUNNER_TEMP/boundary.xml"; fi'),
+    ),
+
+    _mutation(
+        # 第 54 轮(codex M3 的延伸):结论行必须说清「点名核对的几条里,
+        # 几条是**允许跳过**的」。第 53 轮那条 M5a(结论行不按路径自证)
+        # 只活在 %TEMP% 里,仓库里**没有**——本条把它补进来(并且更强:
+        # 不只分路径,还要分「必须真跑 / 允许跳过」)。
+        "让结论行不说明「点名核对里的几条是允许跳过的」",
+        "tools/check_ci_ran.py",
+        ('    checked = ("点名核对 %d 条(必须真跑 %d 条,允许跳过 %d 条)"\n'
+         "               % (len(wanted), must_count, allow_count))",
+         '    checked = "点名核对 %d 条" % len(wanted)'),
+        targets=[TOOL_TEST],
+    ),
+
     # ---- 反向:无害改动必须**保持绿**(证明脚本不是"一律报红") ----
     _mutation(
         "只改守卫里的一个注释(无害改动)",
         BOUNDARY,
         ('"""「被包住」的判定**自己**也要有探针(第 47 轮之三,实测发现的洞)。',
          '"""「被包住」的判定**自己**也要有探针(第 47 轮之三,实测发现的洞;无害改动)。'),
+        expect="green",
+    ),
+    _mutation(
+        # 第 54 轮(codex H3)的**反向对照**:把 `python -m pytest` 写成
+        # `python3 -m pytest` —— 守卫必须**照样认得**它(否则就是"只认字面量")。
+        # 这条**保持绿**才是对的;若它变红,说明守卫还是认死字符串。
+        "把 `python -m pytest` 写成 `python3 -m pytest`(守卫照样认得)",
+        WORKFLOW,
+        ("          python -m pytest -p no:cacheprovider -q --junitxml=\"$RUNNER_TEMP/boundary.xml\" \\",
+         "          python3 -m pytest -p no:cacheprovider -q --junitxml=\"$RUNNER_TEMP/boundary.xml\" \\"),
         expect="green",
     ),
 )
@@ -343,6 +444,27 @@ WITNESSES: dict[str, str] = {
         "tests/test_research_boundary.py::test_the_guard_looks_at_every_suite_the_roster_names",
     "让名单的采集看不见条件块里的用例":
         "tests/test_research_boundary.py::test_the_name_collector_sees_a_conditionally_defined_test",
+    # ---- 第 54 轮:CI 接线那一族(codex 第 2 轮 H1/H2/H3/H5) ----
+    "在闸门命令后面接一个恒真后缀(判红也不算失败)":
+        "tests/test_research_boundary.py::test_every_gate_call_can_actually_fail_the_step",
+    "在闸门调用之前加 `set +e`":
+        "tests/test_research_boundary.py::test_every_gate_call_can_actually_fail_the_step",
+    "在闸门调用之后加 `exit 0`(强制判成功)":
+        "tests/test_research_boundary.py::test_every_gate_call_can_actually_fail_the_step",
+    "给那一步加 `continue-on-error: true`(红了也不算数)":
+        "tests/test_research_boundary.py::test_every_gate_call_can_actually_fail_the_step",
+    "给整个 job 加 `if: false`(这一步压根不跑)":
+        "tests/test_research_boundary.py::test_every_gate_call_can_actually_fail_the_step",
+    "把闸门点名的套件换成**同一份报告里另一份**套件":
+        "tests/test_research_boundary.py::test_every_gate_call_checks_the_suites_its_own_report_produced",
+    "把 CI 循环里的一份套件从 pytest 调用里删掉":
+        "tests/test_research_boundary.py::test_every_gate_call_checks_the_suites_its_own_report_produced",
+    "把删报告的 `rm -f` 挪进注释里(命令根本不执行)":
+        "tests/test_research_boundary.py::test_every_junit_report_is_deleted_before_pytest_writes_it",
+    "把删报告的 `rm -f` 挪进 `if false` 里(命令根本不执行)":
+        "tests/test_research_boundary.py::test_every_junit_report_is_deleted_before_pytest_writes_it",
+    "让结论行不说明「点名核对里的几条是允许跳过的」":
+        "tests/test_check_ci_ran.py::test_the_conclusion_line_discloses_how_many_may_be_skipped",
 }
 
 

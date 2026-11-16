@@ -5,6 +5,7 @@
 import ast
 import functools
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -2449,39 +2450,133 @@ def test_the_core_closure_suites_are_actually_run_by_the_ci_gate(suite):
 
 
 # ---------------------------------------------------------------------------
-# CI ↔ 闸门的**接线**(第 53 轮 codex 第 2 轮 M3)
+# CI ↔ 闸门的**接线**(第 53 轮 codex 第 2 轮 M3;第 54 轮 codex H1/H2/H3/M1/M5 加固)
 #
-# 「真的跑了吗」这道闸门要成立,前提是三件事同时为真:
+# 「真的跑了吗」这道闸门要成立,前提是下面这几件事**同时**为真:
 #   ①pytest 真的把报告写出来了(⇒ 写之前必须先 `rm -f` 掉上一轮的残留,
 #     否则 pytest 崩在写文件之前时,闸门读到的是**陈旧报告**,看着全绿其实什么都没跑);
 #   ②闸门读的是**同一份**报告(路径必须一模一样);
-#   ③点名的套件**真的**在那一步里跑了。
-# 这三件事此前**全靠人记**:workflow 改一行(比如把 `rm -f` 删了),
-# 没有任何一条用例会红——而那正是"闸门看上去配好了,实际没跑"的入口。
+#   ③闸门**点名**的套件就是这一步跑的套件(不是同一份报告里别的套件);
+#   ④闸门**判红要让这一步红**(裸命令、后面不跟 `|| true`、
+#     步骤与 job 都不许 `continue-on-error: true`、都不许带 `if:`、脚本里不许 `set +e`)。
+#
+# 第 53 轮只钉了 ①②(而且是**子串**判断)。codex 第 2 轮实测出**多条已复现的旁路**,
+# 三条守卫**全绿**,而闸门其实已经不生效了:
+#   `|| true` / `set +e` / `exit 0` / `continue-on-error: true` / job 级 `if: false` /
+#   把 `--suite` 换成同一份报告里的**另一份**套件 / 把 `python -m pytest` 写成 `python3 -m pytest`。
+# 那正是本轮要消灭的失败模式。第 54 轮把守卫从**文本匹配**改成**切词 + 结构判定**。
 # ---------------------------------------------------------------------------
 
-def _ci_step_scripts() -> list[tuple[str, list[str]]]:
-    """workflow 里每个带 `run:` 的 step ⇒ (步骤名, 逻辑命令行列表)。
+# shell 的**控制运算符**:按它们把一条逻辑命令行切成若干条子命令
+_CONTROL_OPS = re.compile(r"\|\||&&|;|\||&")
 
-    用 YAML 解析(研究侧依赖里就有 pyyaml——见 requirements-research.txt:
-    「【仅测试期需要】Preset 的**结构**断言要解析 YAML」)。
-    续行(行尾 `\\`)会被合并成一条逻辑命令行。
+# 条件结构的关键字:出现在同一条逻辑命令行里 ⇒ 那条命令**可能根本不执行**
+_CONDITIONAL_WORDS = ("if", "then", "elif", "else", "fi", "while", "until",
+                       "case", "select", "function")
+
+# `for X in …; do … done` 写成一行时,循环体里的变量能还原成列表里的每一项
+_FOR_RE = re.compile(r"^for\s+([A-Za-z_]\w*)\s+in\s+(.+?)\s*;?\s*do\s+(.*?)\s*(?:;\s*)?done$",
+                     re.DOTALL)
+
+
+def _norm_path(text: str) -> str:
+    """报告路径归一化:去引号;`${VAR}` ⇒ `$VAR`(两种写法要能对上,codex L8)。"""
+    text = text.strip().strip('"').strip("'")
+    return re.sub(r"\$\{([^}]+)\}", r"$\1", text)
+
+
+def _tokens(segment: str) -> list[str]:
+    """切词:按 shell 规则切;切不动(引号不成对)就按空白切——宁可粗一点也别崩。"""
+    try:
+        return shlex.split(segment, posix=True)
+    except ValueError:
+        return segment.split()
+
+
+def _segments(logical: str) -> list[str]:
+    """按控制运算符切一条逻辑命令行。"""
+    return [part.strip() for part in _CONTROL_OPS.split(logical) if part.strip()]
+
+
+# 可以**直接执行**的解释器/运行器(命令位置上的第一个词)
+_PYTHON_EXES = {"python", "python3", "py", "pythonw"}
+_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "tox", "nox"}
+# 行首的**环境变量赋值**(`FOO=1 python …`)——不是命令,得先跳过
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _script_of(tokens: list[str]) -> str | None:
+    """这条命令行里**被执行的脚本/模块**是什么。
+
+    第 54 轮(codex H3 收尾):只认**命令位置**——
+    python 解释器后面的第一个非开关参数,或 `uv run …` 之类运行器后面的脚本。
+
+    为什么必须认位置:文件名出现在**参数**里 ≠ 那条命令在跑它。
+    实测:ruff 那一步的文件清单里列着 `tools/check_ci_ran.py`
+    ⇒ 此前「任何位置出现 check_ci_ran.py 就算闸门调用」把**被检查的对象**
+    误判成**被执行的命令** ⇒ 守卫报「闸门调用没有 --roster」这种假红。
     """
-    import yaml
+    tokens = [t for t in tokens if not _ENV_ASSIGN.match(t)]
+    if not tokens:
+        return None
+    head = tokens[0].rsplit("/", 1)[-1].lower()
+    if head in _PYTHON_EXES:
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue                    # `-m` / `-I` / `-p` 都是开关
+            return token
+        return None
+    if head in _RUNNERS:
+        for index, token in enumerate(tokens):
+            if token in ("run", "exec") and index + 1 < len(tokens):
+                return tokens[index + 1]
+        return None
+    if head == "pytest":
+        return "pytest"
+    return None
 
-    data = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-    steps: list[tuple[str, list[str]]] = []
-    for job in (data.get("jobs") or {}).values():
-        for step in (job.get("steps") or []):
-            script = str(step.get("run") or "")
-            if not script:
-                continue
-            steps.append((str(step.get("name") or ""), _logical_commands(script)))
-    return steps
+
+def _is_pytest(tokens: list[str]) -> bool:
+    """这条命令是不是在跑 pytest。
+
+    第 54 轮(codex H3):此前写死 `"python -m pytest" in command` ——
+    改成 `python3 -m pytest`(或 `pytest`、`uv run pytest`)就**认不出来**了
+    ⇒ 那一步的报告从此没人核对,而守卫全绿。
+    现在按**命令位置**认(见 `_script_of`)。
+    """
+    script = _script_of(tokens)
+    return bool(script) and script.rsplit("/", 1)[-1] == "pytest"
+
+
+def _option_value(tokens: list[str], name: str) -> str | None:
+    """取 `--name=value` 或 `--name value` 的值。"""
+    for index, token in enumerate(tokens):
+        if token.startswith(name + "="):
+            return token[len(name) + 1:]
+        if token == name and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def _apply_bindings(tokens: list[str], bindings: dict[str, str]) -> list[str]:
+    """把循环变量还原成它那一轮的值(`--suite "$suite"` ⇒ `--suite tests/x.py`)。"""
+    out: list[str] = []
+    for token in tokens:
+        match = re.fullmatch(r"\$\{(\w+)\}|\$(\w+)", token)
+        if match:
+            name = match.group(1) or match.group(2)
+            out.append(bindings.get(name, token))
+        else:
+            out.append(token)
+    return out
 
 
 def _logical_commands(script: str) -> list[str]:
-    """把一段 shell 脚本拆成**逻辑命令行**(续行合并、注释与空行丢掉)。"""
+    """把一段 shell 脚本拆成**逻辑命令行**(续行合并、注释与空行丢掉)。
+
+    第 54 轮:`for … ; do … done` 会被合并成**一条**逻辑命令行——
+    守卫要能静态还原「闸门点名的每一份套件」,循环变量必须能还原成列表项。
+    """
     commands: list[str] = []
     buf = ""
     for raw in script.splitlines():
@@ -2496,12 +2591,156 @@ def _logical_commands(script: str) -> list[str]:
         buf = ""
     if buf:
         commands.append(buf)
-    return commands
+    return _merge_for_loops(commands)
 
 
-def _junit_paths(command: str) -> list[str]:
-    """这条命令行里 `--junitxml=` 指向的报告路径。"""
-    return re.findall(r"--junitxml[=\s]+\"?([^\s\"\\]+)", command)
+def _merge_for_loops(commands: list[str]) -> list[str]:
+    """把 `for X in …; do` … `done` 合并成一条逻辑命令行。"""
+    merged: list[str] = []
+    index = 0
+    while index < len(commands):
+        command = commands[index]
+        if re.search(r"\bfor\s+\w+\s+in\b.*;\s*do\s*$", command):
+            body = [command]
+            index += 1
+            while index < len(commands) and not re.search(r"\bdone\s*$", commands[index]):
+                body.append(commands[index])
+                index += 1
+            if index < len(commands):
+                body.append(commands[index])          # `done`
+                index += 1
+            merged.append(" ".join(body))
+            continue
+        merged.append(command)
+        index += 1
+    return merged
+
+
+def _if_text(value) -> str:
+    """`if:` 条件的原样文本。
+
+    **不能用 `or ""`**:`if: false` 在 YAML 里解析成**布尔 False** ⇒
+    `False or ""` ⇒ `""` ⇒ 守卫**看不见**这一条 ⇒ 整个 job 压根不跑也没人发现。
+    第 54 轮的变异验证(「给整个 job 加 `if: false`」)当场把这条洞打了出来。
+    """
+    if value is None:
+        return ""
+    if value is False:
+        return "false"
+    return str(value).strip()
+
+
+def _ci_steps() -> list[dict]:
+    """workflow 里每个带 `run:` 的 step ⇒ 一份描述。
+
+    带上 job 级与 step 级的 `if:` / `continue-on-error` ——
+    它们能让这一步**整个不跑**或**红了也不算数**,而守卫此前只读 `run:`
+    (codex 第 2 轮 M5:job 级 `if: false` ⇒ 三条守卫全绿,而整条线一步没跑)。
+    """
+    import yaml
+
+    data = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    steps: list[dict] = []
+    for job_name, job in (data.get("jobs") or {}).items():
+        job = job or {}
+        for step in (job.get("steps") or []):
+            script = str(step.get("run") or "")
+            if not script:
+                continue
+            steps.append({
+                "job": job_name,
+                "name": str(step.get("name") or ""),
+                "commands": _logical_commands(script),
+                "job_if": _if_text(job.get("if")),
+                "step_if": _if_text(step.get("if")),
+                "job_continue": bool(job.get("continue-on-error") or False),
+                "step_continue": bool(step.get("continue-on-error") or False),
+            })
+    return steps
+
+
+def _step_actions(step: dict) -> list[dict]:
+    """把一个 step 摊平成一串**动作**(按执行顺序)。
+
+    动作的种类:
+      - `pytest`:跑了 pytest(带 `--junitxml` 时 report 才有值);
+      - `rm`:删了一个文件;
+      - `gate`:调了 `tools/check_ci_ran.py`;
+      - `set+e`:关掉了 errexit ⇒ 之后的失败**不会**让这一步红。
+    """
+    actions: list[dict] = []
+    for order, logical in enumerate(step["commands"]):
+        for bindings, body in _expand_for_loop(logical):
+            segments = _segments(body)
+            conditional = any(word in _tokens(" ".join(segments)) for word in _CONDITIONAL_WORDS)
+            for index, segment in enumerate(segments):
+                tokens = _apply_bindings(_tokens(segment), bindings)
+                if not tokens:
+                    continue
+                position = (order, index)
+                if _is_pytest(tokens):
+                    report = _option_value(tokens, "--junitxml")
+                    actions.append({
+                        "kind": "pytest", "position": position,
+                        "report": _norm_path(report) if report else None,
+                        "suites": [t for t in tokens
+                                   if t.endswith(".py") and not t.startswith("-")],
+                        "conditional": conditional,
+                    })
+                elif tokens[0] == "rm":
+                    targets = [t for t in tokens[1:] if not t.startswith("-")]
+                    actions.append({
+                        "kind": "rm", "position": position,
+                        "path": _norm_path(targets[-1]) if targets else None,
+                        "force": "-f" in tokens,
+                        "conditional": conditional,
+                    })
+                elif (_script_of(tokens) or "").rsplit("/", 1)[-1] == "check_ci_ran.py":
+                    report = _option_value(tokens, "--junitxml")
+                    actions.append({
+                        "kind": "gate", "position": position,
+                        "report": _norm_path(report) if report else None,
+                        "suite": _option_value(tokens, "--suite"),
+                        "roster": _option_value(tokens, "--roster"),
+                        "allow_unlisted": "--allow-unlisted-suite" in tokens,
+                        # **裸命令**:这条命令是该逻辑命令行的**最后一条**,
+                        # 且整条命令行里没有条件结构。
+                        # (前面挂着 `|| true`、后面跟着 `exit 0` ⇒ 判红也不算数)
+                        "bare": (index == len(segments) - 1) and not conditional,
+                        "conditional": conditional,
+                    })
+                elif tokens[0] == "set" and "+e" in tokens:
+                    actions.append({"kind": "set+e", "position": position})
+                elif tokens[0] == "exit" and "0" in tokens[1:]:
+                    # `exit 0`:把这一步**强制**判成成功 ⇒ 前面闸门判红也不算数
+                    # (codex 第 2 轮 H1 列出的第三条旁路)。
+                    actions.append({"kind": "exit0", "position": position})
+    return actions
+
+
+def _expand_for_loop(logical: str) -> list[tuple[dict, str]]:
+    """`for X in a b; do BODY; done` ⇒ [(绑定, BODY), …];不是 for 循环就原样返回。"""
+    match = _FOR_RE.match(logical.strip())
+    if not match:
+        return [({}, logical)]
+    variable, items, body = match.group(1), match.group(2), match.group(3)
+    return [({variable: item}, body) for item in items.split()]
+
+
+def test_the_if_condition_reader_does_not_swallow_a_boolean_false():
+    """`if: false` 在 YAML 里是**布尔 False**——不能被 `or ""` 吞成空串。
+
+    第 54 轮(codex H1 的第四种旁路「整个 job 带 `if: false`」):
+    接线守卫此前写的是 `str(job.get("if") or "").strip()`
+    ⇒ `False or ""` ⇒ `""` ⇒ **这条旁路完全看不见**
+    ⇒ 整个 job 一步都不跑,守卫还是绿的。
+    这条用例就是那个洞的**双向探针**:读出来必须是「非空的 false」,
+    不能是「没有 if」。
+    """
+    assert _if_text(False) == "false", "`if: false` 被吞成空串了 ⇒ 整条旁路看不见"
+    assert _if_text(None) == "", "没有 if 时应当是空串"
+    assert _if_text("${{ github.event_name == 'push' }}") != "", "字符串形式的 if 必须原样保留"
+    assert _if_text(True) == "True", "布尔 True 也要保留"
 
 
 def test_every_junit_report_is_deleted_before_pytest_writes_it():
@@ -2509,14 +2748,27 @@ def test_every_junit_report_is_deleted_before_pytest_writes_it():
 
     否则:pytest 崩在写文件之前 ⇒ 闸门去读的是**上一轮的陈旧报告**,
     看着全绿其实这一轮什么都没跑(codex 第 2 轮 L4 那条洞的接线面)。
+
+    第 54 轮(codex M1):此前是**子串**判断(`"rm -f" in c and path in c`)——
+    `echo noop # rm -f "$X"` 与 `if false; then rm -f "$X"; fi` 都算数
+    ⇒ 那条命令**根本不会删**任何东西,而守卫是绿的。
+    现在:切词 + 要求这条命令**真的**是 `rm -f <路径>`、且不在条件结构里。
     """
     problems: list[str] = []
-    for step_name, commands in _ci_step_scripts():
-        for index, command in enumerate(commands):
-            for path in _junit_paths(command):
-                earlier = commands[:index]
-                if not any("rm -f" in c and path in c for c in earlier):
-                    problems.append(f"步骤「{step_name}」:报告 {path} 写之前没有 rm -f")
+    for step in _ci_steps():
+        actions = _step_actions(step)
+        for action in actions:
+            if action["kind"] != "pytest" or not action["report"]:
+                continue
+            path = action["report"]
+            deleted = [
+                a for a in actions
+                if a["kind"] == "rm" and a["path"] == path and a["force"]
+                and a["position"] < action["position"] and not a["conditional"]
+            ]
+            if not deleted:
+                problems.append(
+                    f"步骤「{step['name']}」:报告 {path} 写之前没有**真的会执行**的 rm -f")
     assert not problems, "；".join(problems)
 
 
@@ -2527,15 +2779,105 @@ def test_every_junit_report_is_handed_to_the_gate():
     「真的跑了吗」这道闸门就名存实亡。
     """
     problems: list[str] = []
-    for step_name, commands in _ci_step_scripts():
-        for index, command in enumerate(commands):
-            if "python -m pytest" not in command:
+    for step in _ci_steps():
+        actions = _step_actions(step)
+        for action in actions:
+            if action["kind"] != "pytest" or not action["report"]:
                 continue
-            for path in _junit_paths(command):
-                later = commands[index + 1:]
-                handed = any("check_ci_ran.py" in c and path in c for c in later)
-                if not handed:
-                    problems.append(f"步骤「{step_name}」:报告 {path} 没有交给 check_ci_ran.py 核对")
+            path = action["report"]
+            handed = [a for a in actions
+                      if a["kind"] == "gate" and a["report"] == path]
+            if not handed:
+                problems.append(f"步骤「{step['name']}」:报告 {path} 没有交给 check_ci_ran.py 核对")
+    assert not problems, "；".join(problems)
+
+
+def test_every_gate_call_checks_the_suites_its_own_report_produced():
+    """闸门**点名**的套件必须就是这一步跑的套件。
+
+    第 54 轮(codex H2):此前只要求「有哪条命令提到闸门**且提到同一路径**」——
+    **不要求** `--suite` 是被查的那份。实测:删掉 `--suite tests/test_approval_ledger.py`
+    那次调用(只留同一份报告里另一份套件的)⇒ 三条守卫全绿,
+    而批准账本那份**从此无人逐条核对**。
+    """
+    problems: list[str] = []
+    for step in _ci_steps():
+        actions = _step_actions(step)
+        for action in actions:
+            if action["kind"] != "pytest" or not action["report"]:
+                continue
+            path = action["report"]
+            expected = set(action["suites"])
+            named = {gate["suite"] for gate in actions
+                     if gate["kind"] == "gate" and gate["report"] == path and gate["suite"]}
+            if named != expected:
+                problems.append(
+                    f"步骤「{step['name']}」:报告 {path} 跑的套件 {sorted(expected)} "
+                    f"与闸门点名的 {sorted(named)} 对不上")
+    assert not problems, "；".join(problems)
+
+
+def test_every_gate_call_can_actually_fail_the_step():
+    """闸门判红 ⇒ 这一步必须红(否则闸门只是装饰)。
+
+    第 54 轮(codex H1/M5):实测过**五条已复现的旁路**,守卫全都绿:
+      - 闸门命令尾加 `|| true`;
+      - 闸门前出现 `set +e`;
+      - 闸门后加 `exit 0`;
+      - 这一步(或这个 job)加 `continue-on-error: true`;
+      - 这一步(或这个 job)带 `if:`(整个可能不跑)。
+    现在:闸门必须是**裸命令**(该逻辑命令行的最后一条、且不在条件结构里)、
+    必须带 `--roster` 指向仓库那份名单;步骤与 job 都不得有 `continue-on-error: true`、
+    都不得带 `if:`;脚本里不得出现 `set +e`。
+    """
+    problems: list[str] = []
+    for step in _ci_steps():
+        if step["step_continue"] or step["job_continue"]:
+            problems.append(f"步骤「{step['name']}」:continue-on-error ⇒ 这一步红了也不算数")
+        if step["step_if"] or step["job_if"]:
+            problems.append(f"步骤「{step['name']}」:带 if: ⇒ 这一步可能**整个不跑**")
+        actions = _step_actions(step)
+        if any(a["kind"] == "set+e" for a in actions):
+            problems.append(f"步骤「{step['name']}」:出现 set +e ⇒ 之后的失败不会让这一步红")
+        for gate in actions:
+            if gate["kind"] != "gate":
+                continue
+            # `exit 0` 出现在闸门**之后** ⇒ 这一步被强制判成成功,
+            # 闸门判红也不算数(codex 第 2 轮 H1 的第三条旁路)。
+            for later in actions:
+                if later["kind"] == "exit0" and later["position"] > gate["position"]:
+                    problems.append(
+                        f"步骤「{step['name']}」:闸门调用之后出现 exit 0"
+                        "⇒ 这一步被强制判成成功,闸门判红也不算数")
+            if not gate["bare"]:
+                problems.append(
+                    f"步骤「{step['name']}」:闸门调用不是裸命令(后面还有东西,或在条件结构里)"
+                    "⇒ 它判红也不会让这一步红")
+            roster = gate["roster"]
+            if not roster:
+                problems.append(f"步骤「{step['name']}」:闸门调用没有 --roster ⇒ 它读的不是仓库那份名单")
+            elif (ROOT / roster).resolve() != GUARD_ROSTER.resolve():
+                problems.append(
+                    f"步骤「{step['name']}」:闸门读的名单不是仓库那份:{roster}"
+                    f"(应当是 {GUARD_ROSTER.relative_to(ROOT).as_posix()})")
+    assert not problems, "；".join(problems)
+
+
+def test_no_gate_call_points_at_a_report_this_step_never_produced():
+    """闸门读的报告必须是**这一步**产出的。
+
+    否则:闸门读的是别的步骤(或上一轮)的旧报告 ⇒ 看着全绿,核对的却是陈旧结论。
+    """
+    problems: list[str] = []
+    for step in _ci_steps():
+        actions = _step_actions(step)
+        produced = {a["report"] for a in actions if a["kind"] == "pytest" and a["report"]}
+        for gate in actions:
+            if gate["kind"] != "gate":
+                continue
+            if gate["report"] not in produced:
+                problems.append(
+                    f"步骤「{step['name']}」:闸门读的报告 {gate['report']} 不是这一步产出的")
     assert not problems, "；".join(problems)
 
 
@@ -2549,22 +2891,21 @@ def test_the_approval_ledger_and_collect_suites_have_a_report_the_gate_checks():
     它们的用例在 CI 上没人核对。
     """
     for suite in ("tests/test_approval_ledger.py", "tests/test_research_collect.py"):
-        holders = [
-            (step_name, commands)
-            for step_name, commands in _ci_step_scripts()
-            if any("python -m pytest" in c and suite in c for c in commands)
-        ]
+        holders = [(step, _step_actions(step)) for step in _ci_steps()
+                   if any(a["kind"] == "pytest" and suite in a["suites"]
+                          for a in _step_actions(step))]
         assert holders, f"{suite} 不在任何 CI 步骤里跑(连 pytest 都没有)"
         covered = False
-        for step_name, commands in holders:
-            for index, command in enumerate(commands):
-                if "python -m pytest" not in command or suite not in command:
+        for step, actions in holders:
+            for action in actions:
+                if action["kind"] != "pytest" or suite not in action["suites"]:
                     continue
-                paths = _junit_paths(command)
-                assert paths, f"步骤「{step_name}」:跑 {suite} 的那一步没有产出 junit 报告"
-                later = commands[index + 1:]
-                if any("check_ci_ran.py" in c and any(p in c for p in paths) for c in later):
-                    covered = True
+                assert action["report"], (
+                    f"步骤「{step['name']}」:跑 {suite} 的那一步没有产出 junit 报告")
+                for gate in actions:
+                    if (gate["kind"] == "gate" and gate["report"] == action["report"]
+                            and gate["suite"] == suite):
+                        covered = True
         assert covered, f"{suite} 的报告没有交给闸门核对"
 
 
@@ -2803,6 +3144,25 @@ def _skip_calls(node, namespaces: set[str] | None = None,
     return calls
 
 
+def _skip_calls_under_a_condition(node, namespaces: set[str] | None = None,
+                                  factories: set[str] | None = None) -> set[int]:
+    """**被某个 if 条件包住**的跳过调用的 id 集合。
+
+    第 54 轮(codex H4 的配套):运行期的 `pytest.skip("...")` 本身**没有条件**,
+    但它写在 `if 库里没有账本:` 里时,跳过与否取决于**数据**——
+    那不是「这条防线永远不跑」。要区分这两种情况,就得看它**被什么包着**。
+
+    返回 `id()` 集合(id 唯一且对象在树存活期间有效 ⇒ 可用来做成员判断)。
+    """
+    guarded: set[int] = set()
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.If):
+            continue
+        for call in _skip_calls(sub, namespaces, factories):
+            guarded.add(id(call))
+    return guarded
+
+
 def _bare_skip_marks(node, namespaces: set[str] | None = None,
                      factories: set[str] | None = None) -> list:
     """节点里**裸**的跳过装饰器(`@pytest.mark.skip` / `@skip`)。
@@ -2906,6 +3266,8 @@ def test_the_core_closure_suite_only_skips_for_registered_reasons():
     for path in _guarded_suites():
         tree = ast.parse(_read_source(path))
         namespaces, factories = _pytest_mark_aliases(tree)
+        rel_path = path.relative_to(ROOT).as_posix()
+        allowed_skip = _allowed_to_skip(rel_path)
         for node in tree.body:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -2918,10 +3280,31 @@ def test_the_core_closure_suite_only_skips_for_registered_reasons():
             # 所以判据不能只看 `marks`——否则那一条根本走不到下面的检查。
             if not (marks or calls or bare):
                 continue
-            assert node.name in PLATFORM_SKIPS, (
+            registered = node.name in PLATFORM_SKIPS
+            # 第 54 轮(codex H4 的配套):「允许跳过」(ALLOW_SKIPPED_JUSTIFICATION)
+            # 是**数据依赖**的跳过——CI 上没有本地账本就跳过那条一致性对照。
+            # 它是**另一类**登记:平台跳过登记的是「有条件的平台差异」,
+            # 允许跳过登记的是「有条件的运行期退出」。两者都要求**有条件**。
+            allowed_here = node.name in allowed_skip
+            assert registered or allowed_here, (
                 f"{path.name}:{node.lineno} {node.name} 用了跳过类标记 {sorted(marks)},"
                 "但没登记在 PLATFORM_SKIPS 里(平台相关跳过要登记理由;"
                 "没登记的跳过 = CI 上少跑一条防线)")
+            if allowed_here and not registered:
+                # 「允许跳过」**只**豁免**运行期**的跳过,且必须**写在 if 条件里**
+                # (数据依赖)——标记类跳过(裸装饰器 / skipif)一律不许:
+                # 那不是数据依赖,是整条永远不跑。
+                assert not marks and not bare, (
+                    f"{path.name}:{node.lineno} {node.name} 用的是**标记类**跳过"
+                    f"({sorted(marks) or [ast.unparse(bare[0])[:60]] if bare else sorted(marks)}):"
+                    "「允许跳过」只允许运行期、数据依赖的跳过,标记类一律不许")
+                guarded = _skip_calls_under_a_condition(node, namespaces, factories)
+                for call in calls:
+                    assert id(call) in guarded, (
+                        f"{path.name}:{node.lineno} {node.name} 的运行期跳过"
+                        f"({ast.unparse(call)[:60]})没有写在任何 if 条件里"
+                        "⇒ 那不是数据依赖,是无条件不跑这条防线")
+                continue
             for call in calls:
                 assert not _is_unconditional_skip(call), (
                     f"{path.name}:{node.lineno} {node.name} 是**无条件**跳过"
@@ -3066,7 +3449,29 @@ GUARD_SUITE_ROSTER = (
     "tests/test_check_domain.py",
     "tests/test_check_ci_ran.py",
     "tests/test_check_guard_mutations.py",
+    # 第 54 轮(codex H4):两份**真钱链路**上的关口也要**逐条点名**核对。
+    # 此前它们只能拿到「文件级」核对(出现过、没整份跳过)——
+    # 「批准账本只读」那条不变式**单独**被跳过时,闸门照样放行。
+    "tests/test_approval_ledger.py",
+    "tests/test_research_collect.py",
 )
+
+# 「允许被跳过」的用例:必须**逐条登记理由**(第 54 轮 codex H4)。
+#
+# 为什么需要这一段:真钱那两份里有一条用例是**数据依赖**的跳过
+# (本地没有账本就跳过)⇒ 它进不了「必须真跑」的名单。
+# 此前只有两条路:要么整份不进名单(丢掉逐条核对),
+# 要么进名单(闸门在 CI 上永远红)。现在分成两段:
+# `must_run` = 必须出现**且不能被跳过**;`allow_skipped` = 必须出现、**允许被跳过**。
+#
+# **每一项都要写理由**:名字出现在这里,就是「这条防线在 CI 上允许不生效」的
+# 书面授权——没有理由就不许出现在名单里。
+ALLOW_SKIPPED_JUSTIFICATION: dict[str, dict[str, str]] = {
+    "tests/test_approval_ledger.py": {
+        "test_reading_is_consistent_with_the_research_side":
+            "没有本地账本时这条用例跳过(CI 上永远没有本地账本)",
+    },
+}
 
 # 允许出现在 `conftest.py` 里的「改收集」钩子(**现在是空的**):
 # 要加必须先在这里登记(路径::钩子名 → 理由),评审时看得见。
@@ -3168,8 +3573,16 @@ def _expected_must_run(suite: str) -> set[str]:
         # (分档器 / 「真的跑了吗」闸门 / 变异脚手架)。
         # 这三份此前**不在名单里** ⇒ 整份被跳过、或某条守卫用例被删掉,
         # CI 都看不出来——**守卫的守卫自己没有兜底**。
-        return _suite_test_names(ROOT / suite)
+        #
+        # 第 54 轮:真钱那两份也进了名单(逐条点名核对);
+        # 其中「允许跳过」的那几条**不算**在必须真跑里(见 ALLOW_SKIPPED_JUSTIFICATION)。
+        return _suite_test_names(ROOT / suite) - _allowed_to_skip(suite)
     raise AssertionError(f"名单里出现了未知套件:{suite}")
+
+
+def _allowed_to_skip(suite: str) -> set[str]:
+    """这一份套件里**允许被跳过**的用例(必须逐条登记理由)。"""
+    return set(ALLOW_SKIPPED_JUSTIFICATION.get(suite, {}))
 
 
 # 采集器自己的探针(第 49 轮 codex M2:采集器漏了条件块 ⇒ 用例可以藏起来)
@@ -3223,6 +3636,8 @@ def test_the_guard_looks_at_every_suite_the_roster_names():
         "tests/test_check_domain.py",
         "tests/test_check_ci_ran.py",
         "tests/test_check_guard_mutations.py",
+        "tests/test_approval_ledger.py",
+        "tests/test_research_collect.py",
     }
     seen = {path.relative_to(ROOT).as_posix() for path in _guarded_suites()}
     assert seen == expected, (
@@ -3254,7 +3669,10 @@ def test_the_guard_roster_matches_the_suites_it_names():
         "等于永远查不到任何一条 ⇒ 静默失效")
     data = json.loads(GUARD_ROSTER.read_text(encoding="utf-8"))
     must_run = data.get("must_run")
+    allow_skipped = data.get("allow_skipped", {})
     assert isinstance(must_run, dict), "guard_roster.json 里的 must_run 必须是 {套件路径: [用例名]}"
+    assert isinstance(allow_skipped, dict), (
+        "guard_roster.json 里的 allow_skipped 必须是 {套件路径: [用例名]}")
     assert must_run, "must_run 是空的 ⇒ CI 侧那道闸门什么也不查"
     # 名单里必须**恰好**是这两份套件:上面那些检查是**按名单里的条目**逐个做的,
     # 所以「把整份套件的条目从名单里删掉」那种改法,逐条检查根本不会碰到它
@@ -3276,6 +3694,29 @@ def test_the_guard_roster_matches_the_suites_it_names():
         assert not missing, (
             f"{GUARD_ROSTER.name}:{suite} **漏登记**了这些用例: {sorted(missing)}"
             "(CI 侧的兜底按名单核对;漏登记 ⇒ 那条防线没跑也没人知道)")
+
+    # 第 54 轮(codex H4):「允许跳过」那一段必须与**登记的理由**完全一致。
+    #
+    # 为什么要钉:允许跳过 = 「这条防线在 CI 上允许不生效」的书面授权。
+    # 如果只改名单文件就能多允许一条,那这份授权就**不需要评审** ⇒ 防线被悄悄松开。
+    # 所以:多一条少一条都得改**这份守卫文件**(代码改动 ⇒ 走评审与变异验证)。
+    expected_allow = {suite: set(names)
+                      for suite, names in ALLOW_SKIPPED_JUSTIFICATION.items() if names}
+    assert set(allow_skipped) == set(expected_allow), (
+        f"{GUARD_ROSTER.name} 里的 allow_skipped {sorted(allow_skipped)} "
+        f"与守卫里登记的理由 {sorted(expected_allow)} 对不上"
+        "(多出来的 ⇒ 有人绕过评审就放开了某条防线)")
+    for suite, names in allow_skipped.items():
+        assert set(names) == expected_allow.get(suite, set()), (
+            f"{GUARD_ROSTER.name}:{suite} 的 allow_skipped {sorted(names)} "
+            f"与登记的理由 {sorted(expected_allow.get(suite, set()))} 对不上")
+        assert suite in must_run, (
+            f"{GUARD_ROSTER.name}:{suite} 只在 allow_skipped 里、却不在 must_run 里"
+            "⇒ 它压根没被逐条核对,「允许跳过」是空转")
+        overlap = set(names) & set(must_run[suite])
+        assert not overlap, (
+            f"{GUARD_ROSTER.name}:{suite} 的 {sorted(overlap)} 同时在两段里"
+            "⇒ 既要求真跑又允许跳过,判据自相矛盾")
 
     # 名单里不许出现会跳过的东西
     for suite, names in must_run.items():

@@ -249,13 +249,23 @@ jobs:
           # 第 53 轮(codex 第 2 轮 M2):这一步此前**只靠 pytest 的退出码**——
           # 整份被跳过时退出码仍是 0 ⇒ CI 照样绿。现在产出报告并交给闸门核对。
           #
-          # 名单(`tests/guard_roster.json`)里**没有**这两份:那份名单是
-          # 「守卫套件专用」的名单(必须是且只是那五份),而 `tests/test_approval_ledger.py`
-          # 里有一条用例在没有本地账本时会**跳过**⇒ 进名单就等于「必须真跑」是句空话
-          # (闸门会永远红)。所以这里显式 `--allow-unlisted-suite`。
-          # 但「不做点名核对」**不等于**「允许这份没跑」:闸门仍然会盯住
-          # `tests/test_approval_ledger.py` 与 `tests/test_research_collect.py` 本身——
-          # 它们必须出现在报告里,且不能整份被跳过(见 tools/check_ci_ran.py)。
+          # 第 54 轮(codex H5):**这一步跑的 10 份套件,此前只有 2 份拿到闸门调用**——
+          # 其余 8 份(sandbox / approval_server / gateway / api / mcp / gate / grid / config)
+          # 仍**只靠 pytest 的退出码** ⇒ 其中任意一份被 `pytestmark = skipif(True)`
+          # 整份跳过,CI 照样绿(而其中 sandbox 与 approval_server 本身就是防线,
+          # 且都在**不可降级**清单里)。现在 10 份**各调一次**闸门。
+          #
+          # 第 54 轮(codex H4):`tests/test_approval_ledger.py` 与
+          # `tests/test_research_collect.py` 已经**进名单** ⇒ 闸门对它们做
+          # **逐条点名**核对(账本那份里「没有本地账本就跳过」的那一条
+          # 登记在名单的 `allow_skipped` 段里,理由写在守卫文件里)。
+          # 其余 8 份**故意不在名单**里(它们有平台/依赖相关的跳过)⇒
+          # 显式 `--allow-unlisted-suite`:不做逐条点名,但**必须真的跑过**
+          # (必须出现在报告里、且不能整份被跳过)。
+          #
+          # 纪律守卫会断言:这份循环里的**每一份**套件都拿到一次点名核对,
+          # 且闸门点名的套件**就是**这一步跑的套件(不能拿同一份报告里
+          # 别的套件顶替)。
           rm -f "$RUNNER_TEMP/research_rest.xml"
           python -m pytest -p no:cacheprovider --continue-on-collection-errors -q \
             --junitxml="$RUNNER_TEMP/research_rest.xml" \
@@ -269,12 +279,21 @@ jobs:
             tests/test_research_grid.py \
             tests/test_approval_ledger.py \
             tests/test_research_collect.py
-          python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/research_rest.xml" \
-            --roster tests/guard_roster.json --suite tests/test_approval_ledger.py \
-            --allow-unlisted-suite
-          python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/research_rest.xml" \
-            --roster tests/guard_roster.json --suite tests/test_research_collect.py \
-            --allow-unlisted-suite
+          for suite in \
+            tests/test_research_config.py \
+            tests/test_research_sandbox.py \
+            tests/test_research_gateway.py \
+            tests/test_research_approval_server.py \
+            tests/test_research_api.py \
+            tests/test_research_mcp.py \
+            tests/test_research_gate.py \
+            tests/test_research_grid.py \
+            tests/test_approval_ledger.py \
+            tests/test_research_collect.py; do
+            python tools/check_ci_ran.py --junitxml="$RUNNER_TEMP/research_rest.xml" \
+              --roster tests/guard_roster.json --suite "$suite" \
+              --allow-unlisted-suite
+          done
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #
@@ -338,14 +357,18 @@ jobs:
       # 为什么要有这一步:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异」
       # **仓库里没有实现**——那是手工拿反例去撞守卫,不可复算、别人也跑不了。
       # 「写下了但没人跑」等于没有防线,所以这一步把它**脚本化**:
-      # `tools/check_guard_mutations.py` 在**仓库副本**上逐个施加 24 种变异
+      # `tools/check_guard_mutations.py` 在**仓库副本**上逐个施加 35 种变异
       # (模块级一刀切跳过 / 别名跳过 / 无条件跳过 / 裸跳过 / 名单被摘 /
-      #  conftest 改收集 / 守卫视野变窄 / 名单采集漏条件块 / …),
-      # 每一种都必须让**钉死的见证用例**变红;其中一条是**无害的注释改动**,必须**保持绿**
+      #  conftest 改收集 / 守卫视野变窄 / 名单采集漏条件块 /
+      #  CI 接线那一族:闸门后接恒真后缀 / set +e / exit 0 /
+      #  continue-on-error: true / job 级 if: false / 点名换成别的套件 /
+      #  少跑一份套件 / rm -f 挪进注释或 if false / …),
+      # 每一种都必须让**钉死的见证用例**变红;其中两条是**无害改动**
+      # (改注释、把 `python -m pytest` 写成 `python3 -m pytest`),必须**保持绿**
       # (证明这份脚本不是"永远红",空转的见证不算见证)。
       #
       # 第 49 轮起每条变异**只跑见证那一条**(此前每条都跑整份套件):
-      # 26 次 pytest(2 次基线 + 24 次变异),约一分钟。
+      # 37 次 pytest(2 次基线 + 35 次变异),约一分钟。
       # 这是**唯一**能证明纪律守卫没被"悄悄放松"的检查。
       - name: 纪律守卫的变异验证(每条守卫松了都必须被抓)
         run: |

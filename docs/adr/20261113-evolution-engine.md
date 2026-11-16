@@ -2994,7 +2994,7 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 脚本在**仓库外**的临时目录里做,真工作树全程不动;行尾符按原样保留(仓库里 CRLF 与 LF 都有,
 统一改写会让 diff 全是行尾噪声)。
 
-#### 4. 纪律守卫的变异表(24 条)
+#### 4. 纪律守卫的变异表(35 条)
 
 | 变异 | 改的是哪个文件 | 见证 |
 |---|---|---|
@@ -3022,6 +3022,28 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 | 让名单的采集看不见条件块里的用例 | tests/test_research_boundary.py | 守卫套件 |
 | 把一份守卫套件从 CI 名单里改名 | tests/guard_roster.json | CI 名单 |
 | 只改守卫里的一个注释(无害改动) | tests/test_research_boundary.py | 守卫套件(**保持绿**) |
+| 在闸门命令后面接一个恒真后缀(判红也不算失败) | .github/workflows/research-guard.yml | 接线守卫 |
+| 在闸门调用之前加 `set +e` | .github/workflows/research-guard.yml | 接线守卫 |
+| 在闸门调用之后加 `exit 0`(强制判成功) | .github/workflows/research-guard.yml | 接线守卫 |
+| 给那一步加 `continue-on-error: true`(红了也不算数) | .github/workflows/research-guard.yml | 接线守卫 |
+| 给整个 job 加 `if: false`(这一步压根不跑) | .github/workflows/research-guard.yml | 接线守卫 |
+| 把闸门点名的套件换成**同一份报告里另一份**套件 | .github/workflows/research-guard.yml | 接线守卫 |
+| 把 CI 循环里的一份套件从 pytest 调用里删掉 | .github/workflows/research-guard.yml | 接线守卫 |
+| 把删报告的 `rm -f` 挪进注释里(命令根本不执行) | .github/workflows/research-guard.yml | 接线守卫 |
+| 把删报告的 `rm -f` 挪进 `if false` 里(命令根本不执行) | .github/workflows/research-guard.yml | 接线守卫 |
+| 把 `python -m pytest` 写成 `python3 -m pytest`(守卫照样认得) | .github/workflows/research-guard.yml | 接线守卫(**保持绿**) |
+| 让结论行不说明「点名核对里的几条是允许跳过的」 | tools/check_ci_ran.py | 闸门自身的用例 |
+
+> **表里的标签不许含竖线**:`|` 会把 markdown 表格切开,解析器取到的第一格
+> 会被截断 ⇒ 核对必然对不上。第 54 轮那条「恒真后缀」因此写成中文,
+> 字面量(`|| true`)写在第 54 轮的正文里——**标签是给人读的,不是给解析器读的**。
+
+> 第 54 轮新增的**十一条**里有**十条**改 **workflow 本身**(不是守卫源码):
+> 这一族此前**零变异验证**——第 53 轮写下的接线守卫若哪天被放松
+> (比如把恒真后缀加回去),CI 不会红,ADR 里那条结论就成了没人复核的话。
+> 现在每一条旁路都有**一条变异**把它变红,且**钉死见证用例**;
+> 最后一条是**反向对照**(把 `python -m pytest` 写成 `python3 -m pytest`,
+> 守卫必须**照样认得**它 ⇒ 保持绿才对;若它变红,说明守卫还在认死字符串)。
 
 这张表与 `tools/check_guard_mutations.py --verify` 的实测集合**必须一致**,
 而且是**双向**一致(第 49 轮 codex H2:此前只查「脚本里的每一条都在表里」,
@@ -3706,3 +3728,154 @@ if not res["passed"] or res["passed"] <= 0:   # 「全绿」是空话 ⇒ 退出
 - `tests/test_approval_ledger.py` 里那条「没有本地账本就跳过」的用例
   **仍然会跳过**(这是它的设计,不是本轮引入的);本轮保证的是
   **这两份套件整体确实在 CI 上跑过**,不是把每一条都变成必须真跑。
+---
+
+### 第 54 轮:CI 闸门的**接线**与「判红了也不算失败」那一族(codex 第 2 轮 H1~H5 / M1~M5 / L1 / L2 / L6)
+
+第 53 轮改的是「闸门自己怎么数」;这一轮改的是「**闸门有没有真的被调用**、
+**它判红了会不会真的让 CI 红**」——也就是 codex 第 2 轮复核里
+**H1~H5 那一整族**。36/50 的分数里,扣分最重的就是这一族:
+**闸门看上去配好了,实际没跑、或跑了但判红不算数。**
+
+#### 1. 缺口(七条,都是「已经写下了但没接线」)
+
+**H1:闸门判红 ⇒ 这一步红吗?没人查。**
+闸门命令只要挂上任何一种旁路,CI 就**照样绿**:
+
+| 旁路 | 后果 |
+|---|---|
+| 闸门命令尾接一个恒真后缀 | 闸门返回非 0 被吞掉 |
+| 闸门之前出现 `set +e` | 之后的失败不让这一步红 |
+| 闸门之后出现 `exit 0` | 这一步被**强制**判成成功 |
+| 这一步(或这个 job)带 `continue-on-error: true` | 这一步红了也不算数 |
+| 这一步(或这个 job)带 `if:` | 这一步**整个可能不跑** |
+
+**H2:闸门点名的那份套件,可以是**同一份报告里**另一份。**
+守卫此前只要求「有哪条命令提到闸门、且提到同一路径」——**不要求** `--suite`
+是被查的那份。实测:把 `--suite tests/test_approval_ledger.py` 那次调用换成
+同一份报告里另一份套件的 ⇒ 三条守卫全绿,而批准账本那份**从此无人逐条核对**。
+
+**H3:守卫认的是字面量 `python -m pytest`。**
+改成 `python3 -m pytest`(或 `pytest`、`uv run pytest`)就**认不出来**了
+⇒ 那一步的报告从此没人核对,而守卫全绿。
+
+**H4:两份真钱链路上的关口只有文件级检查。**
+`tests/test_approval_ledger.py`(批准账本只读模块)与
+`tests/test_research_collect.py`(收菜)此前只是「被 pytest 跑了一下」,
+那一步没有 `--junitxml`、也没有闸门 ⇒ 整份被跳过时退出码仍是 0 ⇒ CI 照样绿。
+另一层:名单里点名的用例**被跳过**时,只有文件级检查是**挡不住**的
+(文件在报告里出现了,但那一条是 skipped)。
+
+**H5:同一步里的十份套件,八份只靠 pytest 的退出码。**
+「研究侧其余测试」那一步跑十份套件,此前只有两份拿到闸门调用
+⇒ 其中任意一份被 `pytestmark = skipif(True)` 整份跳过,CI 照样绿
+(而 sandbox 与 approval_server 本身就是防线,且都在**不可降级**清单里)。
+
+**M1:`rm -f` 用子串判断。** `echo noop # rm -f "$X"` 与
+`if false; then rm -f "$X"; fi` 都算「删过了」⇒ 那条命令**根本不会删**任何东西,
+而守卫是绿的。
+
+**M4:变异证据只活在 `%TEMP%`。** 第 53 轮那七条变异写在临时脚本里,
+仓库里**没有**——「写下了但没人跑」等于没有防线(仓库自己的教训)。
+
+#### 2. 处置
+
+| 项 | 处置 |
+|---|---|
+| H1 旁路 | 守卫要求:闸门调用是**裸命令**(该逻辑命令行的最后一条、且不在条件结构里)、带 `--roster` 指向仓库那份名单;步骤与 job 都不得有 `continue-on-error: true`、都不得带 `if:`;脚本里不得出现 `set +e`;**闸门之后不得出现 `exit 0`** |
+| H2 顶替 | 守卫要求:闸门点名的套件集合 **==** 这一步跑的套件集合(拿同一份报告里别的套件顶替 ⇒ 红) |
+| H3 字面量 | 判定改为**切词 + 命令位置**:只认解释器/运行器**后面**那个脚本(`python3 -m pytest`、`uv run pytest` 都认);**参数里**出现文件名不算(ruff 的文件清单里列着 `tools/check_ci_ran.py` ≠ 那条命令在跑闸门) |
+| H4 覆盖 | 两份真钱链路上的关口**进名单**;名单分**两段**:`must_run`(必须出现**且不能被跳过**)与 `allow_skipped`(必须出现、**允许被跳过**——「本地没有账本就跳过」那种**数据依赖**的跳过)。两段不许重叠,也不许悬空 |
+| H5 覆盖 | 那一步的十份套件**各调一次**闸门(名单内的两份做逐条点名核对;其余八份走 `--allow-unlisted-suite`,但**必须真的出现在报告里**且不能整份被跳过) |
+| M1 `rm -f` | 判定改为切词 + 命令位置 + 非条件结构(挪进注释 / 挪进 `if false` 都算没删) |
+| M4 证据 | 接线那一族**十条变异**进 `tools/check_guard_mutations.py`(在**仓库副本**上跑,跑完自动还原并逐字节比对),每条**钉死见证用例**;另有**一条反向对照**(把 `python -m pytest` 写成 `python3 -m pytest`,守卫必须照样认得 ⇒ 保持绿) |
+| L1 口径 | 跳过数与失败数改成**逐用例**数(`case.find("skipped")` / `case.find("failure")`),与 `_is_skipped` 认的是同一件事;此前 `root.iter("skipped")` 任意深度都算 ⇒ 连 `<system-out>` 里嵌的 `<skipped/>` 都会把跳过数抬高 |
+| L2 属性 | `<testsuite>` 的四个属性**只做格式校验**(`^\d+$`),**不再作为计数依据**——`int()` 接受 `"-5"` / `" 5 "` / `"1_0"`,那些不是「非负整数」 |
+| L6 结论完整 | 名单外的套件「压根没跑」不再**提前 return 1**(那会把「有 N 条失败」这类结论吞掉),改成进 `problems` 统一在末尾打印 |
+
+#### 3. 本轮**自己**踩出来的三处(都是变异验证/守卫当场打出来的,不是静态推理)
+
+**① `if: false` 在 YAML 里是**布尔 `False`**——守卫此前写的是
+`str(job.get("if") or "")` ⇒ `False or ""` ⇒ `""` ⇒ **这条旁路完全看不见**
+⇒ 整个 job 一步都不跑,守卫还是绿的。
+这是「给整个 job 加 `if: false`」那条变异**当场打红**打出来的洞。
+修法:`_if_text()` 单独处理(`None` → `""`、`False` → `"false"`),并配一条**双向探针**。
+
+**② 守卫把 ruff 的**文件清单**误当成闸门调用。**
+判定此前是「任何位置出现 `check_ci_ran.py` 就算」⇒ ruff 那一步(它的文件清单里
+列着 `tools/check_ci_ran.py`)被误判 ⇒ 报「闸门调用没有 --roster」这种**假红**。
+修法:只认**命令位置**(见上表 H3)。
+
+**③ 「允许跳过」必须**有条件**。**
+名单里的 `allow_skipped` 段放的是「没有本地账本就跳过」那类**数据依赖**的跳过,
+它用的是**运行期** `pytest.skip("…")`(写在 `if 库里没有账本:` 里)。
+守卫的跳过纪律此前只认 `PLATFORM_SKIPS`,且把运行期 `pytest.skip()` 一律当作
+「无条件跳过」⇒ 那条用例**注册不进去**。
+修法:`ALLOW_SKIPPED_JUSTIFICATION` 是**另一类登记**(数据依赖的运行期退出),
+只豁免**运行期**跳过,且**必须写在某个 `if` 条件里**;
+标记类跳过(裸装饰器 / `skipif`)**一律不许**。
+
+#### 4. 用例
+
+| 套件 | 新增 | 钉的是什么 |
+|---|---|---|
+| `tests/test_check_ci_ran.py` | 31 → 32 个函数(本轮只改断言口径,未新增函数) | 结论行按路径自证的两条断言跟工具的新措辞对齐 |
+| `tests/test_research_boundary.py` | 67 → **104** | 见下表 |
+| `tests/guard_roster.json` | 7 份套件 + `allow_skipped` 段 | 名单与套件**完全一致**;两段不许重叠、不许悬空 |
+
+本轮在纪律守卫里**新增/重写**的接线判据(每一族都配了变异,见 §5):
+
+| 守卫 | 钉的是什么 |
+|---|---|
+| `test_every_junit_report_is_deleted_before_pytest_writes_it` | 每份报告写之前有**真的会执行**的 `rm -f`(切词 + 非条件) |
+| `test_every_junit_report_is_handed_to_the_gate` | 每份报告交给闸门核对(路径一致) |
+| `test_every_gate_call_checks_the_suites_its_own_report_produced` | 闸门点名的套件 == 这一步跑的套件 |
+| `test_every_gate_call_can_actually_fail_the_step` | 裸命令 / 无 `set +e` / 无 `exit 0` / 无 `continue-on-error` / 无 `if:` / 带 `--roster` |
+| `test_no_gate_call_points_at_a_report_this_step_never_produced` | 闸门读的报告是这一步产出的 |
+| `test_the_approval_ledger_and_collect_suites_have_a_report_the_gate_checks` | 两份真钱链路上的关口有报告级兜底 |
+| `test_the_if_condition_reader_does_not_swallow_a_boolean_false` | `if: false` 不被 `or ""` 吞成空串(**双向探针**) |
+
+#### 5. 变异验证(十一条**接线**变异 + 两条反向对照,全部在**仓库内**可复算)
+
+脚本:`python tools/check_guard_mutations.py --verify`(变异 24 → **35** 种)。
+接线那一族改的是 **workflow 本身**——此前这一族**零变异验证**,
+第 53 轮写下的接线守卫若哪天被放松(比如把恒真后缀加回去),CI 不会红。
+
+| 变异 | 见证 | 结果 |
+|---|---|---|
+| 在闸门命令后面接一个恒真后缀(判红也不算失败) | `..._can_actually_fail_the_step` | **红** ✔ |
+| 在闸门调用之前加 `set +e` | `..._can_actually_fail_the_step` | **红** ✔ |
+| 在闸门调用之后加 `exit 0`(强制判成功) | `..._can_actually_fail_the_step` | **红** ✔ |
+| 给那一步加 `continue-on-error: true`(红了也不算数) | `..._can_actually_fail_the_step` | **红** ✔ |
+| 给整个 job 加 `if: false`(这一步压根不跑) | `..._can_actually_fail_the_step` | **红** ✔(第一版**没红**——就是它把 §3① 那处布尔坑打出来的) |
+| 把闸门点名的套件换成**同一份报告里另一份**套件 | `..._checks_the_suites_its_own_report_produced` | **红** ✔ |
+| 把 CI 循环里的一份套件从 pytest 调用里删掉 | `..._checks_the_suites_its_own_report_produced` | **红** ✔ |
+| 把删报告的 `rm -f` 挪进注释里(命令根本不执行) | `..._deleted_before_pytest_writes_it` | **红** ✔ |
+| 把删报告的 `rm -f` 挪进 `if false` 里(命令根本不执行) | `..._deleted_before_pytest_writes_it` | **红** ✔ |
+| 让结论行不说明「点名核对里的几条是允许跳过的」 | `test_the_conclusion_line_discloses_how_many_may_be_skipped` | **红** ✔ |
+| 只改守卫里的一个注释(无害改动) | 整套守卫套件 | **保持绿** ✔(通过数 104 = 基线 104) |
+| 把 `python -m pytest` 写成 `python3 -m pytest`(守卫照样认得) | 整套守卫套件 | **保持绿** ✔(通过数 104 = 基线 104) |
+
+另外:有一条变异**第一次跑没打红**,如实登记——
+`给整个 job 加 if: false` 那条:守卫此前读 `if:` 用的是
+`str(job.get("if") or "")` ⇒ `if: false`(YAML 里的**布尔 False**)
+被 `or ""` 吞成空串 ⇒ 这条旁路**守卫完全看不见**。
+这不是「变异规格写错了」,而是**守卫自己有洞**,被这条变异当场打出来
+(脚手架的 fail-closed 分类把两者分得很清)。修法见 §3①,并配了一条**双向探针**。
+**反向对照**(`python3 -m pytest`)是这条纪律的另一半:
+若它**变红**,说明守卫还在认死字符串——它保持绿,才证明 H3 那条修法是真的。
+
+#### 6. 残余(如实登记)
+
+- 本轮**没有动任何实盘防线的口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、
+  批准链的写入、沙盒筛查**全部未动**。
+- 改的是 `tools/check_ci_ran.py`(CI 闸门)、`tools/check_guard_mutations.py`
+  (变异脚手架)、`tests/test_research_boundary.py`(纪律守卫)、
+  `tests/guard_roster.json`(名单)与 `.github/workflows/research-guard.yml`
+  (CI 接线)——五者都在**不可降级**清单里,本轮按执行域口径处理。
+- **codex 第 2 轮仍未做的**:L3(没有 `<testsuite>` 子元素时的属性校验)、
+  L4(模块名重复计算——已在本轮顺手改掉一处在闸门工具里,守卫里的那处未动)、
+  L5(`rm -f X && pytest` 的误判)、L7 / L8(小项),如实登记在案。
+- 名单里 `tests/test_approval_ledger.py` 那条「没有本地账本就跳过」的用例
+  **仍然会跳过**(这是它的设计,不是本轮引入的);本轮保证的是
+  **它必须出现在报告里**,而不是把它变成必须真跑。

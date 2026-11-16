@@ -72,9 +72,12 @@ def _write_report(tmp_path: Path, cases: list[dict], *, root_tag: str = "testsui
     return path
 
 
-def _write_roster(tmp_path: Path, must_run: dict) -> Path:
+def _write_roster(tmp_path: Path, must_run: dict, allow_skipped: dict | None = None) -> Path:
     path = tmp_path / "roster.json"
-    path.write_text(json.dumps({"must_run": must_run}, ensure_ascii=False), encoding="utf-8")
+    payload = {"must_run": must_run}
+    if allow_skipped is not None:
+        payload["allow_skipped"] = allow_skipped
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
 
 
@@ -428,7 +431,7 @@ def test_the_conclusion_line_says_which_check_ran_for_an_unlisted_suite(tmp_path
         "--allow-unlisted-suite",
     ]) == 0
     out = capsys.readouterr().out
-    assert "在报告里跑了 1 条" in out, "结论行必须说清这条路径上做的是哪种核对(输出:%s)" % out
+    assert "在报告里 1 条" in out, "结论行必须说清这条路径上做的是哪种核对(输出:%s)" % out
     assert "点名核对 0 条" not in out, "结论行不能自称「点名核对 0 条」(读起来像什么都没查)"
 
 
@@ -444,6 +447,32 @@ def test_the_conclusion_line_says_the_named_checks_for_a_rostered_suite(tmp_path
     ]) == 0
     out = capsys.readouterr().out
     assert "点名核对 1 条" in out, "结论行必须报出点名核对的条数(输出:%s)" % out
+
+
+def test_the_conclusion_line_discloses_how_many_may_be_skipped(tmp_path, capsys):
+    """结论行必须说清「点名核对的几条里,几条是**允许跳过**的」。
+
+    第 54 轮(codex M3 的延伸):名单分两段(`must_run` / `allow_skipped`)之后,
+    「点名核对 N 条」里的 N 是**两段合起来**的总数——只报总数,读的人会以为
+    **那 N 条全都必须真跑**。这正是 M3 那条「结论行必须自证」要防的事:
+    允许跳过的那几条在 CI 上**可能整条不生效**,而结论行没说。
+    """
+    module = _load_tool()
+    report = _write_report(tmp_path, [
+        {"name": "test_a", "classname": "tests.test_x"},
+        {"name": "test_b", "classname": "tests.test_x", "skipped": True},
+    ])
+    roster = _write_roster(tmp_path, {"tests/test_x.py": ["test_a"]},
+                           allow_skipped={"tests/test_x.py": ["test_b"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "点名核对 2 条" in out, "结论行必须报出点名核对的总数(输出:%s)" % out
+    assert "必须真跑 1 条" in out, "结论行必须说清其中几条是必须真跑的(输出:%s)" % out
+    assert "允许跳过 1 条" in out, "结论行必须说清其中几条是允许跳过的(输出:%s)" % out
 
 
 def test_the_real_roster_is_readable_and_not_empty():
