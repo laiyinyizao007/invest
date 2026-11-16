@@ -905,15 +905,34 @@ def test_writing_into_the_price_array_in_place_is_rejected(statement):
     assert findings and any("受保护" in f for f in findings), f"{statement!r} 未被拦下:{findings}"
 
 
-def test_binding_the_price_array_to_another_name_is_rejected():
-    """`arr = self.am.close` 之后 `arr[0] = 999` 改的是同一个数组——别名也不许取。
+def test_binding_the_price_array_to_another_name_is_allowed_now():
+    """**第 4 轮 G8 复核的 F2(更正本用例原先的断言)**。
 
-    vn.py 的 ArrayManager 里 `close` 是 property,返回的就是 `close_array` 本身
-    (不是副本),所以"取出来再改"和"直接改"是一回事。"""
+    原先的断言是"`arr = self.am.close` 之后 `arr[0] = 999` 一律拒",理由是
+    vn.py 的 `ArrayManager.close` 是 property、返回的就是 `close_array` 本身(不是副本)。
+    只读行情视图落地之后这个前提不成立了:候选在 `entry_signal` 里读到的 `self.am.close`
+    是**拷贝**,别名改不到回测数据(端到端用例 `tests/test_market_view.py::
+    test_writing_every_array_the_view_gives_changes_nothing` 逐笔验证过)。
+
+    而这条规则原先把仓库**自己的 LLM 提示词**写法
+    (`self.am.close[-2:]`、`np.mean(self.am.close)`、`self.am.count`、`self.am.close_array`)
+    整片拒掉,进化循环因此被闲置。静态层随之**收窄到"写入"**:
+    写入的形态仍拒(见 `test_writing_into_the_price_array_in_place_is_rejected`
+    与 `tests/test_g8_round4.py` 的写入清单)。"""
     src = ("class C:\n    def entry_signal(self):\n"
            "        arr = self.am.close\n        arr[0] = 999.0\n        return 0\n")
     findings = screen(src)
-    assert findings and any("容器" in f for f in findings), findings
+    assert findings == [], f"读取被误伤: {findings}"
+
+
+def test_writing_through_a_view_of_the_price_array_is_rejected():
+    """收窄到"写入"之后,这条**不能跟着漏掉**:
+    `self.am.close.reshape(-1)[0] = 9.0` 是把容器上的**视图型结果**当写入目标——
+    读是允许的(视图下是拷贝),写不是。"""
+    src = ("class C:\n    def entry_signal(self):\n"
+           "        self.am.close.reshape(-1)[0] = 9.0\n        return 0\n")
+    findings = screen(src)
+    assert findings and any("视图型结果" in f for f in findings), findings
 
 
 def test_reading_a_single_price_is_still_allowed():

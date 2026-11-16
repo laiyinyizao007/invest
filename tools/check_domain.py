@@ -233,6 +233,15 @@ NEVER_DOWNGRADE = (
     "tests/test_sandbox_module_view.py",
     "tests/test_sandbox_round25_rules.py",
     "tests/test_sandbox_round26_rules.py",
+    # --- 本分支(#23 只读视图)带来的用例:同样**直接调用**判定点 ---
+    # 它们改的是「缺陷能不能被发现」,与上面那批同一性质;
+    # 20261114 分档器的动态探针(生产依赖闭包)在合并 main 后当场指出这批漏登记。
+    "tests/test_constitution_gate_attrs.py",
+    "tests/test_frame_introspection.py",
+    "tests/test_g8_round4.py",
+    "tests/test_g8_round7.py",
+    "tests/test_market_view.py",
+    "tests/test_view_escape_hatch.py",
 )
 
 # --------------------------------------------------------------------------

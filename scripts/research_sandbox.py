@@ -50,6 +50,12 @@ FORBIDDEN_MODULES = {
     "os", "sys", "subprocess", "socket", "ctypes", "shutil", "pathlib", "importlib", "pickle", "marshal",
     "requests", "urllib", "http", "ftplib", "smtplib", "asyncio", "multiprocessing", "threading", "signal",
     "builtins", "inspect", "gc", "tempfile", "glob", "io",
+    # 栈帧与回溯的内省(第 14 轮之后自查实测):`traceback.walk_stack(None)` 不需要写任何被禁的属性名,
+    # 就能拿到调用栈上每个栈帧的 `f_locals`——沿它走得到回测引擎(`history_data`、`cta_engine`)、
+    # `run_evaluation` 的局部变量(含**整份**行情,包括验证窗口)。这与 `self.cta_engine`(引用即拦)是同一个能力。
+    # `linecache` 还能读任意文件;`code`/`pdb`/`dis`/`runpy`/`faulthandler`/`tracemalloc` 同属解释器内省与动态执行。
+    "traceback", "linecache", "code", "codeop", "pdb", "bdb", "dis", "faulthandler", "tracemalloc", "runpy", "pkgutil",
+    "zipimport",
     "operator",     # operator.attrgetter('__dict__') 这类反射入口:属性名可以是字符串,绕开属性名检查
     # 风控与框架包本身:候选拿到 `risk.risk_guard` 就等于拿到风控函数的**定义**,
     # 改写它们(`rg.risk_per_trade = lambda ...: 0.0`)可以架空单笔预算,而静态层按
@@ -831,7 +837,9 @@ FORBIDDEN_ATTRS = {"__bases__", "__subclasses__", "__globals__", "__builtins__",
                    # 闭包单元(第 24 轮实测):受限导入器把真导入器藏在闭包单元里,
                    # 而闭包单元在 f_locals 里看得见——`f.__closure__[0].cell_contents`
                    # 就是真导入器。这两个名字静态层一律不许引用。
-                   "__closure__", "cell_contents"}
+                   "__closure__", "cell_contents",
+                   # 本分支(#23)补的帧/协程/回溯相关名字(main 的集合里没有):
+                   "f_trace", "gi_yieldfrom", "cr_await", "ag_await", "with_traceback"}
 
 # 这些名字以**字符串**形式出现时同样拒绝:它们是"按键名取内建"的钥匙——
 # `__builtins__['setattr'](self, 'risk_budget', 1e12)` 能改写任意实例属性,

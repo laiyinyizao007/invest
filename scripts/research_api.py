@@ -491,6 +491,16 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
         # 父进程只会看到"回测失败",那条给 LLM 的诊断通道就断了。
         raise CandidateError(describe_error(exc)) from exc
+    # 运行期第六层(第 4 轮 G8 复核的 F1):通配符导入(`from X import *`)把被导入模块的
+    # 公开名字一次性绑进候选命名空间,静态层看不见它拿到了什么——候选
+    # `from strategies.trend_atr_strategy import *` 就这样把 `swap_out` 拿到了手里,
+    # 只读视图的整个前提被绕开。静态层已经按"解析被导入模块的名字集合"拒了这一路,
+    # 这里在**导入之后**再核对一次命名空间:静态层万一被绕开,这一层仍然是门。
+    # 按**身份**核对,不按名字核对(第 4 轮 codex 复核的 High-1:改名 + 删除能骗过按名字的核对)。
+    leaked = const.check_candidate_namespace(module.__dict__)
+    if leaked:
+        raise JobError(EXIT_REFUSED, "候选命名空间里持有受保护对象:"
+                       + chr(10) + "  " + (chr(10) + "  ").join(leaked))
     # 第二个实参**当场**拍:必须是"这一次调用"的新快照,不能是提前存好的变量或它的拷贝
     # (宪法历史守卫按这条核对执行点:拿拷贝比对,指纹必然一致,第四层形同虚设)。
     tampered = const.check_protected_state(protected_before, const.snapshot_protected_state())

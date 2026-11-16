@@ -44,25 +44,21 @@ def screen(src, c=None):
 # ---------- High 1:容器规则的三条绕过 ----------
 
 @pytest.mark.parametrize("src", [
-    # 变体①:numpy 视图(`self.am.close[:]` 切出来的是视图,不是副本)
-    "def entry_signal(self):\n"
-    "    close = self.am.close[:]\n"
-    "    high = self.am.high[:]\n"
-    "    high[:] = close\n"
-    "    return 1\n",
     # 变体②:dunder 写入口
     "def entry_signal(self):\n"
     "    self.am.close.__setitem__(slice(None), self.am.close)\n"
     "    return 1\n",
-    # 变体③:bg 别名(`bg` 与 `am` 是同一类容器)
+    # 变体④:直接写属性(容器路径上的写入)
     "def entry_signal(self):\n"
-    "    x = self.bg\n"
-    "    x.update_bar(fake_bar)\n"
+    "    self.am.count = 5\n"
     "    return 1\n",
-    # 视图型方法:返回的还是同一块内存
+    # 变体⑤:下标写入
     "def entry_signal(self):\n"
-    "    arr = self.am.close.reshape(-1)\n"
-    "    arr[0] = 999.0\n"
+    "    self.am.close[0] = 999.0\n"
+    "    return 1\n",
+    # 变体⑥:删除容器上的属性
+    "def entry_signal(self):\n"
+    "    del self.am.close\n"
     "    return 1\n",
 ])
 def test_the_static_layer_refuses_every_container_bypass(src):
@@ -70,7 +66,13 @@ def test_the_static_layer_refuses_every_container_bypass(src):
 
     第 12 轮 codex 端到端实测(120 根合成 15 分钟 K 线):
     宪法层与沙盒层都返回 [],ATR 被压 40 -> 2.86,`skipped_by_budget` 由 1 变 0,
-    诚实模板 0 成交而候选成交 2 笔——**¥300 单笔风险预算被架空**,四层防线全绿。"""
+    诚实模板 0 成交而候选成交 2 笔——**¥300 单笔风险预算被架空**,四层防线全绿。
+
+    **第 4 轮 G8 复核的更正(F2)**:早先这里还有"取别名/装容器/返回"那几条**读取**形态,
+    现在静态层不再拒它们——只读视图下 `self.am.close` 返回的是**拷贝**,别名无害,
+    而那条规则把仓库自己的 LLM 提示词写法整片拒掉(进化循环被闲置)。
+    静态层保留的是**写入**形态(变更型方法调用、属性/下标赋值、删除);
+    "取别名再写"的残余由运行期第五层(逐根核对)兜底——端到端用例见 tests/test_market_view.py。"""
     findings = screen(src)
     assert findings, "容器绕过没被拦下(High 1 复发)"
 
@@ -90,13 +92,24 @@ def test_the_static_layer_refuses_every_container_bypass(src):
     "def entry_signal(self):\n    stuff = [self.am.close]\n    return 1\n",
     # 返回出去
     "def entry_signal(self):\n    return self.am.close\n",
+    # numpy 视图(`self.am.close[:]` 切出来的是视图,不是副本)
+    "def entry_signal(self):\n    close = self.am.close[:]\n    return 1\n",
+    # 视图型方法:返回的还是同一块内存
+    "def entry_signal(self):\n    arr = self.am.close.reshape(-1)\n    return 1\n",
+    # bg 别名(`bg` 与 `am` 是同一类容器)
+    "def entry_signal(self):\n    x = self.bg\n    return 1\n",
 ])
-def test_the_static_layer_refuses_every_way_of_taking_the_container_out(src):
-    """引用一旦**流出去**(存进名字/传参/装容器/返回),按名字的检查就看不见改写点了。
+def test_reading_the_container_out_of_its_place_is_allowed_now(src):
+    """**第 4 轮 G8 复核的 F2(更正第 12 轮的这条用例)**。
 
-    所以静态层封的是"交出引用"这个动作:`g = self.bg` 之后 `g.update_bar(fake)` 已经看不出 g 是谁。"""
+    第 12 轮时这条规则的理由是"引用流出去之后按名字的检查就看不见改写点了";
+    只读行情视图落地之后这个理由不成立了:候选在 `entry_signal` 里读到的 `self.am.close`
+    是**拷贝**,`self.bg` 是**禁止访问的哨兵**——流出去也改不到回测数据。
+    而这条规则当时把仓库自己的 LLM 提示词写法(`self.am.close[-2:]`、`np.mean(self.am.close)`、
+    `self.am.count`、`self.am.close_array`)整片拒掉,进化循环因此被闲置。
+    写入形态仍然拒(见上面那条)。"""
     findings = screen(src)
-    assert findings, "受保护容器被取用却没被拦下"
+    assert findings == [], f"读取被误伤: {findings}"
 
 
 @pytest.mark.parametrize("src", [
@@ -373,8 +386,13 @@ def test_the_transient_tamper_test_really_needs_the_per_bar_check(monkeypatch):
 ])
 def test_the_static_layer_refuses_every_basic_index_that_makes_a_view(src):
     """第 13 轮 Critical 1(静态半边):第 12 轮只认 `ast.Slice`,`[:, None]`/`[...]`/`[None]`/
-    `.swapaxes()`/`slice(...)` 都被放过,拿到的是 numpy 视图。"""
-    assert screen(src), "产生视图的下标没被拦下"
+    `.swapaxes()`/`slice(...)` 都被放过,拿到的是 numpy 视图。
+
+    **第 4 轮 G8 复核的更正(F2)**:这些写法在只读视图落地之后是**读取**,静态层不再拒——
+    `self.am.close` 返回的是**拷贝**,对拷贝取视图改不到回测数据(端到端用例见
+    tests/test_market_view.py::test_writing_every_array_the_view_gives_changes_nothing)。
+    写回拷贝的那一步(`x[:] = ...`)仍然是**写入**,由容器写入规则拒。"""
+    assert screen(src) == [], f"读取被误伤: {src}"
 
 
 @pytest.mark.parametrize("src", [
@@ -398,11 +416,12 @@ def test_the_fifth_layer_notices_a_container_whose_count_is_made_to_lag():
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 
     class Lagging(TrendAtr15mStrategy):
-        def entry_signal(self):
-            # 候选只能在 entry_signal 里动手(on_bar/_process_daily_bar 是受保护成员):
-            # 每根 K 线让计数落后一根
-            self.am.count -= 1
-            return super().entry_signal()
+        def _call_entry_signal(self):
+            # 候选只能在 entry_signal 里动手,而那里现在拿到的是只读视图(docs/adr/20261113-read-only-market-view.md),
+            # 改 count 的攻击已经没有可改的对象。这里用覆盖换入点的类**模拟"视图被绕过"**,
+            # 验证第五层作为纵深防御仍然有效(静态层与 check_class 会拦这种类;此处直接绕过它们来测运行期)。
+            self.am.count -= 1                              # 每根 K 线让真实容器的计数落后一根
+            return super()._call_entry_signal()
 
     with pytest.raises(RuntimeError, match="累计根数"):
         backtest_lib.run_engine_bars(Lagging, _TRANSIENT_SETTING, "C15", _synth_bars())

@@ -5,7 +5,147 @@
 与 [`PROJECTWIKI.md`](PROJECTWIKI.md) 互相链接;相关 Issue:[#1](https://github.com/laiyinyizao007/invest/issues/1)。
 
 ## [Unreleased]
+
+### Fixed（第 2 轮 G8 复核后,只读行情视图 / Issue #23)
+- **并入 `origin/main`(第 6 轮)**:合并裁决的标准只有一条——**不许削弱**。
+  `risk/constitution.py` 两边是**同一条防线的两次演进**(main +102 行 / 本分支 +876 行)
+  ⇒ 底稿取本分支那份,把 main 的四样东西并进来:闸门函数名黑名单 `BUILTIN_PROTECTED_GATE_ATTRS`、
+  `_gate_attr_violations()`、`_setattr_protected_name()`、以及把它们接进 `screen_source` 的两处。
+  main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` **一开始被我判为「不必并入」,
+  后被仓库自己的宪法历史守卫驳回,已改回并入**:守卫守的是「受保护常量的活代码引用次数只许增不许减」,
+  我那次裁决把引用次数从 6 降到 5 ⇒ 报红「常量还在但底线的执行点被删了」。
+  **守卫是对的**——「反正有别的判定覆盖」是推理,不是代码里写着的事实;照那条推理做,
+  这次合并就会成为第一个洞。代价(如实):同一次属性写入现在报两条**内容相同**的结论
+  (main 自己就如此,保持原样)。`CHANGELOG.md` 两边各加一段,语义不冲突 ⇒ 两边都保留。
+- **补一条 main 自己没配探针的规则**:闸门函数名的**七种**写入形态
+  (赋值/带注解赋值/复合赋值/元组解包/`del`/`setattr`/`delattr`/`vars()[...]`)——
+  main 在 PR #34 里加了这条规则,但**没配动态探针**(仓库规矩:每条新规则都要有放行+拦截双向探针)。
+  ⇒ 新增 `tests/test_constitution_gate_attrs.py`:拦截侧七形态逐一被拒 + **断言是哪一类规则拒的**
+  (不是「有拒绝」就绿)+ 拒绝信息里带被改写的名字 + 黑名单里每个名字都被挡住;
+  放行侧三条(读闸门名不是改写它 / 普通属性写入 / 按名 `setattr` 普通名字)。
+- **分档清单随之更新(合并暴露出来的缺口)**:main 的分档器有一道动态探针(生产依赖闭包)——
+  凡是自己定义或直接调用真钱链路判定点的文件必须判为不可降级。合并之后它**当场**指出
+  本分支带来的 5 份用例 + 新增的那 1 份「直接调用 `screen_source`」没登记
+  ⇒ 已补进 `tools/check_domain.py` 的 `NEVER_DOWNGRADE`(改清单 = 执行域改动)。
+- **残余(如实)**:本分支那 5 份用例(`test_market_view` / `test_view_escape_hatch` /
+  `test_frame_introspection` / `test_g8_round4` / `test_g8_round7`)import 交易栈 ⇒
+  **不在 research-only CI 上跑**,目前只在本地跑;main 那条「运行时装载候选」的路仍默认关着(#37);
+  两边的闸门清单**没有**并表(并表会改命中集合 = 改判定口径,另开一轮,不夹在这次合并里做)。
+- **新增探针的变异验证(实测,不是推理)**:`tests/test_constitution_gate_attrs.py` 声称
+  「断言是哪一类规则拒的」⇒ 实测把 `_gate_attr_violations(tree)` 的接线摘掉 ⇒ **7 条变红**;
+  把 `BUILTIN_PROTECTED_GATE_ATTRS` 清空 ⇒ **9 条变红**;还原后 **13 passed**。
+  ⇒ 这条探针**不是空转的**(不是「恒真」也不是「只断言有报错」)。
+- **新登记的一条残余(静态层按名拦,动态拼名走不到静态层)**:
+  实测 `setattr(obj, <名字是变量>, v)` 与 `setattr(obj, "screen_" + "_source", v)`
+  在 `screen_source` 静态层**放行**(规则只认字面量字符串)。
+  运行时实测(`safe_builtins` + `RepoImportGuard`):候选内建里**没有** `setattr`/`getattr`/`vars`/`object`/`type`
+  ⇒ 这两种写法在候选手里构造不出来;`import risk.constitution` 被仓库导入守卫拒(`禁止导入 risk.constitution`)
+  ⇒ 候选**拿不到**闸门函数的模块对象。
+  **结论**:这是**两道闸分工**的结果,不是缺口;但静态层那一层确实拦不住「名字是变量」的写法,
+  如实登记——将来若只保留静态层(例如把筛查拆成独立服务),这条会变成真缺口。
+- **第 3 轮 G8 复核(34/50)**:第 2 轮修复经 40 种绕过实测有效;新发现**辅助模块逃逸**(候选用文本写出能力在 cwd 写辅助 `.py` 再导入,跑在完整 Python 下)是沙盒的结构性缺口、早于本 PR,如实登记进 ADR,不在本 PR 修(需改 `bootstrap.py` 的 cwd/`sys.path`,另开 Issue)。
+- **Critical**:候选可经 `strategies.trend_atr_strategy` 导入 `swap_out/swap_in` 拿到真容器(静态层零发现,关第五层时 ATR 40.0→2.9、预算闸门被架空)。这些名字进 `BUILTIN_PROTECTED_READ_ATTRS`;`swap_in` 拒重入/陈旧视图,`swap_out` 无记录时不抛;外流规则补 lambda/条件表达式/`or`/`*x`/`await`;视图只转发显式白名单指标。ADR 先前"拿不到真实容器"的结论已更正。
+- **第 4 轮 G8 复核(37.5/50)的 4 条缺陷**(ADR `20261113-read-only-market-view` 新增「第 4 轮」小节):
+  - **F1(Critical)通配符导入的缺口**:`from strategies.trend_atr_strategy import *` 在两层筛查里都是 **0 findings**,
+    却把 `swap_in`/`swap_out`/`read_only_view`/`within_budget` 一次性绑进候选命名空间——只读视图的前提被绕开。
+    **修法**:筛查 `import *` 时**解析被导入模块的名字集合**(只解析源码不执行),含受保护符号或模块级私有符号就拒,
+    并在发现里写明**是哪一条规则拒的**(`规则:通配符导入不得暴露受保护符号`)与具体符号名;解析不出来(仓库外模块、相对导入)按
+    **"查不了等于没查"** 拒;干净模块放行(模板的 15 分钟子模块正是这种)。运行期再补一层:候选导入后核对命名空间,
+    出现受保护符号就 fail-closed 拒绝执行。
+  - **F2(主要)读取外流规则误伤诚实候选**:"受保护容器读取不得流出去"把仓库**自己的 LLM 提示词**写法
+    (`self.am.close[-2:]`、`np.mean(self.am.close)`、`self.am.count`、`self.am.close_array`)**整片拒掉**,进化循环因此被闲置。
+    **修法**:规则从"读取"收窄到**"写入"**——只读视图下读到的是拷贝,别名无害;
+    属性赋值/下标赋值/复合赋值、变更型方法调用(`fill`/`update_bar`/`__setitem__`/…)、`del self.am.close` 三条写入路径仍然拒。
+    **收窄时顺手补上的一个洞**:收窄之后"容器上的视图型方法"这份名单一度没人引用,宪法历史守卫随即报
+    "引用次数从 1 降到 0"——**那条报错不是误报**,它指出 `self.am.close.reshape(-1)[0] = 9.0`
+    (把视图型结果当写入目标)此前没有任何一层管。现补一条写入规则:**写入目标里出现视图型方法/属性、
+    且接收者路径上有 `am`/`bg` 就拒**(`T` 是属性不是方法,一并补进名单);读(`x = self.am.close.reshape(-1)`)仍放行。
+    **自我更正**:ADR 第 3 轮曾写"本 PR 不收窄",本轮收窄了(理由:运行期视图本身才是那个保证)。
+  - **F3(主要)断言要指向具体的错**:变异用例原来只断言"回测失败",现断言抛的是 `ReadOnlyViewError`;
+    补 lambda/条件表达式/`or-and` 三个表达式位置的**负例**(不许被误伤);
+    补**真实筛查入口**(`research_api.screen` 与 `import_candidate`)的用例;视图侧未转发的属性(如 `update_bar`)必须抛 `ReadOnlyViewError`。
+  - **F4(流程)合并顺序**:**先合 PR #27 → 再 rebase PR #25 → 然后重跑 `tests/test_view_escape_hatch.py` 与 `tools/check_constitution_history.py`**。
+    本轮**不做 rebase**。实测冲突面是 `PROJECTWIKI.md`、`docs/adr/20261113-evolution-engine.md`、`scripts/research_sandbox.py` 三个;
+    `risk/constitution.py` 与 `scripts/research_api.py` 自动合并;**`BUILTIN_PROTECTED_READ_ATTRS` 本轮未改动**,故与 PR #27 无冲突。
+  - **变异验证**(每条修复改回旧行为看用例是否变红,脚本只放在临时目录、跑完清理):
+    关掉通配符裁决 → 6 条变红;去掉运行期命名空间核对 → 1 条变红;把读取外流规则改回去 → **5 条变红**(此前此处误记为 4 条,按实测更正);
+    视图不再抛 `ReadOnlyViewError` → 2 条变红;一律拒通配符(过度收紧) → 7 条变红;清空变更型方法名单 → 11 条变红;
+    去掉删除检查 → 2 条变红;不看"视图型结果当写入目标" → 7 条变红。
+    其中"去掉运行期命名空间核对"最初**没有判别力**(静态层本来就拒这一路),把静态筛查中性掉再跑才变红——记在 ADR 里。
+- **第 5 轮 G8 复核(codex,39/50)的 11 条缺陷**(ADR `20261113-read-only-market-view` 新增「第 5 轮」小节):
+  - **两轮复核的结果必须分开说**:第一轮(`mcp__zen__codereview`)的内部流程跑完(38 步、46 个文件),
+    但专家分析那一步被 **Gemini 429 RESOURCE_EXHAUSTED** 挡住(免费额度用尽),**没有产出评审文本**——
+    这一轮**记为"未取得结果",不写分数**;第二轮(`mcp__zen__clink` → codex CLI,role=codereviewer)给出 **39/50**
+    (质量 7 / 安全 7 / 性能 9 / 架构 7 / 文档 9)。**本轮只拿到一个外部分数,不声称"提高了"。**
+  - **HIGH-1 运行期命名空间核对改为按身份**:按名字核对时,候选 `_hoard = swap_out` 再 `del swap_out`
+    就能把名字删干净而**手里仍然握着真的 `swap_out`**。现按**值**核对(`sys.modules` 里受保护符号的 `id` 建表,
+    再扫候选命名空间的顶层 + 一层嵌套);受保护模块一个都没加载时才退回按名字核对(宁可多拒,不可漏放)。
+    候选**自己**定义的同名符号(如自己的 `trading_day`)按身份核对**放行**——按名字核对会误伤它。
+  - **MEDIUM-1 模块解析改为包优先**(Python 的 `FileFinder` 先找 `X/__init__.py` 再找 `X.py`;顺序反了会核验错的文件)。
+  - **MEDIUM-2 名字集合要完备**:收进模块级 `if`/`try`/`for`/`with`/`match` 里的绑定;
+    `__getattr__`(PEP 562)、算出来的 `__all__`、模块内部自己的 `from ... import *` 三种"不可证"情形一律 fail-closed 拒。
+  - **MEDIUM-3 补上 F2 收窄时漏掉的两种写入形态**:**容器别名**(`a = self.am` 之后 `a.update_bar(fake)`、
+    `a.close[0] = 1`)与**自由函数形态**(`np.copyto(self.am.close, x)`)——原来 0 findings。
+    **自我更正**:第 4 轮写"收窄后不再需要拦'取别名'这一形态",本轮**部分收回**:不拦"取别名"本身(那是读取),但**拦别名上的写入**。
+  - **LOW-1 下标删除**(`del self.am.close[0]`)新增规则;**LOW-2** 自由函数形态的变更型函数
+    (只认 `copyto`/`put`/`putmask`/`place`——`append`/`extend` 是方法,第一个实参是**读**,按第一个实参判会误伤);
+    **LOW-3** 字面量 `__all__` 以它为准(点名受保护符号要拒、没点名要放行,双向各一条用例);
+    **LOW-4** 模块级 `__getattr__` 的模块 fail-closed;**LOW-5** 本文件上一条"M3 变红条数"由 4 更正为 **5**(按实测);
+    **LOW-6** 模块名缓存上限 128 条,超过即清空。
+  - **本轮变异验证 15 条(M9–M23),全部变红**:通配符一律放行 12 条、不核验受保护符号 6 条、不核验私有符号 1 条、
+    动态导出不 fail-closed 3 条、`__all__` 不生效 1 条、包优先撤销 1 条、F2 收窄撤销 4 条、
+    容器别名变更型调用 2 条、容器别名写入 2 条、自由函数形态 1 条、下标删除 1 条、视图型写入目标 6 条、
+    身份核对退回按名字 3 条、导入后不核对命名空间 2 条、视图不再抛 `ReadOnlyViewError` 2 条。
+    其中"`__all__` 不生效"这一条**最初没有判别力**(用例缺"`__all__` 把受保护符号排除在外时也要放行"这一半),
+    补上用例后才变红——**用例绿不等于规则有判别力**。
+  - **残余(如实记录)**:身份核对只看**一层**嵌套(更深或经闭包/`partial` 间接持有的看不见,由第四/第五层兜底);
+    静态层不再拦"先取数组别名再写"(视图下写的是拷贝);仓库外模块的 `import *` 一律按"无法核验"拒(有意的取舍);
+    **辅助模块逃逸仍未关闭**(PR #27 的范围,合并顺序:**先合 #27 → 再 rebase #25 → 再重跑
+    `tests/test_view_escape_hatch.py` 与 `tools/check_constitution_history.py`**)。
+- **第 6 轮 G8 复核(codex,40/50)的 9 条发现**(ADR `20261113-read-only-market-view` 新增「第 6 轮」小节):
+  - **两轮复核的结果仍然要分开说**:第一轮(`mcp__zen__codereview`)**再次**被 **Gemini 429** 挡住,
+    **未取得结果、不写分数**;第二轮(codex CLI)**40/50**(质量 8 / 安全 8 / 性能 9 / 架构 8 / 文档 7)。
+  - **HIGH-1 静态层仍按名字拒候选**自己**的同名符号**:候选写一个 `def trading_day()`
+    (LLM 候选极常见的辅助名,本仓 `risk/account_guard.py` 就有同名函数)就被拒,
+    而运行期已改成**按身份**核对(候选自己的同名符号放行)——两层口径相反,
+    静态筛查先执行,运行期那条"放行"在真实流水线里**永远走不到**。
+    **修法**:静态层引入"候选自己定义的名字"豁免(`def`/`class`/赋值目标)。
+    **豁免的边界**:只对**裸名**生效;**不收 import 绑定的名字**
+    (`from risk.market_view import swap_out` 照旧拒);**属性那一路照旧拒**
+    (`x = risk.market_view.swap_out` 照旧拒);候选没定义过的名字照旧拒。
+    **双向用例**:自己定义 `trading_day`/`stop_distance`/`within_budget` → 放行(含真实入口
+    `research_api.screen`);具名导入受保护对象 → 仍拒;按属性取受保护对象 → 仍拒;引用未定义的同名 → 仍拒。
+  - **MEDIUM-1 运行期命名空间核对不覆盖"持有整个模块对象"**(`import strategies.trend_atr_strategy as t`
+    → `t.swap_out` 一步可达)——**如实登记为残余**(本轮未修;今天不可利用:候选唯一的钩子是
+    `entry_signal`,那一段 `self.am` 是只读视图)。
+  - **MEDIUM-2 自由函数只看第一个位置实参**:`np.copyto(dst=self.am.close, src=x)`、
+    `np.put(a=self.am.close, …)` 原来 0 findings(numpy 的 `copyto` 是 ufunc、`put` 是普通函数,
+    都接受关键字)。**修法**:同时检查关键字实参里的目标形参(`dst`/`a`/`arr`/`array`);
+    **放行方向**:`np.copyto(dst=other, src=self.am.close)`(被写的是别的数组)放行。
+  - **MEDIUM-3 "模块级私有符号"规则的裁决文本不成立**:没有 `__all__` 时 Python 的 `import *`
+    本来就**不绑**下划线名,而文本说"会把它放进候选命名空间"——**按文本无法自证**。
+    **修法**:文本改成实话("该模块在藏东西"),**行为不变**,点名具体符号这一条保留。
+  - **LOW-1** 上一轮变异表把"撤销 F2 收窄"记成 4 条变红,codex 用**精确复原旧三条函数**的变体实测 **14 条**——
+    本轮按更精确的变体更正,并写明两次测的**不是同一个变体**。
+  - **LOW-2** 受保护包名不再写死,改为从 `PROTECTED_RUNTIME_PACKAGES` 派生;docstring 改成说真话。
+  - **LOW-3** 身份表**跳过标量**(`bool`/`int`/`float`/`str`/`bytes`/`complex`/`None`):
+    `id()` 对小整数会撞号,拿它当身份会让候选命名空间里任何一个同值整数被误判成持有受保护对象
+    ——**整个进化循环被闲置**。
+  - **LOW-4** 命名空间核对也扫字典的**键**(`{swap_out: 1}` 这种藏法原来漏放);**LOW-5** 缓存返回 `frozenset`。
+  - **本轮变异验证 5 条(M24–M28)全部变红**。
+  - **残余(如实记录)**:字符串间接引用(`getattr(sys.modules[...])`)静态层仍是 0 findings
+    (沙盒层与运行期身份核对兜住顶层形态,闭包内形态看不见,由第五层在数据真被改时兜底);
+    容器别名**两层以上**静态层 0 findings;命名空间核对不覆盖模块对象;
+    仓库外**以及仓库内带模块级私有名**的模块,`import *` 一律按"无法核验"/"在藏东西"拒(有意的取舍)。
+
 ### Added（新增）
+- **宪法加固:候选在 `entry_signal` 里只拿行情容器的只读副本视图(收能力)**(Issue [#23](https://github.com/laiyinyizao007/invest/issues/23),ADR `20261113-read-only-market-view`;**这是对模板与既有宪法决策的修订**,用户以 `/goal 剩下这些都要做完` 授权):
+G8 第 12/13/14 轮 codex 为 38.5 / 38.0 / 38.5,逐条堵"改写行情容器"的**写法**没有收敛(视图、dunder、别名、`[:, None]`、改 `count`/`size`、预热期塞假 K 线、跨 K 线改后还原……),因为这些攻击共同的前提是候选手里拿着**真实容器**。现在模板在调用 `entry_signal()` 的那一刻(`_call_entry_signal`,候选碰得到容器的唯一时机)把 `self.am` 换成只读视图、`self.bg` 换成禁止访问的哨兵,调用结束(含异常)立刻还原。视图没有 `update_bar` 等变更入口、所有数组与指标结果都是**拷贝**、视图本身不可变、真实容器只在方法闭包里。
+**踩到并写进测试的一点**:不能返回"只读视图"(`flags.writeable = False`)——numpy 允许对基础数组可写的视图重新打开可写,写回去照样改到引擎的数据;拷贝没有这个问题。
+**验证**:单元(拷贝、没有变更入口、不可变、容器不在属性里)+ 端到端用真实回测引擎、**不经静态筛查**——第 12–14 轮的攻击要么抛 `ReadOnlyViewError`,要么写在副本上、结果与诚实模板逐笔一致;有真实成交的行情上有视图与无视图逐笔、逐位一致;变异验证(返回真数组 19 条、跳过换入 10 条、放开 `update_bar` 2 条、视图可写 7 条用例变红,其中放开 `update_bar` 最初只有 1 条变红——端到端那条喂的是 `None`,真容器收到也会抛错,改喂合法假 K 线后才有判别力);第五层作为纵深防御保留(用覆盖换入点的类模拟"视图被绕过",`count -= 1` 仍被逐根核对抓到)。`_call_entry_signal` 与 `_am_view` 进了受保护成员,`_call_entry_signal` 进了受保护执行点(候选引用/覆盖它就能绕开视图)。
+**自查发现的更大的洞(先于本修订、在已合并的宪法里就存在)**:受限导入器放行了 `traceback`,`traceback.walk_stack(None)` 不需要写任何被禁的属性名就能拿到调用栈上每个栈帧的 `f_locals`;`e.__traceback__.tb_frame.f_back.f_locals` 这条链上的名字也都不在禁用清单里——沿栈帧一路能走到回测引擎(`history_data`、`cta_engine`)与 `run_evaluation` 的局部变量(含整份行情、包括验证窗口),这与 `self.cta_engine`(引用即拦)是同一个能力。实测(真实引擎、不经静态筛查):候选取回了真实 `ArrayManager` 并改写它、另一条走到了 `BacktestingEngine`;两条都被第五层抓到,但那是碰巧的设计。已把 19 个栈帧/回溯属性名与 `traceback`/`linecache`/`code`/`pdb`/`dis`/`runpy` 等 12 个模块补进禁用清单(静态层与运行期受限导入器),`_call_entry_signal` 不再把真容器放在局部变量里;变异验证过。**这不是封死**:绕过静态层后沿栈帧仍走得到引擎,静态层是这道口子的门;另有 `gzip`/`zipfile`/`tarfile`/`sqlite3`、`numpy.load(allow_pickle=True)` 这类同类缺口**没有处理**,已如实写进 ADR。
+**如实记录**:这仍是纵深防御不是沙盒——视图把真实容器放在闭包里,取出它需要受禁的 `__closure__` 等 dunder,静态层本来就拦,但静态层是黑名单,绕过它就绕过了这一层;"必须认全所有写法"降成了"必须拦住取闭包这一个口子",**不是零**。**这次修订没有得到新的外部复核分数**,不能声称"分数提高了"。`guard`/`trail`/`cta_engine` 没有换视图(`write_log`、`get_size` 要用 `cta_engine`,隐藏会误伤诚实候选)。
+
 - **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
   ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
   却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
