@@ -210,6 +210,40 @@ def test_a_successful_login_queries_the_positions(monkeypatch, capsys):
     assert "探针结束(未发任何委托)" in out
 
 
+def test_an_unrecognized_position_direction_is_shown_as_no_direction(monkeypatch, capsys):
+    """认不出来的持仓方向显示「无方向」,不把内部枚举名漏给看报告的人(2026-11-16 codex 复核 L4)。
+
+    `.value` 是被 gettext 翻译过的枚举值(英文机器上是 'Long'),直接打出来会让同一份持仓
+    在不同机器上显示成不同文案;认不出来的时候更不能打枚举名 —— 看报告的人不认得它。
+    """
+    monkeypatch.setattr(p, "load_profile", lambda profile="", root=None: _profile(
+        {"CTP_USERNAME": "012345678", "CTP_PASSWORD": "pw", "CTP_BROKER_ID": "8030",
+         "CTP_TD_ADDRESS": "121.13.218.19:41285", "CTP_MD_ADDRESS": "121.13.218.19:41293"}))
+    monkeypatch.setattr(p, "Collector", _FakeCollector)
+    monkeypatch.setattr(p, "check_positions", lambda engine, wait, early_exit, collector=None: ([], True))
+    monkeypatch.setattr(p, "close_engine", lambda engine: None)
+    monkeypatch.setattr(p.time, "sleep", lambda s: None)
+    monkeypatch.setattr(p, "EventEngine", lambda: SimpleNamespace(register=lambda *a: None))
+
+    class _Engine(_FakeMainEngine):
+        def get_all_positions(self):
+            return [SimpleNamespace(vt_symbol="c2701.DCE", direction="???", volume=3,
+                                    yd_volume=0, frozen=0)]
+
+    monkeypatch.setattr(p, "MainEngine", lambda event_engine=None: _Engine())
+
+    class _FakeCtpGateway:
+        default_name = "CTP"
+
+    monkeypatch.setattr("vnpy_ctp.CtpGateway", _FakeCtpGateway)
+    monkeypatch.setattr(p.os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    with pytest.raises(SystemExit):
+        p.main([])
+    out = capsys.readouterr().out
+    assert "c2701.DCE 无方向 volume=3" in out
+    assert "???" not in out
+
+
 def test_an_unknown_broker_id_is_refused_not_widened_to_the_known_set(monkeypatch, capsys, tmp_path):
     """BrokerID 没有绑定前置表 → 拒绝,而不是退回「国信 ∪ SimNow」全集(那会破坏 BrokerID 绑定)。"""
     import probe_position as pp

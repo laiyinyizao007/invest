@@ -35,6 +35,7 @@ from logging import ERROR  # 标准库的级别常量:不要从 vnpy.trader.logg
 from vnpy.trader.utility import get_file_path
 from vnpy_ctastrategy import CtaStrategyApp
 
+from risk.account_guard import beijing_now
 from risk.positions import describe, signed_net, undirected
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
@@ -103,7 +104,12 @@ class TradingRuntime:
         strategy_classes: dict[str, type] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
-        now: Callable[[], datetime] = datetime.now,
+        # 默认时钟用**北京时间**:ENTRY_SESSIONS 写的是交易所时区的时段,
+        # 而风控规则那边已经统一成北京时间了 —— 同一进程里两套时钟会让「在不在盘中」
+        # 与「今天算哪个交易日」错开 8 小时(宿主机 UTC-8 时)。
+        # 生产跑在 TZ=Asia/Shanghai 的容器里,本机时间恰好等于北京时间,问题被掩盖了;
+        # 开发/测试机上没有这层掩盖(2026-11-16 codex 复核 M3)。
+        now: Callable[[], datetime] = beijing_now,
     ) -> None:
         self.config = config
         self.notifier: Notifier = notifier or NullNotifier()

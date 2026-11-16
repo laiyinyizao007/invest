@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import sys
 from pathlib import Path

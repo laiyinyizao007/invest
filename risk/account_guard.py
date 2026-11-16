@@ -21,8 +21,28 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+# 固定 UTC+8,**不用** `ZoneInfo("Asia/Shanghai")`:
+# ZoneInfo 要读系统(或 pip 装的 `tzdata`)里的时区数据库,Windows 上常常只有用户目录里那份
+# `tzdata` —— 而以 `-I` 隔离模式启动的进程(仪表盘冒烟 `scripts/status_server.py`)拿不到用户目录,
+# 一 import 就 `ZoneInfoNotFoundError`,把仪表盘带崩(2026-11-16 全量 pytest 抓到:
+# `tests/test_dashboard_boundaries.py` 多出 2 个失败)。中国**自 1991-04-14 起**不再用夏令时,
+# 自那以后固定偏移与 `Asia/Shanghai` 在交易日口径上完全等价(1991 年以前的部分日期会差 1 小时,
+# 交易日语义上无影响),而且不依赖任何外部数据。
+BEIJING = timezone(timedelta(hours=8), "北京时间")
+
+
+def beijing_now() -> datetime:
+    """北京时间(无时区信息)。
+
+    期货交易日按**交易所所在时区**算,不能用运行机的本地时间:宿主机可能是 UTC-8,
+    本地时间与北京时间在夜盘时段会分属不同的交易日(2026-11-16 codex 复核 M2:
+    预检按北京时间算交易日、运行时按本机时间算,两者在 20:00 之后的几个小时里分叉,
+    预检判「没锁」放行、运行时判「当日锁定」⇒ 白跑一次国信登录额度)。
+    """
+    return datetime.now(BEIJING).replace(tzinfo=None)
 
 
 def trading_day(dt: datetime) -> date:
@@ -194,7 +214,7 @@ class AccountGuard:
 
         重置峰值等于重新获得完整的累计死线预算,所以每次解锁都写入 unlock_history(含是否越过冷却)。
         """
-        now = now or datetime.now()
+        now = now or beijing_now()
         before = (self.hard_locked, self.hard_reason, self.hard_locked_at, self.peak_equity, list(self.unlock_history))
         self.unlock_history = (self.unlock_history + [{
             "at": now.isoformat(timespec="seconds"), "locked_at": self.hard_locked_at,
@@ -228,7 +248,12 @@ class AccountGuard:
         state = {
             "account_id": self.account_id,
             "last_equity": self.last_equity,
-            "sampled_at": self.last_sampled_at.astimezone().isoformat(timespec="seconds") if self.last_sampled_at else None,   # 带时区
+            # 采样时刻是**北京时间的 naive 值**(beijing_now()),不能直接 `.astimezone()`:
+            # 对 naive 值,`.astimezone()` 一律按**本机时区**解释,于是落盘时刻被平移了
+            # (北京 − 本地)—— 非北京宿主机上状态页的「权益新鲜度」会一直显示陈旧,
+            # 而那是操作员判断「风控还活着吗」的唯一依据(2026-11-16 codex 复核 M5)。
+            "sampled_at": (self.last_sampled_at.replace(tzinfo=BEIJING).isoformat(timespec="seconds")
+                           if self.last_sampled_at else None),   # 带时区
             "peak_equity": self.peak_equity,
             "day": self.day.isoformat() if self.day else None,
             "day_start_equity": self.day_start_equity,

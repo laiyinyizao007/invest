@@ -7,13 +7,15 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 # 交易所时区:所有"属于哪一天"的判断都用它,不用本机时区。
 # 宿主机(UTC-8)与容器(Asia/Shanghai)差 16 小时,按本机时区算会把日期算错。
-EXCHANGE_TZ = ZoneInfo("Asia/Shanghai")
+# 用**固定 UTC+8 偏移**而不是 `ZoneInfo`:ZoneInfo 依赖时区数据库,
+# Windows 上常常只有用户目录里那份 `tzdata`,`-I` 隔离模式的进程拿不到 ⇒ 一 import 就崩
+# (2026-11-16 codex 复核 H1)。中国自 1991-04-14 起不再用夏令时,自那以后两者等价。
+EXCHANGE_TZ = timezone(timedelta(hours=8), "北京时间")
 
 # 日志里表示"异常事件"的措辞 → 报告里的人话。
 # 键是日志里出现的片段,值是 (严重级别, 展示名)。

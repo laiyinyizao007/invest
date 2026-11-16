@@ -35,7 +35,7 @@ from vnpy_ctastrategy.base import APP_NAME as CTA_APP_NAME
 from vnpy_riskmanager.base import APP_NAME
 from vnpy_riskmanager.template import RuleTemplate
 
-from risk.account_guard import AccountGuard, AccountLimits, LockEvent, trading_day
+from risk.account_guard import AccountGuard, AccountLimits, LockEvent, beijing_now, trading_day
 from risk.positions import describe, undirected
 from risk.order_policy import (
     RejectKind,
@@ -123,7 +123,9 @@ class AccountGuardRule(RuleTemplate):
         self.day_start_equity: float = 0.0
         self.cancel_count: int = 0
 
-        self.clock = datetime.now             # 测试可替换
+        # 交易日按**交易所所在时区**算:宿主机本地时间可能是 UTC-8,夜盘时段会与北京时间
+        # 分属不同的交易日 ⇒ 当日熔断/硬锁定的「当天」与预检对不上(2026-11-16 codex 复核 M2)。
+        self.clock = beijing_now              # 测试可替换
         self.mono = time.monotonic            # 测试可替换
         self.retry_policy = RetryPolicy()
         self.guard = AccountGuard()

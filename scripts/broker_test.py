@@ -25,7 +25,6 @@ import os
 import subprocess
 import sys
 import time
-from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -63,16 +62,12 @@ from ctp_tools.penetration import (  # noqa: E402
 )
 from trading.events import EVENT_GUARD_ALERT  # noqa: E402
 from trading.guard_rule import ACCOUNT_RULE_NAME  # noqa: E402
-from risk.account_guard import AccountGuard, AccountLimits, trading_day  # noqa: E402
+from risk.account_guard import AccountGuard, AccountLimits, beijing_now, trading_day  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
 from trading.safe_risk import SafeRiskManagerApp  # noqa: E402
 
-BEIJING = ZoneInfo("Asia/Shanghai")
-
-
-def beijing_now() -> datetime:
-    """北京时间(无时区信息)。交易时段按交易所所在时区判断,不能用运行机的本地时间(宿主机可能是 UTC-8)。"""
-    return datetime.now(BEIJING).replace(tzinfo=None)
+# 北京时间来自 `risk.account_guard`:预检(这里)与运行时(`trading.guard_rule`)必须用**同一个**
+# 时钟函数,否则两边算出的期货交易日可能不同(2026-11-16 codex 复核 M2)。
 
 
 OUT_ROOT = bootstrap.ROOT / "data" / "broker_test"
@@ -83,7 +78,8 @@ ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6",
 STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
 FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上限(秒)
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
-SETTLE_MAX_ROUNDS = 200                    # settle_counter 的轮数上限:注入的时钟不前进时也不死循环
+SETTLE_MIN_ROUNDS = 200                    # settle_counter 的轮数下限:注入的时钟不前进时也不死循环
+SETTLE_STEP = 0.1                          # settle_counter 每轮之间的间隔(秒)
 
 
 # ======================= 上下文与工具 =======================
@@ -241,6 +237,20 @@ def send(ctx: Ctx, req: OrderRequest) -> str:
     return ctx.main_engine.send_order(req, ctx.gateway_name)
 
 
+def cancel_and_note(ctx: Ctx, vt_orderids: list[str], lines: list[str]) -> list[str]:
+    """撤单,并把**撤不掉**的委托写进证据行。
+
+    撤不掉 = 撤单后仍在活动,或本地根本查不到(状态未知就当还挂着)。
+    这些委托必须进步骤证据,不能只在整轮收尾时兜底
+    (2026-11-16 codex 复核 L2:原先 8 个调用点里只有 1 个用了返回值,
+    T3/T5/P1.2、T4、P4.1、P5.1、重复报单撤不掉的委托都不进证据)。
+    """
+    leftover = cancel_active(ctx, vt_orderids)
+    if leftover:
+        lines.append(f"⚠ 清场后仍在活动或本地查不到的委托:{', '.join(leftover)}(可能还挂在柜台上)")
+    return leftover
+
+
 def cancel_active(ctx: Ctx, vt_orderids: list[str]) -> list[str]:
     """撤掉还挂着的委托,并**等到终态**;返回**仍在活动(或本地查不到)**的委托号。
 
@@ -295,6 +305,15 @@ def counter_value(rule, attr: str) -> int:
     return int(getattr(rule, attr, 0) or 0)
 
 
+def settle_rounds(timeout: float) -> int:
+    """等待窗口对应的轮数上限:每轮最多推进 SETTLE_STEP 秒,所以轮数要跟着 timeout 走。
+
+    上限写死(200 轮 = 20 秒)而 timeout 调大时,`settle_counter` 会在 20 秒处**静默**提前返回,
+    返回值与「到点放弃」无法区分(2026-11-16 codex 复核 L1)。
+    """
+    return max(SETTLE_MIN_ROUNDS, int(timeout / SETTLE_STEP) + 2)
+
+
 def settle_counter(ctx: Ctx, rule, attr: str, timeout: float = 5.0) -> int:
     """读计数**之前**先等它稳定下来(连续 1 秒不变才算数)。
 
@@ -310,7 +329,10 @@ def settle_counter(ctx: Ctx, rule, attr: str, timeout: float = 5.0) -> int:
     clock = ctx.clock
     deadline = clock() + timeout
     last, stable_since = -1, clock()
-    for _ in range(SETTLE_MAX_ROUNDS):
+    # 轮数上限跟着 timeout 走(见 settle_rounds):写死的上限会在等待窗口还没走完时
+    # **静默**提前返回,而返回值与「到点放弃」无法区分(2026-11-16 codex 复核 L1)。
+    rounds = settle_rounds(timeout)
+    for _ in range(rounds):
         ctx.pump()
         cur = counter_value(rule, attr)
         now = clock()
@@ -320,7 +342,7 @@ def settle_counter(ctx: Ctx, rule, attr: str, timeout: float = 5.0) -> int:
             return cur
         if now >= deadline:
             break                       # 到点就返回,不能把取证流程挂死
-        ctx.sleep(0.1)
+        ctx.sleep(SETTLE_STEP)
     return counter_value(rule, attr)
 
 
@@ -431,7 +453,7 @@ def step_basic_trade(ctx: Ctx, book: Book) -> None:
     open_lines = [f"买开 1 手 @ {buy_px}(对手价) 委托号 {open_id or '-'}",
                   f"终态 {open_order.status.value if open_order else '无回报'}  成交 {getattr(open_order, 'traded', 0)} 手"]
     if not open_ok:
-        cancel_active(ctx, [open_id] if open_id else [])
+        cancel_and_note(ctx, [open_id] if open_id else [], open_lines)
         for item, label in (("T3", ""), ("T5", ""), ("P1.2", "开仓")):
             book.add(item, FAIL, "开仓未成交", [Shot(label, open_lines)], started)
         return
@@ -521,7 +543,7 @@ def step_duplicate(ctx: Ctx, book: Book) -> dict:
                     break
         finally:
             rule.duplicate_order_limit = original         # 无论如何还原阈值,后面的步骤还在同一个进程里用这条规则
-            cancel_active(ctx, sent)
+            cancel_and_note(ctx, sent, lines)
     ctx.wait_until(lambda: any(a["title"] == "风控阈值触发" and "重复报单" in a["message"] for a in ctx.alerts_since(alert_mark)), 4.0)
     hits = ctx.logs_since(mark, "重复报单笔数")
     alerts = [a for a in ctx.alerts_since(alert_mark) if "重复报单" in a["message"]]
@@ -553,6 +575,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
     shots, oks = [], []
     stall_reasons: list[str] = []          # 每个指标:「判不出来」的具体原因(空 = 能判)
     hard_flags: list[str] = []             # 每个指标:硬失败的说明(空 = 没有硬失败)
+    fill_notes: list[str] = []             # 每个指标:演示单的成交情况(空 = 没成交)
 
     def count_of(attr: str) -> int:
         return counter_value(daily, attr)
@@ -567,7 +590,10 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         lines.append(f"设置{label}阈值 = {limit}(当前已有 {base})")
         advanced = False
         cancel_confirmed: bool | None = None     # 撤单指标:我们**自己**那张单撤成功了吗
+        cancel_filled = False                      # 撤单指标:演示单其实**成交了**(账户可能多出持仓)
+        fill_note = ""                             # 成交/部分成交的人话(空 = 没成交)
         stale_base = False                          # 计数基数取旧 → 对照做不成
+        blocked_detail = ""                        # 「对照用的那一笔」没发出去时的归因说明
         a = b = ""
         alerts: list[dict] = []
         try:
@@ -580,7 +606,43 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             a = send(ctx, make_req(ctx, price=probe_price(ctx)))
             if a:
                 made.append(a)
-            lines.append(f"阈值内委托:{'通过' if a else '被拦截(意外)'}")
+            lines.append(f"阈值内委托:{'通过' if a else '未发出'}")
+            if not a:
+                # 「对照用的那一笔」没发出去 —— 必须查清**是谁拦的**,更不能一口咬定
+                # 「阈值设得太紧」:委托规模超限、通道断开、账户被锁都会落到同一条分支,
+                # 那样写等于对风控系统栽赃(2026-11-16 codex 复核 H1 复现:
+                # 风控日志写的是「委托价值20900.0超过上限」,报告却断言「阈值太紧」)。
+                # 归因只看**证据**,优先级从硬到软:
+                #   ①风控日志点名了**我们这一项**的指标(「汇总委托笔数N达到上限M」)
+                #     ⇒ 就是本项阈值拦的 ⇒ 计数基数取旧 ⇒ 判不出来;
+                #   ②有拦截日志但没点名我们这项 ⇒ 是**别的规则**拦的 ⇒ 实打实的失败,
+                #     但结论只能说「委托没发出去」并引用日志,不能说「阈值太紧」;
+                #   ③压根没有拦截日志 ⇒ 通道断开/账户被锁/别的规则 ⇒ 失败,中性措辞;
+                #   ④只有在**没有日志**时,才退回用计数推断(计数已到阈值 ⇒ 可能是本项拦的)。
+                ctx.wait_until(lambda: bool(ctx.logs_since(mark, "委托被拦截")), 2.0)
+                block_logs = ctx.logs_since(mark, "委托被拦截")
+                ours = [h for h in block_logs if key_word in h]
+                count_now = count_of(counter_attr)
+                # 「读取计数」是**读到**那一刻的值,不是「发单那一刻」的值 —— 措辞得对得上,
+                # 而且不等式只在真的成立时才写:否则会打出「计数 1 < 阈值 1」这种假话
+                # (2026-11-16 codex 复核 M2)。这种句子会原样进国信的取证报告。
+                count_txt = (f"读取计数 {count_now} < 本项阈值 {limit}" if count_now < limit
+                             else f"读取计数 {count_now}(本项阈值 {limit})")
+                if ours:
+                    stale_base = True
+                    blocked_detail = (f"是本项阈值拦的({key_word}达到上限{limit},风控日志:"
+                                      f"{ctx.clean(ours[-1][:160])})⇒ 计数基数取旧,这轮对照做不成")
+                elif block_logs:
+                    blocked_detail = (f"委托没发出去,{count_txt},不是本项阈值拦的"
+                                      f"(风控日志:{ctx.clean(block_logs[-1][:160])})")
+                elif count_now >= limit:
+                    stale_base = True
+                    blocked_detail = (f"读取计数已到 {count_now} ≥ 本项阈值 {limit},是本项阈值拦的"
+                                      " ⇒ 计数基数取旧,这轮对照做不成")
+                else:
+                    blocked_detail = (f"委托没发出去,{count_txt},不是本项阈值拦的"
+                                      "(没有风控拦截日志:可能是通道断开/账户被锁/委托被其它规则拦下)")
+                lines.append(f"⚠ {blocked_detail}")
             # 计数是**异步**更新的:send() 立刻返回,而规则的计数要等委托回报事件到达才 +1。
             # 不等计数涨上去就发第二笔,第二笔会因为计数还停在旧值而被放行 ——
             # 2026-11-16 夜盘实测就是这样把「超过阈值的委托」放过去的。
@@ -590,14 +652,23 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 是白等 5 秒,还会把「计数没推进」这个结论安错地方(撤单指标就永远 SKIP 了)。
             # 所以撤单指标的推进判断放到撤单之后(见下面)。
             if not need_cancel:
-                advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, 5.0)
-                if not advanced:
-                    lines.append(f"⚠ {label}计数在 5 秒内没有推进(仍为 {count_of(counter_attr)}),下面的对照不可靠")
-                elif count_of(counter_attr) > base + 1:
-                    # 一次跳了不止 +1 = 有**别的**委托回报混进来了 → 基数不可信 → 判不出来。
-                    stale_base = True
-                    lines.append(f"⚠ {label}计数一次跳到 {count_of(counter_attr)}(不止 +1),"
-                                 "有别的委托回报混进来,本次对照不可靠")
+                if a:
+                    advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, 5.0)
+                    if not advanced:
+                        lines.append(f"⚠ {label}计数在 5 秒内没有推进(仍为 {count_of(counter_attr)}),下面的对照不可靠")
+                    elif count_of(counter_attr) > base + 1:
+                        # 一次跳了不止 +1 = 有**别的**委托回报混进来了 → 基数不可信 → 判不出来。
+                        stale_base = True
+                        lines.append(f"⚠ {label}计数一次跳到 {count_of(counter_attr)}(不止 +1),"
+                                     "有别的委托回报混进来,本次对照不可靠")
+                elif count_of(counter_attr) >= base + 1:
+                    # 委托没发出去,但计数已经到阈值(可能就是刚才被阈值拦下的那一次):
+                    # 「超阈值那笔真的发出去了」仍然是硬失败(见下面 hard_reason),
+                    # 不能因为 a 为空就把这条证据丢掉。
+                    # 这里**不能**动 advanced:a 为空时下面的 `elif not a:` 必然先命中,
+                    # advanced 只在 a 非空时被读 —— 原先在这里写 advanced=True 是死代码,
+                    # 留着会让人以为它改变过结论(2026-11-16 codex 复核 L1)。
+                    pass
             if need_cancel and a:
                 order_a = ctx.collector.order_of(a)
                 if order_a is not None:
@@ -616,12 +687,25 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                         # 终态是「成交」而不是「已撤销」:撤单没赶上,单子真成交了。
                         # 这不是「撤单成功」,账户可能因此多出一笔持仓,必须点出来
                         # (2026-11-16 codex 复核 L4:原先只写「已撤销」,成交会被当成撤销)。
+                        cancel_filled = True
+                        fill_note = "演示单已成交"
                         lines.append("⚠ 演示单**成交了**(不是撤单成功),账户可能多出持仓,请人工核对")
+                    elif final is not None and final.status == Status.PARTTRADED:
+                        # 部分成交:账户已经多出一部分持仓,**同时**余量可能还挂在柜台上 ——
+                        # 两个后果都要说。只说「还挂着」会把操作员引去柜台撤单,而忘了核持仓
+                        # (2026-11-16 codex 复核 M6)。
+                        cancel_filled = True
+                        fill_note = "演示单部分成交(余量可能仍挂在柜台上)"
+                        lines.append("⚠ 演示单**部分成交**,账户可能多出一部分持仓,请人工核对持仓")
+                        lines.append("⚠ 演示单余量可能仍挂在柜台上,请人工去柜台核对")
                 # 撤单计数同样要等回报到达才 +1(撤单回报 → 规则 on_order → 计数 +1)
                 advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, ctx.cancel_wait)
                 if not advanced:
                     lines.append(f"⚠ {label}计数在 {ctx.cancel_wait} 秒内没有推进"
                                  f"(仍为 {count_of(counter_attr)}),下面的对照不可靠")
+            # 发第二笔之前再取一次计数:它就是规则**决定放行还是拦截**时看到的那份数字。
+            # 「计数已经 ≥ 阈值,而超阈值那笔还是发出去了」= 阈值确实没生效(硬失败)。
+            count_before_b = count_of(counter_attr)
             b = send(ctx, make_req(ctx, price=probe_price(ctx)))
             if b:
                 made.append(b)
@@ -633,38 +717,45 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             forward_alerts(ctx, alerts)
         finally:
             restore()                      # 无论如何还原阈值并撤掉演示委托,不留下挂单
-            leftover = cancel_active(ctx, made)
-            if leftover:
-                lines.append(f"⚠ 清场后仍在活动或本地查不到的委托:{', '.join(leftover)}(可能还挂在柜台上)")
+            cancel_and_note(ctx, made, lines)
         # 「阈值失效」是**硬结论**:计数确实到过阈值(base+1),而超阈值那笔却发出去了。
         # 它不能被「判不出来」盖掉 —— 否则报告会写成「未测试」,把一次真实的阈值失效
         # 洗成「没法测」(2026-11-16 codex 复核 H1:证据行字面写着「未被拦截(意外)」,
         # 而 P3.1/T6 判成了 SKIP)。
-        # 另一条硬失败:阈值**内**的那一笔压根没发出去(基数取旧时不算 —— 那是被旧基数
-        # 挤掉的,判不出来;基数没取旧就是真失败)。
         hard_reason = ""
-        if bool(b) and advanced:
+        # 「判不出来」有四种:①计数**基数取旧**(有别的回报混进来)—— 拿旧基数比出来的结论不算数;
+        # ②委托发出去了但计数没推进(回报没到/没回);
+        # ③撤单指标里**我们自己的撤单没确认** —— 触发不是我们想要的那一次;
+        # ④「对照用的那一笔」被**本项阈值**拦下(计数已到阈值)—— 基数取旧,这轮做不成。
+        # 「对照用的那一笔」压根没发出去**不一定**是失败:被本项阈值拦下说明基数取旧
+        # (判不出来),被别的东西拦下才是失败 —— 但失败也只能说「委托没发出去」,
+        # 不能说「阈值设得太紧」:那样写是在指控一个没有证据支持的原因
+        # (2026-11-16 codex 复核 H1:委托规模超限/断连都被写成「阈值太紧」)。
+        stall_reason = ""
+        if bool(b) and count_before_b >= limit:
             hard_reason = "超过阈值的委托没有被本地风控拦下(阈值未生效)"
-        elif not a and not stale_base:
-            hard_reason = "阈值内的委托被拦下了(阈值设得太紧,演示不成立)"
+        elif not a:
+            if stale_base:
+                stall_reason = f"对照用的委托没能发出({blocked_detail})"
+            else:
+                hard_reason = f"对照用的委托没能发出({blocked_detail})"
+        elif stale_base:
+            stall_reason = "计数基数取旧(有别的回报混进来)"
+        elif need_cancel and not cancel_confirmed:
+            # 撤单没确认的**后果**分两种:演示单成交了(账户可能多出持仓,要平仓核对)
+            # 与演示单可能还挂着(要去柜台撤)。摘要必须分开说,否则会把人引到错的动作上
+            # (2026-11-16 codex 复核 M-1)。
+            stall_reason = (f"撤单未确认({fill_note},账户可能多出持仓,请人工核对持仓)" if cancel_filled
+                            else "撤单未确认(演示单可能仍在柜台上)")
+        elif not advanced:
+            stall_reason = f"{label}计数未推进(限时内没有推进)"
         if hard_reason:
             lines.append(f"✗ {hard_reason}")
         ok = bool(a) and not b and bool(alerts) and not stale_base and (not need_cancel or cancel_confirmed)
         oks.append(ok)
-        # 「判不出来」有三种:①计数**基数取旧**(有别的回报混进来)—— 拿旧基数比出来的结论不算数;
-        # ②委托发出去了但计数没推进(回报没到/没回);
-        # ③撤单指标里**我们自己的撤单没确认** —— 触发不是我们想要的那一次。
-        # 委托压根没发出去(a 为空)不是判不出来,是实打实的失败(阈值内就被拦了)——
-        # 把它混进 SKIP 就是把失败洗成「没法测」。
-        stall_reason = ""
-        if stale_base:
-            stall_reason = "计数基数取旧(有别的回报混进来)"
-        elif need_cancel and bool(a) and not cancel_confirmed:
-            stall_reason = "撤单未确认(演示单可能仍在柜台上)"
-        elif bool(a) and not advanced:
-            stall_reason = f"{label}计数未推进(限时内没有推进)"
         stall_reasons.append(stall_reason)
         hard_flags.append(hard_reason)
+        fill_notes.append(fill_note)
         shots.append(Shot(label, lines))
 
     if daily is None:
@@ -677,17 +768,20 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
     order_ok = oks[-1]
     order_stalled = stall_reasons[-1]
     order_hard = hard_flags[-1]
+    order_fill = fill_notes[-1]
     if ctx.in_session:
         metric("撤单总笔数", "汇总撤单笔数", lambda n: setattr(daily, "total_cancel_limit", n), "total_cancel_count",
                lambda: setattr(daily, "total_cancel_limit", orig_c), need_cancel=True)
         cancel_ok = oks[-1]
         cancel_stalled = stall_reasons[-1]
         cancel_hard = hard_flags[-1]
+        cancel_fill = fill_notes[-1]
     else:
         shots.append(Shot("撤单总笔数", ["非交易时段委托不会进入可撤状态,撤单阈值无法演示,请在交易时段补测"]))
         cancel_ok = None
         cancel_stalled = ""
         cancel_hard = ""
+        cancel_fill = ""
     shots.append(Shot("重复报单总笔数", dup.get("lines", ["(重复报单演示未执行)"])))
     dup_ok = bool(dup.get("ok"))
     # 计数没推进 = 演示**不可靠**,不是「阈值没生效」:这两种情况必须分开,
@@ -699,11 +793,30 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
     # 硬失败不能被 SKIP 盖掉:超阈值那笔真的发出去了,这是「阈值没生效」的确定结论,
     # 写成「未测试」就是把失败洗成没法测(2026-11-16 codex 复核 H1)。
     if order_hard or cancel_hard:
-        status, summary = FAIL, (order_hard or cancel_hard)
+        # 两个指标的硬失败**都**要收集:只取第一个会把另一个指标的真实失败吞掉
+        # (2026-11-16 codex 复核 M1)。硬失败优先,但另一个指标「判不出来」的原因
+        # 也要带上 —— 它解释了这一项为什么没测出来。
+        hards = [f"报单:{h}" for h in (order_hard,) if h] + [f"撤单:{h}" for h in (cancel_hard,) if h]
+        stalls = [f"报单:{s}" for s in (order_stalled,) if s] + [f"撤单:{s}" for s in (cancel_stalled,) if s]
+        status, summary = FAIL, ";".join(hards)
+        if stalls:
+            summary += f"(另:{';'.join(stalls)})"
+        if order_fill or cancel_fill:
+            summary += f" ⚠ {order_fill or cancel_fill},账户可能多出持仓,请人工核对持仓"
     elif order_stalled or cancel_stalled:
-        reason = order_stalled or cancel_stalled
+        # 「判不出来」的原因也要**都**收上:只取第一个,另一个指标的原因就整条消失了
+        # (2026-11-16 codex 复核 M1:报单指标判不出来时,撤单指标那条
+        #  「演示单已成交 ⇒ 账户可能多出持仓」就从摘要里消失了)。
+        reasons = [r for r in (order_stalled, cancel_stalled) if r]
+        reason = ";".join(reasons)
         status, summary = SKIP, f"阈值对照不可靠({reason}),请在委托回报正常时补测"
-        if "撤单未确认" in reason:
+        # 摘要必须说清**后果**:演示单成交了 ⇒ 账户可能多出持仓(要去平仓核对);
+        # 撤单没确认 ⇒ 单子可能还挂着(要去柜台撤)。混成一句会把人引到错的动作上
+        # (2026-11-16 codex 复核 M-1)。成交告警**无条件**补:它跟「为什么判不出来」无关,
+        # 只跟「账户现在可能多了持仓」有关,漏掉就是把真风险写没了。
+        if order_fill or cancel_fill:
+            summary += f" ⚠ {order_fill or cancel_fill},账户可能多出持仓,请人工核对持仓"
+        elif "撤单未确认" in reason:
             summary += " ⚠ 演示单可能仍挂在柜台上,请人工去柜台核对"
     elif order_ok and dup_ok and cancel_ok:
         status, summary = PASS, ""
@@ -713,12 +826,17 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         status, summary = FAIL, "有阈值未能触发拦截与预警"
     book.add("P3.1", status, summary, shots, started)
     if order_hard:
-        t6_status, t6_summary = FAIL, f"报单阈值未能限制下单:{order_hard}"
+        # 摘要**不许**预设原因:硬失败的措辞已经写明了真实原因(「阈值未生效」是证据支持的,
+        # 「对照用的委托没能发出(…)」不是),这里只做中性前缀(2026-11-16 codex 复核 H1)。
+        t6_status, t6_summary = FAIL, f"报单阈值对照未通过:{order_hard}"
     elif order_stalled:
         t6_status, t6_summary = SKIP, f"报单阈值对照不可靠({order_stalled})"
     else:
         t6_status = PASS if order_ok else FAIL
-        t6_summary = "" if order_ok else "报单阈值未能限制下单"
+        # 走到这里还没被硬失败/判不出来覆盖,剩下的唯一可能:阈值**拦住了**委托但没等到预警告警。
+        # 原先写「报单阈值未能限制下单」——那是在指控一个没有证据支持的原因
+        # (2026-11-16 codex 复核 H1:这句话会原样进券商取证报告)。
+        t6_summary = "" if order_ok else "报单阈值对照未通过(阈值拦住了委托但没有收到预警告警)"
     book.add("T6", t6_status, t6_summary, [Shot("", shots[0].lines)], started)
 
 
@@ -748,7 +866,7 @@ def step_validity(ctx: Ctx, book: Book) -> None:
         shots.append(Shot(label, [f"发送错误委托:{ctx.clean(str(req.symbol))} 买开 {req.volume} 手 @ {req.price}",
                                   "结果:本地风控已拒绝,未发往柜台" if not oid else "⚠ 委托没有被拦截",
                                   *[ctx.clean(f"风控日志:{h[:200]}") for h in hit[:1]]]))
-        cancel_active(ctx, [oid] if oid else [])
+        cancel_and_note(ctx, [oid] if oid else [], shots[-1].lines)
     ok_all = all(oks)
     book.add("P4.1", PASS if ok_all else FAIL, "" if ok_all else "有错误指令没有被本地检查拦截", shots, started)
 
@@ -802,7 +920,7 @@ def step_counter_errors(ctx: Ctx, book: Book) -> None:
         if not ok and expect:
             notes.append(f"{label}:柜台没有返回含「{expect}」的错误(账户资金充裕时无法触发资金不足)")
         oks.append(ok)
-        cancel_active(ctx, [oid] if oid else [])
+        cancel_and_note(ctx, [oid] if oid else [], shots[-1].lines)
     if any(o is True for o in oks):
         # 只要真收到了柜台的错误提示,「接收柜台错误提示」这个功能就算演示到了;
         # 没演示的场景按「需补测」记在说明里,不能当成失败。
@@ -839,7 +957,7 @@ def step_pause(ctx: Ctx, book: Book) -> None:
         lines += [ctx.clean(f"风控日志:{h[:160]}") for h in ctx.logs_since(mark, "已手动暂停")[:1]]
     finally:
         pause_trading.resume(state_dir)                   # 无论如何解除暂停标志:不能让演示遗留一个"暂停中"的运行机
-        cancel_active(ctx, made)
+        cancel_and_note(ctx, made, lines)
     lines.append(f"{ctx.now()} 执行 pause_trading off(恢复)")
     ctx.wait_until(lambda: any(a["title"] == "交易已恢复" for a in ctx.alerts_since(alert_mark)), 4.0)
     resumed = send(ctx, make_req(ctx, price=probe_price(ctx)))
@@ -849,7 +967,7 @@ def step_pause(ctx: Ctx, book: Book) -> None:
     alerts = [a for a in ctx.alerts_since(alert_mark) if a["title"] in ("交易已暂停", "交易已恢复")]
     lines += [ctx.clean(f"告警:[{a['level']}] {a['title']}") for a in alerts]
     forward_alerts(ctx, alerts)
-    cancel_active(ctx, made)
+    cancel_and_note(ctx, made, lines)
     ok = (not opened) and bool(closed) and bool(resumed) and len(alerts) >= 2
     book.add("P5.1", PASS if ok else FAIL, "" if ok else "暂停/恢复行为或告警不符合预期", [Shot("", lines)], started)
 

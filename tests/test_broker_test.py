@@ -299,6 +299,101 @@ def test_orders_that_could_not_be_cancelled_are_written_into_the_evidence(env, m
     assert any("仍在活动或本地查不到的委托" in line for s in p31.shots for line in s.lines), p31.shots
 
 
+def test_an_order_blocked_by_another_rule_is_not_reported_as_a_tight_threshold(env):
+    """委托被**别的规则**拦下 ⇒ 不能写成「阈值设得太紧」(2026-11-16 codex 复核 H1 复现)。
+
+    复现:把「委托规模检查」的委托价值上限调到 1 元,任何委托都会被它拦下。
+    风控日志写的是「委托被拦截，委托价值X超过上限1.0」,而旧代码的断言却是
+    「阈值内的委托被拦下了(阈值设得太紧,演示不成立)」—— 那是对风控系统的错误指控,
+    原样进国信取证报告会把人引向「调阈值/改配置」,而真正该做的是改演示委托的规模。
+    """
+    env.risk.rules["委托规模检查"].order_value_limit = 1.0
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值设得太紧" not in p31.summary
+    assert "不是本项阈值拦的" in p31.summary
+    assert "委托价值" in p31.summary               # 把风控日志里的真实原因带进摘要
+    assert "报单阈值未能限制下单" not in item(env, "T6").summary
+
+
+def test_a_late_report_between_reading_the_count_and_sending_is_inconclusive(env, monkeypatch):
+    """迟到回报在「读计数」与「发单」之间推进计数 ⇒ 判不出来(SKIP),不是「阈值失灵」。
+
+    复现(codex 复核 H1 路径 B):计数被**别的**回报推进了一格,于是我们那笔「阈值内」的
+    委托被阈值拦下 —— 阈值其实**生效**了,这轮对照只是做不成(基数取旧)。
+    旧代码把它写成硬失败「阈值内的委托被拦下了(阈值设得太紧,演示不成立)」。
+    """
+    daily = env.risk.rules["每日上限检查"]
+    real_send = bt.send
+
+    def fake_send(ctx, req):
+        daily.total_order_count += 1               # 模拟迟到回报:发单**之前**计数就动了
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "阈值设得太紧" not in p31.summary
+    assert "基数取旧" in p31.summary
+    # 归因靠的是**风控日志点名了我们这一项**(「汇总委托笔数…达到上限…」),
+    # 不是靠事后猜计数 —— 断言里能看到日志原文才算数。
+    assert "汇总委托笔数" in p31.summary
+
+
+def test_a_disconnected_gateway_does_not_accuse_the_threshold(env):
+    """通道断开 ⇒ 委托没发出去,但**不是**阈值的锅,也不能说「阈值太紧」。
+
+    断连时框架本地就失败(没有委托、没有风控拦截日志),计数一动不动。
+    """
+    env.gw.mode = "disconnected"
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值设得太紧" not in p31.summary
+    assert "没有风控拦截日志" in p31.summary
+
+
+def test_a_demo_order_that_filled_points_at_the_position_not_at_the_counter(env):
+    """撤单没赶上、演示单**成交了** ⇒ 摘要要说「账户可能多出持仓」,不是「去柜台撤挂单」。
+
+    2026-11-16 codex 复核 M-1:同一份证据里写着「终态 全部成交」,摘要却让人去柜台撤单 ——
+    方向完全相反:真正的问题是账户多出一笔持仓,要平仓核对。
+    """
+    env.gw.mode = "fill"
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "已成交" in p31.summary
+    assert "柜台上" not in p31.summary
+
+
+def test_the_runtime_guard_and_the_precheck_share_one_trading_day_clock(env):
+    """预检与运行时必须用**同一个**时钟函数,否则两边算出的期货交易日会分叉。
+
+    2026-11-16 codex 复核 M2:预检按北京时间算交易日、运行时的账户风控按宿主机本地时间算。
+    宿主机是 UTC-8 时,北京时间 20:30 与本地 04:30 分属不同的交易日 ⇒
+    预检判「没锁」放行、运行时判「当日锁定」⇒ 白跑一次国信登录额度。
+    """
+    from risk import account_guard as ag
+    from trading import guard_rule as gr
+
+    assert gr.beijing_now is ag.beijing_now          # 运行时与纯逻辑模块同源
+    assert env.rule.clock is ag.beijing_now          # 运行时的账户风控按北京时间算交易日
+    assert bt.beijing_now is ag.beijing_now          # 取证预检用同一个函数
+
+
+def test_the_settle_round_budget_follows_the_timeout():
+    """等待窗口变长时轮数上限必须跟着长 —— 写死的上限会**静默**提前返回。
+
+    2026-11-16 codex 复核 L1:原先上限写死 200 轮(=20 秒),timeout 调大后
+    `settle_counter` 在 20 秒处悄悄返回,返回值与「到点放弃」无法区分。
+    """
+    assert bt.settle_rounds(5.0) == bt.SETTLE_MIN_ROUNDS
+    assert bt.settle_rounds(60.0) > bt.SETTLE_MIN_ROUNDS
+
+
 def test_an_order_the_collector_lost_is_reported_as_not_confirmed_gone(env):
     """本地查不到委托 ≠ 它已经不在柜台上:状态未知就当还挂着,进证据。
 
@@ -930,6 +1025,7 @@ def test_save_connection_info_appends_one_entry_per_run(tmp_path):
 def test_session_and_evidence_timestamps_use_beijing_time_not_host_local_time(monkeypatch):
     """宿主机可能是 UTC-8:北京周五 10:00 在本机是周四 18:00,按本地时间会把交易时段误判为休市。"""
     from datetime import datetime as real_datetime, timezone
+    from risk import account_guard as ag
     real_now = real_datetime(2026, 11, 13, 2, 0, tzinfo=timezone.utc)          # = 北京 2026-11-13 10:00 周五
 
     class Fake(real_datetime):
@@ -938,6 +1034,7 @@ def test_session_and_evidence_timestamps_use_beijing_time_not_host_local_time(mo
             return real_now.astimezone(tz) if tz else real_now.astimezone(timezone.utc).replace(tzinfo=None) - __import__("datetime").timedelta(hours=8)
 
     monkeypatch.setattr(bt, "datetime", Fake)
+    monkeypatch.setattr(ag, "datetime", Fake)      # 北京时间函数现在住在 risk.account_guard,补丁要打在它身上
     now = bt.beijing_now()
     assert (now.hour, now.weekday()) == (10, 4)
     assert bt.in_trading_session(now) is True
@@ -1236,3 +1333,126 @@ def test_settle_counter_gives_up_instead_of_hanging():
     value = bt.settle_counter(_Ctx(), _Jumpy(), "total_order_count", timeout=0.3)
     assert time.monotonic() - started < 5.0
     assert value >= 1
+
+
+def test_the_position_warning_survives_another_metric_being_inconclusive(env, monkeypatch):
+    """一个指标判不出来,不能把**另一个**指标的关键告警从摘要里挤掉。
+
+    2026-11-16 codex 复核 M1:摘要原来只取**第一个**非空原因
+    (`order_stalled or cancel_stalled`),于是报单指标判不出来时,撤单指标那条
+    「演示单已成交 ⇒ 账户可能多出持仓」整条消失 —— 而摘要是**进国信报告正文的那行字**
+    (`broker_report.py` 渲染 `f"{ev.status}({ev.summary})"`)。
+    持仓风险跟「为什么判不出来」无关,不能被它盖掉。
+    """
+    daily = env.risk.rules["每日上限检查"]
+    real_send = bt.send
+
+    def fake_send(ctx, req):
+        daily.total_order_count += 1               # 迟到回报:报单指标的基数取旧 ⇒ 判不出来
+        return real_send(ctx, req)
+
+    env.gw.mode = "fill"                           # 撤单指标:演示单直接成交
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "已成交" in p31.summary                  # 成交告警没被另一个指标挤掉
+    assert "持仓" in p31.summary
+    assert "撤单未确认" in p31.summary               # 两个指标的原因都在
+
+
+def test_the_counter_comparison_is_never_a_false_inequality(env, monkeypatch):
+    """摘要里的不等式必须**真的成立**:不能打出「计数 1 < 阈值 1」这种话。
+
+    2026-11-16 codex 复核 M2:原先这句话无条件拼在「不是本项阈值拦的」后面,
+    而那个计数是读到时的值、不是发单时的值,而且没校验不等式成立 ——
+    这种句子会原样进国信的取证报告。
+    """
+    daily = env.risk.rules["每日上限检查"]
+    real_send = bt.send
+
+    def fake_send(ctx, req):
+        oid = real_send(ctx, req)                  # 委托被「委托规模检查」按价值拦下
+        daily.total_order_count += 1               # 计数被**别的**回报推到阈值上
+        return oid
+
+    # 用**别的规则**拦住委托(委托价值超限):风控日志里点名的是「委托价值」,
+    # 不是我们这一项 ⇒ 归因走「不是本项阈值拦的」那一支,那里会带上计数对比。
+    env.risk.rules["委托规模检查"].order_value_limit = 1.0
+    env.ctx.in_session = False                     # 只留报单这一个指标,免得撤单指标搅局
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert "不是本项阈值拦的" in p31.summary
+    assert "读取计数 1(本项阈值 1)" in p31.summary     # 计数已经到阈值,不能写成 1 < 1
+    assert "读取计数 1 < 本项阈值" not in p31.summary
+
+
+def test_a_partially_filled_demo_order_points_at_both_the_position_and_the_counter(env):
+    """部分成交的后果**有两个**:账户多出一部分持仓 + 余量可能还挂在柜台上。
+
+    2026-11-16 codex 复核 M6:原先只有终态恰好是「全部成交」才提示持仓,
+    部分成交只提示「可能仍挂在柜台上」—— 操作员会被引去柜台撤单,忘了核持仓。
+    """
+    env.gw.mode = "partial"
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "部分成交" in p31.summary
+    assert "持仓" in p31.summary
+    assert "柜台" in p31.summary
+
+
+def test_a_hard_failure_also_carries_the_position_warning(env, monkeypatch):
+    """**硬失败**(阈值确实没生效)的摘要里也必须带上「账户可能多出持仓」。
+
+    2026-11-16 codex 复核 M1:持仓告警原先只在「判不出来」分支里补,硬失败分支反而漏掉 ——
+    而恰恰是演示单可能已经成交的那一轮(撤单没赶上)会同时命中两个分支。
+    摘要正是**进国信报告正文的那行字**,漏掉就是把真风险写没了。
+    """
+    env.gw.mode = "fill"                          # 演示单一报出去就成交 ⇒ 撤单来不及
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:                      # 超阈值那笔:假装风控没拦下 ⇒ 硬失败
+            return "VT999999"
+        return real_send(ctx, req)
+
+    real_settle = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real_settle(ctx, rule, attr, timeout) - 2, 0)   # 故意报旧两笔 ⇒ 基数取旧
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    calls["n"] = 0
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值未生效" in p31.summary, p31.summary
+    assert "已成交" in p31.summary, p31.summary
+    assert "持仓" in p31.summary, p31.summary
+
+
+def test_a_blocked_order_with_no_risk_log_falls_back_to_the_counter(env, monkeypatch):
+    """压根没有风控拦截日志 ⇒ 最后才用计数兜底,措辞必须是「读取计数已到 N ≥ 本项阈值 M」。
+
+    2026-11-16 codex 复核 M2:这个兜底分支以前写的是「发单时计数」—— 那个数是**读到**那一刻的,
+    不是发单那一刻的,措辞对不上;而且不等式无条件写出,会打出「计数 1 < 阈值 1」这种假话。
+    """
+    daily = env.risk.rules["每日上限检查"]
+
+    def fake_send(ctx, req):
+        daily.total_order_count += 1           # 计数推到阈值,但没有任何拦截日志
+        return None                             # 委托没发出去
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    lines = [line for s in p31.shots if s.label == "报单总笔数" for line in s.lines]
+    assert any("读取计数已到" in line and "≥ 本项阈值" in line for line in lines), lines
+    assert not any("< 本项阈值" in line for line in lines), lines

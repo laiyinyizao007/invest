@@ -55,7 +55,8 @@ ISOLATED = bootstrap.isolate_state(FLATTEN_ROOT.name)
 
 from ctp_tools.broker_targets import allowed_for_broker, resolve_allowed  # noqa: E402
 from ctp_tools.collector import (  # noqa: E402
-    Collector, close_engine, direction_text, merge_position_rows, normalize_direction, query_positions,
+    Collector, close_engine, direction_text, merge_position_rows, normalize_direction, position_key,
+    query_positions,
 )
 from ctp_tools.penetration import check_target, mask_account  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
@@ -217,16 +218,46 @@ def plan_closes(positions: list, quotes: dict[str, tuple[float, float, float]],
 def manual_positions(positions: list) -> list[str]:
     """必须人工处理的持仓,返回给人看的说明。
 
-    目前只有一种情况:上期所/能源中心的今昨仓拆分不可靠
-    (vnpy_ctp 只在纯昨仓时写 yd_volume,见 `split_is_reliable`)。
+    三种情况:
+    - 上期所/能源中心的今昨仓拆分不可靠
+      (vnpy_ctp 只在纯昨仓时写 yd_volume,见 `split_is_reliable`);
+    - **净持仓**(NET):方向认得出来,但净仓没有「多/空」可平,自动发单会变成开仓 ⇒ 人工处理;
+    - 方向**认不出来**(归一化后既不是 LONG/SHORT/NET,包括方向为空的行):
+      这类行进不了平仓计划(`plan_closes` 只认 LONG/SHORT),方向为空时连合并键都取不到
+      (`position_key` 返回 None)会被 `merge_position_rows` 丢掉 ⇒ 既不进计划也不进对账,
+      不点名的话它就「隐形」了(2026-11-16 codex 复核 L3)。
+      vnpy_ctp 路径上净仓实际不可达(净仓被报成 SHORT),但工具不能靠「不可达」当保证。
+
+    同一 (合约, 方向) 出现两行是常态(网关自动查 + 我们主动查,两份快照混在一个窗口里,
+    见 `merge_position_rows` 的说明)。人工清单要用**合并后**的行,否则会重复列两行、
+    而且手数取到较旧的那次快照(2026-11-16 codex 复核 L3)。
+    但方向为空的行连合并键都取不到,它们会被合并层丢掉 —— 所以这类行**单独**保留,
+    不能因为「已经合并过了」就没人点名。
     """
-    out: list[str] = []
+    latest: dict[tuple[str, str], object] = {}
+    unkeyed: list = []
     for pos in positions:
+        key = position_key(pos)
+        if key is None:
+            unkeyed.append(pos)
+        else:
+            latest[key] = pos          # 同键取**最后一次**那行(与 merge_position_rows 同口径)
+    out: list[str] = []
+    for pos in list(latest.values()) + unkeyed:
         if int(getattr(pos, "volume", 0) or 0) <= 0:
             continue
         if not split_is_reliable(pos):
             out.append(f"{pos.vt_symbol} {direction_text(pos.direction)} {pos.volume} 手"
                        "(上期所/能源中心的今昨仓拆不出来,自动平仓会被柜台拒单,请人工平仓)")
+            continue
+        name = normalize_direction(getattr(pos, "direction", None))
+        if name == "NET":
+            out.append(f"{pos.vt_symbol} 净 {pos.volume} 手"
+                       "(净持仓没有多空可平,自动发单会变成开仓,请人工核对后平仓)")
+            continue
+        if name not in ("LONG", "SHORT"):
+            out.append(f"{pos.vt_symbol} 方向未知 {pos.volume} 手"
+                       "(持仓方向认不出来,不会自动发平仓单,请人工核对方向后平仓)")
     return out
 
 
@@ -486,8 +517,7 @@ def run(args: argparse.Namespace) -> int:
 
         manual = manual_positions(positions)
         if manual:
-            print("以下持仓的今昨仓拆不出来,不会自动发单(柜台会以「平今量超过今持仓量」拒单),请人工平仓:",
-                  file=sys.stderr)
+            print("以下持仓不能自动平仓,不会自动发单,请人工处理:", file=sys.stderr)
             for m in manual:
                 print(f"  - {m}", file=sys.stderr)
             record["需人工处理"] = manual

@@ -40,7 +40,7 @@ if not ISOLATED:
     sys.exit(2)
 
 from ctp_tools.broker_targets import allowed_for_broker  # noqa: E402
-from ctp_tools.collector import Collector, check_positions, close_engine, direction_text  # noqa: E402
+from ctp_tools.collector import Collector, check_positions, close_engine, direction_text, normalize_direction  # noqa: E402
 from ctp_tools.penetration import mask_account  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
@@ -186,7 +186,11 @@ def main(argv: list[str] | None = None) -> int:
             # 方向用 `direction_text` 打印固定中文:`.value` 是 gettext 翻译过的
             # (英文 locale 下是 'Long'),同一份持仓在不同机器上输出不一样,没法直接对比
             # (2026-11-16 codex 复核 L2:CHANGELOG 说「全部改用它」,这里漏了)。
-            print(f"  vn.py 持仓: {p.vt_symbol} {direction_text(p.direction)} volume={p.volume} "
+            # 认不出来的方向(既不是多/空/净,也不是空值)显示「无方向」,
+            # **别把原始值或内部枚举名漏给看报告的人**(2026-11-16 codex 复核 L4)。
+            name = normalize_direction(p.direction)
+            direction = direction_text(p.direction) if name in ("LONG", "SHORT", "NET") else "无方向"
+            print(f"  vn.py 持仓: {p.vt_symbol} {direction} volume={p.volume} "
                   f"yd={p.yd_volume} frozen={p.frozen}")
         for a in main_engine.get_all_accounts():
             print(f"  资金: 余额={a.balance} 可用={a.available} 冻结={a.frozen}")

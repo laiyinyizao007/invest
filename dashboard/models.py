@@ -12,9 +12,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
-BEIJING = ZoneInfo("Asia/Shanghai")
+# 固定 UTC+8,**不用** `ZoneInfo("Asia/Shanghai")`:
+# ZoneInfo 要读时区数据库,Windows 上常常只有用户目录里那份 `tzdata`,
+# 而以 `-I` 隔离模式启动的进程(仪表盘冒烟 `scripts/status_server.py`)拿不到用户目录 ——
+# 一 import 就 `ZoneInfoNotFoundError`,整个仪表盘起不来
+# (2026-11-16 codex 复核 H1:`python -I -c "from dashboard import collectors"` 复现)。
+# 中国自 1991-04-14 起不再用夏令时,自那以后固定偏移与 `Asia/Shanghai` 等价,
+# 而且不依赖任何外部数据。
+BEIJING = timezone(timedelta(hours=8), "北京时间")
 MAX_JSON_FILE_BYTES = 2_000_000          # 状态 JSON(风控状态、录制状态、批准记录、运行结果)的读取上限
 LEVELS = ("ok", "warn", "critical", "unknown")
 _RANK = {"ok": 0, "warn": 1, "unknown": 2, "critical": 3}     # unknown 比 warn 更糟:不知道比知道有点问题更危险

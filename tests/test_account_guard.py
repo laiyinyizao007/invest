@@ -491,3 +491,62 @@ def test_a_corrupt_sampled_at_in_the_state_file_is_dropped_not_invented(tmp_path
     path.write_text(json.dumps(state), encoding="utf-8")
     g = AccountGuard(AccountLimits(600, 2000), path)
     assert g.last_sampled_at is None and g.peak_equity == 10_000          # 其余状态照常加载
+
+
+def test_the_beijing_clock_does_not_depend_on_the_tz_database():
+    """时区**不能**依赖 `tzdata`:Windows 上它常常只装在用户目录,而 `-I` 隔离模式启动的进程
+    (仪表盘 `scripts/status_server.py` 就是这种)拿不到用户目录 ⇒ 一 import 就
+    `ZoneInfoNotFoundError`,把仪表盘带崩(2026-11-16 全量 pytest 抓到的回归)。
+    中国自 1991 年起不用夏令时,固定 UTC+8 偏移与 `Asia/Shanghai` 在交易日口径上等价。"""
+    import subprocess
+
+    root = str(Path(__file__).resolve().parents[1])
+    code = (
+        "import sys; sys.path.insert(0, %r); import risk.account_guard as g; "
+        "assert 'tzdata' not in sys.modules, 'the clock must not pull in the tz database'; "
+        "print(g.beijing_now().isoformat())" % root
+    )
+    proc = subprocess.run([sys.executable, "-I", "-c", code],
+                          capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert proc.stdout.strip()
+
+
+def test_the_sampled_at_timestamp_keeps_the_beijing_offset(tmp_path):
+    """落盘的采样时刻必须带着**北京时间的偏移**写出去。
+
+    2026-11-16 codex 复核 M5:采样时刻是 naive 的北京时间,原先用 `.astimezone()` 落盘 ——
+    而 `.astimezone()` 对 naive 值一律按**本机时区**解释,于是落盘时刻被平移了
+    (北京 − 本地)。非北京宿主机上,状态页的「权益新鲜度」会一直显示陈旧 ——
+    而那是操作员判断「风控还活着吗」的唯一依据。
+    """
+    path = tmp_path / "guard.json"
+    guard = AccountGuard(AccountLimits(), path)
+    guard.last_sampled_at = datetime(2026, 11, 10, 21, 30)      # 北京时间(naive)
+    guard._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["sampled_at"].startswith("2026-11-10T21:30:00"), saved["sampled_at"]
+    assert saved["sampled_at"].endswith("+08:00"), saved["sampled_at"]
+
+
+def test_the_dashboard_and_evidence_modules_do_not_need_the_tz_database():
+    """状态页与证据统计也不能依赖 `tzdata`:它们在 `-I` 隔离进程里被 import。
+
+    2026-11-16 codex 复核 H1:原先只把 `risk/account_guard` 摘出去了,
+    `dashboard/models.py` 与 `evidence/logstats.py` 仍在 import 期求值
+    `ZoneInfo("Asia/Shanghai")` ⇒ `python -I -c "from dashboard import collectors"`
+    直接 `ZoneInfoNotFoundError`,**仪表盘照旧起不来**。
+    """
+    import subprocess
+
+    root = str(Path(__file__).resolve().parents[1])
+    code = (
+        "import sys; sys.path.insert(0, %r); "
+        "import dashboard.models, evidence.logstats; "
+        "assert 'tzdata' not in sys.modules, 'the dashboard must not pull in the tz database'; "
+        "print(dashboard.models.BEIJING.utcoffset(None), evidence.logstats.EXCHANGE_TZ.utcoffset(None))" % root
+    )
+    proc = subprocess.run([sys.executable, "-I", "-c", code],
+                          capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert "8:00:00" in proc.stdout

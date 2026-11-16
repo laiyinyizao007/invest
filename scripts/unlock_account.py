@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap  # noqa: F401
 
-from risk.account_guard import AccountGuard, AccountLimits
+from risk.account_guard import AccountGuard, AccountLimits, beijing_now
 
 DEFAULT_STATE = bootstrap.ROOT / "data" / "state" / "account_guard.json"
 
@@ -69,7 +69,11 @@ def unlock(state_path: Path, confirm: Callable[[str], str] | None = None, assume
         print(f"历次解锁(共 {len(guard.unlock_history)} 条,最近在前):")
         for h in reversed(guard.unlock_history[-5:]):
             print(f"  - {h['at']}{'(强制)' if h.get('forced') else ''}  原锁定: {h.get('reason', '')}")
-    now = now or datetime.now()
+    # 冷却期按**交易日**算,而交易日是交易所所在时区的日期:锁定时刻写的是北京时间
+    # (AccountGuard 用 beijing_now()),所以这里也必须用同一个时钟 ——
+    # 拿本机时间(UTC-8 宿主机)比,会把「已隔夜」的解锁多拒最多 8 小时
+    # (2026-11-16 codex 复核 M4)。
+    now = now or beijing_now()
     cooldown = guard.unlock_cooldown(now)
     forced = False
     if cooldown:

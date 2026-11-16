@@ -643,6 +643,35 @@ def test_a_position_without_a_reliable_split_goes_to_a_human(monkeypatch, tmp_pa
     assert "请人工平仓" in capsys.readouterr().err
 
 
+def test_a_position_with_an_unknown_direction_is_named_for_a_human(monkeypatch, tmp_path, capsys):
+    """方向认不出来 / 净持仓:不自动发单,但必须**点名**(2026-11-16 codex 复核 L3)。
+
+    方向为空时这行连合并键都取不到(`position_key` 返回 None)→ 被 `merge_position_rows`
+    丢掉 → 既不进平仓计划也不进对账。不点名的话它就「隐形」了:
+    账户上明明有仓位,报告却只说「生成不出平仓单」,看的人不知道是哪一笔。
+    净持仓(NET)方向是认得出来的,但没有多空可平 —— 自动发单会变成**开仓**,同样必须人工。
+    """
+    import flatten_positions as f
+
+    pos = _pos("c2701", Exchange.DCE, Direction.NET, 3)
+    pos.vt_symbol = "c2701.DCE"
+    listed = f.manual_positions([pos])
+    assert listed and "净持仓" in listed[0]
+    assert "c2701.DCE" in listed[0]
+
+    weird = SimpleNamespace(vt_symbol="pp2701.DCE", direction="???", volume=2,
+                            yd_volume=0, frozen=0)
+    listed2 = f.manual_positions([weird])
+    assert listed2 and "方向认不出来" in listed2[0]
+    assert "pp2701.DCE" in listed2[0]
+
+    _install_fakes(monkeypatch, tmp_path, positions=[pos])
+    assert f.run(_args(symbol="c2701.DCE", tick_wait=0.0)) == f.EXIT_FAILED
+    err = capsys.readouterr().err
+    assert "净持仓" in err
+    assert "c2701.DCE" in err
+
+
 def test_the_confirmed_run_closes_the_position_and_leaves_a_record(monkeypatch, tmp_path, capsys):
     """--confirm-flatten:真的发平仓单,成交后复查为空,并留下可追溯的记录。"""
     import flatten_positions as f
@@ -767,3 +796,35 @@ def test_a_shrinking_snapshot_does_not_plan_the_stale_volume():
     plans = plan_closes([stale, fresh], {"c2701.DCE": (2185.0, 2186.0, 2185.0)})
     assert len(plans) == 1
     assert plans[0].volume == 1
+
+
+def test_the_manual_list_uses_the_merged_rows_not_the_raw_snapshot():
+    """同一 (合约, 方向) 出现两行(网关自动查 + 我们主动查)时,人工清单只列**合并后**那一行。
+
+    2026-11-16 codex 复核 L3:人工清单原先直接遍历原始行 ⇒ 重复列两行,
+    而且手数取到较旧的那次快照(与 `merge_position_rows` 的口径相反)。
+    """
+    import flatten_positions as f
+
+    older = _pos("c2701", Exchange.DCE, Direction.NET, 5)
+    older.vt_symbol = "c2701.DCE"
+    newer = _pos("c2701", Exchange.DCE, Direction.NET, 2)
+    newer.vt_symbol = "c2701.DCE"
+
+    listed = f.manual_positions([older, newer])
+    assert len(listed) == 1, listed
+    assert "2 手" in listed[0], listed[0]
+
+
+def test_a_position_without_a_direction_is_still_named_for_a_human():
+    """方向为**空**的行连合并键都取不到(`position_key` 返回 None)⇒ 合并层会把它丢掉。
+
+    2026-11-16 codex 复核 L3:人工清单改成「用合并后的行」之后,这类行如果不做特殊处理
+    就会既不进计划、也不进人工清单 —— 账户上明明有仓位,提示里却一个字都没有。
+    """
+    import flatten_positions as f
+
+    blank = SimpleNamespace(vt_symbol="pp2701.DCE", direction=None, volume=2, yd_volume=0, frozen=0)
+    listed = f.manual_positions([blank])
+    assert listed and "方向认不出来" in listed[0], listed
+    assert "pp2701.DCE" in listed[0]

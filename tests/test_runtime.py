@@ -1013,3 +1013,19 @@ def test_position_drift_reports_unknown_direction_instead_of_miscounting(make):
     assert rt.start() is None                                   # None = 启动成功,进入运行
     rt.gw.set_position(Direction.NET, 2)
     assert "方向不明" in (rt._position_drift() or "")
+
+
+def test_the_trading_session_check_uses_the_beijing_clock():
+    """时段判断必须按**交易所时区**(ENTRY_SESSIONS 写的是北京时间)。
+
+    2026-11-16 codex 复核 M3:运行时的「在不在盘中」原先用宿主机本地时间,
+    而账户风控那边已经统一成北京时间 —— 同一进程里两套时钟,
+    UTC-8 宿主机上两者错开 8 小时(挂单年龄基线、时段边沿重置都跟着错位)。
+    生产跑在 `TZ=Asia/Shanghai` 的容器里,本机时间恰好等于北京时间,问题被掩盖了。
+    """
+    import inspect
+
+    from risk.account_guard import beijing_now
+
+    default = inspect.signature(TradingRuntime.__init__).parameters["now"].default
+    assert default is beijing_now
