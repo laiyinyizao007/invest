@@ -31,6 +31,18 @@
   `test_frame_introspection` / `test_g8_round4` / `test_g8_round7`)import 交易栈 ⇒
   **不在 research-only CI 上跑**,目前只在本地跑;main 那条「运行时装载候选」的路仍默认关着(#37);
   两边的闸门清单**没有**并表(并表会改命中集合 = 改判定口径,另开一轮,不夹在这次合并里做)。
+- **新增探针的变异验证(实测,不是推理)**:`tests/test_constitution_gate_attrs.py` 声称
+  「断言是哪一类规则拒的」⇒ 实测把 `_gate_attr_violations(tree)` 的接线摘掉 ⇒ **7 条变红**;
+  把 `BUILTIN_PROTECTED_GATE_ATTRS` 清空 ⇒ **9 条变红**;还原后 **13 passed**。
+  ⇒ 这条探针**不是空转的**(不是「恒真」也不是「只断言有报错」)。
+- **新登记的一条残余(静态层按名拦,动态拼名走不到静态层)**:
+  实测 `setattr(obj, <名字是变量>, v)` 与 `setattr(obj, "screen_" + "_source", v)`
+  在 `screen_source` 静态层**放行**(规则只认字面量字符串)。
+  运行时实测(`safe_builtins` + `RepoImportGuard`):候选内建里**没有** `setattr`/`getattr`/`vars`/`object`/`type`
+  ⇒ 这两种写法在候选手里构造不出来;`import risk.constitution` 被仓库导入守卫拒(`禁止导入 risk.constitution`)
+  ⇒ 候选**拿不到**闸门函数的模块对象。
+  **结论**:这是**两道闸分工**的结果,不是缺口;但静态层那一层确实拦不住「名字是变量」的写法,
+  如实登记——将来若只保留静态层(例如把筛查拆成独立服务),这条会变成真缺口。
 - **第 3 轮 G8 复核(34/50)**:第 2 轮修复经 40 种绕过实测有效;新发现**辅助模块逃逸**(候选用文本写出能力在 cwd 写辅助 `.py` 再导入,跑在完整 Python 下)是沙盒的结构性缺口、早于本 PR,如实登记进 ADR,不在本 PR 修(需改 `bootstrap.py` 的 cwd/`sys.path`,另开 Issue)。
 - **Critical**:候选可经 `strategies.trend_atr_strategy` 导入 `swap_out/swap_in` 拿到真容器(静态层零发现,关第五层时 ATR 40.0→2.9、预算闸门被架空)。这些名字进 `BUILTIN_PROTECTED_READ_ATTRS`;`swap_in` 拒重入/陈旧视图,`swap_out` 无记录时不抛;外流规则补 lambda/条件表达式/`or`/`*x`/`await`;视图只转发显式白名单指标。ADR 先前"拿不到真实容器"的结论已更正。
 - **第 4 轮 G8 复核(37.5/50)的 4 条缺陷**(ADR `20261113-read-only-market-view` 新增「第 4 轮」小节):

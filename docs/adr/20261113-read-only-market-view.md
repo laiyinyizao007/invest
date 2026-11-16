@@ -589,3 +589,13 @@ main 的 `tools/check_domain.py` 里有一道动态探针(生产依赖闭包):�
    main 的 `BUILTIN_PROTECTED_GATE_ATTRS` 列的是筛查/账本一侧的闸门名。
    合并没有把它们并成一张表——**并表会改变命中集合**(多拒或少拒),属于改判定口径,
    要单独一轮评审,不夹在这次合并里做。
+4. **静态层按名拦,动态拼名走不到静态层(但走不到运行时)**:
+   实测 `setattr(obj, <名字是变量>, v)`、`setattr(obj, "screen_" + "_source", v)`
+   在 `screen_source` 静态层**放行**(规则只认字面量字符串)。
+   运行时实测(`scripts/research_sandbox.py::safe_builtins` + `RepoImportGuard`):
+   候选内建里**没有** `setattr` / `getattr` / `vars` / `object` / `type`
+   ⇒ 这两种写法在候选手里根本构造不出来;而且 `import risk.constitution` 被仓库导入守卫拒
+   (`禁止导入 risk.constitution`)⇒ 候选**拿不到**闸门函数的模块对象。
+   **结论**:这是**两道闸分工**的结果,不是缺口;但静态层那一层确实拦不住「名字是变量」的写法,
+   如实登记——将来若有人只保留静态层(例如把筛查拆成独立服务),这条就变成真缺口。
+   附:动态拼名的那条**没有**被静态层拦,但 `o.__dict__[...]` 已被「禁止引用 `__dict__`」那条规则拦下。
