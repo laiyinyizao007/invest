@@ -7,6 +7,14 @@
 ## [Unreleased]
 
 ### Fixed（第 15 轮 codex 复核后,阶段 3 / Issue #21)
+- **并入 `origin/main` 之后,分档器的动态探针当场指出本分支的 5 个文件漏登记**:
+  「生产依赖闭包」那道探针要求——**凡是自己的值会流进真钱链路判定点的文件,必须被判为不可降级**——
+  实测把 `risk/heatmap.py`、`risk/ladder.py`、`risk/lineage.py`、`risk/outward.py`
+  (梯子/揭示层/经验方差/谱系台账这四块的值会流进 `check_gate`)与
+  `tests/test_child_result_channel.py`(直接调用判定点)判了出来。
+  它们此前停在「默认拒绝」——那只保证它不是研究域,**挡不住"被降级成研究域"**。
+  ⇒ 已补进 `tools/check_domain.py` 的 `NEVER_DOWNGRADE`(改清单 = 执行域改动,按规矩要复核)。
+  CI 的研究侧闸门此前因此变红(2 failed),现已转绿。
 - **CI 研究侧闸门**:3 条走子进程路径的用例(`test_a_candidate_cannot_change_the_validation_windows_by_rebinding_the_builder`、`test_windows_where_validation_is_not_after_selection_are_refused`、`test_a_candidate_cannot_raise_the_grid_cap_by_mutating_the_config_after_the_import`)要真的载入候选并构造 vnpy 的 `BarData`,此前**漏标** `requires_trading_stack`,在不带交易栈的 CI 研究侧闸门上以 `ModuleNotFoundError: No module named 'vnpy'` 变红(3 failed / 497 passed);现按仓库既有约定补标——本机装交易栈时照常跑并断言,不装时**跳过**而不是红掉。**未改动任何已登记阈值**。
 - **梯子**(High):状态改为带哈希链的追加日志 + 头指针,手工编辑/回滚/截断按篡改 fail-closed;`submit` 按 `run_id` 幂等;写失败不留半行、不烧查询;人工续期只能走新增的 `scripts/research_ladder.py renew --reason`(留 `renew` 审计事件,`best` 保留)。
 - **经验方差 V**:改为"各次评估网格夏普方差的中位数"(≥3 次评估、每次 ≥5 格,最近 ≤200 次),仍与 `1/(T-1)` 取 max,只会更严。

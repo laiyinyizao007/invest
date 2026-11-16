@@ -233,6 +233,16 @@ NEVER_DOWNGRADE = (
     "tests/test_sandbox_module_view.py",
     "tests/test_sandbox_round25_rules.py",
     "tests/test_sandbox_round26_rules.py",
+    # --- 本分支(#21 阶段 3)带来的文件 ---
+    # 梯子/揭示层/经验方差/谱系台账这四块的值会**流进** check_gate
+    # (分档器的「生产依赖闭包」探针实测出来),按规则必须是不可降级,
+    # 而不是停在「默认拒绝」(默认拒绝只保证它不是研究域,挡不住"降级成研究域")。
+    "risk/heatmap.py",
+    "risk/ladder.py",
+    "risk/lineage.py",
+    "risk/outward.py",
+    # 用例:直接调用判定点,改断言 = 削弱检出能力。
+    "tests/test_child_result_channel.py",
 )
 
 # --------------------------------------------------------------------------
