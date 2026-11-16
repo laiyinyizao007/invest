@@ -7,6 +7,27 @@
 ## [Unreleased]
 
 ### Fixed（第 2 轮 G8 复核后,只读行情视图 / Issue #23)
+- **并入 `origin/main`(第 6 轮)**:合并裁决的标准只有一条——**不许削弱**。
+  `risk/constitution.py` 两边是**同一条防线的两次演进**(main +102 行 / 本分支 +876 行)
+  ⇒ 底稿取本分支那份,把 main 的四样东西并进来:闸门函数名黑名单 `BUILTIN_PROTECTED_GATE_ATTRS`、
+  `_gate_attr_violations()`、`_setattr_protected_name()`、以及把它们接进 `screen_source` 的两处。
+  main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` **不单独并入**——
+  通用判定(`_gate_attr_violations` 走遍全树)已覆盖该形态,单独再插只会在同一次写入上报两条重复结论;
+  **覆盖范围不减**。`CHANGELOG.md` 两边各加一段,语义不冲突 ⇒ 两边都保留。
+- **补一条 main 自己没配探针的规则**:闸门函数名的**七种**写入形态
+  (赋值/带注解赋值/复合赋值/元组解包/`del`/`setattr`/`delattr`/`vars()[...]`)——
+  main 在 PR #34 里加了这条规则,但**没配动态探针**(仓库规矩:每条新规则都要有放行+拦截双向探针)。
+  ⇒ 新增 `tests/test_constitution_gate_attrs.py`:拦截侧七形态逐一被拒 + **断言是哪一类规则拒的**
+  (不是「有拒绝」就绿)+ 拒绝信息里带被改写的名字 + 黑名单里每个名字都被挡住;
+  放行侧三条(读闸门名不是改写它 / 普通属性写入 / 按名 `setattr` 普通名字)。
+- **分档清单随之更新(合并暴露出来的缺口)**:main 的分档器有一道动态探针(生产依赖闭包)——
+  凡是自己定义或直接调用真钱链路判定点的文件必须判为不可降级。合并之后它**当场**指出
+  本分支带来的 5 份用例 + 新增的那 1 份「直接调用 `screen_source`」没登记
+  ⇒ 已补进 `tools/check_domain.py` 的 `NEVER_DOWNGRADE`(改清单 = 执行域改动)。
+- **残余(如实)**:本分支那 5 份用例(`test_market_view` / `test_view_escape_hatch` /
+  `test_frame_introspection` / `test_g8_round4` / `test_g8_round7`)import 交易栈 ⇒
+  **不在 research-only CI 上跑**,目前只在本地跑;main 那条「运行时装载候选」的路仍默认关着(#37);
+  两边的闸门清单**没有**并表(并表会改命中集合 = 改判定口径,另开一轮,不夹在这次合并里做)。
 - **第 3 轮 G8 复核(34/50)**:第 2 轮修复经 40 种绕过实测有效;新发现**辅助模块逃逸**(候选用文本写出能力在 cwd 写辅助 `.py` 再导入,跑在完整 Python 下)是沙盒的结构性缺口、早于本 PR,如实登记进 ADR,不在本 PR 修(需改 `bootstrap.py` 的 cwd/`sys.path`,另开 Issue)。
 - **Critical**:候选可经 `strategies.trend_atr_strategy` 导入 `swap_out/swap_in` 拿到真容器(静态层零发现,关第五层时 ATR 40.0→2.9、预算闸门被架空)。这些名字进 `BUILTIN_PROTECTED_READ_ATTRS`;`swap_in` 拒重入/陈旧视图,`swap_out` 无记录时不抛;外流规则补 lambda/条件表达式/`or`/`*x`/`await`;视图只转发显式白名单指标。ADR 先前"拿不到真实容器"的结论已更正。
 - **第 4 轮 G8 复核(37.5/50)的 4 条缺陷**(ADR `20261113-read-only-market-view` 新增「第 4 轮」小节):
@@ -109,6 +130,253 @@ G8 第 12/13/14 轮 codex 为 38.5 / 38.0 / 38.5,逐条堵"改写行情容器"�
 **验证**:单元(拷贝、没有变更入口、不可变、容器不在属性里)+ 端到端用真实回测引擎、**不经静态筛查**——第 12–14 轮的攻击要么抛 `ReadOnlyViewError`,要么写在副本上、结果与诚实模板逐笔一致;有真实成交的行情上有视图与无视图逐笔、逐位一致;变异验证(返回真数组 19 条、跳过换入 10 条、放开 `update_bar` 2 条、视图可写 7 条用例变红,其中放开 `update_bar` 最初只有 1 条变红——端到端那条喂的是 `None`,真容器收到也会抛错,改喂合法假 K 线后才有判别力);第五层作为纵深防御保留(用覆盖换入点的类模拟"视图被绕过",`count -= 1` 仍被逐根核对抓到)。`_call_entry_signal` 与 `_am_view` 进了受保护成员,`_call_entry_signal` 进了受保护执行点(候选引用/覆盖它就能绕开视图)。
 **自查发现的更大的洞(先于本修订、在已合并的宪法里就存在)**:受限导入器放行了 `traceback`,`traceback.walk_stack(None)` 不需要写任何被禁的属性名就能拿到调用栈上每个栈帧的 `f_locals`;`e.__traceback__.tb_frame.f_back.f_locals` 这条链上的名字也都不在禁用清单里——沿栈帧一路能走到回测引擎(`history_data`、`cta_engine`)与 `run_evaluation` 的局部变量(含整份行情、包括验证窗口),这与 `self.cta_engine`(引用即拦)是同一个能力。实测(真实引擎、不经静态筛查):候选取回了真实 `ArrayManager` 并改写它、另一条走到了 `BacktestingEngine`;两条都被第五层抓到,但那是碰巧的设计。已把 19 个栈帧/回溯属性名与 `traceback`/`linecache`/`code`/`pdb`/`dis`/`runpy` 等 12 个模块补进禁用清单(静态层与运行期受限导入器),`_call_entry_signal` 不再把真容器放在局部变量里;变异验证过。**这不是封死**:绕过静态层后沿栈帧仍走得到引擎,静态层是这道口子的门;另有 `gzip`/`zipfile`/`tarfile`/`sqlite3`、`numpy.load(allow_pickle=True)` 这类同类缺口**没有处理**,已如实写进 ADR。
 **如实记录**:这仍是纵深防御不是沙盒——视图把真实容器放在闭包里,取出它需要受禁的 `__closure__` 等 dunder,静态层本来就拦,但静态层是黑名单,绕过它就绕过了这一层;"必须认全所有写法"降成了"必须拦住取闭包这一个口子",**不是零**。**这次修订没有得到新的外部复核分数**,不能声称"分数提高了"。`guard`/`trail`/`cta_engine` 没有换视图(`write_log`、`get_size` 要用 `cta_engine`,隐藏会误伤诚实候选)。
+
+- **后果域分档:研究档 / 执行档的项目级流程**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
+  ADR `20261114-consequence-domain-tiers`)。策略研究的改动规模与生产代码一样,
+  却付了同一份流程税(plan.md + plan-down、结构化确认块、6/6 完备性清单、Issue + worktree、
+  双轮 codex、文档原子提交),而它的产物**可以重跑、失败只影响结论、不动钱**。
+  本次新增仓库根 `CLAUDE.md`,按**后果域**分档,而不是按改动规模分档:
+  - **研究域**(只影响研究产物):跳过 P2 plan.md 与 plan-down、结构化确认块、6/6 清单、
+    Issue + worktree;G8 只省第二轮(第一轮照做);G1 降级为 CHANGELOG 记一笔;
+    G9 沿用最低 70%;G14 只登记越出研究域的部分。**ADR 记录与相关既有测试照做。**
+  - **执行域**(可能影响真实委托/持仓/资金、风控底线、实盘准入批准链、凭据或部署):
+    全局全套流程照旧,本文件不提供任何减法。
+  - 两档都**不适用**的规则(不论档位照做):G3 意图边界、G5 安全合规、G7 脱敏、G4 一致性、
+    G8「两轮都做」、G12 学习闭环、**代码内的全部实盘防线**(不改任何阈值)、CI 闸门。
+  - **判据由代码执行**(`tools/check_domain.py`,仅标准库):按路径清单把每个文件判成
+    研究域 / 不可降级 / 执行域,退出码 `0` 全研究域 / `1` 含执行域 / `2` 环境不可用
+    (fail-closed:判不了等于不放行)。**默认拒绝**:不在白名单里的一律执行域。
+  - **清单是实测出来的,不是拍脑袋写的**:`tools/verdict_graph.py` 用**函数级** AST 分析
+    算出每个文件「自己定义或直接调用了哪些判定点」(`check_gate` / `check_live_admission` /
+    `write_approval` / `record_approval` / `screen_source` / `check_instance_state` /
+    `check_class`)。实测推翻了直觉:名字带 research 的 `scripts/research_sandbox.py` 是
+    **批准账本的唯一写入者**;`risk/candidate_eval.py` **直接调 `check_gate`**;
+    `scripts/backtest_lib.py` 回测跑完**核对风控底线**;`scripts/research_api.py` /
+    `research_approval_server.py` / `research_gateway.py` 是批准与筛查链的入口。
+    另有**数据流**上的耦合 AST 看不见(`risk/dsr.py` / `risk/plateau.py` /
+    `risk/trial_ledger.py` 是门槛第 9/8 条的输入),靠人工清单兜住——**图找得到的归图,
+    图找不到的归清单**。
+  - **清单有动态探针盯着**(`tests/test_check_domain.py`,99 条):两道**全仓不变量**
+    ——①**调用关系**:任何自己定义或直接调用判定点的文件必须判为不可降级
+    (**含尚未入库的新文件**);②**数据流**:不调用判定点、但**值被喂进**判定点的模块
+    同样不可降级(实测例子:`research_api.py` 从 `walk_forward_optimizer` 取
+    `wf.DATA_FILE` / `wf.build_windows()`,改它 = 改门槛的评估窗口与数据)。
+    另有:研究白名单不得拥有判定点、生产 import 闭包不得与白名单相交、
+    以及**探针自身的准确性夹具**(既不漏报也不误报——误伤的探针等于没有探针)。
+  - **探针经变异验证**(十一种清单改动,每次都被抓住,条数由脚本实测):删 `trading/` 条目、
+    把 `risk/live_admission.py` / `risk/candidate_eval.py` / `research_sandbox.py` /
+    `backtest_lib.py` / `walk_forward_optimizer.py` / `research_grid.py` / `research_api.py`
+    移出不可降级、把 `scripts/optimize.py` 移出研究白名单、把整个 `scripts/` 放进研究**目录**白名单、
+    新建一个直接调 `check_gate` 的文件。变异验证是**可复算的脚本** `tools/check_mutations.py`
+    (复制仓库到临时目录、逐个施加变异、数 pytest 的 FAILED 行数);`--verify` 还会核对
+    ADR 表格里的数字。
+  - CI:`research-guard.yml` 的 ruff 清单与测试清单已纳入这四个新文件,
+    另加一步**分档器冒烟**(真实 CLI,`PYTHONIOENCODING=cp1252` + 退出码语义)与
+    **变异验证**——只有单元测试的话,CLI 那条路径与变异台架在 CI 上从没被跑过。
+  - **第 1 轮 codex 复核的处置**(2 High / 5 Medium / 6 Low,逐条独立复现后):
+    ①`walk_forward_optimizer.py` 曾被判研究域,但它提供门槛评估的窗口与数据文件
+    ——已移入不可降级,并**新增数据流探针**自动覆盖这一整类,不再依赖人手写断言;
+    ②`verdict_graph` 对 `from X import f as g` 后调 `g(...)` 的形态**漏报**——已修
+    (裸名字分支查别名表),并补了三种调用形态的夹具;
+    ③未跟踪**目录**里的文件不被扫描(`git status` 缺 `-uall`)——已改;
+    ④「生产闭包不相交」的模块解析器不认 `scripts/` 裸模块导入,`scripts/bootstrap.py`
+    漏在闭包外——已统一口径(闭包 17 → 18 项);
+    ⑤文档三处不实(条数、校验范围、点名了没有该调用的文件)——已订正;
+    ⑥分档判定在 CI 里没有机器强制点——已加冒烟关卡;
+    ⑦Windows cp1252 控制台上 CLI 直接崩(CLAUDE.md 文档的命令在主力开发环境不可用)
+    ——已加 stdout/stderr 重配,并补了非 UTF-8 控制台的回归用例。
+  - **第 2 轮 codex 复核的处置**(第 1 轮的 12 条经独立复现全部真修;本轮新发现
+    1 Critical / 3 Medium / 5 Low,同样逐条独立复现后处置):
+    ①**Critical:新加的 CI 冒烟关卡在两条触发路径上都会让 CI 永久变红**——
+    `pull_request` 事件下浅克隆没有 `origin/main` → `git diff` rc=128 → 分档器 exit 2;
+    push 到 main 时 base==HEAD、diff 为空 → 同样 exit 2。根因是「没有改动」与
+    「环境不可用」共用退出码 2。已改为:checkout 加 `fetch-depth: 0`;
+    `--diff` 成功但**改动集为空** → 打印说明并 **exit 0**,只有 git 读取失败才 exit 2。
+    ②数据流探针对 `from X import DATA_FILE` 这种**函数式 import** 漏报(只认模块别名)
+    ——已修,并补了三种 import 写形的夹具;
+    ③数据流探针**过度包含**(读一个跟门槛无关的 helper 也被算成门槛输入,
+    有把研究文件强制升级、**侵蚀研究档**的风险)——已收窄为排除「语句位置的
+    纯副作用调用」,provider 集合 25 → 24 且无关的 `research_console.py` 已不在其中;
+    ④ADR 变异表三行数字不可复现、一行**变异描述写反**——变异验证改为**可复算的脚本**
+    `tools/check_mutations.py`(复制仓库到临时目录、逐个施加变异、数 FAILED 行数),
+    ADR 表格按脚本实测重写,`--verify` 可核对;CI 里也加了这一步;
+    ⑤CLI 改吐 UTF-8 后,守护 CLI 契约的用例按 locale 解码 → stdout 变 None → **空跑通过**
+    ——已加 `encoding="utf-8"`,并断言 stdout 里确有「研究域」「不可降级」;
+    ⑥「文档条数必须是真的」那条断言按行且会误报第二个「N 条」——已收紧,
+    并补验「条数写错 / 条数被挪走 / 条数被删」三种情形都变红;
+    ⑦目录前缀的「拼写近似」检查对 8 个前缀里 6 个**不可达**——已换成**穷尽**判据
+    (要么是真实存在的目录、要么是 gitignore 的运行时目录,两者都不是即写错);
+    ⑧ADR 的 provider 清单写「10 个」却列了 11 个名字且含不在集合内的条目——已按实测重写。
+  - **第 4 轮 Sourcery 复核的处置**(2 条实质发现):
+    ①**fail-open 口子**:`python` 遇到未捕获异常时退出码是 **1**,而 1 在本工具的语义里
+    是「判为执行域」(**正常结果**)——于是「分档器自己崩了」与「分档器说这是执行域」
+    在 CI 眼里完全一样,崩了也照样放行。已改:CLI 入口把任何未预期异常归到 **2**
+    (环境不可用,fail-closed);CI 的冒烟关卡除退出码外还要求输出里有「总判定:」这一行。
+    语义自洽了:**退出码 1 = 我确实判出了执行域;退出码 2 = 我没能给出判断**。
+    ②「削弱型改动一律升档」只列了具体调用、没有总则——已改为先立总则
+    (少做一次检查 / 把「拒绝」改成「告警后继续」/ 阈值调松 / fail-open /
+    让不可能变可能),已知易踩处只作示例,并写明「拿不准 → 升档」。
+    另有三条 subprocess 安全告警经核为误报(实参全是本地常量、不经 shell),已在代码里写明。
+  - **合并到 main 之后才暴露的缺口**:#38 合并后 main 上的 Research Guard 直接变红
+    (PR 的 CI 是绿的)。根因:冒烟关卡要求输出里有「总判定:」这一行,但
+    **「没有改动」那一支没打印它**——而那一支正是 **push 到 main** 时走的
+    (base==HEAD、diff 为空)。PR 路径永远有改动,这条分支**从没被走到**。
+    本地推理说「push 到 main → exit 0」没错——**退出码对,输出形状不对**。
+    已修:那一支也打印「总判定: 无改动(无需分档)」,让每次成功运行都以结论行收尾;
+    并补了回归用例。**「合并前全绿」不等于「合并后全绿」**。
+  - **本决策不削弱任何一道代码内的防线,也不改它们的阈值**;它只减少改动的**审批成本**,
+    不减少缺陷的**检出能力**。
+
+- **闭合沙盒状态机:`approved/` 目录 + 收菜动作 + 运行时装载 fail-closed**(Issue [#34](https://github.com/laiyinyizao007/invest/issues/34);
+  ADR `20261115-approved-sandbox-closure`)。**这轮补的是整条链上最要紧的一处断裂**:
+  阶段四的状态机「pending → 人工批准 → `approved/`(runtime 只认)」此前只落了前半段——
+  `approved/` 目录根本不存在,批准只往账本写一条记录,**没有任何下游消费它**。
+  于是批准过的代码与没批准的代码在运行时受到同样的对待,批准沦为流程仪式而不是授权。
+  - **收菜**(`scripts/research_collect.py`,**独立脚本**:网关 import `research_api`,但 import 不到收菜模块,
+    端点白名单里也没有它——外层只能请求批准,不能请求收菜、更不能自己批准):
+    四道校验缺一不可——① 源文件当前字节的 sha256 **必须在批准账本里**;② 人确认之后**再算一次** sha256
+    (防「批准后文件被换掉」的 TOCTOU);③ 写入 `approved/` 之后**复算**目标文件 sha256
+    (复制必须逐字节一致,不一致就删掉并拒绝);④ 目标路径固定 `approved/<原文件名>`,不接受任何路径参数。
+    写盘用「唯一临时名(pid + uuid)+ `os.replace` + Windows 重试」,与 `record_approval` 同款。
+    人的门槛与批准一致:交互式终端 + 粘贴**完整 64 位**哈希(敲 `y` 不算——任何程序都能喂一个 `y`)。
+  - **运行时装载**(`risk/approved_guard.py` + `trading/runtime.py`):装载时做四件事——
+    位置(必须在 `approved/` 内,解析后的父目录就是它)、授权(账本命中)、合规(宪法静态筛查 + 设置里不得夹带
+    受保护参数如 `risk_budget`)、同一性(哈希、筛查、编译、执行基于**同一份字节**;只读一次字节再编译执行,
+    `.pyc` 没有机会生效)。任何一项不过 → `EXIT_STARTUP_FAILED`(3)并告警,**绝不降级**到 `strategies/` 里的默认策略
+    (回退等于「装不上就换一个照样跑」,那批准就白批了)。装载点选在**连网关之前**:没过批准复核的策略不该登录 CTP。
+    `RuntimeConfig.approved_file` 等四项**全为 `None` 时行为与从前完全一致**。
+  - **批准账本共享只读模块**(`risk/approval_ledger.py`):研究侧写、运行侧读;写入口仍然唯一在
+    `research_sandbox.record_approval`,共享模块里**没有任何写入口**(AST 测试锁住)。
+    研究侧的读取改为委托,异常类型与文案**逐字不变**(既有调用点靠它识别拒绝)。
+  - **第四层跟着新执行入口走**:宪法历史守卫(`tools/check_constitution_history.py`)要求任何执行候选代码的入口
+    必须在**同一个函数体**里自己成对取快照并比对——`approved_guard` 因此在 `exec` 前后各拍一次受保护对象的身份指纹。
+    这条不是新规矩,是既有守卫**第一次拦住本 PR 的新代码**后按要求补齐的。
+  - **骨架契约独立单测**(`tests/test_strategy_skeleton_contract.py`):roadmap 要求「策略骨架模板由人维护、
+    有独立单测」——骨架事实上早已存在(宪法 template 指向它),缺的是这份独立单测。
+  - **断耦演练**(`scripts/decoupling_drill.py`,证据 `docs/decoupling-drill.md`):阶段四 4b 的退出条件之一。
+    三项全过:内层(`trading/`/`risk/`/`strategies/`)不 import 任何研究侧模块、外层容器环境里没有 `CTP_*`、
+    **外层停掉时内层照跑**(心跳继续刷新、策略仍在运行)。演练只停**自己起的一次性探针容器**,
+    不碰正在服务别人的网关容器。⚠️ **不连真 CTP**:证明的是「外层宕机不阻断内层」,不是实盘可用性。
+  - `approved/` **不入库**(未经审查的代码不进版本库);`docker-compose.yml` 挂载它与只读的批准账本。
+  - **如实记录的取舍**:宪法第三层(运行**途中**的实例级复检)在运行时装载里**没有**完整实现——
+    静态层已禁止候选引用 `guard`/`trail`/`cta_engine`,本轮只在**装载期**做了完整指纹比对;运行途中的持续核对留待评估。
+    另一条更要紧的:**运行时装载与研究侧存在能力不对称**——研究侧执行候选用受限内建 + 按路径的导入裁决,
+    而运行时的 `exec` 用完整真实内建、且跑在持有 CTP 凭据与交易会话的进程里(交易进程**不是容器**,
+    实盘在 Windows 运行机上直跑)。于是 LLM 产出的候选一旦被批准,权限与人工写的 `strategies/` 代码相同。
+    本轮**没有**在运行时复用受限内建(语义是为研究沙盒设计的,且会抹掉研究/交易的分层),
+    改为在 ADR 里写明,并把「运行时装载前须有晋级门槛通过记录」列为遗留的下一道门。
+  - **收菜默认拒绝覆盖已存在的另一版本**(要换版本须显式 `--replace`,旧版本留成 `<名>.prev`):
+    覆盖等于换掉「运行时正在认的策略」,是另一件需要显式授权的事。
+    收菜时**把源码打出来**让人真看一眼:批准那一步只给大小+哈希(`review` 才给源码),
+    而本轮把批准的效力提升到了「运行时执行权」——批准环节的强度也得跟上。
+  - **状态命名空间按批准哈希派生**(`approved_<sha8>`):换批准版本自动换命名空间,
+    旧版本的持仓/止损状态不会被新版本继承——不靠操作者记得改 `--strategy-name`。
+
+- **第 1 轮 codex 复核(32/50)实测出四处问题,已逐条修掉**(Issue [#34](https://github.com/laiyinyizao007/invest/issues/34);
+  ADR `20261115-approved-sandbox-closure` §10~§14):
+  - **[critical] 第四层可被候选自己关掉**:原先在 `exec` **之后**才经 `const.` 取比较器,
+    候选可以 `const.check_protected_state = lambda *a, **k: []` 把它换成空函数 →
+    结论恒为「没被改写」→ **第四层静默失效**(实测:静态层对这条载荷返回 [],不报)。
+    改为:比较器与快照器在 exec **之前**绑定成同名局部引用,用后**再核对**模块上的属性没被换过。
+  - **[high] 运行时装载漏了宪法的类级校验 `check_class`**:静态层只按名字查黑名单,
+    候选可以重写 `on_daily_bar`(日线处理的唯一入口)/ `variables` / `daily_end`
+    这类**不在受保护名单里**的模板成员。研究侧有这层,运行侧原先漏了 → 研究侧拒的候选运行侧会收。
+  - **[high] 宪法默认模板是「仅研究回测」的 15m 骨架**(`on_tick` 直接抛异常),
+    候选必然继承它 → 实盘第一根 tick 上抛异常并被引擎静默停掉(失败方向安全但信息误导)。
+    骨架加 `research_only` 标记,装载器看到就拒绝;实盘骨架用 `--approved-template` 显式选
+    (走宪法的内置白名单)。
+  - **[high] `--history` 与 `check_params` 冲突**:`history_vt_symbol` 是操作参数(预热用哪个历史合约)
+    不是风控底线,却与底线一起被拦掉 → **实盘的正常配置(带历史预热)永远装不上**。
+    装载时只校验底线那三个参数。
+  - 另修:授权来源钉死(删 `--approvals-file`;`--approved-dir` 必须解析到 `<root>/approved`;
+    装载前跑批准目录整体自检);收菜只读一次字节(哈希/筛查/落盘同一份);
+    文件名规则与运行时装载共用一份常量;`docker-compose` 的 approved 挂载改只读。
+
+- **第 2 轮 codex 复核(41/50)实测出六条,已逐条修掉**:
+  - **[high] 一次被拒的候选能永久毒化闸门,同进程第二次装载完全裸奔**:载荷 #1 关掉五道闸并被拒,
+    载荷 #2 直接 LOADED、300 元单笔预算被永久换成恒 0 的函数。
+    修法:① 所有闸门函数在**模块导入时**绑成常量,装载时用的始终是「导入时那个真函数」;
+    ② 装载前后逐一核对「模块上的属性还是不是那个真函数」——
+    **比对结论可以被伪造,但属性身份核对不能**;③ 发现被改写 → 进程标记为**已中毒**,
+    之后任何装载一律拒绝。
+  - **[medium] `del const.check_protected_state` 让 AttributeError 逃出装载器** →
+    运行时崩溃 + 退出码 1 + **零告警**。改成 `getattr(..., None)` 比对,运行时兜一层
+    `except BaseException` → 统一「拒绝 + 告警 + 退出码 3」。
+  - **[medium] 候选 `raise SystemExit(0)` → 进程以退出码 0 静默结束**:
+    `restart: on-failure` 不重启、监控看着像「正常停止」、零告警。exec 的兜底改成 `except BaseException`。
+  - **[medium] 一条回归用例是「走过场」的**:载荷不是骨架子类,「不是策略骨架的子类」
+    先一步拒绝,断言照样成立。载荷改成真骨架子类,并断言拒绝理由里出现「闸门」或「受保护对象」。
+  - **[low] 筛查/参数/类级三道闸退回内置默认宪法** → 清单文件里追加的保护项对**运行侧**不生效。
+    改成统一用 `const.load()` 的结果并显式传参。
+  - **[low] 公开 API 的 `template=` 参数绕过骨架白名单** → 删掉,骨架只能按名字选(走白名单)。
+
+- **第 3 轮 codex 复核实测出 critical 级绕过,已修,并把「修不掉的部分」如实登记**:
+  - **[critical]「换属性 → 调用 → 复原」完整绕过**:候选把 `check_protected_state` 换成
+    「**被调用时把原函数装回去**并返回 `[]`」的假函数 → 指纹结论恒为空、事后身份核对看到的是
+    「真函数」→ 两条检查**同时**被骗过,装载成功、300 元单笔预算被换掉。
+    修法三条一起上:① 闸门函数在 exec **之前**绑成局部引用(候选的代码在另一个 module dict 里,
+    改不到);② 装载前后逐一核对属性身份(清单用默认参数绑死,免得清单本身被换);
+    ③ **静态层先封**——新开 `BUILTIN_PROTECTED_GATE_ATTRS`,候选写这些名字、
+    或用 `setattr(obj, "名字", …)` 按字符串写,在 exec 之前就被拒。
+  - **[medium] 闸门被 `del` / 被置 None 时裸异常逃出装载器** → 装载器整体包成「失败模式只有一种」。
+  - **[medium] 闸门清单不完整**(漏 `const.load` / `load_template` / `BUILTIN_ALLOWED_TEMPLATES`)→ 补齐。
+  - **[low] 参数校验「先过滤再校验」对未来的受保护参数 fail-open** → 改成对**整个** setting 校验,
+    只对 `history_vt_symbol` 这一个**具名**操作参数豁免。
+  - **ADR 更正**:原先写「第四层候选拆不掉」「属性身份核对不能被伪造」——与代码不符,已改。
+    如实写明:第 3 轮 codex 实测 `sys._getframe(1).f_locals['check'] = fake`
+    (Python 3.13 的 PEP 667 写穿)能**直接改装载器的局部变量**,
+    所以在运行侧(同进程、完整真实内建)执行任意 Python 代码**做不到安全**。
+    真正的边界仍是「人工审批 + 隔离」,而**运行侧至今没有隔离**(研究侧有受限内建 + 容器)。
+
+- **外层 LLM 端到端联调已通**(不在本 PR 的代码里,是本机毕昇工作流 v3 的进展):
+  模型额度恢复后实跑——想法 → LLM 起名 → LLM 写候选 → 提交 → 静态筛查 → **停在「请本机审阅批准」**。
+  中途发现 LLM 连着两轮都写出「把 `am.close` 的切片传给函数调用」这种容器逃逸写法
+  (静态筛查正确拒绝:切片是**视图**,拿到之后可以原地改写、伪造回测结果);
+  把这条硬约束写进提示词后一次写对。
+  → **批准那一步仍然必须由人做**(模型不能代替),这正是本 PR 让批准成为「真正的授权」的意义所在。
+
+- **装载门与准入门拆成两份独立的记录**(Issue #37;ADR §22):
+  - 准入门 `data/state/promotion_approval.json` 问「这个账号能不能连生产 API」;
+    装载门 `data/state/approved_promotion.json` 问「这份**代码**配不配被装载执行」。
+    共用一份记录会让「过了一次门槛」同时满足两件事,而且没法单独撤销其中一件。
+  - 装载门那份额外绑定**品种 / 字节 / 那一次评估**(`key` + `sha256` + `run_id`):
+    同一份代码换个品种不通用、换个文件不能蹭记录、数据一更新同一次通过的含义就变了。
+    品种**从那次评估的结果文件里取**(`data/research/<run_id>.json` 的 `key`),
+    人手填的 `--key` 与评估结果不一致时拒绝(fail-closed)。
+  - 装载时四样都要对上:记录存在 → `gate_failures == []` → sha256 与要跑的字节一致 →
+    key 与运行时声明的品种(可选 `--approved-key`)一致。
+  - **今天没有任何候选通过过晋级门槛 → 装载门记录不存在 → `approved/` 装载这条路是关着的。**
+
+- **合并 main 的「后果域分档」并按新分档器补齐不可降级清单**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
+  ADR `20261114-consequence-domain-tiers`)。main 上新增了项目级 `CLAUDE.md`(按后果域分档)、
+  `tools/check_domain.py`(机器可判的分档器)、`tests/test_check_domain.py`(99 条动态探针)与
+  变异验证关卡。本分支的改动按新分档器判定为**执行域**——`risk/live_admission.py` 与
+  `scripts/record_promotion.py` 属真钱链路判定点、`trading/` 与 `scripts/run_headless.py` 接真实委托
+  ——而这一轮全程走的就是执行域流程(P2 的 plan.md 经 plan-down、结构化确认块、6/6 清单、
+  Issue + worktree、G8 四轮 codex、文档同原子提交)。
+  → 分档器的探针随即指出:本轮新增的 `risk/approval_ledger.py`、`risk/approved_guard.py`、
+  `scripts/research_collect.py` 与三个用例文件**拥有判定点或喂值给判定点**,却没被判为不可降级
+  → 已按新 CLAUDE.md §4 规则 6(清单本身是代码)补进不可降级清单。变异验证 11 种变异全部被抓住。
+
+- **第 4 轮 codex 复核(35/50)的发现与处置**:
+  - **[critical] 帧劫持**:候选可用 `getattr(sys._getframe(1), 'f_' + 'locals')['check'] = fake`
+    直接改装载器的局部变量(PEP 667 写穿),第四层能被完全中和。
+    → 修法:**候选的 exec 放进独立线程**——线程里 `sys._getframe(1)` 拿到的是那个线程的帧,
+    够不到主线程的局部变量。帧劫持、闭包单元、`__code__` 改写这一类够不到主线程的招被挡住。
+  - **[high] 宪法风控底线可被已批准的候选用 `setattr`/`getattr`/`vars` 绕过**(H1)。
+    → 处置(第 4 轮 codex 建议的折中):**把「运行时装载候选」这条路默认关着**——
+    装载现在要求三道**互相独立**的记录:
+    ① 批准账本(人读过代码)、② **已收菜**记录(收菜那道把源码打给人看的关口,
+    人工 `cp` 绕不过)、③ **晋级门槛通过**记录(且其中的 sha256 与要跑的那份字节相同)。
+    **今天没有任何候选通过过晋级门槛 → 这条路实际关着**(见 Issue #37),
+    H1 那个洞因此到不了实盘。要打开它,先做完 #37 与运行侧的能力隔离。
+  - **[medium] 静态层「先封」名不副实**:只挡 `x.attr = v`,实测 `AnnAssign`/元组解包/
+    `AugAssign`/`del`/`setattr`/`delattr`/`vars()[...]` 全都绕得过。
+    → 七种形态一次收进 `_gate_attr_violations()`。
+  - **[low] 闸门清单是可变 dict**:改成不可变 tuple + 默认参数绑定(候选一句
+    `_g._CANONICAL_GATES = {...}` 就能换掉它)。
+  - **[low] 清理**:删死常量 `RISK_FLOOR_PARAMS`、改与实现相反的 docstring、
+    修一条空转断言、改一条过期注释。
 - **合并 main #22 进 #26 分支:两边沙盒防线取并集**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),PR #27;
   ADR `20261113-evolution-engine` 的「合并 main #22 的取舍」一节)。main 的 DSH 研究入口(#22)与本分支都在加固同一个沙盒,
   且各自重写了"导入门"。合并后**两边的防御都在,没有为省事丢掉任何一边**:

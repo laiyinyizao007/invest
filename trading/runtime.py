@@ -34,6 +34,7 @@ from vnpy.trader.logger import ERROR
 from vnpy.trader.utility import get_file_path
 from vnpy_ctastrategy import CtaStrategyApp
 
+from risk import approved_guard
 from risk.positions import describe, signed_net, undirected
 from strategies.trend_atr_strategy import ENTRY_SESSIONS, TrendAtrStrategy
 from trading.events import EVENT_GUARD_ALERT, EVENT_GUARD_HARD_LOCK
@@ -86,6 +87,20 @@ class RuntimeConfig:
     stale_cancel_open_orders: bool = True
     drift_tolerance_seconds: float = 15.0            # 策略持仓与账户持仓不一致持续超过该时间 → 视为漂移,告警并紧急平仓
     heartbeat_file: Path | None = None               # 运行中每 10 秒刷新一次,供容器健康检查判断进程是否真的在工作
+
+    # ---- 批准目录装载(阶段四 4c:approved/ 是运行时唯一认的目录)----
+    # 全部为 None 时行为与从前**完全一致**(仍从 strategies/ 装载受信骨架)。
+    # 一旦给了 approved_file,策略就从 approved/ 装载,且必须通过批准账本与宪法的复核,
+    # 否则拒绝启动(EXIT_STARTUP_FAILED)——**不回退**到默认策略。
+    approved_file: str | None = None                 # approved/ 里的文件名,如 "my_candidate.py"
+    approved_dir: Path | None = None                 # 批准目录;None 时取 <approved_root>/approved(位置**钉死**,不可改指)
+    approved_root: Path | None = None                # 批准目录与账本的共同根;None 时取本文件所在代码根
+    approved_class_in_file: str = "Candidate"        # 批准文件里的类名(与 strategy_class 是两回事:那是引擎类表的键)
+    approved_strategy_name: str | None = None        # 状态命名空间;None 时按批准哈希派生(换版本自动换命名空间)
+    approved_key: str | None = None                  # 本次要跑的品种(如 C15);给了就与装载门记录的 key 核对
+    approved_template: str | None = None             # 骨架(模块:类);None 时用宪法指定的默认骨架
+                                                      # ——默认那个是**仅研究回测**的 15m 骨架,会被拒绝装载,
+                                                      # 实盘要用日线骨架:strategies.trend_atr_strategy:TrendAtrStrategy
 
     def __post_init__(self) -> None:
         # 等持仓回报稳定的时间设下限:配成 0 时,两次"未到回报的空快照"会被当成稳定而通过对账
@@ -217,6 +232,11 @@ class TradingRuntime:
         if problem:
             self.notify("FATAL", "启动失败", problem)
             return EXIT_STARTUP_FAILED
+        # 批准目录装载**先于**连网关:策略没过批准复核就不该登录 CTP、更不该下单。
+        problem = self._load_approved_strategy()
+        if problem:
+            self.notify("FATAL", "策略装载被拒,拒绝启动", problem)
+            return EXIT_STARTUP_FAILED
         self._t_connect = self._mono()
         try:
             self.main.connect(self.config.gateway_setting, self.config.gateway_name)
@@ -257,6 +277,68 @@ class TradingRuntime:
         if not snapshot:
             return "无任何里程碑"
         return ", ".join(f"{k}={v:.1f}s" for k, v in sorted(snapshot.items(), key=lambda kv: kv[1]))
+
+    def _load_approved_strategy(self) -> str | None:
+        """从 `approved/` 装载策略(配置了 approved_file 时)。
+
+        返回 None 表示成功(或本次没要求装载);返回一段说明表示**拒绝**。
+        拒绝的原因只有一种:这份代码凭什么有权被执行?答案必须是「人批准过这段字节」。
+        校验不过就拒绝启动,**绝不**回退到 `strategies/` 里的默认策略——
+        回退等于「装不上就换一个照样跑」,那批准就白批了。
+        """
+        cfg = self.config
+        if not cfg.approved_file:
+            return None
+        root = Path(cfg.approved_root) if cfg.approved_root else Path(__file__).resolve().parents[1]
+        approved_dir = Path(cfg.approved_dir) if cfg.approved_dir else root / "approved"
+        # 批准目录的位置**钉死**:解析后必须就是 `<root>/approved`。
+        # 把它配成别处(尤其 `strategies/`)等于「候选目录与受信目录混为一谈」——
+        # 研究侧用同一份受保护目录名单把这条堵死(见 research_config.RESERVED_DIRS)。
+        if approved_dir.resolve() != (root / "approved").resolve():
+            return (f"批准目录必须固定为 {root / 'approved'},当前是 {approved_dir};"
+                    f"把它指到别处会让候选目录与运行时认的目录混为一谈")
+        approvals_file = root / "data" / "research-control" / "approvals.json"
+        # 第三、四道门(与「人批准」独立的记录):「已收菜」(收菜那道把源码打给人看的关口)
+        # 与「晋级门槛通过」(人工审阅挡不住「这策略没有统计优势」)。
+        # 今天没有任何候选通过过门槛 → 这条路实际上**关着**(见 Issue #37)。
+        collected_file = root / "data" / "research-control" / "collected.json"
+        # 装载门是**独立**的一份记录(与准入门那份分开):准入门问「能不能连生产 API」,
+        # 装载门问「这份代码配不配跑」——共用一份记录会让「过了一次门槛」同时满足两件事。
+        promotion_file = root / "data" / "state" / "approved_promotion.json"
+        # 批准目录整体自检:里面有任何一个文件与账本不一致,就拒绝启动(fail-closed)。
+        problems = approved_guard.check_approved_consistency(
+            approved_dir=approved_dir, approvals_file=approvals_file)
+        if problems:
+            return ("批准目录与批准账本不一致,拒绝启动:" + "; ".join(problems)
+                    + "。请重新收菜(approved/ 里的文件被改过或从未批准)")
+        try:
+            cls, sha = approved_guard.load_approved_strategy(
+                approved_dir=approved_dir,
+                approvals_file=approvals_file,
+                file_name=cfg.approved_file,
+                class_name=cfg.approved_class_in_file,
+                setting=cfg.strategy_setting,
+                template_name=cfg.approved_template,
+                collected_file=collected_file,
+                promotion_file=promotion_file,
+                expected_key=cfg.approved_key,
+            )
+        except approved_guard.ApprovedLoadError as exc:
+            return str(exc)
+        except BaseException as exc:                          # noqa: BLE001
+            # 任何别的异常也必须变成「拒绝 + 告警 + 退出码 3」,
+            # 不能变成裸 traceback + 退出码 1(操作者会收不到告警,只看到一个栈)。
+            return f"策略装载异常: {exc!r}"
+        # 状态命名空间按**批准哈希**派生:换批准版本就换命名空间,
+        # 旧版本的持仓/止损状态不会被新版本继承(不靠操作者记得改 --strategy-name)。
+        if not cfg.approved_strategy_name:
+            cfg.strategy_name = f"approved_{sha[:8]}"
+        # 注册进 CTA 引擎的类表:键名沿用 strategy_class,引擎按名字取类
+        self.cta.classes[cfg.strategy_class] = cls
+        self.main.write_log(
+            f"已从批准目录装载策略: {cfg.approved_file} -> {cfg.strategy_class}"
+            f"(状态命名空间 {cfg.strategy_name})", source="Runtime")
+        return None
 
     def _check_state_writable(self) -> str | None:
         """状态目录必须可写,否则风控状态(尤其是硬锁定)写不进磁盘,重启后会被"洗掉"。Docker 挂载卷默认属 root,容器内 uid 1000 写不进。"""

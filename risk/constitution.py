@@ -250,6 +250,19 @@ BUILTIN_PROTECTED_READ_ATTRS = (
     # 静态层零发现、运行期拿到真 ArrayManager,把 ATR 40.0 压成 2.9,单笔预算闸门被架空)
     "swap_in", "swap_out", "read_only_view", "_REAL", "_SOURCE",
 )
+# **闸门函数**:它们是「拒绝」这件事的执行者。
+# 改写它们 = 把筛查/比对换成一个听话的版本,于是「静态筛查: 通过」「没有改写受保护对象」
+# 这两个**给人看的信号**都能变成谎言(第 3 轮 codex 实测:候选把 `check_protected_state`
+# 换成「调用时把原函数装回去并返回 []」的假函数,指纹结论恒为空,事后身份核对也看不出)。
+# 所以这类名字:**写**它要拒,`setattr(obj, "名字", ...)` 这种按字符串写的也要拒。
+BUILTIN_PROTECTED_GATE_ATTRS = (
+    "check_protected_state", "snapshot_protected_state",
+    "screen_source", "check_class", "check_params", "load_template",
+    "safe_builtins", "record_approval",
+    "is_approved", "is_approved_sha", "file_sha256", "load_approvals",
+    "BUILTIN_ALLOWED_TEMPLATES", "BUILTIN_PROTECTED_NAMES", "BUILTIN_PROTECTED_PARAMETERS",
+)
+
 
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
 BUILTIN_ALLOWED_OVERRIDES = (
@@ -796,6 +809,80 @@ def _self_instance_attr(node: ast.AST, import_names: set[str] | None = None) -> 
     if import_names and path[0] in import_names:
         return False            # `self` 是模块别名,不是实例
     return True
+
+
+def _gate_attr_violations(tree: ast.AST) -> list[str]:
+    """闸门函数名的**任何**写入形态都要拒(第 4 轮 codex 实测的 M1)。
+
+    只看 `x.attr = v` 是不够的——实测这几种改法全都绕过了:
+      - `x.attr: int = v`(AnnAssign)
+      - `a, b = v`(元组解包)
+      - `x.attr += v`(AugAssign)
+      - `del x.attr`
+      - `setattr(obj, "attr", v)` / `delattr(obj, "attr")`
+      - `vars(obj)["attr"] = v`
+    名字是**字符串**或藏在容器里时,按属性名查黑名单看不见它。
+    """
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        # ① 属性写入/删除(含 AnnAssign 与元组解包里的元素)
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            for element in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                if isinstance(element, ast.Attribute) and element.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 改写了闸门函数 {element.attr}"
+                                    "(把「拒绝」这件事的执行者换掉)")
+        # ② `del x.attr`
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 删除了闸门函数 {target.attr}")
+        # ③ `setattr(obj, "名字", v)` / `delattr(obj, "名字")`
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in ("setattr", "delattr") and len(node.args) >= 2:
+            name_node = node.args[1]
+            if isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) \
+                    and name_node.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                findings.append(f"第 {node.lineno} 行: 按名改写了闸门函数 {name_node.value}"
+                                "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
+        # ④ `vars(obj)["名字"] = v`
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Call) \
+                        and isinstance(target.value.func, ast.Name) and target.value.func.id == "vars":
+                    key = target.slice
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str) \
+                            and key.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(f"第 {node.lineno} 行: 通过 vars() 改写了闸门函数 {key.value}")
+    return findings
+
+
+def _setattr_protected_name(node: ast.Call, c: Constitution) -> str | None:
+    """`setattr(obj, "名字", 值)` 里的「名字」是不是受保护成员。
+
+    名字是**字符串**,按属性名查黑名单看不见它——第 3 轮 codex 实测:
+    候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)` 把 300 元
+    单笔预算换成一个恒 0 的函数,静态层对那条载荷返回 []。
+    """
+    if not (isinstance(node.func, ast.Name) and node.func.id == "setattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    name_node = node.args[1]
+    if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+        return None
+    name = name_node.value
+    if name in BUILTIN_PROTECTED_GATE_ATTRS:
+        return name
+    if name in c.protected_module_attrs and _module_attr_owner_ok(name, []):
+        return name
+    return None
 
 
 def _write_violation(target: ast.AST, c: Constitution, import_names: set[str] | None = None) -> str | None:
@@ -1617,6 +1704,14 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
         elif isinstance(node, ast.Call):
+            # `setattr(对象, "名字", 值)`:名字是**字符串**,按属性名查黑名单看不见它。
+            # 第 3 轮 codex 实测:候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)`
+            # 把 300 元预算换掉,静态层对这条载荷返回 []。
+            setattr_name = _setattr_protected_name(node, c)
+            if setattr_name:
+                findings.append(
+                    f"第 {node.lineno} 行: 按名改写了受保护成员 {setattr_name}"
+                    "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
             # 对受保护容器调用**变更型方法**:`self.am.update_bar(fake_bar)` 会往回测里
             # 插一根假 K 线,而它既不是属性赋值也不是取别名(第 11 轮 codex 的 High 1)。
             violation = _container_mutator_call(node, c)
@@ -1722,6 +1817,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     # 早先那条"引用流出去就拒"的规则把诚实候选整片拒掉,进化循环因此被闲置。
     for lineno, message in _container_write_findings(tree):
         findings.append(f"第 {lineno} 行: {message}(写入受保护容器, 伪造回测结果)")
+    # 闸门函数名的**任何**写入形态(AnnAssign / 元组解包 / AugAssign / del /
+    # setattr / delattr / vars()[...])——第 4 轮 codex 实测:只挡 `x.attr = v` 会被绕开。
+    findings.extend(_gate_attr_violations(tree))
     return findings
 
 

@@ -501,3 +501,80 @@ codex 用**精确复原旧三条读取外流函数**(保留新写入规则)的�
    `tests/test_view_escape_hatch.py` 与 `tools/check_constitution_history.py`。
 7. **本轮成绩单**:第二轮(codex)**40/50**;第一轮(`mcp__zen__codereview`)**未取得结果**
    (Gemini 429,两次都被挡)。**不编第三个数**。
+
+---
+
+### 第 6 轮:把 `origin/main` 并进本分支——合并裁决的标准只有一条:**不许削弱**
+
+**起点(先把两边算清楚,再决定怎么合)**
+
+| | `risk/constitution.py` |
+|---|---|
+| merge base(`96959a2`) | 起点 |
+| `origin/main` 之后 | **+102 行** |
+| 本分支(#23)之后 | **+876 行**(−137) |
+
+两边是**同一条防线的两次演进**:本分支加的是「只读视图 + 别名/容器写 + 导入绑定名 + 候选命名空间核对」,
+main 加的是「闸门函数名黑名单 + 七种写入形态 + 按名 setattr」。
+两边都还不到对方的程度 ⇒ **取一边丢另一边 = 丢一条防线** ⇒ 不能用「取 ours/theirs」解决。
+
+**裁决(逐处人工裁决,不是脚本合)**
+
+1. **底稿取本分支那份**(`git checkout --ours`),因为 main 只动了这一个文件;
+   本分支那 876 行(只读视图一族)一行不动。
+2. **把 main 的四样东西并进底稿**:
+   - `BUILTIN_PROTECTED_GATE_ATTRS`(闸门函数名黑名单,15 个名字);
+   - `_gate_attr_violations(tree)`(闸门名的**任何**写入形态);
+   - `_setattr_protected_name(node, c)`(`setattr(obj, "名字", v)` 这种按字符串写的);
+   - 以及 main 把上面两者接进 `screen_source` 的两处。
+3. **main 另加的那条 `elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS` 分支不单独并入**:
+   同一份文件里已经有覆盖该形态的通用判定(`_gate_attr_violations` 走遍全树,
+   Assign / AnnAssign / AugAssign / 元组解包 / del / setattr / delattr / `vars()[...]` 全在里头),
+   单独再插一条只会在**同一次写入**上报两条重复结论。**覆盖范围不减**,只是不重复报。
+4. `CHANGELOG.md` 两边各加了一段(本分支的「只读视图」与 main 的「第 4 轮 codex 复核」),
+   **语义不冲突** ⇒ 两边都保留(本分支在前)。
+
+**补一条 main 自己没配探针的规则**
+
+main 在 PR #34 里加了「闸门函数名的任何写入形态都要拒」这条规则,
+但**没有为它配动态探针**(仓库规矩:每条新规则都要有放行+拦截双向探针,静态推理必漏)。
+⇒ 新增 `tests/test_constitution_gate_attrs.py`:
+
+| 侧 | 断言 |
+|---|---|
+| 拦截 | 七种写入形态逐一被拒(赋值 / 带注解赋值 / 复合赋值 / 元组解包 / `del` / `setattr` / `delattr` / `vars()[...]`) |
+| 拦截 | **断言是哪一类规则拒的**(不是「有拒绝」就绿——把规则名删掉这条测试也得绿) |
+| 拦截 | 拒绝信息里带上**被改写的名字** |
+| 拦截 | 黑名单里**每一个**名字都被这条规则挡住(不是只挡头几个) |
+| 放行 | 读闸门名不是改写它(放行);普通属性写入不受影响;按名 `setattr` 一个普通名字不受影响 |
+
+**分档清单随之更新(合并暴露出来的缺口)**
+
+main 的 `tools/check_domain.py` 里有一道动态探针(生产依赖闭包):凡是自己定义或
+直接调用了真钱链路判定点的文件,必须被判为**不可降级**。
+合并之后它当场指出本分支带来的 5 份用例 + 新增的那 1 份**直接调用 `screen_source`**,
+却没登记进不可降级清单 ⇒ 已补进 `NEVER_DOWNGRADE`。
+(按仓库规矩「清单本身是代码」:改清单 = 执行域改动 = 要复核。)
+
+**验证(本轮实测)**
+
+| 项 | 结果 |
+|---|---|
+| `tests/test_constitution_gate_attrs.py`(新) | **13 passed** |
+| `tests/test_constitution.py` + `round11` + `round12` + `round25` | **292 passed** |
+| `tests/test_check_domain.py` | **99 passed** |
+| 分档变异(`tools/check_mutations.py --verify`) | 见下 |
+
+**本轮如实记录:仍未解决的**
+
+1. **本分支的 5 份用例不在 research-only CI 上跑**:`test_market_view` /
+   `test_view_escape_hatch` / `test_frame_introspection` / `test_g8_round4` / `test_g8_round7`
+   都 import `vnpy` / `bootstrap`(交易栈),而 `research-guard.yml` 那个 runner 刻意不装交易栈
+   ⇒ 它们目前**只在本地跑**,CI 没有覆盖。新增的 `test_constitution_gate_attrs.py`
+   只依赖 `risk.constitution`(纯标准库)⇒ 已接进 CI 的 ruff 清单与「研究侧其余测试」那一步。
+2. **main 那条「运行时装载候选」的路仍默认关着**(#37:要三道互相独立的记录),
+   本分支的只读视图改动**不改变**这一点。
+3. **两边的闸门清单不是同一份**:本分支把 `_call_entry_signal` / `_am_view` 列为受保护成员,
+   main 的 `BUILTIN_PROTECTED_GATE_ATTRS` 列的是筛查/账本一侧的闸门名。
+   合并没有把它们并成一张表——**并表会改变命中集合**(多拒或少拒),属于改判定口径,
+   要单独一轮评审,不夹在这次合并里做。

@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parent.parent
 import record_promotion  # noqa: E402
 import run_headless  # noqa: E402
 from fakes import FakeGateway  # noqa: E402
-from risk.live_admission import check_live_admission, write_approval  # noqa: E402
+from risk.live_admission import (  # noqa: E402
+    check_live_admission,
+    write_approval,
+    write_load_approval,
+)
 from risk.promotion_gate import CandidateMetrics, check_gate  # noqa: E402
 from test_scripts_cli import ENV, StubRuntime  # noqa: E402,F401
 
@@ -149,3 +153,78 @@ def test_environment_is_stripped_and_strictly_validated():
     for bad in ("live", "PROD", "实 盘", "test"):
         with pytest.raises(ValueError, match="CTP_ENVIRONMENT"):
             build_ctp_setting({**ENV, "CTP_ENVIRONMENT": bad})
+
+
+# ---------- 装载门(Issue #37):与准入门是**两份独立的记录** ----------
+
+def test_write_load_approval_refuses_a_failing_candidate_and_writes_nothing(tmp_path):
+    path = tmp_path / "state" / "load.json"
+    failures = write_load_approval(path, "S", "C15", "a" * 64, "run-1", FAILING, "me", NOW)
+    assert failures and not path.exists()
+
+
+def test_write_load_approval_requires_key_sha_and_run_id(tmp_path):
+    path = tmp_path / "state" / "load.json"
+    assert write_load_approval(path, "S", "", "a" * 64, "run-1", PASSING, "me", NOW)
+    assert write_load_approval(path, "S", "C15", "", "run-1", PASSING, "me", NOW)
+    assert write_load_approval(path, "S", "C15", "a" * 64, "", PASSING, "me", NOW)
+    assert write_load_approval(path, "S", "C15", "not-a-sha", "run-1", PASSING, "me", NOW)
+    assert not path.exists()
+
+
+def test_the_load_gate_record_is_independent_of_the_admission_record(tmp_path):
+    """两道门写**两份文件**:过了一次门槛不等于同时满足两件事,也不该被同一份记录撤销。"""
+    admission = tmp_path / "state" / "promotion_approval.json"
+    load = tmp_path / "state" / "approved_promotion.json"
+    assert write_approval(admission, "S", PASSING, "me", NOW) == []
+    assert write_load_approval(load, "S", "C15", "b" * 64, "run-9", PASSING, "me", NOW) == []
+
+    assert admission.exists() and load.exists()
+    assert admission != load
+    assert "key" not in json.loads(admission.read_text(encoding="utf-8"))     # 准入门不绑品种
+    load_record = json.loads(load.read_text(encoding="utf-8"))
+    assert load_record["key"] == "C15" and load_record["run_id"] == "run-9"
+
+
+def test_record_promotion_writes_both_records_when_the_bytes_are_given(tmp_path, monkeypatch):
+    """给了 sha256 + run-id → 准入门与装载门两份都写;品种从那次评估的结果里取。"""
+    metrics_file = tmp_path / "metrics.json"
+    metrics_file.write_text(json.dumps(asdict(PASSING)), encoding="utf-8")
+    run_id = "20261114-120000-abc"
+    research = tmp_path / "data" / "research"
+    research.mkdir(parents=True)
+    (research / f"{run_id}.json").write_text(json.dumps({"kind": "evaluate", "key": "C15"}),
+                                            encoding="utf-8")
+    monkeypatch.setattr(record_promotion.bootstrap, "ROOT", tmp_path)
+
+    admission = tmp_path / "state" / "promotion_approval.json"
+    load = tmp_path / "state" / "approved_promotion.json"
+    code = record_promotion.main([
+        "--metrics", str(metrics_file), "--strategy", "S", "--approver", "me",
+        "--out", str(admission), "--load-out", str(load),
+        "--sha256", "c" * 64, "--run-id", run_id,
+    ])
+
+    assert code == record_promotion.EXIT_OK
+    assert admission.exists() and load.exists()
+    assert json.loads(load.read_text(encoding="utf-8"))["key"] == "C15"
+
+
+def test_record_promotion_refuses_a_key_that_contradicts_the_evaluation(tmp_path, monkeypatch):
+    """--key 与那次评估的品种不一致 → 拒绝(fail-closed)。"""
+    metrics_file = tmp_path / "metrics.json"
+    metrics_file.write_text(json.dumps(asdict(PASSING)), encoding="utf-8")
+    run_id = "20261114-120000-abc"
+    research = tmp_path / "data" / "research"
+    research.mkdir(parents=True)
+    (research / f"{run_id}.json").write_text(json.dumps({"key": "C15"}), encoding="utf-8")
+    monkeypatch.setattr(record_promotion.bootstrap, "ROOT", tmp_path)
+
+    code = record_promotion.main([
+        "--metrics", str(metrics_file), "--strategy", "S", "--approver", "me",
+        "--out", str(tmp_path / "a.json"), "--load-out", str(tmp_path / "l.json"),
+        "--sha256", "c" * 64, "--run-id", run_id, "--key", "MAADJ",
+    ])
+
+    assert code == record_promotion.EXIT_BAD_INPUT
+    assert not (tmp_path / "l.json").exists()
