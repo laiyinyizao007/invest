@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import base64
+import binascii
 import hashlib
 import importlib.util
 import json
@@ -1074,7 +1076,7 @@ def _floor_to_granularity(value_ns: int, granularity: int) -> int:
 
 
 def site_package_roots() -> tuple[Path, ...]:
-    """当前解释器的站点包根(site-packages / dist-packages)。
+    """当前解释器的**站点包目录**(site-packages / dist-packages)。
 
     **为什么需要它**(Issue #47):仓库自带的 venv 常常就躺在仓库根之内
     (本仓库是 `.venv/`),于是站点包里的模块**物理上**在仓库根之下。
@@ -1082,15 +1084,19 @@ def site_package_roots() -> tuple[Path, ...]:
     而 docstring 第三支(站点包:要求「候选开始运行之前就存在」)就永远用不上——
     候选于是连 `vnpy_ctastrategy` 都 import 不了(本仓库主 checkout 里实测 4 条用例红)。
 
-    这**不是**放宽防线:站点包那一支本来就带「预先存在且此后没被改过」的检查
-    (第 24 轮 codex 的原始理由:站点包在宿主机上通常可写,候选往里写一个辅助模块
-    就能绕开仓库内的路径规则)。本函数只是让分类**对得上 docstring**,
-    不改变任何一道检查的松紧。
+    取值口径:标准库给的路径(sysconfig)+ site 模块的清单 + 按 sys.prefix 拼的兜底,
+    然后**只保留真的是站点包目录的**(basename ∈ {site-packages, dist-packages}且存在)。
 
-    取值口径:标准库给的路径(sysconfig)+ site 模块的清单 + 按 sys.prefix 拼的兜底。
+    **为什么按 basename 过滤**(codex 第 4 轮复核的 M1):Windows 上
+    `site.getsitepackages()` 返回的是**prefix 本身**
+    (`['<repo>/.venv', '<repo>/.venv/Lib/site-packages']`),
+    照单全收等于把**整个 venv / 整个 Python 安装目录**当成站点包信任区——
+    信任面比预期大得多,还多出几条根本不存在的根。按 basename 过滤后
+    信任区就是真正的 site-packages。
+
     取不到就少一条根——**判不出站点包时仍走原来的「仓库内模块」那一支**(fail-closed)。
     """
-    roots: list[Path] = []
+    candidates: list[Path] = []
 
     def add(p: object) -> None:
         if not p or not isinstance(p, (str, Path)):
@@ -1099,8 +1105,8 @@ def site_package_roots() -> tuple[Path, ...]:
             resolved = Path(p).resolve()
         except OSError:
             return
-        if resolved not in roots:
-            roots.append(resolved)
+        if resolved not in candidates:
+            candidates.append(resolved)
 
     try:
         import sysconfig
@@ -1139,7 +1145,105 @@ def site_package_roots() -> tuple[Path, ...]:
         ):
             add(Path(base) / rel)
 
+    # **只保留真的是站点包目录的**:basename 必须是 site-packages / dist-packages,
+    # 而且目录得真的存在(不存在的根是噪音,还会让「信任区」的描述失真)。
+    roots: list[Path] = []
+    for candidate in candidates:
+        if candidate.name not in ("site-packages", "dist-packages"):
+            continue
+        if not candidate.is_dir():
+            continue
+        if candidate not in roots:
+            roots.append(candidate)
     return tuple(roots)
+
+
+# 站点包的安装记录缓存:键 = 站点包根,值 = {绝对路径(规范化字符串): (sha256 十六进制, size)}。
+# **模块级缓存**:守卫是每个子进程重建一次的,索引跟着重建就太贵了
+# (实测一个 venv 的 site-packages 有 8.5 万个文件,逐个 Path.resolve() 要几十秒)。
+_SITE_RECORDS_CACHE: dict[str, dict[str, tuple[str | None, int]]] = {}
+
+
+def installed_site_files(roots: Sequence[Path]) -> dict[str, tuple[str | None, int]]:
+    """站点包的**安装记录**:绝对路径(规范化字符串) -> (sha256 十六进制, size)。
+
+    从各发行版的 `*.dist-info/RECORD` 读(pip 安装时写下的清单,带每个文件的大小与哈希)。
+
+    **为什么需要它**(Issue #47 的收尾,codex 第 4 轮复核的 H1):
+    站点包那一支原本只有「mtime 早于本轮起点」这一道检查,而守卫是**每个子进程重建一次**
+    (`research_api.py` 每轮 `started_at_ns = time.time_ns()`),
+    于是候选**第 1 轮**写进站点包的辅助模块,**第 2 轮**就能导入它并被执行
+    (实测:白名单里的真实包 `numpy`,辅助模块拿到真内建)。
+    仓库自己早就证过「只比 mtime 不可靠」(`_changed()` 的注释:
+    「改写内容再把 mtime 还原」能骗过),受信目录正因如此补了 sha256 + 仓库提交基准。
+    安装记录就是站点包的**「提交基准」等价物**:
+    - 不在记录里 → 安装之后才出现的文件(候选写的就是这种)→ 不算第三方库;
+    - 在记录里但大小/哈希变了 → 被改写过 → 不算第三方库。
+
+    **性能**:索引按站点包根**模块级缓存**(一次进程只建一次),
+    且**不对每个条目调 Path.resolve()**(那要几万次文件系统调用)。
+    取不到(没有 RECORD / 解析不了)→ 返回空字典 —— 调用方据此退回
+    「仓库内一切拒」的**字面口径**(fail-closed),不会退成「站点包一律放行」。
+    """
+    merged: dict[str, tuple[str | None, int]] = {}
+    for root in roots:
+        key = str(root)
+        cached = _SITE_RECORDS_CACHE.get(key)
+        if cached is None:
+            cached = _read_site_records(root)
+            _SITE_RECORDS_CACHE[key] = cached
+        merged.update(cached)
+    return merged
+
+
+def _read_site_records(root: Path) -> dict[str, tuple[str | None, int]]:
+    """读一个站点包根下的全部 `*.dist-info/RECORD`。"""
+    records: dict[str, tuple[str | None, int]] = {}
+    if not root.is_dir():
+        return records
+    try:
+        dist_infos = sorted(root.glob("*.dist-info"))
+    except OSError:
+        return records
+    base = str(root)
+    for dist_info in dist_infos:
+        record = dist_info / "RECORD"
+        try:
+            text = record.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            parts = line.split(",")
+            if not parts or not parts[0]:
+                continue
+            rel = parts[0].strip()
+            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+                continue
+            digest = parts[1].strip() if len(parts) > 1 else ""
+            size = parts[2].strip() if len(parts) > 2 else ""
+            # sha: None = RECORD 里没记摘要(脚本、__pycache__ 这类条目);
+            #      ""   = 记了但**解不开** → 视为「不是可信的安装记录」;
+            #      十六进制 = 可直接和 file_sha256() 比。
+            sha: str | None = None
+            if digest.startswith("sha256="):
+                # RECORD 里是 urlsafe-base64 的原始摘要,这里换成十六进制
+                # ——好和 file_sha256() 的输出直接比。
+                raw = digest[len("sha256="):]
+                try:
+                    padding = "=" * (-len(raw) % 4)
+                    sha = base64.urlsafe_b64decode(raw + padding).hex()
+                except (ValueError, binascii.Error):
+                    # 解不开就**别装作没记**:空串会被判成「不可信」(见 _is_site_package),
+                    # 绝不能悄悄退化成「只比大小」。
+                    sha = ""
+            try:
+                size_int = int(size) if size else 0
+            except ValueError:
+                size_int = 0
+            # **不调 resolve()**:几万次文件系统调用太贵。根已经是解析过的,
+            # RECORD 里的相对路径也不含 ".."(上面滤掉了),拼起来就是最终路径。
+            records[os.path.normpath(os.path.join(base, rel))] = (sha, size_int)
+    return records
 
 
 class RepoImportGuard:
@@ -1161,6 +1265,9 @@ class RepoImportGuard:
         # 站点包根(Issue #47):判「这个模块算不算仓库之外的第三方库」时要用。
         # 取不到就是空元组 —— 那时分类退回到原来的字面口径(fail-closed)。
         self.site_roots = site_package_roots()
+        # 站点包的**安装记录**(路径 -> (sha256 十六进制, size))。
+        # 取不到就是空字典 —— 那时仓库内的站点包文件一律按「仓库内模块」拒(fail-closed)。
+        self.site_installed = installed_site_files(self.site_roots)
         self.snapshot = dict(snapshot or {})
         self.started_at_ns = started_at_ns if started_at_ns is not None else time.time_ns()
         # 受信目录要不要与**仓库提交**核对(第 25 轮 codex 的 Critical 1)。
@@ -1227,16 +1334,51 @@ class RepoImportGuard:
         return False
 
     def _is_site_package(self, resolved: Path) -> bool:
-        """这个路径是不是**站点包**(第三方库)——哪怕它物理上落在仓库根之内。
+        """这个路径是不是**站点包里安装好的第三方库文件**。
 
-        本仓库的 venv 就在仓库根之内(`.venv/`),站点包里的模块物理上在仓库之下。
-        按字面判定会把它们当「仓库内模块」直接拒掉,docstring 第三支(站点包:
-        要求「候选开始运行之前就存在」)就永远用不上(Issue #47)。
+        判据两条,都要成立:
+        ①它在某个站点包根之下(本仓库的 venv 就在仓库根之内,`.venv/`);
+        ②它在**安装记录**(`*.dist-info/RECORD`)里,且**内容没被改过**。
+
+        **为什么②不能省**(codex 第 4 轮复核的 H1):守卫是**每个子进程重建一次**
+        (`research_api.py` 每轮刷新 `started_at_ns`),站点包那一支原本只有
+        「mtime 早于本轮起点」这一道检查 —— 于是候选**第 1 轮**写进站点包的辅助模块,
+        **第 2 轮**就能导入它并被执行(实测:白名单里的真实包 `numpy`,辅助模块拿到真内建)。
+        仓库自己早就证过「只比 mtime 不可靠」(`_changed()` 的注释:
+        「改写内容再把 mtime 还原」能骗过),受信目录正因如此补了 sha256 + 仓库提交基准。
+        安装记录就是站点包的**「提交基准」等价物**。
+
+        装记录取不到(没有 RECORD / 解析不了)→ 判 False → 仍按「仓库内模块」拒(fail-closed)。
         """
-        for root in self.site_roots:
-            if resolved == root or root in resolved.parents:
-                return True
-        return False
+        if not any(resolved == root or root in resolved.parents for root in self.site_roots):
+            return False
+        key = os.path.normpath(str(resolved))
+        known = self.site_installed.get(key)
+        if known is None:
+            # RECORD 记的是**文件**;而「包位置」那一支拿到的是**目录**。
+            # 目录算不算装上去的,看它的 __init__.py 在不在记录里。
+            known = self.site_installed.get(key + os.sep + "__init__.py")
+        if known is None:
+            # 不在安装记录里 = 安装之后才出现的文件(候选写的就是这种)→ 不算第三方库
+            return False
+        sha, size = known
+        if sha == "":
+            # RECORD 里记了摘要却解不开 → 这条记录不可信,当「不是装上去的」处理
+            return False
+        # **要核对的那个文件**:RECORD 记的是文件;而「包位置」那一支拿到的是目录。
+        # 对目录就核对它的 __init__.py(目录本身没有内容哈希,也比不了大小)。
+        target = resolved
+        if target.is_dir():
+            target = target / "__init__.py"
+        try:
+            stat = target.stat()
+        except OSError:
+            return False
+        if size and stat.st_size != size:
+            return False
+        if sha and file_sha256(target) != sha:
+            return False
+        return True
 
     def _outside_repo(self, resolved: Path) -> bool:
         """这个路径算不算「仓库之外」。

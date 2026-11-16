@@ -17,8 +17,20 @@
     `vnpy_ctastrategy` 是站点包,不是本仓库的代码)。**CI 永远看不到**:CI 现装依赖,
     站点包在 checkout 之外,走的是第三条。
   - 修法:判据改成「**这是不是本仓库自己的代码**」——新增 `site_package_roots()` 算出当前解释器的
-    站点包根,守卫构造时取一次;`_is_site_package()` + `_outside_repo()` 统一五处分类判定
+    站点包根(**只保留真的是 site-packages/dist-packages 的**;Windows 上
+    `site.getsitepackages()` 返回的是 prefix 本身,照单全收等于把整个 venv 当信任区),
+    新增 `installed_site_files()` 从 `*.dist-info/RECORD` 读出**安装记录**(路径 → sha256 + 大小),
+    守卫构造时取一次(模块级缓存:一个 venv 的 site-packages 有 8.5 万个条目,
+    逐个 `Path.resolve()` 要几十秒);`_is_site_package()` + `_outside_repo()` 统一四处分类判定
     (模块、祖先包、包位置、通配符)。
+  - **「安装好的」不只看 mtime,还要看安装记录**:守卫是**每个子进程重建一次**的
+    (`research_api.py` 每轮刷新 `started_at_ns`),所以「mtime 早于本轮起点」挡不住跨轮次——
+    候选第 1 轮写进站点包的辅助模块,第 2 轮就能导入并执行(实测:白名单里的真实包 `numpy`,
+    辅助模块拿到真内建)。仓库自己早就证过「只比 mtime 不可靠」,受信目录正因如此补了
+    sha256 + 仓库提交基准;**安装记录就是站点包的同一把尺子**:
+    不在记录里 = 安装之后才出现的文件 → 拒;哈希变了 = 被改写过 → 拒。
+  - 新增 `tests/test_import_guard_venv_site_packages.py`(9 条),按仓库自己的标准写成
+    **动态探针**(真的写、真的导、真的看结果),覆盖跨轮次与改写两种攻击面。
   - **这是收窄分类,不是放宽防线**:站点包那一支本来就带「预先存在且此后没被改过」的检查,
     修复只是让分类对得上 docstring;仓库自己的代码(`risk/`/`scripts/`/`trading/`/`strategies/`)
     仍然落进「仓库之内 → 只许在允许目录里」那一支,一道检查都没松;
