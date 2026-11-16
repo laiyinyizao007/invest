@@ -303,10 +303,44 @@
     「撤单这项没过时摘要点名是撤单」
     「重复报单『压根没被拦』与『被拦了但没预警』分开写」
     「没有任何风控日志时 T6 不赖到本项阈值头上」。
-  - 验证:全量 `pytest` **2880 passed / 5 skipped**(唯一的红是本机隔离环境缺 `fastapi`/`uvicorn`
-    导致的 `tests/test_dashboard_boundaries.py`,改动前后一致);本批**差异覆盖率 98.9%**
-    (89 行新增可执行语句覆盖 88 行,未覆盖的 1 行是 `broker_test.py` 的 CLI 启动 `print`);
-    改动文件 `ruff` 仍是 7 条既有告警(无新增)。
+  - 验证(本批最终状态,含下面第七轮整改):全量 `pytest` **2883 passed / 5 skipped**
+    (唯一的红是本机隔离环境缺 `fastapi`/`uvicorn` 导致的 `tests/test_dashboard_boundaries.py`,
+    改动前后一致);本批**差异覆盖率 97.4%**(39 行新增可执行语句覆盖 38 行,未覆盖的 1 行是
+    `broker_test.py` 的 CLI 主流程 `out_dir` 行——单元测试进不去 CLI 入口);
+    改动文件 `ruff` 与改动前逐条一致(`penetration_check.py` 28 条、`test_discipline.py` 1 条既有告警,无新增)。
+  - **G8 第一轮(自查)新发现并同批修掉 3 条**(1 Medium + 2 Low):
+    - **新发生的硬锁定没有走 `_stamp_beijing`**:触发时刻原样写 `now.isoformat()`,
+      调用方若传了非北京偏移,存下来的偏移会被后面 `trading_day(fromisoformat(...))` 当成北京时间
+      比交易日 —— 与 L2 修掉的正是同一类 fail-open;而且从旧状态文件升级上来时,新锁会**继承**
+      legacy 标记 ⇒ 冷却期永远要 `--force`(方向保守,但属于「卡住」)。现在新锁一律写 `+08:00`
+      并复位 legacy 标记。
+    - **「是不是废单」原先用整串关键字判断**(`"拒单" not in reason`):将来任何指标的原因里出现
+      「拒单」二字都会误抑制「演示单可能仍挂在柜台上」这条告警。改用结构化标记
+      (`cancel_unconfirmed` / `cancel_rejected`)。
+    - **用不了的采样时刻被丢掉却没有留痕**:状态文件里看不出「曾经有采样时刻、只是格式不对」。
+      方向是保守的(状态页显示「无法确认」而不是「新鲜」),现在把原值留一份在 `sampled_at_unusable`。
+- **codex 第七轮复核(41/50,「需小修」;无 Critical/High)的 1 条 Medium + 5 条 Low 整改**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
+  - 上一轮的 9 条整改**逐条复核后确认全部修好**,本轮是新发现。
+  - **M1(Medium)——阈值归因存在「日志还没到」的竞态,证据会自相矛盾**。
+    `vnpy_riskmanager` 的 `write_log` 走**异步** `event_engine.put` ⇒ `send()` 返回时
+    风控日志可能还没落到收集器里。原实现发完单立刻读日志,读不到就写「没有风控拦截日志」,
+    而证据行里其实有那条日志 ⇒ 摘要与证据打架,读报告的人会以为阈值没生效。
+    现在发单前打日志水位、发单后**等日志到位**(最多 2 秒),归因只认水位之后的日志。
+  - **L3(Low)——`state_version` 直接 `int(...)`,遇到垃圾值会抛异常**。
+    该字段在 `_load()` 里读,抛异常 ⇒ 状态文件读不出来 ⇒ 上层当成「文件损坏」⇒ **误触硬锁定**
+    (误停交易,原因还误导)。现在读值包在 `try/except` 里,坏值一律按**旧文件**处理(方向保守)。
+  - **L5(Low)——两处时间戳还在用本机本地时间**:证据**目录名**(`out_dir`)与
+    `scripts/penetration_check.py` 的元数据/报告文件名。目录里的内容(条目时间、连接记录、清场留痕)
+    都是北京时间,目录名却差 16 小时 ⇒ 事后对时间线会打架。统一走 `beijing_now()`。
+  - **L6(Low)——`started_wall` 的注释误导**:它**必须**留在本机本地时间(vn.py 的 loguru 时间戳是本地时间),
+    改成北京时间会把 P6.1 的全部日志证据过滤掉。补注释写明「不许改」。
+  - **L7(Low)——两个 T6 归因用例只断言了措辞,没断言「判定仍是 FAIL」**:将来有人把 `t6_status`
+    改成 SKIP,这两条照样绿 ⇒ 必测项的判定可以被悄悄放松。两条用例补 `assert t6.status == FAIL`。
+  - **L8(Low)——重复报单的原因串出现「重复报单:重复报单没有被拦截」这种重复措辞**。
+    现在 `step_duplicate` 返回**不带前缀**的原因,由 P3.1 统一补「重复报单:」前缀,
+    与同段「报单:…」「撤单:…」的格式对齐。
+  - 附带修正:`hard_locked_at` 统一成 `+08:00` 后,`tests/test_discipline.py` 的两条断言
+    仍是旧格式 ⇒ 已同步更新(改动前后各跑一遍,确认红的是同一处,不是新引入的失败)。
 - **codex 第五轮复核(39/50,「需小修」)的 1 条 High + 6 条 Medium + 4 条 Low 整改**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
   - **H1(High)——时区依赖没有真正去掉,仪表盘在 `-I` 隔离模式下仍然起不来**。上一轮只把 `risk/account_guard` 摘出去了,
     `dashboard/models.py` 与 `evidence/logstats.py` 仍在 import 期求值 `ZoneInfo("Asia/Shanghai")`

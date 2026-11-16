@@ -100,6 +100,10 @@ class AccountGuard:
         # 该权益『被采样』的时刻(账户回报到达柜台网关的时间),不是文件写入时间。只供状态页判断权益是否新鲜:
         # 网关断开后 vn.py 仍缓存着旧账户对象,定时器照常读到它并落盘,文件 mtime 因此一直是新的。纯可观测字段,不参与任何熔断判断。
         self.last_sampled_at: datetime | None = None
+        # 读盘时**用不了**的采样时刻原样留一份(纯留痕):值被丢掉是保守的(状态页显示
+        # 「无法确认」而不是「新鲜」),但「值曾经存在、只是格式不对」这件事不该被抹掉 ——
+        # 否则运维看到状态页变陈旧,却查不到任何线索(2026-11-16 codex 复核 L3)。
+        self.sampled_at_unusable: str = ""
         self.account_id: str = ""              # 状态所属的账户;换账户时权益基准必须重置(SimNow 2000 万 vs 实盘 1 万)
         self.save_error: str = ""
         self._last_saved_at: datetime | None = None
@@ -151,6 +155,7 @@ class AccountGuard:
             return []  # 无效采样
         if sampled_at is not None:
             self.last_sampled_at = sampled_at
+            self.sampled_at_unusable = ""      # 有了新的可用采样时刻,旧的「用不了」留痕作废
         day = trading_day(now)
         events: list[LockEvent] = []
         changed = False
@@ -165,7 +170,16 @@ class AccountGuard:
 
         if not self.hard_locked and self.peak_equity - equity >= self.limits.max_drawdown:
             self.hard_locked = True
-            self.hard_locked_at = now.isoformat(timespec="seconds")
+            # 触发时刻一律走 `_stamp_beijing()`:写出来一定是 `+08:00`,
+            # 不依赖调用方传进来的 `now` 带什么偏移(旧代码原样写 `now.isoformat()`,
+            # 调用方若传了非北京偏移,存下来的偏移会被后面
+            # `trading_day(datetime.fromisoformat(...))` 当成北京时间比交易日 ⇒ 冷却期被放宽,
+            # 与「旧状态文件里的本机本地时间」是同一类 fail-open)。
+            self.hard_locked_at = self._stamp_beijing(now) or ""
+            # 新发生的锁,触发时刻是**我们自己**按北京时间写的 ⇒ 不再是「旧文件里的未知时间」。
+            # 不复位的话:从旧状态文件升级上来之后,新锁会继承 legacy 标记,
+            # 冷却期永远要 `--force`(方向是保守的,但属于「卡住」)。
+            self.hard_locked_at_legacy = False
             self.hard_reason = (f"权益 {equity:.0f} 距最高点 {self.peak_equity:.0f} 回撤 "
                                 f"{self.peak_equity - equity:.0f} 元 >= 累计死线 {self.limits.max_drawdown:.0f} 元")
             events.append(LockEvent("HARD", self.hard_reason, equity, day))
@@ -264,6 +278,9 @@ class AccountGuard:
             # 写出来永远是 +08:00(2026-11-16 codex 复核 M1:旧的 `.replace(tzinfo=BEIJING)`
             # 对**带时区**的值是「换标签不换时区」,旧文件(-08:00)会被平移 16 小时)。
             "sampled_at": self._stamp_beijing(self.last_sampled_at),   # 带时区
+            # 用不了的采样时刻原样留一份(纯留痕,不参与任何判断):值被丢掉时状态页显示
+            # 「无法确认」(保守),但值本身留着,运维查得到「格式不对」这个事实。
+            "sampled_at_unusable": self.sampled_at_unusable or None,
             # 状态文件格式版本:2 = 时刻字段一律北京时间。旧文件(无此字段)里的
             # hard_locked_at 是**本机本地时间**,混着比交易日会把冷却期放宽(fail-open),
             # 所以旧文件按「触发时间未知」处理(2026-11-16 codex 复核 L2)。
@@ -349,11 +366,23 @@ class AccountGuard:
             # 判成「已过冷却期」⇒ 冷却期被放宽(fail-open)。生产跑在 TZ=Asia/Shanghai 的容器里
             # (本地 == 北京)影响 ≈ 0,但运维机上有影响。旧文件一律按「触发时间未知」处理:
             # 保守拒绝,需 --force(与既有的「触发时间未知」口径一致)(2026-11-16 codex 复核 L2)。
+            # `state_version` 读成数字:字段缺失/为 null/是垃圾值,一律按**旧文件**处理(版本 1)。
+            # 不能让一个坏字段把**完好的**状态文件判成「损坏」⇒ 误触硬锁定(误停交易,原因还误导)
+            # (2026-11-16 codex 复核 L3)。
+            try:
+                state_version = int(s.get("state_version") or 1)
+            except (TypeError, ValueError):
+                state_version = 1
             self.hard_locked_at_legacy = bool(s.get("hard_locked_at_legacy", False)) or (
-                bool(self.hard_locked_at) and int(s.get("state_version", 1)) < 2)
+                bool(self.hard_locked_at) and state_version < 2)
             self.unlock_history = [dict(h) for h in s.get("unlock_history", [])][-UNLOCK_HISTORY_LIMIT:]
             self.manual_orders = {str(k): int(v) for k, v in s.get("manual_orders", {}).items()}
-            self.last_sampled_at = self._parse_sampled_at(s.get("sampled_at"))
+            raw_sampled = s.get("sampled_at")
+            self.last_sampled_at = self._parse_sampled_at(raw_sampled)
+            # 用不了的采样时刻**留痕**(纯可观测):值被丢掉本身是保守的(状态页显示「无法确认」),
+            # 但值曾经存在、只是格式不对这件事不该被抹掉(2026-11-16 codex 复核 L3)。
+            self.sampled_at_unusable = (raw_sampled if isinstance(raw_sampled, str) and raw_sampled
+                                        and self.last_sampled_at is None else "")
         except (ValueError, KeyError, TypeError, OSError) as exc:
             # 状态文件损坏:宁可保守地进入硬锁定,也不能当作"没有锁"继续交易
             self.hard_locked = True

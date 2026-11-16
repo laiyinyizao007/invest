@@ -1481,6 +1481,9 @@ def test_the_t6_summary_does_not_blame_our_threshold_when_another_rule_blocked_i
     monkeypatch.setattr(bt, "send", fake_send)
     bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
     t6 = item(env, "T6")
+    # 归因措辞对不对是一回事,判定**仍是 FAIL**(必测项没过就是没过)——两条都要断言,
+    # 否则将来有人把 t6_status 改成 SKIP,这两条照样绿(2026-11-16 codex 复核 L7)。
+    assert t6.status == be.FAIL, t6
     assert "阈值拦住了委托" not in t6.summary, t6.summary
     assert "被其它规则拦下" in t6.summary, t6.summary
 
@@ -1562,6 +1565,8 @@ def test_the_t6_summary_says_our_threshold_blocked_it_when_the_log_names_it(env,
     monkeypatch.setattr(bt, "send", fake_send)
     bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
     t6 = item(env, "T6")
+    # 判定必须仍是 FAIL:归因措辞与判定是两件事,都要钉住(2026-11-16 codex 复核 L7)。
+    assert t6.status == be.FAIL, t6
     assert "本项阈值拦住了委托" in t6.summary, t6.summary
     p31 = item(env, "P3.1")
     assert "报单:" in p31.summary, p31.summary
@@ -1640,7 +1645,7 @@ def test_the_duplicate_order_metric_says_when_it_was_not_blocked_at_all(env, mon
     monkeypatch.setattr(rule, "check_allowed", lambda *a, **k: True)   # 规则不再拦任何委托
     dup = bt.step_duplicate(env.ctx, env.book)
     assert not dup["ok"]
-    assert dup["reason"] == "重复报单没有被拦截", dup["reason"]
+    assert dup["reason"] == "没有被拦截", dup["reason"]   # 不带前缀:前缀由 P3.1 统一补
     assert item(env, "P2.3").status == be.FAIL
 
 
@@ -1649,7 +1654,7 @@ def test_the_duplicate_order_metric_says_when_it_was_blocked_without_an_alert(en
     monkeypatch.setattr(env.rule, "_alert", lambda *a, **k: None)     # 预警通道静默,拦截照旧
     dup = bt.step_duplicate(env.ctx, env.book)
     assert not dup["ok"]
-    assert dup["reason"] == "重复报单被拦截但没有收到预警", dup["reason"]
+    assert dup["reason"] == "被拦截但没有收到预警", dup["reason"]   # 同上
     assert item(env, "P2.3").status == be.FAIL
 
 

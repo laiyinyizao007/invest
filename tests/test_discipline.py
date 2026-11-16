@@ -34,7 +34,10 @@ def hard_locked_guard(path: Path) -> AccountGuard:
 def test_hard_lock_records_trigger_time_and_survives_restart(tmp_path):
     path = tmp_path / "g.json"
     hard_locked_guard(path)
-    assert AccountGuard(AccountLimits(), path).hard_locked_at == "2026-11-09T11:00:00"
+    # 触发时刻一律带 `+08:00`:与 `sampled_at` 同一套时刻契约(状态文件里不再有两种基准)。
+    # 之前是 naive 北京时间,调用方若传了带其它偏移的 `now`,存下来的偏移会被
+    # `trading_day(fromisoformat(...))` 当成北京时间比交易日 ⇒ 冷却期被放宽(fail-open)。
+    assert AccountGuard(AccountLimits(), path).hard_locked_at == "2026-11-09T11:00:00+08:00"
 
 
 def test_cooldown_blocks_same_trading_day_and_allows_next_day(tmp_path):
@@ -56,7 +59,7 @@ def test_unlock_appends_history_and_caps_it(tmp_path):
     g = hard_locked_guard(path)
     g.unlock_hard(TUE_10AM, forced=True)
     entry = AccountGuard(AccountLimits(), path).unlock_history[-1]
-    assert entry["forced"] is True and entry["locked_at"] == "2026-11-09T11:00:00" and "回撤" in entry["reason"]
+    assert entry["forced"] is True and entry["locked_at"] == "2026-11-09T11:00:00+08:00" and "回撤" in entry["reason"]
     for _ in range(UNLOCK_HISTORY_LIMIT + 5):
         g.hard_locked = True
         g.unlock_hard(TUE_10AM)

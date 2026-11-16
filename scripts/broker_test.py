@@ -103,7 +103,11 @@ class Ctx:
     probe_seq: int = 0                   # 演示委托的价格序号:每笔演示委托用不同价格,避免重复报单规则的累计计数跨步骤污染
     flat: bool | None = None             # 账户是否已确认空仓(None = 还没查)
     flat_reason: str = ""                # 空仓闸门失败的具体原因(有持仓 / 连接断开)
-    started_wall: datetime = field(default_factory=datetime.now)   # 本次运行开始时刻,日志归因用
+    # 本次运行开始的**墙钟时刻**:只用来把 vn.py 的日志行归到「本次运行」里。
+    # 它**必须留在本机本地时间**:vn.py 的日志时间戳来自 loguru 的本地时间,
+    # 两边基准必须一致 —— 改成北京时间会把本次运行的 P6.1 日志证据**全部过滤掉**。
+    # (同一 dataclass 里的 `main()` 的 `started_at` 是北京时间,那是给证据目录用的,两者语义不同。)
+    started_wall: datetime = field(default_factory=datetime.now)
     alerts: list[dict] = field(default_factory=list)
     failed_steps: list[str] = field(default_factory=list)      # 抛了异常的步骤:证据不完整,main 据此返回崩溃码
     trades: list = field(default_factory=list)
@@ -554,18 +558,22 @@ def step_duplicate(ctx: Ctx, book: Book) -> dict:
     status = PASS if ok else FAIL
     # 失败原因要分开说:「压根没被拦」与「被拦了但没预警」是两种不同的结论,
     # 混成一句「没有触发重复报单拦截或预警」等于没给结论(2026-11-16 codex 复核 M3)。
+    # `reason` 不带「重复报单」前缀:回给 P3.1 时由那边统一加前缀(和其它两个指标
+    # 的「报单:…」「撤单:…」格式一致),免得拼出「重复报单:重复报单没有被拦截」这种
+    # 重复措辞(2026-11-16 codex 复核 L8)。
     if rule is None:
-        summary = "找不到重复报单规则"
+        reason = "找不到规则"
     elif not blocked:
-        summary = "重复报单没有被拦截"
+        reason = "没有被拦截"
     elif not alerts:
-        summary = "重复报单被拦截但没有收到预警"
+        reason = "被拦截但没有收到预警"
     else:
-        summary = ""
+        reason = ""
+    summary = f"重复报单{reason}" if reason else ""
     book.add("P2.3", status, summary, [Shot("", lines)], started)
     # 把原因一并回给 P3.1:三个阈值指标里,重复报单原来只回一个布尔,
     # 失败时 P3.1 的摘要会退化成「有阈值未能触发拦截与预警」—— 一个原因都没有。
-    return {"ok": ok, "lines": lines, "reason": summary}
+    return {"ok": ok, "lines": lines, "reason": reason}
 
 
 def forward_alerts(ctx: Ctx, alerts: list[dict]) -> None:
@@ -589,6 +597,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
     fill_notes: list[str] = []             # 每个指标:演示单的成交情况(空 = 没成交)
     block_attribs: list[str] = []          # 每个指标:超过阈值那笔的**拦截归因**(ours/other/none/空)
     block_details: list[str] = []          # 每个指标:归因的人话 + 原文引用
+    rejected_flags: list[bool] = []       # 每个指标:撤单演示单是不是废单(结构化标记)
+    unconfirmed_flags: list[bool] = []     # 每个指标:撤单没确认(结构化标记)
 
     def count_of(attr: str) -> int:
         return counter_value(daily, attr)
@@ -604,7 +614,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         advanced = False
         cancel_confirmed: bool | None = None     # 撤单指标:我们**自己**那张单撤成功了吗
         cancel_filled = False                      # 撤单指标:演示单其实**成交了**(账户可能多出持仓)
-        cancel_state = ""                          # 撤单指标:演示单的终态归类(filled/partial/rejected/空=查不到)
+        cancel_rejected = False                   # 撤单指标:演示单是**废单**(被柜台拒单 ⇒ 没有挂单、账户无持仓变化)
+        unconfirmed = False                       # 撤单指标:撤单**没确认**(结构化标记,不用整串关键字判断)
         fill_note = ""                             # 成交/部分成交的人话(空 = 没成交)
         stale_base = False                          # 计数基数取旧 → 对照做不成
         blocked_detail = ""                        # 「对照用的那一笔」没发出去时的归因说明
@@ -707,7 +718,6 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                         # 这不是「撤单成功」,账户可能因此多出一笔持仓,必须点出来
                         # (2026-11-16 codex 复核 L4:原先只写「已撤销」,成交会被当成撤销)。
                         cancel_filled = True
-                        cancel_state = "filled"
                         fill_note = "演示单已成交"
                         lines.append("⚠ 演示单**成交了**(不是撤单成功),账户可能多出持仓,请人工核对")
                     elif final is not None and final.status == Status.PARTTRADED:
@@ -715,14 +725,13 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                         # 两个后果都要说。只说「还挂着」会把操作员引去柜台撤单,而忘了核持仓
                         # (2026-11-16 codex 复核 M6)。
                         cancel_filled = True
-                        cancel_state = "partial"
                         fill_note = "演示单部分成交(余量可能仍挂在柜台上)"
                         lines.append("⚠ 演示单**部分成交**,账户可能多出一部分持仓,请人工核对持仓")
                         lines.append("⚠ 演示单余量可能仍挂在柜台上,请人工去柜台核对")
                     elif final is not None and final.status == Status.REJECTED:
                         # 废单:委托被柜台拒了,**压根没上柜台**。说「可能还挂在柜台上」是事实错误
                         # (2026-11-16 codex 复核 L1)。账户没有持仓变化,但撤单确实没成功。
-                        cancel_state = "rejected"
+                        cancel_rejected = True
                         lines.append("⚠ 演示单被拒单(废单):没有挂单,账户无持仓变化")
                 # 撤单计数同样要等回报到达才 +1(撤单回报 → 规则 on_order → 计数 +1)
                 advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, ctx.cancel_wait)
@@ -732,6 +741,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 发第二笔之前再取一次计数:它就是规则**决定放行还是拦截**时看到的那份数字。
             # 「计数已经 ≥ 阈值,而超阈值那笔还是发出去了」= 阈值确实没生效(硬失败)。
             count_before_b = count_of(counter_attr)
+            mark_b = ctx.log_mark()          # 归因只看**这一笔之后**的日志(别把上一笔的算进来)
             b = send(ctx, make_req(ctx, price=probe_price(ctx)))
             if b:
                 made.append(b)
@@ -740,7 +750,16 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 风控规则按顺序判定(ActiveOrderRule 在 DailyLimitRule 之前),别人先拦 ⇒
             # 本项阈值压根没参与,这次对照**做不成** —— 那样就不能说「阈值拦住了委托」
             # (2026-11-16 codex 复核 M2:旧文案在无证据的情况下断言「阈值拦住了委托」)。
-            block_logs_b = ctx.logs_since(mark, "委托被拦截")
+            if not b:
+                # 风控日志是**异步**投递的:`vnpy_riskmanager` 的 `write_log` 走
+                # `event_engine.put(Event(EVENT_LOG, ...))`,采集器在事件线程里收到 ⇒
+                # `send()` 返回时日志通常**还没到**。不等就归因 ⇒ 有证据的
+                # 「本项阈值拦的」会被降级成「没有风控拦截日志」(判不出来),
+                # 而下面又把日志原文写进证据行 ⇒ 摘要与证据**自相矛盾**
+                # (2026-11-16 codex 复核 M-1)。测试用同步事件引擎 + 手工 append 日志,
+                # 抓不到这个竞态,所以这里必须显式等。
+                ctx.wait_until(lambda: bool(ctx.logs_since(mark_b, "委托被拦截")), 2.0)
+            block_logs_b = ctx.logs_since(mark_b, "委托被拦截")
             ours_b = [h for h in block_logs_b if key_word in h]
             if b:
                 block_attrib, block_detail = "", ""
@@ -790,8 +809,9 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 撤单没确认的**后果**分两种:演示单成交了(账户可能多出持仓,要平仓核对)
             # 与演示单可能还挂着(要去柜台撤)。摘要必须分开说,否则会把人引到错的动作上
             # (2026-11-16 codex 复核 M-1)。
+            unconfirmed = True
             stall_reason = (f"撤单未确认({fill_note},账户可能多出持仓,请人工核对持仓)" if cancel_filled
-                            else ("撤单未确认(演示单被拒单:没有挂单,账户无持仓变化)" if cancel_state == "rejected"
+                            else ("撤单未确认(演示单被拒单:没有挂单,账户无持仓变化)" if cancel_rejected
                                   else "撤单未确认(演示单可能仍在柜台上)"))
         elif not advanced:
             stall_reason = f"{label}计数未推进(限时内没有推进)"
@@ -804,6 +824,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         fill_notes.append(fill_note)
         block_attribs.append(block_attrib)
         block_details.append(block_detail)
+        rejected_flags.append(cancel_rejected)
+        unconfirmed_flags.append(unconfirmed)
         shots.append(Shot(label, lines))
 
     if daily is None:
@@ -827,6 +849,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         cancel_hard = hard_flags[-1]
         cancel_fill = fill_notes[-1]
         cancel_block = block_details[-1]
+        cancel_rejected = rejected_flags[-1]
+        cancel_unconfirmed = unconfirmed_flags[-1]
     else:
         shots.append(Shot("撤单总笔数", ["非交易时段委托不会进入可撤状态,撤单阈值无法演示,请在交易时段补测"]))
         cancel_ok = None
@@ -834,10 +858,13 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         cancel_hard = ""
         cancel_fill = ""
         cancel_block = ""
+        cancel_rejected = False
+        cancel_unconfirmed = False
     shots.append(Shot("重复报单总笔数", dup.get("lines", ["(重复报单演示未执行)"])))
     dup_ok = bool(dup.get("ok"))
-    # 重复报单这一项的失败原因:它原来只回一个布尔,失败时摘要里一个字都没有
-    # (2026-11-16 codex 复核 M3)。原因**不能被别的指标盖掉** ⇒ 三个分支都带上它。
+    # 原因串**不带**「重复报单」前缀(step_duplicate 里已去掉),这里统一补上,
+    # 与其它两个指标的「报单:…」「撤单:…」格式对齐;不补前缀会与上面同段的
+    # 「报单:…」「撤单:…」并列时看不出是哪一项(2026-11-16 codex 复核 L8)。
     dup_note = f"重复报单:{dup['reason']}" if (not dup_ok and dup.get("reason")) else ""
     # 计数没推进 = 演示**不可靠**,不是「阈值没生效」:这两种情况必须分开,
     # 否则证据会把「计数异步没跟上」写成「阈值失灵」(2026-11-16 夜盘就踩过这个坑:
@@ -875,8 +902,10 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         # 只跟「账户现在可能多了持仓」有关,漏掉就是把真风险写没了。
         if order_fill or cancel_fill:
             summary += f" ⚠ {order_fill or cancel_fill},账户可能多出持仓,请人工核对持仓"
-        elif "撤单未确认" in reason and "拒单" not in reason:
-            # 废单(被拒)没有挂单,不需要去柜台撤;其余「撤单未确认」才可能是还挂着
+        elif cancel_unconfirmed and not cancel_rejected:
+            # 废单(被拒)没有挂单,不需要去柜台撤;其余「撤单未确认」才可能是还挂着。
+            # 两个判断都用**结构化标记**(cancel_unconfirmed / cancel_rejected),不用整串关键字 ——
+            # 关键字匹配会被别的指标的原因里出现的「拒单」二字误伤(2026-11-16 codex 复核 L3)。
             summary += " ⚠ 演示单可能仍挂在柜台上,请人工去柜台核对"
     elif order_ok and dup_ok and cancel_ok:
         status, summary = PASS, ""
@@ -1544,7 +1573,9 @@ def main(argv: list[str] | None = None) -> int:
         closed = close_engine(main_engine)
         if ctx.notifier is not None:
             ctx.notifier.close()
-    out_dir = args.resume or args.out_dir or (OUT_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S"))
+    # 证据目录名也是**北京时间**:目录里的内容(条目时间、连接记录、清场留痕)都是北京时间,
+    # 目录名若用本机本地时间,同一目录里就会差 16 小时(2026-11-16 codex 复核 L5)。
+    out_dir = args.resume or args.out_dir or (OUT_ROOT / beijing_now().strftime("%Y%m%d-%H%M%S"))
     evidences = merge_evidence(load_evidence(out_dir) if args.resume else {}, book.list())
     cjk = render_all(evidences, out_dir, secrets)
     save_evidence(out_dir, evidences)

@@ -632,6 +632,30 @@ def test_a_legacy_marker_survives_the_next_save(tmp_path):
     assert again.hard_locked_at_legacy is True
 
 
+def test_a_broken_state_version_is_treated_as_an_old_file(tmp_path):
+    """`state_version` 是垃圾值(字符串/None/对象)时,按**旧文件**处理,不能让程序崩。
+
+    2026-11-16 codex 复核 L3:直接 `int(s["state_version"])` 遇到坏值会抛 ValueError,
+    而这个文件在 `_load()` 里 —— 崩了就等于**状态读不出来**,方向上比「保守当旧文件」差得多
+    (读不出来会被上层当成文件损坏 ⇒ 误触硬锁定)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",
+        "state_version": "not-a-number",
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    # 坏版本号 ⇒ 当成旧文件 ⇒ 时间戳不可信 ⇒ 保守拒绝,冷却期要 --force
+    assert g.hard_locked is True
+    assert g.hard_locked_at_legacy is True
+    assert "--force" in g.unlock_cooldown(datetime(2026, 11, 16, 21, 0))
+
+
 def test_an_aware_sample_time_is_converted_to_the_beijing_offset(tmp_path):
     """带时区的采样时刻一律换算到北京时间再落盘(内部契约是 naive 北京时间)。"""
     from datetime import timedelta, timezone
@@ -661,3 +685,52 @@ def test_a_naive_sample_time_in_the_state_file_is_dropped_not_guessed(tmp_path):
     g = AccountGuard(AccountLimits(600, 2000), path)
     assert g.last_sampled_at is None
     assert g.hard_locked is False                    # 不能因此当成状态文件损坏
+
+
+def test_a_new_hard_lock_writes_a_beijing_stamp_and_clears_the_legacy_marker(tmp_path):
+    """新发生的硬锁定:时刻一律写成 `+08:00`,且**不再继承**旧文件的「本地时间」标记。
+
+    2026-11-16 codex 复核(第一轮自查):新锁原先原样写 `now.isoformat()` —— 调用方若传了
+    非北京偏移,存下来的偏移会被后面 `trading_day(fromisoformat(...))` 当成北京时间比交易日
+    (与旧状态文件同一类 fail-open);而且从旧文件升级上来时,新锁会继承 legacy 标记 ⇒
+    冷却期永远要 `--force`(方向保守,但属于「卡住」)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",          # 本机本地时间(旧代码的 datetime.now())
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.hard_locked_at_legacy is True
+
+    g.hard_locked = False                        # 模拟一次**新**的硬锁定
+    g.update(5_000, datetime(2026, 11, 17, 9, 0))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["hard_locked_at"].endswith("+08:00"), saved["hard_locked_at"]
+    assert saved["hard_locked_at_legacy"] is False
+    # 新锁的时刻是北京时间 ⇒ 冷却期可以正常判定,不再一律要 --force
+    assert g.unlock_cooldown(datetime(2026, 11, 18, 9, 0)) == ""
+
+
+def test_an_unusable_sample_time_is_kept_for_the_record(tmp_path):
+    """用不了的采样时刻**留痕**:值被丢掉是保守的,但「曾经有、只是格式不对」不该被抹掉。"""
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",               # 没有时区 ⇒ 用不了
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at is None
+    assert g.sampled_at_unusable == "2026-11-16T21:00:00"
+    g.update(10_000, datetime(2026, 11, 16, 21, 0), sampled_at=datetime(2026, 11, 16, 21, 0))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["sampled_at_unusable"] is None            # 有了可用的采样时刻,旧留痕作废
+    assert saved["sampled_at"] == "2026-11-16T21:00:00+08:00"

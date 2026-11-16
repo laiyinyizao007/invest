@@ -265,8 +265,20 @@ flowchart LR
   ⇒ 现在读盘先 `astimezone(BEIJING)` 换算成同一瞬时再去掉时区(内部契约一律 naive 北京时间),写盘统一走 `_stamp_beijing()`。
   状态文件带 `state_version`:旧文件里的 `hard_locked_at` 是**本机本地时间**,混着比交易日会把解锁冷却期
   **放宽**(fail-open)⇒ 旧文件一律按「触发时间未知」处理(保守拒绝,需 `--force`),这个标记**跟着文件一起存**。
+  **新发生的硬锁定一律走 `_stamp_beijing()`(写 `+08:00`)并复位该标记** —— 否则调用方传了非北京偏移会被
+  当成北京时间比交易日(与上面同一类 fail-open),而且从旧文件升级上来时新锁会继承「未知时间」标记 ⇒ 冷却期永远要 `--force`。
+  采样时刻**用不了**时(格式不对)值被丢掉是保守的(状态页显示「无法确认」而不是「新鲜」),
+  但原值留一份在 `sampled_at_unusable`,免得运维看着状态页变陈旧却查不到任何线索。
   **证据目录里的时间戳一律北京时间**:条目时间、连接记录(`connection_info` 的 `at`)、运行起始、清场留痕 ——
-  混进本机本地时间会让同一个目录里差 16 小时,事后对时间线会打架。
+  混进本机本地时间会让同一个目录里差 16 小时,事后对时间线会打架。**证据目录名本身**也是北京时间
+  (`out_dir`),`scripts/penetration_check.py` 的元数据与报告文件名同理。
+  唯一例外是 `started_wall`:**必须**留本机本地时间 —— vn.py 的 loguru 时间戳是本地时间,
+  改成北京时间会把 P6.1 的日志证据整片过滤掉。
+  **风控日志是异步落的**,归因要等:vnpy_riskmanager 的 `write_log` 走 `event_engine.put`,
+  `send()` 返回时日志可能还没到 ⇒ 发单后必须等水位之后的日志到位(最多 2 秒)再判「谁拦的」,
+  否则会写出「没有风控拦截日志」而证据行里其实有那条 ⇒ 摘要与证据自相矛盾。
+  **状态文件的 `state_version` 读值包 `try/except`**:坏值按旧文件处理,不能让读文件这一步抛异常
+  (上层会把「读不出来」当成「文件损坏」⇒ 误触硬锁定)。
   时区一律用**固定 UTC+8 偏移**而不是 `ZoneInfo("Asia/Shanghai")`:ZoneInfo 依赖时区数据库,Windows 上常常只有
   用户目录里的 `tzdata`,而以 `-I` 隔离模式启动的进程(`dashboard/config.py` 会 import `risk.account_guard`)
   拿不到它 ⇒ 一 import 就崩仪表盘。**全仓库统一**:`risk/account_guard.py`、`dashboard/models.py`、

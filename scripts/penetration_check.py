@@ -24,7 +24,6 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import sys
@@ -43,6 +42,7 @@ from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest  # 
 from vnpy.trader.utility import round_to  # noqa: E402
 
 from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 from notify.webhook import redact  # noqa: E402
 from ctp_tools.simnow import is_simnow_address, normalize_address  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
@@ -190,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     import platform
     import socket
     meta = {
-        "time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "target": note,
+        # 时间戳一律**北京时间**:与其它证据目录(条目时间、连接记录)同一基准,
+        # 宿主机不在北京时不会差 16 小时(2026-11-16 codex 复核 L5)。
+        "time": f"{beijing_now():%Y-%m-%d %H:%M:%S}", "target": note,
         "account": mask_account(env.get("CTP_USERNAME", "")), "symbol": symbol,
         "vnpy": package_version("vnpy"), "vnpy_ctp": package_version("vnpy_ctp"),
         "python": platform.python_version(), "host": socket.gethostname(),
@@ -200,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     report = render_report(run, meta, log_lines, secrets)
     out_dir = Path(args.out_dir) if args.out_dir else REPORT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"penetration-{datetime.now():%Y%m%d-%H%M%S}.md"
+    out = out_dir / f"penetration-{beijing_now():%Y%m%d-%H%M%S}.md"
     out.write_text(report, encoding="utf-8")
     print(f"\n报告已写入 {out}")
     if code == EXIT_OK and run.failed():

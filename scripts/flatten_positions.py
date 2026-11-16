@@ -261,7 +261,9 @@ def manual_positions(positions: list) -> list[str]:
                        "(净持仓没有多空可平,自动发单会变成开仓,请人工核对后平仓)")
             continue
         if name not in ("LONG", "SHORT"):
-            out.append(f"{pos.vt_symbol} 方向未知 {pos.volume} 手"
+            # 措辞与上面那支、与 `probe_position` 统一成「无方向」
+            # (2026-11-16 codex 复核 L8:同一个函数里两种说法,看报告的人会以为是两回事)。
+            out.append(f"{pos.vt_symbol} 无方向 {pos.volume} 手"
                        "(持仓方向认不出来,不会自动发平仓单,请人工核对方向后平仓)")
     return out
 
