@@ -13,6 +13,10 @@ CI 那一步照样绿。而**纪律守卫自己**(tests/test_research_boundary.p
    ——这条是关键:它把「某条防线没跑」从「看不出来」变成「CI 直接红」。
    名单在 `tests/guard_roster.json`(机器可读,守卫与本工具共读同一份)。
 
+**计数一律按报告的「内容」数出来**(第 53 轮 codex M4),不读 `<testsuite>` 的属性:
+属性是**自述**,内容是**事实**——属性写 `failures="0"` 而实际带着 `<failure>`
+的子元素时,读属性就看不出有失败(改报告即可骗过闸门)。
+
 用法:
     python tools/check_ci_ran.py --junitxml REPORT --roster tests/guard_roster.json \
         --suite tests/test_fs_capability_closure.py
@@ -32,27 +36,39 @@ DEFAULT_ROSTER = ROOT / "tests" / "guard_roster.json"
 def _load_report(path: Path) -> tuple[list, int, int, int]:
     """读 junitxml ⇒ (用例列表, 总数, 跳过数, 失败数)。
 
-    pytest 写的根是 `<testsuites>`,里面每个 `<testsuite>` 带
-    `tests`/`skipped`/`failures`/`errors` 四个属性;有的工具写的是单个
-    `<testsuite>` 根——两种都认。
+    **计数一律按报告的「内容」数出来**(第 53 轮 codex M4):
+      - 总数 = `<testcase>` 元素有几个;
+      - 跳过 = `<skipped>` 子元素有几个;
+      - 失败 = `<failure>` + `<error>` 子元素有几个。
+
+    此前**只读 `<testsuite>` 上的属性**(`tests`/`skipped`/`failures`/`errors`)
+    ⇒ 报告写 `failures="0"` 而实际带着 `<failure>` 子元素时,闸门
+    **看不出有失败**(直接放行)——计数与内容脱钩 ⇒ 改报告就能骗过闸门。
+    属性**仍然校验是不是整数**(格式不对 ⇒ 判不了 ⇒ 不放行),
+    但**不再作为计数依据**。
+
+    pytest 写的根是 `<testsuites>`,里面每个 `<testsuite>` 带那四个属性;
+    有的工具写的是单个 `<testsuite>` 根——两种根都认。
     """
     root = ET.parse(path).getroot()
     suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
     cases = list(root.iter("testcase"))
 
-    def _count(attr: str) -> int:
-        total = 0
-        for suite in suites:
-            raw = suite.get(attr, "0")
+    # --- 计数:一律按内容 ---
+    total = len(cases)
+    skipped = len(list(root.iter("skipped")))
+    failed = len(list(root.iter("failure"))) + len(list(root.iter("error")))
+
+    # --- 属性:只做**格式校验**,不做计数依据 ---
+    for suite in suites:
+        for attr in ("tests", "skipped", "failures", "errors"):
+            raw = suite.get(attr)
+            if raw is None:
+                continue
             try:
-                total += int(raw)
+                int(raw)
             except (TypeError, ValueError):
                 raise ValueError("报告里 %s 不是整数:%r" % (attr, raw))
-        return total
-
-    total = _count("tests")
-    skipped = _count("skipped")
-    failed = _count("failures") + _count("errors")
     return cases, total, skipped, failed
 
 
@@ -102,6 +118,19 @@ def _module_name(case) -> str:
     return raw.replace("/", ".")
 
 
+def _cases_of_suite(cases: list, suite_path: str) -> list:
+    """报告里属于**这一份套件**的用例。
+
+    按模块名配对(`tests/test_x.py` ⇒ `tests.test_x`)。用**前缀**匹配:
+    pytest 的 `classname` 在用例被放进 `class` 里时会带上类名
+    (`tests.test_x.TestFoo`)⇒ 精确相等会漏掉它们。
+    """
+    module = _module_of_suite(suite_path)
+    return [case for case in cases
+            if _module_name(case) == module
+            or _module_name(case).startswith(module + ".")]
+
+
 def main(argv: list[str] | None = None) -> int:
     # **Windows 兼容**(第 48 轮):默认控制台是 cp1252,打印中文会抛 UnicodeEncodeError
     # ⇒ 工具"崩"在打印阶段 ⇒ 退出码非 0 ⇒ 看起来像"红了",实际是**没给出结论**。
@@ -139,10 +168,10 @@ def main(argv: list[str] | None = None) -> int:
 
     problems: list[str] = []
     if total == 0:
-        problems.append("一条测试都没跑(报告里 tests=0)")
+        problems.append("一条测试都没跑(报告里没有 <testcase> 元素)")
     if failed > 0:
         problems.append("有 %d 条失败/错误" % failed)
-    if total > 0 and skipped == total:
+    if total > 0 and skipped >= total:
         problems.append("全部 %d 条都被跳过(整份一刀切跳过)" % skipped)
 
     # 名单核对:点名的用例必须**在报告里、且不是 skipped**。
@@ -194,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
             if _is_skipped(case):
                 problems.append("名单点名的用例**被跳过**:%s(%s)"
                                 % (name, _case_name(case)))
+    # 结论行必须**自证**做的是哪种核对(第 53 轮):
+    # 「点名核对 0 条」会被读成「什么都没查」——而这条路径上做的是
+    # 「这一份在报告里跑了几条」,两者不是一回事。
+    checked = "点名核对 %d 条" % len(wanted)
     if args.suite and args.suite not in must_run:
         if not args.allow_unlisted_suite:
             print("[FAIL] 名单里没有 %s 的条目:点名核对一条都做不了 ⇒ 静默降级。"
@@ -202,6 +235,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print("[提示] 名单里没有 %s 的条目(已显式允许):这次只做全局核对(总数/失败/全跳过)"
               % args.suite)
+        # **不在名单里也得真的跑过**(第 53 轮 codex M2):
+        # 显式允许"不做点名核对"≠ 允许"这份套件根本没跑"。
+        # 全局核对只看得见**整份报告**——别的套件跑了就算数 ⇒
+        # 这一份被整份跳过/压根没跑,全局核对照样绿。
+        # 所以这里**单独**盯这一份:它必须在报告里出现,且不能整份被跳过。
+        own = _cases_of_suite(cases, args.suite)
+        if not own:
+            print("[FAIL] 报告里没有 %s 的用例 ⇒ 这一份**没跑**"
+                  "(全局核对看的是整份报告,别的套件跑了就够 ⇒ 挡不住这一份没跑)"
+                  % args.suite)
+            return 1
+        own_skipped = sum(1 for case in own if _is_skipped(case))
+        if own and own_skipped == len(own):
+            print("[FAIL] %s 的 %d 条**全部被跳过**(整份一刀切跳过)" % (args.suite, own_skipped))
+            return 1
+        checked = "%s 在报告里跑了 %d 条(不做点名核对;名单里没有这一份)" % (args.suite, len(own))
     elif args.suite and not wanted:
         print("[FAIL] 名单里 %s 的条目是**空的**:点名核对一条都做不了 ⇒ 静默降级。" % args.suite)
         return 1
@@ -210,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         for problem in problems:
             print("[FAIL] %s" % problem)
         return 1
-    print("[OK ] 该跑的都跑了(点名核对 %d 条)" % len(wanted))
+    print("[OK ] 该跑的都跑了(%s)" % checked)
     return 0
 
 

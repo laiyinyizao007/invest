@@ -2448,6 +2448,126 @@ def test_the_core_closure_suites_are_actually_run_by_the_ci_gate(suite):
         f"(实测的 pytest 命令: {commands})")
 
 
+# ---------------------------------------------------------------------------
+# CI ↔ 闸门的**接线**(第 53 轮 codex 第 2 轮 M3)
+#
+# 「真的跑了吗」这道闸门要成立,前提是三件事同时为真:
+#   ①pytest 真的把报告写出来了(⇒ 写之前必须先 `rm -f` 掉上一轮的残留,
+#     否则 pytest 崩在写文件之前时,闸门读到的是**陈旧报告**,看着全绿其实什么都没跑);
+#   ②闸门读的是**同一份**报告(路径必须一模一样);
+#   ③点名的套件**真的**在那一步里跑了。
+# 这三件事此前**全靠人记**:workflow 改一行(比如把 `rm -f` 删了),
+# 没有任何一条用例会红——而那正是"闸门看上去配好了,实际没跑"的入口。
+# ---------------------------------------------------------------------------
+
+def _ci_step_scripts() -> list[tuple[str, list[str]]]:
+    """workflow 里每个带 `run:` 的 step ⇒ (步骤名, 逻辑命令行列表)。
+
+    用 YAML 解析(研究侧依赖里就有 pyyaml——见 requirements-research.txt:
+    「【仅测试期需要】Preset 的**结构**断言要解析 YAML」)。
+    续行(行尾 `\\`)会被合并成一条逻辑命令行。
+    """
+    import yaml
+
+    data = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    steps: list[tuple[str, list[str]]] = []
+    for job in (data.get("jobs") or {}).values():
+        for step in (job.get("steps") or []):
+            script = str(step.get("run") or "")
+            if not script:
+                continue
+            steps.append((str(step.get("name") or ""), _logical_commands(script)))
+    return steps
+
+
+def _logical_commands(script: str) -> list[str]:
+    """把一段 shell 脚本拆成**逻辑命令行**(续行合并、注释与空行丢掉)。"""
+    commands: list[str] = []
+    buf = ""
+    for raw in script.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        buf = f"{buf} {line}".strip() if buf else line
+        if buf.endswith("\\"):
+            buf = buf[:-1].strip()
+            continue
+        commands.append(buf)
+        buf = ""
+    if buf:
+        commands.append(buf)
+    return commands
+
+
+def _junit_paths(command: str) -> list[str]:
+    """这条命令行里 `--junitxml=` 指向的报告路径。"""
+    return re.findall(r"--junitxml[=\s]+\"?([^\s\"\\]+)", command)
+
+
+def test_every_junit_report_is_deleted_before_pytest_writes_it():
+    """每份 junit 报告都必须在**写之前**删掉上一轮的残留。
+
+    否则:pytest 崩在写文件之前 ⇒ 闸门去读的是**上一轮的陈旧报告**,
+    看着全绿其实这一轮什么都没跑(codex 第 2 轮 L4 那条洞的接线面)。
+    """
+    problems: list[str] = []
+    for step_name, commands in _ci_step_scripts():
+        for index, command in enumerate(commands):
+            for path in _junit_paths(command):
+                earlier = commands[:index]
+                if not any("rm -f" in c and path in c for c in earlier):
+                    problems.append(f"步骤「{step_name}」:报告 {path} 写之前没有 rm -f")
+    assert not problems, "；".join(problems)
+
+
+def test_every_junit_report_is_handed_to_the_gate():
+    """每份 junit 报告都必须**交给闸门**核对(否则写报告只是装饰)。
+
+    路径必须**一模一样**:闸门读的是另一份文件 ⇒ 报告与结论无关,
+    「真的跑了吗」这道闸门就名存实亡。
+    """
+    problems: list[str] = []
+    for step_name, commands in _ci_step_scripts():
+        for index, command in enumerate(commands):
+            if "python -m pytest" not in command:
+                continue
+            for path in _junit_paths(command):
+                later = commands[index + 1:]
+                handed = any("check_ci_ran.py" in c and path in c for c in later)
+                if not handed:
+                    problems.append(f"步骤「{step_name}」:报告 {path} 没有交给 check_ci_ran.py 核对")
+    assert not problems, "；".join(problems)
+
+
+def test_the_approval_ledger_and_collect_suites_have_a_report_the_gate_checks():
+    """第 53 轮(codex 第 2 轮 M2):这两份套件必须**有报告级兜底**。
+
+    `tests/test_approval_ledger.py`(批准账本只读模块)与
+    `tests/test_research_collect.py`(收菜)此前只是「被 pytest 跑了一下」,
+    那一步**没有** `--junitxml`、也没有闸门 ⇒ 整份被跳过时退出码仍是 0 ⇒
+    CI 照样绿。这两份正是真钱链路上的两道关口(批准账本 / 收菜),
+    它们的用例在 CI 上没人核对。
+    """
+    for suite in ("tests/test_approval_ledger.py", "tests/test_research_collect.py"):
+        holders = [
+            (step_name, commands)
+            for step_name, commands in _ci_step_scripts()
+            if any("python -m pytest" in c and suite in c for c in commands)
+        ]
+        assert holders, f"{suite} 不在任何 CI 步骤里跑(连 pytest 都没有)"
+        covered = False
+        for step_name, commands in holders:
+            for index, command in enumerate(commands):
+                if "python -m pytest" not in command or suite not in command:
+                    continue
+                paths = _junit_paths(command)
+                assert paths, f"步骤「{step_name}」:跑 {suite} 的那一步没有产出 junit 报告"
+                later = commands[index + 1:]
+                if any("check_ci_ran.py" in c and any(p in c for p in paths) for c in later):
+                    covered = True
+        assert covered, f"{suite} 的报告没有交给闸门核对"
+
+
 def test_the_trading_stack_marks_are_justified_and_never_blanket():
     """`@requires_trading_stack` 要**逐条有理由**,不许一刀切。
 

@@ -257,6 +257,195 @@ def test_a_report_with_a_non_numeric_count_fails_instead_of_crashing(tmp_path):
     ]) == 1
 
 
+# --------------------------------------------------------------------------
+# 第 53 轮(codex 第 2 轮 M4):计数必须按报告的**内容**数,不读属性
+# --------------------------------------------------------------------------
+
+def _write_report_with_attributes(tmp_path: Path, cases_xml: str, attrs: str) -> Path:
+    """写一份**属性与内容对不上**的报告(属性是"自述",内容才是"事实")。"""
+    path = tmp_path / "report.xml"
+    path.write_text(
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<testsuites><testsuite name="t" %s>%s</testsuite></testsuites>' % (attrs, cases_xml),
+        encoding="utf-8")
+    return path
+
+
+def test_the_counts_come_from_the_report_content_not_the_attributes(tmp_path):
+    """计数必须**按内容**数出来(第 53 轮 codex M4)。
+
+    此前计数只读 `<testsuite>` 上的属性 ⇒ 属性写 `failures="0"` 而实际带着
+    `<failure>` 子元素时,闸门**看不出有失败**——改报告就能骗过它。
+    这里直接钉住 `_load_report` 的返回值:总数/跳过/失败三项**都来自内容**。
+    """
+    module = _load_tool()
+    report = _write_report_with_attributes(
+        tmp_path,
+        '<testcase name="test_a" classname="tests.test_x"/>'
+        '<testcase name="test_b" classname="tests.test_x"><failure message="boom"/></testcase>'
+        '<testcase name="test_c" classname="tests.test_x"><skipped/></testcase>',
+        'tests="99" skipped="0" failures="0" errors="0"')
+    cases, total, skipped, failed = module._load_report(report)
+    assert total == 3, "总数必须按 <testcase> 元素数出来(不是属性里的 99)"
+    assert skipped == 1, "跳过数必须按 <skipped> 子元素数出来(不是属性里的 0)"
+    assert failed == 1, "失败数必须按 <failure>/<error> 子元素数出来(不是属性里的 0)"
+    assert len(cases) == 3
+
+
+def test_a_report_whose_attributes_hide_a_failure_fails(tmp_path, capsys):
+    """拦截侧:属性说「没有失败」而内容里有 `<failure>` ⇒ **红**。
+
+    这是 M4 那条洞的直接反例:旧实现读属性 ⇒ 直接放行。
+    """
+    module = _load_tool()
+    report = _write_report_with_attributes(
+        tmp_path,
+        '<testcase name="test_a" classname="tests.test_x"/>'
+        '<testcase name="test_b" classname="tests.test_x"><failure message="boom"/></testcase>',
+        'tests="2" skipped="0" failures="0" errors="0"')
+    roster = _write_roster(tmp_path, {"tests/test_x.py": ["test_a", "test_b"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+    ]) == 1
+    out = capsys.readouterr().out
+    assert "有 1 条失败/错误" in out, "失败数必须按内容数出来(输出:%s)" % out
+
+
+def test_a_report_whose_attributes_hide_a_skip_fails(tmp_path, capsys):
+    """拦截侧:属性说「没有跳过」而内容里整份都被 `<skipped>` ⇒ **红**。
+
+    旧实现读属性 ⇒ `skipped=0` ⇒ 「全部被跳过」这条检查**不触发** ⇒ 放行。
+    """
+    module = _load_tool()
+    report = _write_report_with_attributes(
+        tmp_path,
+        '<testcase name="test_a" classname="tests.test_x"><skipped/></testcase>',
+        'tests="1" skipped="0" failures="0" errors="0"')
+    roster = _write_roster(tmp_path, {"tests/test_x.py": ["test_a"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+    ]) == 1
+    out = capsys.readouterr().out
+    assert "都被跳过" in out, "跳过数必须按内容数出来(输出:%s)" % out
+
+
+def test_a_report_with_no_testcases_fails_even_when_the_attributes_claim_tests(tmp_path, capsys):
+    """拦截侧:属性写 `tests="5"` 而报告里**一条 `<testcase>` 都没有** ⇒ 红。
+
+    「一条都没跑」这条判据必须**按内容**判:属性说 5 条不算数。
+    """
+    module = _load_tool()
+    report = _write_report_with_attributes(tmp_path, "", 'tests="5" skipped="0" failures="0" errors="0"')
+    roster = _write_roster(tmp_path, {"tests/test_x.py": ["test_a"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+    ]) == 1
+    out = capsys.readouterr().out
+    assert "一条测试都没跑" in out, "「一条都没跑」必须按内容判(输出:%s)" % out
+
+
+def test_an_unlisted_suite_that_did_not_run_fails(tmp_path):
+    """拦截侧:显式允许「不做点名核对」**不等于**允许「这份套件没跑」。
+
+    全局核对看的是**整份报告**——别的套件跑了就够 ⇒ 挡不住这一份压根没跑。
+    """
+    module = _load_tool()
+    report = _write_report(tmp_path, [{"name": "test_a", "classname": "tests.some_other_module"}])
+    roster = _write_roster(tmp_path, {"tests/test_other.py": ["test_a"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+        "--allow-unlisted-suite",
+    ]) == 1
+
+
+def test_an_unlisted_suite_that_was_entirely_skipped_fails(tmp_path):
+    """拦截侧:不在名单里的那一份**整份被跳过** ⇒ 红。
+
+    「整份一刀切跳过时 pytest 退出码仍是 0」——这正是这道闸门存在的理由,
+    名单外的套件同样适用。
+
+    报告里**故意再放一条别的套件的通过用例**:否则全局的「全部被跳过」
+    就会先一步挡住,这条用例就分不清是**哪一条**判据在起作用。
+    """
+    module = _load_tool()
+    report = _write_report(tmp_path, [
+        {"name": "test_a", "skipped": True},
+        {"name": "test_b", "classname": "tests.some_other_module"},
+    ])
+    roster = _write_roster(tmp_path, {"tests/test_other.py": ["test_b"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+        "--allow-unlisted-suite",
+    ]) == 1
+
+
+def test_an_unlisted_suite_that_ran_among_others_passes(tmp_path):
+    """放行侧:这一份**确实跑了**(只是不在名单里)⇒ 0。
+
+    没有这一条,上一条就可能是「凡不在名单里的一律红」的假红。
+    """
+    module = _load_tool()
+    report = _write_report(tmp_path, [
+        {"name": "test_a"},
+        {"name": "test_b", "classname": "tests.some_other_module"},
+    ])
+    roster = _write_roster(tmp_path, {"tests/test_other.py": ["test_b"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+        "--allow-unlisted-suite",
+    ]) == 0
+
+
+def test_the_conclusion_line_says_which_check_ran_for_an_unlisted_suite(tmp_path, capsys):
+    """结论行必须**自证**做的是哪种核对(放行侧)。
+
+    名单外那条路径做的是「这一份在报告里跑了几条」,**不是**「点名核对」——
+    结论行若写成「点名核对 0 条」,读的人会以为**什么都没查**
+    (仓库的老教训:结论行必须自证,不能只给退出码)。
+    """
+    module = _load_tool()
+    report = _write_report(tmp_path, [
+        {"name": "test_a"},
+        {"name": "test_b", "classname": "tests.some_other_module"},
+    ])
+    roster = _write_roster(tmp_path, {"tests/test_other.py": ["test_b"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+        "--allow-unlisted-suite",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "在报告里跑了 1 条" in out, "结论行必须说清这条路径上做的是哪种核对(输出:%s)" % out
+    assert "点名核对 0 条" not in out, "结论行不能自称「点名核对 0 条」(读起来像什么都没查)"
+
+
+def test_the_conclusion_line_says_the_named_checks_for_a_rostered_suite(tmp_path, capsys):
+    """放行侧:在名单里的那一份,结论行必须报出**点名核对了几条**。"""
+    module = _load_tool()
+    report = _write_report(tmp_path, [{"name": "test_a", "classname": "tests.test_x"}])
+    roster = _write_roster(tmp_path, {"tests/test_x.py": ["test_a"]})
+    assert module.main([
+        "--junitxml", str(report),
+        "--roster", str(roster),
+        "--suite", "tests/test_x.py",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "点名核对 1 条" in out, "结论行必须报出点名核对的条数(输出:%s)" % out
+
+
 def test_the_real_roster_is_readable_and_not_empty():
     """仓库里那份名单必须**存在**且非空(否则 CI 侧那道闸门查了个空)。"""
     roster = ROOT / "tests" / "guard_roster.json"
