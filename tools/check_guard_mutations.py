@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,7 +47,12 @@ ROOT = Path(__file__).resolve().parent.parent
 # ADR 变异表的核对口径**两个脚本共用**(第 49 轮:此前两处各写一份,
 # 同名函数口径不同——一处有反向断言、一处没有)。
 sys.path.insert(0, str(ROOT / "tools"))
-from check_mutations import cleanup_temp_dir, verify_mutation_table  # noqa: E402
+from check_mutations import (  # noqa: E402
+    cleanup_temp_dir,
+    copy_repo,
+    run_outcome,
+    verify_mutation_table,
+)
 
 BOUNDARY = "tests/test_research_boundary.py"
 CLOSURE = "tests/test_fs_capability_closure.py"
@@ -361,6 +365,13 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
     **为什么把"收集错误"单独拎出来**:变异把文件改成语法错误时,pytest 在**收集阶段**
     就炸,一条 FAILED 都不会有——那与"守卫没抓住"在退出码上无法区分。
     前者是**变异规格写错了**(脚本自己该红),后者是**守卫有洞**(也该红,但要分开说)。
+
+    **第 52 轮(codex 第 2 轮 M1/L2)**:这个分类此前是**本文件自己写的一套**
+    (`line.startswith("ERROR") or " errors" in line and "error" in line.lower()`),
+    与 `tools/check_mutations.py` 那套**同名不同义**——同一份 pytest 输出,
+    两个脚手架可能给出**相反**的结论。现在**共用同一份实现**
+    (`check_mutations.run_outcome`):退出码 0 且无失败 ⇒ ok;退出码 1 且**有** FAILED ⇒ ok;
+    退出码 1 却一条 FAILED 没有(收集阶段炸了)或退出码 ≥ 2 ⇒ spec_broken。
     """
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
@@ -371,8 +382,6 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
     )
     output = proc.stdout + proc.stderr
     failed = [line for line in proc.stdout.splitlines() if line.startswith("FAILED")]
-    errors = [line for line in proc.stdout.splitlines()
-              if line.startswith("ERROR") or " errors" in line and "error" in line.lower()]
     # **见证用例的 nodeid**:pytest 的短摘要行是 "FAILED tests/x.py::test_y - 原因",
     # 取 " - " 之前的部分就是 nodeid(第 49 轮 codex M3:必须能指名道姓)。
     failed_nodes: list[str] = []
@@ -382,60 +391,32 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
             failed_nodes.append(node)
     return {
         "failed": len(failed),
-        "errors": len(errors),
         "output": output,
         "failed_nodes": failed_nodes,
         "returncode": proc.returncode,
         "passed": _passed_count(output),
+        # **共用**分档那套脚手架的判定(第 52 轮):不再自己写一套关键词启发式。
+        "outcome": run_outcome(len(failed), proc.returncode),
     }
 
 
-def _passed_count(output: str) -> int:
+def _passed_count(output: str) -> int | None:
     """从 pytest 的摘要行里读出**通过数**(绿对照要比基线,codex M4)。
 
     从**末尾**往前找:摘要行在最后,而 FAILED 行里也可能出现 "passed" 字样。
+
+    **第 52 轮(codex 第 2 轮 L1)**:读不出来时返回 `None`(此前返回 `-1`)。
+    `-1` 与 `-1` **相等** ⇒ 绿对照的 `res["passed"] == base` 在「两边都没读出来」时
+    **恒真** ⇒ 绿对照变成空转的。现在 `None` 与任何数都不相等,
+    且判定处额外要求 `base > 0`(基线必须真的跑过用例)。
     """
     for line in reversed(output.splitlines()):
         match = re.search(r"(\d+) passed", line)
         if match:
             return int(match.group(1))
-    return -1
+    return None
 
 
-def _copy_repo(dest: Path) -> None:
-    """复制一份够用的仓库副本(与 `tools/check_mutations.py` 同口径)。
-
-    **必须建一个 git 仓库**:守卫里有探针是走 git 的(`git ls-files`),
-    没有 .git 时它们会直接报错——那不是探针在工作,是环境坏了,
-    两者在「红了」这件事上无法区分。
-
-    **`.github/` 也要复制**:守卫会读 `research-guard.yml`(接线守卫),
-    缺了它那条守卫会**因为读不到文件而报错**——看起来像"变异被抓住",
-    其实是环境坏了(假绿)。`tests/guard_roster.json` 在 tests/ 里 ✓。
-    """
-    for rel in ("tools", "tests", "risk", "scripts", "config", "docs", "strategies",
-                "trading", "ctp_tools", "notify", "dashboard", "evidence",
-                "pending_strategies", "pyproject.toml", ".github",
-                "Dockerfile", "docker-compose.yml", "docker-compose.research.yml",
-                "requirements.txt", "requirements-research.txt", "requirements-dashboard.txt",
-                "CLAUDE.md", "CHANGELOG.md", "PROJECTWIKI.md", "README.md",
-                ".gitignore"):
-        src = ROOT / rel
-        if not src.exists():
-            continue
-        dst = dest / rel
-        if src.is_dir():
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__"))
-        else:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-
-    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
-               GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-    for cmd in (["git", "init", "-q", "-b", "main"],
-                ["git", "add", "-A"],
-                ["git", "commit", "-q", "-m", "baseline"]):
-        subprocess.run(cmd, cwd=str(dest), check=True, env=env, capture_output=True)
 
 
 def _read_text(path: Path) -> tuple[str, str]:
@@ -523,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
     repo = tmp / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     try:
-        _copy_repo(repo)
+        copy_repo(repo)
 
         # **基线**:两份套件各跑一遍,必须全绿。
         # 见证用例在基线里就该绿——否则"红了"分不清是变异造成的还是本来就红
@@ -531,8 +512,26 @@ def main(argv: list[str] | None = None) -> int:
         baselines: dict[tuple[str, ...], int] = {}
         for targets in ((BOUNDARY,), (TOOL_TEST,)):
             res = _run_tests(repo, list(targets))
-            if res["failed"] or res["errors"] or res["returncode"] != 0:
+            # **基线必须全绿**:一条失败都不许有。
+            #
+            # **这里不能拿 `outcome` 当判据**(第 52 轮实测踩到的坑):
+            # `run_outcome` 的 "ok" 覆盖两种情况——「退出码 0 且无失败」**与**
+            # 「退出码 1 且**有** FAILED」(对变异脚手架来说那是"探针在工作")。
+            # 但对**基线**来说,「有 FAILED」恰恰是**环境坏了**(名单过期、
+            # 守卫本身红了),必须停下报退出码 2。
+            # 本轮第一次写这里时用了 `outcome != "ok"` ⇒ **红基线被当成了绿基线**,
+            # 脚手架据此说「全绿」——**假绿**。它是被那条「无害改动必须保持绿」的
+            # 反向对照逮住的(改完之后绿对照自己红了,才暴露出基线本来就是红的)。
+            if res["failed"] or res["returncode"] != 0:
                 print("基线(未变异的副本)就有测试失败/收集错误,变异验证无从谈起:", file=sys.stderr)
+                print(res["output"][-2000:], file=sys.stderr)
+                return 2
+            # **基线必须真的跑过用例**(第 52 轮 codex L1):
+            # 通过数读不出来(None)或读到 0 ⇒ 「全绿」是空话(可能整份被跳过),
+            # 绿对照就没有基准可比 ⇒ 退出码 2(环境不可用)。
+            if not res["passed"] or res["passed"] <= 0:
+                print("基线(未变异的副本)读不出通过数(读到了 %r):"
+                      "「全绿」无从谈起,变异验证无从谈起:" % res["passed"], file=sys.stderr)
                 print(res["output"][-2000:], file=sys.stderr)
                 return 2
             baselines[targets] = res["passed"]
@@ -565,7 +564,9 @@ def main(argv: list[str] | None = None) -> int:
             res = _run_tests(repo, run_targets)
             path.write_bytes(orig)
 
-            if res["errors"]:
+            # **共用**分档那套的判定(第 52 轮 codex M1/L2):
+            # spec_broken = 变异把文件改到收集阶段就炸了 ⇒ 变异规格写错了(不是守卫有洞)。
+            if res["outcome"] == "spec_broken":
                 print("  [跳过] %s:变异把文件改到收集阶段就报错了(变异规格写错了)" % label,
                       file=sys.stderr)
                 print(res["output"][-1500:], file=sys.stderr)
@@ -583,7 +584,14 @@ def main(argv: list[str] | None = None) -> int:
                     problems.append(label)
             else:
                 base = baselines.get(tuple(spec["targets"]))
-                same = base is not None and res["passed"] == base
+                # **绿对照不许空转**(第 52 轮 codex L1):
+                # 此前 `same = base is not None and res["passed"] == base`,
+                # 而 `_passed_count` 读不出来时返回 -1 ⇒ **-1 == -1 恒真**
+                # ⇒ 「没跑用例」会被算成「与基线一致」⇒ 绿对照什么也没证明。
+                # 现在:通过数必须**读得出来**、**大于 0**、且与基线**相等**。
+                same = (base is not None and base > 0
+                        and res["passed"] is not None and res["passed"] > 0
+                        and res["passed"] == base)
                 ok = res["failed"] == 0 and res["returncode"] == 0 and same
                 mark = "OK " if ok else "!! "
                 print("  [%s保持绿] %s(通过数 %s,基线 %s)" % (mark, label, res["passed"], base))

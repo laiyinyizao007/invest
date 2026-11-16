@@ -324,3 +324,196 @@ def test_the_real_adr_table_matches_the_scripts_labels() -> None:
     assert cgm._verify_adr(results) == 0, (
         "ADR 里的变异表与脚本的标签对不上——改脚本里的标签时必须同步改 ADR 那一行"
     )
+
+
+# --------------------------------------------------------------------------
+# 第 52 轮(codex 第 2 轮):脚手架自己的判定路径要有覆盖 + 两套脚手架共用一份实现
+# --------------------------------------------------------------------------
+
+def test_both_harnesses_share_one_outcome_classifier() -> None:
+    """两个脚手架必须共用**同一份**「这次 pytest 算不算抓住」的判定。
+
+    此前纪律守卫那套**自己写了一套**关键词启发式
+    (`line.startswith("ERROR") or " errors" in line and "error" in line.lower()`),
+    与分档那套的 `_run_outcome` **同名不同义**——同一份 pytest 输出,
+    两个脚手架可能给出**相反**的结论。这正是仓库的教训:「同一个问题两个答案」。
+    """
+    assert cgm.run_outcome is cm.run_outcome
+
+
+def test_both_harnesses_share_one_copy_repo() -> None:
+    """仓库复制也必须**只有一份实现**。
+
+    此前各写一份:分档那套**不复制** `.github/`,纪律守卫那套复制。
+    ⇒ 同一件事两个答案 ⇒ 迟早只改一边(而 `.github` 恰恰是接线守卫要读的东西)。
+    """
+    assert cgm.copy_repo is cm.copy_repo
+
+
+def test_the_shared_copy_repo_carries_the_ci_workflow(tmp_path: Path, monkeypatch) -> None:
+    """**动态探针**:共用那份复制实现必须把 `.github/` 也带过去。
+
+    接线守卫(`tests/test_research_boundary.py` 里那条)会**读**
+    `.github/workflows/research-guard.yml`。副本里缺了它,那条守卫会
+    **因为读不到文件而报错**——看起来像「变异被抓住」,其实是环境坏了(假绿)。
+    """
+    fake_root = tmp_path / "fake_root"
+    (fake_root / ".github" / "workflows").mkdir(parents=True)
+    (fake_root / ".github" / "workflows" / "research-guard.yml").write_text(
+        "name: fake\n", encoding="utf-8")
+    (fake_root / "tools").mkdir()
+    (fake_root / "tools" / "t.py").write_text("x = 1\n", encoding="utf-8")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(cm, "ROOT", fake_root)
+
+    cm.copy_repo(dest)
+
+    assert (dest / ".github" / "workflows" / "research-guard.yml").is_file(), (
+        "副本里没有 CI workflow ⇒ 接线守卫读不到文件,会假绿")
+    assert (dest / "tools" / "t.py").is_file()
+
+
+# --------------------------------------------------------------------------
+# `main()` 的判定路径(codex 第 2 轮 H2:此前**零覆盖**)
+#
+# 此前 `tests/test_check_guard_mutations.py` 从不调 `cgm.main()`——
+# 「红/绿判定」这条路径**一次都没被跑过**。codex 的 H2 说得直接:
+# 唯一的绿对照抓不住它声称要抓的退化,而没人知道,因为那条路径没人测。
+#
+# 这里用**极小的假仓库**(两份只有一条用例的套件)把 `main()` 真跑一遍:
+#   拦截侧:明知抓不住的变异 ⇒ 必须返回 **1**(不是 0)
+#   放行侧:确实把见证用例打红的变异 ⇒ 必须返回 **0**
+# 两头都要有,否则这条用例自己也是空转的。
+# --------------------------------------------------------------------------
+
+def _fake_repo(dest: Path) -> None:
+    """造一个**极小**的仓库副本:两份只有一条用例的套件 + 一个被改的文件。"""
+    (dest / "tests").mkdir(parents=True, exist_ok=True)
+    # 钉住 rootdir,免得 pytest 往上找到别的配置文件
+    (dest / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (dest / "tests" / "test_fake_boundary.py").write_text(
+        "def test_witness():\n    assert True\n", encoding="utf-8")
+    (dest / "tests" / "test_fake_tool.py").write_text(
+        "def test_tool():\n    assert True\n", encoding="utf-8")
+    (dest / "guard_target.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+
+def _run_main_with(monkeypatch, mutations, witnesses) -> int:
+    """把脚手架的「输入」换成一组极小的假规格,再真跑一遍 `main()`。"""
+    monkeypatch.setattr(cgm, "MUTATIONS", mutations)
+    monkeypatch.setattr(cgm, "WITNESSES", witnesses)
+    monkeypatch.setattr(cgm, "BOUNDARY", "tests/test_fake_boundary.py")
+    monkeypatch.setattr(cgm, "TOOL_TEST", "tests/test_fake_tool.py")
+    monkeypatch.setattr(cgm, "copy_repo", _fake_repo)
+    return cgm.main([])
+
+
+def test_main_returns_1_when_a_mutation_is_not_caught(monkeypatch, capsys) -> None:
+    """**拦截侧**:明知抓不住的变异 ⇒ `main()` 必须返回 **1**(不是 0)。
+
+    这条变异改的是 `guard_target.py`(一个跟见证用例无关的文件)⇒
+    见证用例照常绿 ⇒ 脚手架**没有**抓住它 ⇒ 必须报"守卫有洞"并返回 1。
+    """
+    mutations = [{
+        "label": "抓不住的变异",
+        "rel": "guard_target.py",
+        "edits": [("VALUE = 1", "VALUE = 2")],
+        "targets": ["guard_target.py"],
+        "expect": "red",
+    }]
+    witnesses = {"抓不住的变异": "tests/test_fake_boundary.py::test_witness"}
+
+    assert _run_main_with(monkeypatch, mutations, witnesses) == 1
+    capsys.readouterr()
+
+
+def test_main_returns_0_when_the_witness_goes_red(monkeypatch, capsys) -> None:
+    """**放行侧**:变异确实把见证用例打红 ⇒ `main()` 必须返回 **0**。
+
+    没有这一条,上面那条就可能是「`main()` 一律返回 1」的假红——
+    那本身也是一种空转。
+    """
+    mutations = [{
+        "label": "抓得住的变异",
+        "rel": "tests/test_fake_boundary.py",
+        "edits": [("assert True", "assert False")],
+        "targets": ["tests/test_fake_boundary.py"],
+        "expect": "red",
+    }]
+    witnesses = {"抓得住的变异": "tests/test_fake_boundary.py::test_witness"}
+
+    assert _run_main_with(monkeypatch, mutations, witnesses) == 0
+    capsys.readouterr()
+
+
+def test_main_refuses_when_a_red_mutation_has_no_witness(monkeypatch, capsys) -> None:
+    """**放行侧(另一头)**:「应该变红」的变异没钉见证 ⇒ 退出码 **2**(环境不可用)。
+
+    没有见证就不知道该跑谁 ⇒ 只能数「红了几条」⇒ 走错原因的红会被算成抓住了。
+    这条路径此前也没被覆盖过。
+    """
+    mutations = [{
+        "label": "没钉见证的变异",
+        "rel": "guard_target.py",
+        "edits": [("VALUE = 1", "VALUE = 2")],
+        "targets": ["guard_target.py"],
+        "expect": "red",
+    }]
+    monkeypatch.setattr(cgm, "MUTATIONS", mutations)
+    monkeypatch.setattr(cgm, "WITNESSES", {})
+
+    assert cgm.main([]) == 2
+    capsys.readouterr()
+
+
+def test_main_returns_0_when_the_green_control_stays_green(monkeypatch, capsys) -> None:
+    """**绿对照侧(保持绿)**:无害改动没有弄红套件 ⇒ `main()` 必须返回 **0**。
+
+    这是绿对照判定的**放行侧**。没有这一条,「绿对照一律判成不合格」
+    (比如把 `ok` 写死成 `False`)的脚本照样能返回 0 —— 脚手架就变成了
+    「一律报红」,而没人知道,因为那条路径没人测(第 52 轮 codex H2)。
+    """
+    mutations = [{
+        "label": "无害改动(套件仍绿)",
+        "rel": "guard_target.py",
+        "edits": [("VALUE = 1", "VALUE = 2")],
+        "targets": ["tests/test_fake_tool.py"],
+        "expect": "green",
+    }]
+
+    assert _run_main_with(monkeypatch, mutations, {}) == 0
+    capsys.readouterr()
+
+
+def test_main_returns_1_when_the_green_control_goes_red(monkeypatch, capsys) -> None:
+    """**绿对照侧(变红)**:本该无害的改动竟然弄红了套件 ⇒ `main()` 必须返回 **1**。
+
+    这是绿对照判定的**拦截侧**。没有这一条,「绿对照一律判成合格」
+    (比如把 `ok` 写死成 `True`)的脚本会把「无害改动弄红了套件」也说成通过。
+    两头都要有,这条用例自己才不是空转的。
+    """
+    mutations = [{
+        "label": "本该无害的改动(竟然弄红)",
+        "rel": "tests/test_fake_tool.py",
+        "edits": [("assert True", "assert False")],
+        "targets": ["tests/test_fake_tool.py"],
+        "expect": "green",
+    }]
+
+    assert _run_main_with(monkeypatch, mutations, {}) == 1
+    capsys.readouterr()
+
+
+def test_the_green_control_cannot_be_vacuous() -> None:
+    """绿对照的「与基线一致」不许在**读不出通过数**时成立(第 52 轮 codex L1)。
+
+    `_passed_count` 读不出时返回 `None`(此前返回 `-1`)⇒ `-1 == -1` 恒真
+    ⇒ 「什么都没跑」会被算成「与基线一致」⇒ 绿对照什么也没证明。
+    """
+    assert cgm._passed_count("") is None
+    assert cgm._passed_count("no summary here") is None
+    assert cgm._passed_count("1 passed, 2 warnings in 0.10s") == 1
+    # 旧行为返回 -1:两个 -1 相等 ⇒ 恒真
+    assert -1 == -1
+

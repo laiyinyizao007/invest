@@ -186,7 +186,7 @@ def cleanup_temp_dir(path: Path) -> None:
               file=sys.stderr)
 
 
-def _run_outcome(failed: int, returncode: int) -> str:
+def run_outcome(failed: int, returncode: int) -> str:
     """把一次 pytest 的结果分类(第 50 轮):'ok' 或 'spec_broken'。
 
     **为什么要分这一类**:pytest 的退出码分不出「用例失败」与「收集阶段就炸了」。
@@ -231,7 +231,7 @@ def _run_tests(cwd: Path) -> tuple[int, str, int]:
     return len(failed), proc.stdout, proc.returncode
 
 
-def _copy_repo(dest: Path) -> None:
+def copy_repo(dest: Path) -> None:
     """复制一份够用的仓库副本。
 
     **必须建一个 git 仓库**:测试里有几条探针是走 git 的
@@ -242,6 +242,11 @@ def _copy_repo(dest: Path) -> None:
     for rel in ("tools", "tests", "risk", "scripts", "config", "docs", "strategies",
                 "trading", "ctp_tools", "notify", "dashboard", "evidence",
                 "pending_strategies", "pyproject.toml",
+                # `.github/` 也要复制(第 52 轮):守卫里有探针**读**这个 workflow
+                # (接线守卫)。缺了它,那条守卫会**因为读不到文件而报错**——
+                # 看起来像「变异被抓住」,其实是环境坏了(假绿)。
+                # 此前只有纪律守卫那套脚手架复制了它,分档这套没有 ⇒ 两套口径不一致。
+                ".github",
                 # 清单里点名的这些也必须复制过去,否则存在性探针会误报
                 "Dockerfile", "docker-compose.yml", "docker-compose.research.yml",
                 "requirements.txt", "requirements-research.txt", "requirements-dashboard.txt",
@@ -310,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     repo = tmp / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     try:
-        _copy_repo(repo)
+        copy_repo(repo)
 
         baseline, out, base_rc = _run_tests(repo)
         if baseline != 0 or base_rc != 0:
@@ -338,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             n, _, rc = _run_tests(repo)
             (repo / rel).write_text(orig, encoding="utf-8")
 
-            if _run_outcome(n, rc) == "spec_broken":
+            if run_outcome(n, rc) == "spec_broken":
                 # **收集阶段就炸**:pytest 退出码非 0 且一条 FAILED 都没有
                 # ⇒ 不是"探针没抓住"(那是守卫有洞),而是**变异规格写错了**
                 # ⇒ 退出码 2(fail-closed,与纪律守卫那套同一口径)。
@@ -362,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         new_file.write_text(EXTRA_PROBE, encoding="utf-8")
         n, _, rc = _run_tests(repo)
         new_file.unlink()
-        if _run_outcome(n, rc) == "spec_broken":
+        if run_outcome(n, rc) == "spec_broken":
             print(f"  [跳过] {EXTRA_PROBE_LABEL}:pytest 退出码 {rc} 且没有 FAILED ⇒ "
                   f"探针场景本身有问题(环境不可用)", file=sys.stderr)
             return 2

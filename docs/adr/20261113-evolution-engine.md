@@ -3491,3 +3491,122 @@ main 带来的两份研究侧用例此前**不在任何 CI 步骤里**:
 - 本轮**没有动任何判定口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、
   批准链的**写入**、沙盒筛查**全部未动**。改的只是**读账本时核不核链**。
 
+
+---
+
+### 第 52 轮之二:变异脚手架自己的判定路径此前**零覆盖**(codex 第 2 轮 H2 / M1 / L2)
+
+本节记录 codex 第 2 轮除 H1(收菜不核链,见上一节)之外的其余几条。
+它们有个共同点:**问题不在"被守的东西",而在"守的工具自己"**。
+
+#### 1. 缺口(三条,都是"同一个问题两个答案"或"没人跑过")
+
+**H2:`cgm.main()` 的红/绿判定路径此前一次都没被跑过。**
+`tests/test_check_guard_mutations.py` 从头到尾**从不调 `main()`**——
+只测那些纯函数(`_apply` / `normalize_cell` / `verify_mutation_table`)。
+于是「红/绿判定」这条**唯一决定结论**的路径**零覆盖**:
+脚本变成"一律报红"或"一律报绿",都不会有任何一个用例红。
+codex 的说法很直白:唯一的绿对照抓不住它声称要抓的退化,而没人知道,因为那条路径没人测。
+
+**M1/L2:两套脚手架对同一份 pytest 输出给出可能相反的结论。**
+纪律守卫那套(`tools/check_guard_mutations.py`)**自己写了一套**关键词启发式:
+
+```python
+errors = any(line.startswith("ERROR") or " errors" in line and "error" in line.lower()
+             for line in output.splitlines())
+```
+
+分档那套(`tools/check_mutations.py`)用的是 `_run_outcome(failed, returncode)`——
+按**失败条数**判定。两边**同名不同义**:纪律那套对
+「退出码 1 且**有** FAILED」判成"有错",而分档那套把它判成
+「"ok"——对变异脚手架来说那恰恰是**探针在工作**」。
+同一个问题两个答案 ⇒ 迟早只改一边。
+
+**顺带暴露的第三处**:仓库复制也是各写一份。
+分档那套(`check_mutations.py`)**不复制 `.github/`**,纪律那套复制。
+而接线守卫(`tests/test_research_boundary.py` 里那条)**要读**
+`.github/workflows/research-guard.yml`——副本里缺了它,那条守卫会
+**因为读不到文件而报错**:看起来像「变异被抓住」,其实是**环境坏了**(假绿)。
+
+**L1:`_passed_count` 读不出时返回 `-1`,让绿对照恒真。**
+绿对照原本是 `same = base is not None and res["passed"] == base`。
+`res["passed"]` 读不出来时是 `-1`,两个 `-1` 相等 ⇒ **恒真**
+⇒ 「什么都没跑」被算成「与基线一致」⇒ 绿对照**什么也没证明**。
+
+#### 2. 处置
+
+| 项 | 处置 |
+|---|---|
+| 两套脚手架的判定 | `check_mutations._run_outcome` → 公开为 `run_outcome`;`check_guard_mutations` 改为 `from check_mutations import run_outcome`,**删掉自己那套启发式** |
+| 两套脚手架的复制 | `check_mutations._copy_repo` → 公开为 `copy_repo`;纪律那套**删掉自己那份**,改用共用的 |
+| 复制的清单 | 分档那套的复制清单**加上 `.github/`**(见上:缺了它,接线守卫在副本里读不到 workflow ⇒ 假绿) |
+| 读不出通过数 | `_passed_count` 改为返回 `None`(**不是 -1**);绿对照要求「读得出来 **且 > 0** **且** 与基线相等」 |
+| 判定路径本身 | 新增用例真跑一遍 `main()`(见第 4 节) |
+
+#### 3. 本轮自己踩的坑:**红基线被当成了绿基线**
+
+改完先跑,绿对照却报「保持绿」,而打印出来是
+「通过数 96,基线 96」——也就是 `res["failed"] > 0`。
+**基线本来就是红的**,脚手架却据此说「全绿」。
+
+原因:第 2 节把基线判据改成了 `res["outcome"] != "ok"`。
+但 `run_outcome` 的 `"ok"` **覆盖两种情况**:
+「退出码 0 且无失败」**与**「退出码 1 且**有** FAILED」
+——对变异脚手架来说,后者是"探针在工作";
+对**基线**来说,后者恰恰是**环境坏了**(名单过期、守卫本身红了)。
+
+**它是被自己加的那条反向对照逮住的**:无害改动本该保持绿,
+结果绿对照自己红了,才暴露出基线本来就是红的。
+(这也是本轮加那两条「绿对照侧」用例的直接理由——它们能让这类假绿**当场变红**,
+而不是靠运气。)
+
+现在基线判据回到**失败条数 + 退出码**:
+
+```python
+if res["failed"] or res["returncode"] != 0:   # 基线红 ⇒ 退出码 2(环境不可用)
+if not res["passed"] or res["passed"] <= 0:   # 「全绿」是空话 ⇒ 退出码 2
+```
+
+#### 4. 用例(`tests/test_check_guard_mutations.py`:25 → **34** 条)
+
+| 用例 | 钉的是什么 |
+|---|---|
+| `test_main_returns_1_when_a_mutation_is_not_caught` | 拦截侧:明知抓不住的变异 ⇒ `main()` 返回 **1**(不是 0) |
+| `test_main_returns_0_when_the_witness_goes_red` | 放行侧:见证确实打红 ⇒ 返回 **0**(否则上一条可能是「一律返回 1」的假红) |
+| `test_main_refuses_when_a_red_mutation_has_no_witness` | 没钉见证 ⇒ 退出码 **2**(只能数「红了几条」⇒ 走错原因的红会被算成抓住了) |
+| `test_main_returns_0_when_the_green_control_stays_green` | 绿对照**保持绿** ⇒ 返回 **0**(钉「绿对照一律判成不合格」的退化) |
+| `test_main_returns_1_when_the_green_control_goes_red` | 绿对照**变红** ⇒ 返回 **1**(钉「绿对照一律判成合格」的退化) |
+| `test_the_green_control_cannot_be_vacuous` | 读不出通过数时绿对照**不得**成立(`None` 而非 `-1`) |
+| `test_both_harnesses_share_one_outcome_classifier` | 两套脚手架**共用同一份**判定(`cgm.run_outcome is cm.run_outcome`) |
+| `test_both_harnesses_share_one_copy_repo` | 仓库复制**只有一份实现**(`cgm.copy_repo is cm.copy_repo`) |
+| `test_the_shared_copy_repo_carries_the_ci_workflow` | 共用那份复制**必须把 `.github/` 带过去**(动态探针,自己造一棵假树) |
+
+名单同步进 `tests/guard_roster.json`(34 条,`tests/test_research_boundary.py`
+会断言名单与源文件里的函数名**完全一致**)。
+
+#### 5. 变异验证(六条,每条都必须把对应探针**打红**)
+
+脚本见 `%TEMP%/mut_harness_guards.py`(跑完自动还原并**逐字节**比对):
+
+| 变异 | 见证 | 结果 |
+|---|---|---|
+| N1 红判定一律当"抓住了"(`ok = True`) | `..._returns_1_when_a_mutation_is_not_caught` | **红** ✔ |
+| N2 绿对照一律判成不合格(`ok = False`) | `..._returns_0_when_the_green_control_stays_green` | **红** ✔ |
+| N2b 绿对照一律判成合格(`ok = True`) | `..._returns_1_when_the_green_control_goes_red` | **红** ✔ |
+| N3 读不出通过数时退回 `-1` | `..._the_green_control_cannot_be_vacuous` | **红** ✔ |
+| N4 自己写一套判定(不再共用) | `..._share_one_outcome_classifier` | **红** ✔ |
+| N5 复制副本时不带 `.github/` | `..._the_shared_copy_repo_carries_the_ci_workflow` | **红** ✔ |
+| 还原 | 整份套件 | **34 passed**,文件与变异前逐字节一致 |
+
+另:`tools/check_mutations.py --verify`(分档那套 22 种变异)在本轮改动后重跑,
+仍是「22 种变异全部被抓住」+「ADR 里列出的变异集合与脚本一致」,退出码 0。
+
+#### 6. 残余(如实登记)
+
+- 本轮改的**是脚手架与它的用例**,不是任何实盘防线:
+  DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查**全部未动**。
+- codex 第 2 轮还剩三条**未做**,如实登记在案(第 53 轮待办):
+  **M2**(给 `tests/test_approval_ledger.py`、`tests/test_research_collect.py` 补 CI 覆盖)、
+  **M3**(CI↔闸门接线守卫:每个 `--junitxml` 前必须有 `rm -f`、报告必须新鲜)、
+  **M4**(`tools/check_ci_ran.py` 改为**按报告内容**计数,不依赖 `<testsuite>` 属性)。
+- 这些守卫工具**本身**在不可降级清单里(改它们=执行域),本轮照执行域口径处理。

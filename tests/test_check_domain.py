@@ -979,11 +979,11 @@ def test_run_outcome_separates_a_broken_spec_from_a_caught_mutation() -> None:
     """
     import check_mutations as cm
 
-    assert cm._run_outcome(0, 0) == "ok", "全绿必须是 ok"
-    assert cm._run_outcome(3, 1) == "ok", "有 FAILED 且退出码 1 ⇒ 探针在工作"
-    assert cm._run_outcome(0, 1) == "spec_broken", "退出码 1 却一条 FAILED 没有 ⇒ 收集阶段炸了"
-    assert cm._run_outcome(0, 2) == "spec_broken", "退出码 ≥ 2 ⇒ 规格/环境有问题"
-    assert cm._run_outcome(0, 4) == "spec_broken", "用法错误(退出码 4)也算规格问题"
+    assert cm.run_outcome(0, 0) == "ok", "全绿必须是 ok"
+    assert cm.run_outcome(3, 1) == "ok", "有 FAILED 且退出码 1 ⇒ 探针在工作"
+    assert cm.run_outcome(0, 1) == "spec_broken", "退出码 1 却一条 FAILED 没有 ⇒ 收集阶段炸了"
+    assert cm.run_outcome(0, 2) == "spec_broken", "退出码 ≥ 2 ⇒ 规格/环境有问题"
+    assert cm.run_outcome(0, 4) == "spec_broken", "用法错误(退出码 4)也算规格问题"
 
 
 def test_run_outcome_matches_what_pytest_actually_does(tmp_path: Path) -> None:
@@ -1012,14 +1012,14 @@ def test_run_outcome_matches_what_pytest_actually_does(tmp_path: Path) -> None:
     failed, rc = _run(broken)
     assert failed == 0, "收集失败不该有 FAILED 行"
     assert rc != 0, "语法错误时 pytest 必须非 0 退出"
-    assert cm._run_outcome(failed, rc) == "spec_broken", "收集失败必须归到 spec_broken"
+    assert cm.run_outcome(failed, rc) == "spec_broken", "收集失败必须归到 spec_broken"
 
     failing = tmp_path / "failing_test.py"
     failing.write_text("def test_x():\n    assert False\n", encoding="utf-8")
     failed, rc = _run(failing)
     assert failed >= 1, "失败的用例必须被数出来"
     assert rc == 1, "有失败时 pytest 退出码是 1"
-    assert cm._run_outcome(failed, rc) == "ok", "探针抓到失败 ⇒ ok"
+    assert cm.run_outcome(failed, rc) == "ok", "探针抓到失败 ⇒ ok"
 
 
 def test_cleanup_temp_dir_removes_the_copy(tmp_path: Path) -> None:
