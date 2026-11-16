@@ -40,6 +40,9 @@ if str(_SCRIPT_ROOT) not in sys.path:
 
 from risk import constitution as const  # noqa: E402
 from risk import ledger_chain as chain  # noqa: E402
+# 第 34 轮(main):把「读批准账本」抽成独立模块 `risk/approval_ledger.py`,
+# 供运行侧(不 import 研究侧)复核同一份账本。
+from risk import approval_ledger  # noqa: E402
 
 PENDING_DIR = "pending_strategies"
 # 沙盒**只跑**这两段。但要说清楚边界(第 39 轮更正):这只保证"沙盒不把测试段喂给候选、
@@ -3227,7 +3230,7 @@ def round_trip_pnls(trades: Sequence, size: float) -> list[float]:
 # 批准的是内容而不是文件名:代码一改哈希就变,批准自动失效。
 
 def file_sha256(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return approval_ledger.file_sha256(path)
 
 
 APPROVALS_TOOL_HINT = ('旧账本(无链):核对现有每个 sha 后 `python scripts/research_ledger.py migrate approvals --confirm-all-approved`;'
@@ -3274,6 +3277,20 @@ def _load_approvals(approvals_file: Path) -> dict:
     返回 {sha: 记录}。候选(或任何外部写入者)往 approvals.json 写进去的 sha 没有合法的链字段与锚点,
     所以不会被采信——这是读侧的第二层;写侧的主防线是候选执行窗口里的审计钩子(见 candidate_window)。"""
     return {row["sha"]: row for row in _verified_approval_rows(approvals_file)}
+
+# **为什么这里不直接用 `approval_ledger.load_approvals`**(第 51 轮合并时的人工裁决):
+# main(#34)抽出的那份 `load_approvals` **只解析 JSON、不核哈希链**;本分支(#31)的读侧
+# 必须核链(链断 / 回滚 / 多出未经合法路径的记录 / 无链记录 ⇒ 一律 fail-closed)。
+# 直接改用 main 那份 = **把一条防线放松**(链校验消失)⇒ 按仓库规矩「任何削弱型改动一律升档」,
+# 不能在一次例行的合并里顺手发生。所以这里保留本分支的链校验实现,
+# `approval_ledger` 在本文件里只用它的 `file_sha256`(与本分支原实现逐字等价)。
+#
+# **残余(如实登记)**:`risk/approval_ledger.load_approvals`(运行侧那条读法)**不核链**。
+# 研究侧写入仍带链(main 的 `record_approval` 与本分支共用 `risk/ledger_chain`),
+# 但运行侧若被喂一份改写过的账本,看到的是**未经链校验**的内容。
+# 这条分歧不是本次合并**造成**的(是 #34 与 #31 各自演进的结果),但它现在**存在**,
+# 已登记为 Issue #29 的待办(运行侧也要核链);在此之前**不合并运行侧改动**。
+
 
 
 def is_approved(path: Path, approvals_file: Path) -> bool:

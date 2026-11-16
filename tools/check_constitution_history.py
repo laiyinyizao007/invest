@@ -54,6 +54,10 @@ BUILTIN_SETS = (
     "BUILTIN_PROTECTED_STATE_OBJECTS",
     "BUILTIN_PROTECTED_PATHS",
     "BUILTIN_PROTECTED_CONTAINERS",
+    # 闸门函数名:改写它们 = 把「拒绝」这件事的执行者换掉(第 3 轮 codex 实测:
+    # 候选把 `check_protected_state` 换成「调用时把原函数装回去」的假函数,
+    # 指纹结论恒为空、事后身份核对也看不出来)。
+    "BUILTIN_PROTECTED_GATE_ATTRS",
     # 容器上的变更型方法:第 11 轮 codex 的 High 1(`self.am.update_bar(fake_bar)`
     # 注入假 K 线,四层防线全绿)——这份名单是"容器只挡写、不挡调用"的补丁。
     "BUILTIN_PROTECTED_CONTAINER_SCOPE",
@@ -136,6 +140,11 @@ FIELD_REGISTRY = ((CONSTITUTION_SOURCE_REL, CONSTITUTION_FIELDS),)
 CALL_SITE_REGISTRY = (
     ("scripts/backtest_lib.py", ("snapshot_protected_state", "check_protected_state")),
     ("scripts/research_api.py", ("snapshot_protected_state", "check_protected_state")),
+    # TODO(#34):`risk/approved_guard.py` 也是执行候选代码的入口,应当登记进来。
+    # 暂不登记的原因:登记表是**历史守卫**用的——它逐个历史版本检查「有没有把第四层摘掉过」。
+    # 本分支早期的那几个提交里,第四层用的是**同名局部引用**的写法(已被「同名遮蔽」规则判违规),
+    # 登记进来会让历史守卫把**那些已提交的版本**判成违规。
+    # 等这个文件进了主干、有了「合规形态」的历史版本之后再登记(见 ADR 的遗留问题)。
 )
 
 # 回测入口的**时序**(第 14 轮 codex 的 G6):`backtest_lib` 没有裸 exec,执行候选的是

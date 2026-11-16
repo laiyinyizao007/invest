@@ -9,6 +9,13 @@
 - [ ] 数据已复权(`CADJ/MAADJ`),并有足够长的样本外(见晋级门槛 ADR 的最少年数表);
 - [ ] 通过晋级门槛全部 9 条(`risk/promotion_gate.py::check_gate` 输出为空;前 8 条对应 11 个失败原因,夏普上下界与回撤双口径各算一条门槛的两个方向;第 9 条 DSR ≥ 0.95,未计算或缺试验次数也算未通过);并用 `python scripts/record_promotion.py` 写出 `data/state/promotion_approval.json`——
       没有这个文件,`run_headless.py` 拒绝连接生产 API(`实盘` 且非 SimNow;见 `docs/adr/20261111-discipline-enforcement.md`);
+- [ ] **若这份策略要走 `approved/` 装载**(即从批准目录装载候选而不是用 `strategies/` 里的受信骨架),
+      还要有**装载门**的批准记录 `data/state/approved_promotion.json`——它与准入门是**两份独立的记录**,
+      额外绑定**品种 / 字节 / 那一次评估**(`key` + `sha256` + `run_id`),
+      所以它只授权**它被评估过的那一份代码、那个品种**。
+      写它:`python scripts/record_promotion.py --metrics … --strategy … --approver … --sha256 <64位> --run-id <评估run_id>`
+      (品种会从那次评估的结果文件里取;`--key` 与评估结果不一致时拒绝)。
+      **今天没有任何候选通过过门槛 → 这份记录不存在 → `approved/` 装载这条路是关着的**;
 - [ ] 随机入场对照分位 ≥ 95%,成本翻倍后夏普 ≥ 1.0;
 - [ ] 测试段只看过**一次**,看后没有再调参;
 - [ ] 回测成本换成期货公司**真实费率**(不是"3 元/手"的假设)。
