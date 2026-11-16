@@ -85,12 +85,22 @@ NEVER_DOWNGRADE = (
     # --- 实盘准入与批准链 ---
     "risk/live_admission.py",       # 生产 API 前置检查
     "scripts/record_promotion.py",  # 实盘准入批准文件的唯一合法写出者
+    # 批准账本的**只读**访问层:研究侧写、运行侧读。
+    # 改它 = 改「什么算被批准过」——例如把 is_approved_sha 变成恒真,
+    # 任何字节都能过账本这一关。
+    "risk/approval_ledger.py",
+    # 运行时装载器:approved/ → runtime 的唯一入口。
+    # 它消费批准账本与晋级记录,替运行时装载做「拒绝/放行」的判定。
+    "risk/approved_guard.py",
     "scripts/research_sandbox.py",        # 批准账本唯一写入者(record_approval)
     "scripts/research_api.py",            # approve/review CLI 入口 + 候选装载
     "scripts/research_approval_server.py",# 带外批准页(人输入 sha256 才写账本)
     "scripts/research_console.py",        # 同一批 CLI 入口的薄壳
     "scripts/research_gateway.py",        # 模型→内核的唯一网络通道(端点白名单)
     "scripts/research_config.py",         # 沙盒配置加载器(硬边界、只能追加的禁用清单)
+    # 收菜:把候选收进 approved/(运行时唯一认的目录)。它**调用静态筛查**,
+    # 并且判定「这份字节能不能进入受信目录」——那是批准链上的一个判定点。
+    "scripts/research_collect.py",
 
     # --- 门槛评估的编排层 ---
     # 名字像"研究",但算出的东西直接喂进 check_gate
@@ -199,6 +209,12 @@ NEVER_DOWNGRADE = (
     "tests/test_candidate_escape_production_path.py",
     "tests/test_helper_module_escape.py",
     "tests/test_live_admission.py",
+    # 骨架契约与批准目录装载的用例:它们**直接调用** screen_source / check_class /
+    # load_approved_strategy(都是判定点),改断言 = 削弱检出能力。
+    "tests/test_strategy_skeleton_contract.py",
+    "tests/test_approved_loading.py",
+    "tests/test_research_collect.py",
+    "tests/test_approval_ledger.py",
     "tests/test_candidate_eval.py",
     "tests/test_diagnosis.py",
     "tests/test_dsr.py",

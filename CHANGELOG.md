@@ -222,6 +222,17 @@
     key 与运行时声明的品种(可选 `--approved-key`)一致。
   - **今天没有任何候选通过过晋级门槛 → 装载门记录不存在 → `approved/` 装载这条路是关着的。**
 
+- **合并 main 的「后果域分档」并按新分档器补齐不可降级清单**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35);
+  ADR `20261114-consequence-domain-tiers`)。main 上新增了项目级 `CLAUDE.md`(按后果域分档)、
+  `tools/check_domain.py`(机器可判的分档器)、`tests/test_check_domain.py`(99 条动态探针)与
+  变异验证关卡。本分支的改动按新分档器判定为**执行域**——`risk/live_admission.py` 与
+  `scripts/record_promotion.py` 属真钱链路判定点、`trading/` 与 `scripts/run_headless.py` 接真实委托
+  ——而这一轮全程走的就是执行域流程(P2 的 plan.md 经 plan-down、结构化确认块、6/6 清单、
+  Issue + worktree、G8 四轮 codex、文档同原子提交)。
+  → 分档器的探针随即指出:本轮新增的 `risk/approval_ledger.py`、`risk/approved_guard.py`、
+  `scripts/research_collect.py` 与三个用例文件**拥有判定点或喂值给判定点**,却没被判为不可降级
+  → 已按新 CLAUDE.md §4 规则 6(清单本身是代码)补进不可降级清单。变异验证 11 种变异全部被抓住。
+
 - **第 4 轮 codex 复核(35/50)的发现与处置**:
   - **[critical] 帧劫持**:候选可用 `getattr(sys._getframe(1), 'f_' + 'locals')['check'] = fake`
     直接改装载器的局部变量(PEP 667 写穿),第四层能被完全中和。
