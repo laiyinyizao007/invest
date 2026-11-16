@@ -193,25 +193,37 @@ def _child_reason(stderr: str) -> str:
 # 站点包快照文件路径:**父进程**在第一次起子进程之前拍好(候选永远跑在子进程里,
 # 父进程的代码不是候选执行的 → 快照不在候选的控制之下)。
 # 见 scripts/research_sandbox.py::snapshot_site_files 的说明(第 4 轮 codex 复核的 C1)。
+_SITE_SNAPSHOT: dict | None = None
 _SITE_SNAPSHOT_PATH: Path | None = None
+_SITE_SNAPSHOT_SHA = ""
 
 
-def site_snapshot_path() -> Path:
-    """站点包快照的文件路径(每个父进程只拍一次)。
+def site_snapshot_path() -> tuple[Path, str]:
+    """站点包快照的 (文件路径, 哈希)。
+
+    **每轮起子进程前都用内存里的原始快照重写一次文件**:
+    快照文件落在系统临时目录,那是**候选可写**的地方;候选若在上一轮改了它,
+    父进程若照着磁盘上那份算哈希,哈希证明的就是**被篡改后的字节**
+    (第 3 轮 codex 复核的 C1:实测跨轮次逃逸成立)。重写 + 用内存里的字节算哈希,
+    篡改自动被抹掉。
 
     只拍**仓库内**的站点包根:仓库外的站点包按原口径处理(物理上就在仓库之外,
     走「预先存在」那一支),本次不动那条——它是既有洞,登记在 Issue #49。
     """
-    global _SITE_SNAPSHOT_PATH
-    if _SITE_SNAPSHOT_PATH is None:
+    global _SITE_SNAPSHOT, _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA
+    if _SITE_SNAPSHOT is None:
         code_root = rc.CODE_ROOT.resolve()
         roots = [root for root in rs.site_package_roots()
                   if root == code_root or code_root in root.parents]
-        snapshot = rs.snapshot_site_files(roots)
-        _SITE_SNAPSHOT_PATH = rs.write_site_snapshot(snapshot)
+        _SITE_SNAPSHOT = rs.snapshot_site_files(roots)
+        _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA = rs.write_site_snapshot(_SITE_SNAPSHOT)
         atexit.register(lambda: _SITE_SNAPSHOT_PATH.unlink(missing_ok=True)
                         if _SITE_SNAPSHOT_PATH else None)
-    return _SITE_SNAPSHOT_PATH
+    else:
+        # 重写:抹掉上一轮可能的篡改(内容与哈希都来自内存里的原始快照)
+        _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA = rs.write_site_snapshot(
+            _SITE_SNAPSHOT, _SITE_SNAPSHOT_PATH)
+    return _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA
 
 
 def spawn_child(cmd: list[str], timeout: float) -> dict:
@@ -220,11 +232,12 @@ def spawn_child(cmd: list[str], timeout: float) -> dict:
     # 传出去,而这里传的是仓库内一个文件路径(不是秘密),
     # 子进程要靠它拿到「候选开跑之前」的基准。
     env = rs.sandbox_env(os.environ)
-    snapshot_path = site_snapshot_path()
+    snapshot_path, snapshot_sha = site_snapshot_path()
     env[rs.SITE_SNAPSHOT_ENV] = str(snapshot_path)
     # 快照文件的哈希也一起给:文件在系统临时目录(候选可写),候选改了它,
-    # 下一轮就会读到伪造的快照。哈希由父进程算,候选改不了父进程的环境。
-    env[rs.SITE_SNAPSHOT_SHA_ENV] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    # 下一轮就会读到伪造的快照。哈希由**父进程内存里的原始快照**算出
+    # (不是现读磁盘 —— 那会证明被篡改后的字节)。
+    env[rs.SITE_SNAPSHOT_SHA_ENV] = snapshot_sha
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
                             errors="replace", cwd=rc.CODE_ROOT, env=env)
     try:

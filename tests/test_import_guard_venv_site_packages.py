@@ -94,6 +94,8 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # 这样这份用例在**修复前**也能跑起来,红的原因才会是「防线行为」
 # (误分类),而不是「实现里还没有这个函数」(用例报错 = 假信号)。
 SNAPSHOT_ENV = "RESEARCH_SITE_SNAPSHOT"
+# 快照文件的哈希:父进程算、经环境变量下发(候选改不了父进程的环境)
+SNAPSHOT_SHA_ENV = "RESEARCH_SITE_SNAPSHOT_SHA256"
 
 
 def _write_snapshot(site_root: Path) -> Path:
@@ -116,10 +118,14 @@ def _write_snapshot(site_root: Path) -> Path:
 
 @pytest.fixture
 def snapshot_env(repo: Path, monkeypatch: pytest.MonkeyPatch):
-    """把父进程拍的快照经环境变量交给守卫(生产同一条路)。"""
+    """把父进程拍的快照经环境变量交给守卫(生产同一条路:路径 + 哈希)。"""
+    import hashlib
+
     site_root = (repo / ".venv" / "Lib" / "site-packages").resolve()
     path = _write_snapshot(site_root)
     monkeypatch.setenv(SNAPSHOT_ENV, str(path))
+    # 哈希也一起给(生产上父进程就是这么下发的):少它就等于「没有基准」→ fail-closed
+    monkeypatch.setenv(SNAPSHOT_SHA_ENV, hashlib.sha256(path.read_bytes()).hexdigest())
     return path
 
 
@@ -304,6 +310,109 @@ def test_a_tampered_snapshot_file_is_refused(
     guard = _guard(repo)
     reason = guard.check("forged")
     assert reason is not None, "伪造的快照文件被采信了 —— 候选可以给自己写后门"
+
+
+def test_a_module_with_the_same_size_but_a_new_mtime_is_refused(
+    repo: Path, snapshot_env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拦截:**大小相同、mtime 变了** → 仍被拒(单独盯住 mtime 这一道比较)。
+
+    为什么单列:「被改写」那条用例同时改了 size 与 mtime,
+    **去掉任一比较照样抓得住** —— 那两条比较谁都没被单独盯到。
+    """
+    target = repo / ".venv" / "Lib" / "site-packages" / "thirdparty.py"
+    original = target.read_bytes()
+    try:
+        # **同大小**:换掉内容但保持字节数不变
+        assert len(original) > 3
+        target.write_bytes(b"X" * len(original))
+        assert target.stat().st_size == len(original)
+        guard = _guard(repo)
+        reason = guard.check("thirdparty")
+        assert reason is not None, "同大小但 mtime 变了却放行了 —— mtime 比较没生效"
+    finally:
+        target.write_bytes(original)
+
+
+def test_a_module_with_the_same_mtime_but_a_new_size_is_refused(
+    repo: Path, snapshot_env: Path,
+) -> None:
+    """拦截:**mtime 相同、大小变了** → 仍被拒(单独盯住 size 这一道比较)。"""
+    target = repo / ".venv" / "Lib" / "site-packages" / "thirdparty.py"
+    original = target.read_bytes()
+    stamp = target.stat().st_mtime_ns
+    try:
+        target.write_bytes(original + b"\n# tampered\n")
+        os.utime(target, ns=(stamp, stamp))   # 测试进程有全权限,能把 mtime 还原
+        assert target.stat().st_mtime_ns == stamp
+        guard = _guard(repo)
+        reason = guard.check("thirdparty")
+        assert reason is not None, "同 mtime 但大小变了却放行了 —— size 比较没生效"
+    finally:
+        target.write_bytes(original)
+
+
+def test_a_forged_snapshot_with_the_real_mtime_and_size_is_refused(
+    repo: Path, snapshot_env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """拦截:**伪造的快照**里填上自造文件的**真实 mtime + size** → 仍被拒。
+
+    这条专杀「哈希核对被去掉」那个变异体:伪造条目填的是**真实**的
+    (mtime, size),所以 mtime 与 size 两道比较都**过得去**,
+    只有**哈希核对**能挡下来。
+    """
+    import json
+
+    forged = json.loads(snapshot_env.read_text(encoding="utf-8"))
+    planted = repo / ".venv" / "Lib" / "site-packages" / "forged_real.py"
+    marker = "MARKER = 1\n"
+    planted.write_text(marker, encoding="utf-8")
+    stat = planted.stat()
+    # **真实**的 mtime 与 size —— 伪造条目因此能骗过那两道比较
+    forged[os.path.normpath(str(planted.resolve()))] = [stat.st_mtime_ns, stat.st_size]
+    snapshot_env.write_text(json.dumps(forged), encoding="utf-8")
+    monkeypatch.setenv(SNAPSHOT_ENV, str(snapshot_env))
+    guard = _guard(repo)
+    reason = guard.check("forged_real")
+    assert reason is not None, "填了真实 mtime+size 的伪造快照被采信了 —— 哈希核对没生效"
+
+
+def test_the_parent_rewrites_the_snapshot_so_tampering_is_erased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """父进程**每轮重写**快照 → 候选上一轮的篡改被抹掉。
+
+    这条对应第 3 轮 codex 复核的 C1:父进程若**每轮现读磁盘**算哈希,
+    哈希证明的就是**被篡改后的字节**(候选改了快照文件,父进程照着改后的算,
+    子进程核对通过 → 跨轮次逃逸成立,实测)。
+    修法:内容与哈希都从**父进程内存里的原始快照**产出,并在每轮起子进程前重写一次。
+
+    这里直接测父进程那一侧(不改实现细节):第一次拿到的哈希与文件内容,
+    在文件被篡改之后,再取一次应当**完全回到原样**。
+    """
+    import json
+
+    import research_api as api
+
+    monkeypatch.setattr(api, "_SITE_SNAPSHOT", None, raising=False)
+    monkeypatch.setattr(api, "_SITE_SNAPSHOT_PATH", None, raising=False)
+    monkeypatch.setattr(api, "_SITE_SNAPSHOT_SHA", "", raising=False)
+    # 站点包根指到一个临时目录(让快照非空)
+    site = tmp_path / "site-packages"
+    site.mkdir()
+    (site / "mod.py").write_text("X = 1\n", encoding="utf-8")
+    monkeypatch.setattr(rs, "site_package_roots", lambda: (site.resolve(),), raising=False)
+
+    path, sha = api.site_snapshot_path()
+    original = path.read_bytes()
+
+    # 候选篡改:把快照文件换掉,再让父进程取一次
+    path.write_text(json.dumps({"forged": [0, 1]}), encoding="utf-8")
+    path2, sha2 = api.site_snapshot_path()
+
+    assert path2 == path
+    assert path.read_bytes() == original, "父进程没有重写快照 —— 候选的篡改被沿用了"
+    assert sha2 == sha, "父进程下发的哈希变了 —— 它算的是被篡改后的字节"
 
 
 def test_a_repo_module_written_during_the_run_is_still_refused(

@@ -1220,21 +1220,49 @@ def _snapshot_one_root(root: Path) -> dict[str, tuple[int, int]]:
     return snapshot
 
 
-def write_site_snapshot(snapshot: Mapping[str, tuple[int, int]]) -> Path:
-    """把快照写到临时文件,返回路径(父进程用)。"""
+def write_site_snapshot(snapshot: Mapping[str, tuple[int, int]],
+                        path: Path | None = None) -> tuple[Path, str]:
+    """把快照写到文件,返回 (路径, **内容的 sha256**)。
+
+    **为什么哈希在这里算、而不是父进程现读磁盘**:快照文件落在系统临时目录,
+    那是**候选可写**的地方。若父进程每轮现读磁盘算哈希,哈希证明的��
+    **被篡改后的字节**(第 3 轮 codex 复核的 C1:实测跨轮次逃逸成立)。
+    所以:内容与哈希**同时**从内存里的原始快照产出,并在每轮起子进程前**重写**一次
+    ——候选的篡改自动被抹掉。
+    """
     import tempfile
 
-    handle, name = tempfile.mkstemp(prefix="site_snapshot_", suffix=".json")
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        json.dump({key: list(value) for key, value in snapshot.items()}, stream)
-    return Path(name)
+    payload = json.dumps({key: list(value) for key, value in snapshot.items()}).encode("utf-8")
+    if path is None:
+        handle, name = tempfile.mkstemp(prefix="site_snapshot_", suffix=".json")
+        path = Path(name)
+    else:
+        handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(handle, "wb") as stream:
+        stream.write(payload)
+    return path, hashlib.sha256(payload).hexdigest()
 
 
-def read_site_snapshot(path: Path) -> dict[str, tuple[int, int]]:
-    """读回快照(子进程用)。读不到就是空字典(fail-closed:一律拒)。"""
+def read_site_snapshot(path: Path, expected_sha: str = "") -> dict[str, tuple[int, int]]:
+    """读回快照(子进程用)。
+
+    **只读一次**:同一份 bytes 既算 sha256 又解析 JSON——
+    读两次会让「被核对的字节」与「被解析的字节」不是同一份(TOCTOU,
+    第 3 轮 codex 复核指出)。
+
+    **哈希缺失或不匹配 → 空字典**(fail-closed:一律拒)。
+    注意:「给了路径却没给哈希」也算没有基准 —— 不能因为少一个环境变量
+    就把校验整段跳过。
+    """
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = Path(path).read_bytes()
+    except OSError:
+        return {}
+    if not expected_sha or hashlib.sha256(raw).hexdigest() != expected_sha:
+        return {}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
         return {}
     if not isinstance(data, dict):
         return {}
@@ -1273,15 +1301,11 @@ class RepoImportGuard:
         # 仓库内的站点包文件一律按「仓库内模块」拒(fail-closed)。
         env_path = os.environ.get(SITE_SNAPSHOT_ENV)
         if env_path:
-            # 父进程拍的那份(生产路径:research_api.spawn_child 经环境变量传下来)
-            snapshot = read_site_snapshot(Path(env_path))
-            # **核对哈希**:快照文件在系统临时目录,那是候选可写的地方——
-            # 候选改了它,下一轮就会读到伪造的快照。哈希由父进程算并经环境变量传下来,
-            # 候选改不了父进程的环境。对不上 → 当作「没有基准」→ fail-closed。
-            expected = os.environ.get(SITE_SNAPSHOT_SHA_ENV, "")
-            if expected and file_sha256(Path(env_path)) != expected:
-                snapshot = {}
-            self.site_snapshot = snapshot
+            # 父进程拍的那份(生产路径:research_api.spawn_child 经环境变量传下来)。
+            # 哈希核对在 read_site_snapshot 里做(只读一次 bytes,消除 TOCTOU);
+            # **哈希缺失也算没有基准** —— 不能因为少一个环境变量就跳过校验。
+            self.site_snapshot = read_site_snapshot(
+                Path(env_path), os.environ.get(SITE_SNAPSHOT_SHA_ENV, ""))
         else:
             # 父进程没给(例如测试直接在进程内跑候选)→ 用**本进程的第一份**快照:
             # snapshot_site_files 按站点包根做**进程级**缓存,所以这份是
