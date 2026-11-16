@@ -213,6 +213,8 @@ flowchart TB
   - **4b Bisheng 工具调用 + HITL**:Agent 调研究 API(触发回测/读诊断书/查 gate);每个候选进入 approved 前经 HITL 人工确认;反馈记忆 maxlen=3 生效。退出:≥1 个候选由外层驱动走完 pending→gate→人工批准全流程;外层宕机不影响内层交易(断耦演练)。
   - **4c 闭环自动化**:Agent 连续迭代,自动收菜到 approved/,**装载仍需人工**;Alpha Factory 双轨并跑;所有 LLM 产出留痕(工作流日志可回放)。
 - **进度(2026-11-12)**:4a 内层部分已完成(CLI、pending 目录、批准绑定哈希、`review`、选参 + 门槛评估、迭代上限、中文报告);4b 部分:毕昇已本机部署(仅 127.0.0.1,Code 节点关闭),工具 `invest 研究沙盒网关` 已导入,工作流 v3(想法→读失败反馈→检索研究资料→LLM 写候选→提交→本机批准→选参 + 评估)已建,无 LLM 联调工作流已实跑通过,**LLM 节点端到端联调待模型额度**;4c 的容器隔离前置已满足但**未放开**,需另行评审。
+- **进度(2026-11-15,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34))**:**4a 收尾完成 + 4b 的断耦演练完成**——`approved/` 目录与收菜 CLI(`scripts/research_collect.py`,本机人工触发、网关触达不到)已落地;**运行时从 `approved/` 装载并 fail-closed 复核批准账本与宪法**,不过即拒绝启动(`EXIT_STARTUP_FAILED`),绝不降级到默认策略;骨架契约独立单测已补齐;断耦演练三项全过(证据 `docs/decoupling-drill.md`)。**批准至此才真正兑现「决定哪份代码有权被运行时执行」这一意义**——此前它只是一张收据。第 1 轮 codex 复核(32/50)实测出四处问题(第四层可被候选自己关掉 / 漏了类级校验 `check_class` / 默认骨架是仅研究回测的 15m 骨架 / `--history` 与参数校验冲突导致实盘装不上),已逐条修掉并补了回归用例。ADR `20261115-approved-sandbox-closure`。
+- **仍未做**:① **15 分钟实盘骨架不存在**(Issue [#36](https://github.com/laiyinyizao007/invest/issues/36))——默认骨架仅研究回测、会被拒绝装载,日线骨架与 15m 候选不同家族,于是 `approved/ → 实盘`今天还没有可用的组合;② **运行时装载前的「晋级门槛通过」闸门**(Issue [#37](https://github.com/laiyinyizao007/invest/issues/37));③ 运行侧缺研究侧的两道闸(`verify_trusted_tree` / 按路径的导入裁决);④ ~~LLM 节点端到端联调~~ **已通(2026-11-14 晚)**:模型额度恢复后,工作流 v3 实跑——想法 → LLM 起名 → LLM 写候选 → 提交 → 静态筛查 → 停在「请本机审阅批准」。中途发现 LLM 连着两轮都写出「把 am.close 切片传给函数调用」这种容器逃逸写法(静态筛查正确拒绝),把该硬约束写进提示词后一次写对。**批准那一步仍必须由人做**(模型不能代替);⑤ 4c 的容器隔离放开(需另行评审);⑥ 运行**途中**的风控底线持续核对。
 - 状态路由(MetaRouter)与 Alpha Factory 双轨在本阶段后半段展开,进入条件:≥2 个通过晋级门槛且风格相反的策略并存。
 
 **§4 技术债条目去向**(§4 原表不动,此处只标去向):
@@ -251,7 +253,7 @@ flowchart TB
 | Optuna TPE 寻优 | 并入 `walk_forward_optimizer.py` 或其旁新脚本(不改 `optimize.py` 已定案口径) | 参数维度 >2 或组合空间 > 数百,网格不再可行 | 要点梳理 §3.5 |
 | 参数平原卷积 / PBO / DSR — **参数平原(3×3×3 邻域)已落地于 `risk/plateau.py` 与选参;DSR 已采纳随进化引擎分期落地(ADR `20261113-evolution-engine`),PBO 延后** | 同上;参数平原强化晋级门槛第 8 条 | 有合格候选实测第 8 条;或试验次数扩大到 DSR 惩罚有统计意义 | 要点梳理 §3.5 |
 | 研究沙盒 API(CLI→HTTP) — **已落地(2026-11-12)** | `scripts/research_api.py`、`research_gateway.py`、`research_sandbox.py`、`research_gate.py`、`research_grid.py`、`research_config.py`;容器 `docker-compose.research.yml`;契约 `docs/research-gateway.openapi.json` | — | ADR bisheng-ai-researcher、`20261112-research-sandbox-*` |
-| 策略骨架模板 + pending/approved 沙盒 — **pending 已落地,approved/ 与骨架模板未做** | `strategies/` 内模板文件 + `pending_strategies/`/`approved/` 目录约定 + 新 ADR | 阶段四 4a 启动前 | 要点梳理 §6.3-① |
+| 策略骨架模板 + pending/approved 沙盒 — **已落地(2026-11-15,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34))**:pending 早已落地;**approved/ 与骨架契约独立单测已补齐** | `strategies/trend_atr_15m_strategy.py`(骨架,宪法 template 指向它)+ `pending_strategies/`/`approved/` 目录约定 + `risk/approved_guard.py` + `scripts/research_collect.py` + `tests/test_strategy_skeleton_contract.py`;ADR `20261115-approved-sandbox-closure` | 已触发 | 要点梳理 §6.3-① |
 | Bisheng 外层 — **已本机部署(2026-11-12),工作流 v3 已建,LLM 联调待额度** | 独立 compose 文件(与交易 compose 完全分离,不共享网络与 `.env`) | 阶段四 4b(前置 = 阶段三 API 固化);版本 ≥2.6.0、仅内网、禁用 Code 节点 | ADR bisheng-ai-researcher |
 | 反馈记忆 maxlen=3 — **已落地为服务端限制**(`feedback.limit`,网关 `GET /research/feedback`) | Bisheng 工作流设计约束(内层零代码) | 阶段四 4b | 要点梳理 §6.3-② |
 | 反向控制 /stop_all | `notify/webhook.py` 增加接收侧 + `trading/runtime.py` 暴露停机钩子 + **新 ADR**(指令来源校验/白名单/误触防护) | 阶段三;前置 = webhook 真机验证通过 + 无人值守常态化 | 要点梳理 §5.3 |

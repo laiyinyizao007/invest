@@ -39,6 +39,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_ROOT))
 
 from risk import constitution as const  # noqa: E402
+from risk import approval_ledger  # noqa: E402
 
 PENDING_DIR = "pending_strategies"
 SEGMENTS = ("train", "valid")        # 测试段不可经由沙盒到达
@@ -2638,19 +2639,19 @@ def round_trip_pnls(trades: Sequence, size: float) -> list[float]:
 # 批准的是内容而不是文件名:代码一改哈希就变,批准自动失效。
 
 def file_sha256(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return approval_ledger.file_sha256(path)
 
 
 def _load_approvals(approvals_file: Path) -> dict:
-    if not Path(approvals_file).exists():
-        return {}
+    """读批准账本。**读**这一半委托给 `risk/approval_ledger.py`(运行侧装载策略时要复核同一份账本,
+    但运行侧不该拖进筛查那一整套依赖);**写**仍然只在本文件的 `record_approval` 里。
+
+    委托后错误文案与异常类型保持不变(共享模块抛 `ApprovalLedgerError`,这里转成 `SandboxError`)。
+    """
     try:
-        data = json.loads(Path(approvals_file).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SandboxError(f"批准记录无法读取,拒绝继续(fail-closed): {exc}") from exc
-    if not isinstance(data, dict):
-        raise SandboxError("批准记录格式错误(应为对象)")
-    return data
+        return approval_ledger.load_approvals(approvals_file)
+    except approval_ledger.ApprovalLedgerError as exc:
+        raise SandboxError(str(exc)) from exc
 
 
 def is_approved(path: Path, approvals_file: Path) -> bool:

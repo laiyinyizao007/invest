@@ -1,0 +1,747 @@
+"""从 `approved/` 装载策略(`risk/approved_guard.py` + `trading/runtime.py`)。
+
+这条路径回答的是整个系统里最要紧的问题:**这份代码凭什么有权被运行时执行?**
+答案只有一个:人批准过这段字节。于是每一条「不是人批准过的字节」的路都必须被拒绝:
+  - 账本里没有 → 拒绝
+  - 批准后被改过 → 拒绝
+  - 不在批准目录里(路径穿越/符号链接)→ 拒绝
+  - 违反宪法 → 拒绝
+  - 不是骨架的子类 → 拒绝
+  - 设置里夹带受保护参数 → 拒绝
+而且失败必须是**拒绝启动**,不能悄悄退回默认策略。
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+import bootstrap  # noqa: F401,E402  (把仓库根放进 sys.path)
+import vnpy_ctastrategy.engine as cta_engine_module  # noqa: E402
+from fakes import FakeDatabase, FakeGateway, SyncEventEngine, history_bars  # noqa: E402
+from risk import approved_guard  # noqa: E402
+from trading.runtime import (  # noqa: E402
+    EXIT_STARTUP_FAILED,
+    RuntimeConfig,
+    TradingRuntime,
+)
+
+# 交易运行时装载用的是**实盘可用**的骨架(日线);
+# 15m 骨架带 research_only 标记,装载时会被拒绝(见 test_research_only_skeleton_is_refused)。
+ROOT = Path(__file__).resolve().parents[1]
+
+LIVE_TEMPLATE = "strategies.trend_atr_strategy:TrendAtrStrategy"
+
+CANDIDATE = '''from strategies.trend_atr_strategy import TrendAtrStrategy
+
+
+class Candidate(TrendAtrStrategy):
+    fast_window = 8
+    slow_window = 20
+    atr_mult = 2.0
+'''
+
+
+@pytest.fixture()
+def approved(tmp_path):
+    """一个临时的批准目录 + 账本。"""
+    approved_dir = tmp_path / "approved"
+    approved_dir.mkdir()
+    # 账本放在与运行时一致的路径约定下:<root>/data/research-control/approvals.json
+    ledger = tmp_path / "data" / "research-control" / "approvals.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text("{}", encoding="utf-8")
+    return approved_dir, ledger
+
+
+def _install(approved_dir: Path, ledger: Path, name: str = "cand.py", source: str = CANDIDATE,
+             collected: bool = True, promotion: bool = True) -> str:
+    """装一份「已批准 + 已收菜 + 晋级通过」的文件,返回它的 sha256。
+
+    三条记录是三道**独立**的门:
+    - 批准账本:人读过代码、粘过哈希;
+    - 收菜记录:经过了收菜那道关口(收菜时把源码打给人看);
+    - 晋级通过:这个策略**统计上有优势**(人工审阅挡不住这条)。
+    """
+    path = approved_dir / name
+    path.write_text(source, encoding="utf-8")
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    data[sha] = {"name": name, "at": "2026-11-14T00:00:00"}
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+    root = approved_dir.parent
+    if collected:
+        collected_file = root / "data" / "research-control" / "collected.json"
+        collected_file.parent.mkdir(parents=True, exist_ok=True)
+        collected_file.write_text(json.dumps({sha: {"name": name, "collected_at": "2026-11-14T00:00:00"}}),
+                                 encoding="utf-8")
+    if promotion:
+        # 装载门的记录(与准入门那份分开):绑定 **品种 / 字节 / 那一次评估**
+        promotion_file = root / "data" / "state" / "approved_promotion.json"
+        promotion_file.parent.mkdir(parents=True, exist_ok=True)
+        promotion_file.write_text(json.dumps({"strategy": name, "key": "C15", "sha256": sha,
+                                              "run_id": "20261114-000000-test", "approver": "test",
+                                              "approved_at": "2026-11-14T00:00:00", "gate_failures": [],
+                                              "metrics": {}}), encoding="utf-8")
+    return sha
+
+
+def _load(approved_dir, ledger, name="cand.py", setting=None, template_name=LIVE_TEMPLATE):
+    """低层装载:**显式**传 `None` 表示「本调用不做收菜/晋级这两道检查」。
+
+    这两个参数在守卫 API 上是必填的(给默认值就等于「忘了传就悄悄跳过一道门」)。
+    """
+    cls, _sha = approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name=name,
+        class_name="Candidate", setting=setting, template_name=template_name,
+        collected_file=None, promotion_file=None)
+    return cls
+
+
+def test_an_approved_candidate_loads(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    cls = _load(approved_dir, ledger)
+
+    assert cls.__name__ == "Candidate"
+    from strategies.trend_atr_strategy import TrendAtrStrategy
+    assert issubclass(cls, TrendAtrStrategy)
+
+
+def test_a_file_that_was_never_approved_is_refused(approved):
+    approved_dir, ledger = approved
+    (approved_dir / "cand.py").write_text(CANDIDATE, encoding="utf-8")
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "没有人工批准记录" in str(excinfo.value)
+
+
+def test_a_file_changed_after_approval_is_refused(approved):
+    approved_dir, ledger = approved
+    sha = _install(approved_dir, ledger)
+    (approved_dir / "cand.py").write_text(CANDIDATE + "\n# 事后被改\n", encoding="utf-8")
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "没有人工批准记录" in str(excinfo.value)
+    assert sha != hashlib.sha256((approved_dir / "cand.py").read_bytes()).hexdigest()
+
+
+def test_a_broken_ledger_is_refused_fail_closed(approved):
+    """账本坏了不能当成「谁都没批准过」——那会让所有文件都被拒,但错误信息会误导人。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    ledger.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "fail-closed" in str(excinfo.value)
+
+
+def test_path_traversal_and_odd_names_are_refused(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    for bad in ("../cand.py", "sub/cand.py", "..\\cand.py", "CAND.py", "cand.txt", ""):
+        with pytest.raises(approved_guard.ApprovedLoadError):
+            _load(approved_dir, ledger, name=bad)
+
+
+def test_a_file_outside_the_approved_dir_is_refused(approved, tmp_path):
+    approved_dir, ledger = approved
+    outside = tmp_path / "elsewhere.py"
+    outside.write_text(CANDIDATE, encoding="utf-8")
+    sha = hashlib.sha256(outside.read_bytes()).hexdigest()
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    data[sha] = {"name": "elsewhere.py", "at": "2026-11-14T00:00:00"}
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+    # 文件名合法、也在账本里,但它**不在** approved/ 里 → 拒绝
+    with pytest.raises(approved_guard.ApprovedLoadError):
+        _load(approved_dir, ledger, name="elsewhere.py")
+
+
+def test_a_candidate_that_violates_the_constitution_is_refused(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=CANDIDATE + (
+        "\n    def entry_signal(self) -> int:\n"
+        "        self.guard.max_losses = 99\n        return 0\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "静态筛查未通过" in str(excinfo.value)
+
+
+def test_a_class_that_is_not_a_skeleton_subclass_is_refused(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "class Candidate:\n"
+        "    pass\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "不是策略骨架" in str(excinfo.value)
+
+
+def test_a_missing_class_is_refused(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source="X = 1\n")
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "没有类 Candidate" in str(excinfo.value)
+
+
+def test_a_setting_that_carries_protected_parameters_is_refused(approved):
+    """风控底线不得由调用方指定:设置里夹带 risk_budget 之类 → 拒绝装载。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger, setting={"risk_budget": 999999})
+    assert "策略设置未通过校验" in str(excinfo.value)
+
+
+def test_consistency_check_reports_a_tampered_approved_file(approved):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    assert approved_guard.check_approved_consistency(
+        approved_dir=approved_dir, approvals_file=ledger) == []
+
+    (approved_dir / "cand.py").write_text("# 事后被改\n", encoding="utf-8")
+    problems = approved_guard.check_approved_consistency(
+        approved_dir=approved_dir, approvals_file=ledger)
+    assert problems and "不在批准账本里" in problems[0]
+
+
+# ---------- 运行时装载 ----------
+
+class RecordingNotifier:
+    def __init__(self):
+        self.messages = []
+
+    def send(self, level, title, message, extra=None):
+        self.messages.append((level, title, message))
+        return True
+
+    def close(self, drain_timeout=0.0):
+        return None
+
+    def titles(self):
+        return [t for _, t, _ in self.messages]
+
+
+@pytest.fixture()
+def make_runtime(monkeypatch, tmp_path):
+    monkeypatch.setattr(cta_engine_module, "load_json", lambda filename: {})
+    monkeypatch.setattr(cta_engine_module, "save_json", lambda *a, **k: None)
+    created = []
+
+    def factory(config_overrides):
+        cfg = RuntimeConfig(
+            vt_symbol="c2601.DCE",
+            # 注意:设置里**不带** risk_budget——它是受保护参数,调用方不得指定
+            # (宪法 check_params 会拒绝)。风控底线只能来自代码里的默认值。
+            strategy_setting={"fast_window": 2, "slow_window": 3, "atr_mult": 1.5},
+            gateway_setting={"用户名": "u"},
+            position_settle_seconds=1.0, connect_timeout=5.0,
+            **config_overrides,
+        )
+        rt = TradingRuntime(cfg, FakeGateway, notifier=RecordingNotifier(),
+                            event_engine=SyncEventEngine())
+        rt.rule.update_setting({"state_file": str(tmp_path / "guard.json")})
+        rt.cta.database = FakeDatabase(history_bars())
+        rt.gw = rt.gateway
+        created.append(rt)
+        return rt
+
+    yield factory
+    for rt in created:
+        rt.shutdown()
+
+
+def test_runtime_loads_the_approved_strategy(make_runtime, approved, tmp_path):
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE, "strategy_class": "ApprovedCandidate"})
+
+    assert rt._load_approved_strategy() is None
+    assert rt.cta.classes["ApprovedCandidate"].__name__ == "Candidate"
+
+
+def test_runtime_refuses_to_start_when_the_approved_strategy_is_not_approved(make_runtime, approved):
+    approved_dir, ledger = approved
+    (approved_dir / "cand.py").write_text(CANDIDATE, encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    code = rt.start()
+
+    assert code == EXIT_STARTUP_FAILED
+    assert rt.strategy is None                      # 没有偷偷换成默认策略
+    assert any(t.startswith("策略装载被拒") for t in rt.notifier.titles())
+
+
+def test_runtime_without_an_approved_file_behaves_exactly_as_before(make_runtime):
+    """没配 approved_file 时,行为与从前完全一致(不装载、不拒绝)。"""
+    rt = make_runtime({})
+
+    assert rt._load_approved_strategy() is None
+    assert "ApprovedCandidate" not in rt.cta.classes
+
+
+# ---------- 第 1 轮 codex 复核实测出的绕过(必须逐条钉住)----------
+
+def test_the_fourth_layer_cannot_be_switched_off_by_the_candidate(approved):
+    """候选不能把第四层(受保护对象的指纹比对)自己关掉。
+
+    绕过手法:候选在自己的模块体里 `import risk.constitution as _c;
+    _c.check_protected_state = lambda *a, **k: []`——如果装载器在 exec **之后**
+    才经 `const.` 去取比较器,取到的就是候选换上去的那个空函数,第四层静默失效。
+    修法:比较器与快照器在 exec 之前就绑定成局部引用,并在 exec 之后核对它们没被换掉。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "_c.snapshot_protected_state = lambda *a, **k: {}\n"
+        "\n"
+        "class Candidate:\n"
+        "    pass\n"))
+
+    # ⚠️ 这个载荷会把**本进程**里的 risk.constitution.check_protected_state
+    # 换成空函数(拒绝发生在比对之后,替换发生在 exec 期间)。
+    # 留着会污染后面所有依赖真第四层的用例(全套跑时表现为几条指纹测试莫名失败)——
+    # 所以这条在**子进程**里跑。
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    # 子进程要显式给 UTF-8:控制台代码页是 cp1252,子进程打印中文会 UnicodeEncodeError
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    # 拒绝理由必须指出「闸门被改写」——只断言"被拒"没有区分力:
+    # 修复前的代码会以「不是策略骨架的子类」拒绝,断言照样成立。
+    assert "闸门" in proc.stdout, proc.stdout
+
+
+def test_a_candidate_that_tampers_with_a_risk_function_is_refused(approved):
+    """端到端载荷:把 300 元单笔预算换成一个恒 0 的函数,再把第四层关掉。
+
+    静态层现在**看得见**这条路了(第 3 轮加的「按名改写」规则:名字是字符串时
+    按属性名查黑名单看不见它),所以它在 exec **之前**就被拒;
+    第四层仍然是兜底——这条用例断言的是「整条链最终拒绝了它」。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import sys\n"
+        "_m = sys.modules['risk.risk_guard']\n"
+        "setattr(_m, 'within_budget', lambda *a, **k: 0.0)\n"
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+
+    # 这个载荷在**被拒之前**就已经把进程里的 risk.risk_guard.within_budget 换掉了
+    # (拒绝发生在比对之后,而改写发生在 exec 期间)。所以:
+    #   ① 拒绝必须发生(这里是断言的重点);
+    #   ② 污染不能留在本进程里——否则后面的测试都跑在一个被拆了风控的进程上。
+    # 因此这一条在**子进程**里跑(与 codex 复核时的做法一致)。
+    probe = """
+import sys, types
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    # 子进程要显式给 UTF-8:控制台代码页是 cp1252,子进程打印中文会 UnicodeEncodeError
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    # 拒绝理由必须指向「闸门被改写」或「受保护对象被改写」——
+    # 只断言"被拒"没有区分力:载荷必须**真的是骨架子类**,
+    # 否则「不是策略骨架的子类」会先一步拒绝,断言照样成立(第 2 轮 codex 复核指出)。
+    assert ("闸门" in proc.stdout or "受保护对象" in proc.stdout), proc.stdout
+
+
+def test_a_candidate_that_overrides_a_template_member_is_refused(approved):
+    """类级校验(`check_class`):候选不得重写白名单以外的模板成员。
+
+    静态层只按**名字**查黑名单,`on_daily_bar` / `variables` / `daily_end` 这些
+    不在受保护名单里的模板成员,静态层看不见——那一层由 `check_class` 负责。
+    研究侧有这层,运行侧原先漏了(第 1 轮 codex 复核发现)。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    def on_daily_bar(self, bar):\n"
+        "        return None\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger)
+    assert "模板成员" in str(excinfo.value)
+
+
+def test_the_research_only_skeleton_is_refused_in_the_trading_runtime(approved):
+    """15m 骨架仅支持研究回测(on_tick 直接抛异常)→ 交易运行时装载时必须拒绝。
+
+    否则策略会在实盘第一根 tick 上抛异常并被引擎静默停掉:
+    失败方向安全(不下单),但错误信息极具误导性。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy\n"
+        "\n"
+        "class Candidate(TrendAtr15mStrategy):\n"
+        "    pass\n"))
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger, template_name=None)
+    assert "仅支持研究回测" in str(excinfo.value)
+
+
+def test_a_setting_with_a_history_symbol_still_loads(approved):
+    """`history_vt_symbol` 是操作参数(预热用哪个历史合约),不是风控底线。
+
+    它在宪法的受保护参数表里,但运行时自己要从 `--history` 传它;
+    若一并禁掉,实盘的正常配置(带历史预热)就永远装不上。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    cls = _load(approved_dir, ledger, setting={"history_vt_symbol": "CADJ.DCE",
+                                              "fast_window": 10})
+    assert cls.__name__ == "Candidate"
+
+
+def test_a_setting_carrying_the_risk_floor_is_refused(approved):
+    """风控底线参数仍由调用方指定 → 拒绝。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+
+    with pytest.raises(approved_guard.ApprovedLoadError) as excinfo:
+        _load(approved_dir, ledger, setting={"risk_budget": 999999})
+    assert "策略设置未通过校验" in str(excinfo.value)
+
+
+def test_a_poisoned_process_refuses_every_further_load(approved):
+    """被投毒之后,本进程不再允许装载任何候选(第 2 轮 codex 实测的 F1)。
+
+    载荷 #1 关掉闸门并被拒;载荷 #2 才是真正的攻击。
+    如果第二次装载绑到**已被换掉**的闸门上,第四层就死了。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.check_protected_state = lambda *a, **k: []\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+
+def load(name):
+    try:
+        approved_guard.load_approved_strategy(
+            approved_dir=approved_dir, approvals_file=ledger, file_name=name,
+            class_name='Candidate',
+            template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
+        return 'LOADED'
+    except approved_guard.ApprovedLoadError as exc:
+        return 'REFUSED:' + str(exc)
+
+print('FIRST:' + load('cand.py'))
+print('SECOND:' + load('cand.py'))
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    out = proc.stdout
+    assert "FIRST:REFUSED" in out, (out, proc.stderr[-800:])
+    assert "SECOND:REFUSED" in out, (out, proc.stderr[-800:])
+    assert "NOT_LOADED" not in out
+
+
+def test_a_candidate_cannot_exit_the_process_silently(approved):
+    """候选在导入期 `raise SystemExit(0)` 不得让交易进程以**退出码 0** 结束。
+
+    那会变成「正常停止」:`restart: on-failure` 不重启、监控看着像没事、且零告警。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "raise SystemExit(0)\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=Path(r'%s'), approvals_file=Path(r'%s'), file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger))
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert "REFUSED" in proc.stdout, (proc.stdout, proc.stderr[-800:])
+    assert proc.returncode == 0, proc.returncode
+
+
+def _probe_load(approved_dir, ledger, source: str, extra: str = "") -> str:
+    """在**子进程**里跑一次装载,返回它的 stdout。
+
+    子进程是必须的:候选载荷会把闸门换掉,而那**留在进程里**(拒绝发生在比对之后)。
+    """
+    probe = """
+import sys
+sys.path.insert(0, r'%s')
+from risk import approved_guard
+from pathlib import Path
+approved_dir = Path(r'%s')
+ledger = Path(r'%s')
+%s
+try:
+    approved_guard.load_approved_strategy(
+        approved_dir=approved_dir, approvals_file=ledger, file_name='cand.py',
+        class_name='Candidate',
+        template_name='strategies.trend_atr_strategy:TrendAtrStrategy',
+        collected_file=None, promotion_file=None)
+except approved_guard.ApprovedLoadError as exc:
+    print('REFUSED:' + str(exc))
+    sys.exit(0)
+except BaseException as exc:
+    print('CRASH:' + repr(exc))
+    sys.exit(2)
+print('NOT_REFUSED')
+sys.exit(1)
+""" % (str(ROOT), str(approved_dir), str(ledger), extra)
+    proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=120,
+                          env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    return proc.stdout
+
+
+def test_the_restore_style_bypass_is_refused(approved):
+    """「换属性 → 调用 → 复原」式绕过必须被拒(第 3 轮 codex 实测的 N1)。
+
+    候选把 `check_protected_state` 换成**调用时把原函数装回去**并返回 `[]` 的假函数:
+    指纹结论恒为空,而事后身份核对看到的是「真函数」——两条检查同时被骗过。
+    装载器现在用的是**exec 之前绑好的局部引用**,候选换不掉它。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_orig = _c.check_protected_state\n"
+        "def _fake(before, after):\n"
+        "    _c.check_protected_state = _orig\n"
+        "    return []\n"
+        "_c.check_protected_state = _fake\n"
+        "import sys\n"
+        "setattr(sys.modules['risk.risk_guard'], 'within_budget', lambda *a, **k: 0.0)\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    out = _probe_load(approved_dir, ledger, "")
+    assert "REFUSED" in out, out
+    assert "NOT_REFUSED" not in out
+
+
+def test_a_deleted_or_emptied_gate_does_not_crash_the_loader(approved):
+    """闸门被 `del` 或被置 None 时,装载器必须**干净拒绝**,不是裸异常。
+
+    裸 AttributeError/TypeError 会逃出装载器:调用方只认 `ApprovedLoadError`,
+    于是「拒绝」被降级成「崩溃」(第 3 轮 codex 实测的 N2)。
+    """
+    approved_dir, ledger = approved
+    for payload in ("import risk.constitution as _c\ndel _c.check_protected_state\n",
+                    "import risk.constitution as _c\n_c.check_protected_state = None\n"):
+        _install(approved_dir, ledger, source=(
+            payload
+            + "\nfrom strategies.trend_atr_strategy import TrendAtrStrategy\n"
+              "\nclass Candidate(TrendAtrStrategy):\n    pass\n"))
+        out = _probe_load(approved_dir, ledger, "")
+        assert "CRASH" not in out, out
+        assert "REFUSED" in out, out
+        assert "NOT_REFUSED" not in out, out
+
+
+def test_a_replaced_constitution_loader_is_refused(approved):
+    """`const.load` 被换掉 → 必须拒绝(换掉它 = 下一份候选的静态筛查被清空)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, source=(
+        "import risk.constitution as _c\n"
+        "_c.load = lambda *a, **k: None\n"
+        "\n"
+        "from strategies.trend_atr_strategy import TrendAtrStrategy\n"
+        "\n"
+        "class Candidate(TrendAtrStrategy):\n"
+        "    pass\n"))
+    out = _probe_load(approved_dir, ledger, "")
+    assert "REFUSED" in out, out
+    assert "NOT_REFUSED" not in out
+
+
+def test_two_clean_loads_are_allowed(approved):
+    """没有投毒时,多次装载仍然允许(被投毒才禁)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    out = _probe_load(approved_dir, ledger, "")
+    # 注意 "NOT_REFUSED" 里也含 "REFUSED",所以要断言的是「没被拒」的那一边
+    assert "NOT_REFUSED" in out, out
+
+
+def test_the_runtime_refuses_without_the_promotion_record(make_runtime, approved):
+    """**没有晋级门槛通过记录 → 拒绝装载**。
+
+    这是第 4 轮 codex 建议的折中:把「运行时装载候选」这条路**关着**,
+    直到「运行时装载前的晋级门槛闸门」(Issue #37)真正落地。
+    人工审阅挡得住「代码里有坏东西」,挡不住「这策略没有统计优势」。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, promotion=False)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "晋级" in problem
+
+
+def test_the_runtime_refuses_without_the_collected_record(make_runtime, approved):
+    """人工 `cp` 把文件拷进 approved/ → 没有「已收菜」记录 → 拒绝装载。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger, collected=False)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "收菜" in problem
+
+
+def test_the_load_gate_binds_the_key_the_strategy_was_evaluated_on(make_runtime, approved):
+    """装载门记录里的品种必须与本次要跑的品种一致(Issue #37 的「品种绑定」)。
+
+    同一份代码换个品种不通用:那份通过记录授权的是「它被评估过的那个品种」。
+    """
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE, "approved_key": "MAADJ"})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "品种" in problem
+
+
+def test_the_load_gate_binds_the_bytes(make_runtime, approved):
+    """记录绑定的是**这份字节**:换一份文件就不能蹭记录。"""
+    approved_dir, ledger = approved
+    sha = _install(approved_dir, ledger)
+    # 账本里批准的是 sha;装载门记录也绑定 sha。改文件内容 → 哈希变了 → 两道门都拒
+    (approved_dir / "cand.py").write_text(CANDIDATE + "\n# 改了\n", encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert sha[:12] not in problem        # 拒绝理由里不应泄露完整哈希口径
+
+
+def test_the_load_gate_requires_a_run_id(make_runtime, approved):
+    """记录必须写明「哪一次评估」(run_id):数据一更新,同一次通过的含义就变了。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    promotion_file = approved_dir.parent / "data" / "state" / "approved_promotion.json"
+    record = json.loads(promotion_file.read_text(encoding="utf-8"))
+    record.pop("run_id")
+    promotion_file.write_text(json.dumps(record), encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "run_id" in problem
+
+
+def test_the_load_gate_requires_a_key(make_runtime, approved):
+    """记录必须写明品种(key)。"""
+    approved_dir, ledger = approved
+    _install(approved_dir, ledger)
+    promotion_file = approved_dir.parent / "data" / "state" / "approved_promotion.json"
+    record = json.loads(promotion_file.read_text(encoding="utf-8"))
+    record.pop("key")
+    promotion_file.write_text(json.dumps(record), encoding="utf-8")
+    rt = make_runtime({"approved_file": "cand.py", "approved_root": approved_dir.parent,
+                       "approved_template": LIVE_TEMPLATE})
+
+    problem = rt._load_approved_strategy()
+
+    assert problem is not None
+    assert "品种" in problem or "key" in problem
