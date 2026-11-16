@@ -14,7 +14,7 @@ from pathlib import Path
 # 宿主机(UTC-8)与容器(Asia/Shanghai)差 16 小时,按本机时区算会把日期算错。
 # 用**固定 UTC+8 偏移**而不是 `ZoneInfo`:ZoneInfo 依赖时区数据库,
 # Windows 上常常只有用户目录里那份 `tzdata`,`-I` 隔离模式的进程拿不到 ⇒ 一 import 就崩
-# (2026-11-16 codex 复核 H1)。中国自 1991-04-14 起不再用夏令时,自那以后两者等价。
+# (2026-11-16 codex 复核 H1)。中国最后一段夏令时 1991-09-15 才结束,自那以后两者等价。
 EXCHANGE_TZ = timezone(timedelta(hours=8), "北京时间")
 
 # 日志里表示"异常事件"的措辞 → 报告里的人话。
@@ -355,7 +355,8 @@ def heartbeat_day(heartbeat_file: Path) -> str:
     **按交易所时区换算**:mtime 是 epoch 秒,`datetime.fromtimestamp` 会用**本机**时区换算。
     宿主机是 UTC-8 时,容器里 Asia/Shanghai 的 08:00 会被算成前一天的 16:00 →
     心跳挂到错误的交易日那一行(或者哪一行都挂不上)。
-    交易日的口径本来就必须是交易所时区,所以这里显式指定 Asia/Shanghai。
+    交易日的口径本来就必须是交易所时区,所以这里显式指定**固定 UTC+8 偏移**(EXCHANGE_TZ),
+    不再用 `ZoneInfo("Asia/Shanghai")`(那要读时区数据库)(2026-11-16 codex 复核 L4)。
     """
     try:
         stamp = datetime.fromtimestamp(heartbeat_file.stat().st_mtime, EXCHANGE_TZ)

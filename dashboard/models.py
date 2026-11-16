@@ -18,7 +18,8 @@ from typing import Any
 # 而以 `-I` 隔离模式启动的进程(仪表盘冒烟 `scripts/status_server.py`)拿不到用户目录 ——
 # 一 import 就 `ZoneInfoNotFoundError`,整个仪表盘起不来
 # (2026-11-16 codex 复核 H1:`python -I -c "from dashboard import collectors"` 复现)。
-# 中国自 1991-04-14 起不再用夏令时,自那以后固定偏移与 `Asia/Shanghai` 等价,
+# 中国最后一段夏令时 1991-09-15 才结束(1991-04-14 是**开始**日),自那以后固定偏移与
+# `Asia/Shanghai` 等价,
 # 而且不依赖任何外部数据。
 BEIJING = timezone(timedelta(hours=8), "北京时间")
 MAX_JSON_FILE_BYTES = 2_000_000          # 状态 JSON(风控状态、录制状态、批准记录、运行结果)的读取上限

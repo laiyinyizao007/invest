@@ -59,7 +59,7 @@ from ctp_tools.simnow import normalize_address  # noqa: E402
 
 # 固定 UTC+8,**不用** `ZoneInfo("Asia/Shanghai")`:ZoneInfo 依赖时区数据库,
 # Windows 上常常只有用户目录里那份 `tzdata`,隔离模式(`-I`)的进程拿不到 ⇒ 一 import 就崩。
-# 中国自 1991-04-14 起不再用夏令时,自那以后两者等价(2026-11-16 codex 复核 H1)。
+# 中国最后一段夏令时 1991-09-15 才结束,自那以后两者等价(2026-11-16 codex 复核 H1/L5)。
 BEIJING = timezone(timedelta(hours=8), "北京时间")
 TEMPLATE_NAME = "国信期货有限责任公司外部接入系统技术测试报告20260717.docx"
 

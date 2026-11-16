@@ -28,9 +28,10 @@ from pathlib import Path
 # ZoneInfo 要读系统(或 pip 装的 `tzdata`)里的时区数据库,Windows 上常常只有用户目录里那份
 # `tzdata` —— 而以 `-I` 隔离模式启动的进程(仪表盘冒烟 `scripts/status_server.py`)拿不到用户目录,
 # 一 import 就 `ZoneInfoNotFoundError`,把仪表盘带崩(2026-11-16 全量 pytest 抓到:
-# `tests/test_dashboard_boundaries.py` 多出 2 个失败)。中国**自 1991-04-14 起**不再用夏令时,
-# 自那以后固定偏移与 `Asia/Shanghai` 在交易日口径上完全等价(1991 年以前的部分日期会差 1 小时,
-# 交易日语义上无影响),而且不依赖任何外部数据。
+# `tests/test_dashboard_boundaries.py` 多出 2 个失败)。中国最后一段夏令时是 1991-04-14 开始、
+# **1991-09-15 结束**(不是 1991-04-14 就停用 —— 那是开始日,1991-09-14 仍是 UTC+9),
+# 自那以后固定偏移与 `Asia/Shanghai` 在交易日口径上完全等价(1991 年 9 月以前的部分日期会差 1 小时,
+# 交易日语义上无影响),而且不依赖任何外部数据(2026-11-16 codex 复核 L5)。
 BEIJING = timezone(timedelta(hours=8), "北京时间")
 
 
@@ -91,7 +92,8 @@ class AccountGuard:
         self.daily_locked_day: date | None = None
         self.hard_locked: bool = False
         self.hard_reason: str = ""
-        self.hard_locked_at: str = ""          # 硬锁定触发时间(ISO);空 = 未知(旧状态文件/文件损坏),冷却期无法计算
+        self.hard_locked_at: str = ""          # 硬锁定触发时间(ISO,北京时间);空 = 未知(旧状态文件/文件损坏),冷却期无法计算
+        self.hard_locked_at_legacy: bool = False   # 旧状态文件里的 hard_locked_at 是**本机本地时间**,交易日不可信
         self.unlock_history: list[dict] = []   # 人工解锁记录:{at, locked_at, reason, forced}
         self.manual_orders: dict[str, int] = {}  # 交易日(ISO) -> 当日检测到的非策略委托笔数
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
@@ -201,6 +203,9 @@ class AccountGuard:
         unknown = "硬锁定触发时间未知(旧状态文件或状态文件损坏),无法证明已过冷却期,解锁需在核对后用 --force 强制"
         if not self.hard_locked_at:
             return unknown
+        if self.hard_locked_at_legacy:
+            return ("硬锁定触发时间来自旧状态文件,记录的是本机本地时间,无法证明已过冷却期,"
+                    "解锁需在核对后用 --force 强制")
         try:
             locked_day = trading_day(datetime.fromisoformat(self.hard_locked_at))
         except ValueError:
@@ -215,7 +220,8 @@ class AccountGuard:
         重置峰值等于重新获得完整的累计死线预算,所以每次解锁都写入 unlock_history(含是否越过冷却)。
         """
         now = now or beijing_now()
-        before = (self.hard_locked, self.hard_reason, self.hard_locked_at, self.peak_equity, list(self.unlock_history))
+        before = (self.hard_locked, self.hard_reason, self.hard_locked_at, self.hard_locked_at_legacy,
+                  self.peak_equity, list(self.unlock_history))
         self.unlock_history = (self.unlock_history + [{
             "at": now.isoformat(timespec="seconds"), "locked_at": self.hard_locked_at,
             "reason": self.hard_reason, "forced": forced,
@@ -223,11 +229,13 @@ class AccountGuard:
         self.hard_locked = False
         self.hard_reason = ""
         self.hard_locked_at = ""
+        self.hard_locked_at_legacy = False
         self.peak_equity = 0.0
         self._save()
         if self.save_error:
             # 没写进磁盘就不算解锁:内存状态回滚,与磁盘保持一致(调用方据 save_error 报错)
-            self.hard_locked, self.hard_reason, self.hard_locked_at, self.peak_equity, self.unlock_history = before
+            self.hard_locked, self.hard_reason, self.hard_locked_at, self.hard_locked_at_legacy, \
+                self.peak_equity, self.unlock_history = before
 
     # ---------- 非策略委托计数 ----------
 
@@ -252,8 +260,14 @@ class AccountGuard:
             # 对 naive 值,`.astimezone()` 一律按**本机时区**解释,于是落盘时刻被平移了
             # (北京 − 本地)—— 非北京宿主机上状态页的「权益新鲜度」会一直显示陈旧,
             # 而那是操作员判断「风控还活着吗」的唯一依据(2026-11-16 codex 复核 M5)。
-            "sampled_at": (self.last_sampled_at.replace(tzinfo=BEIJING).isoformat(timespec="seconds")
-                           if self.last_sampled_at else None),   # 带时区
+            # 统一走 _stamp_beijing():naive 一律按北京时间解释,带时区的一律换算到北京时间,
+            # 写出来永远是 +08:00(2026-11-16 codex 复核 M1:旧的 `.replace(tzinfo=BEIJING)`
+            # 对**带时区**的值是「换标签不换时区」,旧文件(-08:00)会被平移 16 小时)。
+            "sampled_at": self._stamp_beijing(self.last_sampled_at),   # 带时区
+            # 状态文件格式版本:2 = 时刻字段一律北京时间。旧文件(无此字段)里的
+            # hard_locked_at 是**本机本地时间**,混着比交易日会把冷却期放宽(fail-open),
+            # 所以旧文件按「触发时间未知」处理(2026-11-16 codex 复核 L2)。
+            "state_version": 2,
             "peak_equity": self.peak_equity,
             "day": self.day.isoformat() if self.day else None,
             "day_start_equity": self.day_start_equity,
@@ -261,6 +275,9 @@ class AccountGuard:
             "hard_locked": self.hard_locked,
             "hard_reason": self.hard_reason,
             "hard_locked_at": self.hard_locked_at,
+            # 旧文件里的 hard_locked_at 是本机本地时间 ⇒ 冷却期算不准。这个标记必须**跟着文件一起存**,
+            # 否则下一次 _save() 写上 state_version=2,旧时间戳就被当成北京时间了(标记丢失 = fail-open)。
+            "hard_locked_at_legacy": self.hard_locked_at_legacy,
             "unlock_history": self.unlock_history,
             "manual_orders": self.manual_orders,
         }
@@ -277,15 +294,40 @@ class AccountGuard:
             self.save_error = repr(exc)
 
     @staticmethod
+    def _stamp_beijing(ts: datetime | None) -> str | None:
+        """把时刻写成**带 +08:00 偏移**的 ISO 串。
+
+        naive 一律按**北京时间**解释(内部契约:naive = 北京时间,见 `beijing_now()`);
+        已经带时区的一律换算到北京时区(同一瞬时,换算不丢信息)。
+        """
+        if ts is None:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=BEIJING)
+        else:
+            ts = ts.astimezone(BEIJING)
+        return ts.isoformat(timespec="seconds")
+
+    @staticmethod
     def _parse_sampled_at(raw) -> datetime | None:
-        """纯可观测字段:坏值只丢弃,**绝不能**因此触发『状态文件损坏→硬锁定』。要求带时区,否则无法与其他时刻比较。"""
+        """纯可观测字段:坏值只丢弃,**绝不能**因此触发『状态文件损坏→硬锁定』。要求带时区,否则无法与其他时刻比较。
+
+        归一成**北京时间 naive**:内部契约一律是 naive 北京时间(见 `beijing_now()`),
+        落盘时再统一盖上 +08:00。早先版本落盘用的是 `.astimezone()`,写出来的是**本机偏移**
+        (UTC-8 宿主机上是 `-08:00`);若原样带着那个偏移回来,`_save()` 里的
+        `.replace(tzinfo=BEIJING)` 就是「换标签不换时区」⇒ 瞬时值平移 16 小时,
+        状态页「权益新鲜度」立刻显示成陈旧值 —— 正是当初要修的那个症状
+        (2026-11-16 codex 复核 M1)。这里先 `astimezone(BEIJING)` 换算成同一瞬时,再去掉时区。
+        """
         if not isinstance(raw, str):
             return None
         try:
             value = datetime.fromisoformat(raw)
         except ValueError:
             return None
-        return value if value.tzinfo is not None else None
+        if value.tzinfo is None:
+            return None
+        return value.astimezone(BEIJING).replace(tzinfo=None)
 
     def _load(self) -> None:
         if self.state_path is None or not self.state_path.exists():
@@ -302,6 +344,13 @@ class AccountGuard:
             self.hard_reason = str(s["hard_reason"])
             # 以下为后加字段:旧状态文件没有,缺失时取默认值(向后兼容)
             self.hard_locked_at = str(s.get("hard_locked_at", ""))
+            # 旧状态文件(没有 state_version)里的 hard_locked_at 是**本机本地时间**(旧代码用
+            # datetime.now())。拿它跟北京时间的 now 比交易日,宿主机不在北京时可能**早一个交易日**
+            # 判成「已过冷却期」⇒ 冷却期被放宽(fail-open)。生产跑在 TZ=Asia/Shanghai 的容器里
+            # (本地 == 北京)影响 ≈ 0,但运维机上有影响。旧文件一律按「触发时间未知」处理:
+            # 保守拒绝,需 --force(与既有的「触发时间未知」口径一致)(2026-11-16 codex 复核 L2)。
+            self.hard_locked_at_legacy = bool(s.get("hard_locked_at_legacy", False)) or (
+                bool(self.hard_locked_at) and int(s.get("state_version", 1)) < 2)
             self.unlock_history = [dict(h) for h in s.get("unlock_history", [])][-UNLOCK_HISTORY_LIMIT:]
             self.manual_orders = {str(k): int(v) for k, v in s.get("manual_orders", {}).items()}
             self.last_sampled_at = self._parse_sampled_at(s.get("sampled_at"))

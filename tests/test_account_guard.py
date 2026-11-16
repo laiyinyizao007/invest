@@ -501,9 +501,16 @@ def test_the_beijing_clock_does_not_depend_on_the_tz_database():
     import subprocess
 
     root = str(Path(__file__).resolve().parents[1])
+    # 断言的是 **`zoneinfo` 这个模块本身**没被 import,而不是 `tzdata`:
+    # ① `ZoneInfo` 只有在**查不到**系统时区库时才去 import `tzdata`,而查不到时它直接抛异常,
+    #    失败的 import **不会**留在 sys.modules 里 ⇒ 断言 `'tzdata' not in sys.modules` 永远是空的;
+    # ② 有系统时区库(Linux/macOS/装了 tzdata 的 Windows)时,`ZoneInfo` 根本不 import `tzdata`,
+    #    把代码改回 `ZoneInfo("Asia/Shanghai")` 这个用例照样绿 —— 守卫名存实亡
+    #    (2026-11-16 codex 复核 M4)。
+    # `zoneinfo` 一旦被 import 就说明代码又用回 ZoneInfo 了,这条在**所有平台**都成立。
     code = (
         "import sys; sys.path.insert(0, %r); import risk.account_guard as g; "
-        "assert 'tzdata' not in sys.modules, 'the clock must not pull in the tz database'; "
+        "assert 'zoneinfo' not in sys.modules, 'the clock must not use the zoneinfo module'; "
         "print(g.beijing_now().isoformat())" % root
     )
     proc = subprocess.run([sys.executable, "-I", "-c", code],
@@ -540,13 +547,117 @@ def test_the_dashboard_and_evidence_modules_do_not_need_the_tz_database():
     import subprocess
 
     root = str(Path(__file__).resolve().parents[1])
+    # 同上:断言 `zoneinfo` 没被 import(而不是 `tzdata`)—— 详见上一个用例的注释
+    # (2026-11-16 codex 复核 M4)。
     code = (
         "import sys; sys.path.insert(0, %r); "
         "import dashboard.models, evidence.logstats; "
-        "assert 'tzdata' not in sys.modules, 'the dashboard must not pull in the tz database'; "
+        "assert 'zoneinfo' not in sys.modules, 'the dashboard must not use the zoneinfo module'; "
         "print(dashboard.models.BEIJING.utcoffset(None), evidence.logstats.EXCHANGE_TZ.utcoffset(None))" % root
     )
     proc = subprocess.run([sys.executable, "-I", "-c", code],
                           capture_output=True, text=True, encoding="utf-8")
     assert proc.returncode == 0, proc.stderr[-800:]
     assert "8:00:00" in proc.stdout
+
+
+# ---------- 采样时刻的时区归一(2026-11-16 codex 复核 M1) ----------
+
+def test_an_old_state_file_with_a_local_offset_keeps_the_same_instant(tmp_path):
+    """旧状态文件里的 `sampled_at` 带的是**本机偏移**(`-08:00`),不是 `+08:00`。
+
+    读回来再落盘时,瞬时值必须**不变**:2026-11-16 codex 复核 M1 指出,原先的
+    `.replace(tzinfo=BEIJING)` 对**带时区**的值是「换标签不换时区」——
+    `-08:00` 被换成 `+08:00` 而墙钟不动 ⇒ 瞬时值平移 16 小时,
+    状态页的「权益新鲜度」立刻显示成陈旧值(那正是当初要修的症状)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T05:00:00-08:00",        # = 北京时间 2026-11-16 21:00
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at == datetime(2026, 11, 16, 21, 0)      # 瞬时值不变,只是换成了北京时间
+    g._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))["sampled_at"]
+    assert saved == "2026-11-16T21:00:00+08:00", saved
+
+
+def test_a_legacy_state_file_cannot_prove_the_unlock_cooldown_has_passed(tmp_path):
+    """旧状态文件里的 `hard_locked_at` 是**本机本地时间**,不能拿它跟北京时间的 now 比交易日。
+
+    2026-11-16 codex 复核 L2:旧代码用 `datetime.now()` 落盘,宿主机 UTC-8 时那个值比北京时间
+    最多晚 16 小时 ⇒ 交易日可能**早一个交易日** ⇒ 冷却期被放宽(fail-open)。
+    旧文件一律按「触发时间未知」处理:保守拒绝,需 --force。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",          # 本机本地时间(旧代码的 datetime.now())
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.hard_locked_at_legacy is True
+    reason = g.unlock_cooldown(datetime(2026, 11, 16, 21, 0))   # 早就过了「下一个交易日」
+    assert reason, "旧文件证明不了冷却期已过,必须保守拒绝"
+    assert "--force" in reason
+
+
+def test_a_legacy_marker_survives_the_next_save(tmp_path):
+    """旧文件的「本地时间」标记必须**跟着文件一起存**:否则下一次落盘写上 state_version=2,
+    旧时间戳就被当成北京时间了(标记丢失 = 冷却期又被放宽)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["state_version"] == 2
+    assert saved["hard_locked_at_legacy"] is True
+    again = AccountGuard(AccountLimits(600, 2000), path)
+    assert again.hard_locked_at_legacy is True
+
+
+def test_an_aware_sample_time_is_converted_to_the_beijing_offset(tmp_path):
+    """带时区的采样时刻一律换算到北京时间再落盘(内部契约是 naive 北京时间)。"""
+    from datetime import timedelta, timezone
+
+    path = tmp_path / "guard.json"
+    guard = AccountGuard(AccountLimits(), path)
+    aware = datetime(2026, 11, 10, 21, 30, tzinfo=timezone(timedelta(hours=8)))
+    guard.update(10_000, MON_10AM, sampled_at=aware)
+    saved = json.loads(path.read_text(encoding="utf-8"))["sampled_at"]
+    assert saved == "2026-11-10T21:30:00+08:00", saved
+
+
+def test_a_naive_sample_time_in_the_state_file_is_dropped_not_guessed(tmp_path):
+    """状态文件里的采样时刻必须带时区,否则无法与其他时刻比较 ⇒ 丢弃,不猜。
+
+    丢的是**纯可观测字段**:不能因此触发「状态文件损坏 → 硬锁定」。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",          # 没有时区
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at is None
+    assert g.hard_locked is False                    # 不能因此当成状态文件损坏

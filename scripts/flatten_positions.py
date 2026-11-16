@@ -43,7 +43,6 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -62,6 +61,7 @@ from ctp_tools.penetration import check_target, mask_account  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status  # noqa: E402
 from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK  # noqa: E402
 from vnpy.trader.object import OrderRequest, SubscribeRequest  # noqa: E402
@@ -247,7 +247,12 @@ def manual_positions(positions: list) -> list[str]:
         if int(getattr(pos, "volume", 0) or 0) <= 0:
             continue
         if not split_is_reliable(pos):
-            out.append(f"{pos.vt_symbol} {direction_text(pos.direction)} {pos.volume} 手"
+            # 方向同样要**归一化后按白名单**显示:认不出来的方向显示「无方向」,
+            # 别把内部枚举名原样漏给看报告的人(与 probe_position 一致,
+            # 2026-11-16 codex 复核 L7)。
+            known = normalize_direction(getattr(pos, "direction", None))
+            shown = direction_text(pos.direction) if known in ("LONG", "SHORT", "NET") else "无方向"
+            out.append(f"{pos.vt_symbol} {shown} {pos.volume} 手"
                        "(上期所/能源中心的今昨仓拆不出来,自动平仓会被柜台拒单,请人工平仓)")
             continue
         name = normalize_direction(getattr(pos, "direction", None))
@@ -456,14 +461,14 @@ def run(args: argparse.Namespace) -> int:
     event_engine.register(EVENT_POSITION, collector.on_position)
     event_engine.register(EVENT_ACCOUNT, collector.on_account)   # 持仓查询「没有行」时用账户回报证明柜台在应答
 
-    record: dict = {"时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    record: dict = {"时间": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
                     "档案": args.profile or "(项目 .env)",
                     "交易前置": address, "行情前置": md_address, "柜台环境": environment,
                     "账号": mask_account(setting["用户名"]), "确认发单": bool(args.confirm_flatten),
                     "计划": [], "结果": [], "收尾持仓": []}
     out_dir = bootstrap.ROOT / "data" / "flatten"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"flatten-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    out_path = out_dir / f"flatten-{beijing_now().strftime('%Y%m%d-%H%M%S')}.json"
 
     def save_record() -> None:
         out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

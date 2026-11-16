@@ -1340,8 +1340,9 @@ def test_the_position_warning_survives_another_metric_being_inconclusive(env, mo
 
     2026-11-16 codex 复核 M1:摘要原来只取**第一个**非空原因
     (`order_stalled or cancel_stalled`),于是报单指标判不出来时,撤单指标那条
-    「演示单已成交 ⇒ 账户可能多出持仓」整条消失 —— 而摘要是**进国信报告正文的那行字**
-    (`broker_report.py` 渲染 `f"{ev.status}({ev.summary})"`)。
+    「演示单已成交 ⇒ 账户可能多出持仓」整条消失 —— 而摘要会进 `evidence.json`、终端输出,
+    以及报告工具的「缺失项清单」(`broker_report.py` 渲染 `f"{ev.status}({ev.summary})"` 写进
+    `outcome.missing`;真正进 docx 正文的是**证据行**,不是摘要)。
     持仓风险跟「为什么判不出来」无关,不能被它盖掉。
     """
     daily = env.risk.rules["每日上限检查"]
@@ -1408,7 +1409,7 @@ def test_a_hard_failure_also_carries_the_position_warning(env, monkeypatch):
 
     2026-11-16 codex 复核 M1:持仓告警原先只在「判不出来」分支里补,硬失败分支反而漏掉 ——
     而恰恰是演示单可能已经成交的那一轮(撤单没赶上)会同时命中两个分支。
-    摘要正是**进国信报告正文的那行字**,漏掉就是把真风险写没了。
+    摘要会进 `evidence.json`、终端输出与报告工具的「缺失项清单」,漏掉就是把真风险写没了。
     """
     env.gw.mode = "fill"                          # 演示单一报出去就成交 ⇒ 撤单来不及
     real_send = bt.send
@@ -1456,3 +1457,215 @@ def test_a_blocked_order_with_no_risk_log_falls_back_to_the_counter(env, monkeyp
     lines = [line for s in p31.shots if s.label == "报单总笔数" for line in s.lines]
     assert any("读取计数已到" in line and "≥ 本项阈值" in line for line in lines), lines
     assert not any("< 本项阈值" in line for line in lines), lines
+
+
+def test_the_t6_summary_does_not_blame_our_threshold_when_another_rule_blocked_it(env, monkeypatch):
+    """超过阈值的那一笔若是**别的规则**拦的,T6 不能断言「阈值拦住了委托」。
+
+    2026-11-16 codex 复核 M2:风控规则按顺序判定(活动委托检查在每日上限检查之前),
+    委托规模检查也会拦 ⇒ 那笔单可能压根没走到本项阈值。
+    旧文案无条件写「阈值拦住了委托但没有收到预警告警」—— 那是**没有证据的因果断言**,
+    而且落在必测项 T6 上。归因只按证据:风控日志点名了我们这一项才算数。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_send(ctx, req)
+        # 第二笔(超阈值那笔)被**别的规则**拦下:日志里没有点名「汇总委托笔数」
+        ctx.collector.log_lines.append("委托被拦截，活动委托数量10达到上限10")
+        return None
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    t6 = item(env, "T6")
+    assert "阈值拦住了委托" not in t6.summary, t6.summary
+    assert "被其它规则拦下" in t6.summary, t6.summary
+
+
+def test_the_duplicate_order_metric_failure_gets_a_reason_in_the_summary(env):
+    """重复报单这一项失败时,P3.1 的摘要里必须有**原因**。
+
+    2026-11-16 codex 复核 M3:三个阈值指标里,重复报单原来只回一个布尔,
+    失败时摘要退化成「有阈值未能触发拦截与预警」—— 一个原因都没有。
+    """
+    env.risk.rules.pop("重复报单检查", None)            # 规则缺失 ⇒ 这一项失败
+    dup = bt.step_duplicate(env.ctx, env.book)
+    assert dup["ok"] is False
+    assert dup["reason"], dup
+    bt.step_threshold(env.ctx, env.book, dup)
+    p31 = item(env, "P3.1")
+    assert "重复报单" in p31.summary, p31.summary
+
+
+def test_a_rejected_demo_order_is_not_reported_as_still_hanging(env, monkeypatch):
+    """废单(被柜台拒单)没有挂单,不能说「可能仍挂在柜台上」。
+
+    2026-11-16 codex 复核 L1:未知终态原先一律落进「可能仍挂着」——
+    对一张**被拒单**的演示单,那句话是事实错误(它压根没上柜台),
+    而真正的事实(废单)一个字都没留。
+    """
+    from vnpy.trader.constant import Status
+
+    env.gw.cancel_works = False                    # 撤单请求发出去但撤不掉 ⇒ 终态留在废单上
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        oid = real_send(ctx, req)
+        # 撤单指标的第一笔(第 3 次发单)被柜台拒单:模拟一个**终态是废单**的演示单
+        if calls["n"] == 3 and oid:
+            order = ctx.collector.order_of(oid)
+            if order is not None:
+                order.status = Status.REJECTED
+        return oid
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert "拒单" in p31.summary or "废单" in p31.summary, p31.summary
+    assert "仍挂在柜台上" not in p31.summary, p31.summary
+
+
+def test_the_connection_info_timestamp_is_beijing_time():
+    """证据目录里的时间戳一律北京时间:条目时间与连接记录时间差 16 小时,事后对时间线会打架。
+
+    2026-11-16 codex 复核 L3:`connection_info` 的 `at` 原先写的是本机本地时间。
+    """
+    from risk import account_guard as ag
+
+    info = bt.connection_info(SETTING)
+    stamp = datetime.fromisoformat(info["at"])
+    assert stamp.tzinfo is None
+    assert abs((stamp - ag.beijing_now()).total_seconds()) < 120, info["at"]
+
+
+def test_the_t6_summary_says_our_threshold_blocked_it_when_the_log_names_it(env, monkeypatch):
+    """风控日志**点名了**本项指标 ⇒ 摘要可以说「本项阈值拦住了委托」。
+
+    与上一条对照:归因要有证据才下结论 —— 点名了才算数,没点名只说「被其它规则拦下」。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # 超阈值那笔:风控日志点名了「汇总委托笔数」,但没有触发预警
+            ctx.collector.log_lines.append("委托被拦截，汇总委托笔数1达到上限1")
+            return None
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    t6 = item(env, "T6")
+    assert "本项阈值拦住了委托" in t6.summary, t6.summary
+    p31 = item(env, "P3.1")
+    assert "报单:" in p31.summary, p31.summary
+
+
+def test_a_hard_failure_also_reports_the_duplicate_order_reason(env, monkeypatch):
+    """硬失败分支里**也要**带上重复报单的失败原因。
+
+    三个指标各有各的结论:硬失败(报单阈值失效)不能把「重复报单这项为什么没过」
+    整条吞掉 —— 摘要会被读成「只有报单这一项有问题」,运维会去错的地方查。
+    """
+    env.risk.rules.pop("重复报单检查", None)          # 重复报单这项失败(找不到规则)
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:                          # 超阈值那笔:假装风控没拦下 ⇒ 硬失败
+            return "VT999999"
+        return real_send(ctx, req)
+
+    real_settle = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real_settle(ctx, rule, attr, timeout) - 2, 0)   # 故意报旧两笔 ⇒ 基数取旧
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    calls["n"] = 0
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值未生效" in p31.summary, p31.summary
+    assert "重复报单:" in p31.summary, p31.summary
+
+
+def test_an_unreliable_threshold_also_reports_the_duplicate_order_reason(env, monkeypatch):
+    """「判不出来(SKIP)」分支里**也要**带上重复报单的失败原因。"""
+    env.risk.rules.pop("重复报单检查", None)          # 重复报单这项失败
+    env.gw.mode = "fill"                             # 演示单一报出去就成交 ⇒ 撤单来不及
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "重复报单:" in p31.summary, p31.summary
+
+
+def test_the_cancel_threshold_failure_says_which_metric_failed(env, monkeypatch):
+    """撤单这项没过时,摘要必须点名是**撤单**那一项(而不是笼统一句)。"""
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 4:                          # 撤单指标的超阈值那笔:被**别的规则**拦下
+            ctx.collector.log_lines.append("委托被拦截，委托价值20900.0超过上限")
+            return None
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    calls["n"] = 0
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "撤单:" in p31.summary, p31.summary
+
+
+def test_the_duplicate_order_metric_says_when_it_was_not_blocked_at_all(env, monkeypatch):
+    """重复报单这项**压根没被拦**时,摘要必须这么写(不是笼统一句「没触发拦截或预警」)。"""
+    rule = env.risk.rules["重复报单检查"]
+    monkeypatch.setattr(rule, "check_allowed", lambda *a, **k: True)   # 规则不再拦任何委托
+    dup = bt.step_duplicate(env.ctx, env.book)
+    assert not dup["ok"]
+    assert dup["reason"] == "重复报单没有被拦截", dup["reason"]
+    assert item(env, "P2.3").status == be.FAIL
+
+
+def test_the_duplicate_order_metric_says_when_it_was_blocked_without_an_alert(env, monkeypatch):
+    """被拦了但**没收到预警**是另一种结论,必须与「压根没被拦」分开写。"""
+    monkeypatch.setattr(env.rule, "_alert", lambda *a, **k: None)     # 预警通道静默,拦截照旧
+    dup = bt.step_duplicate(env.ctx, env.book)
+    assert not dup["ok"]
+    assert dup["reason"] == "重复报单被拦截但没有收到预警", dup["reason"]
+    assert item(env, "P2.3").status == be.FAIL
+
+
+def test_the_t6_summary_does_not_blame_our_threshold_when_there_is_no_log_at_all(env, monkeypatch):
+    """超阈值那笔没发出去、**又没有风控拦截日志** ⇒ 判不出是谁拦的,不能赖到本项阈值头上。"""
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return None                                   # 发出去了但没有任何风控日志
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    t6 = item(env, "T6")
+    assert t6.status == be.FAIL, t6.summary
+    assert "判不出是不是本项阈值拦的" in t6.summary, t6.summary

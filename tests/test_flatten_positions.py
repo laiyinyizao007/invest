@@ -828,3 +828,20 @@ def test_a_position_without_a_direction_is_still_named_for_a_human():
     listed = f.manual_positions([blank])
     assert listed and "方向认不出来" in listed[0], listed
     assert "pp2701.DCE" in listed[0]
+
+
+def test_an_unknown_direction_never_leaks_an_internal_enum_name():
+    """方向认不出来时显示「无方向」,不把内部枚举名漏给看报告的人。
+
+    2026-11-16 codex 复核 L7:`probe_position` 早就改对了,`manual_positions` 的
+    「今昨仓拆不出来」那一支还在用 `direction_text(pos.direction)` —— 兜底会把
+    认不出来的方向**原样**返回(大写原文),报告里就会冒出 `FOO` 这种内部名字。
+    """
+    from vnpy.trader.constant import Direction
+
+    pos = _pos("rb2701", Exchange.SHFE, Direction.LONG, 5, yd=2)     # 今昨混合 ⇒ 走「拆不出来」那一支
+    pos.direction = "SOME_INTERNAL_NAME"                              # 认不出来的方向
+    manual = manual_positions([pos])
+    assert manual, manual
+    assert "无方向" in manual[0], manual[0]
+    assert "SOME_INTERNAL_NAME" not in manual[0], manual[0]

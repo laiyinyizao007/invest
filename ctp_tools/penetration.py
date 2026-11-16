@@ -21,13 +21,13 @@
 """
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from vnpy.trader.constant import Direction, Offset, OrderType, Status
 from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest
 from vnpy.trader.utility import round_to
 
 from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session, trade_live
+from risk.account_guard import beijing_now
 from notify.webhook import redact
 from ctp_tools.simnow import is_simnow_address, normalize_address
 
@@ -270,7 +270,10 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
         if tick is not None:
             break
         time.sleep(0.5)
-    in_session = session_func(datetime.now())
+    # 盘中判定必须用**北京时间**:宿主机不在北京时,本机时间会把「盘中」判成「非盘中」,
+    # 于是「盘中没收到 Tick」被从 FAIL 降级成 WARN —— 少报一个真问题
+    # (2026-11-16 codex 复核 L8)。broker_test.py 走的是同一个口径。
+    in_session = session_func(beijing_now())
     if tick is not None:
         run.add("订阅行情", "PASS", f"收到 Tick,最新价 {tick.last_price}", time.monotonic() - t1)
     elif in_session:
