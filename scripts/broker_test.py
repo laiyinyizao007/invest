@@ -100,6 +100,7 @@ class Ctx:
     disconnect_timeout: float = 120.0
     position_wait: float = 8.0           # 查询持仓的等待窗口(CTP 持仓回报是异步的)
     cancel_wait: float = 8.0             # 等撤单确认的时间
+    attrib_wait: float = 5.0              # 等风控拦截日志到位的时间(日志是异步投递的)
     probe_seq: int = 0                   # 演示委托的价格序号:每笔演示委托用不同价格,避免重复报单规则的累计计数跨步骤污染
     flat: bool | None = None             # 账户是否已确认空仓(None = 还没查)
     flat_reason: str = ""                # 空仓闸门失败的具体原因(有持仓 / 连接断开)
@@ -561,15 +562,17 @@ def step_duplicate(ctx: Ctx, book: Book) -> dict:
     # `reason` 不带「重复报单」前缀:回给 P3.1 时由那边统一加前缀(和其它两个指标
     # 的「报单:…」「撤单:…」格式一致),免得拼出「重复报单:重复报单没有被拦截」这种
     # 重复措辞(2026-11-16 codex 复核 L8)。
+    # `summary` 是 P2.3 自己那条证据的措辞(完整短语,单独看也读得懂);
+    # `reason` 是回给 P3.1 的**短原因**(不带「重复报单」前缀,由 P3.1 统一补,
+    # 免得拼出「重复报单:重复报单没有被拦截」这种重复措辞 —— 2026-11-16 codex 复核 L8)。
     if rule is None:
-        reason = "找不到规则"
+        reason, summary = "找不到规则", "找不到重复报单规则"
     elif not blocked:
-        reason = "没有被拦截"
+        reason, summary = "没有被拦截", "重复报单没有被拦截"
     elif not alerts:
-        reason = "被拦截但没有收到预警"
+        reason, summary = "被拦截但没有收到预警", "重复报单被拦截但没有收到预警"
     else:
-        reason = ""
-    summary = f"重复报单{reason}" if reason else ""
+        reason, summary = "", ""
     book.add("P2.3", status, summary, [Shot("", lines)], started)
     # 把原因一并回给 P3.1:三个阈值指标里,重复报单原来只回一个布尔,
     # 失败时 P3.1 的摘要会退化成「有阈值未能触发拦截与预警」—— 一个原因都没有。
@@ -621,6 +624,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         blocked_detail = ""                        # 「对照用的那一笔」没发出去时的归因说明
         block_attrib = ""                          # 超过阈值那笔的拦截归因:ours=本项阈值/other=别的规则/none=没有日志
         block_detail = ""                          # 归因的人话(带日志原文引用)
+        first_no_log = False                       # 「对照用的那一笔」归因时**没看到**拦截日志
+        first_count_txt = ""                       # 那时候读到的计数措辞(补记时要用)
         a = b = ""
         alerts: list[dict] = []
         try:
@@ -646,7 +651,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                 #     但结论只能说「委托没发出去」并引用日志,不能说「阈值太紧」;
                 #   ③压根没有拦截日志 ⇒ 通道断开/账户被锁/别的规则 ⇒ 失败,中性措辞;
                 #   ④只有在**没有日志**时,才退回用计数推断(计数已到阈值 ⇒ 可能是本项拦的)。
-                ctx.wait_until(lambda: bool(ctx.logs_since(mark, "委托被拦截")), 2.0)
+                ctx.wait_until(lambda: bool(ctx.logs_since(mark, "委托被拦截")), ctx.attrib_wait)
                 block_logs = ctx.logs_since(mark, "委托被拦截")
                 ours = [h for h in block_logs if key_word in h]
                 count_now = count_of(counter_attr)
@@ -670,6 +675,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                     blocked_detail = (f"读取计数已到 {count_now} ≥ 本项阈值 {limit}"
                                       "(没有拦截日志,可能是本项阈值拦的) ⇒ 计数基数取旧,这轮对照做不成")
                 else:
+                    first_no_log = True
+                    first_count_txt = count_txt
                     blocked_detail = (f"委托没发出去,{count_txt},不是本项阈值拦的"
                                       "(没有风控拦截日志:可能是通道断开/账户被锁/委托被其它规则拦下)")
                 lines.append(f"⚠ {blocked_detail}")
@@ -758,9 +765,33 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                 # 而下面又把日志原文写进证据行 ⇒ 摘要与证据**自相矛盾**
                 # (2026-11-16 codex 复核 M-1)。测试用同步事件引擎 + 手工 append 日志,
                 # 抓不到这个竞态,所以这里必须显式等。
-                ctx.wait_until(lambda: bool(ctx.logs_since(mark_b, "委托被拦截")), 2.0)
-            block_logs_b = ctx.logs_since(mark_b, "委托被拦截")
+                ctx.wait_until(lambda: bool(ctx.logs_since(mark_b, "委托被拦截")), ctx.attrib_wait)
+            # 归因与证据行用**同一次读**(一份快照):分开读两次,日志可能正好在两次之间
+            # 到达 ⇒ 摘要说「没有风控拦截日志」、证据行里却那条日志都在 ⇒ 又自相矛盾
+            # (2026-11-16 codex 第八轮复核 L2/L3)。
+            # 快照起点是 mark(本指标开始),`mark_b - mark` 就是「第二笔之后」的下标偏移。
+            snapshot = ctx.logs_since(mark)
+            block_logs_b = [h for h in snapshot[mark_b - mark:] if "委托被拦截" in h]
             ours_b = [h for h in block_logs_b if key_word in h]
+            # 「对照用的那一笔」归因时没看到日志、但快照里有了 ⇒ 补记它。
+            # **同一份证据 ⇒ 同一个判定**:日志晚到只影响**什么时候**看到,不影响
+            # 「是谁拦的」。所以这里按日志点名的是哪一项,给出与「日志准时到达」
+            # 时**完全相同**的归因与判定:
+            #   ①点名了**我们这一项** ⇒ 计数基数取旧 ⇒ 判不出来(SKIP);
+            #   ②点名的是**别的规则** ⇒ 实打实的失败(FAIL)。
+            # 两边判定不一致 = 同样的证据跑两次给出两个结论(报告没法复核),
+            # 所以这里必须与上面的分支对齐(2026-11-16 codex 第八轮复核 L2/L3)。
+            if first_no_log:
+                late_logs = [h for h in snapshot if "委托被拦截" in h]
+                if late_logs:
+                    late = late_logs[-1]
+                    if key_word in late:
+                        stale_base = True
+                        blocked_detail = (f"对照用的委托被本项阈值拦下(风控日志:{ctx.clean(late[:160])})")
+                    else:
+                        blocked_detail = (f"委托没发出去,{first_count_txt},不是本项阈值拦的"
+                                          f"(风控日志:{ctx.clean(late[:160])})")
+                    lines.append(f"⚠ {blocked_detail}(日志在等待窗口之后才到)")
             if b:
                 block_attrib, block_detail = "", ""
             elif ours_b:
@@ -776,7 +807,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                 lines.append(f"⚠ 超过阈值的委托被拦下,{block_detail}")
             ctx.wait_until(lambda: any(al["title"] == "风控阈值触发" and key_word in al["message"] for al in ctx.alerts_since(alert_mark)), 4.0)
             alerts = [al for al in ctx.alerts_since(alert_mark) if key_word in al["message"]]
-            lines += [ctx.clean(f"风控日志:{h[:200]}") for h in ctx.logs_since(mark, key_word)[:1]]
+            lines += [ctx.clean(f"风控日志:{h[:200]}") for h in snapshot if key_word in h][:1]
             lines += [ctx.clean(f"预警:[{al['level']}] {al['title']} {al['message'][:160]}") for al in alerts[:1]]
             forward_alerts(ctx, alerts)
         finally:
@@ -796,6 +827,11 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         # 不能说「阈值设得太紧」:那样写是在指控一个没有证据支持的原因
         # (2026-11-16 codex 复核 H1:委托规模超限/断连都被写成「阈值太紧」)。
         stall_reason = ""
+        # 「撤单没确认」是**结构化标记**,在分支链**之前**就定下来:
+        # 之前只在 elif 链的那一支置位 ⇒ 先命中「计数基数取旧」时这条标记就丢了,
+        # 「演示单可能仍挂在柜台上」的告警会跟着丢(2026-11-16 codex 第八轮复核 L6)。
+        # 条件是「**确实发出过**演示单、而撤单没确认」—— 压根没发出去的委托不会挂在柜台上。
+        unconfirmed = need_cancel and bool(a) and cancel_confirmed is not True
         if bool(b) and count_before_b >= limit:
             hard_reason = "超过阈值的委托没有被本地风控拦下(阈值未生效)"
         elif not a:
@@ -809,7 +845,6 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 撤单没确认的**后果**分两种:演示单成交了(账户可能多出持仓,要平仓核对)
             # 与演示单可能还挂着(要去柜台撤)。摘要必须分开说,否则会把人引到错的动作上
             # (2026-11-16 codex 复核 M-1)。
-            unconfirmed = True
             stall_reason = (f"撤单未确认({fill_note},账户可能多出持仓,请人工核对持仓)" if cancel_filled
                             else ("撤单未确认(演示单被拒单:没有挂单,账户无持仓变化)" if cancel_rejected
                                   else "撤单未确认(演示单可能仍在柜台上)"))

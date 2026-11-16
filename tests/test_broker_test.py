@@ -1658,6 +1658,183 @@ def test_the_duplicate_order_metric_says_when_it_was_blocked_without_an_alert(en
     assert item(env, "P2.3").status == be.FAIL
 
 
+def test_a_late_risk_log_does_not_make_the_summary_and_the_evidence_row_disagree(env, monkeypatch):
+    """日志在**等待窗口之外**才到时,摘要与证据行必须**说同一件事**。
+
+    2026-11-16 codex 第八轮复核 L2/L3:归因读一次日志、证据行再读一次,
+    日志正好在两次之间到达 ⇒ 摘要写「没有风控拦截日志」、证据行里却摆着那条日志
+    ⇒ 报告自相矛盾。现在归因与证据行用**同一份快照**(等完之后只读一次)。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return None                                   # 超阈值那笔被拦下
+        return real_send(ctx, req)
+
+    real_wait = env.ctx.wait_until
+
+    def wait_with_late_log(predicate, timeout, step=0.2):
+        # 预警等待窗口是 4 秒(与归因等待的 attrib_wait 不同)⇒ 用它当「迟到的时刻」锚点
+        if timeout == 4.0:
+            env.collector.log_lines.append("委托被拦截，汇总委托笔数1达到上限1")
+        return real_wait(predicate, timeout, step)
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    monkeypatch.setattr(env.ctx, "wait_until", wait_with_late_log)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    t6 = item(env, "T6")
+    quoted_log = [ln for shot in t6.shots for ln in shot.lines if "委托被拦截" in ln]
+    says_no_log = "没有风控拦截日志" in t6.summary
+    # 摘要说有日志,证据行就得有;摘要说没有,证据行就不能有 —— 两边必须一致
+    assert bool(quoted_log) != says_no_log, (t6.summary, quoted_log)
+
+
+def test_a_log_that_arrives_between_the_attribution_and_the_snapshot_is_still_used(env, monkeypatch):
+    """归因读完**之后**、取快照**之前**才到的风控日志,也要被算进归因。
+
+    2026-11-16 codex 第八轮复核 L2/L3:风控日志是**异步**投递的,可能正好落在这
+    两次读之间 —— 生产里这一小段窗口真实存在。落在这里的日志原先被忽略 ⇒
+    摘要写「没有风控拦截日志」、而证据行里其实有那条日志(自相矛盾)。
+    现在补记它,并且**按同一份证据给出同一个判定**(日志晚到只影响什么时候看到,
+    不影响「是谁拦的」)。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None                      # 「对照用的那一笔」没发出去,而且**当时没有**拦截日志
+        return real_send(ctx, req)
+
+    real_wait = env.ctx.wait_until
+    real_logs_since = env.ctx.logs_since
+    state = {"waited": False, "appended": False}
+
+    def wait_marking(predicate, timeout, step=0.2):
+        result = real_wait(predicate, timeout, step)
+        state["waited"] = True               # 归因的等待窗口已经结束
+        return result
+
+    def logs_since_with_late(mark, *needles):
+        result = real_logs_since(mark, *needles)
+        if state["waited"] and not state["appended"] and needles:
+            # 日志正好落在这两次读之间:归因那次读**看不到**它,快照那次看得到
+            state["appended"] = True
+            env.collector.log_lines.append("委托被拦截，汇总委托笔数1达到上限1")
+        return result
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    monkeypatch.setattr(env.ctx, "wait_until", wait_marking)
+    monkeypatch.setattr(env.ctx, "logs_since", logs_since_with_late)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+
+    p31 = item(env, "P3.1")
+    late = [ln for shot in p31.shots for ln in shot.lines if "日志在等待窗口之后才到" in ln]
+    assert late, p31.shots
+    assert "没有风控拦截日志" not in p31.summary, p31.summary
+    # 日志点名了**我们这一项** ⇒ 与「日志准时到达」时同一个判定(判不出来,不是失败)
+    assert p31.status == be.SKIP, (p31.status, p31.summary)
+
+
+def test_a_late_log_naming_another_rule_still_counts_as_a_failure(env, monkeypatch):
+    """迟到的日志点名的是**别的规则**时,判定必须与「日志准时到达」时一样是失败。
+
+    2026-11-16 codex 第八轮复核 L2/L3:同一份证据(别的规则拦的)必须给出同一个判定,
+    否则同样的输入跑两次会得到两个结论,报告没法复核。
+    """
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_send(ctx, req)
+
+    real_wait = env.ctx.wait_until
+    real_logs_since = env.ctx.logs_since
+    state = {"waited": False, "appended": False}
+
+    def wait_marking(predicate, timeout, step=0.2):
+        result = real_wait(predicate, timeout, step)
+        state["waited"] = True
+        return result
+
+    def logs_since_with_late(mark, *needles):
+        result = real_logs_since(mark, *needles)
+        if state["waited"] and not state["appended"] and needles:
+            state["appended"] = True
+            # 迟到的是**别的规则**的拦截日志(不是本项阈值)
+            env.collector.log_lines.append("委托被拦截，委托价值20900.0超过上限")
+        return result
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    monkeypatch.setattr(env.ctx, "wait_until", wait_marking)
+    monkeypatch.setattr(env.ctx, "logs_since", logs_since_with_late)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+
+    p31 = item(env, "P3.1")
+    late = [ln for shot in p31.shots for ln in shot.lines if "日志在等待窗口之后才到" in ln]
+    assert late, p31.shots
+    assert "不是本项阈值拦的" in p31.summary, p31.summary
+    assert p31.status == be.FAIL, (p31.status, p31.summary)
+
+
+def test_the_hanging_warning_survives_a_stale_base_verdict(env, monkeypatch):
+    """「撤单没确认」这条**结构化标记**不能因为先命中别的分支而丢掉。
+
+    2026-11-16 codex 第八轮复核 L6:标记原先只在 elif 链的那一支置位 ⇒
+    先命中「计数基数取旧」时,「演示单可能仍挂在柜台上」这条告警会整条消失 ——
+    而演示单**确实**发出去了、撤单也**确实**没确认,它就真的可能还挂在柜台上,
+    操作员必须去柜台撤(这个动作不能因为「另一项判不出来」而消失)。
+    """
+    dup = bt.step_duplicate(env.ctx, env.book)
+
+    daily = env.risk.rules["每日上限检查"]
+    real_check = daily.check_allowed
+    calls = {"n": 0}
+
+    def counting_check(req, gateway_name):
+        calls["n"] += 1
+        if calls["n"] == 3:        # 撤单指标的「阈值内」那一笔:它**发出去了**,只是基数取旧
+            return True
+        return real_check(req, gateway_name)
+
+    real_settle = bt.settle_counter
+
+    def settle_with_late_cancel(ctx, rule, attr, timeout=5.0):
+        base = real_settle(ctx, rule, attr, timeout)
+        if attr == "total_cancel_count":
+            # 迟到的撤单回报把计数推上去 ⇒ 设完阈值时计数已经到阈值 ⇒ 基数取旧
+            rule.total_cancel_count = max(rule.total_cancel_count, base + 1)
+        return base
+
+    monkeypatch.setattr(daily, "check_allowed", counting_check)
+    monkeypatch.setattr(bt, "settle_counter", settle_with_late_cancel)
+    env.gw.cancel_works = False                    # 撤单撤不掉 ⇒ 撤单没确认
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert "计数基数取旧" in p31.summary, p31.summary
+    assert "演示单可能仍挂在柜台上" in p31.summary, p31.summary
+
+
+def test_the_duplicate_order_step_keeps_its_own_wording_and_returns_a_short_reason(env, monkeypatch):
+    """P2.3 的措辞是完整短语;回给 P3.1 的原因**不带前缀**(前缀由 P3.1 统一补)。
+
+    2026-11-16 codex 第八轮复核 L4:上一轮把原因改成「找不到规则」后,
+    P2.3 的摘要变成了不自然的「重复报单找不到规则」,文档也跟着漂移。
+    """
+    env.risk.rules.pop("重复报单检查", None)              # 重复报单这项失败(找不到规则)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    assert dup["reason"] == "找不到规则", dup["reason"]
+    assert item(env, "P2.3").summary == "找不到重复报单规则", item(env, "P2.3").summary
+
+
 def test_the_t6_summary_does_not_blame_our_threshold_when_there_is_no_log_at_all(env, monkeypatch):
     """超阈值那笔没发出去、**又没有风控拦截日志** ⇒ 判不出是谁拦的,不能赖到本项阈值头上。"""
     real_send = bt.send

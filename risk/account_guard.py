@@ -175,7 +175,7 @@ class AccountGuard:
             # 调用方若传了非北京偏移,存下来的偏移会被后面
             # `trading_day(datetime.fromisoformat(...))` 当成北京时间比交易日 ⇒ 冷却期被放宽,
             # 与「旧状态文件里的本机本地时间」是同一类 fail-open)。
-            self.hard_locked_at = self._stamp_beijing(now) or ""
+            self.hard_locked_at = self._stamp_beijing(now)   # `now` 必填 ⇒ 一定有值
             # 新发生的锁,触发时刻是**我们自己**按北京时间写的 ⇒ 不再是「旧文件里的未知时间」。
             # 不复位的话:从旧状态文件升级上来之后,新锁会继承 legacy 标记,
             # 冷却期永远要 `--force`(方向是保守的,但属于「卡住」)。
@@ -381,8 +381,14 @@ class AccountGuard:
             self.last_sampled_at = self._parse_sampled_at(raw_sampled)
             # 用不了的采样时刻**留痕**(纯可观测):值被丢掉本身是保守的(状态页显示「无法确认」),
             # 但值曾经存在、只是格式不对这件事不该被抹掉(2026-11-16 codex 复核 L3)。
-            self.sampled_at_unusable = (raw_sampled if isinstance(raw_sampled, str) and raw_sampled
-                                        and self.last_sampled_at is None else "")
+            # 留痕必须**跨落盘存活**:只写不读的话,一次 `_save()`(或重启)就把它抹了,
+            # 恰好死在运维最需要它的时候(2026-11-16 codex 第八轮复核 L1)。
+            if isinstance(raw_sampled, str) and raw_sampled and self.last_sampled_at is None:
+                self.sampled_at_unusable = raw_sampled
+            else:
+                saved_unusable = s.get("sampled_at_unusable")
+                self.sampled_at_unusable = (saved_unusable if isinstance(saved_unusable, str)
+                                            and saved_unusable else "")
         except (ValueError, KeyError, TypeError, OSError) as exc:
             # 状态文件损坏:宁可保守地进入硬锁定,也不能当作"没有锁"继续交易
             self.hard_locked = True

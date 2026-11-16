@@ -315,6 +315,18 @@ def test_context_from_env_reads_broker_test_settings():
     assert c.machine == "Dell XPS" and c.cpu == "Ultra 9" and "954GB" in c.disk
 
 
+def test_the_report_test_date_is_beijing_time():
+    """报告表头「测试时间」必须与证据链同一基准(北京时间)。
+
+    2026-11-16 codex 第八轮复核 L5:证据目录、条目时间、连接记录都已是北京时间,
+    报告头却是本机本地时间 ⇒ 夜盘时段出的报告日期比证据目录早一天。
+    """
+    from risk import account_guard as ag
+
+    c = br.context_from_env({}, {})
+    assert c.test_time == ag.beijing_now().strftime("%Y-%m-%d")
+
+
 # ---------- 证据模型与渲染 ----------
 
 def test_render_shot_produces_a_valid_png_even_without_cjk_font(tmp_path, monkeypatch):

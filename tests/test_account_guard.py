@@ -656,6 +656,32 @@ def test_a_broken_state_version_is_treated_as_an_old_file(tmp_path):
     assert "--force" in g.unlock_cooldown(datetime(2026, 11, 16, 21, 0))
 
 
+def test_the_unusable_sample_time_survives_a_save_and_a_restart(tmp_path):
+    """留痕必须**跨落盘存活**:只写不读的话,一次落盘(≤60 秒)或一次重启就把它抹了。
+
+    2026-11-16 codex 第八轮复核 L1:上一轮只把原值写进状态文件,`_load()` 从不回读
+    ⇒ 留痕活不过一次 `_save()`,恰好死在运维最需要它的时候。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "",
+        "hard_locked_at": "", "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",          # 坏格式(naive 且不是 ISO)
+    }), encoding="utf-8")
+    guard = AccountGuard(AccountLimits(), path)
+    assert guard.sampled_at_unusable == "2026-11-16T21:00:00"
+    guard._save()
+    # 落盘后重新读:留痕还在(而不是被下一次落盘抹成 null)
+    again = AccountGuard(AccountLimits(), path)
+    assert again.sampled_at_unusable == "2026-11-16T21:00:00", again.sampled_at_unusable
+    # 有了新的可用采样时刻,旧留痕作废
+    again.update(10_000.0, datetime(2026, 11, 16, 10, 0), sampled_at=datetime(2026, 11, 16, 10, 0))
+    assert again.sampled_at_unusable == ""
+
+
 def test_an_aware_sample_time_is_converted_to_the_beijing_offset(tmp_path):
     """带时区的采样时刻一律换算到北京时间再落盘(内部契约是 naive 北京时间)。"""
     from datetime import timedelta, timezone

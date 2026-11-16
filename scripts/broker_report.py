@@ -35,6 +35,7 @@ from lxml import etree
 
 from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
 from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
 
@@ -607,7 +608,10 @@ def context_from_env(env, info: dict | None = None) -> ReportContext:
         os_name=f"{os_info.get('name', '')} {os_info.get('version', '')}".strip(),
         cpu=(cpus[0]["name"] if cpus else ""), memory=(f"{machine.get('memory_gb')} GB" if machine.get("memory_gb") else ""),
         disk="; ".join(f"{d['model']} {d['size_gb']}GB" for d in disks[:2]),
-        test_time=datetime.now().strftime("%Y-%m-%d"), functions=functions,
+        # 「测试时间」是**报告表头**,与证据链其余部分同一基准(北京时间):
+        # 本机本地时间会让夜盘时段出的报告日期比证据目录早一天
+        # (2026-11-16 codex 第八轮复核 L5)。
+        test_time=beijing_now().strftime("%Y-%m-%d"), functions=functions,
     )
 
 
