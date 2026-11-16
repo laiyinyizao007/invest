@@ -44,13 +44,18 @@ def parent_snapshot(monkeypatch, tmp_path):
     (第 4 轮 codex 复核的 N2)。
 
     这些用例直接调子入口,等于**替父进程跑**,所以得把父进程会给的东西给足。
-    快照内容是空的:仓库**外**的站点包按物理位置放行(不查快照),
-    仓库内的按快照判 —— 与生产一致。
+    快照**照生产那样拍**:仓库内的站点包根(本仓库的 venv 就在仓库根之内)
+    的全部 .py 的 (mtime, size);仓库外的站点包按物理位置放行(不查快照)。
     """
     import hashlib
 
+    code_root = api.rc.CODE_ROOT.resolve()
+    roots = [root for root in api.rs.site_package_roots()
+              if root == code_root or code_root in root.parents]
+    snapshot = api.rs.snapshot_site_files(roots)
     path = tmp_path / "site_snapshot.json"
-    path.write_text("{}", encoding="utf-8")
+    payload = {key: list(value) for key, value in snapshot.items()}
+    path.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setenv(api.rs.SITE_SNAPSHOT_ENV, str(path))
     monkeypatch.setenv(api.rs.SITE_SNAPSHOT_SHA_ENV,
                        hashlib.sha256(path.read_bytes()).hexdigest())
