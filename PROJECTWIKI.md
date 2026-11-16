@@ -125,6 +125,8 @@ flowchart LR
   - [`20261113-evolution-engine.md`](docs/adr/20261113-evolution-engine.md):进化引擎的不可变宪法(静态/运行时类/参数/实例/指纹/行情六层)
   - [`20261115-approved-sandbox-closure.md`](docs/adr/20261115-approved-sandbox-closure.md):闭合沙盒状态机——`approved/` 目录、收菜动作与运行时装载的 fail-closed(批准终于成为真正的授权)
 
+  - [`20261114-consequence-domain-tiers.md`](docs/adr/20261114-consequence-domain-tiers.md):**流程按后果域分档**（研究档 / 执行档），不按改动规模——研究与生产的规模一样，但研究的产物可重跑、失败只影响结论。分档判据由 `tools/check_domain.py` 执行（默认拒绝），清单由 `tools/verdict_graph.py` 的**函数级** AST 分析**实测**得出（谁拥有 `check_gate` / `record_approval` / `screen_source` 等判定点）。**不削弱任何代码内的防线，也不改阈值**——只减少改动的审批成本
+
 ## 4. 设计决策 & 技术债务
 > 只保留**未解决**的条目。已处理或重复的行已归档到 `docs/roadmap.md` §2.7;各条目的阶段归属见 `docs/roadmap.md` §2.4 末尾的去向表。
 | 项 | 说明 | 优先级 |
@@ -339,6 +341,13 @@ sequenceDiagram
   它会把 vnpy 交易栈与 `.env` 的交易凭据拖进研究进程,与「研究侧不碰交易侧」的边界冲突;研究侧改为按文件位置推断代码根并自行 `sys.path` 注入。
   边界测试 `tests/test_research_boundary.py` 用 AST 检查锁住这条(植入违规会被抓住)。
 - 部署到 Docker/VPS 时设置 `TZ=Asia/Shanghai`;`.env` 通过挂载注入,不入库。
+- **改动前先分档**:`python tools/check_domain.py --diff origin/main`(仓库根 `CLAUDE.md` 的流程按**后果域**
+  分研究档/执行档,不是按改动规模)。研究域(只影响研究产物)走轻流程,执行域(可能影响真实委托/
+  持仓/资金、风控底线、实盘准入批准链、凭据、部署)走全套。**默认拒绝**:不在研究白名单里的
+  一律执行域。要把新文件放进研究域,改 `tools/check_domain.py` 的白名单——那是需要 codex 复核的
+  代码改动,不是随手一句话。白名单由 `tools/verdict_graph.py` 的函数级 AST 分析盯着:
+  任何自己拥有判定点(`check_gate` / `record_approval` / `screen_source` 等)的文件都必须判为
+  不可降级,新增此类文件会让 `tests/test_check_domain.py` 的全仓不变量立刻变红。
 - 临时文件:pip 异常中断会在 `%TEMP%` 残留 `pip-unpack-*`,可手动清理。
 - **本机网络**:走本地代理(127.0.0.1:7897)下载 PyPI/Docker 镜像这类大文件只有约 20 KB/s,直连约 4.7 MB/s。pip 安装与镜像拉取应绕过代理(`NO_PROXY=*`;WSL 里还要 `unset http_proxy https_proxy` 并忽略 pip 的旧代理配置)。
 - 运行与部署:见 `docs/runbook-simnow.md`、`docs/live-readiness.md`、`docker-compose.yml`;宿主机挂载目录需让 uid 1000 可写。
@@ -359,6 +368,10 @@ sequenceDiagram
 
 ## 12. 变更日志
 - 参见 [`CHANGELOG.md`](CHANGELOG.md)。提交与本文件同步更新,提交信息引用对应 Issue。
+- 2026-11-14:**流程按后果域分档**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35)):新增仓库根 `CLAUDE.md`,
+  研究域只影响研究产物(可重跑、不动钱)走轻流程,执行域走全套;判据由 `tools/check_domain.py` 执行(默认拒绝),
+  清单由 `tools/verdict_graph.py` 的函数级 AST 分析实测得出。**代码内的防线与 CI 闸门一个都没动**。
+  详见 ADR `20261114-consequence-domain-tiers`。
 - 2026-11-14:**合并 main #22 进 #26 分支(PR #27)**:沙盒"导入门"取两边并集——黑名单 → 全名禁用 → 按路径裁决(#26)→ 导入白名单(main)→ 配置追加模块准入审计(main);候选拿到的代理同时带名字层(main)与对象层(#26)规则;`matplotlib`/`psutil` 两边口径冲突按更严一侧处理并记录。详见 ADR `20261113-evolution-engine`「合并 main #22 的取舍」。
 - 2026-11-12:**夜盘实测日**:演练六场景全部通过(含真实切网);行情录制第一套前置验收与卡住检测;`drill.py --trace` 诊断埋点定位 `td_api.close()` 段错误并重写 `disconnect` 场景;通知器落盘待补发队列(起因:断网期间的告警恢复后也没送到);研究沙盒 CLI/网关/容器/选参评估/迭代上限/报告/审阅;毕昇本机部署与工作流 v3(LLM 联调待额度)。详见 `CHANGELOG.md`。
 - 2026-11-11:国信测试报告取证与自动生成(Issue #9):`broker_test.py`/`broker_evidence.py`/`broker_report.py`,模板不入库;`docs/live-readiness.md` 补 C2b。
