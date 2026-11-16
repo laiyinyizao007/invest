@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **复用官方/成熟组件评估的结论与待办**(新 ADR [`docs/adr/20261116-reuse-official-components-eval.md`](docs/adr/20261116-reuse-official-components-eval.md),
+  只记录、不改代码):结论是先做策略;登记 4 项触发条件驱动的待办(DSR 参考实现对照测试、夏普口径核对、
+  无头启动流程与官方 `no_ui/run.py` 对读、通知库评估),并记下明确不做的组件(`vnpy_akshare`、`empyrical-reloaded`、
+  QuantStats、`vnpy_datamanager`)及理由。DSR/夏普口径两项在**有候选接近晋级阈值之前必须先做**。
 - **候选独立进程执行的设计方案**(Issue [#29](https://github.com/laiyinyizao007/invest/issues/29),
   新 ADR [`docs/adr/20261115-candidate-process-isolation.md`](docs/adr/20261115-candidate-process-isolation.md),**状态:待评审**):
   候选代码与框架代码跑在同一个子进程里,是 PR #24 的 G8 复审连续五轮(38 → 32 → 35 → 33 → 34)不收敛的根因——
