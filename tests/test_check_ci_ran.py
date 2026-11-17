@@ -232,7 +232,12 @@ def test_a_class_based_case_still_satisfies_the_roster(tmp_path):
 
 
 def test_a_roster_whose_must_run_is_not_an_object_fails_instead_of_crashing(tmp_path):
-    """名单结构不对(JSON 合法但不是对象)⇒ **红并给结论**,不是抛栈(第 49 轮 codex L4)。"""
+    """名单结构不对(JSON 合法但不是对象)⇒ **红并给结论**,不是抛栈(第 49 轮 codex L4)。
+
+    **退出码是 2 而不是 1**(第 55 轮之七,R13):名单结构不对 ⇒
+    「逐条点名核对」**压根做不了** ⇒ 这是「判不了」,不是「测试失败了」
+    ⇒ 与 `tools/ci_gate.py` 的口径**统一**(那边同样是 2)。
+    """
     module = _load_tool()
     report = _write_report(tmp_path, [{"name": "test_a"}])
     roster = tmp_path / "roster.json"
@@ -241,11 +246,14 @@ def test_a_roster_whose_must_run_is_not_an_object_fails_instead_of_crashing(tmp_
         "--junitxml", str(report),
         "--roster", str(roster),
         "--suite", "tests/test_x.py",
-    ]) == 1
+    ]) == 2
 
 
 def test_a_roster_entry_that_is_not_a_list_fails_instead_of_crashing(tmp_path):
-    """名单里某一份的条目不是列表 ⇒ 一样要红并给结论。"""
+    """名单里某一份的条目不是列表 ⇒ 一样要红并给结论。
+
+    **退出码 2 = 判不了**(第 55 轮之七,R13),与 `ci_gate` 一致。
+    """
     module = _load_tool()
     report = _write_report(tmp_path, [{"name": "test_a"}])
     roster = tmp_path / "roster.json"
@@ -255,7 +263,7 @@ def test_a_roster_entry_that_is_not_a_list_fails_instead_of_crashing(tmp_path):
         "--junitxml", str(report),
         "--roster", str(roster),
         "--suite", "tests/test_x.py",
-    ]) == 1
+    ]) == 2
 
 
 def test_a_report_with_a_non_numeric_count_fails_instead_of_crashing(tmp_path):
@@ -560,7 +568,10 @@ def test_an_unlisted_suite_passes_only_when_explicitly_allowed(tmp_path):
 
 
 def test_an_empty_roster_entry_fails(tmp_path):
-    """拦截侧:名单里有这一份套件、但**条目是空的** ⇒ 红(同样是静默降级)。"""
+    """拦截侧:名单里有这一份套件、但**条目是空的** ⇒ 红(同样是静默降级)。
+
+    **退出码 2 = 判不了**(第 55 轮之七,R13),与 `ci_gate` 一致。
+    """
     module = _load_tool()
     report = _write_report(tmp_path, [{"name": "test_a"}])
     roster = _write_roster(tmp_path, {"tests/test_x.py": []})
@@ -568,22 +579,25 @@ def test_an_empty_roster_entry_fails(tmp_path):
         "--junitxml", str(report),
         "--roster", str(roster),
         "--suite", "tests/test_x.py",
-    ]) == 1
+    ]) == 2
 
 
 def test_a_missing_roster_fails_instead_of_crashing(tmp_path):
-    """拦截侧:名单文件读不到 ⇒ 红(而不是抛异常崩掉——崩掉也是红,但没有结论)。"""
+    """拦截侧:名单文件读不到 ⇒ 红(而不是抛异常崩掉——崩掉也是红,但没有结论)。
+
+    **退出码 2 = 判不了**(第 55 轮之七,R13),与 `ci_gate` 一致。
+    """
     module = _load_tool()
     report = _write_report(tmp_path, [{"name": "test_a"}])
     assert module.main([
         "--junitxml", str(report),
         "--roster", str(tmp_path / "nope.json"),
         "--suite", "tests/test_x.py",
-    ]) == 1
+    ]) == 2
 
 
 def test_a_broken_roster_fails_instead_of_crashing(tmp_path):
-    """拦截侧:名单不是合法 JSON ⇒ 红。"""
+    """拦截侧:名单不是合法 JSON ⇒ 红(**退出码 2 = 判不了**,第 55 轮之七 R13)。"""
     module = _load_tool()
     report = _write_report(tmp_path, [{"name": "test_a"}])
     roster = tmp_path / "roster.json"
@@ -592,4 +606,4 @@ def test_a_broken_roster_fails_instead_of_crashing(tmp_path):
         "--junitxml", str(report),
         "--roster", str(roster),
         "--suite", "tests/test_x.py",
-    ]) == 1
+    ]) == 2

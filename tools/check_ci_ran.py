@@ -289,8 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         roster = json.loads(args.roster.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        print("[FAIL] 名单读不了:%s(%s)" % (args.roster, exc))
-        return 1
+        # **退出码 2 = 判不了**(第 55 轮之七,claude 第 4 轮的 L-3):
+        # 名单读不了 ⇒ 点名核对**压根做不了** ⇒ 这不是「测试失败了」(1),
+        # 而是「没法判」⇒ 必须与 `ci_gate` 的口径**一致**
+        # (闸门那边同样是 2)⇒ 三处同一个含义,读日志的人才分得清。
+        print("[FAIL] 名单读不了:%s(%s)(退出码 2 = 判不了,fail-closed)"
+              % (args.roster, exc))
+        return 2
     # **结构校验**(第 55 轮之五,codex 第 2 轮的 H2):**一份共享实现**
     # (`validate_roster`),接线自检与闸门也调它 ⇒ 三处判法一致。
     # 名单是 JSON,但 JSON 合法 ≠ 结构对;结构不对 ⇒ **一律 fail-closed**。
@@ -298,7 +303,10 @@ def main(argv: list[str] | None = None) -> int:
     if roster_problems:
         for problem in roster_problems:
             print("[FAIL] 名单结构不对:%s(%s)" % (problem, args.roster))
-        return 1
+        # **退出码 2**(第 55 轮之七):结构不对 ⇒ 点名核对**做不了**
+        # ⇒ 与「有测试失败」(1)不是一回事 ⇒ 与 `ci_gate` 的口径统一。
+        print("[FAIL] 名单结构不对 ⇒ 点名核对做不了 ⇒ 退出码 2(fail-closed)")
+        return 2
     must_run = roster.get("must_run", {})
     allow_skipped = roster.get("allow_skipped", {})
 

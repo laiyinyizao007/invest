@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1474,12 +1475,62 @@ def _run_blocks(text: str) -> list[str]:
     return blocks
 
 
+# **重定向词**:`2>&1` / `>out` / `&>log` / `2>` …… 它们**不是参数**
+# (研究层 `logical_commands` 早就把它们剥掉了 ⇒ 两层口径必须一致)。
+_REDIRECTION_TOKEN_RE = re.compile(r"^[0-9<>&()]*[<>][0-9<>&()]*$")
+
+
+def _command_tokens(text: str) -> list[str]:
+    """把一段文本切成「命令词」:去掉**行尾注释**与**重定向**。
+
+    **为什么**(第 55 轮之十,codex 第 5 轮的 M-5):
+    宪法层此前用 `shlex.split(block, comments=False)` ⇒ ①行尾注释
+    (`python tools/check_ci_wiring.py  # 接线自检`)②重定向(`… 2>&1`)
+    都**留在词里** ⇒ 「脚本后面不许再有任何词」那条 ⇒ 判成**非规范形**
+    ⇒ **误伤合法写法** ⇒ 而研究层会**动态跑**宪法层这条检查
+    ⇒ **两层一起红** ⇒ CI 变红(实测)。
+    ⇒ 现在:注释交给 shlex 的 `comments=True`,重定向词**整个丢掉**
+    ——与研究层 `logical_commands` 的口径**一致**。
+    """
+    try:
+        tokens = shlex.split(text, comments=True, posix=True)
+    except ValueError:
+        return []                    # 引号不配对 ⇒ 认不出来 ⇒ 交给上层判红
+    out: list[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if _REDIRECTION_TOKEN_RE.match(token):
+            continue                # 重定向 ⇒ 不是参数
+        out.append(token)
+    return out
+
+
+def _normalize_script_path(path: str) -> str:
+    """脚本路径**归一化**:统一分隔符、去掉 `./` 与 `..`。
+
+    **为什么**(第 55 轮之七,claude 第 4 轮的 M-1):
+    研究层(`tools/check_ci_wiring.py`)用的是 `os.path.normpath` ⇒
+    `python ./tools/check_ci_wiring.py` 与 `python tools/../tools/check_ci_wiring.py`
+    在**研究层**都算规范形;而宪法层此前只按**字面**比 ⇒ 同一处调用
+    **两层结论相反**(一层说合规、一层说不是规范形)⇒ CI 变红,
+    或者更糟:两层都判「压根没有」而真实调用还在。
+    ⇒ 两层**必须同一套口径**(仓库规矩:两层都要有,不能只靠一边)。
+    """
+    return os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+
+
 def _script_index(tokens: list[str]) -> int | None:
     """命令位置上的那个脚本词(解释器**和它的选项**之后);认不出 ⇒ None。
 
     **为什么要跳过解释器选项**(第 55 轮之五,codex 第 2 轮的 M1):
     `python -X utf8 tools/check_ci_wiring.py` 里,脚本那个词**不紧跟**解释器
     ⇒ 此前认不出「在跑它」⇒ 报「压根没有」⇒ **误伤合法写法**。
+
+    **连写的取值选项**(第 55 轮之七,claude 第 4 轮的 M-1):
+    CPython **也接受** `-Werror` / `-Xutf8` 这种「选项和值连在一起」的写法
+    ⇒ 研究层已经认 ⇒ 宪法层也要认 ⇒ 否则**两层结论相反**。
     """
     if not tokens:
         return None
@@ -1492,6 +1543,10 @@ def _script_index(tokens: list[str]) -> int | None:
             return None
         if token in _INTERPRETER_VALUE_FLAGS:
             index += 2                      # 跳过选项**和它的值**
+            continue
+        if any(token.startswith(flag) and len(token) > len(flag)
+               for flag in _INTERPRETER_VALUE_FLAGS):
+            index += 1                      # 连写形式:`-Werror` / `-Xutf8`
             continue
         if token in _INTERPRETER_NO_VALUE_FLAGS or re.match(r"^-\d+(\.\d+)*$", token):
             index += 1
@@ -1512,10 +1567,7 @@ def _wiring_call_shapes(block: str) -> list[str]:
     只有当脚本那个词**在命令位置**(解释器及其选项之后)才算「在跑它」
     ⇒ `ruff check … tools/check_ci_wiring.py` 不算。
     """
-    try:
-        tokens = shlex.split(block, comments=False, posix=True)
-    except ValueError:
-        tokens = block.split()
+    tokens = _command_tokens(block)
     if not tokens:
         return []
     # **为什么要 strip**:shlex 的 POSIX 模式会把行尾的续行反斜杠
@@ -1526,7 +1578,7 @@ def _wiring_call_shapes(block: str) -> list[str]:
     script_index = _script_index(tokens)
     shapes: list[str] = []
     for index, cleaned in enumerate(tokens):
-        if cleaned == WIRING_SCRIPT_REL:
+        if _normalize_script_path(cleaned) == WIRING_SCRIPT_REL:
             if script_index is None or index != script_index:
                 continue          # 不在命令位置 ⇒ 只是被列进文件清单 ⇒ 不算「在跑它」
             if index == 0:
@@ -1537,7 +1589,7 @@ def _wiring_call_shapes(block: str) -> list[str]:
                     shapes.append(block)        # 规范形
                 else:
                     shapes.append(" ".join([tokens[0], cleaned] + rest))  # 带了选项 ⇒ 非规范形
-        elif WIRING_SCRIPT_REL in cleaned and cleaned != WIRING_SCRIPT_REL:
+        elif WIRING_SCRIPT_REL in cleaned and _normalize_script_path(cleaned) != WIRING_SCRIPT_REL:
             # 藏在引号里(例如 `bash -c "python tools/check_ci_wiring.py"`)
             shapes.append(block)
     return shapes
@@ -1591,15 +1643,13 @@ def _is_canonical_wiring_call(shape: str) -> bool:
     **禁止** `-c`(把脚本整个换掉)与 `-m`(把脚本换成模块);
     脚本后面**不许**再有任何词(那才是「缩小检查范围」的口子)。
     """
-    try:
-        tokens = shlex.split(shape, comments=False, posix=True)
-    except ValueError:
+    tokens = _command_tokens(shape)
+    if not tokens:
         return False
-    tokens = [token.strip() for token in tokens]
     index = _script_index(tokens)
     if index is None:
         return False
-    if tokens[index].replace("\\", "/") != WIRING_SCRIPT_REL:
+    if _normalize_script_path(tokens[index]) != WIRING_SCRIPT_REL:
         return False
     return index == len(tokens) - 1
 

@@ -454,10 +454,10 @@ MUTATIONS = (
     _mutation(
         "让接线自检不再把『认不出来的命令』判红(fail-closed 被放松)",
         "tools/check_ci_wiring.py",
-        ("            elif kind == \"unknown\":\n"
-         "                if any(word in command for word in _DANGEROUS_WORDS):",
-         "            elif kind == \"unknown\":\n"
-         "                if False:"),
+        ("                if any(word in command for word in _DANGEROUS_WORDS):\n"
+         "                    stray.append(\"认不出来的命令里提到了 pytest/闸门(判不了 ⇒ 判红):%s\"",
+         "                if False:\n"
+         "                    stray.append(\"认不出来的命令里提到了 pytest/闸门(判不了 ⇒ 判红):%s\""),
     ),
     _mutation(
         "让接线自检不再核对名单覆盖(删掉闸门步骤也没人发现)",
@@ -601,7 +601,7 @@ MUTATIONS = (
     _mutation(
         "让宪法层不再判「藏起来的调用」(bash -c 里也能躲过去)",
         "tools/check_constitution_history.py",
-        ("        elif WIRING_SCRIPT_REL in cleaned and cleaned != WIRING_SCRIPT_REL:",
+        ("        elif WIRING_SCRIPT_REL in cleaned and _normalize_script_path(cleaned) != WIRING_SCRIPT_REL:",
          "        elif False:"),
         targets=[WIRING],
     ),
@@ -648,18 +648,24 @@ MUTATIONS = (
         # C2:闸门 **job** 上的 `env:`。
         "让接线自检不再报闸门 job 上的 env:",
         "tools/check_ci_wiring.py",
-        ("        if \"env\" in job:\n"
-         "            problems.append(\"闸门步骤「%s」所在的 job 带了 `env:` ⇒ 同上(解释器可被换掉)\"",
-         "        if False and \"env\" in job:\n"
-         "            problems.append(\"闸门步骤「%s」所在的 job 带了 `env:` ⇒ 同上(解释器可被换掉)\""),
+        ("            if \"env\" in job:\n"
+         "                problems.append(\n"
+         "                    \"闸门步骤「%s」所在的 job 带了 `env:` ⇒ 解释器/模块搜索路径\"",
+         "            if False and \"env\" in job:\n"
+         "                problems.append(\n"
+         "                    \"闸门步骤「%s」所在的 job 带了 `env:` ⇒ 解释器/模块搜索路径\""),
         targets=[WIRING],
     ),
     _mutation(
         # C1:闸门 job 上的 `needs:` ⇒ 上游一被跳过,闸门也不跑。
         "让接线自检不再报闸门 job 上的 needs:",
         "tools/check_ci_wiring.py",
-        ("        if \"needs\" in job:\n            # **C1(codex 第 2 轮)**",
-         "        if False and \"needs\" in job:\n            # **C1(codex 第 2 轮)**"),
+        ("            if \"needs\" in job:\n"
+         "                problems.append(\n"
+         "                    \"闸门步骤「%s」所在的 job 带了 `needs:` ⇒ 上游 job 一旦被跳过\"",
+         "            if False and \"needs\" in job:\n"
+         "                problems.append(\n"
+         "                    \"闸门步骤「%s」所在的 job 带了 `needs:` ⇒ 上游 job 一旦被跳过\""),
         targets=[WIRING],
     ),
     _mutation(
@@ -800,9 +806,11 @@ MUTATIONS = (
     _mutation(
         "让接线自检不再报 workflow 级 env:",
         "tools/check_ci_wiring.py",
-        ('    if "env" in data:\n'
+        ('    # (此前只禁了 step 级与 job 级 ⇒ workflow 级是个洞。)\n'
+         '    if "env" in data:\n'
          '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
          '                        "解释器/模块搜索路径可以被换掉',
+         '    # (此前只禁了 step 级与 job 级 ⇒ workflow 级是个洞。)\n'
          '    if False:\n'
          '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
          '                        "解释器/模块搜索路径可以被换掉'),
@@ -811,12 +819,14 @@ MUTATIONS = (
     _mutation(
         "让接线自检的存在性检查不再报 workflow 级 env:",
         "tools/check_ci_wiring.py",
-        ('    if "env" in data:\n'
+        ('    # ⇒ 现在两边**共用同一句** ⇒ 去重生效 ⇒ 只报一遍。\n'
+         '    if "env" in data:\n'
          '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
-         '                        "守卫自己的解释器也可以被换掉',
+         '                        "解释器/模块搜索路径可以被换掉',
+         '    # ⇒ 现在两边**共用同一句** ⇒ 去重生效 ⇒ 只报一遍。\n'
          '    if False:\n'
          '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
-         '                        "守卫自己的解释器也可以被换掉'),
+         '                        "解释器/模块搜索路径可以被换掉'),
         targets=[WIRING],
     ),
     _mutation(
@@ -829,10 +839,144 @@ MUTATIONS = (
     _mutation(
         "让接线自检不再报 job 级 defaults.run.working-directory",
         "tools/check_ci_wiring.py",
-        ('            if isinstance(run_defaults, dict) and "working-directory" in run_defaults:\n'
-         '                problems.append("闸门步骤「%s」所在的 job 在 **job 级** "',
-         '            if False:\n'
-         '                problems.append("闸门步骤「%s」所在的 job 在 **job 级** "'),
+        ('                if "working-directory" in run_defaults:\n'
+         '                    problems.append(\n'
+         '                        "job「%s」在 **job 级** defaults.run.working-directory 上"',
+         '                if False and "working-directory" in run_defaults:\n'
+         '                    problems.append(\n'
+         '                        "job「%s」在 **job 级** defaults.run.working-directory 上"'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报 job 级 container:(这一步整个跑在别人给的镜像里)",
+        "tools/check_ci_wiring.py",
+        ('        if _job_key_present(job, "container"):',
+         '        if False and _job_key_present(job, "container"):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报 job 级 services:(这一步整个跑在别人给的容器里)",
+        "tools/check_ci_wiring.py",
+        ('        if _job_key_present(job, "services"):',
+         '        if False and _job_key_present(job, "services"):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报 $GITHUB_ENV/$GITHUB_PATH(给后续所有步骤换解释器)",
+        "tools/check_ci_wiring.py",
+        ('        for marker in ("GITHUB_ENV", "GITHUB_PATH"):\n'
+         '            if marker in raw_run:\n'
+         '                problems.append(\n'
+         '                    "%s 的步骤「%s」(%s)提到了 `$%s` ⇒ 它能**给后续所有步骤**"',
+         '        for marker in ("GITHUB_ENV", "GITHUB_PATH"):\n'
+         '            if False and marker in raw_run:\n'
+         '                problems.append(\n'
+         '                    "%s 的步骤「%s」(%s)提到了 `$%s` ⇒ 它能**给后续所有步骤**"'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报 push 触发器上的 paths 过滤(不匹配的提交压根不触发)",
+        "tools/check_ci_wiring.py",
+        ('            if key in push:',
+         '            if False and key in push:'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再扫复合动作(.github/actions/**/action.yml 里的闸门步骤)",
+        "tools/check_ci_wiring.py",
+        (_lines('    # **复合动作**(第 55 轮之七):`.github/actions/**/action.yml`。',
+                '    actions_dir = workflows_dir.parent / "actions"',
+                '    if actions_dir.is_dir():'),
+         _lines('    # **复合动作**(第 55 轮之七):`.github/actions/**/action.yml`。',
+                '    actions_dir = workflows_dir.parent / "actions"',
+                '    if False and actions_dir.is_dir():')),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再认模块形态的闸门调用(python -m tools.ci_gate)",
+        "tools/check_ci_wiring.py",
+        ('    return _script_identity(script).replace("/", ".").rsplit(".", 1)[-1].lower()',
+         '    return _script_identity(script).rsplit("/", 1)[-1].lower()'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再要求受保护脚本那一步带 --verify(ADR 的变异表双向核对不再被 CI 执行)",
+        "tools/check_ci_wiring.py",
+        ('            if _protected_requirement(protected) is not None:',
+         '            if False:'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让宪法层不再按归一化路径认接线自检的调用(两层口径漂移)",
+        "tools/check_constitution_history.py",
+        ('    if _normalize_script_path(tokens[index]) != WIRING_SCRIPT_REL:',
+         '    if tokens[index] != WIRING_SCRIPT_REL:'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让宪法层不再认连写的取值选项(-Xutf8)(两层口径漂移)",
+        "tools/check_constitution_history.py",
+        ('        if any(token.startswith(flag) and len(token) > len(flag)\n'
+         '               for flag in _INTERPRETER_VALUE_FLAGS):\n'
+         '            index += 1                      # 连写形式:`-Werror` / `-Xutf8`\n'
+         '            continue\n',
+         '        if False:\n'
+         '            index += 1\n'
+         '            continue\n'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让名单结构不对时的退出码回到 1(判不了与失败混为一谈)",
+        "tools/check_ci_ran.py",
+        ('        print("[FAIL] 名单结构不对 ⇒ 点名核对做不了 ⇒ 退出码 2(fail-closed)")\n'
+         '        return 2',
+         '        print("[FAIL] 名单结构不对 ⇒ 点名核对做不了 ⇒ 退出码 2(fail-closed)")\n'
+         '        return 1'),
+        targets=[TOOL_TEST],
+    ),
+    _mutation(
+        "让接线自检不再管分档器冒烟那一步的旁路键(裁决者的关卡可以被轻轻放过)",
+        "tools/check_ci_wiring.py",
+        ('        if self_guard is not None:\n'
+         '            for key in ("if", "continue-on-error", "shell", "env"):\n'
+         '                if key in step:\n'
+         '                    problems.append(\n'
+         '                        "分档器冒烟(%s)那一步带了 `%s:` ⇒ 它可以不算数"',
+         '        if self_guard is not None:\n'
+         '            for key in ("if", "continue-on-error", "shell", "env"):\n'
+         '                if False and key in step:\n'
+         '                    problems.append(\n'
+         '                        "分档器冒烟(%s)那一步带了 `%s:` ⇒ 它可以不算数"'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报分档器冒烟所在 job 的 job 级旁路键(整个 job 可以不出力)",
+        "tools/check_ci_wiring.py",
+        ('            for key in ("if", "continue-on-error", "env", "needs"):\n'
+         '                if key in job:\n'
+         '                    problems.append(\n'
+         '                        "分档器冒烟(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"',
+         '            for key in ("if", "continue-on-error", "env", "needs"):\n'
+         '                if False and key in job:\n'
+         '                    problems.append(\n'
+         '                        "分档器冒烟(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线层的 workflow 级 env 文案与形状检查的不一样(同一条问题报两遍)",
+        "tools/check_ci_wiring.py",
+        ('    if "env" in data:\n'
+         '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
+         '                        "解释器/模块搜索路径可以被换掉(实测:提交一个 `exit 0` 的 python "\n'
+         '                        "放在 PATH 前面 ⇒ 闸门没跑而工具照样报「[OK]」)" % workflow.name)\n'
+         '\n'
+         '    found = False',
+         '    if "env" in data:\n'
+         '        problems.append("%s 在 **workflow 级**带了 `env:` ⇒ 它被所有 job/step 继承 ⇒ "\n'
+         '                        "守卫自己的解释器也可以被换掉 ⇒ 守卫压根没跑而工具照样报「[OK]」"\n'
+         '                        % workflow.name)\n'
+         '\n'
+         '    found = False'),
         targets=[WIRING],
     ),
     _mutation(
@@ -847,8 +991,8 @@ MUTATIONS = (
     _mutation(
         "让接线自检不再扫别的 workflow 文件里的闸门步骤",
         "tools/check_ci_wiring.py",
-        ('                if base in ("ci_gate.py", "check_ci_ran.py"):',
-         '                if False:'),
+        ('    if base in ("ci_gate", "check_ci_ran"):',
+         '    if False:'),
         targets=[WIRING],
     ),
     _mutation(
@@ -887,12 +1031,14 @@ MUTATIONS = (
     _mutation(
         "让接线自检不再报受保护脚本所在 job 的 job 级旁路键",
         "tools/check_ci_wiring.py",
-        ('                for key in ("if", "continue-on-error", "env", "needs"):\n'
-         '                    if key in job:\n'
-         '                        problems.append("受保护脚本(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"',
-         '                for key in ("if", "continue-on-error", "env", "needs"):\n'
-         '                    if False and key in job:\n'
-         '                        problems.append("受保护脚本(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"'),
+        ('            for key in ("if", "continue-on-error", "env", "needs"):\n'
+         '                if key in job:\n'
+         '                    problems.append(\n'
+         '                        "受保护脚本(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"',
+         '            for key in ("if", "continue-on-error", "env", "needs"):\n'
+         '                if False and key in job:\n'
+         '                    problems.append(\n'
+         '                        "受保护脚本(%s)所在的 job 带了 `%s:` ⇒ 这一步可以不算数"'),
         targets=[WIRING],
     ),
     _mutation(
@@ -932,6 +1078,562 @@ MUTATIONS = (
          '            covered.add(suite)'),
         targets=[WIRING],
     ),
+    # ---- 第 55 轮之十:codex 第 5 轮实测出的七条通道 ----
+    #
+    # 这一族改的是 `tools/check_ci_wiring.py` 与 `tools/check_constitution_history.py`
+    # **自己**的判据。codex 第 5 轮在**仓库副本**上实测出七条漏过的通道
+    # (模块形态的受保护脚本 / awk|sed|find|git 能执行 / 复合动作不受管 /
+    # `set +eo pipefail` / 退出码不一致 / `Container:` 大写 / 转义的 `&`),
+    # 外加宪法层把**行尾注释与重定向**误判成「非规范形」⇒ 两层一起红。
+    _mutation(
+        "让接线自检查不到模块形态的受保护脚本(它就不再要求 --verify 了)",
+        "tools/check_ci_wiring.py",
+        ("        if name == base:\n"
+         "            return required",
+         "        if False and name == base:\n"
+         "            return required"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检把 awk 当成不执行类命令(它能 system())",
+        "tools/check_ci_wiring.py",
+        ('    "echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "cat", "head",',
+         '    "echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "cat", "awk", "head",'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报复合动作里的 $GITHUB_ENV(它能给后续所有步骤换解释器)",
+        "tools/check_ci_wiring.py",
+        ("    for index, raw_run in enumerate(blocks):\n"
+         "        for marker in (\"GITHUB_ENV\", \"GITHUB_PATH\"):\n"
+         "            if marker in raw_run:",
+         "    for index, raw_run in enumerate(blocks):\n"
+         "        for marker in (\"GITHUB_ENV\", \"GITHUB_PATH\"):\n"
+         "            if False and marker in raw_run:"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再报复合动作里认不出来的命令(藏一条 pytest 进去)",
+        "tools/check_ci_wiring.py",
+        ("            if any(word in command for word in _DANGEROUS_WORDS):\n"
+         "                problems.append(\n"
+         "                    \"复合动作 %s 的第 %d 个 `run:` 块里有认不出来的命令\"",
+         "            if False and any(word in command for word in _DANGEROUS_WORDS):\n"
+         "                problems.append(\n"
+         "                    \"复合动作 %s 的第 %d 个 `run:` 块里有认不出来的命令\""),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再认出 set +eo 关掉 errexit",
+        "tools/check_ci_wiring.py",
+        ('        if arg.startswith("+") and "e" in arg[1:]:\n'
+         "            return True",
+         '        if False and arg.startswith("+") and "e" in arg[1:]:\n'
+         "            return True"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检在名单判不了时返回 1 而不是 2(三个消费者退出码不一致)",
+        "tools/check_ci_wiring.py",
+        ("        for problem in unique_problems(list(roster_problems) + problems):\n"
+         "            print(\"  - %s\" % problem)\n"
+         "        return 2",
+         "        for problem in unique_problems(list(roster_problems) + problems):\n"
+         "            print(\"  - %s\" % problem)\n"
+         "        return 1"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检只认小写的 job 级 container 键(大写的 Container: 就不报了)",
+        "tools/check_ci_wiring.py",
+        ("    return any(str(name).lower() == key for name in job)",
+         "    return any(str(name) == key for name in job)"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检把转义的 & 也当成后台操作符(合法写法被误伤)",
+        "tools/check_ci_wiring.py",
+        ("        if _BACKGROUND_RE.search(_remove_quoted(_remove_escaped(line))):",
+         "        if _BACKGROUND_RE.search(_remove_quoted(line)):"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让宪法层不再剥掉行尾注释(它把合法写法判成非规范形)",
+        "tools/check_constitution_history.py",
+        ("        tokens = shlex.split(text, comments=True, posix=True)",
+         "        tokens = shlex.split(text, comments=False, posix=True)"),
+        targets=[WIRING],
+    ),
+    # ---- 第 55 轮之八:旁路**键**纪律拦不住的三条通道(实测) ----
+    _mutation(
+        "让接线自检不再管分档器那一步里关掉的 errexit(分档器崩了也不红)",
+        "tools/check_ci_wiring.py",
+        ('            if _errexit_disabled(raw_run):',
+         '            if False and _errexit_disabled(raw_run):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再管分档器调用后面的「或真」后缀(失败被吃掉)",
+        "tools/check_ci_wiring.py",
+        ('                if _OR_TRUE_RE.search(stripped):',
+         '                if False and _OR_TRUE_RE.search(stripped):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再要求裁决者冒烟关卡存在(整个步骤删掉也没人发现)",
+        "tools/check_ci_wiring.py",
+        ('        problems.append(\n            "被守的 workflow 里**没有**任何裁决者冒烟调用"\n            "(`tools/check_domain.py`)⇒ 分档器的关卡压根不在 CI 里 "\n            "⇒ 它被改坏、或者被整个删掉,都不会有人发现")',
+         '        pass  # 变异:不再要求裁决者冒烟关卡存在'),
+        targets=[WIRING],
+    ),
+    # ---- 第 55 轮之九:「失败被吃掉」的**其它形态** + 存在性口径收紧 ----
+    _mutation(
+        "让接线自检不再管分档器调用失败被吃掉的其它形态(失败照样被吃掉)",
+        "tools/check_ci_wiring.py",
+        ('            if _SWALLOW_RE.search(stripped):',
+         '            if False and _SWALLOW_RE.search(stripped):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再管分档器调用换行接后缀的续行(失败照样被吃掉)",
+        "tools/check_ci_wiring.py",
+        ('            elif _continuation_swallows(lines, index):',
+         '            elif False and _continuation_swallows(lines, index):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再管分档器调用被包在条件里(失败不会让这一步变红)",
+        "tools/check_ci_wiring.py",
+        ('            elif depth > 0 or _CONDITIONAL_RE.match(stripped):',
+         '            elif False and (depth > 0 or _CONDITIONAL_RE.match(stripped)):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再要求本 workflow 自己带裁决者冒烟调用(拿别的 workflow 的假调用顶掉)",
+        "tools/check_ci_wiring.py",
+        ('        if _self_guard_calls(workflow):\n'
+         '            continue',
+         '        if any(_self_guard_calls(w) for w in workflows):'
+         '  # 变异:不再要求本 workflow 自己带调用\n'
+         '            continue'),
+        targets=[WIRING],
+    ),
+
+    # ---- 第 55 轮之十一:子代理复核实测出的 C-1~C-7 / H-1~H-6 / M-1 / M-2 ----
+
+    _mutation(
+        "让接线自检不再把 pytest.__main__ 归一成 pytest(它真的跑 pytest)",
+        "tools/check_ci_wiring.py",
+        (
+            '    if module.endswith(".__main__"):',
+            '    if False and module.endswith(".__main__"):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再报复合动作里跑的 pytest(闸门在别处跑而 CI 是绿的)",
+        "tools/check_ci_wiring.py",
+        (
+            '            if kind == "pytest":',
+            '            if False and kind == "pytest":'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再报别的 workflow 里跑的 pytest",
+        "tools/check_ci_wiring.py",
+        (
+            '                    if tokens is not None and command_kind(tokens, command) == "pytest":',
+            '                    if False and tokens is not None and command_kind(tokens, command) == "pytest":'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检把只跑 --help 的裁决者调用也当成关卡(它不做任何分档)",
+        "tools/check_ci_wiring.py",
+        (
+            '    if all(arg in ("-h", "--help") for arg in args):',
+            '    if False and all(arg in ("-h", "--help") for arg in args):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再管写在 exit 之后的裁决者调用(那是死代码)",
+        "tools/check_ci_wiring.py",
+        (_lines('        if depth == 0:',
+                '            for _operator, text in _split_segments(line):',
+                '                if _segment_terminates_shell(text):',
+                '                    dead = True'),
+         _lines('        if depth == 0:',
+                '            for _operator, text in _split_segments(line):',
+                '                if False and _segment_terminates_shell(text):',
+                '                    dead = True')),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再管从未被调用的函数体里的裁决者调用",
+        "tools/check_ci_wiring.py",
+        (
+            '        elif _FUNCTION_DEF_END_RE.match(stripped):',
+            '        elif False and _FUNCTION_DEF_END_RE.match(stripped):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再把续行接起来判(失败被吃掉的形态漏过)",
+        "tools/check_ci_wiring.py",
+        (
+            '        sources.append(line)\n        if buf.endswith("\\\\"):\n            buf = buf[:-1].strip()\n            continue',
+            '        sources.append(line)\n        if buf.endswith("\\\\"):\n            buf = buf[:-1].strip()'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再管 eval 里的 set +e(它关掉了 errexit)",
+        "tools/check_ci_wiring.py",
+        (
+            '            if _head_of(tokens) in _SCRIPT_STRING_HEADS and _SET_OFF_RE.search(text):',
+            '            if False and _head_of(tokens) in _SCRIPT_STRING_HEADS and _SET_OFF_RE.search(text):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再把绝对路径的 true 后缀判成吃掉失败",
+        "tools/check_ci_wiring.py",
+        (
+            '                if next_operator in ("||", ";", "|", "&"):',
+            '                if next_operator in (";", "|", "&"):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检把 echo skipped 后缀也当成捕获(失败被吃掉却看不见)",
+        "tools/check_ci_wiring.py",
+        (
+            '                    if _is_capture(next_text):',
+            '                    if True:'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再报步骤级的 container 键",
+        "tools/check_ci_wiring.py",
+        (
+            '            if any(str(name).lower() == key for name in step):',
+            '            if False and any(str(name).lower() == key for name in step):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检只认规范形的闸门步骤(非规范形的 job 级攻击面被盖住)",
+        "tools/check_ci_wiring.py",
+        (
+            '                    elif _gate_step_mentions(command) is not None:',
+            '                    elif False and _gate_step_mentions(command) is not None:'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检按基名认受保护脚本(仓库根放个同名空壳就能顶掉证据链)",
+        "tools/check_ci_wiring.py",
+        (
+            '    if _normalize_script(script) != _normalize_script(expected):',
+            '    if False and _normalize_script(script) != _normalize_script(expected):'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检不再管复合动作里的裁决者冒烟",
+        "tools/check_ci_wiring.py",
+        (
+            '        if "check_domain" in raw_run:',
+            '        if False and "check_domain" in raw_run:'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检把能执行的 sed 形态也当成不执行类命令",
+        "tools/check_ci_wiring.py",
+        (
+            '    if head == "sed":\n        return not _sed_executes(tokens, command)',
+            '    if head == "sed":\n        return True'),
+        targets=[WIRING],
+    ),
+
+    _mutation(
+        "让接线自检被单行的 if 分支骗到(后面的调用全被当成在条件里)",
+        "tools/check_ci_wiring.py",
+        (
+            '        if (_CONDITIONAL_OPEN_RE.match(stripped)\n                and not _CONDITIONAL_CLOSE_ANY_RE.search(stripped)):\n            # **单行的 `if …; then …; fi`**(第 55 轮之十一,子代理复核的 M-2):',
+            '        if _CONDITIONAL_OPEN_RE.match(stripped):\n            # **单行的 `if …; then …; fi`**(第 55 轮之十一,子代理复核的 M-2):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        "让接线自检不再按 token 找 set(条件里的 set +e 认不出来)",
+        "tools/check_ci_wiring.py",
+        (
+            '                if token == "set" and _flags_disable_errexit(tokens[index + 1:]):',
+            '                if False and token == "set" and _flags_disable_errexit(tokens[index + 1:]):'),
+        targets=[WIRING],
+    ),
+
+    # ---- 第 55 轮之十二:codex 第 6 轮的 H-1 / H-2 / H-3 / H-4 与 M-1 / M-2 ----
+    #
+    # 这一族把 codex 第 6 轮指出的**每一个新洞**都钉一条红变异:
+    # 见证用例逐条对应(见 WITNESSES),**一条变异一条见证**(共用 ⇒ 走错原因的红也算数)。
+    _mutation(
+        # H-1:同一逻辑行里 `exit 0` **之后**的调用是**死代码**
+        # ⇒ 裁决者那一步压根走不到 ⇒ 而守卫此前恒把它当成活调用。
+        "让接线自检不再把同一逻辑行里 exit 之后的调用当死代码",
+        "tools/check_ci_wiring.py",
+        (
+            '                if _segment_terminates_shell(text):\n'
+            '                    break',
+            '                if False and _segment_terminates_shell(text):\n'
+            '                    break'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # H-2:`sed` 的 `e` 标志在**不引号**的形态下就认不出来了
+        # ⇒ `sed -e s/a/pytest/e x.txt` 能把 pytest 藏进去。
+        "让接线自检认不出不引号的 sed e 标志",
+        "tools/check_ci_wiring.py",
+        (
+            "      [a-z0-9]* e [a-z0-9]*",
+            "      [a-z0-9]* x [a-z0-9]*"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # H-3A:`rg --pre` 会**执行**预处理器 ⇒ 它不是「只读文本」。
+        "让接线自检把 rg --pre 当成只读命令",
+        "tools/check_ci_wiring.py",
+        (
+            '    if head == "rg" and any(token == "--pre" or token.startswith("--pre=")\n'
+            '                              for token in tokens):',
+            '    if False and head == "rg" and any(token == "--pre" or token.startswith("--pre=")\n'
+            '                              for token in tokens):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # H-3B / 第 55 轮之十三:**管道给 shell** ⇒ 能执行
+        # (原先这条判据只写在 `awk` 分支里 ⇒ 只对 awk 生效
+        #  ⇒ 且作用在**切完 `|` 之后**的片段上 ⇒ **永远匹配不到**
+        #  ⇒ 整条判据是**空转**的 ⇒ 变异脚手架打红才发现。)
+        "让接线自检不再认管道给 shell",
+        "tools/check_ci_wiring.py",
+        (
+            "    if _PIPE_TO_SHELL_RE.search(command):\n"
+            "        return False",
+            "    if False and _PIPE_TO_SHELL_RE.search(command):\n"
+            "        return False"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # H-4:`uses:` 一步能执行**任意代码** ⇒ 第三方动作必须**逐个登记**。
+        "让接线自检不再逐个登记第三方动作",
+        "tools/check_ci_wiring.py",
+        (
+            "    if uses in _ALLOWED_THIRD_PARTY_ACTIONS:\n"
+            "        return []",
+            "    if True:  # 变异:第三方动作不再逐个登记\n"
+            "        return []"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # M-1:只读命令里**提到**闸门 ≠ **在跑**闸门。
+        "让接线自检把只读命令里提到的闸门也算成闸门步骤",
+        "tools/check_ci_wiring.py",
+        (
+            "        if _is_inert_command(tokens, command):\n"
+            "            return None\n"
+            "        if any(word in command for word in (\"check_ci_ran\", \"ci_gate\")):",
+            "        if any(word in command for word in (\"check_ci_ran\", \"ci_gate\")):"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # 第 55 轮之十三之二:`sed` 的标志位判据**必须认分隔符**。
+        # 放宽回「引号里有 s … e … 就算」的老写法 ⇒
+        # `sed 's/pytest/e/'`(那个 `e` 是**替换文本**)被误判成「可执行」
+        # ⇒ **误伤方向** ⇒ 放行侧探针必须变红。
+        #
+        # **这一版的写法是被脚手架实测换掉的**(第 55 轮之十三之三):
+        # 上一版把分隔符**写死成 `/`** ⇒ 实测**不命中** `sed 's/pytest/e/'`
+        # ⇒ 见证不红 ⇒ **那条变异是空转的** ⇒ 改成**真正不分隔符**的形态
+        # (连分隔符结构都没有)⇒ 两条放行侧探针**都**会红。
+        "让接线自检把 sed 的标志位判据放宽回不分隔符的形态",
+        "tools/check_ci_wiring.py",
+        (
+            "      [^'\"]* (?P=q) [^'\"]* (?P=q) [a-z0-9]* e [a-z0-9]* ['\"]",
+            "      [^'\"]* e [^'\"]* ['\"]"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # 第 55 轮之十三之三:另一种「放宽」——把分隔符**写死成斜杠**
+        # (而不是**回引用**同一个分隔符)⇒ `sed 's/.*/python -m pytest …/'`
+        # 这种**只是写文本**的写法被误判成「可执行」⇒ **误伤方向**
+        # ⇒ 那条放行侧探针必须变红。
+        "让接线自检把 sed 的分隔符写死成斜杠",
+        "tools/check_ci_wiring.py",
+        (
+            "      [^'\"]* (?P=q) [^'\"]* (?P=q) [a-z0-9]* e [a-z0-9]* ['\"]",
+            "      [^'\"]* / [^'\"]* / [^'\"]* e [^'\"]* ['\"]"),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # 第 55 轮之十三:「管道给 shell」这条判据**依赖**逻辑行**不在 `|` 处切**。
+        # 切了 ⇒ 管道右侧那个 shell 看不见 ⇒ `awk '…' | sh`(管道在引号**外**)
+        # 那种形态**又漏过** ⇒ 拦截侧探针必须变红。
+        "让接线自检又在管道处把逻辑行切开",
+        "tools/check_ci_wiring.py",
+        (
+            '            if not pipe_to_shell and not in_single and not in_double:',
+            '            if not in_single and not in_double:'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # M-2:`rc="$?"` / `rc='$?'` / `export rc=$?` 与 `rc=$?` **同义**
+        # ⇒ 只认最后一种 ⇒ 等价的合法写法被误判成「失败被吃掉」。
+        "让接线自检认不出带引号的退出码捕获",
+        "tools/check_ci_wiring.py",
+        (
+            "_CAPTURE_RE = re.compile(\n"
+            "    r\"^(?:(?:export|local|readonly|typeset)\\s+|declare\\s+(?:-\\w+\\s+)*)?\"\n"
+            "    r\"[A-Za-z_][A-Za-z0-9_]*=(?:\\\"\\$\\?\\\"|'\\$\\?'|\\$\\?)$\")",
+            "_CAPTURE_RE = re.compile(r\"^[A-Za-z_][A-Za-z0-9_]*=\\$\\?$\")"),
+        targets=[WIRING],
+    ),
+    # ---- 第 55 轮之十四:codex 第 2 轮的 6 条发现 ⇒ 10 条规则 ----
+    #
+    # **每条发现都先自己复现过**(见 %TEMP%/r64a_verify_codex.py)才动手改的。
+    # **一条变异一条见证**(共用 ⇒ 走错原因的红也算数)。
+    _mutation(
+        # R14-1(C-1a):仓库里**不存在**的本地动作 ⇒ 判红。
+        # 此前 `uses: ./…` **无条件放行** ⇒ 而扫描面只有
+        # `.github/actions/**/action.yml` ⇒ 仓库里**别处**的本地动作
+        # **完全逃出扫描面** ⇒ 那个动作里的命令**没人看**。
+        "让接线自检放行仓库里不存在的本地动作",
+        "tools/check_ci_wiring.py",
+        (
+            '    if not found:\n'
+            '        return ["%s 用了**本地动作** `%s` ⇒ 仓库里没有 `%s/action.yml`"\n'
+            '                " ⇒ 认不出来 ⇒ 判红" % (where, uses, rel)]',
+            '    if not found:\n'
+            '        return []'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-2(C-1b):本地动作**不是复合动作** ⇒ 判红。
+        # node/docker 动作的代码**不在**本工具的扫描面内
+        # ⇒ 它的 `run:` 块没有 ⇒ 那些命令**没人看**。
+        "让接线自检放行非复合的本地动作",
+        "tools/check_ci_wiring.py",
+        (
+            '    if using != "composite":\n'
+            '        return ["本地动作 %s 的 `runs.using` 是 `%s` ⇒ 它的代码**不在**本工具的"\n'
+            '                "扫描面内(node/docker 动作能执行任意代码)⇒ 判红"\n'
+            '                % (action.name, using)]',
+            '    if using != "composite":\n'
+            '        return []'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-3(C-1c):本地**复合**动作的 `run:` 块受同一套纪律。
+        # 复合动作是 GitHub 官方推荐的复用方式 ⇒ 别的 workflow 引用它
+        # ⇒ 研究侧依赖在那儿**跑不起来** ⇒ 闸门在别处跑。
+        "让接线自检不扫本地复合动作的 run 块",
+        "tools/check_ci_wiring.py",
+        (
+            '    return _composite_action_problems(action, data)',
+            '    return []'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-4(H-1):`exit` 的**等价写法**同样终止这个 shell。
+        # `eval "exit 0"` / `builtin exit 0` / `command exit 0`
+        # ⇒ 裁决者那一步压根走不到 ⇒ 而守卫照样报「自检本身有人跑」。
+        "让接线自检认不出 eval 里的 exit",
+        "tools/check_ci_wiring.py",
+        (
+            '    if head in ("eval", "builtin", "command"):\n'
+            '        return bool(_EXIT_WORD_RE.search(text))',
+            '    if False and head in ("eval", "builtin", "command"):\n'
+            '        return bool(_EXIT_WORD_RE.search(text))'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-5(H-2):awk 的 **co-process**(`| "命令"`)能把**任意命令**执行掉
+        # ⇒ 它**不是**「只读文本」⇒ 不该给它免检通道。
+        "让接线自检把 awk 的 co-process 当成只读命令",
+        "tools/check_ci_wiring.py",
+        (
+            '        if _awk_has_coprocess(tokens):\n'
+            '            return False',
+            '        if False and _awk_has_coprocess(tokens):\n'
+            '            return False'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-6(H-2b):**引号里**的 `|` 不是管道(那是 awk 的 co-process 语法)
+        # ⇒ 在那儿切碎 ⇒ 两半都**引号不配对** ⇒ 分词失败
+        # ⇒ 整条命令碎掉 ⇒ co-process **完全隐形**。
+        "让接线自检在引号里也把逻辑行切开",
+        "tools/check_ci_wiring.py",
+        (
+            '            if not pipe_to_shell and not in_single and not in_double:',
+            '            if not pipe_to_shell:'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-7(H-3):`rg --pre=COMMAND` 是 `--pre COMMAND` 的**等价写法**
+        # ⇒ 只认独立的 `--pre` token ⇒ 等价写法**漏过**。
+        "让接线自检认不出 rg --pre= 这种写法",
+        "tools/check_ci_wiring.py",
+        (
+            '    if head == "rg" and any(token == "--pre" or token.startswith("--pre=")\n'
+            '                              for token in tokens):',
+            '    if head == "rg" and any(token == "--pre"\n'
+            '                              for token in tokens):'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-8(M-1):`sed` 的 `e` **命令**(不是 `e` **标志**)也能执行
+        # ⇒ GNU sed 的 `e [COMMAND]` ⇒ 只认标志位 ⇒ **命令**形态漏过。
+        "让接线自检认不出 sed 的 e 命令",
+        "tools/check_ci_wiring.py",
+        (
+            '    if head == "sed":\n'
+            '        return not _sed_executes(tokens, command)',
+            '    if head == "sed":\n'
+            '        return _SED_EXEC_RE.search(command) is None'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-9(M-2):here-doc 的**正文是数据,不是命令**
+        # ⇒ 正文里的裁决者调用被当成「真跑了」⇒ 而其实什么命令都没跑。
+        "让接线自检把 here-doc 的正文当成命令",
+        "tools/check_ci_wiring.py",
+        (
+            '    for raw in _strip_heredoc_bodies(script).splitlines():',
+            '    for raw in script.splitlines():'),
+        targets=[WIRING],
+    ),
+    _mutation(
+        # R14-10:复合动作里**分词失败** ⇒ 提到 pytest/闸门就判红(兜底)
+        # ⇒ 此前复合动作那条路径有 `tokens is None ⇒ continue`
+        # ⇒ 整条命令**隐形** ⇒ 与 workflow 步骤那条路径**口径分叉**
+        # ⇒ 而那条兜底本来是**最后一道**防线。
+        "让接线自检在复合动作里跳过认不出来的命令",
+        "tools/check_ci_wiring.py",
+        (
+            '        for command in logical_commands(raw_run):\n'
+            '            tokens = _tokens(command)',
+            '        for command in logical_commands(raw_run):\n'
+            '            tokens = _tokens(command)\n'
+            '            if tokens is None:\n'
+            '                continue'),
+        targets=[WIRING],
+    ),
 )
 
 
@@ -949,6 +1651,25 @@ MUTATIONS = (
 # 钉死的好处:每条变异**只跑这一条**(而不是整份套件)⇒ CI 从 ~15 分钟降到 ~1 分钟;
 # 而且"红了"必须**指名道姓**,不能只是"红了几条"。
 WITNESSES: dict[str, str] = {
+    # ---- 第 55 轮之十 ----
+    "让接线自检查不到模块形态的受保护脚本(它就不再要求 --verify 了)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_protected_script_in_module_form_without_verify",
+    "让接线自检把 awk 当成不执行类命令(它能 system())":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_awk_command_that_hides_pytest",
+    "让接线自检不再报复合动作里的 $GITHUB_ENV(它能给后续所有步骤换解释器)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_composite_action_that_rewrites_the_environment",
+    "让接线自检不再报复合动作里认不出来的命令(藏一条 pytest 进去)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_composite_action_that_hides_pytest",
+    "让接线自检不再认出 set +eo 关掉 errexit":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_combined_errexit_switch",
+    "让接线自检在名单判不了时返回 1 而不是 2(三个消费者退出码不一致)":
+        "tests/test_ci_wiring.py::test_the_wiring_layer_exits_with_two_when_the_roster_is_malformed",
+    "让接线自检只认小写的 job 级 container 键(大写的 Container: 就不报了)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_job_level_container_with_a_capital_key",
+    "让接线自检把转义的 & 也当成后台操作符(合法写法被误伤)":
+        "tests/test_ci_wiring.py::test_the_background_operator_check_ignores_an_escaped_ampersand",
+    "让宪法层不再剥掉行尾注释(它把合法写法判成非规范形)":
+        "tests/test_ci_wiring.py::test_the_constitution_layer_accepts_a_wiring_call_with_a_trailing_comment",
     "在核心防线套件顶部加一行模块级 pytestmark 一刀切跳过":
         "tests/test_research_boundary.py::test_the_core_closure_suite_cannot_be_skipped_wholesale",
     "把模块级 pytestmark 包在 if 里(顶层扫描的老洞)":
@@ -1103,6 +1824,46 @@ WITNESSES: dict[str, str] = {
         "tests/test_ci_wiring.py::test_the_checker_reports_a_step_level_working_directory",
     "让接线自检不再报 job 级 defaults.run.working-directory":
         "tests/test_ci_wiring.py::test_the_checker_reports_a_job_level_working_directory",
+    "让接线自检不再报 job 级 container:(这一步整个跑在别人给的镜像里)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_job_level_container",
+    "让接线自检不再报 job 级 services:(这一步整个跑在别人给的容器里)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_job_level_services",
+    "让接线自检不再报 $GITHUB_ENV/$GITHUB_PATH(给后续所有步骤换解释器)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_step_mentioning_github_env",
+    "让接线自检不再报 push 触发器上的 paths 过滤(不匹配的提交压根不触发)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_push_trigger_with_a_paths_filter",
+    "让接线自检不再扫复合动作(.github/actions/**/action.yml 里的闸门步骤)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_gate_step_in_a_composite_action",
+    "让接线自检不再认模块形态的闸门调用(python -m tools.ci_gate)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_module_form_gate_call_in_a_composite_action",
+    "让接线自检不再要求受保护脚本那一步带 --verify(ADR 的变异表双向核对不再被 CI 执行)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_protected_step_without_the_verify_flag",
+    "让宪法层不再按归一化路径认接线自检的调用(两层口径漂移)":
+        "tests/test_ci_wiring.py::test_the_constitution_layer_normalises_the_script_path",
+    "让宪法层不再认连写的取值选项(-Xutf8)(两层口径漂移)":
+        "tests/test_ci_wiring.py::test_the_constitution_layer_accepts_the_attached_value_options",
+    "让名单结构不对时的退出码回到 1(判不了与失败混为一谈)":
+        "tests/test_check_ci_ran.py::test_an_empty_roster_entry_fails",
+    "让接线自检不再管分档器冒烟那一步的旁路键(裁决者的关卡可以被轻轻放过)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_step_with_continue_on_error",
+    "让接线自检不再管分档器那一步里关掉的 errexit(分档器崩了也不红)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_step_that_disables_errexit",
+    "让接线自检不再管分档器调用后面的「或真」后缀(失败被吃掉)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_call_followed_by_or_true",
+    "让接线自检不再要求裁决者冒烟关卡存在(整个步骤删掉也没人发现)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_missing_domain_classifier_gate",
+    "让接线自检不再管分档器调用失败被吃掉的其它形态(失败照样被吃掉)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_call_whose_failure_is_swallowed",
+    "让接线自检不再管分档器调用换行接后缀的续行(失败照样被吃掉)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_call_swallowed_across_a_continuation",
+    "让接线自检不再管分档器调用被包在条件里(失败不会让这一步变红)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_call_wrapped_in_a_condition",
+    "让接线自检不再要求本 workflow 自己带裁决者冒烟调用(拿别的 workflow 的假调用顶掉)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_decoy_domain_classifier_call_in_another_workflow",
+    "让接线自检不再报分档器冒烟所在 job 的 job 级旁路键(整个 job 可以不出力)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_domain_classifier_job_with_a_bypass_key",
+    "让接线层的 workflow 级 env 文案与形状检查的不一样(同一条问题报两遍)":
+        "tests/test_ci_wiring.py::test_the_two_workflow_level_env_messages_are_identical",
     "让接线自检不再报 workflow 级 defaults.run.working-directory":
         "tests/test_ci_wiring.py::test_the_checker_reports_a_workflow_level_working_directory",
     "让接线自检不再扫别的 workflow 文件里的闸门步骤":
@@ -1125,6 +1886,107 @@ WITNESSES: dict[str, str] = {
         "tests/test_ci_wiring.py::test_the_canonical_form_accepts_equivalent_relative_paths[dot_slash]",
     "让不存在的套件也被算成「已覆盖」(覆盖判定被一个根本不存在的文件顶掉)":
         "tests/test_ci_wiring.py::test_a_nonexistent_suite_is_not_counted_as_covered",
+    "让接线自检不再把 pytest.__main__ 归一成 pytest(它真的跑 pytest)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_pytest_main_module_invocation",
+
+    "让接线自检不再报复合动作里跑的 pytest(闸门在别处跑而 CI 是绿的)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_pytest_invocation_inside_a_composite_action",
+
+    "让接线自检不再报别的 workflow 里跑的 pytest":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_pytest_invocation_in_another_workflow",
+
+    "让接线自检把只跑 --help 的裁决者调用也当成关卡(它不做任何分档)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_that_only_prints_help",
+
+    "让接线自检不再管写在 exit 之后的裁决者调用(那是死代码)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_after_an_exit",
+
+    "让接线自检不再管从未被调用的函数体里的裁决者调用":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_inside_a_function_that_is_never_called",
+
+    "让接线自检不再把续行接起来判(失败被吃掉的形态漏过)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_backslash_continuation_that_swallows_the_failure",
+
+    "让接线自检不再管 eval 里的 set +e(它关掉了 errexit)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_eval_that_disables_errexit",
+
+    "让接线自检不再把绝对路径的 true 后缀判成吃掉失败":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_absolute_true_that_swallows_the_failure",
+
+    "让接线自检把 echo skipped 后缀也当成捕获(失败被吃掉却看不见)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_generic_success_suffix_that_swallows_the_failure",
+
+    "让接线自检不再报步骤级的 container 键":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_step_level_container",
+
+    "让接线自检只认规范形的闸门步骤(非规范形的 job 级攻击面被盖住)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_job_level_keys_of_a_job_whose_gate_call_is_not_canonical",
+
+    "让接线自检按基名认受保护脚本(仓库根放个同名空壳就能顶掉证据链)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_protected_script_called_through_a_stub_path",
+
+    "让接线自检不再管复合动作里的裁决者冒烟":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_inside_a_composite_action",
+
+    "让接线自检把能执行的 sed 形态也当成不执行类命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_sed_command_that_executes_pytest",
+
+    "让接线自检被单行的 if 分支骗到(后面的调用全被当成在条件里)":
+        "tests/test_ci_wiring.py::test_the_checker_does_not_report_a_call_after_a_single_line_conditional",
+
+    "让接线自检不再按 token 找 set(条件里的 set +e 认不出来)":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_set_plus_e_inside_a_single_line_conditional",
+
+    # ---- 第 55 轮之十二 ----
+    "让接线自检不再把同一逻辑行里 exit 之后的调用当死代码":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_after_an_exit_on_the_same_line",
+
+    "让接线自检认不出不引号的 sed e 标志":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_unquoted_sed_exec_flag",
+
+    "让接线自检把 rg --pre 当成只读命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_rg_pre_processor_command",
+
+    "让接线自检不再认管道给 shell":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_sed_program_that_is_piped_into_a_shell",
+
+    "让接线自检不再逐个登记第三方动作":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_unregistered_third_party_action",
+
+    "让接线自检把只读命令里提到的闸门也算成闸门步骤":
+        "tests/test_ci_wiring.py::test_the_checker_does_not_treat_an_inert_mention_of_the_gate_as_a_gate_step",
+
+    "让接线自检把 sed 的标志位判据放宽回不分隔符的形态":
+        "tests/test_ci_wiring.py::test_the_checker_does_not_report_a_sed_replacement_that_merely_contains_an_e",
+    "让接线自检把 sed 的分隔符写死成斜杠":
+        "tests/test_ci_wiring.py::test_the_checker_does_not_report_a_sed_program_that_writes_a_command",
+    "让接线自检又在管道处把逻辑行切开":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_awk_program_that_is_piped_into_a_shell",
+    "让接线自检认不出带引号的退出码捕获":
+        "tests/test_ci_wiring.py::test_the_checker_does_not_report_a_quoted_capture_as_a_swallowed_failure",
+
+    # ---- 第 55 轮之十四 ----
+    "让接线自检放行仓库里不存在的本地动作":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_local_action_whose_definition_is_missing",
+    "让接线自检放行非复合的本地动作":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_local_action_that_is_not_composite",
+    "让接线自检不扫本地复合动作的 run 块":
+        "tests/test_ci_wiring.py::test_the_checker_scans_the_run_blocks_of_a_local_composite_action",
+    "让接线自检认不出 eval 里的 exit":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_after_an_eval_that_exits",
+    "让接线自检把 awk 的 co-process 当成只读命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_awk_coprocess_command",
+    "让接线自检在引号里也把逻辑行切开":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_quoted_pipe_as_part_of_one_command",
+    "让接线自检认不出 rg --pre= 这种写法":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_rg_pre_with_an_equals_sign",
+    "让接线自检认不出 sed 的 e 命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_sed_e_command",
+    "让接线自检把 here-doc 的正文当成命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_a_self_guard_call_inside_a_heredoc_body",
+    "让接线自检在复合动作里跳过认不出来的命令":
+        "tests/test_ci_wiring.py::test_the_checker_reports_an_unparsable_block_inside_a_local_composite_action",
+
 }
 
 
