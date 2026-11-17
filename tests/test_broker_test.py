@@ -2302,3 +2302,32 @@ def test_the_t6_summary_does_not_blame_our_threshold_when_there_is_no_log_at_all
     t6 = item(env, "T6")
     assert t6.status == be.FAIL, t6.summary
     assert "判不出是不是本项阈值拦的" in t6.summary, t6.summary
+
+
+# ---------- 2026-11-17 国信实测暴露的两处顺序问题 ----------
+
+def test_batch_cancel_runs_before_the_stability_run(env, monkeypatch):
+    """200 笔稳定运行会把合约委托笔数推过上限 200,之后的批量撤单演示单会被全部拦下 ⇒ 6.2 必须先跑。"""
+    calls: list[str] = []
+    monkeypatch.setattr(bt, "step_login", lambda ctx, book: True)
+    monkeypatch.setattr(bt, "ensure_flat", lambda ctx: True)
+    for name in ("step_market", "step_basic_trade", "step_cancel", "step_counts", "step_duplicate", "step_threshold",
+                 "step_validity", "step_counter_errors", "step_pause", "step_batch_cancel", "step_stability",
+                 "step_connection", "step_exit", "step_logs"):
+        monkeypatch.setattr(bt, name, lambda *a, _n=name: calls.append(_n) or {})
+    bt.run_steps(env.ctx, env.book)
+    assert calls.index("step_batch_cancel") < calls.index("step_stability")
+
+
+def test_persist_evidence_writes_files(env, tmp_path):
+    env.book.add("P1.1", be.PASS, "", [be.Shot("", ["登录成功"])], "2026-11-17 13:31:37")
+    evs, _ = bt.persist_evidence(tmp_path, env.book, None, (), {"经纪商代码": "8030", "交易服务器": "tcp://1.2.3.4:1", "行情服务器": "tcp://1.2.3.4:2", "产品名称": "app", "柜台环境": "测试"}, bt.beijing_now(), False)
+    assert [e.item for e in evs] == ["P1.1"]
+    assert (tmp_path / "evidence.json").exists()
+
+
+def test_main_persists_evidence_before_closing_the_engine():
+    """CTP 关闭可能卡死在原生代码里且持有 GIL(连限时都失效):证据必须在 close_engine 之前落盘。"""
+    import inspect
+    src = inspect.getsource(bt.main)
+    assert src.index("persist_evidence(") < src.index("close_engine(main_engine)")

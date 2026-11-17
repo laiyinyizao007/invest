@@ -1625,14 +1625,16 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         gated = guarded(("P4.2",), step_counter_errors, ctx, book)[0] or gated
     if not gated and want("P5.1"):
         gated = guarded(("P5.1",), step_pause, ctx, book)[0] or gated
+    # 批量撤单必须排在稳定运行之前:200 笔跑完后合约委托笔数已越过「合约委托笔数上限 200」,
+    # 之后的演示单会被本地风控全部拦下(2026-11-17 国信实测:合约委托笔数 209 达到上限 200)。
+    if not gated and want("P5.2"):
+        gated = guarded(("P5.2",), step_batch_cancel, ctx, book)[0] or gated
     if not gated and want("P1.3"):
         gated = guarded(("P1.3",), step_stability, ctx, book)[0] or gated
     if want("P2.1"):
         guarded(("P2.1",), step_connection, ctx, book)
     if want("T7"):
         guarded(("T7",), step_exit, ctx, book)
-    if not gated and want("P5.2"):
-        gated = guarded(("P5.2",), step_batch_cancel, ctx, book)[0] or gated
     if want("P6.1"):
         guarded(("P6.1",), step_logs, ctx, book)         # 最后做:前面各步产生的日志才齐
     return True
@@ -1805,21 +1807,24 @@ def main(argv: list[str] | None = None) -> int:
     closed = False
     logged_in = False
     notes: list[str] = []
+    # 证据目录名也是**北京时间**:目录里的内容(条目时间、连接记录、清场留痕)都是北京时间,
+    # 目录名若用本机本地时间,同一目录里就会差 16 小时(2026-11-16 codex 复核 L5)。
+    out_dir = args.resume or args.out_dir or (OUT_ROOT / beijing_now().strftime("%Y%m%d-%H%M%S"))
+    evidences: list[Evidence] = []
+    cjk = True
     try:
         logged_in = run_steps(ctx, book, only)
     finally:
         if ctx.contract is not None:                      # 已登录并拿到合约才有东西可兜底
             notes = final_safety(ctx)
-        closed = close_engine(main_engine)
-        if ctx.notifier is not None:
-            ctx.notifier.close()
-    # 证据目录名也是**北京时间**:目录里的内容(条目时间、连接记录、清场留痕)都是北京时间,
-    # 目录名若用本机本地时间,同一目录里就会差 16 小时(2026-11-16 codex 复核 L5)。
-    out_dir = args.resume or args.out_dir or (OUT_ROOT / beijing_now().strftime("%Y%m%d-%H%M%S"))
-    evidences = merge_evidence(load_evidence(out_dir) if args.resume else {}, book.list())
-    cjk = render_all(evidences, out_dir, secrets)
-    save_evidence(out_dir, evidences)
-    save_connection_info(out_dir, connection_info(setting, started_at, rehearsal=args.rehearsal))
+        try:
+            # 证据**先落盘、再关引擎**:CTP 关闭在「登出 → 柜台断开 → 自动重连」之后可能卡死在原生代码里
+            # 且持有 GIL(2026-11-17 国信实测),连 close_engine 的限时都失效;证据若排在关闭之后就全丢了。
+            evidences, cjk = persist_evidence(out_dir, book, args.resume, secrets, setting, started_at, args.rehearsal)
+        finally:
+            closed = close_engine(main_engine)
+            if ctx.notifier is not None:
+                ctx.notifier.close()
     if not cjk:
         print("⚠ 没找到支持中文的字体(msyh.ttc/simhei.ttf),证据图里的中文会显示为方框;可设环境变量 BROKER_REPORT_FONT 指定字体。", file=sys.stderr)
     for note in notes:
@@ -1829,6 +1834,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"证据已写入 {out_dir}")
     print_summary(evidences)
     return exit_code_for(logged_in, ctx.failed_steps, notes, evidences)
+
+
+def persist_evidence(out_dir: Path, book: Book, resume, secrets, setting: dict, started_at, rehearsal: bool) -> tuple[list[Evidence], bool]:
+    """合并(补测时)、渲染并写入证据与连接记录;返回 (证据列表, 是否找到中文字体)。"""
+    evidences = merge_evidence(load_evidence(out_dir) if resume else {}, book.list())
+    cjk = render_all(evidences, out_dir, secrets)
+    save_evidence(out_dir, evidences)
+    save_connection_info(out_dir, connection_info(setting, started_at, rehearsal=rehearsal))
+    return evidences, cjk
 
 
 def exit_code_for(logged_in: bool, failed_steps: list[str], notes: list[str], evidences: list[Evidence]) -> int:

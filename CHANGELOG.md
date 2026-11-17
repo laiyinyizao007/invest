@@ -6,6 +6,7 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **国信取证实测(2026-11-17 13:31)暴露的两处顺序问题已修**(Issue #14):①CTP 关闭在「登出 → 柜台断开 → 自动重连」后卡死在原生代码里且持有 GIL,`close_engine` 的限时失效,而证据排在关闭之后才落盘 ⇒ 整轮证据丢失;改为**先落盘再关引擎**(`persist_evidence`,嵌套 finally 保证关闭照常执行)。②6.2 批量撤单排在 200 笔稳定运行之后,被「合约委托笔数上限 200」拦下;改为排在稳定运行之前。codex 复核 46/50。
 - **批量撤单(国信模板 6.2,选测)**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14),ADR `20261111-broker-test-compliance.md`「修订:批量撤单」):新增 `scripts/cancel_all_orders.py`,写一次性请求文件 `cancel_all.request`;`AccountGuardRule` 定时器撤销全部**开仓**挂单(平仓委托不撤)、删除请求并发 WARN「批量撤单」告警,请求删不掉时只处理一次并告警。取证运行器 P5.2 由「未实现/未测试」改为真实演示(挂 3 笔 → 运行时入口批量撤销 → 确认终态),纳入空仓闸门。只新增撤单入口,不放松任何防线。请求原子认领(崩溃后 `.processing` 下一周期补处理)、CLI 临时文件+fsync+原子替换、原因有界清洗、告警笔数取自同一次遍历。G8:codex 四轮 40 → 41 → 44 → **45/50**(全部 High/Medium/Low 已修);第一轮 Gemini 因配额 429 未能出外部意见,仅本地自查(发现并修复「处理期间新请求被顺手删掉」)。
 - **第二个品种的复权连续序列已构建并核实**(Issue [#18](https://github.com/laiyinyizao007/invest/issues/18),
   ADR `20261113-evolution-engine`「数据(本机核实)」):除玉米外,**塑料 L** 与**豆粕 M** 的 15 分钟复权连续合约已构建完成,
