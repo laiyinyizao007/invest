@@ -8,6 +8,7 @@ import pytest
 from risk.promotion_gate import (  # noqa: E402
     CandidateMetrics,
     GateThresholds,
+    cap_for_metrics,
     check_gate,
     sharpe_ci,
     sharpe_standard_error,
@@ -259,13 +260,13 @@ def test_the_cap_matches_the_measured_table_in_the_adr():
     assert suspicious_sharpe_cap(50, 600) == 3.0
 
 
-def test_the_relaxation_window_is_narrow_and_that_is_measured_not_assumed():
-    """**诚实的量**:「放宽」真正打开的窗口很窄,这是**实测**结论,不是推测。
+def test_the_normal_model_sub_window_is_narrow_but_is_not_the_whole_relaxation():
+    """**正态模型内**的那一小段确实很窄(≈0.011),但它**不是**这次改动的全部效果。
 
-    窗口 = {夏普 ≤ 上限} ∩ {DSR ≥ 阈值}。DSR 阈值要求夏普不低于**同一条**认证线,
-    所以窗口的上沿 = 认证线(正态假设),下沿 = 最乐观矩(分母 = 1)下的认证线。
-    实测 (N=1000, T=600):上沿 3.1121,下沿 3.1013 ⇒ 窗口宽约 0.011 年化夏普。
-    ⇒ 这条改动的实质影响很小(ADR 里写明),但方向是对的:上限不再与试验次数无关。
+    更正(codex 双轮复核):ADR 原先把这个 0.011 当成「放宽打开的窗口」,
+    那是**错的** —— 真正的打开区间是 (旧上限 3.0, 新上限] ⇒ 宽约 0.1121。
+    0.011 是「候选的收益接近正态时,DSR 自己也在 3.1013 处就顶到 0.95」的那一小段。
+    这条探针把**两个数字**都钉住,免得文档再写错。
     """
     from statistics import NormalDist
     from risk.dsr import expected_max_sharpe
@@ -275,7 +276,8 @@ def test_the_relaxation_window_is_narrow_and_that_is_measured_not_assumed():
     lower = (expected_max_sharpe(n_trials, n_obs)
              + NormalDist().inv_cdf(0.95) / math.sqrt(n_obs - 1)) * math.sqrt(240)
     assert lower < upper, (lower, upper)
-    assert upper - lower == pytest.approx(0.0108, abs=2e-3)
+    assert upper - lower == pytest.approx(0.0108, abs=2e-3)   # 正态模型内的窄段
+    assert upper - 3.0 == pytest.approx(0.1121, abs=1e-3)     # 实际打开的区间
 
 
 def test_the_relaxation_probe_has_discriminating_power(monkeypatch):
@@ -311,4 +313,184 @@ def test_the_dsr_threshold_is_still_locked_at_0_95_by_the_new_rule():
     assert GateThresholds().min_dsr == 0.95
     fails = check_gate(replace(RELAXED, dsr=0.949))
     assert any("DSR" in f for f in fails)
+
+
+# ---------- 第 55 轮之十七:codex 双轮复核后的更正与加固 ----------
+#
+# **来历**:第 55 轮之十六那版把「放宽打开的窗口」写成「宽约 0.011」,并且
+# 在 docstring/ADR 里写了「正态假设偏保守(更严)的一侧 ⇒ 安全」。
+# codex 双轮复核(第 55 轮之十七)指出这两句都**只在正态模型内成立**:
+# - 实际 DSR 用**样本自己的**偏度/峰度(`denom = 1 − 偏度·sr + (峰度−1)·sr²/4`),
+#   **正偏度会让分母 < 1** ⇒ 实测 DSR 更高 ⇒ 能过 DSR 的夏普**更低**
+#   ⇒ 实际打开的区间比正态模型宽(下沿更低);
+# - 而**这次改动**打开的区间是 (旧上限 3.0, 新上限] ⇒ 宽约 0.1121,不是 0.011。
+# 本节把更正后的口径钉成探针(放行侧 + 拦截侧),并补上「输入非法值」的加固。
+
+
+def _right_skewed_returns(n_obs=600, p=0.018, sd=0.01, sr_daily=0.19685):
+    """两点分布:小概率(1.8%)取一个高值、其余取低值 ⇒ 强右偏(skew ≈ 7.2)。"""
+    mean = sr_daily * sd
+    gap = sd / math.sqrt(p * (1 - p))
+    high = mean + (1 - p) * gap
+    low = high - gap
+    n_high = round(p * n_obs)
+    return [high] * n_high + [low] * (n_obs - n_high)
+
+
+def test_the_newly_opened_band_is_measured_from_the_old_constant():
+    """**更正后的口径**:这次改动打开的区间 = (旧上限 3.0, 新上限] ⇒ 宽约 0.1121。
+
+    「宽约 0.011」是**正态模型内**的那一小段,不是这次改动的实际效果。
+    """
+    upper = suspicious_sharpe_cap(1000, 600)
+    assert upper == pytest.approx(3.1121, abs=1e-3)
+    assert upper - 3.0 == pytest.approx(0.1121, abs=1e-3)
+
+
+def test_a_right_skewed_candidate_can_land_in_the_newly_opened_band():
+    """**放行侧**:右偏的候选能落进 (3.0, 3.1121] 这段新打开的区间 ⇒ 通过全部门槛。
+
+    这条把「0.011 不是全局结论」钉成事实:实测这条序列年化夏普 **3.0582**、
+    实测 DSR **0.99999997**(偏度 7.16 ⇒ DSR 分母被压到 0.0877)⇒
+    旧规则(固定 3.0)会毙掉它,新规则放行。
+    """
+    from risk.dsr import deflated_sharpe, moments
+
+    rets = _right_skewed_returns()
+    mean, sd, skew, _kurt = moments(rets)
+    annual = mean / sd * math.sqrt(240)
+    dsr_value = deflated_sharpe(rets, n_trials=1000)
+    assert annual == pytest.approx(3.0582, abs=1e-3)
+    assert 3.0 < annual <= suspicious_sharpe_cap(1000, 600)
+    assert dsr_value >= 0.95
+    candidate = replace(GOOD, oos_sharpe=annual, oos_years=600 / 240,
+                        n_trials=1000, dsr=dsr_value)
+    assert check_gate(candidate) == []
+
+
+def test_the_same_sharpe_with_normal_moments_fails_the_dsr_gate():
+    """**拦截侧**:同样的年化夏普,若矩接近正态 ⇒ DSR 顶不到 0.95 ⇒ 被毙。
+
+    ⇒ 「能不能落进新打开的区间」取决于**候选自己的矩**,不是这条改动的常量。
+    (也说明:DSR 不是前视检测器 —— 它按矩去通胀,不识别前视。)
+    """
+    from statistics import NormalDist
+    from risk.dsr import expected_max_sharpe
+
+    annual = 3.0582
+    sr = annual / math.sqrt(240)
+    denom = math.sqrt(1.0 + sr * sr / 2.0)          # 正态收益 ⇒ DSR 分母退化
+    z = (sr - expected_max_sharpe(1000, 600)) * math.sqrt(599) / denom
+    normal_dsr = NormalDist().cdf(z)
+    assert normal_dsr < 0.95, normal_dsr
+    fails = check_gate(replace(GOOD, oos_sharpe=annual, oos_years=600 / 240,
+                               n_trials=1000, dsr=normal_dsr))
+    assert any("DSR" in f for f in fails), fails
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), "2.0", None])
+def test_a_non_finite_or_non_numeric_sharpe_fails_closed(bad):
+    """非法样本外夏普 ⇒ **不予通过**(而不是被 NaN 的比较静默放过)。"""
+    fails = check_gate(replace(GOOD, oos_sharpe=bad))
+    assert any("样本外夏普" in f and "非法" in f for f in fails), (bad, fails)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), "5.0", None])
+def test_a_non_finite_or_non_numeric_sample_length_fails_closed(bad):
+    """非法样本外年数 ⇒ **不予通过**。"""
+    fails = check_gate(replace(GOOD, oos_years=bad))
+    assert any("样本外年数" in f and "非法" in f for f in fails), (bad, fails)
+
+
+@pytest.mark.parametrize("field", ["max_drawdown_pct", "max_drawdown_yuan",
+                                   "round_trips", "random_entry_percentile",
+                                   "stress_sharpe"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_the_other_metric_fields_do_not_silently_pass_nan(field, bad):
+    """**其余指标字段**同样不许被 NaN/inf 静默放过(逐个查,不是只查夏普)。
+
+    只查夏普是**半条规则**:回撤、往返笔数、随机分位、成本翻倍夏普的比较
+    在 NaN 下同样恒为 False ⇒ 都会变成「通过」。
+    """
+    fails = check_gate(replace(GOOD, **{field: bad}))
+    assert any("非法" in f for f in fails), (field, bad, fails)
+
+
+@pytest.mark.parametrize("field", ["data_adjusted", "parameter_on_plateau"])
+@pytest.mark.parametrize("bad", ["False", "yes", 2, None])
+def test_a_boolean_field_given_a_non_boolean_is_rejected(field, bad):
+    """布尔字段只认 bool / 0 / 1;字符串 "False" 在 Python 里是**真** ⇒ 必须拦。"""
+    fails = check_gate(replace(GOOD, **{field: bad}))
+    assert any("非法" in f for f in fails), (field, bad, fails)
+
+
+@pytest.mark.parametrize("bad_floor", [float("nan"), float("inf"), float("-inf"),
+                                       -1.0, 0.0, "3.0", None])
+def test_an_illegal_floor_falls_back_to_the_constant(bad_floor):
+    """兜底下限被传成非法值 ⇒ 退回常量 3.0,**不许**让上限变成 NaN。
+
+    NaN 的危害:上限变 NaN ⇒ 「夏普 > 上限」恒为 False ⇒ 「高得可疑」这条
+    **永远不触发** ⇒ 防线静默失效(fail-open)。
+    """
+    thresholds = GateThresholds(suspicious_sharpe_floor=bad_floor)
+    cap = suspicious_sharpe_cap(1000, 600, thresholds)
+    assert math.isfinite(cap), bad_floor
+    assert cap == pytest.approx(3.1121, abs=1e-3), bad_floor
+
+
+def test_an_absurd_sample_length_does_not_crash_the_gate():
+    """样本外年数大到折算溢出(1e308 年)⇒ **不抛异常**,并且被明确拒掉。
+
+    旧实现会抛 OverflowError(inf → int)⇒ 整个评估流程炸掉,而不是 fail-closed。
+    """
+    candidate = replace(GOOD, oos_years=1e308)
+    assert cap_for_metrics(candidate) == 3.0
+    fails = check_gate(candidate)
+    assert any("不合理" in f for f in fails), fails
+
+
+def test_the_gate_never_raises_on_hostile_metrics():
+    """一批怪输入 ⇒ 门槛**既不抛异常**,也**不放行**(fail-closed)。"""
+    hostile = [
+        {"oos_sharpe": float("nan")},
+        {"oos_sharpe": "2.0"},
+        {"oos_years": float("inf")},
+        {"oos_years": 1e308},
+        {"oos_years": -3.0},
+        {"max_drawdown_pct": float("nan")},
+        {"max_drawdown_yuan": float("inf")},
+        {"round_trips": float("nan")},
+        {"random_entry_percentile": float("nan")},
+        {"stress_sharpe": float("nan")},
+        {"data_adjusted": "False"},
+        {"parameter_on_plateau": "False"},
+        {"dsr": float("nan")},
+        {"n_trials": 0},
+    ]
+    for change in hostile:
+        fails = check_gate(replace(GOOD, **change))
+        assert fails, change           # 不许出现「静默全过」
+
+
+@pytest.mark.parametrize("field,change", [
+    ("min_oos_sharpe", {"oos_sharpe": 1.2}),
+    ("max_drawdown_pct", {"max_drawdown_pct": -25.0}),
+    ("max_drawdown_yuan", {"max_drawdown_yuan": -2500}),
+    ("min_round_trips", {"round_trips": 80}),
+    ("min_random_percentile", {"random_entry_percentile": 80.0}),
+    ("min_stress_sharpe", {"stress_sharpe": 0.4}),
+    ("min_sharpe_ci_lower", {"oos_years": 2.0}),
+    ("min_dsr", {"dsr": 0.80}),
+])
+def test_a_non_finite_threshold_still_rejects_what_the_default_rejects(field, change):
+    """**阈值本身**是 NaN ⇒ 退回该字段的默认值 ⇒ **该拦的仍然拦得住**。
+
+    NaN 阈值的危害和 NaN 指标一样:「夏普 < NaN」恒为 False ⇒ 下限那条
+    **永远不触发** ⇒ 等于把这一关悄悄关掉。
+    """
+    thresholds = GateThresholds(**{field: float("nan")})
+    candidate = replace(GOOD, **change)
+    fails = check_gate(candidate, thresholds)
+    assert fails, (field, change)               # 默认阈值会拒 ⇒ 退回默认后也必须拒
+    assert fails == check_gate(candidate), (field, change)
 
