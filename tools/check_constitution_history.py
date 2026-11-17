@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 import json
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -1398,6 +1400,210 @@ def check_constitution_module_is_clean(root: Path) -> list[str]:
     return problems
 
 
+# --------------------------------------------------------------------------
+# 第 55 轮:接线自检的**独立落点**(这一层是纯标准库 + git,永远会跑)
+# --------------------------------------------------------------------------
+# **为什么放在宪法层**:宪法 workflow 是「纯标准库 + git」——不装 PyYAML、
+# 不装 pytest、不装整个交易环境 ⇒ 它**没有理由不跑** ⇒ 它是接线自检的
+# **独立落点**(研究层那一处被删掉时,这里还在;反之亦然)。
+#
+# **为什么是纯文本**:宪法层不许引入依赖(没有 PyYAML)。文本级足够——
+# 只需要认出「有没有一处规范形的调用」,不需要解析整个 YAML。
+#
+# **只认规范形**:第 55 轮**实测**的洞——接线自检的调用可以被加参数
+# (`--workflow` 曾是**替换**语义 ⇒ 真实的 workflow 压根没被查,
+#  而工具**照样报「[OK] CI 接线合规」**)⇒ 这里要求
+# `python tools/check_ci_wiring.py`,**一个选项都不许带**。
+RESEARCH_WORKFLOW_REL = ".github/workflows/research-guard.yml"
+WIRING_SCRIPT_REL = "tools/check_ci_wiring.py"
+_PYTHON_TOKEN_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|py|pythonw)$")
+
+# **规范形里允许的解释器选项**(第 55 轮之五,codex 第 2 轮的 M1):
+# `python -X utf8 …`、`py -3 …` 这些**合法**写法此前一律判红(误伤)。
+# **两层必须一致**:研究层(`tools/check_ci_wiring.py`)放宽了,这里也要放宽,
+# 否则同一处调用研究层说「合规」、宪法层说「不是规范形」⇒ CI 变红。
+# **禁止**的选项:`-c`(把脚本整个换掉)、`-m`(把脚本换成模块)。
+_INTERPRETER_VALUE_FLAGS = {"-W", "-X"}
+_INTERPRETER_NO_VALUE_FLAGS = {
+    "-3", "-u", "-B", "-E", "-s", "-I", "-O", "-OO", "-P", "-v",
+    "--check-hash-based-pycs",
+}
+_FORBIDDEN_INTERPRETER_FLAGS = {"-c", "-m"}
+
+
+def _run_blocks(text: str) -> list[str]:
+    """把 workflow 文本切成「每个 run 步骤的命令串」。
+
+    **为什么文本级**:宪法层没有 PyYAML。这里只需要认出
+    「有没有一处规范形的 `python tools/check_ci_wiring.py`」,
+    不需要解析整个 YAML ⇒ 文本级够用,而且**不引入依赖**。
+
+    块标量(`run: |`)按**缩进**收集后续行,拼成**一个**命令串
+    (这样 `ruff check ... tools/check_ci_wiring.py` 这种
+    「把脚本列进文件清单」的写法不会被误认成「在跑它」)。
+    """
+    lines = text.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped.startswith("run:"):
+            index += 1
+            continue
+        rest = stripped[len("run:"):].strip()
+        indent = len(line) - len(line.lstrip())
+        if rest and rest not in ("|", ">", "|-", ">-", "|+", ">+"):
+            blocks.append(rest)                 # `run: 一条命令`(行内写法)
+            index += 1
+            continue
+        cursor = index + 1
+        body: list[str] = []
+        while cursor < len(lines):
+            candidate = lines[cursor]
+            if not candidate.strip():
+                cursor += 1
+                continue
+            if len(candidate) - len(candidate.lstrip()) <= indent:
+                break                           # 缩进回退了 ⇒ 这一步结束
+            if not candidate.strip().startswith("#"):
+                body.append(candidate.strip())
+            cursor += 1
+        blocks.append("\n".join(body))
+        index = cursor
+    return blocks
+
+
+def _script_index(tokens: list[str]) -> int | None:
+    """命令位置上的那个脚本词(解释器**和它的选项**之后);认不出 ⇒ None。
+
+    **为什么要跳过解释器选项**(第 55 轮之五,codex 第 2 轮的 M1):
+    `python -X utf8 tools/check_ci_wiring.py` 里,脚本那个词**不紧跟**解释器
+    ⇒ 此前认不出「在跑它」⇒ 报「压根没有」⇒ **误伤合法写法**。
+    """
+    if not tokens:
+        return None
+    if not _PYTHON_TOKEN_RE.match(tokens[0].rsplit("/", 1)[-1].lower()):
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _FORBIDDEN_INTERPRETER_FLAGS:
+            return None
+        if token in _INTERPRETER_VALUE_FLAGS:
+            index += 2                      # 跳过选项**和它的值**
+            continue
+        if token in _INTERPRETER_NO_VALUE_FLAGS or re.match(r"^-\d+(\.\d+)*$", token):
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _wiring_call_shapes(block: str) -> list[str]:
+    """这个步骤里「在跑接线自检」的写法(认不出规范形就返回**非规范形**的写法)。
+
+    - 规范形:`python tools/check_ci_wiring.py`(解释器是 python 系,
+      可以带解释器自己的选项,但脚本后面**不许**再有任何词);
+    - 其它一切**真的在跑那个脚本**的写法(带选项、直接执行脚本、
+      藏进 `bash -c "…"` 里)⇒ 都算「非规范形」。
+
+    **怎么区分「在跑它」和「只是把它列进文件清单」**:
+    只有当脚本那个词**在命令位置**(解释器及其选项之后)才算「在跑它」
+    ⇒ `ruff check … tools/check_ci_wiring.py` 不算。
+    """
+    try:
+        tokens = shlex.split(block, comments=False, posix=True)
+    except ValueError:
+        tokens = block.split()
+    if not tokens:
+        return []
+    # **为什么要 strip**:shlex 的 POSIX 模式会把行尾的续行反斜杠
+    # 当成转义 ⇒ 换行变成**词内的一个字面换行** ⇒
+    # `tools/check_ci_wiring.py` 会变成 "\ntools/check_ci_wiring.py"。
+    # 不 strip 就会把「只是把脚本列进文件清单」误认成「在跑它」。
+    tokens = [token.strip() for token in tokens]
+    script_index = _script_index(tokens)
+    shapes: list[str] = []
+    for index, cleaned in enumerate(tokens):
+        if cleaned == WIRING_SCRIPT_REL:
+            if script_index is None or index != script_index:
+                continue          # 不在命令位置 ⇒ 只是被列进文件清单 ⇒ 不算「在跑它」
+            if index == 0:
+                shapes.append(block)            # 直接执行脚本 ⇒ 非规范形
+            else:
+                rest = tokens[index + 1:]
+                if not rest:
+                    shapes.append(block)        # 规范形
+                else:
+                    shapes.append(" ".join([tokens[0], cleaned] + rest))  # 带了选项 ⇒ 非规范形
+        elif WIRING_SCRIPT_REL in cleaned and cleaned != WIRING_SCRIPT_REL:
+            # 藏在引号里(例如 `bash -c "python tools/check_ci_wiring.py"`)
+            shapes.append(block)
+    return shapes
+
+
+def check_ci_wiring_presence(root: Path) -> list[str]:
+    """研究 workflow 里必须**还在**跑接线自检(而且是规范形)。
+
+    **失败模式(都是第 55 轮实测过的)**:
+      - 调用被删 ⇒ 接线自检自己被悄悄拆掉;
+      - 调用被加上 `--workflow <别处文件>` ⇒ 检查范围被缩小,
+        真实的 workflow 压根没被查,而工具**照样报「[OK]」**。
+
+    **失败即 fail-closed**:文件读不到 ⇒ 报问题;不当作「没问题」。
+    """
+    workflow = root / RESEARCH_WORKFLOW_REL
+    if not workflow.exists():
+        return ["%s 不存在 ⇒ 宪法层无法核对接线自检是否还在(fail-closed)"
+                % RESEARCH_WORKFLOW_REL]
+    try:
+        text = workflow.read_text(encoding="utf-8")
+    except OSError as exc:
+        return ["%s 读不了:%s(fail-closed)" % (RESEARCH_WORKFLOW_REL, exc)]
+
+    canonical = False
+    non_canonical: list[str] = []
+    for block in _run_blocks(text):
+        shapes = _wiring_call_shapes(block)
+        if not shapes:
+            continue
+        for shape in shapes:
+            if _is_canonical_wiring_call(shape):
+                canonical = True
+            else:
+                non_canonical.append(shape)
+    if canonical:
+        return []
+    if non_canonical:
+        return ["%s 里跑接线自检的那处调用**不是规范形**:%s ⇒ "
+                "守卫的检查范围可以被缩小(实测:加 `--workflow <别处文件>` ⇒ "
+                "真实的 workflow 压根没被查,工具却照样报「[OK]」)"
+                % (RESEARCH_WORKFLOW_REL, " | ".join(non_canonical)[:200])]
+    return ["%s 里**没有任何**跑 `tools/check_ci_wiring.py` 的地方 ⇒ "
+            "接线自检自己可以被悄悄删掉" % RESEARCH_WORKFLOW_REL]
+
+
+def _is_canonical_wiring_call(shape: str) -> bool:
+    """这一段文本是不是规范形的 `python tools/check_ci_wiring.py`。
+
+    **允许解释器自己的选项**(第 55 轮之五):`python -X utf8 …`、`py -3 …` 算规范形;
+    **禁止** `-c`(把脚本整个换掉)与 `-m`(把脚本换成模块);
+    脚本后面**不许**再有任何词(那才是「缩小检查范围」的口子)。
+    """
+    try:
+        tokens = shlex.split(shape, comments=False, posix=True)
+    except ValueError:
+        return False
+    tokens = [token.strip() for token in tokens]
+    index = _script_index(tokens)
+    if index is None:
+        return False
+    if tokens[index].replace("\\", "/") != WIRING_SCRIPT_REL:
+        return False
+    return index == len(tokens) - 1
+
+
 def check_all(root: Path) -> list[str]:
     """跑完全部检查,返回问题清单(空列表表示通过)。"""
     require_full_history(root)
@@ -1414,6 +1620,7 @@ def check_all(root: Path) -> list[str]:
     problems += check_executor_completeness(root)
     problems += check_constitution_module_is_clean(root)
     problems += check_shrink_only(root)
+    problems += check_ci_wiring_presence(root)   # 第 55 轮:接线自检的独立落点
     seen: set[str] = set()
     unique = []
     for problem in problems:            # 同一个问题可能对多个历史版本重复出现,报一次就够

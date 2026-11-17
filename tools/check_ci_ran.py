@@ -153,6 +153,94 @@ def _cases_of_suite(cases: list, suite_path: str, modules: list | None = None) -
             if name == module or name.startswith(module + ".")]
 
 
+def validate_roster(roster) -> list[str]:
+    """名单**结构**校验(第 55 轮之五,codex 第 2 轮的 H2)。
+
+    **一份实现,三处共用**:接线自检(`tools/check_ci_wiring.py`)、
+    闸门(`tools/ci_gate.py`)、闸门工具自己(`tools/check_ci_ran.py`)。
+    此前三处**各写各的** ⇒ **坏名单的判法不一致** ⇒ 最严重的一条:
+
+        `must_run: {}` ⇒ 闸门把每份套件都当成「不在名单里」
+        ⇒ 自动加 `--allow-unlisted-suite`
+        ⇒ **逐条点名核对整个消失** ⇒ 闸门照样打印「[OK] 闸门通过」。
+
+    ⇒ 现在:**结构不对一律 fail-closed**,且三处判法一致。
+
+    返回**问题清单**(空列表 = 结构没问题)。不抛异常——调用方自己决定怎么表态。
+    """
+    problems: list[str] = []
+    if not isinstance(roster, dict):
+        # 顶层是数组/字符串 ⇒ 此前 `roster.get(...)` 直接 AttributeError 抛栈,
+        # **没有结论行**(与本工具自己的注释宣称「已按第 49 轮 L4 修好」相悖)。
+        return ["名单的顶层不是对象(是 %s)" % type(roster).__name__]
+
+    must_run = roster.get("must_run", {})
+    allow_skipped = roster.get("allow_skipped", {})
+    # **未知的顶层键**(第 55 轮之六,codex 第 3 轮的 M1):
+    # 名单里多写一个键 ⇒ 没人知道它是什么意思 ⇒ 可能是**以为**写了就生效
+    # (例如把 `must_skip` 写上去,以为能跳过某些用例)⇒ 实际什么都没发生。
+    # ⇒ 未知的键一律判红。下划线开头的键当作文档说明(`_说明`),放行。
+    known_top = {"must_run", "allow_skipped"}
+    for key in roster:
+        if not isinstance(key, str) or (key not in known_top and not key.startswith("_")):
+            problems.append("名单里有**未知的顶层键**:%r(只认 must_run / allow_skipped;"
+                            "下划线开头的当作文档说明放行)" % (key,))
+    if not isinstance(must_run, dict):
+        problems.append("名单里的 must_run 不是对象(是 %s)" % type(must_run).__name__)
+    if not isinstance(allow_skipped, dict):
+        problems.append("名单里的 allow_skipped 不是对象(是 %s)"
+                        % type(allow_skipped).__name__)
+
+    if isinstance(must_run, dict):
+        if not must_run:
+            # **空的 must_run ⇒ 点名核对一条都做不了** ⇒ 静默降级 ⇒ 假绿。
+            problems.append("名单里的 must_run 是空的 ⇒ 逐条点名核对一条都做不了 ⇒ "
+                            "静默降级 ⇒ 假绿")
+        for suite_path, names in must_run.items():
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                problems.append("名单里 must_run 的 %s 条目不是字符串列表" % suite_path)
+            elif not names:
+                # **空列表**(第 55 轮之六,claude 第 3 轮的 L-1):
+                # 这份套件被点名了,但**一条用例都没点名** ⇒ 逐条核对等于没做
+                # ⇒ 闸门会「跑完 0 条」而照样报「[OK]」。
+                problems.append("名单里 must_run 的 %s 条目是空的 ⇒ 这份套件一条用例"
+                                "都没被点名 ⇒ 逐条核对等于没做" % suite_path)
+    if isinstance(allow_skipped, dict):
+        for suite_path, names in allow_skipped.items():
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                problems.append("名单里 allow_skipped 的 %s 条目不是字符串列表" % suite_path)
+            elif not names:
+                # 同上:「允许跳过」却一条都不许跳过 ⇒ 这条允许是空转。
+                problems.append("名单里 allow_skipped 的 %s 条目是空的 ⇒ 这条允许是空转"
+                                % suite_path)
+
+    if isinstance(must_run, dict) and isinstance(allow_skipped, dict):
+        for suite_path, names in allow_skipped.items():
+            if suite_path not in must_run:
+                # 「允许跳过」却不在 must_run ⇒ 这条允许是**空转**(压根没被点名核对)。
+                problems.append("名单里 %s 列在 allow_skipped,却不在 must_run:"
+                                "「允许跳过」是空转" % suite_path)
+                continue
+            if (not isinstance(names, list)
+                    or not isinstance(must_run.get(suite_path), list)):
+                continue
+            overlap = sorted(set(names) & set(must_run[suite_path]))
+            if overlap:
+                # 既要求真跑、又允许跳过 ⇒ 判据自相矛盾。
+                problems.append("名单里 %s 的 %s 同时在 must_run 与 allow_skipped:"
+                                "既要求真跑又允许跳过,判据自相矛盾"
+                                % (suite_path, ", ".join(overlap)))
+            # **注意(第 55 轮之六)**:这里**不做**「allow_skipped 的名字必须
+            # 出现在 must_run 里」的名字级检查——那会**误伤合法名单**。
+            # 本工具的语义是:`allow_skipped` 是**独立的一段**——
+            # 那些用例**必须出现在报告里**,但**允许被跳过**;
+            # 它们本来就不在 must_run 里(正因为预期会被跳过)。
+            # 真名单就是这样:`tests/test_approval_ledger.py` 的
+            # `test_reading_is_consistent_with_the_research_side` 就在
+            # allow_skipped 段、且不在 must_run 段 ⇒ 名字级「悬空」是**正常**的。
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     # **Windows 兼容**(第 48 轮):默认控制台是 cp1252,打印中文会抛 UnicodeEncodeError
     # ⇒ 工具"崩"在打印阶段 ⇒ 退出码非 0 ⇒ 看起来像"红了",实际是**没给出结论**。
@@ -203,39 +291,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print("[FAIL] 名单读不了:%s(%s)" % (args.roster, exc))
         return 1
+    # **结构校验**(第 55 轮之五,codex 第 2 轮的 H2):**一份共享实现**
+    # (`validate_roster`),接线自检与闸门也调它 ⇒ 三处判法一致。
+    # 名单是 JSON,但 JSON 合法 ≠ 结构对;结构不对 ⇒ **一律 fail-closed**。
+    roster_problems = validate_roster(roster)
+    if roster_problems:
+        for problem in roster_problems:
+            print("[FAIL] 名单结构不对:%s(%s)" % (problem, args.roster))
+        return 1
     must_run = roster.get("must_run", {})
     allow_skipped = roster.get("allow_skipped", {})
-    # **结构校验**:名单是 JSON,但 JSON 合法 ≠ 结构对。
-    # 此前 `roster.get("must_run", {})` 之后直接 `.items()`/`.extend()`:
-    # 顶层是数组 ⇒ AttributeError ⇒ 抛栈(退出码虽非 0,但**没有结论**),
-    # 与仓库「崩掉也要给结论行」的规矩不符(第 49 轮 codex L4)。
-    if not isinstance(must_run, dict):
-        print("[FAIL] 名单里的 must_run 不是对象(是 %s):%s" % (type(must_run).__name__, args.roster))
-        return 1
-    if not isinstance(allow_skipped, dict):
-        print("[FAIL] 名单里的 allow_skipped 不是对象(是 %s):%s"
-              % (type(allow_skipped).__name__, args.roster))
-        return 1
-    for table, label in ((must_run, "must_run"), (allow_skipped, "allow_skipped")):
-        for suite_path, names in table.items():
-            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
-                print("[FAIL] 名单里 %s 的 %s 条目不是字符串列表:%s"
-                      % (suite_path, label, args.roster))
-                return 1
-    # **「允许跳过」不许悬空**(第 54 轮 codex H4):
-    # 允许跳过的套件必须在 must_run 里(否则这条允许是空转);
-    # 同一条用例不许同时出现在 must_run 与 allow_skipped
-    # (那等于「既必须真跑、又允许跳过」——判据自相矛盾)。
-    for suite_path, names in allow_skipped.items():
-        if suite_path not in must_run:
-            print("[FAIL] 名单里 %s 列在 allow_skipped,却不在 must_run:"
-                  "「允许跳过」是空转(它压根没被点名核对)" % suite_path)
-            return 1
-        overlap = sorted(set(names) & set(must_run[suite_path]))
-        if overlap:
-            print("[FAIL] 名单里 %s 的 %s 同时在 must_run 与 allow_skipped:"
-                  "既要求真跑又允许跳过,判据自相矛盾" % (suite_path, ", ".join(overlap)))
-            return 1
 
     def _names_for(suite_path: str) -> list[str]:
         """这一份套件要**逐条点名**的用例(必须真跑 + 允许跳过)。"""
@@ -255,13 +320,22 @@ def main(argv: list[str] | None = None) -> int:
     # 闸门证明不了「跑的是那份套件」。实测(造一份 classname 指向别的模块的报告)
     # 旧实现照样返回 0。
     modules = [_module_name(case) for case in cases]          # 第 54 轮:只算一遍
-    by_base: dict[tuple[str, str], list] = {}
+    # **第 55 轮(codex 第 2 轮的 M3)**:此前这里按**(模块, 函数名)精确**取,
+    # 而 `_cases_of_suite` 按**前缀**取 —— 两处口径不一致:
+    #   - pytest 把用例放进 `class` 里时,报告里的 `classname` 是
+    #     `tests.test_x.TestFoo` ⇒ 精确相等匹配不上 ⇒ 名单点名的用例
+    #     「没有出现在报告里」⇒ **CI 永久变红**,而且报的是**误导性的**理由
+    #     (真跑过了,只是模块名带了类名)。
+    # 现在两处**同一条口径**:模块名相等**或**以「模块.」开头。
+    by_base: dict[str, list] = {}
     for case, module in zip(cases, modules):
-        by_base.setdefault((module, _base_name(_case_name(case))), []).append(case)
+        by_base.setdefault(_base_name(_case_name(case)), []).append((module, case))
     for suite_path in target_suites:
+        module = _module_of_suite(suite_path)
         skip_ok = set(allow_skipped.get(suite_path, []))
         for name in _names_for(suite_path):
-            matched = by_base.get((_module_of_suite(suite_path), name), [])
+            matched = [case for case_module, case in by_base.get(name, [])
+                       if case_module == module or case_module.startswith(module + ".")]
             if not matched:
                 problems.append("名单点名的用例**没有出现在报告里**:%s" % name)
                 continue

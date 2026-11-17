@@ -302,14 +302,21 @@ def test_every_red_mutation_has_a_witness() -> None:
 
 
 def test_every_witness_points_at_a_test_that_exists() -> None:
-    """见证用例必须**真的存在**——否则改名后脚手架会一直红着而无从解释。"""
+    """见证用例必须**真的存在**——否则改名后脚手架会一直红着而无从解释。
+
+    **参数化的见证**(第 55 轮之五):nodeid 可以带参数段
+    (`…::test_x[utf8]`)⇒ 存在性只看**函数名**那一段;
+    参数 id 写错 ⇒ 脚手架跑那一轮时「见证没有红」⇒ 退出码 1
+    (由 `check_guard_mutations.py` 自己兜住,这里不重复实现)。
+    """
     for label, witness in cgm.WITNESSES.items():
         rel, _, name = witness.partition("::")
         assert name, "见证用例的 nodeid 不完整:%s" % witness
         path = ROOT / rel
         assert path.exists(), "见证用例指向的文件不存在:%s" % witness
         source = path.read_bytes().decode("utf-8")
-        assert ("def %s(" % name) in source, (
+        base = name.split("[", 1)[0]
+        assert ("def %s(" % base) in source, (
             "见证用例指向的函数不存在(改名了?):%s" % witness)
 
 
@@ -388,7 +395,7 @@ def test_the_shared_copy_repo_carries_the_ci_workflow(tmp_path: Path, monkeypatc
 # --------------------------------------------------------------------------
 
 def _fake_repo(dest: Path) -> None:
-    """造一个**极小**的仓库副本:两份只有一条用例的套件 + 一个被改的文件。"""
+    """造一个**极小**的仓库副本:三份只有一条用例的套件 + 一个被改的文件。"""
     (dest / "tests").mkdir(parents=True, exist_ok=True)
     # 钉住 rootdir,免得 pytest 往上找到别的配置文件
     (dest / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
@@ -396,6 +403,10 @@ def _fake_repo(dest: Path) -> None:
         "def test_witness():\n    assert True\n", encoding="utf-8")
     (dest / "tests" / "test_fake_tool.py").write_text(
         "def test_tool():\n    assert True\n", encoding="utf-8")
+    # 第 55 轮:基线里多了「接线自检自己的用例」这一份(接线那族变异的见证在那儿)
+    # ⇒ 假仓库也得有它,否则基线跑不起来 ⇒ `main()` 退出码 2 ⇒ 这几条用例全红。
+    (dest / "tests" / "test_fake_wiring.py").write_text(
+        "def test_wiring():\n    assert True\n", encoding="utf-8")
     (dest / "guard_target.py").write_text("VALUE = 1\n", encoding="utf-8")
 
 
@@ -405,6 +416,7 @@ def _run_main_with(monkeypatch, mutations, witnesses) -> int:
     monkeypatch.setattr(cgm, "WITNESSES", witnesses)
     monkeypatch.setattr(cgm, "BOUNDARY", "tests/test_fake_boundary.py")
     monkeypatch.setattr(cgm, "TOOL_TEST", "tests/test_fake_tool.py")
+    monkeypatch.setattr(cgm, "WIRING", "tests/test_fake_wiring.py")
     monkeypatch.setattr(cgm, "copy_repo", _fake_repo)
     return cgm.main([])
 
@@ -516,4 +528,3 @@ def test_the_green_control_cannot_be_vacuous() -> None:
     assert cgm._passed_count("1 passed, 2 warnings in 0.10s") == 1
     # 旧行为返回 -1:两个 -1 相等 ⇒ 恒真
     assert -1 == -1
-

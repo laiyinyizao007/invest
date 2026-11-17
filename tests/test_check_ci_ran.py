@@ -216,6 +216,21 @@ def test_a_same_named_test_from_another_module_does_not_satisfy_the_roster(tmp_p
     ) == 1
 
 
+def test_a_class_based_case_still_satisfies_the_roster(tmp_path):
+    """用例被放进 `class` 里时,报告里的 `classname` **带着类名** ⇒ 仍要匹配得上。
+
+    第 55 轮(codex 第 2 轮的 **M3**):此前**逐条点名**那一步按**精确**模块名取,
+    而同一文件里的 `_cases_of_suite` 按**前缀**取 —— 两处口径不一致 ⇒
+    这类用例**永远**匹配不上 ⇒ CI **永久变红**,而且报的是**误导性的**理由
+    (「点名点名的用例没有出现在报告里」——它明明跑了)。
+    """
+    assert _run(
+        tmp_path,
+        [{"name": "test_a", "classname": "tests.test_x.TestFoo"}],
+        {"tests/test_x.py": ["test_a"]},
+    ) == 0
+
+
 def test_a_roster_whose_must_run_is_not_an_object_fails_instead_of_crashing(tmp_path):
     """名单结构不对(JSON 合法但不是对象)⇒ **红并给结论**,不是抛栈(第 49 轮 codex L4)。"""
     module = _load_tool()
@@ -578,4 +593,3 @@ def test_a_broken_roster_fails_instead_of_crashing(tmp_path):
         "--roster", str(roster),
         "--suite", "tests/test_x.py",
     ]) == 1
-

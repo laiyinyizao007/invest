@@ -221,6 +221,15 @@ NEVER_DOWNGRADE = (
     # 上面那个脚手架**自己的**守卫用例:守卫工具的守卫也要有人守
     # (仓库教训:新写的守卫工具自己也要有人守)。
     "tests/test_check_guard_mutations.py",
+    # 第 55 轮:CI 接线的**规范形**闸门与它的自检。
+    # `tools/ci_gate.py` 是 CI 里那一步的**全部**内容(自己跑 pytest、自己核对名单、
+    # 用退出码说话)——改它 = 改「闸门判红会不会让 CI 红」。
+    "tools/ci_gate.py",
+    # `tools/check_ci_wiring.py` 是接线自检的本体:它断言「每个闸门步骤都是规范形」
+    # 与「名单里的套件都真的被跑到」——改它 = 改检出能力本身。
+    "tools/check_ci_wiring.py",
+    # 上面那个自检工具**自己**的用例。
+    "tests/test_ci_wiring.py",
     # 防线不变量与门槛相关的用例:改断言 = 削弱检出能力
     "tests/test_research_boundary.py",
     "tests/test_research_config.py",
