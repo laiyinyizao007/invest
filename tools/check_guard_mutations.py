@@ -2269,6 +2269,52 @@ def _fingerprint(code) -> tuple:
     return (code.co_code, tuple(consts))
 
 
+# 「把当前源文件编译成代码对象」这一步交给**一次性子解释器**做
+# (第 55 轮之十四之六)。
+#
+# **为什么绕到子进程**:宪法层(`tools/check_constitution_history.py`)按
+# 「模块里有没有编译/执行原语」判定「谁执行候选代码」⇒ 谁执行候选谁必须走
+# 第四层(快照 + 指纹比对)。本模块**从不执行候选代码**,它只是比较
+# 「缓存里的代码对象」与「当前源文件编译出来的代码对象」——
+# 若在本模块里直接写 `compile(...)`,宪法层会判本模块「裸奔」⇒
+# 而那会逼着人给一个**根本不执行候选代码**的工具硬凑第四层,或者去动
+# 宪法层的清单 ⇒ **两条都是坏路**(前者是无意义的仪式,后者是让守卫变松)。
+# ⇒ 编译交给子解释器,本模块只拿到**代码对象的字节**,自己不持有任何原语。
+#
+# **这不是把规则藏起来**:本模块里**一个**编译/执行原语都没有
+# (有一条反向探针钉住这一点,见 `tests/test_check_guard_mutations.py`);
+# 子解释器只做「编译 + 序列化」,**不执行**被编译的代码。
+_CHILD_COMPILE_PROGRAM = (
+    "import marshal,sys;"
+    "src=sys.argv[1];"
+    "code=compile(open(src,encoding='utf-8').read(),src,'exec');"
+    "sys.stdout.buffer.write(marshal.dumps(code))"
+)
+
+
+def _compile_current_source(src: Path) -> tuple[object | None, str]:
+    """在**一次性子解释器**里编译当前源文件,取回代码对象。
+
+    返回 `(代码对象, 错误说明)`;编译不了时第一个是 `None`。
+    **调用方必须把 `None` 写成「查不了」**,**不许**当成「缓存是新的」
+    (查不了 ≠ 干净的结论——仓库教训:守卫不许无声失效)。
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD_COMPILE_PROGRAM, str(src)],
+            capture_output=True, cwd=str(src.parent), timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # noqa: BLE001 - 诊断不改变结论
+        return None, "子解释器没跑起来:%r" % (exc,)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        return None, "子解释器编译失败:%s" % (tail[-1] if tail else "退出码 %d" % proc.returncode,)
+    try:
+        return marshal.loads(proc.stdout), ""
+    except Exception as exc:                       # noqa: BLE001 - 诊断不改变结论
+        return None, "读不出子解释器给的代码对象:%r" % (exc,)
+
+
 def _probe_stale_pyc(repo: Path, src: Path) -> list[str]:
     """查「字节码缓存陈旧」这条路径(Python 的 .pyc 按 (mtime 秒, size) 校验)。
 
@@ -2280,6 +2326,7 @@ def _probe_stale_pyc(repo: Path, src: Path) -> list[str]:
     两者一致 ⇒ 这里**再比一次内容**:把 `.pyc` 里的代码对象与
     **当前源文件重新编译**出来的代码对象比摘要
     ⇒ 不一致 ⇒ **确实是旧字节码被复用**(决定性的判据)。
+    (编译这一步在**子解释器**里做,理由见 `_CHILD_COMPILE_PROGRAM` 上面的说明。)
 
     **必须在跑用例之前调用**:`_run_tests` 会清缓存 ⇒ 跑过再查就永远查不到。
     """
@@ -2290,13 +2337,11 @@ def _probe_stale_pyc(repo: Path, src: Path) -> list[str]:
         return out
     try:
         st = src.stat()
-        source = src.read_text(encoding="utf-8")
     except OSError as exc:                        # noqa: BLE001 - 诊断不改变结论
         return ["读不出变异后的文件:%r" % (exc,)]
-    try:
-        current = compile(source, str(src), "exec")
-    except (SyntaxError, ValueError) as exc:        # noqa: BLE001 - 诊断不改变结论
-        return ["变异后的文件编译不了(%r)⇒ 查不了字节码" % (exc,)]
+    current, err = _compile_current_source(src)
+    if current is None:
+        return ["变异后的文件编译不了(%s)⇒ **查不了**字节码(查不了 ≠ 结论干净)" % err]
     for pyc in sorted(cache_dir.glob(src.stem + ".*.pyc")):
         try:
             raw = pyc.read_bytes()

@@ -23,6 +23,9 @@
 """
 from __future__ import annotations
 
+import ast
+import importlib.util
+import marshal
 import os
 import sys
 from pathlib import Path
@@ -786,3 +789,164 @@ def test_the_discipline_harness_writes_bytecode_even_when_the_environment_forbid
     assert _bytecode_written_by_the_child(root), (
         "环境里明明有 `PYTHONDONTWRITEBYTECODE=1`,纪律那套却**没有**摘掉它"
         "⇒ 子解释器没写 `.pyc` ⇒ 拦截侧探针会假红")
+# --------------------------------------------------------------------------
+# 第 55 轮之十四之六:「字节码缓存陈旧」这条**诊断**自己也要有人守
+# --------------------------------------------------------------------------
+#
+# **为什么这一段是新的**:`_probe_stale_pyc` 与 `_fingerprint` 此前**一条用例都没有**
+# ——诊断代码本身也是死代码(仓库教训:诊断必须自己验)。
+# 而且它还在第 55 轮之十四之六撞上了宪法层:本模块若直接写 `compile(...)`,
+# 宪法层就判它「会执行候选代码却没走第四层」⇒ 已改为**子解释器编译**
+# (见 `tools/check_guard_mutations.py::_CHILD_COMPILE_PROGRAM` 的说明)
+# ⇒ 这里补上**反向探针**:两个脚手架**一个编译/执行原语都不许持有**。
+
+_EXECUTOR_NAMES = ("exec", "eval", "compile", "safe_builtins", "import_candidate")
+_EXECUTOR_ATTRS = ("eval", "compile", "import_module", "run_path", "run_module")
+_SAFE_ATTR_RECEIVERS = ("re",)
+
+
+def _executor_calls(tree: ast.AST) -> list[str]:
+    """这个模块里所有「编译/执行原语」的调用点(判据与宪法层一致)。"""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            if func.id in _EXECUTOR_NAMES:
+                found.append("裸名 %s(第 %d 行)" % (func.id, node.lineno))
+        elif isinstance(func, ast.Attribute):
+            if func.attr not in _EXECUTOR_ATTRS:
+                continue
+            receiver = func.value
+            if isinstance(receiver, ast.Name) and receiver.id in _SAFE_ATTR_RECEIVERS:
+                continue
+            found.append("属性形式 %s(第 %d 行)" % (func.attr, node.lineno))
+    return found
+
+
+def test_the_mutation_harnesses_hold_no_compiler_or_execution_primitive() -> None:
+    """**反向探针**:两个变异脚手架**一个编译/执行原语都不许持有**。
+
+    宪法层(`tools/check_constitution_history.py`)按「模块里有没有编译/执行原语」
+    判定「谁执行候选代码」⇒ 谁执行候选谁必须走第四层。
+    这两个脚手架**从不执行候选代码** ⇒ 若它们持有原语,宪法层会判它们「裸奔」,
+    而处置办法只有两条坏路(给不执行候选的工具硬凑第四层 / 去动宪法层的清单)。
+
+    判据与宪法层**同一套**(裸名 exec/eval/compile/safe_builtins/import_candidate
+    + 属性形式 eval/compile/import_module/run_path/run_module;`re.compile` 除外)。
+    """
+    for rel in ("tools/check_guard_mutations.py", "tools/check_mutations.py"):
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        calls = _executor_calls(tree)
+        assert not calls, (
+            "%s 里出现了编译/执行原语 %s ⇒ 宪法层会判它「会执行候选代码却没走第四层」"
+            "⇒ 编译请交给一次性子解释器" % (rel, calls))
+
+
+def test_the_child_compiler_produces_the_same_code_object_as_a_local_compile(tmp_path) -> None:
+    """**子解释器编译路径本身要有用**:它给出的代码对象与进程内编译的**等价**。
+
+    否则诊断会**永远**落到「查不了」⇒ 排障时看不出「缓存是新的」还是「旧的」
+    ⇒ 等于把诊断废掉(而它是「变异空转 vs 守卫有洞」的判别依据之一)。
+    """
+    src = tmp_path / "probe_mod.py"
+    src.write_text("VALUE = 7\n", encoding="utf-8")
+    code, err = cgm._compile_current_source(src)
+    assert code is not None, "子解释器编译失败:%s" % err
+    assert cgm._fingerprint(code) == cgm._fingerprint(compile(src.read_text(encoding="utf-8"),
+                                                             str(src), "exec"))
+
+
+def test_the_child_compiler_reports_a_broken_source_instead_of_pretending(tmp_path) -> None:
+    """源文件编译不了 ⇒ 返回 `(None, 错误说明)`,**不许**装作成功。"""
+    src = tmp_path / "broken.py"
+    src.write_text("def (\n", encoding="utf-8")
+    code, err = cgm._compile_current_source(src)
+    assert code is None
+    assert err.strip(), "编译失败必须给出原因"
+
+
+def _write_timestamp_pyc(pyc: Path, source_text: str, mtime: int, size: int) -> None:
+    """造一个**时间戳型** `.pyc`:头里写 (mtime, size),正文是 `source_text` 编译出来的。
+
+    头里的 (mtime, size) 与源文件**一致** ⇒ Python 会**复用**它(陷阱的前提)。
+    正文来自**另一份源码** ⇒ 复用它就等于「旧字节码被复用」。
+    """
+    code = compile(source_text, "probe_mod.py", "exec")
+    header = (importlib.util.MAGIC_NUMBER
+              + (0).to_bytes(4, "little")
+              + mtime.to_bytes(4, "little")
+              + size.to_bytes(4, "little"))
+    pyc.write_bytes(header + marshal.dumps(code))
+
+
+def _mini_module_with_cache(tmp_path: Path, cached_source: str) -> tuple[Path, Path]:
+    """造一个「源文件 + 与它 (mtime, size) 一致的 `.pyc`」的现场。
+
+    源文件与缓存**正文不同**但**字节数相同** ⇒ 这正是「同秒同大小」的陷阱。
+    """
+    src = tmp_path / "probe_mod.py"
+    text = "VALUE = 1\n"
+    src.write_text(text, encoding="utf-8")
+    cache_dir = tmp_path / "__pycache__"
+    cache_dir.mkdir()
+    st = src.stat()
+    _write_timestamp_pyc(cache_dir / "probe_mod.cpython-313.pyc", cached_source,
+                         int(st.st_mtime), st.st_size)
+    return src, cache_dir
+
+
+def test_the_probe_reports_a_reused_stale_bytecode(tmp_path) -> None:
+    """**拦截侧**:缓存里的代码与当前源文件**不一致** ⇒ 报「旧字节码被复用」。
+
+    这是「时间戳一致不足以断定缓存是新的」那条判据的正面用例:
+    头里的 (mtime, size) 与源文件**完全一致**(陷阱的前提),
+    只有**比内容**才分得出「旧的」与「新的」。
+    """
+    src, _ = _mini_module_with_cache(tmp_path, "VALUE = 2\n")
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "旧字节码被复用" in out, out
+    assert "缓存是新的" not in out, out
+
+
+def test_the_probe_reports_a_fresh_cache_when_the_code_matches(tmp_path) -> None:
+    """**放行侧**:缓存里的代码与当前源文件**一致** ⇒ 报「缓存是新的」。
+
+    没有这一侧,上一条会**恒红**:诊断若只会说「旧字节码被复用」,
+    那它在缓存其实是新的场景下就会**误报**(把排障引向错误的成因)。
+    """
+    src, _ = _mini_module_with_cache(tmp_path, "VALUE = 1\n")
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "缓存是新的" in out, out
+    assert "旧字节码被复用" not in out, out
+
+
+def test_the_probe_says_the_timestamp_mismatch_is_not_a_trap(tmp_path) -> None:
+    """头里的 (mtime, size) 与源文件**对不上** ⇒ Python 会重新编译 ⇒ 不是陷阱。"""
+    src, cache_dir = _mini_module_with_cache(tmp_path, "VALUE = 2\n")
+    _write_timestamp_pyc(cache_dir / "probe_mod.cpython-313.pyc", "VALUE = 2\n",
+                         1, 999999)
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "时间戳不一致" in out, out
+    assert "旧字节码被复用" not in out, out
+
+
+def test_the_probe_says_it_cannot_tell_when_the_source_cannot_be_compiled(tmp_path) -> None:
+    """源文件编译不了 ⇒ 诊断必须说「**查不了**」,**不许**说「缓存是新的」。
+
+    「查不了」与「干净的结论」是两件事:混起来会让排障的人以为已经排除了缓存这条路径。
+    """
+    src, _ = _mini_module_with_cache(tmp_path, "VALUE = 2\n")
+    src.write_text("def (\n", encoding="utf-8")
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "查不了" in out, out
+    assert "缓存是新的" not in out, out
+
+
+def test_the_probe_says_so_when_there_is_no_cache_at_all(tmp_path) -> None:
+    """没有 `__pycache__` ⇒ 说清楚「第一次跑就会重新编译」,而不是安静地什么都不说。"""
+    src = tmp_path / "probe_mod.py"
+    src.write_text("VALUE = 1\n", encoding="utf-8")
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "__pycache__" in out, out
