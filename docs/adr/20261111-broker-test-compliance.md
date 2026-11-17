@@ -740,3 +740,66 @@ mihomo 的 `tun.route-exclude-address`(`121.13.218.19/32`、`120.86.114.57/32`),
 
 **旁证**:行情登录成功后出现「行情接口报错，代码：77，信息：CTP:无此功能」——
 柜台对某个行情侧请求不支持(不是本次阻塞点,但说明该测试柜台行情功能也精简)。
+
+### 追记(2026-11-17,只读核对国信重发的 API 包):「生产/仿真开关」我方早已合规;6.7.13 的 32 位构建改了导出名,64 位与我们一致
+
+客户经理重发的测试包里有一张说明图(包内文件名《6.7.11开始生产、仿真共用同一API,由此参数控制。测试使用false,生产使用true》),
+以及 `6.7.13-API/`(头文件 + **32 位与 64 位两套** DLL + import `.lib`)。逐条核对结果:
+
+**一、参数侧:我方早已合规,「把生产/仿真开关搞反」这条从我方这一侧可以排除。**
+
+| 环节 | 实测事实 |
+|---|---|
+| 国信文档 | 包内 `ThostFtdcTraderApi.h:582` `CreateFtdcTraderApi(const char* pszFlowPath="", bool bIsProductionMode=true)`;`ThostFtdcMdApi.h:88` `CreateFtdcMdApi(..., bool bIsProductionMode=true)` |
+| 我方网关 | `vnpy_ctp 6.7.11.4` 的 `gateway/ctp_gateway.py:174-175`:`production_mode = (柜台环境 == "实盘")`;`:191-192` 把该值分别传给 `td_api.connect` / `md_api.connect` |
+| 我方配置 | `.env.guoxin` 里 `CTP_ENVIRONMENT=测试` ⇒ **实际传 `False`**(测试用 false,与国信文档一致) |
+| 客户端确实带这个参数 | 已装 6.7.11 **x64** DLL 的导出符号为 `?CreateFtdcTraderApi@CThostFtdcTraderApi@@SAPEAV1@PEBD_N@Z`,末位 `N` 即 `bool` ⇒ 参数真实存在(项目 `.venv` 与用户 site-packages 两处安装的 `vnpy_ctp 6.7.11.4` 网关代码与 DLL 符号一致) |
+
+⇒ 候选清单里「柜台环境/前置不匹配」中的**开关方向**部分(此前只是推断)现在有了证据:
+**导出表证明的是「参数确实存在(bool 形参)」**,「测试→false」的方向则由说明图 + 头文件默认值
++ 网关代码 + `.env` 共同佐证——两类证据不要混为一谈。
+
+**二、6.7.13 的 32 位与 64 位构建导出名不同;我方跑的是 64 位,那一半不会断绑定。**
+
+实测(PE 导出表,逐符号比对):
+
+| 文件 | 位次 | `CreateFtdcTraderApi` 导出符号 |
+|---|---|---|
+| 已装 `thosttraderapi_se.dll`(`vnpy_ctp 6.7.11.4`) | **x64** | `?CreateFtdcTraderApi@CThostFtdcTraderApi@@SAPEAV1@PEBD_N@Z` |
+| 国信包 `20260225_traderapi64_se_windows/thosttraderapi_se.dll`(6.7.13) | **x64** | **完全相同**(导出表全量 diff 为空,同样 7 个符号) |
+| 国信包 `20260225_traderapi_se_windows/thosttraderapi_se.dll`(6.7.13) | x86 | `?CreateFtdcTraderApi@CThostFtdcTraderApi@@SAPAV1@PBD_N@Z`(static 方法 `const`→非 `const`、`const char*`→`char*`) |
+
+我方运行时是 **64 位**(`vnctptd.cp313-win_amd64.pyd` / `vnctpmd.cp313-win_amd64.pyd`),
+按名导入的正是 `?CreateFtdcTraderApi@…SAPEAV1@PEBD_N@Z` 与 `?CreateFtdcMdApi@…SAPEAV1@PEBD_N1_N@Z`
+——**6.7.13 的 x64 DLL 全部提供** ⇒ **x64 单换 DLL 不会断绑定**(技术上可行);
+会断绑定的是 32 位那份,而且位次本来也与我们不匹配。
+
+⇒ 因此**「保持 6.7.11.4、不手工替换 DLL」的理由不是符号名**,而是:
+①PyPI 上 `vnpy-ctp` **没有 6.7.13 版**(wrapper 未适配、未验证);
+②本轮是**只读核对**,不引入未经我方验证的券商 DLL(6.7.13 x64 与 6.7.11 x64 是否行为等价,我方未验证);
+③包内 demo 默认走生产模式(见第三点),照抄会连错环境。
+
+> **更正记录**:本节初稿(未单独提交)据 **32 位**构建的符号名断言「6.7.13 的 DLL 不能单换、会断绑定」——
+> 该断言**只对 x86 成立**,对我们要跑的 x64 **不成立**,已按上表更正。(此更正由 G8 第二轮
+> codex 复核发现,经我方独立重跑 PE 导出/导入表解析确认。)
+
+**若国信确认「交易端要求客户端 ≥ 6.7.13」**,客户端侧并非无路可走:可在**副本目录**里
+只读地试 x64 的 6.7.13 DLL(不在生产 venv 内替换);但那属于「不换 DLL」纪律的**显式例外**,
+需单独决定并单独记录。
+
+**三、顺带记一个坑**:国信包内 demo `demo/main.cpp:68` 写的是
+`pUserApi->CreateFtdcTraderApi(".\\flow\\")` —— **走默认值 `true`(=生产)**。
+任何基于该 demo 的自测都必须显式传 `false`,否则会拿「生产客户端」去连仿真前置。
+
+**四、候选清单新增第 4 条(只能问国信)**:**交易端是否对客户端 API 版本有下限(要求 ≥ 6.7.13)?**
+行情用**同一个 6.7.11 客户端**登录成功,说明**行情侧**接受 6.7.11 客户端(不能外推到交易端);
+但若国信只对**交易端**做版本门槛,仍能解释 code 3。
+在「不换 DLL」的纪律下**本轮**客户端侧查不出来 ⇒ 并入给国信技术部的问询清单
+(本 ADR 早前已把「API 6.7.13」一问降级为次要怀疑;本次只是把它固化成正式问询条目)。
+
+**纪律**:以上只是把候选**收窄**,没有缩小到唯一原因;在国信给出答案前,
+**不换 DLL、不改版本、不再动凭据**(每套前置每轮只试一次)。
+
+**方法留存**:上面的位次/符号结论全部来自**标准库解析 PE 导出表与导入表**(不靠读头文件猜)。
+本次用的是临时脚本;若要长期复用,需按仓库规则单独走一次改动流程落进 `tools/`
+(`tools/` 不在研究白名单内 ⇒ 属执行域),**本轮不做**,登记为待办。

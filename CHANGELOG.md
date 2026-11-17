@@ -106,6 +106,38 @@
   - **纪律**:改密属对外动作且会改掉国信发来的密码 ⇒ **未经确认不执行**;也不要靠反复试密码去「碰运气」。
   - **旁证**:行情登录成功后出现「行情接口报错，代码：77，信息：CTP:无此功能」——
     柜台对某个行情侧请求不支持(非本次阻塞点,但说明该测试柜台的行情功能也是精简的)。
+- **国信重发的 6.7.13 API 包已核对:「生产/仿真共用同一 API、由参数控制」我方早已合规;
+  6.7.13 的 **x64** DLL 与我们装的 6.7.11 **导出名完全一致(符号兼容、不会断绑定)**,但仍保持不换**
+  (Issue [#14](https://github.com/laiyinyizao007/invest/issues/14),
+  ADR `20261111-broker-test-compliance.md` 2026-11-17「只读核对国信重发的 API 包」追记):
+  - **参数侧已合规(逐条可查)**:国信包内说明图与头文件 `ThostFtdcTraderApi.h:582`
+    (`CreateFtdcTraderApi(const char*, bool bIsProductionMode=true)`)、
+    `ThostFtdcMdApi.h:88`(同名参数)说明「测试用 false、生产用 true」;我方 `vnpy_ctp 6.7.11.4` 的
+    `gateway/ctp_gateway.py:174-175` 是 `production_mode = (柜台环境 == "实盘")`,`:191-192` 把它传给
+    `td_api.connect`/`md_api.connect`;`.env.guoxin` 里 `CTP_ENVIRONMENT=测试` ⇒ **实际传 False**;
+    已装 6.7.11 **x64** DLL 的导出符号 `?CreateFtdcTraderApi@CThostFtdcTraderApi@@SAPEAV1@PEBD_N@Z`
+    末尾 `N` 即 `bool` ⇒ 参数真实存在(项目 `.venv` 与用户 site-packages 两处安装一致)。
+    **⇒ 从我方接线这一侧排除「生产/仿真开关搞反」。**
+  - **DLL 位次结论(实测 PE 导出表)**:6.7.13 的 **64 位**构建
+    (`20260225_traderapi64_se_windows/`)导出表与我方已装的 6.7.11 x64 **完全一致**
+    (同样 7 个符号、全量 diff 为空);只有 **32 位**构建才是
+    `?CreateFtdcTraderApi@CThostFtdcTraderApi@@SAPAV1@PBD_N@Z`(static 方法 `const`→非 `const`、
+    `const char*`→`char*`)。我方跑的是 64 位 wrapper
+    (`vnctptd.cp313-win_amd64.pyd`),按名导入 `?CreateFtdcTraderApi@…SAPEAV1@PEBD_N@Z`
+    与 `?CreateFtdcMdApi@…SAPEAV1@PEBD_N1_N@Z`,6.7.13 x64 全部提供 ⇒ **x64 单换不会断绑定**。
+  - **更正**:本条早一版据 32 位构建断言「6.7.13 的 DLL 不能单换、会断绑定」——
+    该断言**只对 x86 成立**,对我们要跑的 x64 **不成立**,已更正。
+  - **仍然保持 6.7.11.4 的理由(不是符号名)**:①PyPI 上 `vnpy-ctp` 无 6.7.13 版
+    (最新 6.7.11.4,2026-03-29)⇒ wrapper 未适配未验证;②本轮只读核对,不引入未验证的券商 DLL;
+    ③包内 demo 默认走生产模式(见下),照抄会连错环境。
+  - **顺带记一个坑**:国信包内 demo `demo/main.cpp:68` 是 `CreateFtdcTraderApi(".\\flow\\")`,
+    **走默认值 true(=生产)**;基于该 demo 的自测必须显式传 `false`。
+  - **新增第 4 个要问国信技术部的问题**:**交易端是否对客户端 API 版本有下限(要求 ≥ 6.7.13)?**
+    行情用同一个 6.7.11 客户端登录成功 ⇒ **行情侧**接受 6.7.11 客户端(不能外推到交易端),
+    但若只对**交易端**设版本门槛,仍能解释 code 3;在「不换 DLL」纪律下**本轮**客户端侧查不出来,只能问国信。
+    **在得到答复前:不换 DLL、不改版本、不再动凭据、每套前置每轮只试一次。**
+    (若国信确认要 ≥6.7.13,客户端侧并非无路可走:可在副本目录里只读地试 x64 的 6.7.13 DLL,
+    但那是纪律的显式例外,需单独决定。)
 - **平仓超平的方向性缺陷:同一个采集窗口落进两次持仓快照时,只出一张平仓单**(Issue [#14](https://github.com/laiyinyizao007/invest/issues/14)):
   实测(2026-11-16 夜盘,SimNow)清场工具拿到**两行** `c2701.DCE Long 3`,照抄就生成
   **两张 3 手平多单** —— 账户只有 3 手持仓,平 6 手 = **超平 = 柜台整单拒(错误码 30)**,仓位没平掉。
