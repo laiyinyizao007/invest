@@ -177,7 +177,7 @@ flowchart LR
 
 **运行时与运维**
 - `trading/runtime.py`、`scripts/run_headless.py`:无头运行入口——启动对账、看门狗、连接状态机、退出码语义、准入检查。
-- `scripts/unlock_account.py`、`scripts/record_promotion.py`、`scripts/pause_trading.py`:人工解锁(冷却/强制/历史)、实盘准入批准记录、手动暂停/恢复新开仓(标志文件,平仓放行)。
+- `scripts/unlock_account.py`、`scripts/record_promotion.py`、`scripts/pause_trading.py`、`scripts/cancel_all_orders.py`:人工解锁(冷却/强制/历史)、实盘准入批准记录、手动暂停/恢复新开仓(标志文件,平仓放行)、批量撤单(请求文件,撤销全部开仓挂单)。
 - `trading/graceful_exit.py`:退出前向交易/行情前置发 `ReqUserLogout`(vnpy_ctp 的 `close()` 只断开连接),供运行时与脚本共用。
 - `notify/webhook.py`:非阻塞 Webhook 通知(通用/飞书/Telegram),发送前脱敏。
 - `scripts/run_gui.py`:图形界面(人工观察用,含算法单/价差应用,不得用于无人值守)。

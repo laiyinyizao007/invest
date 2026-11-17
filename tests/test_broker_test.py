@@ -734,9 +734,39 @@ def test_connection_step_is_manual_without_interactive(env):
     assert item(env, "P2.1").status == be.MANUAL
 
 
-def test_batch_cancel_is_recorded_as_not_implemented(env):
+def test_batch_cancel_cancels_all_resting_open_orders_through_the_runtime_request(env):
+    env.gw.mode = "accept"
     bt.step_batch_cancel(env.ctx, env.book)
-    assert item(env, "P5.2").status == be.SKIP and "未实现" in item(env, "P5.2").shots[0].lines[0]
+    ev = item(env, "P5.2")
+    assert ev.status == be.PASS, ev.summary
+    text = "\n".join(ev.shots[0].lines)
+    assert "挂出 3 笔" in text and "全部已撤销" in text and "批量撤单" in text
+    assert env.main.get_all_active_orders() == []
+    assert not (env.state_file.parent / "cancel_all.request").exists()
+
+
+def test_batch_cancel_fails_and_notes_leftovers_when_cancels_do_not_land(env):
+    env.gw.mode = "accept"
+    env.gw.cancel_works = False
+    bt.step_batch_cancel(env.ctx, env.book)
+    ev = item(env, "P5.2")
+    assert ev.status == be.FAIL
+    assert any("仍在活动" in line for line in ev.shots[0].lines)
+    assert not (env.state_file.parent / "cancel_all.request").exists()   # 请求无论成败都清掉
+
+
+def test_batch_cancel_is_skipped_off_session(tmp_path):
+    e = Env(tmp_path, in_session=False)
+    try:
+        bt.step_batch_cancel(e.ctx, e.book)
+        assert e.book.items["P5.2"].status == be.SKIP
+        assert e.gw.sent == []
+    finally:
+        e.main.close()
+
+
+def test_batch_cancel_is_gated_by_flat_check_like_other_order_steps():
+    assert "P5.2" in bt.ORDER_ITEMS
 
 
 def test_logs_step_needs_all_four_categories(env, monkeypatch):

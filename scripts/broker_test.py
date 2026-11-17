@@ -4,7 +4,7 @@
     穿透式演示 ①登录 ②行情 ③委托(开/平仓) ④撤单 ⑤成交 ⑥流量控制 ⑦异常自动退出(20260717 版模板已无穿透专章,仅留存证据)
     外部接入 1.1 连通 1.2 基础交易 2.1 稳定运行(持续下单 200 笔)
     程序化补充 3.1 连接断开监测 3.2 报撤单笔数 3.3 重复报单(选测) 4.1 阈值与预警 5.1 指令检查 5.2 柜台错误提示
-           6.1 暂停交易 6.2 批量撤单(未实现,选测) 7.1 日志
+           6.1 暂停交易 6.2 批量撤单(选测) 7.1 日志
     (内部测试项 ID 仍是 P1.1…P6.1,与模板编号的对应见 broker_evidence.TEMPLATE_NO;--only 用内部 ID)
 结果写到 `data/broker_test/<时间戳>/`:evidence.json + images/*.png,再用 `scripts/broker_report.py` 填进国信模板。
 
@@ -47,6 +47,7 @@ from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_OR
 from vnpy.trader.object import OrderRequest, SubscribeRequest  # noqa: E402
 from vnpy.trader.utility import round_to  # noqa: E402
 
+import cancel_all_orders  # noqa: E402
 import pause_trading  # noqa: E402
 from broker_evidence import (  # noqa: E402
     FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
@@ -62,7 +63,7 @@ from ctp_tools.penetration import (  # noqa: E402
     wait_milestones,
 )
 from trading.events import EVENT_GUARD_ALERT  # noqa: E402
-from trading.guard_rule import ACCOUNT_RULE_NAME  # noqa: E402
+from trading.guard_rule import ACCOUNT_RULE_NAME, CANCEL_ALL_REQUEST_NAME  # noqa: E402
 from risk.account_guard import AccountGuard, AccountLimits, beijing_now, trading_day  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
 from trading.safe_risk import SafeRiskManagerApp  # noqa: E402
@@ -75,7 +76,7 @@ OUT_ROOT = bootstrap.ROOT / "data" / "broker_test"
 DAILY_RULE, SIZE_RULE, DUP_RULE = "每日上限检查", "委托规模检查", "重复报单检查"
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN, EXIT_CRASH = 0, 1, 2, 3, 4
 # 会向柜台发委托的测试项:这些步骤之前必须先确认账户空仓
-ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1"})
+ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1", "P5.2"})
 STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
 FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上限(秒)
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
@@ -1474,8 +1475,60 @@ def step_logs(ctx: Ctx, book: Book) -> None:
     book.add("P6.1", PASS if not missing else FAIL, "" if not missing else f"缺少日志类别:{'、'.join(missing)}", shots, started)
 
 
+BATCH_CANCEL_ORDERS = 3                    # 6.2 批量撤单演示:先挂出的不易成交开仓委托笔数
+
+
 def step_batch_cancel(ctx: Ctx, book: Book) -> None:
-    book.add("P5.2", SKIP, "批量撤单(选测)尚未实现,见 docs/roadmap.md §2.6", [Shot("", ["未实现(选测项,报告标「未测试」)"])], ctx.now())
+    """P5.2(模板 6.2 批量撤单,选测):挂出 N 笔不易成交的开仓委托 → 走**运行时真实入口**
+    (`cancel_all_orders.request` 写请求文件,`AccountGuardRule` 定时器处理)→ 确认全部到达撤销终态。
+
+    判定只认运行时这一路的结果;之后的兜底撤单(cancel_and_note)只为清场,不计入通过。
+    """
+    started = ctx.now()
+    if ctx.tick is None or not ctx.in_session:
+        reason = "非交易时段或没有 Tick,挂单不会被柜台正常接受,请在交易时段补测"
+        book.add("P5.2", SKIP, reason, [Shot("", [reason])], started)
+        return
+    rule = ctx.rule(ACCOUNT_RULE_NAME)
+    state_dir = rule.guard.state_path.parent if rule is not None and rule.guard.state_path is not None else None
+    if state_dir is None:
+        book.add("P5.2", FAIL, "风控规则没有状态目录,批量撤单请求不可用", [Shot("", ["规则缺失或无状态文件"])], started)
+        return
+    alert_mark = len(ctx.alerts)
+    lines: list[str] = []
+    made: list[str] = []
+    leftover: list[str] = []
+    resting: list[str] = []
+
+    def is_active(oid: str) -> bool:
+        order = ctx.collector.order_of(oid)
+        return order is None or order.is_active()          # 查不到 = 状态未知,按还挂着算
+
+    try:
+        for _ in range(BATCH_CANCEL_ORDERS):
+            oid = send(ctx, make_req(ctx, price=probe_price(ctx)))
+            if oid:
+                made.append(oid)
+        ctx.wait_until(lambda: all(ctx.collector.order_of(o) is not None for o in made), ctx.cancel_wait)
+        resting = [o for o in made if is_active(o)]
+        lines.append(f"{ctx.now()} 挂出 {len(made)} 笔不易成交的开仓委托,其中 {len(resting)} 笔处于未成交挂单状态")
+        cancel_all_orders.request(state_dir, "国信测试演示")
+        lines.append(f"{ctx.now()} 执行 cancel_all_orders(批量撤单请求)")
+        ctx.wait_until(lambda: not any(is_active(o) for o in made), ctx.cancel_wait)
+        leftover = [o for o in made if is_active(o)]
+        lines.append("批量撤单结果:" + ("全部已撤销" if not leftover else f"⚠ 仍在活动:{', '.join(leftover)}"))
+    finally:
+        for leftover_req in (CANCEL_ALL_REQUEST_NAME, CANCEL_ALL_REQUEST_NAME + ".processing"):
+            try:                                   # 运行时没处理掉的请求不能遗留到下一轮;删不掉也不能挡住下面的清场
+                (state_dir / leftover_req).unlink(missing_ok=True)
+            except OSError as exc:
+                lines.append(ctx.clean(f"⚠ 批量撤单请求文件 {leftover_req} 删除失败:{exc!r}(请手动删除)"))
+        cancel_and_note(ctx, made, lines)
+    alerts = [a for a in ctx.alerts_since(alert_mark) if a["title"].startswith("批量撤单")]
+    lines += [ctx.clean(f"告警:[{a['level']}] {a['title']}:{a.get('message', '')}") for a in alerts]
+    forward_alerts(ctx, alerts)
+    ok = len(made) == BATCH_CANCEL_ORDERS and len(resting) == len(made) and not leftover and         any(a["title"] == "批量撤单" for a in alerts)
+    book.add("P5.2", PASS if ok else FAIL, "" if ok else "批量撤单未能撤销全部挂单或未发出告警", [Shot("", lines)], started)
 
 
 def final_safety(ctx: Ctx) -> list[str]:
@@ -1578,8 +1631,8 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
         guarded(("P2.1",), step_connection, ctx, book)
     if want("T7"):
         guarded(("T7",), step_exit, ctx, book)
-    if want("P5.2"):
-        guarded(("P5.2",), step_batch_cancel, ctx, book)
+    if not gated and want("P5.2"):
+        gated = guarded(("P5.2",), step_batch_cancel, ctx, book)[0] or gated
     if want("P6.1"):
         guarded(("P6.1",), step_logs, ctx, book)         # 最后做:前面各步产生的日志才齐
     return True
