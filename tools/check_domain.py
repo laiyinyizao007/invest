@@ -206,6 +206,8 @@ NEVER_DOWNGRADE = (
     "tests/test_constitution_round12.py",
     "tests/test_constitution_round25.py",
     "tests/test_merge_main_sandbox_union.py",
+    # 导入守卫的分类用例(Issue #47):改断言 = 改「站点包能不能被导入」这道判定
+    "tests/test_import_guard_venv_site_packages.py",
     "tests/test_candidate_escape_production_path.py",
     "tests/test_helper_module_escape.py",
     "tests/test_live_admission.py",

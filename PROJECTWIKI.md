@@ -125,6 +125,7 @@ flowchart LR
   - [`20261113-evolution-engine.md`](docs/adr/20261113-evolution-engine.md):进化引擎的不可变宪法(静态/运行时类/参数/实例/指纹/行情六层)
   - [`20261115-approved-sandbox-closure.md`](docs/adr/20261115-approved-sandbox-closure.md):闭合沙盒状态机——`approved/` 目录、收菜动作与运行时装载的 fail-closed(批准终于成为真正的授权)
 
+  - [`20261115-import-guard-site-package-classification.md`](docs/adr/20261115-import-guard-site-package-classification.md):导入守卫按「是不是本仓库的代码」分类——仓库内 venv 的站点包不再被当成「仓库内模块」误杀(Issue #47);**收窄分类,不放宽任何一道检查**
   - [`20261114-consequence-domain-tiers.md`](docs/adr/20261114-consequence-domain-tiers.md):**流程按后果域分档**（研究档 / 执行档），不按改动规模——研究与生产的规模一样，但研究的产物可重跑、失败只影响结论。分档判据由 `tools/check_domain.py` 执行（默认拒绝），清单由 `tools/verdict_graph.py` 的**函数级** AST 分析**实测**得出（谁拥有 `check_gate` / `record_approval` / `screen_source` 等判定点）。**不削弱任何代码内的防线，也不改阈值**——只减少改动的审批成本
 
 ## 4. 设计决策 & 技术债务
@@ -368,6 +369,9 @@ sequenceDiagram
 
 ## 12. 变更日志
 - 参见 [`CHANGELOG.md`](CHANGELOG.md)。提交与本文件同步更新,提交信息引用对应 Issue。
+- 2026-11-15:**导入守卫的站点包分类修正**(Issue [#47](https://github.com/laiyinyizao007/invest/issues/47)):
+  仓库自带 venv 在仓库根之内 → 站点包被当成「仓库内模块」误杀,主 checkout 里研究侧 4 条用例红(CI 看不到)。
+  判据改为「是不是本仓库自己的代码」;收窄分类,防线一道没松。详见 ADR `20261115-import-guard-site-package-classification`。
 - 2026-11-14:**流程按后果域分档**(Issue [#35](https://github.com/laiyinyizao007/invest/issues/35)):新增仓库根 `CLAUDE.md`,
   研究域只影响研究产物(可重跑、不动钱)走轻流程,执行域走全套;判据由 `tools/check_domain.py` 执行(默认拒绝),
   清单由 `tools/verdict_graph.py` 的函数级 AST 分析实测得出。**代码内的防线与 CI 闸门一个都没动**。

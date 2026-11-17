@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import importlib.util
 import json
@@ -189,10 +190,56 @@ def _child_reason(stderr: str) -> str:
     return rs.scrub_text(lines[-1])[:200]
 
 
+# 站点包快照文件路径:**父进程**在第一次起子进程之前拍好(候选永远跑在子进程里,
+# 父进程的代码不是候选执行的 → 快照不在候选的控制之下)。
+# 见 scripts/research_sandbox.py::snapshot_site_files 的说明(第 4 轮 codex 复核的 C1)。
+_SITE_SNAPSHOT: dict | None = None
+_SITE_SNAPSHOT_PATH: Path | None = None
+_SITE_SNAPSHOT_SHA = ""
+
+
+def site_snapshot_path() -> tuple[Path, str]:
+    """站点包快照的 (文件路径, 哈希)。
+
+    **每轮起子进程前都用内存里的原始快照重写一次文件**:
+    快照文件落在系统临时目录,那是**候选可写**的地方;候选若在上一轮改了它,
+    父进程若照着磁盘上那份算哈希,哈希证明的就是**被篡改后的字节**
+    (第 3 轮 codex 复核的 C1:实测跨轮次逃逸成立)。重写 + 用内存里的字节算哈希,
+    篡改自动被抹掉。
+
+    只拍**仓库内**的站点包根:仓库外的站点包按原口径处理(物理上就在仓库之外,
+    走「预先存在」那一支),本次不动那条——它是既有洞,登记在 Issue #49。
+    """
+    global _SITE_SNAPSHOT, _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA
+    if _SITE_SNAPSHOT is None:
+        code_root = rc.CODE_ROOT.resolve()
+        roots = [root for root in rs.site_package_roots()
+                  if root == code_root or code_root in root.parents]
+        _SITE_SNAPSHOT = rs.snapshot_site_files(roots)
+        _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA = rs.write_site_snapshot(_SITE_SNAPSHOT)
+        atexit.register(lambda: _SITE_SNAPSHOT_PATH.unlink(missing_ok=True)
+                        if _SITE_SNAPSHOT_PATH else None)
+    else:
+        # 重写:抹掉上一轮可能的篡改(内容与哈希都来自内存里的原始快照)
+        _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA = rs.write_site_snapshot(
+            _SITE_SNAPSHOT, _SITE_SNAPSHOT_PATH)
+    return _SITE_SNAPSHOT_PATH, _SITE_SNAPSHOT_SHA
+
+
 def spawn_child(cmd: list[str], timeout: float) -> dict:
     """在受限环境(环境变量白名单)的子进程里运行,返回子进程回传的 JSON;失败抛 JobError。"""
+    # 快照路径**刻意**绕过 sandbox_env 的白名单:白名单是为了不把**凭据**
+    # 传出去,而这里传的是仓库内一个文件路径(不是秘密),
+    # 子进程要靠它拿到「候选开跑之前」的基准。
+    env = rs.sandbox_env(os.environ)
+    snapshot_path, snapshot_sha = site_snapshot_path()
+    env[rs.SITE_SNAPSHOT_ENV] = str(snapshot_path)
+    # 快照文件的哈希也一起给:文件在系统临时目录(候选可写),候选改了它,
+    # 下一轮就会读到伪造的快照。哈希由**父进程内存里的原始快照**算出
+    # (不是现读磁盘 —— 那会证明被篡改后的字节)。
+    env[rs.SITE_SNAPSHOT_SHA_ENV] = snapshot_sha
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-                            errors="replace", cwd=rc.CODE_ROOT, env=rs.sandbox_env(os.environ))
+                            errors="replace", cwd=rc.CODE_ROOT, env=env)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -858,8 +905,25 @@ def cmd_gate(args) -> int:
     return run_cli_job(job)
 
 
+def _require_parent_snapshot() -> None:
+    """子进程必须由父进程起:拿不到父进程拍的快照就拒绝跑。
+
+    为什么(第 4 轮 codex 复核的 N2):守卫拿不到父进程快照时会退回
+    「本进程自己拍的一份」——而**在子进程里**,那份快照是在**上一轮候选跑完之后**
+    才拍的,于是**包含上一轮候选写进去的文件** → 上一轮种下的模块会被判成
+    「候选开跑之前就装好的」→ 跨轮次逃逸成立。
+
+    所以子进程入口一律要求父进程下发快照;拿不到 → 拒绝(退出码 2)。
+    父进程起的子进程一定带(`spawn_child` 会下发),正常路径不受影响。
+    """
+    if not os.environ.get(rs.SITE_SNAPSHOT_ENV):
+        raise JobError(EXIT_REFUSED,
+                       "子进程必须由父进程启动(缺少父进程拍好的站点包快照)")
+
+
 def run_gate_child(args) -> int:
     """子进程:在 15 分钟玉米数据的滚动验证段上做门槛评估。测试段不可达(research_gate 内断言)。"""
+    _require_parent_snapshot()
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_gate
@@ -900,6 +964,7 @@ def run_gate_child(args) -> int:
 
 def run_evaluate_child(args) -> int:
     """子进程：加载候选，读取其 param_grid，在选参窗口选参，再在滚动验证窗口做门槛评估。测试段不可达。"""
+    _require_parent_snapshot()
     import walk_forward_optimizer as wf
     from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
     from research_gate import engine_runner, run_evaluation
@@ -938,6 +1003,7 @@ def run_evaluate_child(args) -> int:
 
 def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
+    _require_parent_snapshot()
     from backtest_lib import run_backtest
     from strategies.instruments import INSTRUMENTS
     try:
