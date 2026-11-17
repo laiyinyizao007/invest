@@ -6,6 +6,7 @@ import pytest
 
 
 from risk.promotion_gate import (  # noqa: E402
+    MAX_OOS_YEARS,
     CandidateMetrics,
     GateThresholds,
     cap_for_metrics,
@@ -493,4 +494,51 @@ def test_a_non_finite_threshold_still_rejects_what_the_default_rejects(field, ch
     fails = check_gate(candidate, thresholds)
     assert fails, (field, change)               # 默认阈值会拒 ⇒ 退回默认后也必须拒
     assert fails == check_gate(candidate), (field, change)
+
+
+# ---------- 第 55 轮之十八:外部复核追问的两点,补成探针 ----------
+
+def test_the_cap_stays_the_floor_when_the_derivation_returns_nan(monkeypatch):
+    """认证线解出 **NaN** ⇒ 上限必须仍是兜底 3.0(不许变成 NaN)。
+
+    为什么单独钉这一条:Python 的 `max(a, b)` 在 NaN 上**依赖参数顺序**
+    (`max(3.0, nan)` → 3.0,`max(nan, 3.0)` → nan)⇒ 若哪天把 `max(floor, x)`
+    写成 `max(x, floor)`,上限就会变成 NaN ⇒ 「夏普 > 上限」恒为 False
+    ⇒ 「高得可疑」这条防线**静默失效**。
+    """
+    import risk.promotion_gate as pg
+
+    monkeypatch.setattr(pg, "required_sharpe_for_dsr", lambda *a, **k: float("nan"))
+    cap = suspicious_sharpe_cap(500, 600)
+    assert math.isfinite(cap)
+    assert cap == 3.0
+
+
+def test_a_sample_length_above_the_physical_limit_only_tightens_the_gate():
+    """样本外年数**超过物理上界**(`MAX_OOS_YEARS`)⇒ 上限落回兜底 3.0 且被明确拒掉。
+
+    这一条钉住「新增的年数上界只会更严」:年数学不出时上限**不升反降**
+    (3.0 < 该 (N,T) 下的认证线)⇒ 不会因为多写一个 1e308 就换到更大的放行区间。
+    """
+    candidate = replace(GOOD, oos_years=MAX_OOS_YEARS + 10.0)
+    assert cap_for_metrics(candidate) == 3.0
+    # 对照组:同一批试验次数(N=1000)、合法样本外长度 ⇒ 上限才是 3.1121
+    assert cap_for_metrics(candidate) < cap_for_metrics(
+        replace(GOOD, oos_years=2.5, n_trials=1000))
+    fails = check_gate(candidate)
+    assert any("不合理" in f for f in fails), fails
+
+
+@pytest.mark.parametrize("n_trials,n_obs", [(1, 3), (2, 10), (1000, 600),
+                                             (10 ** 6, 3), (10 ** 6, 10 ** 6),
+                                             (500, 3)])
+def test_the_cap_is_always_finite_and_never_below_the_floor(n_trials, n_obs):
+    """极端 (N, T) 组合 ⇒ 上限恒为有限数且 **≥ 3.0**。
+
+    这是「只放宽、不收紧」的**穷举式**钉法:任何 (N, T) 下上限都不得低于
+    旧常量 3.0(否则旧规则放行的候选会被新规则毙掉)。
+    """
+    cap = suspicious_sharpe_cap(n_trials, n_obs)
+    assert math.isfinite(cap), (n_trials, n_obs)
+    assert cap >= 3.0, (n_trials, n_obs, cap)
 
