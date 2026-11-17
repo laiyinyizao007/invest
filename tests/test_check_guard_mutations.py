@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -528,3 +529,260 @@ def test_the_green_control_cannot_be_vacuous() -> None:
     assert cgm._passed_count("1 passed, 2 warnings in 0.10s") == 1
     # 旧行为返回 -1:两个 -1 相等 ⇒ 恒真
     assert -1 == -1
+
+
+# --------------------------------------------------------------------------
+# 第 55 轮之十四之四:变异被**陈旧的 .pyc** 吃掉(「见证没红」的真正成因)
+# --------------------------------------------------------------------------
+#
+# **这一族问题的来历**:CI 上 17 条变异报了「见证没红」,而本机 155 条全绿。
+#
+# **机制**:Python 的 `.pyc` 按 (源文件 mtime 的**整秒**, 源文件大小) 校验新鲜度。
+# **pytest 的改写缓存是同一套机制**(pytest 8.4.2
+# `_pytest/assertion/rewrite.py`:`_read_pyc` 比 `int(st.st_mtime)` 与 `size`,
+# `_write_pyc` 写 `int(source_stat.st_mtime) & 0xFFFFFFFF` 与 `size & 0xFFFFFFFF`)
+# ⇒ **测试文件一样会中招**。(此前此处写「pytest 的改写缓存是 hash-based」
+# 是**事实错误**,已按实测改正——见下。)
+# 脚手架的变异多是**同大小**的小改动(`if X:` → `if False and X:`);
+# 两次变异落在**同一整秒**时,第二次变异后的源文件与上一次编译出的
+# 缓存头部**完全吻合** ⇒ 解释器复用**旧字节码** ⇒ 变异根本没生效
+# ⇒ 见证保持绿 ⇒ 看起来像「守卫有洞」,实际是**变异空转**。
+#
+# **实测坐实(不是推测)**:触发要**同时**满足 (a) 变异前后**字节数相同**
+# 与 (b) 两次落在**同一整秒**。158 条变异里**31 条**满足 (a)(29 条在
+# `tools/check_ci_wiring.py`、1 条在 pytest 用例文件、1 条在 YAML——**YAML 不是
+# Python,没有字节码缓存,天然不中招**);CI 上**恰好 17 条**同时满足 (b)
+# ⇒ **CI 报错的 17 条全部落在这 31 条之内,且这 31 条之外无一条报错**。
+# CI 一次变异循环只要 0.3~0.8 秒 ⇒ 常常真撞上;本机慢 ⇒ 撞不上。
+
+def _mini_repo_with_a_value(root: Path) -> Path:
+    """造一个最小的「模块 + 用例」副本,返回那个模块的路径。
+
+    - `tests/probe_mod.py` 里有个值 `VALUE`;
+    - `tests/test_check_domain.py` 断言它是 `"A"`(用例文件名用分档那套的,
+      因为那套脚手架只跑固定的那一个路径)。
+
+    脚手架跑这个用例时 `probe_mod` 会被 import ⇒ 写出 `.pyc` ⇒
+    后面就能拿它做「同秒 + 同大小」的碰撞。
+    """
+    tests = root / "tests"
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / "probe_mod.py").write_text('VALUE = "A"\n', encoding="utf-8")
+    (tests / "test_check_domain.py").write_text(
+        "import probe_mod\n"
+        "\n"
+        "\n"
+        "def test_value():\n"
+        "    assert probe_mod.VALUE == \"A\"\n",
+        encoding="utf-8",
+    )
+    return tests / "probe_mod.py"
+
+
+def _failed_and_output(result) -> tuple[int, str]:
+    """两个脚手架的 `_run_tests` 返回**两种形状**(字典 / 元组)⇒ 这里统一成
+    (失败条数, 输出文本),免得探针自己分叉成两套口径。"""
+    if isinstance(result, dict):
+        return int(result["failed"]), str(result["output"])
+    return int(result[0]), str(result[1])
+
+
+def _stamp_of(pyc: Path) -> tuple[int, int]:
+    """读 `.pyc` 头里记的 (整秒 mtime, 源文件大小)。"""
+    head = pyc.read_bytes()[:16]
+    assert len(head) >= 16, "`.pyc` 头不足 16 字节:不是标准的时间戳型缓存"
+    flags = int.from_bytes(head[4:8], "little")
+    assert flags == 0, "这个解释器用的是 hash 型 `.pyc`(按内容哈希校验)⇒ 本族问题不成立"
+    return int.from_bytes(head[8:12], "little"), int.from_bytes(head[12:16], "little")
+
+
+def test_running_the_suite_clears_the_bytecode_cache_before_it_runs(tmp_path) -> None:
+    """**放行侧**:两个脚手架跑用例之前,都必须把副本里的字节码缓存清掉。
+
+    少了这一步,「同秒 + 同大小」的变异会被陈旧的 `.pyc` 顶掉 ⇒ 变异空转。
+    这里直接**摆一个假的 `.pyc` 在副本里**,跑一次之后它必须消失。
+    """
+    planted = tmp_path / "pkg" / "__pycache__" / "planted.cpython-312.pyc"
+    planted.parent.mkdir(parents=True)
+    planted.write_bytes(b"\x00" * 16)
+
+    # 分档那套:跑固定的那一个测试路径
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_check_domain.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8")
+    cm._run_tests(tmp_path)
+    assert not planted.exists(), "分档那套跑用例之前没有清掉字节码缓存"
+
+    # 纪律那套:跑指定的用例
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_bytes(b"\x00" * 16)
+    cgm._run_tests(tmp_path, ["tests/test_check_domain.py"])
+    assert not planted.exists(), "纪律那套跑用例之前没有清掉字节码缓存"
+
+
+def _same_second_mutation_must_be_seen(run, root: Path, name: str) -> None:
+    """同秒 + 同大小的改动,必须照样被跑用例的那一侧看见。
+
+    这是 CI 上「17 条见证没红」的**原样复现**:
+    第一次跑 ⇒ 模块被 import ⇒ 写出 `.pyc`;
+    接着把模块改成**同样大小**的内容、mtime 设成**同一整秒**
+    ⇒ 若不清缓存,Python 会复用**旧字节码**,用例仍然绿(变异空转);
+    ⇒ 所以「第二次跑必须看到那次改动」——用例必须**变红**。
+    """
+    mod = _mini_repo_with_a_value(root)
+
+    first, first_out = run(root)
+    assert first == 0, "%s:第一次跑就红了,前提不成立:%s" % (name, first_out[-500:])
+
+    pycs = list((mod.parent / "__pycache__").glob("probe_mod.*.pyc"))
+    assert pycs, ("%s:副本里没写出 `.pyc` ⇒ 这条探针的前提不成立"
+                  "(若环境里有 `PYTHONDONTWRITEBYTECODE` 或用了 `-B`,"
+                  "解释器压根不写缓存 ⇒ 是**环境配置**问题,不是「变异被吃」)" % name)
+    # **不能随便取第一个**(第 55 轮之十四之五,codex L4):
+    # 目录里若同时存在时间戳型与 hash 型两个变体,`[0]` 的顺序取决于文件系统
+    # ⇒ 可能取到 hash 型那条 ⇒ `flags == 0` 的断言报出与实际情形不符的解释。
+    # 这里**显式挑出时间戳型**(flags == 0)的那一条,挑不出就当场报错。
+    stamp_pyc = None
+    for cand in sorted(pycs):
+        head = cand.read_bytes()[:16]
+        if len(head) >= 16 and int.from_bytes(head[4:8], "little") == 0:
+            stamp_pyc = cand
+            break
+    assert stamp_pyc is not None, (
+        "%s:副本里没有**时间戳型** `.pyc`(只有 %d 个: %s)⇒ 这条探针的前提不成立"
+        % (name, len(pycs), [p.name for p in sorted(pycs)]))
+    stamp, size = _stamp_of(stamp_pyc)
+
+    # **同样大小** + **同一整秒** ⇒ `.pyc` 会被当成新鲜的
+    mod.write_text('VALUE = "B"\n', encoding="utf-8")
+    assert mod.stat().st_size == size, "改动没有保持同样大小(那就不是同一个陷阱)"
+    os.utime(mod, (stamp, stamp))
+
+    second, second_out = run(root)
+    assert second >= 1, (
+        "%s:同秒 + 同大小的改动被**陈旧的 `.pyc`** 吃掉了 ⇒ 变异空转 ⇒ "
+        "见证会保持绿(假绿)" % name)
+
+
+def test_the_discipline_harness_sees_a_same_second_mutation(tmp_path) -> None:
+    """**拦截侧(纪律那套)**:同秒 + 同大小的改动,纪律脚手架必须看见。
+
+    **与分档那套分成两条用例**(不共用一条):两条变异各有**专属**见证 ⇒
+    不会「走错原因的红」(仓库教训:变异见证必须指向唯一那一条规则)。
+    """
+    root = tmp_path / "纪律"
+    root.mkdir()
+    _same_second_mutation_must_be_seen(
+        lambda r: _failed_and_output(
+            cgm._run_tests(r, ["tests/test_check_domain.py"])),
+        root, "纪律那套")
+
+
+def test_the_domain_harness_sees_a_same_second_mutation(tmp_path) -> None:
+    """**拦截侧(分档那套)**:同秒 + 同大小的改动,分档脚手架必须看见。
+
+    分档那套的变异**全部**作用在 `tools/check_domain.py`(普通 import
+    ⇒ 时间戳型 `.pyc`)⇒ 它才是本轮 17 条中招的那一族。
+    """
+    root = tmp_path / "分档"
+    root.mkdir()
+    _same_second_mutation_must_be_seen(
+        lambda r: _failed_and_output(cm._run_tests(r)),
+        root, "分档那套")
+
+
+# --------------------------------------------------------------------------
+# 第 55 轮之十四之五:codex 第 2 轮 Low-1~Low-4 —— 清理动作本身的健壮性
+# --------------------------------------------------------------------------
+#
+# **为什么这一族也要有探针**:清理字节码缓存是**本轮修复的支点**
+# ⇒ 它自己若「静悄悄地失败」(删不掉的没说、目录读不了直接崩、
+# 环境变量让解释器压根不写缓存),本轮修的坑就会**以更隐蔽的方式回来**。
+# 仓库规矩:**每条新规则都配双向探针 + 一条能变红的变异**。
+
+def test_the_purge_reports_a_cache_file_it_cannot_delete(tmp_path, monkeypatch, capsys) -> None:
+    """**删不掉**的字节码缓存必须**出声**(codex Low-1)。
+
+    此前 `except OSError: pass` 静默吞掉 ⇒ 缓存没清掉 ⇒ 那一轮变异可能又被吃
+    ⇒ 脚手架把「变异空转」**误报成「守卫有洞」**——正是本轮要根治的故障,
+    却以更隐蔽的方式回归。删不掉时**至少要能在日志里看见**。
+    """
+    cache = tmp_path / "pkg" / "__pycache__"
+    cache.mkdir(parents=True)
+    pyc = cache / "x.cpython-312.pyc"
+    pyc.write_bytes(b"\x00" * 16)
+
+    real_unlink = Path.unlink
+
+    def fake_unlink(self, *args, **kwargs):
+        if self.name == "x.cpython-312.pyc":
+            raise OSError("模拟:文件被别的进程锁住")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fake_unlink)
+    removed = cm._purge_bytecode_cache(tmp_path)
+    err = capsys.readouterr().err
+    assert removed == 0, "删不掉就不该算成删掉了(返回值必须如实)"
+    assert "x.cpython-312.pyc" in err, (
+        "删不掉的字节码缓存**没有出声** ⇒ 防线可能无声失效(日志里看不到):%r" % err)
+
+
+def test_the_purge_survives_an_unreadable_directory(tmp_path, monkeypatch, capsys) -> None:
+    """**目录读不了**时,清理不能整体崩(codex Low-2)。
+
+    `rglob` 在迭代中途抛 `PermissionError` ⇒ 脚手架以未处理 traceback 崩掉,
+    错误形态与「规格坏了 / 守卫有洞」完全不一样 ⇒ 排障会绕路。
+    这里要求:不崩、**出声**、如实返回。
+    """
+    real_rglob = Path.rglob
+
+    def fake_rglob(self, pattern):
+        if self == tmp_path:
+            raise OSError("模拟:目录读不了")
+        return real_rglob(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", fake_rglob)
+    removed = cm._purge_bytecode_cache(tmp_path)
+    err = capsys.readouterr().err
+    assert removed == 0, "没删掉任何东西时返回数必须是 0"
+    assert "不完整" in err, (
+        "目录读不了时**没有出声** ⇒ 排障时看不到清理其实没做:%r" % err)
+
+
+def _bytecode_written_by_the_child(root: Path) -> bool:
+    """副本里有没有 `probe_mod` 的字节码缓存(= 子进程真的写了 `.pyc`)。"""
+    return bool(list((root / "tests" / "__pycache__").glob("probe_mod.*.pyc")))
+
+
+def test_the_domain_harness_writes_bytecode_even_when_the_environment_forbids_it(
+        tmp_path, monkeypatch) -> None:
+    """**分档那套**必须摘掉 `PYTHONDONTWRITEBYTECODE`(codex Low-3)。
+
+    环境里若有这个变量(或用 `-B` 起解释器),解释器**根本不写 `.pyc`**
+    ⇒ 拦截侧探针的「第一次跑会写出 `.pyc`」前提不成立 ⇒ 探针**假红**
+    ⇒ 把「环境配置」误报成「变异被吃」。
+    """
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    root = tmp_path / "分档"
+    root.mkdir()
+    _mini_repo_with_a_value(root)
+    cm._run_tests(root)
+    assert _bytecode_written_by_the_child(root), (
+        "环境里明明有 `PYTHONDONTWRITEBYTECODE=1`,分档那套却**没有**摘掉它"
+        "⇒ 子解释器没写 `.pyc` ⇒ 拦截侧探针会假红")
+
+
+def test_the_discipline_harness_writes_bytecode_even_when_the_environment_forbids_it(
+        tmp_path, monkeypatch) -> None:
+    """**纪律那套**必须摘掉 `PYTHONDONTWRITEBYTECODE`(codex Low-3)。
+
+    与分档那套**分成两条用例**:两条变异各有**专属**见证 ⇒ 不会「走错原因的红」。
+    """
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+    root = tmp_path / "纪律"
+    root.mkdir()
+    _mini_repo_with_a_value(root)
+    cgm._run_tests(root, ["tests/test_check_domain.py"])
+    assert _bytecode_written_by_the_child(root), (
+        "环境里明明有 `PYTHONDONTWRITEBYTECODE=1`,纪律那套却**没有**摘掉它"
+        "⇒ 子解释器没写 `.pyc` ⇒ 拦截侧探针会假红")

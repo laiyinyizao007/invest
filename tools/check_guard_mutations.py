@@ -35,11 +35,13 @@
 from __future__ import annotations
 
 import argparse
+import marshal
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +50,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # 同名函数口径不同——一处有反向断言、一处没有)。
 sys.path.insert(0, str(ROOT / "tools"))
 from check_mutations import (  # noqa: E402
+    _purge_bytecode_cache,
     cleanup_temp_dir,
     copy_repo,
     run_outcome,
@@ -1634,6 +1637,91 @@ MUTATIONS = (
             '                continue'),
         targets=[WIRING],
     ),
+    # ---- 第 55 轮之十四之四:变异被**陈旧的 .pyc** 吃掉(变异空转) ----
+    #
+    # 这三条把「跑见证之前必须清掉字节码缓存」这条规则钉死:
+    # 少了它,「同秒 + 同大小」的变异会被上一次编译出的 `.pyc` 顶掉
+    # ⇒ 变异根本没生效 ⇒ 见证保持绿 ⇒ 看起来像「守卫有洞」(实际是空转)。
+    #
+    # **一条变异一条见证**:纪律那套与分档那套各有**专属**的拦截侧探针
+    # ⇒ 不会「走错原因的红」(仓库教训:变异见证必须指向唯一那一条规则)。
+    # (`targets` 只在**绿对照**时用;这三条是「应该变红」的变异 ⇒ 不写 targets。)
+    _mutation(
+        # 共享实现被掏空 ⇒ 两个脚手架都失去保护
+        # 【第 55 轮之十四之五】锚点**搬过**:共享实现加了「找到几个/删掉几个」
+        # 的计数与提醒(原锚点 `for cache in root.rglob(...)` 已不在)
+        # ⇒ **规则还在就搬锚点,不许删变异**(仓库教训:变异规格漂移)。
+        "不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)",
+        "tools/check_mutations.py",
+        (
+            '    removed = 0\n'
+            '    found = 0\n',
+            '    return 0  # (mutation: 不再清字节码缓存)\n'
+            '    removed = 0\n'
+            '    found = 0\n'),
+    ),
+    _mutation(
+        # 纪律守卫那套不再清 ⇒ 只有它自己的变异会空转
+        "纪律守卫不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)",
+        "tools/check_guard_mutations.py",
+        (
+            "    _purge_bytecode_cache(cwd)\n",
+            "    pass  # (mutation: 不再清字节码缓存)\n"),
+    ),
+    _mutation(
+        # 分档那套不再清 ⇒ 它的变异(全部作用在 tools/check_domain.py)会空转
+        "分档守卫不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)",
+        "tools/check_mutations.py",
+        (
+            "    _purge_bytecode_cache(cwd)\n",
+            "    pass  # (mutation: 不再清字节码缓存)\n"),
+    ),
+    # ---- 第 55 轮之十四之五:清理动作**本身**的健壮性(codex 第 2 轮 Low-1~Low-3) ----
+    #
+    # 清理字节码缓存是**本轮修复的支点** ⇒ 它自己若「静悄悄地失败」,
+    # 本轮修的坑就会**以更隐蔽的方式回来**(删不掉的没说 ⇒ 看起来像「守卫有洞」;
+    # 环境变量让解释器压根不写缓存 ⇒ 拦截侧探针假红 ⇒ 误报成「变异被吃」)。
+    # ⇒ 这几条把「清理要么做对、要么出声」钉死。**一条变异一条见证**。
+    _mutation(
+        # 删不掉的缓存**不再出声** ⇒ 防线无声失效
+        "字节码缓存删不掉时不再出声",
+        "tools/check_mutations.py",
+        (
+            '            except OSError as exc:    # 删不掉 ⇒ 防线可能**无声失效** ⇒ 必须出声\n'
+            '                print("[提醒] 删不掉字节码缓存:%s(%s)⇒ 本轮可能仍被陈旧字节码影响"\n'
+            '                      % (pyc, exc), file=sys.stderr)\n',
+            '            except OSError:    # (mutation: 删不掉时不再出声)\n'
+            '                pass\n'),
+    ),
+    _mutation(
+        # 目录读不了 ⇒ 整体崩(而不是"不出声地跳过")
+        "字节码缓存目录读不了时直接崩掉",
+        "tools/check_mutations.py",
+        (
+            '    try:\n'
+            '        caches = list(root.rglob("__pycache__"))\n'
+            '    except OSError as exc:            # 目录不可读 ⇒ 不能当成「没有缓存」\n'
+            '        print("[提醒] 遍历字节码缓存目录时出错:%s ⇒ 本次清理**不完整**" % exc,\n'
+            '              file=sys.stderr)\n'
+            '        caches = []\n',
+            '    caches = list(root.rglob("__pycache__"))  # (mutation: 目录读不了就崩)\n'),
+    ),
+    _mutation(
+        # 分档那套不再摘掉 PYTHONDONTWRITEBYTECODE ⇒ 拦截侧探针假红
+        "分档守卫不再摘掉 PYTHONDONTWRITEBYTECODE",
+        "tools/check_mutations.py",
+        (
+            '    env.pop("PYTHONDONTWRITEBYTECODE", None)\n',
+            '    pass  # (mutation: 不再摘掉 PYTHONDONTWRITEBYTECODE)\n'),
+    ),
+    _mutation(
+        # 纪律那套不再摘掉 PYTHONDONTWRITEBYTECODE ⇒ 拦截侧探针假红
+        "纪律守卫不再摘掉 PYTHONDONTWRITEBYTECODE",
+        "tools/check_guard_mutations.py",
+        (
+            '    env.pop("PYTHONDONTWRITEBYTECODE", None)\n',
+            '    pass  # (mutation: 不再摘掉 PYTHONDONTWRITEBYTECODE)\n'),
+    ),
 )
 
 
@@ -1987,6 +2075,24 @@ WITNESSES: dict[str, str] = {
     "让接线自检在复合动作里跳过认不出来的命令":
         "tests/test_ci_wiring.py::test_the_checker_reports_an_unparsable_block_inside_a_local_composite_action",
 
+    # ---- 第 55 轮之十四之四(变异被陈旧的 .pyc 吃掉) ----
+    "不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)":
+        "tests/test_check_guard_mutations.py::test_running_the_suite_clears_the_bytecode_cache_before_it_runs",
+    "纪律守卫不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)":
+        "tests/test_check_guard_mutations.py::test_the_discipline_harness_sees_a_same_second_mutation",
+    "分档守卫不再清掉副本里的字节码缓存(陈旧 .pyc 会让变异空转)":
+        "tests/test_check_guard_mutations.py::test_the_domain_harness_sees_a_same_second_mutation",
+
+    # ---- 第 55 轮之十四之五(清理动作本身的健壮性) ----
+    "字节码缓存删不掉时不再出声":
+        "tests/test_check_guard_mutations.py::test_the_purge_reports_a_cache_file_it_cannot_delete",
+    "字节码缓存目录读不了时直接崩掉":
+        "tests/test_check_guard_mutations.py::test_the_purge_survives_an_unreadable_directory",
+    "分档守卫不再摘掉 PYTHONDONTWRITEBYTECODE":
+        "tests/test_check_guard_mutations.py::test_the_domain_harness_writes_bytecode_even_when_the_environment_forbids_it",
+    "纪律守卫不再摘掉 PYTHONDONTWRITEBYTECODE":
+        "tests/test_check_guard_mutations.py::test_the_discipline_harness_writes_bytecode_even_when_the_environment_forbids_it",
+
 }
 
 
@@ -2019,6 +2125,16 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
     """
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
+    # 【第 55 轮之十四之五,codex L3】**不能带着 `PYTHONDONTWRITEBYTECODE` 跑**:
+    # 一旦这个变量(或 `-B`)在环境里,解释器**根本不写 `.pyc`**
+    # ⇒ 拦截侧探针的「第一次跑会写出 `.pyc`」前提不成立 ⇒ 探针假红
+    # ⇒ 把「环境配置」误报成「变异被吃」。这里**显式摘掉**它。
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    # 【第 55 轮之十四之四】**先清字节码缓存**再跑:
+    # 否则「同秒 + 同大小」的变异会被**陈旧的 .pyc** 吃掉 ⇒ 变异空转
+    # ⇒ 见证保持绿(假绿)。共享实现见 `check_mutations._purge_bytecode_cache`
+    # (两个脚手架共用一份 ⇒ 不会只改一边)。
+    _purge_bytecode_cache(cwd)
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider"],
         capture_output=True, text=True, cwd=str(cwd), env=env,
@@ -2061,6 +2177,156 @@ def _passed_count(output: str) -> int | None:
     return None
 
 
+
+
+def _diagnose_no_red(repo: Path, path: Path, witness: str, res: dict) -> list[str]:
+    """见证没红时,把「变异到底生效了没有」查清楚(第 55 轮之十四之三)。
+
+    **为什么要有这一步**:脚手架此前只说「见证没红 ⇒ 守卫有洞」,
+    但**变异空转**(变异根本没改到行为)与**守卫有洞**在退出码上**完全一样**
+    ⇒ 照字面处置就会去"修"一个没坏的守卫,或者删掉一条还在生效的变异
+    (仓库教训:变异见证必须指向唯一那一条规则)。
+
+    **查三件事**:
+      1. 变异后的文件里到底有没有那处改动(没落到这份文件 ⇒ 根本没执行到);
+      2. **字节码缓存**是不是把这次变异吃掉了(第 55 轮之十四之四的成因):
+         **决定性的问法**是「**显式**清掉缓存再跑同一条见证」——
+         清完就红 ⇒ 之前那次绿是**陈旧的 `.pyc` 把变异吃掉了**(空转);
+         清完仍然不红 ⇒ 不是缓存的事 ⇒ 变异对**所有**用例都没影响
+         (空转,或改到的不是被执行的那份代码);
+      3. **同一变异下整份套件**的失败集合(空 ⇒ 变异对所有用例都没影响;
+         非空但**不含**见证 ⇒ 见证被**第二条规则**顶替)。
+
+    **顺序很重要(第 55 轮之十四之四的复核发现)**:`_run_tests` **会清字节码缓存**
+    ⇒ 查缓存必须在**任何一次跑用例之前**做,否则查的就是「刚被清空后重编出来」
+    的缓存 ⇒ 那条诊断**永远看不到**陈旧的字节码(写下了但没人跑)。
+    """
+    out: list[str] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:                       # noqa: BLE001 - 诊断不改变结论
+        return ["读不出变异后的文件:%r" % (exc,)]
+    # **`False and` 计数只对那一族变异有意义**(第 55 轮之十四之五,codex Info):
+    # 其余一百多条变异改的不是这个形状 ⇒ 这里恒为 0 ⇒ 排障时容易误读
+    # ⇒ **把适用范围写清楚**,而不是让人以为「0 次 ⇒ 变异没生效」。
+    out.append("变异后的 %s 里 `False and` 出现 %d 次"
+               "(**此计数只对 `False and` 族有意义**,其余族的变异恒为 0)"
+               % (path.name, text.count("False and")))
+    out.append("见证用例的 pytest 输出尾部:%s"
+               % res["output"][-500:].replace("\n", " | "))
+    # **先查缓存**(必须在跑用例之前:跑用例会清缓存)。
+    out.extend(_probe_stale_pyc(repo, path))
+    suite = witness.split("::")[0]
+    whole = _run_tests(repo, [suite])
+    out.append("同一变异下**整份套件**(%s)的失败集合:%s"
+               % (suite, ", ".join(whole["failed_nodes"][:20])
+                  or "无 ⇒ 变异对所有用例都没影响(空转,或改到的不是被执行的那份代码)"))
+    out.append("整份套件的输出尾部:%s" % whole["output"][-500:].replace("\n", " | "))
+    # **决定性的一问**:显式清掉缓存,再跑**同一条见证**。
+    # (`_run_tests` 自己会清;这里**再显式清一次**是为了让这条诊断在
+    #  「清缓存那一步被删掉」时**仍然可用**——那正是要诊断的故障模式。)
+    _purge_bytecode_cache(repo)
+    again = _run_tests(repo, [witness])
+    if again["failed"]:
+        out.append("**显式清掉字节码缓存后,同一条见证红了 %d 条** ⇒ 之前那次绿是"
+                   "**陈旧的 `.pyc` 把变异吃掉了**(变异空转,不是守卫有洞)"
+                   % again["failed"])
+    else:
+        out.append("**显式清掉字节码缓存后,同一条见证仍然没红** ⇒ 不是缓存的问题 ⇒ "
+                   "变异对**所有**用例都没影响(空转,或改到的不是被执行的那份代码)")
+    return out
+
+
+def _const_key(const) -> str:
+    """把一个常量压成**稳定**的字符串。
+
+    **为什么要专门写这个**:`frozenset` 的 `repr` 取决于**迭代顺序**
+    ⇒ 同一份源码,「进程内编译出来的」与「从 `.pyc` 反序列化出来的」
+    两次 `repr` **顺序可能不同** ⇒ 直接比 `repr` 会**假阳性**
+    (实测踩过:未变异的文件被报成「旧字节码被复用」)
+    ⇒ 集合类常量必须**排序后再比**。
+    """
+    if isinstance(const, (frozenset, set)):
+        return "{%s}" % ",".join(sorted(_const_key(item) for item in const))
+    if isinstance(const, tuple):
+        return "(%s)" % ",".join(_const_key(item) for item in const)
+    return repr(const)
+
+
+def _fingerprint(code) -> tuple:
+    """把代码对象压成一个**可比较**的摘要(递归)。
+
+    用来判断「`.pyc` 里的代码是不是当前源文件编译出来的那一份」。
+    **刻意不包含 `co_filename`**(同一份代码在不同路径下编译出来的
+    `co_filename` 不同 ⇒ 会造成假的不一致)。
+    """
+    consts = []
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            consts.append(_fingerprint(const))
+        else:
+            consts.append(_const_key(const))
+    return (code.co_code, tuple(consts))
+
+
+def _probe_stale_pyc(repo: Path, src: Path) -> list[str]:
+    """查「字节码缓存陈旧」这条路径(Python 的 .pyc 按 (mtime 秒, size) 校验)。
+
+    **为什么查这条**:Python 导入模块时,若 `.pyc` 头里记的 (mtime 秒, size)
+    与源文件**当前**的 (mtime 秒, size) 一致,就直接用**旧的字节码**,
+    源文件改了也看不见 ⇒ 变异「施加了但没生效」。
+
+    **时间戳一致**本身**不足以**断定「字节码是旧的」——碰撞的定义就是
+    两者一致 ⇒ 这里**再比一次内容**:把 `.pyc` 里的代码对象与
+    **当前源文件重新编译**出来的代码对象比摘要
+    ⇒ 不一致 ⇒ **确实是旧字节码被复用**(决定性的判据)。
+
+    **必须在跑用例之前调用**:`_run_tests` 会清缓存 ⇒ 跑过再查就永远查不到。
+    """
+    out: list[str] = []
+    cache_dir = src.parent / "__pycache__"
+    if not cache_dir.is_dir():
+        out.append("副本里没有 %s 的 __pycache__(第一次跑就会重新编译)" % src.name)
+        return out
+    try:
+        st = src.stat()
+        source = src.read_text(encoding="utf-8")
+    except OSError as exc:                        # noqa: BLE001 - 诊断不改变结论
+        return ["读不出变异后的文件:%r" % (exc,)]
+    try:
+        current = compile(source, str(src), "exec")
+    except (SyntaxError, ValueError) as exc:        # noqa: BLE001 - 诊断不改变结论
+        return ["变异后的文件编译不了(%r)⇒ 查不了字节码" % (exc,)]
+    for pyc in sorted(cache_dir.glob(src.stem + ".*.pyc")):
+        try:
+            raw = pyc.read_bytes()
+        except OSError:                            # noqa: BLE001 - 诊断不改变结论
+            continue
+        if len(raw) < 16:
+            continue
+        flags = int.from_bytes(raw[4:8], "little")
+        if flags != 0:
+            out.append("%s 是 hash-based pyc(flags=%d)⇒ 不做时间戳校验" % (pyc.name, flags))
+            continue
+        mtime = int.from_bytes(raw[8:12], "little")
+        size = int.from_bytes(raw[12:16], "little")
+        if not (mtime == int(st.st_mtime) and size == st.st_size):
+            out.append("%s 记的 (mtime=%d, size=%d) vs 变异后源文件 (mtime=%d, size=%d) ⇒ "
+                       "时间戳不一致 ⇒ Python 会重新编译(这一项不构成陷阱)"
+                       % (pyc.name, mtime, size, int(st.st_mtime), st.st_size))
+            continue
+        try:
+            cached = marshal.loads(raw[16:])
+            stale = _fingerprint(cached) != _fingerprint(current)
+        except Exception as exc:                   # noqa: BLE001 - 诊断不改变结论
+            out.append("%s 读不出缓存里的代码:%r" % (pyc.name, exc))
+            continue
+        out.append("%s 记的 (mtime=%d, size=%d) vs 变异后源文件 (mtime=%d, size=%d) ⇒ 时间戳一致;"
+                   "缓存里的代码与当前源文件%s"
+                   % (pyc.name, mtime, size, int(st.st_mtime), st.st_size,
+                      "**不一致 ⇒ 旧字节码被复用 ⇒ 变异根本没被执行**" if stale
+                      else "一致 ⇒ 缓存是新的(不是这一条成因)"))
+    return out
 
 
 def _read_text(path: Path) -> tuple[str, str]:
@@ -2206,6 +2472,11 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 run_targets = list(spec["targets"])
             res = _run_tests(repo, run_targets)
+            # 【第 55 轮之十四之三】见证没红时,先把「变异到底生效了没有」查清楚
+            # (诊断必须在**还原之前**做:还原了就看不到变异的效果了)。
+            diag: list[str] = []
+            if expect == "red" and not res["failed_nodes"] and res["returncode"] == 0:
+                diag = _diagnose_no_red(repo, path, WITNESSES[label], res)
             path.write_bytes(orig)
 
             # **共用**分档那套的判定(第 52 轮 codex M1/L2):
@@ -2225,6 +2496,12 @@ def main(argv: list[str] | None = None) -> int:
                     print("      ↑ 见证用例 %s 没有红(实际退了 %d 条:%s)"
                           % (witness, res["failed"], ", ".join(res["failed_nodes"][:5]) or "无"),
                           file=sys.stderr)
+                    print("      ↑ **这句提示语本身有两种含义,先分清是哪一种**"
+                          "(仓库教训:变异见证必须指向唯一那一条规则):"
+                          "①变异空转(变异根本没改到行为)②守卫有洞(变异改坏了守卫但没人抓住)。",
+                          file=sys.stderr)
+                    for line in diag:
+                        print("      ↑ [诊断] %s" % line, file=sys.stderr)
                     problems.append(label)
             else:
                 base = baselines.get(tuple(spec["targets"]))

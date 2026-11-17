@@ -206,6 +206,63 @@ def run_outcome(failed: int, returncode: int) -> str:
     return "ok"
 
 
+def _purge_bytecode_cache(root: Path) -> int:
+    """删掉副本里的所有字节码缓存(第 55 轮之十四之四)。返回删掉几个。
+
+    **为什么必须删**:Python 的 `.pyc` 按 (源文件 mtime 的**整秒**, 源文件大小)
+    校验新鲜度。本脚手架的变异多是**同大小**的小改动
+    (`if X:` → `if False and X:`),若两次变异落在**同一整秒**,
+    第二次变异后的源文件与上一次编译出的 `.pyc` 头部**完全吻合**
+    ⇒ Python 直接复用**旧字节码** ⇒ 变异**根本没生效**
+    ⇒ 见证保持绿 ⇒ 看起来像「守卫有洞」,实际是**变异空转**。
+
+    **pytest 的改写缓存也是同一套机制**(第 55 轮之十四之五,codex 第 2 轮 M1):
+    `_pytest/assertion/rewrite.py` 的 `_read_pyc` 比的是
+    `int(st.st_mtime)` 与 `size`(写成 `mtime & 0xFFFFFFFF` / `size & 0xFFFFFFFF`),
+    `_write_pyc` 写的也是这两个值 ⇒ **与 CPython 的时间戳型 `.pyc` 完全是同一套**
+    ⇒ **测试文件一样会中招**。
+    **两个版本都核对过**:CI 用的 **8.3.4** 与本机的 **8.4.2** —— 且 8.3.4 的
+    `_read_pyc` 见到 `flags != 0` 会直接判「invalid pyc (unsupported flags)」
+    ⇒ **pytest 的改写缓存只认时间戳型**,不存在 hash 型那条路。
+    (此前本文件写「pytest 的改写缓存是 hash-based ⇒ 只有那 17 条会中招」
+    是**事实错误**,已按实测改正。)
+
+    **实测(第 55 轮之十四之四/五)**:触发要**同时**满足两条——
+    (a) 变异前后**字节数相同**;(b) 两次落在**同一整秒**。
+    158 条变异里**31 条**满足 (a)(这 158 条 = **CI 报错那时的集合**;
+    本轮又加 4 条 ⇒ 现共 162 条):29 条在 `tools/check_ci_wiring.py`、
+    1 条在 pytest 用例文件、1 条在 YAML——**YAML 不是 Python,没有字节码缓存,
+    天然不中招**。CI 上**恰好 17 条**同时满足 (b) ⇒
+    **CI 报错的 17 条全部落在这 31 条之内,且这 31 条之外无一条报错**
+    ⇒ 机制被实测坐实(不是推测)。
+    **只在本机的 CI 上犯**:一次变异循环只要 0.3~0.8 秒 ⇒ 常常落进同一整秒;
+    本机 Windows 上 pytest 启动慢(>1 秒)⇒ 整秒总是错开 ⇒ 撞不上。
+
+    **两个脚手架共用这一份实现**(仓库教训:同一个问题两个答案 ⇒ 迟早只改一边)。
+    """
+    removed = 0
+    found = 0
+    try:
+        caches = list(root.rglob("__pycache__"))
+    except OSError as exc:            # 目录不可读 ⇒ 不能当成「没有缓存」
+        print("[提醒] 遍历字节码缓存目录时出错:%s ⇒ 本次清理**不完整**" % exc,
+              file=sys.stderr)
+        caches = []
+    for cache in caches:
+        for pyc in cache.glob("*.pyc"):
+            found += 1
+            try:
+                pyc.unlink()
+                removed += 1
+            except OSError as exc:    # 删不掉 ⇒ 防线可能**无声失效** ⇒ 必须出声
+                print("[提醒] 删不掉字节码缓存:%s(%s)⇒ 本轮可能仍被陈旧字节码影响"
+                      % (pyc, exc), file=sys.stderr)
+    if found != removed:
+        print("[提醒] 找到 %d 个字节码缓存,只删掉 %d 个 ⇒ 清理不完整"
+              % (found, removed), file=sys.stderr)
+    return removed
+
+
 def _run_tests(cwd: Path) -> tuple[int, str, int]:
     """跑本文件的测试,返回 (FAILED 行数, 完整输出)。
 
@@ -220,6 +277,14 @@ def _run_tests(cwd: Path) -> tuple[int, str, int]:
     """
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
+    # **不能带着 `PYTHONDONTWRITEBYTECODE` 跑**(第 55 轮之十四之五,codex L3):
+    # 一旦这个变量(或 `-B`)在环境里,解释器**根本不写 `.pyc`**
+    # ⇒ 拦截侧探针的「第一次跑会写出 `.pyc`」前提不成立 ⇒ 探针假红
+    # ⇒ 把「环境配置」误报成「变异被吃」。这里**显式摘掉**它。
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+    # **先清字节码缓存**(第 55 轮之十四之四):否则「同秒 + 同大小」的变异
+    # 会被**陈旧的 .pyc** 吃掉 ⇒ 变异空转 ⇒ 见证保持绿(假绿)。
+    _purge_bytecode_cache(cwd)
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", TEST_REL, "-q", "-p", "no:cacheprovider"],
         capture_output=True, text=True, cwd=str(cwd), env=env,
@@ -293,7 +358,16 @@ def _apply(repo: Path, rel: str, token: str, new_line: str) -> str:
 
 
 def _tier_of(repo: Path, rel: str) -> str:
-    """问副本里的分档器:这个路径现在判成什么档。"""
+    """问副本里的分档器:这个路径现在判成什么档。
+
+    **必须先清字节码缓存**(第 55 轮之十四之四):这个判定是**靠 import**
+    得到的 ⇒ Python 若发现 `.pyc` 头记的 (整秒 mtime, size) 与源文件
+    **一致**,就直接复用**旧字节码** ⇒ 若变异前后的这两个值相同,
+    `after` 会读到**变异前**的判定 ⇒ 被误报成「空操作变异」(退出码 1)。
+    现有 22 条变异碰巧都改了文件长度(size 不同 ⇒ 会重编),
+    但那是**运气**,不是保证 ⇒ 这里把缓存清掉,让判定**只**取决于源文件。
+    """
+    _purge_bytecode_cache(repo)
     code = (
         "import sys; sys.path.insert(0, 'tools'); "
         "import check_domain as cd; print(cd.classify(%r)[0])" % rel
