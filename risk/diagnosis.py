@@ -7,10 +7,11 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from risk.promotion_gate import (TRADING_DAYS_PER_YEAR, GateThresholds,
+from risk.promotion_gate import (MAX_OOS_YEARS, TRADING_DAYS_PER_YEAR, GateThresholds,
                                  suspicious_sharpe_cap)
 
 DIMENSIONS = ("drawdown", "trades", "losing_streak", "sharpe")   # 固定顺序,同等严重度时取靠前者
@@ -34,8 +35,19 @@ def max_losing_streak(pnls: Sequence[float]) -> int:
 
 
 def _num(row: Mapping[str, Any], key: str) -> float | None:
+    """取一个**有限数**;取不到(或不是有限数)一律返回 None ⇒ 那一维报「未知」。
+
+    为什么连 NaN/inf 也当「取不到」:NaN 与任何数比较恒为 False ⇒ 会被静默当成
+    「没超限」(看着像合格);inf 会让折算溢出成 OverflowError 把诊断整个炸掉。
+    """
     value = row.get(key)
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        v = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 def _unknown(note: str) -> dict:
@@ -89,8 +101,12 @@ def _cap_of(row: Mapping[str, Any], g: GateThresholds) -> float:
         n_trials = 0
     years = _num(row, "oos_years")
     n_obs = 0
-    if years is not None and years > 0:
-        n_obs = int(round(years * TRADING_DAYS_PER_YEAR))
+    # 与门槛同一套退化处理:折算溢出(年数大到乘 240 变成 inf)或年数超过物理上界
+    # ⇒ 一律按「样本太短」处理 ⇒ 落回兜底下限 ⇒ **不许抛异常**。
+    if years is not None and 0 < years <= MAX_OOS_YEARS:
+        scaled = years * TRADING_DAYS_PER_YEAR
+        if math.isfinite(scaled):
+            n_obs = int(round(scaled))
     return suspicious_sharpe_cap(n_trials, n_obs, g)
 
 

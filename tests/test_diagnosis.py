@@ -105,3 +105,25 @@ def test_the_diagnosis_reports_a_missing_sharpe_as_unknown():
     d = diagnose({"maxdd_pct": -5.0, "maxdd_yuan": -500.0, "round_trips": 200})
     assert levels(d)["sharpe"] == "unknown"
     assert d["dimensions"]["sharpe"]["value"] is None
+
+
+# ---------- 第 55 轮之十七:诊断层与门槛层同款的 fail-closed ----------
+
+@pytest.mark.parametrize("bad_years", [1e308, float("inf"), float("nan"), 10 ** 400])
+def test_the_diagnosis_does_not_crash_on_an_absurd_sample_length(bad_years):
+    """样本外年数荒谬(1e308 / inf / NaN / 10**400)⇒ 诊断**不抛异常**,上限落回兜底。
+
+    修之前:`int(round(inf * 240))` 抛 OverflowError;`float(10**400)` 也抛
+    ⇒ 诊断整个炸掉(而不是报「未知」)。
+    """
+    row = {**GOOD, "sharpe": 3.5, "n_trials": 1000, "oos_years": bad_years}
+    d = diagnose(row)
+    assert d["dimensions"]["sharpe"]["limit"] == 3.0
+
+
+@pytest.mark.parametrize("bad_sharpe", [float("nan"), float("inf"), float("-inf"), "2.0"])
+def test_the_diagnosis_reports_a_non_finite_sharpe_as_unknown(bad_sharpe):
+    """非有限夏普 ⇒ 报 **unknown**,不许当成「没超限」(NaN 比较恒为 False)。"""
+    d = diagnose({**GOOD, "sharpe": bad_sharpe})
+    assert levels(d)["sharpe"] == "unknown", bad_sharpe
+    assert d["dimensions"]["sharpe"]["value"] is None
