@@ -22,6 +22,7 @@
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -102,6 +103,7 @@ class Ctx:
     cancel_wait: float = 8.0             # 等撤单确认的时间
     attrib_wait: float = 5.0              # 等风控拦截日志到位的时间(日志是异步投递的)
     probe_seq: int = 0                   # 演示委托的价格序号:每笔演示委托用不同价格,避免重复报单规则的累计计数跨步骤污染
+    probe_fallback_base: float | None = None   # 演示委托的**兜底基准价**(拿不到跌停价时用):冻结一次,全轮共用(不冻结会随最新价漂移 ⇒ 两笔同价 ⇒ 归因张冠李戴)
     flat: bool | None = None             # 账户是否已确认空仓(None = 还没查)
     flat_reason: str = ""                # 空仓闸门失败的具体原因(有持仓 / 连接断开)
     # 本次运行开始的**墙钟时刻**:只用来把 vn.py 的日志行归到「本次运行」里。
@@ -203,12 +205,77 @@ def limit_price(ctx: Ctx, which: str = "down") -> float:
 
 def probe_price(ctx: Ctx) -> float:
     """演示用的不易成交买价:跌停价起,每笔上浮一个最小变动价位(循环 20 档,仍远低于市价)。
-    每笔不同价格,是为了不让 vnpy_riskmanager 的重复报单规则把不同步骤的委托累计成"重复"。"""
+    每笔不同价格,是为了不让 vnpy_riskmanager 的重复报单规则把不同步骤的委托累计成"重复"。
+
+    兜底基准价**冻结**:拿不到跌停价时用「最新价的一半」兜底,而最新价**随行情漂移**
+    ⇒ 同一轮里前后两笔可能算出**同一个价格** ⇒ 归因的「按价格认领日志」就张冠李戴
+    (2026-11-16 codex 第十二轮复核 M-1:实测最新价 2000 → 1998 时两笔算出同一个价)。
+    所以兜底基准**第一次算出来就冻结**,全轮共用 ⇒ 同一轮里两笔的价格必然差一个 tick。
+    (跌停价那条路本身不漂移 —— 那是柜台给的静态价格。)
+    """
     tickp = ctx.contract.pricetick or 1.0
-    base = limit_price(ctx) or round_to(float(getattr(ctx.tick, "last_price", 0) or 1000.0) * 0.5, tickp)
+    base = limit_price(ctx)
+    if not base:
+        if ctx.probe_fallback_base is None:
+            ctx.probe_fallback_base = round_to(
+                float(getattr(ctx.tick, "last_price", 0) or 1000.0) * 0.5, tickp)
+        base = ctx.probe_fallback_base
     n = ctx.probe_seq % 20
     ctx.probe_seq += 1
     return base + n * tickp
+
+
+def log_belongs_to(h: str, price: float) -> bool:
+    """这条风控日志是不是**这一笔**的?
+
+    风控日志原文带 `OrderRequest` 的 repr —— `vnpy_riskmanager` 的
+    `DailyLimitRule.check_allowed` 写的是 `write_log(f"...达到上限{limit}：{req}")`,
+    `{req}` 的 dataclass repr 里含 `price=<这一笔的价格>`;而演示单**每笔价格不同**
+    (`probe_price` 逐笔上浮一个最小变动价位)⇒ 可以用价格把日志**认回具体那一笔**,
+    不再依赖「日志什么时候到」。
+
+    这是「按**归属**匹配」而不是「按**位置**猜」:位置猜有一个残余面 ——
+    控制那笔自己的日志迟到落在第二笔的窗口里(2026-11-16 codex 第十轮复核 M-1),
+    按位置就会把它的日志当成第二笔的归因。
+
+    认不出的日志(规则没把 req 写进日志)返回 False —— 那种日志只能退回按位置找。
+
+    匹配**必须带边界**:`repr(2091.0)`="2091.0" 是 `repr(2091.05)`="2091.05" 的**前缀**,
+    裸子串匹配会把「第二笔(2091.05)」的日志误认成「对照那笔(2091.0)」的
+    (2026-11-16 codex 复核 L-2)。因此要求价格后面不能再跟数字/小数点。
+    c2601.DCE 的 pricetick=1.0 撞不上,但国债/能源那种 0.005 级别的最小变动价位会撞。
+    """
+    return bool(re.search(rf"price={re.escape(repr(price))}(?![\w.])", h))
+
+
+def replace_attribution_line(lines: list[str], idx: int, old_text: str, new_text: str,
+                             label: str = "") -> None:
+    """把归因行**就地替换**成补记后的那句话,下标失效或内容对不上时**显式炸出来**。
+
+    为什么不能直接 `lines[idx] = text`:下标一旦失效,`lines[-1] = ...` 会**静默覆盖末行**
+    并正常返回 —— 注释里承诺的「宁可这轮取证失败,也不要写出一份归因错的报告」就落不了地
+    (2026-11-16 codex 第十轮复核 L-2:注释与实际行为不符)。这里把「失效」变成一次显式的失败。
+
+    还要校**内容**:下标有效不代表那一行还是「我们以为的那一行」—— 若将来有人在
+    这一段改成**头插**(`lines.insert(0, …)`)或删行,下标会整体错位,替换就会写到**别的行**上
+    (静默产出一份归因错的报告)。所以这里同时校验那一行的**原文**:
+    对不上 ⇒ 同样是显式失败。
+
+    单独抽成函数,是为了让这两个防御分支**可以被用例直接验证**(不能只靠注释承诺)。
+
+    失败消息带上**指标名**与那一行的开头:现场只看到「下标 12」不易定位
+    (2026-11-16 codex 第十二轮复核 nit-3)。带出去的是我们自己写的归因行,
+    且日志引用已经过 `ctx.clean` 脱敏 ⇒ 不含账号/口令。
+    """
+    who = f"[{label}]" if label else ""
+    if idx < 0 or idx >= len(lines):
+        raise RuntimeError(
+            f"归因行下标失效({idx}){who},内部状态异常:宁可这轮取证失败,也不要写出一份归因错的报告")
+    if lines[idx] != old_text:
+        raise RuntimeError(
+            f"归因行内容对不上(下标 {idx}){who},那一行是:{lines[idx][:60]!r};"
+            "内部状态异常:宁可这轮取证失败,也不要写出一份归因错的报告")
+    lines[idx] = new_text
 
 
 def ensure_flat(ctx: Ctx) -> bool:
@@ -600,8 +667,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
     fill_notes: list[str] = []             # 每个指标:演示单的成交情况(空 = 没成交)
     block_attribs: list[str] = []          # 每个指标:超过阈值那笔的**拦截归因**(ours/other/none/空)
     block_details: list[str] = []          # 每个指标:归因的人话 + 原文引用
-    rejected_flags: list[bool] = []       # 每个指标:撤单演示单是不是废单(结构化标记)
-    unconfirmed_flags: list[bool] = []     # 每个指标:撤单没确认(结构化标记)
+    may_hang_flags: list[bool] = []       # 每个指标:演示单**可能还挂在柜台上**(结构化标记)
 
     def count_of(attr: str) -> int:
         return counter_value(daily, attr)
@@ -618,7 +684,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         cancel_confirmed: bool | None = None     # 撤单指标:我们**自己**那张单撤成功了吗
         cancel_filled = False                      # 撤单指标:演示单其实**成交了**(账户可能多出持仓)
         cancel_rejected = False                   # 撤单指标:演示单是**废单**(被柜台拒单 ⇒ 没有挂单、账户无持仓变化)
-        unconfirmed = False                       # 撤单指标:撤单**没确认**(结构化标记,不用整串关键字判断)
+        cancel_may_hang = False                   # 撤单指标:演示单**可能还挂在柜台上**(结构化标记,不用整串关键字判断)
         fill_note = ""                             # 成交/部分成交的人话(空 = 没成交)
         stale_base = False                          # 计数基数取旧 → 对照做不成
         blocked_detail = ""                        # 「对照用的那一笔」没发出去时的归因说明
@@ -626,6 +692,8 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         block_detail = ""                          # 归因的人话(带日志原文引用)
         first_no_log = False                       # 「对照用的那一笔」归因时**没看到**拦截日志
         first_count_txt = ""                       # 那时候读到的计数措辞(补记时要用)
+        first_log_idx = -1                         # 那条归因行在 lines 里的下标(迟到日志补记时**替换**它)
+        first_log_text = ""                        # 那条归因行的**原文**(替换时要核对内容,防止下标错位)
         a = b = ""
         alerts: list[dict] = []
         try:
@@ -635,7 +703,11 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             if now_count >= limit:
                 stale_base = True
                 lines.append(f"⚠ 设置阈值时计数已经是 {now_count}(≥ 阈值 {limit}),基数取旧了,本次对照不可靠")
-            a = send(ctx, make_req(ctx, price=probe_price(ctx)))
+            # 这两笔的价格各记一份:风控日志里带 `OrderRequest` 的 repr(含 `price=…`),
+            # 而演示单每笔价格不同 ⇒ 可以用价格把日志**认回具体那一笔**(见 `log_belongs_to`),
+            # 不必再靠「日志什么时候到」猜是哪一笔的。
+            price_a = probe_price(ctx)
+            a = send(ctx, make_req(ctx, price=price_a))
             if a:
                 made.append(a)
             lines.append(f"阈值内委托:{'通过' if a else '未发出'}")
@@ -673,13 +745,16 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                     # ⇒ 只能说「可能是本项阈值拦的」,不能断言「是本项阈值拦的」
                     # (2026-11-16 codex 复核 L6)。
                     blocked_detail = (f"读取计数已到 {count_now} ≥ 本项阈值 {limit}"
-                                      "(没有拦截日志,可能是本项阈值拦的) ⇒ 计数基数取旧,这轮对照做不成")
+                                      "(归因窗口内没有拦截日志,可能是本项阈值拦的)"
+                                      " ⇒ 计数基数取旧,这轮对照做不成")
                 else:
                     first_no_log = True
                     first_count_txt = count_txt
                     blocked_detail = (f"委托没发出去,{count_txt},不是本项阈值拦的"
                                       "(没有风控拦截日志:可能是通道断开/账户被锁/委托被其它规则拦下)")
-                lines.append(f"⚠ {blocked_detail}")
+                first_log_idx = len(lines)          # 这一行待会儿可能被**替换**(见下面的迟到日志补记)
+                first_log_text = f"⚠ {blocked_detail}"
+                lines.append(first_log_text)
             # 计数是**异步**更新的:send() 立刻返回,而规则的计数要等委托回报事件到达才 +1。
             # 不等计数涨上去就发第二笔,第二笔会因为计数还停在旧值而被放行 ——
             # 2026-11-16 夜盘实测就是这样把「超过阈值的委托」放过去的。
@@ -740,6 +815,15 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                         # (2026-11-16 codex 复核 L1)。账户没有持仓变化,但撤单确实没成功。
                         cancel_rejected = True
                         lines.append("⚠ 演示单被拒单(废单):没有挂单,账户无持仓变化")
+                    # 「可能还挂在柜台上」要用**结构化标记**,不能靠「撤单没确认」笼统推:
+                    # 全部成交(ALLTRADED)⇒ 单子已经成交完,柜台上**没有**它了(说还挂着是假的);
+                    # 废单(REJECTED)⇒ 压根没上柜台;已撤销(CANCELLED)⇒ 也不挂着。
+                    # 只有「部分成交」或「没有终态回报」才可能还挂着。
+                    # (2026-11-16 codex 第十轮复核 L-1:原来用 `elif` 让成交告警把这条短路掉,
+                    #  改成两条独立 `if` 之后又会误报「还挂着」—— 用这个标记两条告警才能既
+                    #  互不排斥、又不互相矛盾。)
+                    if final is None or final.status not in (Status.ALLTRADED, Status.REJECTED, Status.CANCELLED):
+                        cancel_may_hang = True
                 # 撤单计数同样要等回报到达才 +1(撤单回报 → 规则 on_order → 计数 +1)
                 advanced = wait_counter_at_least(ctx, daily, counter_attr, base + 1, ctx.cancel_wait)
                 if not advanced:
@@ -749,7 +833,16 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # 「计数已经 ≥ 阈值,而超阈值那笔还是发出去了」= 阈值确实没生效(硬失败)。
             count_before_b = count_of(counter_attr)
             mark_b = ctx.log_mark()          # 归因只看**这一笔之后**的日志(别把上一笔的算进来)
-            b = send(ctx, make_req(ctx, price=probe_price(ctx)))
+            price_b = probe_price(ctx)
+            # 两笔**同价** ⇒ 「按价格认领日志」不再成立(认不出哪条日志属于哪一笔):
+            # 这时**不用**归属匹配,退回按位置归因,并在证据行里写明为什么退回
+            # (2026-11-16 codex 第十二轮复核 M-1:兜底基准不冻结时最新价漂移会让两笔同价)。
+            # 正常情况下两笔必然差一个 tick(`probe_price` 的基准已冻结),这一支是兜底。
+            ownership_ok = price_a != price_b
+            if not ownership_ok:
+                lines.append(f"⚠ 两笔演示单价格相同({price_a}),按价格认领日志不可用,"
+                             "本次归因退回按位置(可能认错人,但不会漏掉我们自己的日志)")
+            b = send(ctx, make_req(ctx, price=price_b))
             if b:
                 made.append(b)
             lines.append(f"超过阈值的委托:{'被拦截' if not b else '未被拦截(意外)'}")
@@ -771,27 +864,74 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             # (2026-11-16 codex 第八轮复核 L2/L3)。
             # 快照起点是 mark(本指标开始),`mark_b - mark` 就是「第二笔之后」的下标偏移。
             snapshot = ctx.logs_since(mark)
-            block_logs_b = [h for h in snapshot[mark_b - mark:] if "委托被拦截" in h]
+            # 第二笔的归因窗口里要**排除控制那笔自己的日志**:它可能迟到落在窗口里
+            # (位置切分的残余面 —— 2026-11-16 codex 第十轮复核 M-1),
+            # 不排除就会把「控制那笔的日志」当成「第二笔的归因」⇒ 张冠李戴。
+            # 认领方式是**按归属**(价格),不是按位置(见 `log_belongs_to`)。
+            block_logs_b = [h for h in snapshot[mark_b - mark:]
+                            if "委托被拦截" in h
+                            and not (ownership_ok and log_belongs_to(h, price_a))]
             ours_b = [h for h in block_logs_b if key_word in h]
             # 「对照用的那一笔」归因时没看到日志、但快照里有了 ⇒ 补记它。
-            # **同一份证据 ⇒ 同一个判定**:日志晚到只影响**什么时候**看到,不影响
-            # 「是谁拦的」。所以这里按日志点名的是哪一项,给出与「日志准时到达」
-            # 时**完全相同**的归因与判定:
-            #   ①点名了**我们这一项** ⇒ 计数基数取旧 ⇒ 判不出来(SKIP);
-            #   ②点名的是**别的规则** ⇒ 实打实的失败(FAIL)。
-            # 两边判定不一致 = 同样的证据跑两次给出两个结论(报告没法复核),
-            # 所以这里必须与上面的分支对齐(2026-11-16 codex 第八轮复核 L2/L3)。
+            #
+            # **判定只认证据,不认日志什么时候到**。「对照那笔是不是被**本项阈值**拦的」
+            # 只由一件事决定:对照发单那一刻计数到没到阈值 ——
+            #   · `DailyLimitRule.check_allowed` 只在「计数 ≥ 阈值」时才拦单、才写日志,
+            #     计数只增不减 ⇒ 对照发单时的计数 ≤ 归因时读到的计数;
+            #   · 所以读到的计数 < 阈值 ⇒ 对照发单时也 < 阈值 ⇒ **本项阈值压根没参与判定**,
+            #     对照那笔不是被本项阈值拦的(它是被别的东西拦的 ⇒ 实打实的失败)。
+            # 换句话说:这条日志点名我们这一项时,它**不可能**是对照那笔的 ——
+            # 它属于**后来那笔**委托(计数后来涨到了阈值)。
+            # 把它当成对照那笔的,等于凭空给一次真实失败盖上「判不出来」的章
+            # (2026-11-16 codex 第九轮复核:该分支对对照那笔不可达)。
+            #
+            # 所以这里**不按「日志什么时候到」改判定**:晚到只影响「什么时候看到」,
+            # 判定仍然由证据(计数 + 日志点名的是哪一项)决定:
+            #   ①点名**别的规则** ⇒ 对照那笔是被别的东西拦的 ⇒ 失败(FAIL);
+            #   ②点名**我们这一项** ⇒ 对照那笔被本项阈值拦下 ⇒ 计数基数取旧 ⇒ 判不出来(SKIP)。
+            # (②在生产里不可达,按上面的计数判据;保留作防御分支。)
+            #
+            # 扫描范围:**先按归属找**(用价格认出控制那笔自己的日志,不管它什么时候到),
+            # 认不出(规则没把 req 写进日志)才退回按**位置**找 —— 「第二笔之前」那段
+            # 窗口(`snapshot[:mark_b - mark]`)里的拦截日志只可能属于控制那笔
+            # (这个指标在两笔之间只发过它这一笔),「后来那笔」的日志在窗口之外
+            # (2026-11-16 codex 第九轮复核 L3)。
+            # 按位置找有残余面:控制那笔的日志迟到落在第二笔窗口里(第十轮复核 M-1),
+            # 所以第一优先是按**归属**找 —— `log_belongs_to` 用 `OrderRequest` repr 里的
+            # 价格认领(演示单每笔价格不同)。
+            #
+            # 判定与措辞**照抄上面「日志准时到达」时的那一支**(同一份证据 ⇒ 同一个判定 ⇒
+            # 同一个措辞):日志晚到只影响「什么时候看到」。
+            #
+            # 补记时**替换**原来那一行(而不是再追加一行):原来那句写着「没有风控拦截日志」,
+            # 补记后它就成了假话,证据块里两句互斥 ⇒ 报告自相矛盾
+            # (2026-11-16 codex 第九轮复核 M1:这正是本机制要关掉的那一类)。
             if first_no_log:
-                late_logs = [h for h in snapshot if "委托被拦截" in h]
+                late_logs = [h for h in snapshot
+                             if "委托被拦截" in h
+                             and ownership_ok and log_belongs_to(h, price_a)]
+                if not late_logs:
+                    late_logs = [h for h in snapshot[:max(mark_b - mark, 0)] if "委托被拦截" in h]
                 if late_logs:
                     late = late_logs[-1]
                     if key_word in late:
                         stale_base = True
-                        blocked_detail = (f"对照用的委托被本项阈值拦下(风控日志:{ctx.clean(late[:160])})")
+                        blocked_detail = (f"是本项阈值拦的({key_word}达到上限{limit},风控日志:"
+                                          f"{ctx.clean(late[:160])})⇒ 计数基数取旧,这轮对照做不成")
                     else:
                         blocked_detail = (f"委托没发出去,{first_count_txt},不是本项阈值拦的"
                                           f"(风控日志:{ctx.clean(late[:160])})")
-                    lines.append(f"⚠ {blocked_detail}(日志在等待窗口之后才到)")
+                    # `first_log_idx` 是刚追加的那条归因行的下标,**必然在范围内**:
+                    # 它与 `first_no_log` 在同一个分支里置位,之后对 `lines` 只有 `append`
+                    # (不改已有下标)⇒ 下标不会失效。这里**直接替换**,但把「失效」变成
+                    # 一次显式的失败(`replace_attribution_line` 负责)——
+                    # 宁可这轮取证失败,也不要写出一份归因错的报告
+                    # (2026-11-16 codex 第十轮复核 L2)。
+                    # 替换时**同时核对那一行的原文**:下标有效不等于那行还是我们以为的那行
+                    # (将来若有人改成头插/删行,下标会整体错位 ⇒ 写到别的行上)。
+                    replace_attribution_line(lines, first_log_idx, first_log_text,
+                                             f"⚠ {blocked_detail}(日志在等待窗口之后才到)",
+                                             label=label)
             if b:
                 block_attrib, block_detail = "", ""
             elif ours_b:
@@ -827,11 +967,10 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         # 不能说「阈值设得太紧」:那样写是在指控一个没有证据支持的原因
         # (2026-11-16 codex 复核 H1:委托规模超限/断连都被写成「阈值太紧」)。
         stall_reason = ""
-        # 「撤单没确认」是**结构化标记**,在分支链**之前**就定下来:
-        # 之前只在 elif 链的那一支置位 ⇒ 先命中「计数基数取旧」时这条标记就丢了,
-        # 「演示单可能仍挂在柜台上」的告警会跟着丢(2026-11-16 codex 第八轮复核 L6)。
-        # 条件是「**确实发出过**演示单、而撤单没确认」—— 压根没发出去的委托不会挂在柜台上。
-        unconfirmed = need_cancel and bool(a) and cancel_confirmed is not True
+        # 「可能还挂在柜台上」用**结构化标记** `cancel_may_hang`:它在撤单分支里按**终态**定下来
+        # (部分成交 / 没有终态回报 ⇒ 可能还挂着;全部成交 / 废单 / 已撤销 ⇒ 不挂着),
+        # 不再用「撤单没确认」笼统推 —— 全部成交时说「还挂着」是**假话**
+        # (2026-11-16 codex 第十轮复核 L-1)。
         if bool(b) and count_before_b >= limit:
             hard_reason = "超过阈值的委托没有被本地风控拦下(阈值未生效)"
         elif not a:
@@ -859,8 +998,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         fill_notes.append(fill_note)
         block_attribs.append(block_attrib)
         block_details.append(block_detail)
-        rejected_flags.append(cancel_rejected)
-        unconfirmed_flags.append(unconfirmed)
+        may_hang_flags.append(cancel_may_hang)
         shots.append(Shot(label, lines))
 
     if daily is None:
@@ -884,8 +1022,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         cancel_hard = hard_flags[-1]
         cancel_fill = fill_notes[-1]
         cancel_block = block_details[-1]
-        cancel_rejected = rejected_flags[-1]
-        cancel_unconfirmed = unconfirmed_flags[-1]
+        cancel_may_hang = may_hang_flags[-1]
     else:
         shots.append(Shot("撤单总笔数", ["非交易时段委托不会进入可撤状态,撤单阈值无法演示,请在交易时段补测"]))
         cancel_ok = None
@@ -893,8 +1030,7 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         cancel_hard = ""
         cancel_fill = ""
         cancel_block = ""
-        cancel_rejected = False
-        cancel_unconfirmed = False
+        cancel_may_hang = False
     shots.append(Shot("重复报单总笔数", dup.get("lines", ["(重复报单演示未执行)"])))
     dup_ok = bool(dup.get("ok"))
     # 原因串**不带**「重复报单」前缀(step_duplicate 里已去掉),这里统一补上,
@@ -922,6 +1058,18 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
             summary += f";{dup_note}"
         if order_fill or cancel_fill:
             summary += f" ⚠ {order_fill or cancel_fill},账户可能多出持仓,请人工核对持仓"
+        if cancel_may_hang:
+            # 硬失败这一支原来**只**消费了「成交」告警,漏掉「撤单没确认 ⇒ 单子可能还挂着」
+            # ⇒ 真的失败时反而看不到要去柜台撤的动作提示(2026-11-16 codex 第九轮复核 L2)。
+            #
+            # 这一支与上面那条**互不排斥**:「部分成交 + 余量还挂在柜台上」是**双重后果**,
+            # 两条告警都要出现 —— 写成 `elif` 就会让成交告警把柜台核对提示短路掉
+            # (2026-11-16 codex 第十轮复核 L-1)。
+            #
+            # 但也不能笼统提示:全部成交的演示单**不在柜台上**(说还挂着是假话)⇒
+            # 用 `cancel_may_hang` 这个按**终态**定下来的结构化标记(见撤单分支),
+            # 而不是「撤单没确认」。废单同理(压根没上柜台)。
+            summary += " ⚠ 演示单可能仍挂在柜台上,请人工去柜台核对"
     elif order_stalled or cancel_stalled:
         # 「判不出来」的原因也要**都**收上:只取第一个,另一个指标的原因就整条消失了
         # (2026-11-16 codex 复核 M1:报单指标判不出来时,撤单指标那条
@@ -937,10 +1085,14 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
         # 只跟「账户现在可能多了持仓」有关,漏掉就是把真风险写没了。
         if order_fill or cancel_fill:
             summary += f" ⚠ {order_fill or cancel_fill},账户可能多出持仓,请人工核对持仓"
-        elif cancel_unconfirmed and not cancel_rejected:
-            # 废单(被拒)没有挂单,不需要去柜台撤;其余「撤单未确认」才可能是还挂着。
-            # 两个判断都用**结构化标记**(cancel_unconfirmed / cancel_rejected),不用整串关键字 ——
+        if cancel_may_hang:
+            # 「可能还挂在柜台上」按**终态**判断(结构化标记 `cancel_may_hang`):
+            # 废单(被拒)没上柜台、全部成交的也不在柜台上 ⇒ 都不提示;
+            # 部分成交或没有终态回报才提示。不用整串关键字匹配 ——
             # 关键字匹配会被别的指标的原因里出现的「拒单」二字误伤(2026-11-16 codex 复核 L3)。
+            #
+            # 与上面那条成交告警**互不排斥**:部分成交 + 余量还挂着是双重后果,两条都要说
+            # (2026-11-16 codex 第十轮复核 L-1)。
             summary += " ⚠ 演示单可能仍挂在柜台上,请人工去柜台核对"
     elif order_ok and dup_ok and cancel_ok:
         status, summary = PASS, ""

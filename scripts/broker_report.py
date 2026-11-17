@@ -24,9 +24,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-import sys
-from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap  # noqa: F401
@@ -35,9 +32,9 @@ from lxml import etree
 
 from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
 from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
-from risk.account_guard import beijing_now  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -300,7 +297,7 @@ class ReportContext:
     test_time: str = ""
     access_system: str = "CTP"
     functions: tuple[str, ...] = ("自动开平仓", "止盈止损", "交易模型编写", "二次开发")
-    report_date: datetime = field(default_factory=datetime.now)
+    report_date: datetime = field(default_factory=beijing_now)
 
 
 @dataclass

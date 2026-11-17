@@ -319,6 +319,57 @@ def test_empty_account_id_is_ignored():
     assert g.bind_account("") is None and g.account_id == "A"
 
 
+def test_switching_account_clears_the_unusable_sampling_stamp(tmp_path):
+    """换账户时,旧账户「采样时刻用不了」的留痕也要一并作废。
+
+    2026-11-16 codex 第九轮复核 L4:`bind_account()` 换了账户会清 `last_sampled_at`,
+    却留着旧账户的 `sampled_at_unusable` ⇒ 状态文件里出现「新账户 + 旧账户的坏采样理由」
+    这种自相矛盾的组合,读状态页的人会以为**新账户**的采样时刻也有问题。
+    """
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.bind_account("A")
+    g.update(10_000, MON_10AM)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["sampled_at"] = "不是一个时刻"          # 坏值 ⇒ 读回时进 sampled_at_unusable
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.sampled_at_unusable == "不是一个时刻"      # 留痕确实读回来了
+    g2.bind_account("B")
+    assert g2.sampled_at_unusable == "" and g2.last_sampled_at is None
+
+
+def test_first_binding_keeps_the_ownerless_unusable_sampling_stamp(tmp_path):
+    """旧状态文件**没有 account_id** 时,首次绑定**故意保留**那条坏采样留痕。
+
+    2026-11-16 codex 第十轮复核 L-7:作废 `sampled_at_unusable` 只覆盖「previous 非空」
+    那一支;旧文件(无 account_id)走的是首次绑定那一支 ⇒ 留痕留着。codex 给了两个选项:
+    一并作废,或写明「无主留痕按保留处理是有意为之」。这里取后者 ——
+    首次绑定那一支本来就**整体沿用**旧文件的基准(peak_equity / day_start_equity /
+    last_sampled_at 一个都不清),只把留痕单独抹掉会让状态变成「旧基准 + 新解释」的
+    半新半旧;而且这条留痕是「这里曾经有个值、只是格式不对」的审计线索,抹掉反而丢证据。
+
+    该字段**不参与任何判定**(can_open / status / is_daily_locked 都不读它)⇒ 实盘防线零影响。
+    """
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["sampled_at"] = "不是一个时刻"          # 坏值 ⇒ 读回时进 sampled_at_unusable
+    state.pop("account_id", None)                # 旧版本的状态文件没有账户
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.sampled_at_unusable == "不是一个时刻"      # 无主留痕读回来了
+    assert g2.account_id == ""
+    g2.bind_account("A")                              # 首次绑定
+    assert g2.account_id == "A"
+    # 留痕**保留**(有意为之,见 docstring);基准也整体沿用 ⇒ 不是半新半旧
+    assert g2.sampled_at_unusable == "不是一个时刻"
+    assert g2.peak_equity == 10_000
+
+
 # ---------- 废单分类 ----------
 
 @pytest.mark.parametrize("text", ["CTP:资金不足", "合约不存在", "平仓量超过持仓量", "不在交易时段", "报单价格不在涨跌停板内"])

@@ -42,6 +42,11 @@ def beijing_now() -> datetime:
     本地时间与北京时间在夜盘时段会分属不同的交易日(2026-11-16 codex 复核 M2:
     预检按北京时间算交易日、运行时按本机时间算,两者在 20:00 之后的几个小时里分叉,
     预检判「没锁」放行、运行时判「当日锁定」⇒ 白跑一次国信登录额度)。
+
+    **测试注入契约**:本函数用的是**模块全局** `datetime` 名字,测试可以
+    `monkeypatch.setattr(account_guard, "datetime", FixedDatetime)` 把整块时钟钉死
+    (2026-11-16 codex 复核 L-6:这个契约原先只存在于测试代码的注释里,没写在源头)。
+    改这里的实现前,先确认报告封面的日期用例还钉得住。
     """
     return datetime.now(BEIJING).replace(tzinfo=None)
 
@@ -134,11 +139,23 @@ class AccountGuard:
             return None
         previous, self.account_id = self.account_id, account_id
         if not previous:               # 首次绑定(含旧版本的状态文件):沿用已有基准,只补记账户
+            # 这一支**故意保留** `sampled_at_unusable`:旧状态文件没有 account_id,
+            # 那条「采样时刻用不了」的留痕是**无主**的(不属于任何旧账户),而这一支
+            # 本来就整体沿用旧文件的基准(peak_equity / day_start_equity / last_sampled_at
+            # 一个都不清)⇒ 只把留痕单独抹掉会让状态变成「旧基准 + 新解释」的半新半旧。
+            # 留痕本来就是「这里曾经有个值、只是格式不对」的审计线索,抹掉反而丢证据
+            # (2026-11-16 codex 第十轮复核 L-7:两个选项里取「有意保留 + 写明」)。
+            # 该字段只出现在 _save/_load,**不参与任何判定**(can_open / status /
+            # is_daily_locked 都不读它)⇒ 对实盘防线零影响。
             self._save()
             return None
         self.peak_equity = 0.0
         self.last_equity = 0.0
         self.last_sampled_at = None           # 换了账户:旧账户的采样时间不属于新账户
+        # 旧账户那条「采样时刻用不了」的留痕也不属于新账户 ⇒ 一并作废,
+        # 否则状态文件里会出现「新账户 + 旧账户的坏采样理由」这种自相矛盾的组合
+        # (2026-11-16 codex 第九轮复核 L4)。
+        self.sampled_at_unusable = ""
         self.day = None
         self.day_start_equity = 0.0
         self.daily_locked_day = None

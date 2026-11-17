@@ -369,6 +369,26 @@ def test_a_demo_order_that_filled_points_at_the_position_not_at_the_counter(env)
     assert "柜台上" not in p31.summary
 
 
+def test_a_partially_filled_demo_order_reports_both_consequences(env):
+    """部分成交 ⇒ **两个**后果都要说:账户多出持仓 **且** 余量可能还挂在柜台上。
+
+    2026-11-16 codex 第十轮复核 L-1:两条告警原先是 `elif` 串联 —— 发生过成交就把
+    「去柜台核对」短路掉了;而改成两条独立 `if` 又会误报「还挂着」(全部成交的单子
+    早就不在柜台上)。⇒ 用按**终态**定下来的结构化标记 `cancel_may_hang`:
+    部分成交/无终态 ⇒ 提示去柜台;全部成交/废单 ⇒ 不提示。
+    """
+    env.gw.mode = "partial"
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    assert p31.status == be.SKIP, p31.summary
+    assert "部分成交" in p31.summary, p31.summary
+    assert "账户可能多出持仓" in p31.summary, p31.summary
+    # 「去柜台核对」这句**动作提示**只由「可能还挂在柜台上」那条告警写出来
+    # (判不出来那句话里的「余量可能仍挂在柜台上」是另一句,不含动作提示)⇒
+    # 断言它才能证明两条告警**都**出现(成交告警没有把柜台提示短路掉)。
+    assert "请人工去柜台核对" in p31.summary, p31.summary
+
+
 def test_the_runtime_guard_and_the_precheck_share_one_trading_day_clock(env):
     """预检与运行时必须用**同一个**时钟函数,否则两边算出的期货交易日会分叉。
 
@@ -1572,6 +1592,41 @@ def test_the_t6_summary_says_our_threshold_blocked_it_when_the_log_names_it(env,
     assert "报单:" in p31.summary, p31.summary
 
 
+def test_a_hard_failure_also_points_at_the_counter_when_the_cancel_is_unconfirmed(env, monkeypatch):
+    """**硬失败**的摘要里也必须说「演示单可能仍挂在柜台上,请人工去柜台核对」。
+
+    2026-11-16 codex 第九轮复核 L2:「撤单没确认」这条告警原先只在「判不出来」那一支里补,
+    硬失败那一支漏了 ⇒ 真的失败时反而看不到要去柜台撤的动作提示。
+    演示单确实发出去了、撤单确实没确认,它就真的可能还挂在柜台上 —— 判成什么都不能改这一点。
+    """
+    env.ctx.cancel_wait = 0.5
+    env.gw.cancel_works = False                     # 我们的撤单请求不生效 ⇒ 演示单还挂着
+    real_send = bt.send
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 2:                         # 报单指标的超阈值那笔:假装风控没拦下 ⇒ 硬失败
+            return "VT999999"
+        return real_send(ctx, req)
+
+    real_settle = bt.settle_counter
+
+    def stale(ctx, rule, attr, timeout=5.0):
+        return max(real_settle(ctx, rule, attr, timeout) - 2, 0)   # 故意报旧两笔 ⇒ 计数到过阈值
+
+    monkeypatch.setattr(bt, "settle_counter", stale)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    calls["n"] = 0
+    monkeypatch.setattr(bt, "send", fake_send)
+    bt.step_threshold(env.ctx, env.book, dup)
+
+    p31 = item(env, "P3.1")
+    assert p31.status == be.FAIL, p31.summary
+    assert "阈值未生效" in p31.summary, p31.summary
+    assert "演示单可能仍挂在柜台上" in p31.summary, p31.summary
+
+
 def test_a_hard_failure_also_reports_the_duplicate_order_reason(env, monkeypatch):
     """硬失败分支里**也要**带上重复报单的失败原因。
 
@@ -1692,52 +1747,418 @@ def test_a_late_risk_log_does_not_make_the_summary_and_the_evidence_row_disagree
     assert bool(quoted_log) != says_no_log, (t6.summary, quoted_log)
 
 
-def test_a_log_that_arrives_between_the_attribution_and_the_snapshot_is_still_used(env, monkeypatch):
-    """归因读完**之后**、取快照**之前**才到的风控日志,也要被算进归因。
+LOG_OTHER_RULE = "委托被拦截，委托价值20900.0超过上限"      # 别的规则(委托规模)拦的
+LOG_OUR_LIMIT = "委托被拦截，汇总委托笔数1达到上限1"          # 本项阈值拦的
 
-    2026-11-16 codex 第八轮复核 L2/L3:风控日志是**异步**投递的,可能正好落在这
-    两次读之间 —— 生产里这一小段窗口真实存在。落在这里的日志原先被忽略 ⇒
-    摘要写「没有风控拦截日志」、而证据行里其实有那条日志(自相矛盾)。
-    现在补记它,并且**按同一份证据给出同一个判定**(日志晚到只影响什么时候看到,
-    不影响「是谁拦的」)。
+
+def _run_two_block_logs(env, monkeypatch, a_log_on_time: bool, a_log: str = LOG_OTHER_RULE):
+    """a(对照那笔)被**别的规则**拦下、b(超阈值那笔)被**本项阈值**拦下,跑一遍阈值步骤。
+
+    两段日志内容固定,只有 a 那段的**到达时刻**可变(`a_log_on_time`):
+    风控日志是异步投递的,a 的日志完全可能落在「归因读完之后、取快照之前」。
+    `a_log` 可换成点名**本项阈值**的那条 —— 那是补记分支里的防御分支(生产里不可达)。
     """
     real_send = bt.send
     calls = {"n": 0}
 
     def fake_send(ctx, req):
         calls["n"] += 1
-        if calls["n"] == 1:
-            return None                      # 「对照用的那一笔」没发出去,而且**当时没有**拦截日志
+        if calls["n"] in (1, 2):
+            return None                      # a、b 都被本地风控拦下
         return real_send(ctx, req)
 
     real_wait = env.ctx.wait_until
     real_logs_since = env.ctx.logs_since
-    state = {"waited": False, "appended": False}
+    st = {"in_wait": False, "wait_no": 0, "read_no": 0, "metric": 0,
+          "a_appended": False, "b_appended": False}
 
-    def wait_marking(predicate, timeout, step=0.2):
-        result = real_wait(predicate, timeout, step)
-        state["waited"] = True               # 归因的等待窗口已经结束
-        return result
+    def wrapped_wait(predicate, timeout, step=0.2):
+        st["wait_no"] += 1
+        st["in_wait"] = True
+        try:
+            return real_wait(predicate, timeout, step)
+        finally:
+            st["in_wait"] = False
 
-    def logs_since_with_late(mark, *needles):
+    def logs_since_hook(mark, *needles):
         result = real_logs_since(mark, *needles)
-        if state["waited"] and not state["appended"] and needles:
-            # 日志正好落在这两次读之间:归因那次读**看不到**它,快照那次看得到
-            state["appended"] = True
-            env.collector.log_lines.append("委托被拦截，汇总委托笔数1达到上限1")
+        if not needles:
+            # 只有快照是无 needles 的读法 ⇒ 快照 = 本指标结束
+            st["metric"] += 1
+            st.update(wait_no=0, read_no=0, a_appended=False, b_appended=False)
+            return result
+        if st["metric"] != 0:
+            return result                     # 只在第一个指标(报单总笔数)里造日志
+        if st["in_wait"]:
+            if st["wait_no"] == 1 and a_log_on_time and not st["a_appended"]:
+                st["a_appended"] = True      # a 的日志在归因窗口内到达(准时)
+                env.collector.log_lines.append(a_log)
+            elif st["wait_no"] == 2 and not st["b_appended"]:
+                st["b_appended"] = True      # b 的日志准时到达
+                env.collector.log_lines.append(LOG_OUR_LIMIT)
+        else:
+            st["read_no"] += 1
+            if st["read_no"] == 1 and not a_log_on_time and not st["a_appended"]:
+                st["a_appended"] = True      # a 的日志在归因读完之后才到(迟到)
+                env.collector.log_lines.append(a_log)
         return result
 
     monkeypatch.setattr(bt, "send", fake_send)
-    monkeypatch.setattr(env.ctx, "wait_until", wait_marking)
-    monkeypatch.setattr(env.ctx, "logs_since", logs_since_with_late)
+    monkeypatch.setattr(env.ctx, "wait_until", wrapped_wait)
+    monkeypatch.setattr(env.ctx, "logs_since", logs_since_hook)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    return item(env, "P3.1")
+
+
+def _attribution_lines(p31) -> list[str]:
+    """取「报单总笔数」这个指标里带归因的那几行(判定依据的文字)。"""
+    return [ln for shot in p31.shots if shot.label == "报单总笔数"
+            for ln in shot.lines if "委托没发出去" in ln or "是本项阈值拦的" in ln]
+
+
+def test_the_late_log_is_written_with_the_same_wording_as_the_on_time_one(env, monkeypatch, tmp_path):
+    """日志迟到时,补记的那一行必须与「准时到达」时**同一句话**(只多一句到达时刻的说明)。
+
+    2026-11-16 codex 第九轮复核:补记分支原来自己拼了一套措辞,于是同一份证据
+    在两种到达时刻下给出两句不同的归因 —— 报告没法复核,读的人要猜哪句对。
+    现在补记**照抄**准时到达那一支,只追加「(日志在等待窗口之后才到)」。
+    """
+    on_time = _run_two_block_logs(env, monkeypatch, True)
+    other = Env(tmp_path / "second")
+    try:
+        late = _run_two_block_logs(other, monkeypatch, False)
+    finally:
+        other.main.close()
+
+    late_lines = _attribution_lines(late)
+    on_time_lines = _attribution_lines(on_time)
+    assert late_lines and on_time_lines, (late_lines, on_time_lines)
+    stripped = [ln.replace("(日志在等待窗口之后才到)", "").strip() for ln in late_lines]
+    assert stripped == [ln.strip() for ln in on_time_lines], (stripped, on_time_lines)
+    # 措辞相同还不够,**判定**也要相同(2026-11-16 codex 第十轮复核 L-6:
+    # 原用例只比措辞,两种到达时刻若同时退化成同一个错误判定,它照样绿)。
+    assert late.status == on_time.status, (late.status, on_time.status, late.summary, on_time.summary)
+
+
+def test_the_defensive_branch_for_our_own_threshold_gives_the_same_verdict(env, monkeypatch, tmp_path):
+    """补记分支里「点名本项阈值」那一支(防御分支)必须与准时到达时给出同一个判定。
+
+    2026-11-16 codex 第九轮复核:按计数判据,这条日志在**生产里写不出来**
+    (能写出它就意味着计数已到阈值 ⇒ 归因时读到的计数 ≥ 阈值 ⇒ 走不到补记分支)，
+    所以它是防御分支。但防御分支也得自洽:若它存在,判定必须与「日志准时到达」
+    时一模一样(都是「计数基数取旧 ⇒ 判不出来」),否则又是一份「同样输入两个结论」的报告。
+    """
+    on_time = _run_two_block_logs(env, monkeypatch, True, a_log=LOG_OUR_LIMIT)
+    other = Env(tmp_path / "second")
+    try:
+        late = _run_two_block_logs(other, monkeypatch, False, a_log=LOG_OUR_LIMIT)
+    finally:
+        other.main.close()
+
+    for p31 in (on_time, late):
+        assert p31.status == be.SKIP, (p31.status, p31.summary)
+        assert "计数基数取旧" in p31.summary, p31.summary
+    late_lines = [ln.replace("(日志在等待窗口之后才到)", "").strip() for ln in _attribution_lines(late)]
+    on_time_lines = [ln.strip() for ln in _attribution_lines(on_time)]
+    assert late_lines == on_time_lines, (late_lines, on_time_lines)
+
+
+@pytest.mark.parametrize("a_log_on_time", [True, False])
+def test_the_same_two_logs_give_the_same_verdict_however_late_the_first_one_arrives(env, monkeypatch, a_log_on_time):
+    """同一份证据 ⇒ 同一个判定:日志**晚到**不能改变结论。
+
+    2026-11-16 codex 第九轮复核:风控日志异步投递,a 的日志可能落在归因读完之后。
+    原先的补记分支取快照里**最后**一条拦截日志 —— 那条是 b 的(本项阈值拦的),
+    于是被当成 a 的 ⇒ 归因写成「对照用的委托被本项阈值拦下」(与事实相反),
+    判定还从 FAIL 变成 SKIP ⇒ 同一份证据跑两次给出两个结论,报告没法复核。
+
+    关键判据:**本项阈值的日志只在「计数 ≥ 阈值」时才写得出来**
+    (`DailyLimitRule.check_allowed`),计数只增不减 ⇒ 归因时读到「计数 < 阈值」
+    就说明对照那笔发单时也没到阈值 ⇒ 那条日志属于**后来那笔**,不是对照那笔。
+    """
+    p31 = _run_two_block_logs(env, monkeypatch, a_log_on_time)
+    # 两种到达时刻都必须是同一个判定:对照那笔被别的规则拦下 ⇒ 失败
+    assert p31.status == be.FAIL, (p31.status, p31.summary)
+    # 不能把「后来那笔」的日志说成「对照那笔被本项阈值拦下」
+    assert "对照用的委托被本项阈值拦下" not in p31.summary, p31.summary
+    # 也不能因此判成「判不出来」——那是把一次真实失败洗成没法测
+    assert "计数基数取旧" not in p31.summary, p31.summary
+
+
+def test_a_late_log_of_another_order_is_not_attributed_to_the_control(env, monkeypatch):
+    """迟到的日志点名**我们这一项**时,它**不可能**是对照那笔的。
+
+    2026-11-16 codex 第九轮复核:本项阈值的日志只在「计数 ≥ 阈值」时才写得出来
+    (`DailyLimitRule.check_allowed`),计数只增不减 ⇒ 对照发单时的计数 ≤ 归因时读到的
+    计数;读到「计数 < 阈值」就说明对照发单时也 < 阈值 ⇒ **本项阈值压根没参与判定**,
+    那条日志属于**后来那笔**委托。
+    原先把它当成对照那笔的 ⇒ 凭空判成「计数基数取旧/判不出来」⇒ 把一次真实的失败
+    (对照那笔没发出去)洗成「没法测」。
+    """
+    real_send = bt.send
+    daily = env.risk.rules["每日上限检查"]
+    calls = {"n": 0}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None                      # 对照那笔没发出去(计数还没到阈值 ⇒ 不是本项阈值拦的)
+        if calls["n"] == 2:
+            # 迟到的委托回报把计数推上阈值 ⇒ 本项阈值能拦住「后来那笔」
+            daily.total_order_count = max(daily.total_order_count, daily.total_order_limit)
+        return real_send(ctx, req)
+
+    monkeypatch.setattr(bt, "send", fake_send)
     bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
 
     p31 = item(env, "P3.1")
-    late = [ln for shot in p31.shots for ln in shot.lines if "日志在等待窗口之后才到" in ln]
-    assert late, p31.shots
-    assert "没有风控拦截日志" not in p31.summary, p31.summary
-    # 日志点名了**我们这一项** ⇒ 与「日志准时到达」时同一个判定(判不出来,不是失败)
-    assert p31.status == be.SKIP, (p31.status, p31.summary)
+    # 判定:对照那笔没发出去 ⇒ 失败(不是「判不出来」)
+    assert p31.status == be.FAIL, (p31.status, p31.summary)
+    assert "计数基数取旧" not in p31.summary, p31.summary
+    # 归因:不能把「后来那笔」的日志说成「对照那笔被本项阈值拦下」
+    assert "对照用的委托被本项阈值拦下" not in p31.summary, p31.summary
+    assert "不是本项阈值拦的" in p31.summary, p31.summary
+    # 但本项阈值在「后来那笔」上是生效的,这话要说清楚(证据行里能看到那条日志)
+    assert "本项阈值拦的" in p31.summary or any(
+        "本项阈值拦的" in ln for shot in p31.shots for ln in shot.lines), p31.shots
+
+
+def _other_rule_log(price: float) -> str:
+    """「别的规则」(委托规模)拦下时风控日志的原文。
+
+    原文带 `OrderRequest` 的 repr ⇒ 带 `price=…` ⇒ 可以用价格认领归属
+    (真日志里这段 repr 是 `vnpy_riskmanager` 写的 `f"...：{req}"`)。
+    """
+    return (f"委托被拦截，委托价值20900.0超过上限：OrderRequest(symbol='c2601.DCE', "
+            f"price={price!r}, volume=1.0)")
+
+
+def _run_control_log_after_the_second_order(env, monkeypatch, b_log_kind: str = "ours"):
+    """对照那笔的拦截日志**在第二笔发出之后**才到(第十轮 codex M-1 的场景)。
+
+    风控日志异步投递:对照那笔发出去以后,它的拦截日志完全可能晚到,
+    甚至晚到**第二笔都发完了**才到 ⇒ 那时它落在「第二笔的归因窗口」里。
+    按**位置**切窗口就会把它当成第二笔的归因日志(取最后一条)⇒ 张冠李戴。
+    这里按**归属**认领:风控日志原文带 `OrderRequest` 的 repr(含 `price=…`),
+    演示单每笔价格不同 ⇒ 用价格把日志认回具体那一笔。
+
+    `b_log_kind`:"ours" = 第二笔被本项阈值拦下;"other" = 第二笔也被别的规则拦下。
+    """
+    real_send = bt.send
+    real_wait = env.ctx.wait_until
+    real_logs_since = env.ctx.logs_since
+    calls = {"n": 0}
+    prices: dict[int, float] = {}
+    st = {"in_wait": False, "wait_no": 0, "metric": 0, "injected": False}
+
+    def fake_send(ctx, req):
+        calls["n"] += 1
+        prices[calls["n"]] = req.price
+        if calls["n"] in (1, 2):
+            return None                      # a、b 都被本地风控拦下
+        return real_send(ctx, req)
+
+    def wrapped_wait(predicate, timeout, step=0.2):
+        st["wait_no"] += 1
+        st["in_wait"] = True
+        try:
+            return real_wait(predicate, timeout, step)
+        finally:
+            st["in_wait"] = False
+
+    def logs_since_hook(mark, *needles):
+        result = real_logs_since(mark, *needles)
+        if not needles:
+            st["metric"] += 1               # 快照读 = 本指标结束
+            return result
+        if st["metric"] != 0:
+            return result                     # 只在第一个指标(报单总笔数)里造日志
+        if st["in_wait"] and st["wait_no"] == 2 and not st["injected"]:
+            # 第二笔发出**之后**才到:先到 b 的日志,再补上对照那笔的日志 ——
+            # 顺序很关键:按位置取「最后一条」的实现会把对照那笔的日志当成第二笔的归因。
+            st["injected"] = True
+            if b_log_kind == "ours":
+                env.collector.log_lines.append(LOG_OUR_LIMIT)
+            else:
+                env.collector.log_lines.append(_other_rule_log(prices[2]))
+            env.collector.log_lines.append(_other_rule_log(prices[1]))
+        return result
+
+    monkeypatch.setattr(bt, "send", fake_send)
+    monkeypatch.setattr(env.ctx, "wait_until", wrapped_wait)
+    monkeypatch.setattr(env.ctx, "logs_since", logs_since_hook)
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    return item(env, "P3.1"), prices
+
+
+def test_a_control_log_arriving_after_the_second_order_is_not_attributed_to_it(env, monkeypatch):
+    """对照那笔的日志迟到到第二笔之后 ⇒ 归因按**归属**(价格),不按**位置**。
+
+    2026-11-16 codex 第十轮复核 M-1:补记窗口原先按「位置」切成「第二笔之前/之后」。
+    对照那笔自己的日志若迟到落在「第二笔之后」那段,就**补记不到**
+    (补记只看「第二笔之前」那段窗口)⇒ 摘要里「没有风控拦截日志」变成假话,
+    而那条日志就在同一份快照里。
+    """
+    p31, prices = _run_control_log_after_the_second_order(env, monkeypatch)
+    lines = [ln for shot in p31.shots for ln in shot.lines]
+
+    # 第二笔的归因:必须是「本项阈值拦的」(它确实是被本项阈值拦的)
+    b_lines = [ln for ln in lines if "超过阈值的委托被拦下" in ln]
+    assert b_lines, lines
+    assert "本项阈值拦的" in b_lines[0], b_lines
+    assert "被其它规则拦下" not in b_lines[0], b_lines
+
+    # 对照那笔的归因:补记里要引**它自己的**日志,并说清「不是本项阈值拦的」
+    a_lines = [ln for ln in lines if "委托没发出去" in ln]
+    assert a_lines, lines
+    assert "不是本项阈值拦的" in a_lines[0], a_lines
+    assert "委托价值20900.0超过上限" in a_lines[0], a_lines
+    assert f"price={prices[1]!r}" in a_lines[0], a_lines
+
+    # 判定:对照那笔是被**别的规则**拦的 ⇒ 实打实的失败(不是「判不出来」)
+    assert p31.status == be.FAIL, (p31.status, p31.summary)
+    assert "计数基数取旧" not in p31.summary, p31.summary
+    # 两笔的价格必须不同 —— 归属匹配的前提
+    assert prices[1] != prices[2], prices
+
+
+def test_the_second_order_quotes_its_own_log_not_the_control_one(env, monkeypatch):
+    """第二笔的归因日志必须是**它自己**的那条,不是对照那笔的。
+
+    2026-11-16 codex 第十轮复核 M-1:两笔都被别的规则拦下时,归因窗口里最后一条
+    日志可能是**对照那笔**的(它迟到落在第二笔之后)⇒ 报告把对照那笔的日志
+    当成第二笔的归因引出来 ⇒ 张冠李戴,复核的人按日志去查会查错委托。
+    """
+    p31, prices = _run_control_log_after_the_second_order(env, monkeypatch, b_log_kind="other")
+    lines = [ln for shot in p31.shots for ln in shot.lines]
+
+    b_lines = [ln for ln in lines if "超过阈值的委托被拦下" in ln]
+    assert b_lines, lines
+    # 引的是**第二笔自己**的日志(带它自己的价格),不是对照那笔的
+    assert f"price={prices[2]!r}" in b_lines[0], b_lines
+    assert f"price={prices[1]!r}" not in b_lines[0], b_lines
+
+
+def test_a_price_is_matched_with_a_boundary_so_a_longer_price_is_not_matched():
+    """`log_belongs_to` 认价格必须**带边界**。
+
+    2026-11-16 codex 复核 L-2:`repr(2091.0)`="2091.0" 是 `repr(2091.05)`="2091.05" 的
+    **前缀** ⇒ 裸子串匹配会把「2091.05 那笔」的日志当成「2091.0 那笔」的
+    ⇒ 归属认领张冠李戴(第二笔的归因被抹掉、对照那笔认错人)。
+    """
+    log_long = _other_rule_log(2091.05)
+    assert "price=2091.05" in log_long
+    # 长价格的那条日志**不能**被短价格认领
+    assert not bt.log_belongs_to(log_long, 2091.0)
+    # 它自己能认领自己
+    assert bt.log_belongs_to(log_long, 2091.05)
+    # 短价格自己的日志仍认得出来
+    assert bt.log_belongs_to(_other_rule_log(2091.0), 2091.0)
+    # 价格后面不是数字/小数点 ⇒ 不管接什么符号都算命中
+    assert bt.log_belongs_to("price=2091.0, volume=1.0", 2091.0)
+    assert bt.log_belongs_to("price=2091.0)", 2091.0)
+    assert not bt.log_belongs_to("price=2091.05, volume=1.0", 2091.0)
+
+
+def test_the_fallback_probe_price_is_frozen_against_the_market_drift(env):
+    """拿不到跌停价时,演示委托的**兜底基准价必须冻结**:最新价漂移不能让两笔同价。
+
+    2026-11-16 codex 第十二轮复核 M-1:兜底基准原先**每次重算** ⇒ 最新价从 2000 漂到
+    1998 时,两笔算出的是 1000.0 与 999.0+1=1000.0 ⇒ **同一个价格** ⇒
+    「按价格认领日志」认不出归属 ⇒ 归因张冠李戴(把第二笔的日志当成第一笔的)。
+    改法:兜底基准**第一次算出来就冻结**,全轮共用 ⇒ 两笔必然差一个最小变动价位。
+    """
+    tick = env.ctx.tick
+    assert tick is not None
+    tick.limit_down = 0.0            # 拿不到跌停价 ⇒ 走「最新价的一半」兜底
+    tick.last_price = 2000.0
+    p1 = bt.probe_price(env.ctx)
+    tick.last_price = 1998.0         # 行情漂移:兜底基准**不能**跟着漂
+    p2 = bt.probe_price(env.ctx)
+    assert p1 != p2, (p1, p2)         # 不冻结的话这两个数会相等
+
+
+def test_two_demo_orders_at_the_same_price_fall_back_to_the_positional_attribution(env, monkeypatch):
+    """两笔**同价** ⇒「按价格认领日志」不成立 ⇒ 必须**显式退回按位置**并写明。
+
+    2026-11-16 codex 第十二轮复核 M-1:同价时归属匹配会把**对照那笔**的日志当成
+    **第二笔**的归因(张冠李戴)。所以同价时:①不用归属匹配;②证据行必须写明为什么退回;
+    ③退回之后**仍然**要认得出「本项阈值拦的」——不能因为退化就把归因整个丢掉。
+    """
+    monkeypatch.setattr(bt, "probe_price", lambda ctx: 1000.0)      # 强制两笔同价
+    p31, prices = _run_control_log_after_the_second_order(env, monkeypatch)
+    lines = [ln for shot in p31.shots for ln in shot.lines]
+
+    # 前提:两笔确实同价了(否则这个用例根本没走到同价那一支)
+    assert prices[1] == prices[2], prices
+
+    # 证据行必须写明「按价格认领日志不可用 + 退回按位置」
+    guard_lines = [ln for ln in lines if "按价格认领日志不可用" in ln]
+    assert guard_lines, lines
+    assert "退回按位置" in guard_lines[0], guard_lines
+    # 退化后的措辞不许再承诺「宁可漏判也不乱归因」这种做不到的强承诺
+    assert "宁可漏判" not in guard_lines[0], guard_lines
+
+    # 退化之后,第二笔的归因**仍然**认得出是本项阈值拦的(没被对照那笔的日志顶掉)
+    b_lines = [ln for ln in lines if "超过阈值的委托被拦下" in ln]
+    assert b_lines, lines
+    assert "本项阈值拦的" in b_lines[0], b_lines
+    assert "被其它规则拦下" not in b_lines[0], b_lines
+
+
+def test_a_demo_order_without_a_final_report_is_flagged_as_may_hang_at_the_counter(env):
+    """**没有终态回报** ⇒ 演示单可能仍挂在柜台上 ⇒ 摘要必须提示去柜台核对。
+
+    2026-11-16 codex 第十二轮复核 L-1:`cancel_may_hang` 的判定里有「`final is None`
+    (没有终态回报)」这一支,但没有用例直接覆盖它(只覆盖了有终态的部分成交/废单/全部成交)。
+    这里让网关**完全不产生委托回报**(`silent` 模式):撤单拿不到终态 ⇒ `final is None`
+    ⇒ 演示单可能还挂在柜台上 ⇒ 摘要必须带这条提示。
+    """
+    env.gw.mode = "silent"
+    bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
+    p31 = item(env, "P3.1")
+    lines = [ln for shot in p31.shots for ln in shot.lines]
+
+    # 走的确实是「没有终态回报」这一支(不是废单/部分成交/全部成交)
+    assert any("终态 无回报" in ln for ln in lines), lines
+    # 后果必须提示去柜台核对:演示单可能还挂着
+    assert "演示单可能仍挂在柜台上,请人工去柜台核对" in p31.summary, p31.summary
+
+
+def test_the_attribution_line_index_guard_fails_loudly():
+    """归因行下标失效**或内容对不上**时必须**显式炸出来**,不能静默覆盖末行/别的行。
+
+    2026-11-16 codex 第十轮复核 L-2:原先的写法是 `lines[first_log_idx] = ...`,
+    下标一旦失效,`lines[-1] = ...` 会**静默覆盖最后一行**并正常返回 ——
+    注释承诺的「宁可这轮取证失败,也不要写出一份归因错的报告」落不了地。
+    现在这个承诺由 `replace_attribution_line` 实现,并且**可以被用例直接验证**
+    (不是只写在注释里)。
+
+    还要校**内容**:下标有效不等于那一行还是「我们以为的那一行」——
+    将来若有人在这一段改成头插/删行,下标会整体错位 ⇒ 替换会写到**别的行**上
+    (2026-11-16 G8 第一轮复核:这一条当时只靠注释里写明的不变量)。
+    """
+    lines = ["第一行", "第二行"]
+    # 正常路径:就地替换,其它行不动
+    bt.replace_attribution_line(lines, 1, "第二行", "补记后的那句话")
+    assert lines == ["第一行", "补记后的那句话"], lines
+    # 下标越界 ⇒ 显式失败(而不是静默覆盖末行)
+    for bad in (-1, 2, 99):
+        with pytest.raises(RuntimeError) as ei:
+            bt.replace_attribution_line(list(lines), bad, "补记后的那句话", "补记后的那句话")
+        assert "宁可这轮取证失败" in str(ei.value), str(ei.value)
+    # 内容对不上(下标错位)⇒ 同样是显式失败,不能写到别的行上
+    with pytest.raises(RuntimeError) as ei:
+        bt.replace_attribution_line(list(lines), 1, "我们以为的那一行", "补记后的那句话")
+    assert "宁可这轮取证失败" in str(ei.value), str(ei.value)
+    # 失败时原列表**没有被改**:宁可这轮取证失败,也不能留下一份改坏的证据
+    snapshot = list(lines)
+    with pytest.raises(RuntimeError):
+        bt.replace_attribution_line(snapshot, 5, "补记后的那句话", "补记后的那句话")
+    assert snapshot == lines, snapshot
+    with pytest.raises(RuntimeError):
+        bt.replace_attribution_line(snapshot, 0, "对不上的原文", "补记后的那句话")
+    assert snapshot == lines, snapshot
 
 
 def test_a_late_log_naming_another_rule_still_counts_as_a_failure(env, monkeypatch):

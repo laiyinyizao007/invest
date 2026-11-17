@@ -320,11 +320,50 @@ def test_the_report_test_date_is_beijing_time():
 
     2026-11-16 codex 第八轮复核 L5:证据目录、条目时间、连接记录都已是北京时间,
     报告头却是本机本地时间 ⇒ 夜盘时段出的报告日期比证据目录早一天。
+
+    北京时间 00:00 前后跨零点时,前后两次取时钟可能落在不同日期 ⇒ 断言
+    「落在前后两次取样之间」,而不是「等于某一次取样」(2026-11-16 codex 第九轮复核 L6:
+    这个用例会在北京时间零点整前后随机挂)。
     """
     from risk import account_guard as ag
 
+    before = ag.beijing_now().strftime("%Y-%m-%d")
     c = br.context_from_env({}, {})
-    assert c.test_time == ag.beijing_now().strftime("%Y-%m-%d")
+    after = ag.beijing_now().strftime("%Y-%m-%d")
+    assert c.test_time in {before, after}
+
+
+def test_the_report_cover_date_is_beijing_time(monkeypatch):
+    """封面「报告日期」也必须是北京时间。
+
+    2026-11-16 codex 第九轮复核 M2:报告头的日期用本机本地时间(datetime.now),
+    而表头「测试时间」用北京时间 ⇒ 同一份报告上可能出现两个日期(宿主机 UTC-8 时差一天)。
+
+    2026-11-16 codex 第十轮复核 L-5:原用例断言「落在前后两次 `beijing_now()` 之间」——
+    只要**实现**也用 `beijing_now()`,它必然成立 ⇒ 在「本机==北京」的环境里是假绿,
+    抓不住被修的缺陷。这里改成**注入固定时钟**:固定一个时刻(北京 2026-11-16 21:30:45),
+    再断言封面日期就是那个北京时间值 —— 实现若用本机本地时间,在任何非北京时区的机器上
+    都会红(北京时区的机器上两者本来就相同,没有可区分的缺陷)。
+    """
+    from datetime import datetime as real_datetime, timezone
+
+    from risk import account_guard as ag
+
+    # 2026-11-16 13:30:45 UTC == 北京 2026-11-16 21:30:45
+    instant = real_datetime(2026, 11, 16, 13, 30, 45, tzinfo=timezone.utc)
+
+    class FixedDatetime(real_datetime):
+        """把「现在」钉死成上面那个时刻;按传入的时区换算 ⇒ 与本机时区无关。"""
+
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz is not None else instant.astimezone()
+
+    monkeypatch.setattr(ag, "datetime", FixedDatetime)
+    c = br.context_from_env({}, {})
+    assert c.report_date == real_datetime(2026, 11, 16, 21, 30, 45), c.report_date
+    # 表头「测试时间」同一基准(两个日期必须同一天)
+    assert c.test_time == "2026-11-16", c.test_time
 
 
 # ---------- 证据模型与渲染 ----------
