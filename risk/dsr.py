@@ -68,8 +68,15 @@ def required_sharpe_for_dsr(n_trials: int, n_obs: int, min_dsr: float = 0.95) ->
         return 0.0
     if isinstance(n_obs, bool) or not isinstance(n_obs, int) or n_obs < 3:
         return 0.0
-    if (isinstance(min_dsr, bool) or not isinstance(min_dsr, (int, float))
-            or not math.isfinite(min_dsr) or not 0.0 < min_dsr < 1.0):
+    # **先查合法域**:合法域是 (0, 1)——DSR 本身是 [0,1] 的概率。
+    # 顺序很重要:超大 int(如 10**400)传给 `math.isfinite` 会抛 OverflowError
+    # ⇒ 门槛整个炸掉(而不是 fail-closed);而**域比较对大整数是安全的**
+    # ⇒ 10**400 落不进 (0,1) ⇒ 直接返回 0.0(fail-closed)。
+    # 域比较同时挡住了 NaN 与 ±inf(它们与任何数的比较恒为 False)
+    # ⇒ 这里**不需要**再单独查有限性(那一层曾经是不可达的分支)。
+    if isinstance(min_dsr, bool) or not isinstance(min_dsr, (int, float)):
+        return 0.0
+    if not 0.0 < min_dsr < 1.0:
         return 0.0
     try:
         q = _NORM.inv_cdf(min_dsr)

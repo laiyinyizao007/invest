@@ -159,3 +159,19 @@ def test_the_certification_line_survives_a_broken_derivation(monkeypatch):
 
     monkeypatch.setattr(dsr, "expected_max_sharpe", boom)
     assert required_sharpe_for_dsr(50, 600) == 0.0
+
+# ---------- 第 55 轮之十九之补:退化输入必须 fail-closed,不许把异常抛出去 ----------
+
+def test_moments_rejects_a_sample_shorter_than_two():
+    """样本少于 2 个观测 ⇒ 明确报错(而不是算出 NaN 矩)。"""
+    with pytest.raises(ValueError):
+        moments([0.01])
+
+
+def test_an_absurd_return_series_fails_closed_instead_of_raising():
+    """荒谬数值(1e200)⇒ 矩计算溢出 ⇒ 必须返回 0.0,不许把异常抛给门槛。
+
+    门槛是「决策的最后一道」:它自己抛异常 = 整个批次中断(而不是把这条毙掉),
+    所以这里钉的是「异常不许冒出去」。
+    """
+    assert deflated_sharpe([1e200, -1e200, 1e200], 50) == 0.0

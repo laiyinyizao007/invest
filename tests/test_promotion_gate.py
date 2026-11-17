@@ -261,24 +261,41 @@ def test_the_cap_matches_the_measured_table_in_the_adr():
     assert suspicious_sharpe_cap(50, 600) == 3.0
 
 
-def test_the_normal_model_sub_window_is_narrow_but_is_not_the_whole_relaxation():
-    """**正态模型内**的那一小段确实很窄(≈0.011),但它**不是**这次改动的全部效果。
+def test_the_normal_model_boundary_is_exactly_the_cap():
+    """**正态矩下,DSR 关卡的下沿就是上限本身** ⇒ 那段区间里正矩候选一个都过不了。
 
-    更正(codex 双轮复核):ADR 原先把这个 0.011 当成「放宽打开的窗口」,
-    那是**错的** —— 真正的打开区间是 (旧上限 3.0, 新上限] ⇒ 宽约 0.1121。
-    0.011 是「候选的收益接近正态时,DSR 自己也在 3.1013 处就顶到 0.95」的那一小段。
-    这条探针把**两个数字**都钉住,免得文档再写错。
+    第 55 轮之十九更正(codex 第 2 轮 Low + 本地复算):
+    早先文档里的「正态模型内的子区间 3.1013–3.1121(宽 0.0108)」是**用了一个忽略
+    DSR 分母的近似式**算出来的(`SR0 + q/√(T−1)`),而真正的 DSR 分母是
+    `√(1 + sr²/2)` ⇒ 真正的正态认证线**恰好等于**上限 ⇒ 那段区间里
+    **正态矩候选一律被 DSR 关毙**(实测:DSR_normal(3.0)=0.9293、DSR_normal(上限)=0.95)。
+
+    ⇒ 这条探针把**更正后**的口径钉死,并顺手钉住「近似式不是判据」这件事。
     """
     from statistics import NormalDist
     from risk.dsr import expected_max_sharpe
 
     n_trials, n_obs = 1000, 600
     upper = suspicious_sharpe_cap(n_trials, n_obs)
-    lower = (expected_max_sharpe(n_trials, n_obs)
-             + NormalDist().inv_cdf(0.95) / math.sqrt(n_obs - 1)) * math.sqrt(240)
-    assert lower < upper, (lower, upper)
-    assert upper - lower == pytest.approx(0.0108, abs=2e-3)   # 正态模型内的窄段
-    assert upper - 3.0 == pytest.approx(0.1121, abs=1e-3)     # 实际打开的区间
+    sr0 = expected_max_sharpe(n_trials, n_obs)
+
+    def normal_dsr(annual: float) -> float:
+        sr = annual / math.sqrt(240)
+        denom = math.sqrt(1.0 + sr * sr / 2.0)      # 正态收益 ⇒ DSR 分母退化
+        z = (sr - sr0) * math.sqrt(n_obs - 1) / denom
+        return NormalDist().cdf(z)
+
+    # 上限处正好顶到 0.95 ⇒ 认证线 = 上限(不是「上限附近」)
+    assert normal_dsr(upper) == pytest.approx(0.95, abs=1e-9)
+    # 打开的区间里,正矩候选的 DSR 全部低于 0.95 ⇒ 一个都过不了 DSR 关
+    for annual in (3.0, 3.05, 3.0582, 3.10, 3.1120):
+        assert normal_dsr(annual) < 0.95, (annual, normal_dsr(annual))
+    # 早先那个「窄段」来自忽略分母的近似式 ⇒ 它**不是**判据(实测 DSR 仍 < 0.95)
+    approx_lower = (sr0 + NormalDist().inv_cdf(0.95) / math.sqrt(n_obs - 1)) * math.sqrt(240)
+    assert approx_lower < upper
+    assert normal_dsr(approx_lower) < 0.95, normal_dsr(approx_lower)
+    # 实际打开的区间(旧上限 → 新上限)宽约 0.1121
+    assert upper - 3.0 == pytest.approx(0.1121, abs=1e-3)
 
 
 def test_the_relaxation_probe_has_discriminating_power(monkeypatch):
@@ -351,19 +368,24 @@ def test_the_newly_opened_band_is_measured_from_the_old_constant():
 def test_a_right_skewed_candidate_can_land_in_the_newly_opened_band():
     """**放行侧**:右偏的候选能落进 (3.0, 3.1121] 这段新打开的区间 ⇒ 通过全部门槛。
 
-    这条把「0.011 不是全局结论」钉成事实:实测这条序列年化夏普 **3.0582**、
-    实测 DSR **0.99999997**(偏度 7.16 ⇒ DSR 分母被压到 0.0877)⇒
+    第 55 轮之十九更正:实测数字按**当前**这条序列重新钉死(偏度 7.1808、
+    峰度 52.5641、DSR 分母 0.08482、年化夏普 3.058191、实测 DSR 0.99999997)⇒
     旧规则(固定 3.0)会毙掉它,新规则放行。
     """
     from risk.dsr import deflated_sharpe, moments
 
     rets = _right_skewed_returns()
-    mean, sd, skew, _kurt = moments(rets)
+    mean, sd, skew, kurt = moments(rets)
     annual = mean / sd * math.sqrt(240)
+    sr = mean / sd
+    denom = 1 - skew * sr + (kurt - 1) / 4 * sr ** 2
     dsr_value = deflated_sharpe(rets, n_trials=1000)
-    assert annual == pytest.approx(3.0582, abs=1e-3)
+    assert annual == pytest.approx(3.058191, abs=1e-6)
+    assert skew == pytest.approx(7.180817, abs=1e-6)
+    assert kurt == pytest.approx(52.564130, abs=1e-6)
+    assert denom == pytest.approx(0.084817, abs=1e-6)
     assert 3.0 < annual <= suspicious_sharpe_cap(1000, 600)
-    assert dsr_value >= 0.95
+    assert dsr_value == pytest.approx(0.99999997, abs=1e-8)
     candidate = replace(GOOD, oos_sharpe=annual, oos_years=600 / 240,
                         n_trials=1000, dsr=dsr_value)
     assert check_gate(candidate) == []
@@ -542,3 +564,93 @@ def test_the_cap_is_always_finite_and_never_below_the_floor(n_trials, n_obs):
     assert math.isfinite(cap), (n_trials, n_obs)
     assert cap >= 3.0, (n_trials, n_obs, cap)
 
+
+
+# ---------- 第 55 轮之十九:codex 第 2 轮(42/50)的四条发现,逐条本地复现后处置 ----------
+
+@pytest.mark.parametrize("bad_dsr_threshold", [0.0, -1.0, -0.5, 1.0, 1.5, 2.0,
+                                                 float("nan"), float("inf"),
+                                                 float("-inf"), 10 ** 400])
+def test_an_illegal_dsr_threshold_does_not_empty_the_dsr_gate(bad_dsr_threshold):
+    """**拦截侧**:DSR 阈值的合法域是开区间 (0, 1);非法 ⇒ 退回默认 0.95。
+
+    实测(codex 第 2 轮 High,本地已复现):`min_dsr = 0.0` 时 `dsr < 0.0` 恒为 False
+    ⇒ **DSR 那一关被整体放空** ⇒ 一条 `dsr = 0.0` 的候选也能全部通过 ⇒ fail-open。
+    `min_dsr = -1.0` 同理。
+    """
+    thresholds = GateThresholds(min_dsr=bad_dsr_threshold)
+    fails = check_gate(replace(GOOD, dsr=0.0), thresholds)
+    assert any("DSR" in f and "0.95" in f for f in fails), (bad_dsr_threshold, fails)
+
+
+@pytest.mark.parametrize("bad_dsr_threshold", [0.0, -1.0, 1.0, float("nan"),
+                                                 float("inf"), 10 ** 400])
+def test_an_illegal_dsr_threshold_does_not_break_the_cap(bad_dsr_threshold):
+    """**同一个问题的另一个答案**:认证线反解也不许被非法阈值炸掉。
+
+    实测:`min_dsr = 10**400` ⇒ `math.isfinite(10**400)` 抛 OverflowError
+    ⇒ 上限计算整个炸掉(而不是 fail-closed)。现在:非法 ⇒ 退回默认 0.95。
+    """
+    cap = suspicious_sharpe_cap(1000, 600, GateThresholds(min_dsr=bad_dsr_threshold))
+    assert math.isfinite(cap), bad_dsr_threshold
+    assert cap >= 3.0, (bad_dsr_threshold, cap)
+
+
+def test_the_dsr_gate_and_the_certification_line_use_the_same_threshold():
+    """**同一个问题只能有一个答案**:上限与 DSR 关卡用**同一份**归一化阈值。
+
+    `min_dsr = 0.5` 在合法域内 ⇒ 两处都按 0.5 走(上限变回兜底 3.0,
+    因为认证线随阈值降低而下移);非法阈值 ⇒ 两处都退回 0.95。
+    """
+    inside = GateThresholds(min_dsr=0.5)
+    assert suspicious_sharpe_cap(1000, 600, inside) == 3.0          # 认证线下移 ⇒ 兜底生效
+    assert check_gate(replace(GOOD, dsr=0.4), inside) != check_gate(replace(GOOD, dsr=0.4))
+    assert any("0.5" in f for f in check_gate(replace(GOOD, dsr=0.4), inside))
+
+    outside = GateThresholds(min_dsr=0.0)
+    assert suspicious_sharpe_cap(1000, 600, outside) == pytest.approx(
+        suspicious_sharpe_cap(1000, 600), abs=1e-12)                 # 退回默认 ⇒ 与默认一致
+
+
+def test_a_dsr_threshold_inside_the_legal_domain_still_takes_effect():
+    """**放行侧**:合法域内的阈值**照旧生效**(阈值可调是 `GateThresholds` 的用途)。"""
+    thresholds = GateThresholds(min_dsr=0.5)
+    assert check_gate(replace(GOOD, dsr=0.6), thresholds) == []
+    assert any("DSR" in f for f in check_gate(replace(GOOD, dsr=0.4), thresholds))
+
+
+@pytest.mark.parametrize("bad_percentile", [150.0, -5.0, 1000.0])
+def test_a_percentage_outside_the_legal_range_is_rejected(bad_percentile):
+    """百分位的合法域是 [0, 100]——`150%` 不可能发生 ⇒ 不许当成「超过随机对照」。"""
+    fails = check_gate(replace(GOOD, random_entry_percentile=bad_percentile))
+    assert any("随机入场分位" in f and "非法" in f for f in fails), (bad_percentile, fails)
+
+
+@pytest.mark.parametrize("bad_trips", [200.5, -5, 0.5, -0.5])
+def test_a_non_integer_or_negative_trade_count_is_rejected(bad_trips):
+    """往返笔数是**计数**⇒ 必须是非负整数(`200.5` 笔不是一笔数)。"""
+    fails = check_gate(replace(GOOD, round_trips=bad_trips))
+    assert any("往返笔数" in f and "非法" in f for f in fails), (bad_trips, fails)
+
+
+def test_an_integral_trade_count_is_still_accepted():
+    """**放行侧**:合法的整数笔数(含整数值浮点)不许被误杀。"""
+    assert check_gate(replace(GOOD, round_trips=200)) == []
+    assert check_gate(replace(GOOD, round_trips=200.0)) == []
+
+# ---------- 第 55 轮之十九之补:布尔字段的合法取值(放行侧) ----------
+
+def test_the_boolean_fields_accept_the_json_style_zero_and_one():
+    """布尔字段除了真正的 `bool`,也接受 **0/1**(JSON 里常见的写法)。
+
+    为什么钉它:把布尔字段收紧到「只认 bool」会**误杀**人手写的指标 JSON
+    (老脚本写的是 1/0 而不是 true/false)⇒ **误杀方向的风险比放宽大**,
+    所以这里用一条**放行侧**探针把「0/1 仍然认」钉死,
+    与「字符串 "False" 不认」那条拦截侧探针成对。
+    """
+    ok = replace(GOOD, data_adjusted=1, parameter_on_plateau=1)
+    assert check_gate(ok) == []
+    off = replace(GOOD, data_adjusted=0, parameter_on_plateau=1)
+    fails = check_gate(off)
+    assert len(fails) == 1
+    assert "未复权" in fails[0]

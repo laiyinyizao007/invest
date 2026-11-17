@@ -131,7 +131,7 @@ def suspicious_sharpe_cap(n_trials: int, n_obs: int,
     if (isinstance(n_trials, bool) or not isinstance(n_trials, int) or n_trials < 1
             or isinstance(n_obs, bool) or not isinstance(n_obs, int)):
         return floor
-    daily = required_sharpe_for_dsr(n_trials, n_obs, t.min_dsr)
+    daily = required_sharpe_for_dsr(n_trials, n_obs, _normalized_min_dsr(t))
     if daily <= 0.0:
         return floor
     annualized = daily * math.sqrt(TRADING_DAYS_PER_YEAR)
@@ -180,6 +180,26 @@ def _safe_threshold(value: object, default: float) -> float:
     return default if v is None else v
 
 
+def _normalized_min_dsr(t: GateThresholds) -> float:
+    """DSR 阈值归一化:合法域是 **开区间 (0, 1)**——DSR 本身是 [0,1] 的概率。
+
+    非法(`≤0` / `≥1` / NaN / inf / 超大 int / 非数)⇒ 退回**默认 0.95**,
+    而不是「取边界值」。为什么这条必须查(codex 第 2 轮 High,本地已复现):
+    `min_dsr = 0.0` 时 `dsr < 0.0` 恒为 False ⇒ **DSR 那一关被整体放空**
+    ⇒ 一条 `dsr = 0.0` 的候选也能全部通过 ⇒ 防线静默失效(fail-open)。
+    `min_dsr = -1.0` 同理;`min_dsr = 0.5` 仍在合法域内 ⇒ 照旧生效
+    (阈值可调是 `GateThresholds` 的用途,但**调整须在看到候选之前确定并记录**,
+    见 `20261109-promotion-gate.md` 的影响一节)。
+
+    **同一个问题只能有一个答案**:门槛判定与认证线反解都用**这一份**归一化值,
+    否则上限按一个阈值算、DSR 按另一个阈值判 ⇒ 两处口径分叉。
+    """
+    v = _as_finite_float(t.min_dsr)
+    if v is None or not (0.0 < v < 1.0):
+        return GateThresholds().min_dsr
+    return v
+
+
 def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> list[str]:
     """返回未通过的条目(中文说明);空列表表示全部通过。
 
@@ -202,7 +222,7 @@ def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> lis
     min_percentile = _safe_threshold(t.min_random_percentile, defaults.min_random_percentile)
     min_stress = _safe_threshold(t.min_stress_sharpe, defaults.min_stress_sharpe)
     min_ci_lower = _safe_threshold(t.min_sharpe_ci_lower, defaults.min_sharpe_ci_lower)
-    min_dsr = _safe_threshold(t.min_dsr, defaults.min_dsr)
+    min_dsr = _normalized_min_dsr(t)
 
     sharpe = _as_finite_float(m.oos_sharpe)
     years = _as_finite_float(m.oos_years)
@@ -255,11 +275,20 @@ def check_gate(m: CandidateMetrics, t: GateThresholds = GateThresholds()) -> lis
         if dd_yuan > max_dd_yuan:
             fails.append(f"最大回撤 {dd_yuan:.0f} 元 > {max_dd_yuan:.0f} 元")
 
-    if trips is not None and trips < min_trips:
-        fails.append(f"样本外往返 {m.round_trips} 笔 < {min_trips}:统计意义不足")
+    if trips is not None:
+        # 业务合法域(不只是有限性):往返笔数是**计数**⇒ 必须是非负整数。
+        # `200.5` 笔不是一笔数;`-5` 笔不是发生过的事。
+        if trips < 0 or not float(trips).is_integer():
+            fails.append(f"样本外往返笔数非法({m.round_trips!r}):必须是非负整数")
+        elif trips < min_trips:
+            fails.append(f"样本外往返 {m.round_trips} 笔 < {min_trips}:统计意义不足")
 
-    if percentile is not None and percentile < min_percentile:
-        fails.append(f"仅超过随机入场对照的 {percentile:.0f}% < {min_percentile:.0f}%:入场信号无明显贡献")
+    if percentile is not None:
+        # 百分位的合法域是 [0, 100];`150%` 不可能发生 ⇒ 不许当成「超过随机对照」。
+        if not 0.0 <= percentile <= 100.0:
+            fails.append(f"随机入场分位非法({m.random_entry_percentile!r}):必须是 0~100 的百分数")
+        elif percentile < min_percentile:
+            fails.append(f"仅超过随机入场对照的 {percentile:.0f}% < {min_percentile:.0f}%:入场信号无明显贡献")
 
     if stress is not None and stress < min_stress:
         fails.append(f"成本翻倍后夏普 {stress:.2f} < {min_stress}:对成本过于敏感")
