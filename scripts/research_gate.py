@@ -76,7 +76,12 @@ def run_gate(*, candidate_cls: type, params: dict, windows: Sequence[Window], ba
     }
     result["diagnosis"] = diagnose(
         {"sharpe": pooled["sharpe"], "maxdd_pct": pooled["max_drawdown_pct"], "maxdd_yuan": pooled["max_drawdown_yuan"],
-         "round_trips": pooled["round_trips"]},
+         "round_trips": pooled["round_trips"],
+         # 第 55 轮之十六:诊断层的「可疑夏普」上限与晋级门槛**同一份口径**
+         # ⇒ 这里必须把门槛用的那两个输入**原样**带过去(从 metrics 里取,
+         # 不另算一份 ⇒ 同一个问题两个答案)。
+         "n_trials": result["metrics"]["n_trials"],
+         "oos_years": result["metrics"]["oos_years"]},
         [p for res in base for p in res.get("trade_pnls", [])] or None,
     )
     return result

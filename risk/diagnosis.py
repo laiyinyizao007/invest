@@ -10,7 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from risk.promotion_gate import GateThresholds
+from risk.promotion_gate import (TRADING_DAYS_PER_YEAR, GateThresholds,
+                                 suspicious_sharpe_cap)
 
 DIMENSIONS = ("drawdown", "trades", "losing_streak", "sharpe")   # 固定顺序,同等严重度时取靠前者
 _SEVERITY = {"fail": 2, "warn": 1}
@@ -76,13 +77,31 @@ def _streak(pnls: Sequence[float] | None, t: DiagnosisThresholds) -> dict:
     return {"level": level, "value": streak, "limit": limit, "note": f"最长连亏 {streak} 笔(上限 {limit})"}
 
 
+def _cap_of(row: Mapping[str, Any], g: GateThresholds) -> float:
+    """「可疑夏普」上限:**与晋级门槛同一份**(`risk.promotion_gate.suspicious_sharpe_cap`)。
+
+    第 55 轮之十六:上限不再是与试验次数无关的常数 ⇒ 诊断层若还用老口径,
+    就会与门槛**报出两个不同的答案**(同一个问题两个答案 ⇒ 迟早只改一边)。
+    行里缺 `n_trials` / `oos_years` 时用**兜底下限**(旧口径)⇒ 诊断偏严 ⇒ 保守。
+    """
+    n_trials = row.get("n_trials")
+    if isinstance(n_trials, bool) or not isinstance(n_trials, int):
+        n_trials = 0
+    years = _num(row, "oos_years")
+    n_obs = 0
+    if years is not None and years > 0:
+        n_obs = int(round(years * TRADING_DAYS_PER_YEAR))
+    return suspicious_sharpe_cap(n_trials, n_obs, g)
+
+
 def _sharpe(row: Mapping[str, Any], t: DiagnosisThresholds) -> dict:
     s = _num(row, "sharpe")
     if s is None:
         return _unknown("缺失 sharpe")
     g = t.gate
-    if s > g.max_suspicious_sharpe:
-        return {"level": "fail", "value": s, "limit": g.max_suspicious_sharpe,
+    cap = _cap_of(row, g)
+    if s > cap:
+        return {"level": "fail", "value": s, "limit": cap,
                 "note": f"夏普 {s:.2f} 高得可疑:先排查前视偏差/过拟合,而不是庆祝"}
     if s < 0:
         return {"level": "fail", "value": s, "limit": g.min_oos_sharpe, "note": f"夏普 {s:.2f} 为负:当前参数亏钱"}

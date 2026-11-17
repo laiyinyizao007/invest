@@ -12,9 +12,12 @@ import math
 from typing import Iterable, Sequence
 
 from risk.dsr import deflated_sharpe
-from risk.promotion_gate import CandidateMetrics, GateThresholds, check_gate
+from risk.promotion_gate import (TRADING_DAYS_PER_YEAR, CandidateMetrics,
+                                 GateThresholds, check_gate)
 
-TRADING_DAYS_PER_YEAR = 240
+# 年化口径**只有一份**:从 promotion_gate 拿(第 55 轮之十六)。
+# 晋级门槛里的「可疑夏普」上限要按同一份口径年化 ⇒ 两处各写一个 240
+# ⇒ 迟早只改一边 ⇒ 同一个问题两个答案。
 DEFAULT_RANDOM_RUNS = 200
 
 

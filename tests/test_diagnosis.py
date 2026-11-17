@@ -71,3 +71,37 @@ def test_missing_fields_are_reported_not_guessed():
     assert levels(d)["drawdown"] == "unknown" and levels(d)["trades"] == "unknown"
     assert d["weakest"] is None                      # unknown 不冒充问题,也不算通过
     assert "unknown" in d["summary"] or "缺失" in d["summary"]
+
+
+# ---------- 第 55 轮之十六:诊断层的「可疑夏普」上限与晋级门槛同源 ----------
+
+def test_the_diagnosis_cap_follows_the_trial_count():
+    """诊断层用**同一份**上限口径:试验次数多时,夏普 3.05 不再被标成「可疑」。
+
+    缺 `n_trials` / `oos_years` 时用兜底下限(旧口径)⇒ 诊断偏严 ⇒ 保守。
+    """
+    row = {**GOOD, "sharpe": 3.05, "n_trials": 1000, "oos_years": 2.5}
+    d = diagnose(row)
+    assert levels(d)["sharpe"] == "ok"                # 上限 3.1121 ⇒ 3.05 不算可疑
+
+    # 同样的夏普,缺输入 ⇒ 落回兜底下限 3.0 ⇒ 判成「可疑」(偏严,保守)
+    d_strict = diagnose({**GOOD, "sharpe": 3.05})
+    assert levels(d_strict)["sharpe"] == "fail"
+    assert d_strict["dimensions"]["sharpe"]["limit"] == 3.0
+
+
+def test_the_diagnosis_reports_the_cap_it_used():
+    """诊断书报出来的 limit 必须就是它**实际用的**那个上限(不是一个写死的 3.0)。"""
+    d = diagnose({**GOOD, "sharpe": 3.5, "n_trials": 1000, "oos_years": 2.5})
+    assert levels(d)["sharpe"] == "fail"             # 3.5 > 上限 3.1121
+    assert d["dimensions"]["sharpe"]["limit"] == pytest.approx(3.1121, abs=1e-3)
+
+    d_few = diagnose({**GOOD, "sharpe": 3.5, "n_trials": 50, "oos_years": 2.5})
+    assert d_few["dimensions"]["sharpe"]["limit"] == 3.0
+
+
+def test_the_diagnosis_reports_a_missing_sharpe_as_unknown():
+    """缺 sharpe ⇒ unknown(不猜),而不是当成 0 或当成可疑。"""
+    d = diagnose({"maxdd_pct": -5.0, "maxdd_yuan": -500.0, "round_trips": 200})
+    assert levels(d)["sharpe"] == "unknown"
+    assert d["dimensions"]["sharpe"]["value"] is None
