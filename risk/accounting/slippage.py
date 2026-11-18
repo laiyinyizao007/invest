@@ -1,0 +1,49 @@
+"""真实滑点对比(资金与成本 ADR 的假设 H1:滑点是主要成本,需逐笔核实)。
+
+比较「下单时的对手盘口价」与成交均价,以最小变动价位计,**对我不利为正**;按成交量加权汇总。
+下单时没有记录盘口价的委托跳过并计数,不猜参照价。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class OrderRef:
+    order_id: str
+    side: str                    # buy / sell
+    reference_price: float | None
+    pricetick: float
+
+
+@dataclass(frozen=True)
+class SlippageRow:
+    order_id: str
+    ticks: float
+    volume: int
+
+
+@dataclass(frozen=True)
+class SlippageReport:
+    rows: list[SlippageRow]
+    skipped: int
+    mean_ticks: float | None
+
+
+def compare(orders: list[OrderRef], fills: dict[str, list[tuple[float, int]]]) -> SlippageReport:
+    rows: list[SlippageRow] = []
+    skipped = 0
+    for o in orders:
+        done = fills.get(o.order_id) or []
+        volume = sum(v for _, v in done)
+        if not volume:
+            continue
+        if o.reference_price is None:
+            skipped += 1
+            continue
+        avg = sum(p * v for p, v in done) / volume
+        diff = avg - o.reference_price if o.side == "buy" else o.reference_price - avg
+        rows.append(SlippageRow(o.order_id, diff / o.pricetick, volume))
+    total = sum(r.volume for r in rows)
+    mean = sum(r.ticks * r.volume for r in rows) / total if total else None
+    return SlippageReport(rows, skipped, mean)
