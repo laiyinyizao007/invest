@@ -44,7 +44,7 @@ from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status  # noqa: E402
 from vnpy.trader.engine import MainEngine  # noqa: E402
 from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK, EVENT_TRADE  # noqa: E402
-from vnpy.trader.object import OrderRequest, SubscribeRequest  # noqa: E402
+from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest  # noqa: E402
 from vnpy.trader.utility import round_to  # noqa: E402
 
 import cancel_all_orders  # noqa: E402
@@ -118,6 +118,7 @@ class Ctx:
     alerts: list[dict] = field(default_factory=list)
     failed_steps: list[str] = field(default_factory=list)      # 抛了异常的步骤:证据不完整,main 据此返回崩溃码
     trades: list = field(default_factory=list)
+    sent_orders: list[str] = field(default_factory=list)    # 本轮发出的全部委托号:收尾兜底要连「还没回报」的一起撤
     notifier: object | None = None
     pump: Callable[[], None] = lambda: None       # 测试里用来推进定时器;真实运行里定时器自己在跑
     sleep: Callable[[float], None] = time.sleep
@@ -310,7 +311,24 @@ def make_req(ctx: Ctx, *, direction=Direction.LONG, offset=Offset.OPEN, price: f
 
 def send(ctx: Ctx, req: OrderRequest) -> str:
     """经风控链发单(与实盘路径一致);被本地风控拦下时返回空串。"""
-    return ctx.main_engine.send_order(req, ctx.gateway_name)
+    oid = ctx.main_engine.send_order(req, ctx.gateway_name)
+    if oid:
+        ctx.sent_orders.append(oid)
+    return oid
+
+
+def cancel_request_of(ctx: Ctx, vt_orderid: str) -> CancelRequest:
+    """撤单请求:本地有这笔委托就用它的;还没收到回报就按委托号构造。
+
+    委托回报是异步的,刚发出的单本地可能还查不到 —— 查不到也必须能撤
+    (2026-11-18 国信实测:查不到就不撤,演示单一直挂到收尾)。CancelRequest 要的是网关内的
+    orderid(去掉 `CTP.` 前缀),带前缀去撤会在 vnpy_ctp 里解析失败(见 drill._cancel_order)。
+    """
+    order = ctx.collector.order_of(vt_orderid)
+    if order is not None:
+        return order.create_cancel_request()
+    raw_id = vt_orderid.split(".", 1)[1] if "." in vt_orderid else vt_orderid
+    return CancelRequest(orderid=raw_id, symbol=ctx.contract.symbol, exchange=ctx.contract.exchange)
 
 
 def cancel_and_note(ctx: Ctx, vt_orderids: list[str], lines: list[str]) -> list[str]:
@@ -341,15 +359,18 @@ def cancel_active(ctx: Ctx, vt_orderids: list[str]) -> list[str]:
     只能靠整轮结束时的 final_safety 兜底)。
     本地**查不到**的委托号也算「撤不掉」:查不到不等于已平,状态未知就当还挂着。
     """
+    # 先等回报:刚发出的委托本地可能还查不到(异步回报),此时撤单会被跳过(2026-11-18 国信实测)。
+    if vt_orderids:
+        ctx.wait_until(lambda: all(ctx.collector.order_of(o) is not None for o in vt_orderids), ctx.cancel_wait)
     for oid in vt_orderids:
         order = ctx.collector.order_of(oid)
-        if order is not None and order.is_active():
-            ctx.main_engine.cancel_order(order.create_cancel_request(), ctx.gateway_name)
+        if order is None or order.is_active():          # 仍查不到 ⇒ 按委托号撤(状态未知就当还挂着)
+            ctx.main_engine.cancel_order(cancel_request_of(ctx, oid), ctx.gateway_name)
 
     def all_terminal() -> bool:
         for oid in vt_orderids:
             order = ctx.collector.order_of(oid)
-            if order is not None and order.is_active():
+            if order is None or order.is_active():
                 return False
         return True
 
@@ -786,9 +807,10 @@ def step_threshold(ctx: Ctx, book: Book, dup: dict) -> None:
                     # 留着会让人以为它改变过结论(2026-11-16 codex 复核 L1)。
                     pass
             if need_cancel and a:
-                order_a = ctx.collector.order_of(a)
-                if order_a is not None:
-                    ctx.main_engine.cancel_order(order_a.create_cancel_request(), ctx.gateway_name)
+                # 委托回报是异步的:刚发完单本地可能还查不到这笔委托,此时撤单请求根本发不出去,
+                # 撤单计数不推进 ⇒ 本项只能 SKIP(2026-11-18 国信实测)。先等回报到达再撤。
+                ctx.wait_until(lambda: ctx.collector.order_of(a) is not None, ctx.cancel_wait)
+                ctx.main_engine.cancel_order(cancel_request_of(ctx, a), ctx.gateway_name)   # 回报仍没到也按委托号撤
                 cancelled = ctx.wait_until(lambda: ctx.collector.order_of(a) is not None and not ctx.collector.order_of(a).is_active(),
                                            ctx.cancel_wait)
                 final = ctx.collector.order_of(a)
@@ -1212,6 +1234,8 @@ def step_counter_errors(ctx: Ctx, book: Book) -> None:
             continue
         ts, since = time.monotonic(), ctx.collector.error_index()
         oid = gateway.send_order(req)
+        if oid:
+            ctx.sent_orders.append(oid)          # 收尾兜底要能看到它(哪怕一直没回报)
         order = ctx.collector.wait_order_final(oid, timeout=8.0) if oid else None
         text = ctx.collector.wait_error(ts, timeout=5.0, since=since)
         ok = bool(text) and (not expect or expect in text)
@@ -1541,6 +1565,12 @@ def final_safety(ctx: Ctx) -> list[str]:
         active = list(ctx.main_engine.get_all_active_orders())
         for order in active:
             ctx.main_engine.cancel_order(order.create_cancel_request(), order.gateway_name)
+        # 引擎的活动委托表也是靠异步回报填的:本轮发出、但还没收到回报的委托不在表里,同样要撤。
+        unseen = [o for o in ctx.sent_orders if ctx.collector.order_of(o) is None]
+        if unseen and ctx.contract is not None:
+            for oid in unseen:
+                ctx.main_engine.cancel_order(cancel_request_of(ctx, oid), ctx.gateway_name)
+            notes.append(f"⚠ 收尾:{len(unseen)} 笔委托未收到回报({', '.join(unseen)}),已按委托号发出撤单,请人工核对柜台")
         if active:
             ctx.wait_until(lambda: not list(ctx.main_engine.get_all_active_orders()), FINAL_CANCEL_WAIT)
             left = len(list(ctx.main_engine.get_all_active_orders()))

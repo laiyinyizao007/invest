@@ -2145,6 +2145,7 @@ def test_a_demo_order_without_a_final_report_is_flagged_as_may_hang_at_the_count
     ⇒ 演示单可能还挂在柜台上 ⇒ 摘要必须带这条提示。
     """
     env.gw.mode = "silent"
+    env.gw.cancel_works = False      # 连撤单也没有回报(否则按委托号兜底撤单会拿到「已撤销」)
     bt.step_threshold(env.ctx, env.book, {"ok": True, "lines": []})
     p31 = item(env, "P3.1")
     lines = [ln for shot in p31.shots for ln in shot.lines]
@@ -2355,3 +2356,64 @@ def test_items_without_orders_do_not_subscribe(env, monkeypatch, item):
         monkeypatch.setattr(bt, name, lambda *a, _n=name: calls.append(_n) or {})
     bt.run_steps(env.ctx, env.book, only={item})
     assert "step_market" not in calls
+
+
+def test_cancel_metric_waits_for_the_order_ack_before_cancelling(env):
+    """委托回报是异步的:发单后立刻撤单时本地可能还查不到这笔委托 ⇒ 撤单请求根本没发出去,
+    撤单计数不推进,4.1 记 SKIP(2026-11-18 09:46 国信实测:委托 _3 直到收尾才撤)。必须先等回报再撤。"""
+    _lag_first_acks(env)
+    dup = bt.step_duplicate(env.ctx, env.book)
+    bt.step_threshold(env.ctx, env.book, dup)
+    cancel_shot = next(s for s in item(env, "P3.1").shots if s.label == "撤单总笔数")
+    assert "已撤销该委托,累计撤单数达到阈值" in cancel_shot.lines, cancel_shot.lines
+
+
+def _lag_first_acks(env):
+    """每笔委托的首个回报晚一个事件循环才到(真实 CTP 是异步回报)。返回被扣住的回报队列。"""
+    held: list = []
+    seen: set[str] = set()
+    real_on_order = env.gw.on_order
+
+    def lagging_on_order(order):
+        if order.orderid not in seen:
+            seen.add(order.orderid)
+            held.append(order)
+            return
+        real_on_order(order)
+
+    env.gw.on_order = lagging_on_order
+    real_pump = env.ctx.pump
+
+    def pump_and_flush():
+        while held:
+            real_on_order(held.pop(0))
+        real_pump()
+
+    env.ctx.pump = pump_and_flush
+    return held
+
+
+def test_cancel_active_waits_for_late_acks_then_cancels(env):
+    _lag_first_acks(env)
+    oid = bt.send(env.ctx, bt.make_req(env.ctx, price=2200.0))
+    assert oid and env.collector.order_of(oid) is None          # 回报还没到
+    assert bt.cancel_active(env.ctx, [oid]) == []
+    assert env.collector.order_of(oid).status == bt.Status.CANCELLED
+
+
+def test_cancel_active_sends_a_fallback_cancel_when_the_ack_never_arrives(env):
+    """回报一直不到:仍要按委托号发撤单(不能因为本地查不到就不撤),并把它报为撤不掉。"""
+    env.gw.mode = "silent"
+    env.gw.cancel_works = False
+    oid = bt.send(env.ctx, bt.make_req(env.ctx, price=2200.0))
+    assert bt.cancel_active(env.ctx, [oid]) == [oid]
+    assert [r.orderid for r in env.gw.cancel_requests] == [oid.split(".", 1)[1]]
+
+
+def test_final_safety_also_cancels_orders_the_engine_has_not_seen_yet(env):
+    env.gw.mode = "silent"
+    env.gw.cancel_works = False
+    oid = bt.send(env.ctx, bt.make_req(env.ctx, price=2200.0))
+    notes = bt.final_safety(env.ctx)
+    assert oid.split(".", 1)[1] in [r.orderid for r in env.gw.cancel_requests]
+    assert any("未收到回报" in n for n in notes), notes
