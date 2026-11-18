@@ -47,6 +47,29 @@ def test_equity_read_skips_corrupt_lines_and_counts_them(tmp_path):
     assert len(hist.records) == 2 and hist.skipped == 2
 
 
+def test_equity_append_on_a_large_file_only_needs_the_tail(tmp_path):
+    p = tmp_path / "equity.jsonl"
+    lines = [json.dumps({"ts": datetime(2026, 1, 1, 0, 0).replace(minute=i % 60, hour=(i // 60) % 24, day=1 + i // 1440).isoformat(),
+                         "equity": 10000.0 + i}) for i in range(3000)]           # 约 20 万字节,远超 64 KB 的尾部窗口
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    last = eh.last_point(p)
+    assert last is not None and last.equity == 10000.0 + 2999
+    with pytest.raises(ValueError):
+        eh.append(p, last.ts, 1.0)                           # 不递增仍被拒
+    eh.append(p, datetime(2026, 2, 1), 1.0)
+    assert eh.read(p).records[-1].equity == 1.0
+
+
+def test_equity_last_point_falls_back_when_the_tail_is_all_garbage(tmp_path):
+    p = tmp_path / "equity.jsonl"
+    eh.append(p, T, 10000.0)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(("x" * 100 + "\n") * 1000)                   # 尾部 10 万字节全是坏行
+    assert eh.last_point(p).ts == T
+    with pytest.raises(ValueError):
+        eh.append(p, T, 1.0)
+
+
 def test_equity_read_missing_file_is_empty(tmp_path):
     hist = eh.read(tmp_path / "none.jsonl")
     assert hist.records == [] and hist.skipped == 0
@@ -85,6 +108,12 @@ def test_short_round_trip_and_fifo_partial_close():
 def test_close_without_open_is_reported_not_guessed():
     res = at.attribute([fill(T, "long", "close", 2300.0)], FEES, est_slippage_ticks=1)
     assert res.round_trips == [] and len(res.unmatched) == 1
+
+
+@pytest.mark.parametrize("ticks", [-1, float("nan")])
+def test_negative_or_nan_slippage_estimate_is_rejected(ticks):
+    with pytest.raises(ValueError):
+        at.attribute([], FEES, est_slippage_ticks=ticks)
 
 
 def test_unknown_product_fee_is_an_error():

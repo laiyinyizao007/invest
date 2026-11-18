@@ -55,13 +55,41 @@ def read(path: Path | str) -> EquityHistory:
     return EquityHistory(records, skipped)
 
 
+_TAIL_BYTES = 64 * 1024
+
+
+def last_point(path: Path | str) -> EquityPoint | None:
+    """最后一条有效记录。只读文件末尾一段:按分钟写一年约 50 万行,每次追加都整文件重读会越来越慢。
+
+    末尾一段里一条有效行都没有(例如尾部整段损坏)时,退回整文件读取,保证结论与 read() 一致。
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - _TAIL_BYTES))
+        tail = fh.read().decode("utf-8", errors="replace")
+    lines = tail.splitlines()
+    if size > _TAIL_BYTES:
+        lines = lines[1:]                       # 第一行可能被截断
+    for line in reversed(lines):
+        if line.strip():
+            point = _parse(line)
+            if point is not None:
+                return point
+    full = read(path).records
+    return full[-1] if full else None
+
+
 def append(path: Path | str, ts: datetime, equity: float) -> None:
     if not _finite_number(equity):
         raise ValueError(f"权益必须是有限数值:{equity!r}")
     path = Path(path)
-    hist = read(path)
-    if hist.records and ts <= hist.records[-1].ts:
-        raise ValueError(f"时间必须严格递增:{ts} <= 上一条 {hist.records[-1].ts}")
+    last = last_point(path)
+    if last is not None and ts <= last.ts:
+        raise ValueError(f"时间必须严格递增:{ts} <= 上一条 {last.ts}")
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps({"ts": ts.isoformat(timespec="seconds"), "equity": float(equity)}) + "\n"
     with open(path, "a", encoding="utf-8") as fh:          # 单次写入一整行并落盘

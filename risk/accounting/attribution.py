@@ -76,6 +76,8 @@ def _cost(symbol: str, costs: dict[str, ProductCost]) -> ProductCost:
 
 def attribute(fills: list[Fill], costs: dict[str, ProductCost], *, est_slippage_ticks: float,
               calendar: TradingCalendar | None = None) -> Attribution:
+    if not (math.isfinite(est_slippage_ticks) and est_slippage_ticks >= 0):
+        raise ValueError(f"估计滑点必须是非负有限数(负数会把成本变成利润):{est_slippage_ticks!r}")
     out = Attribution()
     books: dict = defaultdict(deque)          # (symbol, side) -> deque[[price, remaining]]
     for f in sorted(fills, key=lambda x: x.dt):
