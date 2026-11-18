@@ -6,6 +6,15 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **交易日历与统一交易时段**(Issue [#54](https://github.com/laiyinyizao007/invest/issues/54),阶段 F-a 的 M1;
+  计划 `docs/plans/20261117-live-readiness-modules-plan.md`)。新增 `risk/sessions.py`(仅标准库)、入库的
+  `config/trading_calendar.json` 与生成脚本 `tools/build_trading_calendar.py`。此前仓库有 7 份互相矛盾的时段/交易日定义,
+  且**没有节假日表**(节前无夜盘无人知晓);本模块建立单一来源,把旧定义改为调用它属于 F-b(待 PR #20/#25 合并后接线)。
+  - 日历来自 AKShare 新浪 A 股交易日历(国内期货与证券交易所休市安排一致),离线生成入库,运行时不联网、不依赖第三方库;
+    生成时校验周末不得为交易日、完整年份交易日数在 230~255,且只许延长覆盖、改动已有日期需 `--allow-changes`。
+  - 区间外日期一律「未知」(fail-closed);覆盖结束前 30 天告警。**当前覆盖到 2026-12-31**,2027 年安排公布后需重新生成。
+  - 夜盘由日历推导:D 日有夜盘 ⇔ D 是交易日且与下一个交易日之间只隔普通周末;20:00 起归入下一日再顺延到交易日。
+  - 时段表只录 C、MA(DCE/CZCE 商品:日盘 9:00–10:15、10:30–11:30、13:30–15:00,夜盘 21:00–23:00),表外品种报错。
 - **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
   (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。
   自愈层用**用户级守护进程**(每 10 分钟 `ensure`;Windows 计划任务注册被拒 `0x80070005 Access Denied`),
