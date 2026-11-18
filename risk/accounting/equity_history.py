@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -90,13 +91,21 @@ def append(path: Path | str, ts: datetime, equity: float) -> None:
 
 
 class EquityWriter:
-    """高频追加用:打开时整文件读一次,之后内存缓存最后时间。单写者(见模块说明)。"""
+    """高频追加用:打开时整文件读一次,之后内存缓存最后时间。
+
+    跨进程靠单写者约定(F-b 由交易进程独占并持进程锁);同进程多线程由内部锁保证「检查 → 写入 → 更新」不交错。
+    `skipped` 是打开时已有文件里被 read() 跳过的行数:大于 0 说明文件曾被损坏或手工改动,调用方应告警。
+    """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
-        self.last = last_point(self.path)
+        hist = read(self.path)
+        self.last = hist.records[-1] if hist.records else None
+        self.skipped = hist.skipped
+        self._lock = threading.Lock()
 
     def append(self, ts: datetime, equity: float) -> None:
-        _check(ts, equity, self.last)
-        _write_line(self.path, ts, equity)
-        self.last = EquityPoint(ts, float(equity))
+        with self._lock:
+            _check(ts, equity, self.last)
+            _write_line(self.path, ts, equity)
+            self.last = EquityPoint(ts, float(equity))

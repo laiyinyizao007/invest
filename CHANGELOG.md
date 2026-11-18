@@ -64,6 +64,8 @@
   新报 1 Medium / 3 Low,复现后修复:封存段台账**内部**区间重叠即 fail-closed;权益历史去掉「只读尾部」的快路径
   (旧位置藏着坏行时与 `read()` 结论不一致),`last_point`/`append` 改为整文件读、与 `read()` 同一规则,高频追加改用新的
   `EquityWriter`(打开时读一次、之后内存缓存,单写者);行情异常值对缺失/类型异常的成交量与时间判坏而不抛异常;滑点对比校验成交明细。
+- **G8 最终复核:codex 45.5/50(质量 9 / 安全 9 / 性能 9 / 架构 9 / 文档 9.5),达到发布线**,无 Critical/High。剩余 Low 中两条已顺手修复
+  (`EquityWriter` 加线程锁、打开时暴露已有文件的损坏行数 `skipped`);单写者须由进程锁落实一条写入计划的「带到 F-b 的事项」。
 - **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
   (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。
   自愈层用**用户级守护进程**(每 10 分钟 `ensure`;Windows 计划任务注册被拒 `0x80070005 Access Denied`),

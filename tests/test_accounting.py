@@ -246,3 +246,26 @@ def test_slippage_rejects_bad_fills():
     for bad in ([(2.0, -1)], [(float("nan"), 1)], [(2.0, 1.5)], [(0.0, 1)]):
         with pytest.raises(ValueError):
             sl.compare(o, {"o": bad})
+
+
+def test_equity_writer_exposes_skipped_lines_and_is_thread_safe(tmp_path):
+    """Low(G8 复核 45.5):打开时暴露已有文件的损坏行数;同进程多线程复用同一个 writer 不会写出乱序。"""
+    import threading
+    p = tmp_path / "equity.jsonl"
+    eh.append(p, T, 1.0)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write("{broken\n")
+    w = eh.EquityWriter(p)
+    assert w.skipped == 1
+    errors = []
+
+    def worker(k):
+        for i in range(50):
+            try:
+                w.append(datetime(2026, 11, 17, 0, 0, 0).replace(minute=k, second=i), float(i))
+            except ValueError:
+                errors.append(1)                       # 不递增被拒是允许的;不允许的是写出乱序
+    threads = [threading.Thread(target=worker, args=(k,)) for k in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert eh.read(p).skipped == 1                    # 只有原来那一行坏行,新写入的全部被 read() 接受
