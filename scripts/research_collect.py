@@ -9,8 +9,11 @@
 
 收菜的**唯一**合法性来源:批准账本 `data/research-control/approvals.json`。
 账本里没有这份字节 → 拒绝。人批准过(账本命中)→ 才谈得上收进 `approved/`。
+**并且账本本身要通过防篡改核对**(哈希链 + 外置锚点)——账本被改写过时,
+「账本命中」什么也证明不了(第 52 轮 codex 第 2 轮 H1)。
 
-四道校验(缺一不可):
+五道校验(缺一不可):
+  0. 批准账本必须**核链通过**(链断 / 回滚 / 截断 / 无链记录 ⇒ 拒绝,fail-closed);
   1. 源文件当前字节的 sha256 **必须在账本里**——收菜不产生批准,只搬运已批准的东西;
   2. 人确认之后**再算一次** sha256,必须仍等于账本里的那份——防「批准后文件被换掉」(TOCTOU);
   3. 写入 `approved/` 之后**复算**目标文件的 sha256,必须仍等于账本里的那份——复制必须逐字节一致;
@@ -45,7 +48,6 @@ from pathlib import Path
 import research_config as rc
 import research_sandbox as rs
 from risk import approval_ledger
-from risk import constitution as const
 from risk.approved_guard import SAFE_FILE_NAME
 
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 2, 3
@@ -113,6 +115,25 @@ def _remove_file(path: Path) -> None:
         pass
 
 
+def _verified_ledger(approvals_file: Path) -> dict:
+    """读批准账本并**核哈希链**(fail-closed),返回 {sha: 记录}。
+
+    **第 52 轮(codex 第 2 轮 H1)**:这里此前用 `approval_ledger.load_approvals`,
+    那份**只解析 JSON、不核链**。于是同一条链上出现了一个缺口:
+    **批准环节核链、收菜环节不核链**——改写过账本(改内容 / 回滚 / 插入 / 删行)
+    仍能把候选收进 `approved/`。收菜是把代码送进「运行时唯一认的目录」的**最后一道关口**,
+    它必须与批准环节(`scripts/research_api.py` 用的是 `rs._load_approvals`)**用同一条读法**。
+
+    核链失败(链断 / 回滚 / 截断 / 多出未经合法写入路径的记录 / 无链字段的旧账本)
+    一律 **fail-closed**:抛 `CollectError`,退出码 2(拒绝),不做任何降级。
+    """
+    try:
+        return rs._load_approvals(Path(approvals_file))
+    except rs.SandboxError as exc:
+        raise CollectError(
+            f"批准账本未通过防篡改核对,拒绝收菜(fail-closed): {exc}") from exc
+
+
 def _atomic_write(target: Path, payload: bytes) -> None:
     """原子写:唯一临时名 + `os.replace`,Windows 上目标被占用时重试。
 
@@ -160,7 +181,7 @@ def collect_job(strategy: str, input_fn=None, write=None, replace: bool = False)
     # 两者可以不是同一份字节——第 1 轮 codex 复核指出过这个缝)。
     raw = source.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
-    ledger = approval_ledger.load_approvals(approvals_file)
+    ledger = _verified_ledger(approvals_file)
     if sha not in ledger:
         raise CollectError(
             f"{source.name} 当前内容没有人工批准记录,拒绝收菜"
@@ -168,7 +189,20 @@ def collect_job(strategy: str, input_fn=None, write=None, replace: bool = False)
 
     # 静态筛查复检:批准时筛过一遍,收菜时再筛一遍(批准与收菜之间文件可能被换过,
     # 而账本命中只保证「这份字节被批准过」,不保证「这份字节符合沙盒规则」)
-    findings = const.screen_source(raw.decode("utf-8", errors="replace"))
+    #
+    # **口径必须与批准/导入路径完全一致**(第 55 轮之二十五,codex 第 2 轮 M3):
+    # 上一版这里用的是 `const.screen_source(...)`——那是**宪法层**的筛查,
+    # **不含**沙盒层的「禁用模块 / 额外禁用调用 / 模块白名单 / 键用法核对」
+    # ⇒ 收菜这道关口比它声称要复检的那道**更窄**(实测:
+    # `const.screen_source("import os")` 返回 `[]`,而
+    # `rs.screen_source("import os")` 会报「禁止导入 os」)
+    # ⇒ 一个只在沙盒层被拦的写法,收菜时**放过去了**。
+    # ⇒ 现在用**同一份调用**(与 `research_api.screen()` / `import_candidate()` 一致)。
+    findings = rs.screen_source(
+        raw.decode("utf-8", errors="replace"),
+        cfg["screening"]["extra_forbidden_modules"],
+        cfg["screening"]["extra_forbidden_calls"],
+        cfg["screening"]["allowed_modules"])
     if findings:
         raise CollectError("静态筛查未通过,拒绝收菜:" + "\n  " + "\n  ".join(findings))
 
@@ -258,7 +292,7 @@ def list_job(write=None) -> dict:
     say = write or (lambda text: print(text, file=sys.stderr))
     entries: list[dict] = []
     if approved_dir.is_dir():
-        ledger = approval_ledger.load_approvals(approvals_file)
+        ledger = _verified_ledger(approvals_file)
         for path in sorted(approved_dir.glob("*.py")):
             sha = approval_ledger.file_sha256(path)
             in_ledger = sha in ledger

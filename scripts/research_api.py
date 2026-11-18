@@ -485,7 +485,48 @@ def import_candidate(path: Path, cls_name: str, sha256: str) -> type:
         # 候选执行期间,受限导入器把会漏的模块换成**代理**(危险属性取不到);
         # `guarded_scope` 退出时无条件还原:宿主机自己的代码不该看到代理
         # (第 10 轮 codex 的 Critical 修复)。
-        with rs.guarded_scope():
+        # `candidate_window`(Issue #31):导入期的审计钩子窗口——白名单里的 numpy/pandas 给出的是
+        # 函数级的写文件/反序列化/起进程能力(np.memmap 写 pickle + pd.read_pickle),名字层规则看不见它们,
+        # 所以在事件层按能力拒。窗口只罩住候选代码真正运行的这一段;框架自己的读写都在窗口外。
+        # 第 40 轮 Medium 4:交易栈的**导入期副作用**必须在候选窗口**之外**发生。
+        # `vnpy.trader.logger` 在**导入期**就会拉起 loguru → colorama → `ctypes.windll.kernel32`
+        # (实测:在候选窗口里导入它会被审计钩子按能力拒掉 `ctypes.dlopen`,报出来的是
+        # `AttributeError: kernel32`——看起来像颜色库坏了,实际上是钩子按能力拒了 ctypes)。
+        #
+        # **实测过的现状(别读成"碰巧")**:窗口打开之前,交易栈其实**早就**被载入了,
+        # 走的是**间接**的两条链——子进程入口的 `from backtest_lib import ...`
+        # (它顶层导了 `vnpy_ctastrategy.backtesting`),以及**上面那行**
+        # `const.snapshot_protected_state()` → `_preload_protected_modules()`
+        # → `strategies.…` → vnpy → logger。两条都是"别的包恰好 import 了 vnpy"的结果。
+        #
+        # 那为什么还要**显式**导一遍?因为上面两条都是**间接**的:哪天子进程入口不再先导
+        # `backtest_lib`,或模板包改成不 import vnpy,窗口内的第一次导入就变成"真·第一次"
+        # ⇒ 被拒,而且**报错点离原因很远**(看起来像颜色库坏了)。
+        # 这里把不变量**显式**钉在开窗口的这一刻,不依赖任何别的包的内部行为——
+        # 这是**纵深防御**,不是"补一个坏掉的洞"。
+        #
+        # 刻意**不用** `importlib.import_module`:那在宪法守卫眼里是"动态导入任意模块"的
+        # 执行入口,会被要求自己成对取快照并比对(这里导的是**写死的两个框架模块**,
+        # 本来就没什么可比的)。写成静态 `import` 语句既表达清楚了"就是这两个",
+        # 也不会让守卫把这里误判成一个裸奔的执行点。
+        #
+        # 导不进去(本机没装交易栈)就跳过——常驻研究进程本来就不许 import vnpy
+        # (见 scripts/backtest_lib.py 的说明),所以这里**只影响真的要跑候选的子进程**。
+        #
+        # **为什么写在 `import_candidate` 里而不是抽成一个函数**:这个不变量绑定的是
+        # "开窗口之前",而开窗口的只有这一处;抽出去就得靠"每个调用方都记得先调它",
+        # 那正是本条要消灭的"碰巧没发生"。研究栈的交易栈 import 只许出现在
+        # `import_candidate` 这个已登记的例外作用域里(见 tests/test_research_boundary.py),
+        # 放在这里**不需要为它新开一个例外**,边界规则一个字都不用改。
+        try:
+            import vnpy.trader.logger              # noqa: F401 - 目的就是它的导入期副作用
+        except Exception:                          # noqa: BLE001 - 没装交易栈就跳过,不是错误
+            pass
+        try:
+            import vnpy_ctastrategy                # noqa: F401 - 同上
+        except Exception:                          # noqa: BLE001
+            pass
+        with rs.guarded_scope(), rs.candidate_window():
             exec(code, module.__dict__)                       # noqa: S102 —— 执行的就是上面校验过的那份字节
     except (Exception, SystemExit) as exc:                     # noqa: BLE001 - 候选自身的错,按结构化错误回传
         # SystemExit 也要兜住:候选在导入期 `raise SystemExit()` 不该让子进程带 traceback 死掉,
@@ -535,7 +576,11 @@ def data_report() -> list:
         out.append({
             "key": key,
             "segments": {seg: [f"{windows[seg][0]:%Y-%m-%d}", f"{windows[seg][1]:%Y-%m-%d}"] for seg in rs.SEGMENTS},
+            # 这条只说"沙盒**不把**测试段喂给候选、也不给候选读库的函数";
+            # 进程内读任意本机文件(含派生 CSV 里的测试段数据)仍未被拦(同进程残余,Issue #29)。
+            # 别把它读成"候选无论如何都看不到测试段"。
             "test_segment_accessible_via_sandbox": False,
+            "test_segment_read_via_local_file": True,
             "test_segment_consumed": consumed,
         })
     return out
@@ -876,6 +921,11 @@ def run_gate_child(args) -> int:
     if args.on_plateau not in ("0", "1"):
         print("--on-plateau 只能是 0 或 1", file=sys.stderr)
         return EXIT_REFUSED
+    # 行情与窗口在候选**导入之前**取定成局部值(Issue #31 D):原先 `load_bars_csv` 在 `import_candidate` 之后,
+    # 候选在导入期若能改写 CSV,框架随后读到的就是被改过的价格("样本外由服务端保证"落空)。
+    # 与评估输入同一个模式:先取定,再让候选运行。
+    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
         cls = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -884,13 +934,12 @@ def run_gate_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = [(w.name, w.valid_start, w.valid_end) for w in wf.build_windows()]
     try:
-        result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
-                          runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
-                          data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
-                          prior_trials=prior_trials)
+        with rs.candidate_window():
+            result = run_gate(candidate_cls=cls, params=params, windows=windows, bars=bars,
+                              runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy, random_runs=random_runs,
+                              data_adjusted=True, on_plateau=args.on_plateau == "1", capital=DEFAULT_CAPITAL,
+                              prior_trials=prior_trials)
     except Exception as exc:
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -912,6 +961,10 @@ def run_evaluate_child(args) -> int:
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    # 行情、窗口、配置在候选**导入之前**取定(Issue #31 D,理由见 run_gate_child)。
+    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    windows = wf.build_windows()
+    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
         candidate = import_candidate(path, args.cls, args.sha256)
     except JobError as exc:
@@ -920,15 +973,13 @@ def run_evaluate_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
-    windows = wf.build_windows()
-    cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
-        result = run_evaluation(
-            candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
-            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
-            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
-            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
+        with rs.candidate_window():
+            result = run_evaluation(
+                candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
+                random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+                min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
+                validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
     except Exception as exc:                  # 含 GridError：声明有问题也是候选自己的问题，作为结果回传
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK
@@ -938,7 +989,8 @@ def run_evaluate_child(args) -> int:
 
 def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
-    from backtest_lib import run_backtest
+    # `vnpy_database_paths` 在**交易侧**模块里(常驻研究进程不许 import vnpy,见 tests/test_research_boundary.py)。
+    from backtest_lib import run_backtest, vnpy_database_paths
     from strategies.instruments import INSTRUMENTS
     try:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
@@ -961,8 +1013,19 @@ def run_child(args) -> int:
     except CandidateError as exc:
         print(CHILD_MARK + json.dumps({"error": exc.detail}, ensure_ascii=False))
         return EXIT_OK
+    # 回测要读 vnpy 数据库(sqlite)。**在窗口之前**由框架先把连接建好(`get_database()` 缓存在模块全局里),
+    # 窗口里的 `load_bar` 等只复用这条已有连接,不再发新的 `sqlite3.connect`——于是窗口里**不需要、也不登记任何 sqlite 路径**
+    # (第 38 轮:登记既不必要,也不解决问题;候选拿活动句柄的入口 `get_database`/`database` 在对象层已不可达)。
+    # 框架自己在窗口里读 vnpy 库(sqlite):peewee 的连接是**惰性**打开的,第一次查询才 connect,
+    # 那次 connect 落在窗口内会被钩子拒(路径在允许目录之外)。所以给"框架读库"一条**窄**豁免:
+    # 只豁免 `sqlite3.connect` 到那个库文件——**只豁免 connect 事件**:连上之后的 SQL 写
+    # (`UPDATE`/`DELETE`/`ATTACH`/`VACUUM`)在事件层发不出带路径的事件,既没被豁免也没被拦;
+    # 候选今天改不动库文件,靠的是**能力层**(sqlite3 模块在危险名单里、库句柄不可达),不是靠这条豁免。
+    # (第 43 轮:原注释写成"不豁免 open/写,候选照样改不动库文件",听起来像这条豁免顺带保证了写不被允许——是错的。)
+    # (候选也拿不到句柄:`get_database`/`database` 在对象层不可达,见 ADR 第 38/39 轮。)
     try:
-        stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
+        with rs.candidate_window(), rs.framework_exempt(sqlite_paths=vnpy_database_paths()):
+            stats, _, trades = run_backtest(strategy_class, params, args.key, start, end)
     except Exception as exc:               # 策略自己的 bug:回传结构化摘要(不含路径),退出码仍为 0
         print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
         return EXIT_OK

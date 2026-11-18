@@ -161,6 +161,11 @@ flowchart LR
 | **进程内执行不受信代码做不到安全** | 候选仍能从第三方模块(如 `numpy`)的**帧**里拿到真实内建——实测确认(Issue #26,ADR 第 22 轮补记);能力隔离(受限内建、按路径的导入裁决)只是纵深防御的**一层**,不是边界。真正的边界是**人工审批 + 容器隔离**;容器一旦改成可写挂载或放开网络,这层就名存实亡 | 高 |
 | **沙盒的 G8 第二轮复核:第 25 轮 31/50、第 26 轮 33/50(同一处代码,两轮都低于 45 的可发布线)** | 第 25 轮 codex CLI 第二轮给 `scripts/research_sandbox.py` 打了 **31/50**、第 26 轮 **33/50**(低于 45 的可发布线,结论都是"禁止发布")。第 26 轮报告里的 Critical 1-3 / High 1,2 / Medium 1,2,3 / Low 1,2,3 已逐条用**动态探针**复现并修复,各配双向回归用例(`tests/test_sandbox_round26_rules.py` 37 条,15 处变异全部被抓到);**但第 26 轮 codex 第二轮复核又报出 2 条 HIGH(linked worktree 下 `.git/config` 根本没进指纹;`__pycache__/*.pyc` 能盖过已核对过的源码)——两条都已在本轮补修并补了回归用例,而补修之后**没有再跑第三轮 codex,新分数未知**。合并前须补这一轮(ADR 第 26 轮补记之二) | **高** |
 | **受信目录的完整性基准要求那个目录在 git 仓库里** | 跨轮次逃逸(Critical 1)的修法是拿**仓库提交**当基准(快照每次重拍,挡不住"上一轮写、这一轮导");取不到基准就 fail-closed 拒掉导入。后果:在**非仓库目录**里跑候选(比如部署机上直接拷一份代码)这条路整体不可用。另外,**容器里 `/app` 只读**这条保护**依赖部署配置**而非代码——谁把 `/app` 改成可写,容器路径就没有提交基准可依(容器里也没有 `.git`)。见 ADR 第 25 轮补记 | 中 |
+| **沙盒的 G8 第二轮复核(第 27~43 轮):第 39 轮 36/50、第 40 轮 34/50、第 43 轮 38/50,均低于 45 的可发布线** | 第 43 轮 codex G8 第二轮给 **38/50**(需改进),分数仍**未达 45 的可发布线**。**本分支已冻结功能改动**——只接受"补规则与用例"的修复,功能性的一律转 Issue #29(候选独立进程 + 只读挂载)。第 40 轮补修三件事:①**规则层**:封住"按名求值的执行器"这一族(`typing.get_type_hints` 实测能读到真环境变量 `ANTHROPIC_AUTH_TOKEN`;`typing.ForwardRef._evaluate` 实测能把真 `PATH` 的值经异常消息带出——载荷藏在字符串字面量里,静态筛查零告警,只有**事件层按触发帧**才判得住;实测过两种"看代码对象"的判据都不成立,已如实记进 ADR);②**守卫层**:守卫自己没守住的形状补上(**冻结正则**与**受保护映射**原先从来没被比对过),危险来源从手写名单改成**派生**(第 39 轮记的"修后 0 个可达"**是错的**,实测仍有 6 项可达);③**一致性层**:两把互不相干的锁合并成一把(并发"批准+重置"能静默丢掉一条已批准记录)、人工重置不许**悄悄**把 N 变小(N 变小 = DSR 分母变小 = 去通胀失效)。**如实登记的残余**:同进程里"按名求值"一族**不可能穷举**;**读侧整体未收口**(`self.load_bar` 能读任意区间含测试段);候选仍能经真 `sqlite3` 写**被豁免**的 vnpy 库文件(与 `framework_exempt` docstring 里"不豁免写"**矛盾**,以本条为准);`window_denials()` **没有生产消费者**。回归用例 `tests/test_fs_capability_closure.py` 增至 **165 条**(第 42~43 轮又加 17 条)。**第 43 轮 codex G8 第二轮 38/50 的 must-close 已逐条收口**(详见下一行),但**分数仍未达 45 的可发布线** |
+| **第 41~43 轮的收口与新登记的残余(锚点无密钥 + 守卫噪音)** | 第 41 轮:一条用例自己会**空转**且是**假绿**(`inspect.getsource` 按行号切块,文件被改写后返回别的函数块 ⇒ 否定式断言看着绿);第 43 轮改成 **AST** 判据。第 42 轮:锁的"重入"必须按**线程**判(第一版按进程,把同进程**另一个线程**的真并发误判成重入,6 线程并发批准用例直接打挂)。第 43 轮(codex 第二轮 **38/50**)逐条收口:**锚点记累计次数**(`<seq> <hash> <total>`)⇒ 删行在**读侧**就 fail-closed、人工重置的"丢了多少次"**精确可算**(此前基准会跟着缩水、"缩小"检不出来、丢失被洗白);**执行器名单按值的来源判**(`typing_extensions.get_type_hints` 此前放行,只是被别的规则兜着);**取不到 `exec` 触发帧 ⇒ fail-closed**;**锁的陈旧判据改成"持有者还在不在"**(此前"年龄到了就抢"会抢活人的锁)且同一把锁**统一口径**(批准路径 60 秒 vs 维护入口 30 秒,锁的是同一个文件);**错误消息按 `reason` 分情形说**(把"重入"说成"被其他进程占用"是**说错话**);**更正 sqlite 豁免的表述**(它只覆盖 connect 事件,连上后的 SQL 写事件层发不出带路径的事件)。**新登记的残余**:**锚点仍无密钥**(账本与锚点都能被同一写权限的人改,本轮把"删行"从完全不可见变成精确可见,但"同时改两边"仍在);**宪法守卫的噪音**(同一处漂移按历史提交重复报、每次重解析全部提交)——新开 **#44** | **高** |
+| **第 44 轮:核心防线套件**在 CI 上一次都没跑过**(闸门配了,但没跑)** | 本 issue 的两份核心套件(`tests/test_fs_capability_closure.py` 165 条、`tests/test_merge_main_sandbox_union.py` 76 条)此前**在 ruff 清单里却不在任何一条 pytest 调用里**——两份文件头的 `import bootstrap` 会拖进 vnpy,研究侧 CI 收集阶段就 ModuleNotFoundError ⇒ **规则再对,不跑就是零**(第 7 轮 codex 的 High 同族)。本轮已接线:守卫式导入 + 逐条 `@requires_trading_stack` + CI 单跑一步 + 两条守卫断言(接线守卫、标记纪律守卫,均做过变异验证)。**残余**:那 32 条需要交易栈的用例在 CI 上仍不跑(**能力收口的另一半在 CI 上没有覆盖**);本轮在 Windows 实测、CI 的 runner 是 Linux;研究侧还有 4 份沙盒规则套件没进 CI(#46);仓库层面仍无跑全套测试的 CI job | **高** |
+| **第 45 轮:维护入口把"链坏了"说成"被其他进程占用"**(第 42 轮修过的那一族,这一边漏了)** | `risk/ledger_admin._ledger_lock` 把**整个临界区**圈在 `try` 里,于是临界区**内部**抛的 `LedgerChainError`(reason=`chain`:锚点写失败/链对不上)也被翻译成"账本被其他进程占用,拒绝维护"——**那句话是错的**:被占用 ⇒ 该稍后重试;链坏了 ⇒ 重试没用,得人工处理。操作员会一直重试、永远出不来。这与第 42 轮在 `scripts/research_sandbox._approvals_lock` 修掉的是**同一个问题**(那一轮只改了沙盒侧)。已修:只翻译"拿不到锁"、临界区内部失败原样抛;两处消息函数把 `occupancy` 从兜底分支里单独拎出来(占用 ⇒ "暂态占用,**请稍后重试**";未知 reason ⇒ 只说"锁获取失败(reason=...)",**不替未知原因编原因**)。**顺带**:此前"默认的 30 秒"是只有不传参的人才用的**暗口径**,现三个调用方都显式传 `stale_seconds`(安全口径,同一把锁必须同值)与 `timeout`(调用方策略,人工维护 5 秒 vs 写入路径 30 秒,**故意不同**)。**残余**:本轮只改消息与口径显式化,**没改任何判定逻辑**,错误仍 fail-closed;第一轮 G8 外部审查(Gemini)因免费配额耗尽 429 **未跑完**,外部意见在第 45 轮缺席,待配额恢复后补跑 | **中** |
+| **第 46~47 轮:CI 接线本身没有守卫,以及合并 main 之后清单失准**(codex 第 2 轮复核 40/50) | **「闸门配好了,实际没跑」的最后一族**:在 `tests/test_fs_capability_closure.py` 顶部加一行 `pytestmark = pytest.mark.skipif(True)`,实测就是 **169 skipped、pytest 退出码 0**,CI 那一步照样绿;当时两条守卫都抓不到(接线守卫只查 workflow 里有没有那行 pytest,标记纪律守卫只看**函数级** decorator,模块级 `pytestmark` 不在视野里)。已补三条守卫(模块级 `pytestmark` 不许有 skip/skipif;除 `@requires_trading_stack` 外不许有任何 `skipif`,`skipif(True)` 与裸 `pytest.mark.skip` 一律拒绝;被标记的用例集合必须与显式名单 `TRADING_STACK_MARKED`(31 条)完全一致),并加 `PLATFORM_SKIPS`(4 条平台差异)逐条写理由;CI 侧再加 `--junitxml` 兜底(从 XML 读 `tests/skipped/failures`,`t==0`/`k==t`/`f>0` 都红——**pytest 的退出码分不出「全跑了」与「全跳过了」**)。**纪律守卫的判据两次收紧**:旧的「候选源码字符串提到 vnpy」会被候选样板满足(实测 88 条只抓住 84 条);第 46 轮换成「对着生产代码核对过的硬依赖」;第 47 轮再收紧为「那次生产入口调用**不能被 try/except 或 pytest.raises 包住**」——被包住说明用例期待的是入口**拒绝**,生产代码里那句 vnpy import 根本没走到(实测那 4 条「样板型」用例在无 vnpy 环境里全绿)。**第 47 轮合并 main 后两条全仓不变量变红**(本分支引入的三个新模块与两个新/改用例不在后果域清单里)⇒ 清单补登 5 条 + 每条配一条变异(**全是收紧,不放松任何防线**)。**残余**:codex 的 M5/M6/M7 本轮未做(M6 属功能改动 → Issue #29);**G8 第一轮外部审查(Gemini)因免费配额 429 仍缺席** | **中** |
 | **受信目录里的字节码缓存(`.pyc`)曾是提交基准的旁路** | 第 26 轮 codex 第二轮实测:提交基准核对的是源码,而 CPython 导入时优先用 `.pyc`(只校验头部里的 mtime+size,候选能伪造)→ 守卫放行、导入机制执行伪造字节码。已修:核对完源码就清掉该 `.pyc`,让导入从刚核对过的源码重新编译。残余:清理与导入之间的极小窗口(多线程候选)、以及只读挂载那一支不做清理(那里不可写,不进清理分支)。见 ADR 第 26 轮补记之二 | 中 |
 | **仓库元数据指纹的覆盖面有限** | 指纹只记 `.git/config`、`.git/info/attributes`(在 **common dir**)与 `HEAD`(在 per-worktree gitdir);`.git/index` 不再记(提交基准从不读它,记它只换来"别人提交一次就全部误杀")。git 二进制已钉死绝对路径、git 子命令有白名单(`rev-parse`/`ls-tree`/`cat-file`)。残余:候选运行期间**别人**提交一次会让 HEAD 变 → 本轮受信导入被 fail-closed 拒掉(方向安全、代价是误杀),见 ADR 第 26 轮补记之二 | 中 |
 
@@ -185,7 +190,11 @@ flowchart LR
   `data/state/approved_promotion.json`(`approved/` 装载的前置,绑定**品种 + 字节 + 那次评估**)。
   写它:`scripts/record_promotion.py --metrics … --sha256 <64位> --run-id <评估run_id>`;
   品种从那次评估的结果文件里取。**今天没有任何候选过门槛 → 装载门记录不存在 → 那条路关着。**
-- 批准目录与收菜(阶段四 4a 收尾 + 4c 前置,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34)):`risk/approval_ledger.py`(批准账本**只读**访问;写入口唯一在 `research_sandbox.record_approval`)、`risk/approved_guard.py`(从 `approved/` 装载策略:位置/授权/合规/同一性四道校验 + 第四层指纹比对)、`scripts/research_collect.py`(收菜 CLI,本机交互式终端触发,**网关 import 不到**)、`scripts/decoupling_drill.py`(断耦演练)。运行时侧:`trading/runtime.py` 的 `RuntimeConfig.approved_file` 等四项(全为 `None` 时行为与从前完全一致)与 `scripts/run_headless.py` 的 `--approved` 等四个参数。见 ADR `20261115-approved-sandbox-closure.md`。
+- 批准目录与收菜(阶段四 4a 收尾 + 4c 前置,Issue [#34](https://github.com/laiyinyizao007/invest/issues/34)):`risk/approval_ledger.py`(批准账本**只读**访问;写入口唯一在 `research_sandbox.record_approval`;
+      注意**读**这一半**不核哈希链**——核链的是**研究侧**的读法(`research_sandbox._load_approvals`;
+      批准 `research_api.py` 与**收菜 `research_collect.py`** 都走它——第 52 轮起收菜也核链了),
+      仍不核链的是**运行侧**那条(`risk/approved_guard.py` 装载时的那次读),
+      两者口径的差异已登记在 ADR `20261113-evolution-engine` 第 51/52 轮与 Issue #29)、`risk/approved_guard.py`(从 `approved/` 装载策略:位置/授权/合规/同一性四道校验 + 第四层指纹比对)、`scripts/research_collect.py`(收菜 CLI,本机交互式终端触发,**网关 import 不到**)、`scripts/decoupling_drill.py`(断耦演练)。运行时侧:`trading/runtime.py` 的 `RuntimeConfig.approved_file` 等四项(全为 `None` 时行为与从前完全一致)与 `scripts/run_headless.py` 的 `--approved` 等四个参数。见 ADR `20261115-approved-sandbox-closure.md`。
 - DSH 研究入口与带外批准(Issue [#22](https://github.com/laiyinyizao007/invest/issues/22),ADR `20261113-dsh-research-entry-and-out-of-band-approval`):`tools/research_mcp/server.py`(MCP 服务,只有 `start_research`/`research_status`/`request_approval` 三个工具,经毕昇开放 API 编排)、`scripts/research_approval_server.py`(**只监听 127.0.0.1 的一次性批准网页,批准记录的两个合法入口之一**;低层写入者只有 `research_sandbox.record_approval`,另一个入口是等价 CLI `research_api approve/review`);人输入候选文件**完整 64 位 sha256** 才写,后端自己重算哈希并把**刚核对过的那个哈希**写进账本,页面源码经 `dashboard/safe.scrub_text` 脱敏并标为不可信数据)、`tools/research_mcp/dsh-research-preset.patch.yml`(DSH `research` Preset 模板,只挂 persona 与该 MCP,不含任何文件读写/命令/网页/子 Agent 工具)、`scripts/research_console.py`(研究侧 CLI 的 stdout/stderr 重配成 utf-8 + `errors="replace"`;原先这项是 `import bootstrap` 的副作用带来的,研究侧不 import bootstrap 后就丢了,Windows 的 cp1252 控制台会直接把中文输出打成 `UnicodeEncodeError`)、`requirements-research.txt`(MCP SDK 与交易环境隔离;该文件**不是**完整运行环境——需要 vnpy 的**只有回测子进程**,筛查/批准/编排/网关/MCP 都是纯 AST 与标准库,隔离的含义是「mcp 不装进交易 venv / 交易镜像」)。**模型只能请求批准,不能授予批准**:批准页地址与 sha256 **不进模型可见的任何通道**,四层防线(网关响应剥掉哈希 / 毕昇 tip 模板不回显工具输出与批准命令 / CLI 的 stdout 不返回值哈希 / MCP 输出再脱敏);**本机绝对路径同样不出模型通道**(网关的清洗收在 `handle` 的**唯一出口** `_scrub`——`_data`/`_candidates`/三种 `view`/`_results`/`_feedback` 五条出口一个不漏;散落在各端点就会漏,漏一条等于边界没守住;MCP 侧 `redact_for_model` 一并盖掉),**批准页地址连磁盘都不落盘**(批准进程自己开浏览器,URL 只活在它的内存里;此前写 `.local/research-mcp/approval-page.txt` 的做法依赖「模型没有本地文件工具」这个未经验证的前提,已废止);候选名以文件系统增量为准(不以模型散文为准);**没有进行中的研究时不得请求批准**(否则模型能把候选目录里任意旧文件推给人批);批准须由人在交互式终端或浏览器完成(非 TTY 拒绝,页面 POST 须带浏览器来源标记——它只挡跨站浏览器 CSRF,挡不住本机程序;真正的屏障是 192 位一次性 URL 令牌 + 页面 CSRF 令牌 + 完整 64 位哈希,脱敏不可用则 fail-closed);无人值守连续迭代(4c)仍不开。毕昇工作流 `1194f8540b9944fea4353b07f0493cbf` 已用改后的 `build_v3.py` 重建(tip 模板不再回显哈希与批准命令)。CI 关卡 `.github/workflows/research-guard.yml`:全仓库 compileall(告警即失败)+ 研究侧 ruff + **研究侧测试(含边界不变量)**,**不安装交易环境**也能跑——研究栈已与交易栈解耦(窗口常量抽到 `scripts/segment_windows.py` 纯数据模块,`scripts/segment_ledger.py` 不再 import bootstrap),需要 vnpy 的用例在没有交易栈时**跳过**而不是失败;闸门**分两步**跑(先单跑边界不变量那一份,再跑其余):同一个 pytest 调用里只要有一个文件在收集阶段报错,整轮就中止、**一个测试都不会跑**;**网关的 `_feedback` 会返回现存候选名**(不含路径、不含源码),供工作流续跑时避让同名(同名会让毕昇把 409 变成 `api_call_fail` 并中止整条工作流);**模型可见通道的脱敏连自由文本也盖**:任意 64 位十六进制串与批准命令行都替换为占位符(不只剥 `sha256` 形状的键),路径脱敏另覆盖 UNC / `\\?\` 扩展长度 / 单段 POSIX 绝对路径;清洗已收成**共享内核** `research_sandbox.scrub_text`(网关、MCP、CLI 三侧共用),并新增**凭据形态**规则(密钥赋值 / `Authorization:` 头 / `Bearer` / `CTP_*`)与批准页 URL 形态;**CLI 的 stdout 同样是模型可见通道**,统一过 `rs.scrub_model_visible`(交互提示语与哈希只在 stderr);**候选的静态筛查用能力白名单而不是模块黑名单**(黑名单漏了 `zipfile` 这类「自己 import 了 os」的模块,候选一句 `import zipfile` 就能拿到 `zipfile.os.system`),另加「取模块危险属性(`X.os`)」的静态规则——**这是纵深防御,不是沙盒**:候选仍以当前用户权限运行,真正的硬保障是「人读过源码 + 批准带外」;**第 9~10 轮的边界收紧**:能力白名单自身会泄漏 `os`/`sys`(实测 `statistics.sys`、`enum.sys`、`random._os`、`collections._sys`、`dataclasses.inspect`、`pandas.io.pickle` 等),候选一句 `import statistics` + `statistics.sys.exit()` 就能逃出沙盒而筛查零告警——现为**静态层(任意深度属性链 + `from X import os` 形态)+ 运行期(`_GuardedModule` 代理挡住危险属性、`guarded_scope()` 退出时恢复原模块)+ 配置准入审计**三道防线;清洗内核补齐 `Authorization: Bearer` 与 JSON 形态 `CTP_*` 两种凭据形态(顺序:赋值 → Bearer → 头 → CTP);CI 关卡升到 **python 3.12**(3.11 上 `-W error::SyntaxWarning` 对无效转义只是 DeprecationWarning,是空操作),compileall 覆盖 `dashboard`/`notify`/`risk` 等研究闭包目录,新增 `concurrency` 组;MCP 侧「不许写 approvals」改为与边界测试**共用同一个 AST 判定器**(原先是子串匹配),Preset 结构断言 key 与 value 都扫;新增固定路径负向用例、「常驻研究进程不得 import 交易栈」的 AST 不变量、批准写入者按引用计数判定;研究侧测试共 **566 项**(模拟 CI 无交易栈时 **546 通过 + 20 跳过**),**G8 双轮评审第 2~16 轮(第 15 轮中断、无报告)均未达 45/50 的发布线**(最新第 16 轮:A 38/50 与 B 40/50);**第 11 轮的边界收紧**:①静态层认得「异常回溯帧」这一类逃逸(`e.__traceback__.tb_frame.f_globals` 指向 numpy 内部帧的**真全局命名空间**,上一轮筛查**零告警**)——`__traceback__`/`tb_frame`/`f_globals`/`__globals__`/`__code__` 等一律进禁用名单(裸名 + 字符串 + 模板形态),单下划线私有属性也按能力入口判,**运行期**那一半(代理不包裹函数与类)仍需靠容器隔离(4b/4c)兜底;②MCP 侧补上**按值**脱敏(原先只有网关有,「网关盖住、MCP 不盖」就是一条漏的通道);③`redact_paths` 盖住 JSON/repr 形态的 Windows 路径(原先泄露盘符 + 用户名 + 文件名)且不再误伤正则字面量;④边界测试的三个 walker **收敛成一个带作用域栈的**——原先「例外函数只被 `*_child` 调用」那条断言**空转**(`_call_sites` 对整个 `research_api.py` 返回 0 个调用点),复合语句里的 import 与调用根本看不见;⑤动态导入(`importlib.import_module`/`__import__`)也纳入不变量;⑥Preset 白名单的两个通用分支补上 7 条参数化负向用例(原先一次都没被走到);⑦CI 第二步加 `--continue-on-collection-errors`,宪法守卫改为只扫 **git 跟踪集**(临时 `.py` 不再把守卫弄红);⑧解耦带出的一处**导入顺序回归**(本分支引入,已修):`tests/test_constitution_round11.py` 与 `round12.py` **合跑**会失败 10 项(`bootstrap 必须先于 vnpy.trader.database 导入`)——这两份用例经 `const.snapshot_protected_state()` 预加载 `vnpy_ctastrategy.backtesting`,连带加载了 `vnpy.trader.database`,而「bootstrap 先于它导入」原先是靠 `conftest → segment_ledger → bootstrap` **间接兜底**的,登记文件与交易栈解耦后那层兜底消失;修法是两份文件在导入期显式 `import bootstrap`(不把 bootstrap 塞回 `scripts/segment_ledger.py`,那会把交易栈拖回研究侧),修完合跑 **92 项全过**;另在研究侧边界测试里钉成一条**可跑在研究 CI 上**的 AST 断言(两份文件必须在模块导入期 import bootstrap);**第 12 轮的边界收紧**(A 36/50、B 36/50,均未达 45 的发布线,无新的 Critical):①**本机路径的清洗改成「扫描式」**——原先三条正则各有一个可复现的漏(盘符前紧贴 ASCII 字母时整条绝对路径原样出去、用户目录里带空格的显示名只盖掉前半段导致 **OS 用户名残留**、UNC 主机名不允许空格),现在空格算不算路径的一部分看**它后面的词是不是紧跟分隔符**,路径旁边的句子照旧保留;②**静态层认得「常量拼接」出来的禁用名**(`'{0.__gl' + 'obals__}'` 一行拼接原先即绕过),`FORBIDDEN_SUBSTRINGS` 补齐成 `FORBIDDEN_ATTRS` 的子集;③**CLI 这条模型可见通道补上按值脱敏**(原先只有网关与 MCP 有,「网关盖住、CLI 不盖」就是一条漏的通道);④**私有属性的静态口径与运行期对齐**(`self._state` 这类候选自己的私有字段原先被直接拒掉);⑤清洗规则的三个边界(64 位摘要藏在更长十六进制串里、批准页地址不带 scheme、Cookie 头只隐去第一个值);⑥凭据读不到时在 stderr 留痕(原先是静默降级);⑦交易栈侧的导入顺序改用 `find_spec` 守卫(不再用 `try/except ImportError` 吞异常);⑧CI 关卡:`compileall` 补 `.github`、依赖从 `requirements-research.txt` 装;⑨**如实登记的遗留**:交易栈侧的 92 项宪法回归与 `test_segment_ledger` 在任何 CI job 里都不会执行(研究侧闸门刻意不装交易环境),已用一条**纯 AST 的断言**顶住最关键的导入顺序约束。**第 13 轮的边界收紧**(A 40/50、B 40/50,均未达 45 的发布线,无 Critical / High):①**路径清洗按「段」推进**——带空格的 Windows 路径原先在空格处就断,目录名只盖掉前半段(**OS 用户名残留**),现改为一串「空格 + 不含分隔符的词」连续推进到真正的终止符,`C:\Users\John Doe\file.py` 这类「空格后面还跟文件段」的形态也一并盖掉(另修:新规则曾多吃一个散文词、`\n` 转义被 UNC 规则误判);②**批准写入者判定器补三条取函数的形态**(`rs.__dict__.get(...)` / `.items()` / `import *` 后裸用 `record_approval`),原先都判不出来;③**`file://` 形态的本机路径不再原样出去**;④**CLI 的按值脱敏降级会往 stderr 留痕**(原先静默降级),与 MCP 侧口径一致;⑤**常量折叠再折 `"".join([...])` 与 `bytes` 两种拼法**(纵深防御层变厚,**不是**可利用绕过的封堵);⑥**研究侧闸门不再每个 PR 都红**——第 12 轮把 CI 依赖改成「从 `requirements-research.txt` 装」之后该文件漏了测试需要的 numpy / pandas,现已补上并标注仅测试期需要;⑦**宪法守卫不再 fail-open**(git 视角取不到跟踪集时,退路是扫全文件系统,而不是「判没问题」);⑧**契约测试锁住守卫的「谓词」而不只是「守卫的存在」**——原先「vnpy 须在 bootstrap 之后」那半截恒空转,把 `is not None` 改成 `is None` 断言照样绿;⑨**模块级 import 收集器补齐 `async with` / `match` / `except*`**;⑩**测试数据里不写本机绝对路径**;⑪**残留第 9 条被更正**(原先称 tmp_path 的 PermissionError「本机未复现」,该结论已被实测推翻:本机可复现,但取决于进程拿到的权限,CI 是 Linux 不受影响);⑫**未做并如实登记**:交易栈侧的导入顺序守卫仍散在两个测试文件里,彻底的做法是下沉到一个共享 helper(ADR 残留第 10 条);⑬**数字口径统一重算**——复核期间工作树被并发改动,六处文档的条数当场作废,现已统一为 539 项(519 通过 + 20 跳过),**今后改动测试条数都要重跑一次 collect**(数字随树变)。**第 14 轮的边界收紧**(A 38/50、B 38.5/50,均未达 45 的发布线,无 Critical / High):①**路径清洗的正斜杠形态也按「段」推进**(第 13 轮那条规则只认 `\`,`Path.as_posix()` 写出来的 `C:/Documents and Settings/x.txt` 原先只盖掉前半段,目录名与文件名残留),并给散文里的相对路径留了判据(前一个词像文件名就不算路径的一部分);②**批准写入者判定器认得「变量中转模块字典」**(`_D = rs.__dict__` 之后 `_D["record_approval"](…)` 原先整条漏掉),`rs.__dict__` / `.copy()` / `vars(rs)` / `dict(rs.__dict__.items())` 四种形态都收;③**三条模型可见通道共用同一份「按值凭据清单」**(原先只有 MCP 侧盖毕昇密钥,CLI 与网关只盖网关令牌——而 ADR 写的是「凭据清单也共享」),清单抽成 `research_config.known_secret_values()`,网关侧也改走 `rs.scrub_text`(长度门槛 ≥8 三侧一致);④**路径清洗的四个边界**:中文句末标点进终止符集(不再把「。后面」整句吃掉)、`Users` 目录规则不再多吃散文词、多词段前瞻上限 4 → 8、POSIX 绝对路径带空格也按段推进;⑤**「直接写批准记录」的判定改成调用图口径**(原先是**作用域**口径,拆成两个函数就能绕过去),沿**同文件**的调用链往下追 2 层;⑥**常量折叠再折 `f-string` / `%` / `str.format`**(剩下三种折不出属纵深防御层,已登记为 ADR 残留第 11 条);⑦**四个 import walker 语义统一**并钉上对照用例(把 `except*` / `match` / `async with` 的 import 植入临时文件、断言四个 walker 都看得见)——这条用例当场逮住 `async with` 在 `_module_level_imports` 里的 `AttributeError`;⑧**研究侧不再依赖进程 CWD**:`scripts/segment_ledger.py` 不再 import bootstrap,顺带取消了 bootstrap 的 `os.chdir(ROOT)` 副作用(pytest 会话的 CWD 不再被强制切到仓库根),于是研究栈里不许出现 `os.chdir` / `os.getcwd`、路径锚点必须 `.resolve()` 成绝对路径(**交易侧不受影响**:那边的脚本自己 import bootstrap);⑨**残留第 9 条按实测重写**(原结论与实测相反:「整批 setup ERROR」不是确定现象,本机直接跑全过;原先给的 `--basetemp` 绕法不成立——pytest 对指定的 `--basetemp` 同样执行 `mkdir(mode=0o700)`;「mode 在 Windows 上落成 DACL」经实测不成立);⑩**「仓库里」改成「入库集(git 跟踪集)」**,并把 `find_spec` 守卫的爆炸半径(交易栈装了但装坏 ⇒ 收集阶段中止 ⇒ 整轮一个用例都不跑)如实登记;⑪**数字口径再次重算**——研究侧九份测试共 **566 项**(546 通过 + 20 跳过)。
 - `notify/webhook.py`:非阻塞、带重试、去重、脱敏的 Webhook 通知(generic/feishu/telegram);**落盘待补发队列**(`WEBHOOK_OUTBOX`,默认 `data/state/webhook_outbox.jsonl`):发送最终失败的告警写入 JSONL,网络恢复后补发(【补发】前缀、保留原始时间、积压 INFO 合并成摘要),进程重启后继续。
 - `scripts/segment_ledger.py`、`config/test_segment_usage.json`:测试段使用登记，`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记，重复使用即拒绝（无强制开关）。
@@ -194,7 +203,9 @@ flowchart LR
 
 **风控(纯逻辑在 `risk/`,vn.py 集成在 `trading/`)**
 - `risk/risk_guard.py`:单笔预算闸、只收紧的移动止损、策略层连亏熔断。
-- `risk/promotion_gate.py`:策略晋级门槛(9 条,含 DSR ≥ 0.95),纯函数;`risk/dsr.py`、`risk/trial_ledger.py`:DSR 与试验次数账本(Issue #15)。
+- 候选文件读写能力收口(Issue [#31](https://github.com/laiyinyizao007/invest/issues/31),ADR `20261113-evolution-engine`「候选文件读写能力收口」):`scripts/research_sandbox.py::candidate_window`(候选导入期/运行期的审计钩子,拒写模式 open 越出临时目录、pickle.find_class、进程创建、ctypes/socket;**纵深防御,不是边界**,同进程根因见 #29)、`risk/ledger_chain.py`/`risk/ledger_admin.py`/`scripts/research_ledger.py`(试验账本与批准账本的哈希链 + 外置锚点 `data/ledger_anchor/`,人工 `status|migrate|reset`;**升级后须先 migrate 一次**)。numpy/pandas 不再在候选默认白名单里,经 `screening.allowed_modules` 追加。残余:只拦写不拦读、候选可吞钩子异常、窗口外回调不受限(靠宪法 `__del__` 禁令兜底)、对 fd 的写无审计事件、哈希链无密钥、锚点靠文件名里的 sha256 短哈希而非目录分离。对象层按 `__module__` 判来源,白名单模块的再导出(如 `importlib.import_module`)曾可绕过——已系统性扫描并补规则,升级 vnpy 后须重跑扫描;sqlite3 无 `open` 事件已单独处置;**读侧整体未收口**(显式放行 numpy 后 `np.loadtxt` 仍可读含测试段的派生 CSV;唯一解是 #29 独立进程 + 只读挂载),仍有若干无法裁决的原语(见 ADR)。对象层只判模块成员的来源,**不判函数返回值/实例属性**;库读原语按名字模式收口(模块级成员),引擎/数据库基类不可达(活动数据库句柄因此曾可经 `get_database()` 取得,已按"不给句柄"处置;sqlite 的 ATTACH/VACUUM INTO 事件层判不了)。
+**第 40 轮(codex G8 第二轮 34/50)的补修**:本分支**冻结功能改动**,只补规则与用例。①**"按名求值的执行器"这一族**(对象层 `EVALUATOR_MEMBERS`,规则名 `按名求值的执行器`):候选不需要 `eval` 本身,只要能调用一个**替它按名字求值**的函数,那个函数命名空间里的**真内建**就等于递到了候选手上——实测 `typing.get_type_hints` 能读到真环境变量 `ANTHROPIC_AUTH_TOKEN`;`typing.ForwardRef._evaluate`(实例方法,实例可以**不出现 `ForwardRef` 这个名字**就拿到)能把真 `PATH` 的值经异常消息带出。②这一族**静态层看不见载荷**(藏在字符串字面量里,静态筛查零告警),因此加**事件层**判据:`exec` 审计事件按"**谁触发的这次 exec**"判(`FORBIDDEN_EVAL_FRAMES`,规则名 `audit:forward-ref-eval`),静态层另按名字拒 `_evaluate`/`_eval_type`(候选必须写出这个名字才能调它,`getattr`/`type`/`__dict__` 一律已被禁)。实测过两种"看代码对象"的判据(`dis` 末条指令、`co_consts[-1] is None`)**都不成立**,已如实记进 ADR。放行方向已钉住:`typing.Optional["int"]` 只 compile 不 exec、`collections.namedtuple`/`dataclasses`/`enum`/`typing.NamedTuple` 全部照旧跑通。③**守卫自己没守住的形状**:`DATA_PRIMITIVE_PATTERN` 是编译出来的正则、`AUDIT_PATH_MUTATION_EVENTS` 是映射,原先的提取器只认字符串集合 ⇒ 这两种形状**从来没被比对过**;现按**冻结正则**与**受保护映射**登记。④**危险来源改成派生**(第 39 轮"修后 0 个可达"**是错的**,实测仍有 6 项可达)。⑤**两把锁合并成一把**(并发"批准+重置"能静默丢掉一条已批准记录)、人工重置不许**悄悄**把 N 变小(N 变小 = DSR 分母变小)。⑥**导入顺序的不变量写进代码**(候选窗口打开**之前**显式预载交易栈,`import_candidate` 内),并**更正**一条此前的说法:此前记的"它只是碰巧没发生"**不准确**——实测窗口打开之前交易栈**早就**被载入了(经 `backtest_lib` 与宪法的受保护模块预载**间接**载入),显式预载是**纵深防御**、不依赖别的包的内部行为;用例拆成"窗口边界不变式"与"隔离(关掉间接那层)"两条,**第一版那条是空转的**(删掉预载照样绿)。残余见风险表;本轮回归用例 `tests/test_fs_capability_closure.py` 增至 **148 条**(`tests/test_research_sandbox.py` +2、`tests/test_research_api.py` +3);第 42~43 轮又加到 **165 条**。**第 41 轮**:补一条用例自身的守卫——`inspect.getsource` 是**按行号**从磁盘上的当前文件切块的,模块导入之后文件被改写(行号位移)就会返回**别的**源码块,曾让上面那条用例在全量运行里误报(单跑绿、全量红);**不是产品的顺序依赖**。现在断言前先核对"拿到的确实是这个函数的源码块",否则否定式断言会**假绿**。**第 42~43 轮(codex G8 第二轮 38/50 的 must-close 收口)**:①**锁的"重入"按**线程**判而不是按进程**——锁文件里除 PID 外再写一个**每线程**的 token(`threading.local()`);第一版按进程分组,把同进程里**另一个线程**的**真并发**误判成重入并立刻失败,6 线程并发批准的用例直接打挂;同时把"**取锁**失败"与"**临界区内部**的链错误"分开(此前两者都被说成"被其他进程占用",后者那句话是错的)。②**锚点记累计次数**(`<seq> <hash> <total>`):删掉账本中间几行此前**既不改长度也不改哈希链**,读侧看不出来,人工重置的基准还会跟着缩水 ⇒ "缩小"完全检不出来、丢失被洗白;现在读侧 `verify()` 核对前 `seq` 行的 `count` 合计与锚点 `total`,对不上即 fail-closed,人工重置的基准取 `max(文件自称, 锚点记的)`,**丢了多少次精确可算**⇒ 必须 `--add-trials <丢失数>` 补回或显式 `--allow-reduce-n --reason`,重置记录另写 `lost` 与 `anchor_seq`。③**"按名求值的执行器"按**值的来源**判**(`__module__`+`__name__`)——此前只按**访问路径**判,`typing_extensions.get_type_hints`(与 `typing.get_type_hints` 同一个函数对象)放行,它此前只是被"别的规则"兜着才没出事。④**取不到 `exec` 的触发帧 ⇒ fail-closed**(规则名 `audit:eval-origin-unknown`;此前是 fail-open)。⑤**锁的陈旧判据改成"持有者还在不在"**(Windows 用 `OpenProcess`,**不能**用 `os.kill(pid,0)`——那会 TerminateProcess),持有者活着就**哪怕锁很老也不抢**;同一把锁**统一口径**(批准路径此前 60 秒、维护入口 30 秒,锁的却是同一个 `approvals.json.chainlock` ⇒ 统一为 `DEFAULT_STALE_SECONDS = 30.0`)。⑥**错误消息按 `reason` 分情形说**(`occupancy`/`reentrancy`/`permission`/`chain`)——把"本进程同一线程重入"说成"被其他进程占用"是**说错话**。⑦**更正 sqlite 豁免的表述**:那条窄豁免**只覆盖 connect 事件**,连上之后的 SQL 写(`UPDATE`/`ATTACH`/`VACUUM`)在事件层**发不出带路径的事件**;候选今天改不动那个库文件靠的是**能力层**,**不是**这条豁免(#43)。⑧源码断言改成 **AST**(`ast.parse` + 按名字取节点 + `ast.unparse`;注意 `ast.unparse` 把引号归一化成单引号)。⑨实测放行 numpy/pandas 后被对象层拦下的公开成员只有 **3 个**(`numpy.ctypeslib`/`numpy.f2py`/`pandas.errors`)⇒ "过度拦截"的担心**不成立**,已固化成回归扫描用例。本轮 8 项变异全部红。回归用例 `tests/test_fs_capability_closure.py` 增至 **165 条**。**残余**:**锚点仍无密钥**(同时改账本与锚点骗得过读侧;本轮把"删行"从完全不可见变成精确可见)、**宪法守卫的噪音**(同一处漂移按历史提交重复报、每次重解析全部提交)——新开 **#44**、`window_denials()` 无生产消费者(#41)、读侧整体未收口(#42)、sqlite 豁免与写(#43)。**第 44 轮(把核心防线**真的接进 CI**——闸门配了,但从没跑过)**:查 `.github/workflows/research-guard.yml` 的**实际调用面**(不是看注释)发现:本 issue 的两份核心套件(`tests/test_fs_capability_closure.py` 165 条、`tests/test_merge_main_sandbox_union.py` 76 条)**在 ruff 清单里,却不在任何一条 pytest 调用里**——根因是两份都写 `import bootstrap`,而 `scripts/bootstrap.py` 在**导入期**就 `from vnpy.trader.setting import SETTINGS` ⇒ 研究侧 CI(只装 numpy/pandas/mcp/pyyaml)上**整份文件在收集阶段就 ModuleNotFoundError**。这正是第 7 轮 codex 的 High 说过的那句话原样又发生一次("写成了测试,却没有 job 会跑它")。第 40~43 轮修的是"规则对不对",本轮修的是"**规则会不会被跑到**":规则再对,不跑就是零。**修法三步(只改测试与 CI 配置,没动生产代码)**:①`import bootstrap` 改成仓库**既有惯例**的守卫写法(`if importlib.util.find_spec("vnpy") is not None: import bootstrap`,与 `tests/test_constitution_round11.py` 同款,那条惯例旁边本来就有守卫断言在盯谓词没被写反);②需要交易栈的用例**逐条**标 `@requires_trading_stack`(判据 `find_spec("vnpy_ctastrategy")`,**环境驱动**:本机照跑、CI 跳过并打印原因;**漏标记不会被静默吞掉**——没标记又要交易栈的用例在 CI 上会**直接失败**);③CI 里**单跑一步**(收集失败必须整步红,不被 `--continue-on-collection-errors` 吞掉)。**两条守卫断言**放进本来就在 CI 上跑的 `tests/test_research_boundary.py`:**接线守卫**(workflow 里必须有一行 `python -m pytest` 指向这两份套件)与**标记纪律守卫**(标了"需要交易栈"必须直接引用交易栈,或登记在显式清单 `TRADING_STACK_INDIRECT` 并写明理由;不许一刀切整份跳过,也不许多标一条把 CI 覆盖偷掉;清单不许有陈旧条目)。**动态探针**:"需要交易栈的用例集合"是**实测**出来的(先改守卫式导入,在无 vnpy 的干净环境跑,取实际失败集再逐条标记)。**变异验证 2 项全红**:删掉 workflow 里的 pytest 调用 → 红(接线守卫);给一条不依赖交易栈的用例加上标记 → 红(标记纪律守卫)。**验证**:无 vnpy 环境 `test_fs_capability_closure.py` **133 passed / 32 skipped / 0 failed**、`test_merge_main_sandbox_union.py` **74 passed / 2 skipped**(那 2 条要真模块才判得了准入审计);研究侧 CI 的整条命令面(8 份 + 本轮两份)同一环境 **598 passed / 55 skipped / 0 failed**;本机(装了 vnpy)同一批 **327 passed**——**标记一条都没让本地少跑**。**残余**:本轮在 Windows 上实测、CI 的 runner 是 Linux;那 32 条需要交易栈的用例在 CI 上仍然不跑(**能力收口的另一半在 CI 上没有覆盖**);研究侧还有 4 份沙盒规则套件没进 CI(候选源码要 `import strategies` 模板,真需要交易栈)——新开 **#46**;仓库层面仍没有跑全套测试的 CI job。
+**第 45 轮(维护入口把"链坏了"说成"被其他进程占用"——第 42 轮修过的那一族,这一边漏了)**:自查(第一轮外部审查因 Gemini 免费配额耗尽 429 未跑完)里翻出 `risk/ledger_admin._ledger_lock` 把**整个临界区**圈在 `try` 里,临界区**内部**的链错误(reason=`chain`)被说成"被其他进程占用"——**说错话**(被占用⇒该重试;链坏了⇒重试没用)。已修:只翻译"拿不到锁",内部失败原样抛;两处消息函数把 `occupancy` 单独拎出来(占用⇒"暂态占用,**请稍后重试**"),未知 reason 只说"锁获取失败(reason=...)"。**顺带**把 `stale_seconds`(安全口径,同一把锁必须同值)与 `timeout`(调用方策略,人工维护 5 秒 vs 写入路径 30 秒,**故意不同**,不该被抹平)的分工写进代码与 ADR,此前"默认 30 秒"是只有不传参的人才用的**暗口径**,现三个调用方都**显式**传参。**变异验证 5 项全红**(删 occupancy 分支 / 改回整段圈住 / 回到本轮之前的完整原状 / 删沙盒侧分支 / 删显式 `stale_seconds`)。回归用例 `tests/test_fs_capability_closure.py` 增至 **169 条**;`test_research_boundary.py`+`test_merge_main_sandbox_union.py` **162 passed**;全量默认顺序 **3325 passed / 3 failed / 5 errors**(失败与错误全在本分支未触及的 dashboard/drill 既有失败)。**第 46 轮(codex 第 2 轮复核 40/50 的 must-close 收口)**:核心防线的 CI 步骤本身加了守卫(模块级 `pytestmark` 一刀切跳过、裸 `pytest.mark.skip`、未登记的 `skipif`、标记名单与实际不一致,四种都会让 CI 红),并加 `--junitxml` 兜底(「一条没跑」与「全被跳过」都不许绿);标记纪律的判据换成**对着生产代码核对**的版本(不再认候选源码字符串里的 vnpy);求值帧这族规则补了**不经生产入口**的沙盒层用例,在研究侧 CI 上**真跑**(此前覆盖率 0)。回归用例 `tests/test_fs_capability_closure.py` 增至 **171 条**,`tests/test_research_boundary.py` **90 条**。**第 47 轮**:本分支的三个新模块(`risk/ledger_chain.py`/`risk/ledger_admin.py`/`scripts/research_ledger.py`)与两个新/改用例补登进后果域不可降级清单(执行域改动,每条配一条变异);纪律守卫再收紧一层(生产入口的那次调用不能被 `try/except`/`pytest.raises` 包住)。**第 47 轮之三(静态复读翻出来的两处缺陷)**:同一文件里同名函数被定义了**两遍**(弱的那份是死代码,行为正确但离危险很近——动态检查发现不了,只有读文件才看得见);「被包住」的判定漏了 `with raises(...)`(不带 `pytest.` 前缀)与 `except*`(`ast.TryStar` 不是 `ast.Try` 的子类)两种形态,**漏判方向危险**(会让守卫被绕过)⇒ 已补齐,并给这个判定自己加了探针(六种形态)+ 3 条变异(实测 3/3 红)。- `risk/promotion_gate.py`:策略晋级门槛(9 条,含 DSR ≥ 0.95),纯函数;`risk/dsr.py`、`risk/trial_ledger.py`:DSR 与试验次数账本(Issue #15)。
 - `scripts/calc_ladder_eta.py`:梯子式量化的**汇报步长 η** 的标定脚本(阶段 3 前置,纯数据 + 纯统计,不碰交易接口)。η = 1.5 × SE(配对日盈亏差),下限 0.25;在**池化验证段**(2022-07-01 ~ 2023-12-31,n=367 交易日)上用分块自助(块长 5 日,2000 次)标定,SE 中位数 0.7297 → **η = 1.10 夏普**(已登记进 ADR,早于任何候选生成);同一方法在 W1 训练段上得 η = 1.010,相差 8%,说明不是单一窗口的偶然。η 是**汇报阈值**(阶梯何时更新汇报值),**不是晋级门槛**,与 DSR 0.95 互相独立。标定**没有**碰测试段——测试段(2024-01-01 起)全程未触碰。
 - `risk/constitution.py` + `config/immutable_constitution.json`:不可变宪法(Issue #16)——候选能改什么、不能改什么的机器可校验清单。三层防线:提交时的静态 AST 筛查、执行前的运行时类校验、请求时的参数校验;清单文件只能追加(相对历史提交只增不减,由 `.github/workflows/constitution-guard.yml` 保证:`fetch-depth: 0` 拉全历史后逐个历史版本比对;仓库是浅克隆时该检查直接失败而不是跳过),文件缺失/非法即 fail-closed。三个子进程入口统一走 `research_api.import_candidate()`,一处不漏。G8:第 1 轮外部复核无 Critical/High;codex 已审 5 轮,第 4 轮(31/50)的 6 项发现逐条复现后修复并各配了会在修复前失败的测试;**第 5 轮已跑完**(`gpt-5.6-sol` 40.5/50 与另一轮独立复核 `MiniMax-M3` 33/50,两轮都未通过),阻塞项已逐条复现后修复并配了回归测试:①**框架的"按名 setter"绕过**(`self.update_setting(dict(risk_budget=1e12))` 能在三层防线全绿时把单笔风险预算从 300 改成 1e12——模板 `parameters` 里就有四个受保护参数),现整体禁用按名 setter 并拦受保护参数作关键字参数;②**内置保护的历史守卫形同虚设**(`BUILTIN_PROTECTED_NAMES` 是 BinOp,提取器只认字面量,删掉受保护成员后 CI 照样全绿),现改为常量表达式求值 + fail-closed,并把沙盒的三个 deny set 一并纳入;③隐藏子入口只复查了设置字典,`--random-runs`/`--prior-trials`/`--key`/`--segment`/`--file` 现在各自复查(其中 `--prior-trials` 为负会放松 DSR 门槛)。修复后补跑第 6 轮(独立复核 32/50,仍不通过),它又报出一条前两轮都没报出的活绕过 `__builtins__['setattr']`(静态层与沙盒层当时都返回空列表,底线照样从 300 被改成 1e12)——现已修(受禁属性名的裸名与字符串形式一律拒);同一轮还查出**宪法守卫在 CI 上收集即失败**(根 conftest 依赖 vnpy),守卫已抽成独立脚本 `tools/check_constitution_history.py`(只用标准库 + git),CI 直接跑它;三轮复核的发现均已逐条复现后修复并配了回归测试。第 7 轮(codex `gpt-5.6-sol` 与独立复核各一轮)结论不一致:gpt 指出前面封的是**已知写法**而不是**能力**——实测经异常回溯拿到 `frame.f_builtins.setattr`、以及 `unittest.mock.patch.object` 两条都放行(gpt 是对的);现已改为**执行时能力隔离**:候选执行时拿到的内建集合里没有 `setattr`/`getattr`/`eval`/`open` 这些,`__import__` 换成受限导入器,无论怎么绕都改不了实例属性。容器隔离与"运行前由人读过代码"仍是真正的边界。第 8 轮(codex CLI 深度分析,36/50,未通过)又报出两条**实测可复现**的 Critical:①候选可以**调用**模板的风控执行点(`self._send_entry(...)` 绕开了同在 `_try_enter()` 体内的预算与熔断判定),②静态层只看赋值的**末段属性名**,不看整条属性路径(`self.guard.max_losses=999` 让熔断失效、`self.cta_engine.size=0.001` 把回撤缩成 -0 元从而让两道回撤门槛同时失效),两条当时三层校验全绿——现静态层新增**受保护执行点**与**受保护状态对象**清单(引用即拦,连别名与读都不许)、按**整条属性路径**判定,并新增**运行时第三层** `check_instance_state()`:回测跑完之后核对实例上的 `risk_budget`/`atr_window`/`max_daily_losses`/`guard.max_losses`/`cta_engine.size`,不一致即 fail-closed(比对基准是回测开始前的快照)。同轮还修了历史守卫"只守常量不守执行点"、网格与参数层的口径裂缝、`check_params` 不查嵌套、受禁 dunder 名单不全、`__slots__` 漏扫。**第 9 轮(codex CLI 深度分析,34/50,需改进)**又报出一条 Critical:候选可以**改写模块对象上的风控函数**(`import risk.risk_guard as rg; rg.risk_per_trade = lambda *a, **k: 0.0`),四层防线全部放行——静态层按整条属性路径判定在这里失效(路径的根是候选自起的别名),而**枚举写法枚举不完**。现新增**运行期第四层:受保护对象的身份指纹**——候选执行前后各拍一张(`risk`/`strategies`/`vnpy_ctastrategy` 三个受保护包下所有已加载模块的公开属性与每个类的成员;容器取副本、函数与类比身份),被替换/被删除/被往已存在的类上新增成员即 fail-closed;接点在 `import_candidate` 的导入期前后与 `backtest_lib` 两条回测入口的回测前后,且**快照必须预加载模板模块**(否则模板是候选自己 import 的,改写它不被记录)。同轮还修了:`__new__` 早于快照(构造期改写结构性不可见)直接禁掉、ADR 保留字表补全并把 `listed()` 扩展到全部宪法名单、`risk` 包加入禁用模块清单(不含 `strategies`——候选要 import 模板)、历史守卫不再对每个历史版本重复解析当前源码。**第 10 轮(codex CLI 深度分析,37/50,未通过)**又报出一条 Critical 并由本地自查抓到另一条独立 Critical,两条都不是"写法"问题:①第 9 轮的"身份指纹"只比**身份**,而函数对象可以**就地改写**(`within_budget.__defaults__ = (0.0,)` → 单笔风险金额恒为 0,300 元预算形同虚设);②候选可以在**实例**上遮蔽模板方法(`self.get_size = lambda: 0.001` → 合约乘数 10 变成 0.001,预算判定恒真)——两者当时四层防线全部放行。现改为:静态层禁 `__defaults__` 等函数状态 dunder + 新增"不得读风控对象"名单 + `get_size` 进受保护成员;第四层对函数比**状态**(函数对象/`__code__`/默认参数/闭包内容)而不是只比身份;第三层加"实例上不许遮蔽模板方法"、家族判定改按 **MRO**(不再用可被改写的 `isinstance`);指纹的 dunder 覆盖从"跳过全部"改为显式忽略清单;第四层的"回测前"基准前移到构造实例之前;历史守卫新增 `CALL_SITE_REGISTRY` 守第四层的两个接点。**第 11 轮(codex CLI 深度分析,43/50,需改进,不建议发布)**逐条复核了第 9/10 轮的 10 条修复(9 条确认真堵住,1 条只半堵),新报出 2 条 High / 3 条 Medium / 2 条 Low,逐条修复:①**High**:受保护容器只挡"写/取别名"、不挡"变更型方法调用"(`self.am.update_bar(fake_bar)` 四层全绿而回测结果被完全改写),新增容器变更型方法名单(路径经过 `am`/`bg` 且调用变更型方法一律拒,只读调用照常放行,裸局部名 `am`/`bg` 降级为路径保护);②**High**:第四层执行点守卫只数名字不看语义(同名影子/自己比自己/死分支/新执行入口四种改法都能让守卫 exit 0),现升级为**调用形态**核对 + **完备性检查**(谁执行候选谁就必须走第四层);③**Medium**:`self.trading_day` 的第 10 轮新误报、运行期新加载的受保护模块看不见、vnpy 核心对象只靠"按名 import"的巧合被覆盖(改为按点号路径显式纳入)、numpy 原地改写看不见;④**Low**:裸局部 `am`/`bg` 误报、运行期给类打补丁看不见(新增类字典比对;仓库自己的演示策略与测试替身不受候选规矩约束)。指纹范围扩到约 4600 键(第 12 轮重测约 8 毫秒/张,实测 7.3–10.1、中位 8.2),真实回测与候选导入前后零虚假 diff;新增 `tests/test_constitution_round11.py`(22 条回归)。**第 12 轮(codex CLI 深度分析,38.5/50,需改进,不建议发布)**端到端实测报出 2 条 High / 2 条 Medium / 2 条 Low,逐条修复:①**High**:容器规则只挡"写/取别名"、不挡"numpy 视图 / dunder 写入口 / bg 别名"(`self.am.close[:]`、`self.am.close.__setitem__(...)`、`x = self.bg` 再 `x.update_bar(fake)` 四层防线全绿,ATR 被从 40 压到 2.86,¥300 单笔风险预算被架空)——静态层新增容器**视图型方法**名单、变更型方法补 dunder 写入口、新增"**交出引用**"检查(存进名字/传参/返回/装容器一律拒,容器只许就地使用);并新增**运行期第五层** `check_market_data_integrity`(回测后把行情容器与引擎真正喂过的 K 线逐值比对:根数不得多于喂入根数、四个价格数组必须逐值相等)——**不依赖静态分析**,未枚举出的写路径一并兜住;②**High**:第四层执行点守卫仍能被"形态"绕过(比对挪进死函数 / 第二个实参语义相同 / 注释冒充 / `eval(compile(...))` 入口 / 只 import 已覆盖模块,五种改法都能让守卫 exit 0),守卫升级为**数据流 + 作用域 + 可达性 + AST 覆盖**(第二个实参必须就是一次 `snapshot_protected_state()` 调用、快照与比对同作用域、所在函数必须被调用过、执行入口按 AST 识别),另加 `check_constitution_module_is_clean`(宪法模块自身不得出现裸 `exec`/`eval`/`compile`);修复过程中自己踩到两个坑也已修正并记入 CHANGELOG:第五层的基准拍在 **`on_init` 之前**、预热的合法根数只认引擎 `load_bar` 实际交出的那些(日线族 `on_init` 会先加载历史日线做预热,不剥出来会把预热误判成"凭空多出来的 K 线",实测让 14 条既有回测测试同时变红;而把基准拍在预热之后会让候选在 `on_init` 里塞的假 K 线变成"基线",第 13 轮自查已改正),"仓库自己的类"的豁免判据改为**类体里自己的代码落在哪个文件**(就地定义的测试替身豁免,伪造 `__module__` 的候选不豁免);③**Medium**:裸局部名 `am.append(...)` 仍被误拒(受保护容器判定改为**路径级**,作用域段须在接收者路径第 2 段及以后)、伪造 `__module__` 能买"仓库自己的类"豁免(豁免改为判定"该类确实由那个模块定义",`vars(sys.modules[module]).get(name) is klass`);④**Low**:保留字表补齐(容器视图型方法与 dunder 写入口)、文档三处不实断言按实现更正。新增 `tests/test_constitution_round12.py`(34 条回归)。**第 13 轮(codex CLI 深度分析,38.0/50,需改进,不建议发布)**:确认单笔 ¥300 底线没有被突破(被判定的 `dist` 与 `pending_dist` 同源),但统计口径可被伪造——①**Critical**:第五层只比末态,"改→用→改回"的瞬时改写看不见(ATR 40.00→5.07、成交 30 笔往返,五层全绿),静态层也漏了 `[:, None]`/`[...]`/`[None]`/`.swapaxes()` 等视图写法;现静态层认出 numpy 全部基本索引视图,运行期改为 `MarketDataWatch` **逐根核对**(终态比对保留),并扩到成交量/成交额/持仓量;②**High**:历史守卫验形态不验效果(结论被扔掉 / 比对挪进 lambda / 执行点挂在别的函数上),现要求结论被用掉、lambda 算作用域、执行点同函数体内自己成对取快照并比对;③**Medium**:仓库类豁免可被候选买断(现只认类体里自己函数的 `co_filename`,且至少有一个)、`pending_dir` 与沙盒口径不一致(现做同一套校验);④G8 第一轮的外部专家验证因 Gemini 配额耗尽没跑成,修复发生在 codex 第 13 轮审查的提交之后,**需第 14 轮复核**。回归用例增至 56 条。**第 14 轮(codex CLI 深度分析,38.5/50,需改进,不建议发布)**:第 13 轮 Critical 真堵住,无 Critical,新报 2 High / 3 Medium / 4 Low:①**High**:`am.count` 被当成模式开关,候选让计数落后即可永久关闭第五层强核对(ATR 31.54→14.51、成交 0→12 笔,运行期各层全绿)——改为把"每根 K 线容器恰好更新一次"当成被核对的契约(由模板受保护的 `on_bar`/`_process_daily_bar` 决定),并更正了 ADR "第五层不依赖静态分析"的过头表述;②**High**:守卫仍只验形态(基准挪到执行之后、结论只被 print、嵌套死函数、条件表达式吞结论五种一行改法 exit 0)——新增时序检查与结论流向决策检查;③**Medium**:嵌套类买断豁免、`pending_dir` 大小写与盘符(宪法与沙盒两边)、终态核对读活的 size,均已修;④删除了掩盖真缺陷的全局 conftest fixture。三轮分数 38.5/38.0/38.5 基本持平:每轮修的都是写法、下一轮总有新的,**继续逐条堵没有理由认为能收敛到 ≥45**,真正可能改变趋势的是收能力(候选拿到只读视图),需经用户确认后再改模板与 ADR。回归用例增至 69 条。结果见 `CHANGELOG.md`。
 - **候选逃逸:按路径的导入裁决**(Issue [#26](https://github.com/laiyinyizao007/invest/issues/26),ADR `20261113-evolution-engine`「第 22 轮补记」):本轮结论全部来自**动态探针**(真的写文件、真的 import、真的看结果),不是静态推理——静态推理一定漏。实测**五条**候选能拿到**真实内建**的路,都不经过禁用名单:①候选写一个辅助模块(`.py`)再 import 它(辅助模块在 import 机制里执行,拿到真实内建);②候选模块的 `__loader__.exec_module(m)`;③`e.__traceback__.tb_frame.f_builtins`(拿到我们自己模块帧里的真实内建);④`from <包> import <子模块>`——子模块的 import 在**导入机制内部**完成,**不经过**候选那层的守卫,而 `scripts/` 这种没有 `__init__.py` 的目录是**命名空间包**(origin 为 `None`),实测 `from scripts import research_api` 拿到带 `subprocess` 的框架模块,等于任意命令执行。处置:规则改成**按路径**裁决(`scripts/research_sandbox.py::RepoImportGuard`)——仓库内只允许 `strategies/` 里**且在候选开始运行之前就已存在、此后没被改过**的模块,仓库外(标准库、站点包)也必须"运行之前就存在"(站点包在宿主机上通常可写);候选模块不再挂 `__spec__`/`__loader__`;受限导入器用自己造的一帧并在 except 块**之外**抛干净异常;**`from` 形式另外裁决**——先裁包位置(`RepoImportGuard.check_package`,通配符 `from 包 import *` 会导入包位置下所有子模块,逐项裁决管不到),再逐个裁 fromlist 里的子模块。白名单 `ALLOWED_REPO_IMPORT_DIRS` 登记进宪法历史守卫(只减不增)。**如实记录的残余**:第三方模块(如 `numpy`)的帧里**仍然是真实内建**——所以"进程内执行不受信代码"做不到安全,能力隔离是纵深防御的一层、**不是边界**;真正的边界仍是**人工审批 + 容器隔离**。ADR 里"把能力收走"那句已就地更正为"收走的是候选自己那些帧里的能力"。第五条:`from <包> import *`(通配符)——逐项裁决对 `"*"` 无能为力,而导入机制自己会按包的 `__all__` 去 import 那些子模块、整条路不经过守卫;探针实证(自造带 `__all__` 的包):候选写的辅助模块**确实在导入机制里执行了**(它用真内建写出了标记文件)。仓库里 `strategies/__init__.py` 目前没有 `__all__`,这条在当前仓库里是**潜伏**的,探针用自造的包把它逼出来。处置:通配符这一路改成**扫目录**(仓库内:包内每个 `.py` 都必须在快照里、此后没被改过;仓库外:同样要过"运行之前就存在"这一关——站点包可写,而包自己的 `__all__` 可能列着某个现写的模块)。用例 **111 条**(`tests/test_helper_module_escape.py` 13 条 + `tests/test_candidate_escape_production_path.py` 40 条 + `tests/test_sandbox_module_view.py` 58 条;后两者走生产入口 `import_candidate`),**20 个变异全部被抓住**。**一条方法教训**:变异验证里有个变异**没被抓住**,查下来是那条用例**根本没走到它想走的那条路**(没把假仓库插到 `sys.path` 最前面,包名解析到了真仓库那个包,import 因“找不到模块”而失败,断言照样绿)——**断言“被拒绝了”不够,还要断言“是被哪一条规则拒绝的”**。第六类逃逸(ADR「第 23 轮补记」):`runpy`/`code`/`pkgutil`/`zipimport` 这类**执行原语**根本不经过 `__import__`,所以第 22 轮那套按路径的导入裁决对它们**完全无效**——对照实验:同一个运行期写出的模块,`import` 被路径规则拒,`runpy.run_path` 却直接执行了(辅助模块在真实内建下跑起来,探针靠标记文件证明)。处置:这类只能按**名字**堵,七个执行原语进 `FORBIDDEN_MODULES`(静态层与运行期层两道独立的闸)。**但名单式封堵不收敛**:实测 `numpy.ctypeslib` 把 `ctypes` 再导出一遍,而 `numpy` 是候选正当需要的包,于是 `CDLL("kernel32")` 能直接调原生代码——路径裁决、内建限制、受保护对象指纹全都管不着;这条路堵不住,边界仍是**人工审批 + 容器隔离**。新增纪律:"规则管得到的那条路"不等于"只有那条路"。
@@ -216,6 +227,437 @@ flowchart LR
 - `scripts/collect_reject_texts.py`:采集 SimNow 真实废单文本,校准关键词表。
 - `scripts/unattended_report.py`:无人值守每日证据表与验收清单、Webhook 连通性自检。
 - `scripts/collect_terminal_info.py`、`scripts/penetration_check.py`:穿透式监管的终端信息采集与看穿式测试环境演练(脱敏报告)。
+- **纪律闸门(自己也有洞,所以每个都配了变异验证)**:
+  - `tools/check_ci_ran.py` + `tests/guard_roster.json`:CI 侧的「**真的跑了吗**」闸门。
+    pytest 的退出码分不出「全跑了」与「整份被跳过」,所以每个关键步骤都出 `--junitxml`,
+    再由这个工具核对:一条没跑 / 全被跳过 / 有失败 ⇒ 红;**名单里点名的用例**没出现在报告里、
+    或出现了却是 skipped ⇒ 红。名单是机器可读的(`must_run`:套件路径 → 用例名),
+    守卫侧(`tests/test_research_boundary.py`)与 CI 侧共读同一份,三个方向互相校验
+    (陈旧 / 漏登记 / 登记了却会被跳过)。**新增或改名关键用例必须同步这份名单**。
+    **点名的那份套件不在名单里(或名单里那一条是空的)⇒ 红**(静默降级:点名核对一条都
+    做不了 ⇒ 闸门只剩「看总数」);确实不需要名单的套件必须**显式**加
+    `--allow-unlisted-suite`(并集回归那份就是)——但「允许不做点名核对」
+    **不等于**「允许这份没跑」:第 53 轮起,名单外的套件**也必须真的出现在报告里**,
+    且不能整份被跳过。
+    **计数一律按报告的「内容」数出来**(第 53 轮):总数=`<testcase>` 元素数、
+    跳过=`<skipped>` 数、失败=`<failure>`+`<error>` 数;
+    `<testsuite>` 上的属性是**自述**,只校验是不是整数,**不再作为计数依据**
+    (此前读属性 ⇒ 报告写 `failures="0"` 而实际带着 `<failure>` 时闸门会放行)。
+    名单里有**九份**套件(第 55 轮起):两份核心防线套件 + **五份「守卫工具自己」的用例**
+    (分档器 / 「真的跑了吗」闸门 / 变异脚手架 / **接线自检** / **宪法层的字符串原语**)
+    + **两份真钱链路上的关口**
+    (批准账本只读模块 / 收菜)——后六份此前不在名单里 ⇒
+    整份被跳过、或某条守卫用例被删掉,CI 都看不出来。
+    当前点名 **575 条** `must_run` 用例(闸门「点名核对」实际核 **576** 条
+    = 575 + 1 条 `allow_skipped`;第 55 轮之二十五;名单随新用例重生成,数字**实测**)。
+    (第 55 轮之二十四、之二十五**各重生成**过一次:名单每次都会因新增用例而**陈旧**
+    ——第 55 轮之二十四那次是纪律那套只登记 49/63、**字符串程序那套整份不在名单里**
+    ⇒「**写下了但没人跑**」;第 55 轮之二十五那次是本轮又加了 16 条用例
+    ⇒ 口径仍是守卫自己的 `_expected_must_run` **重新采集**,不靠人记。)
+    名单分**两段**(第 54 轮):`must_run` = 必须出现**且不能被跳过**;
+    `allow_skipped` = 必须出现、**允许被跳过**(如「本地没有账本就跳过」那种
+    **数据依赖**的跳过)。两段不许重叠,也不许悬空。
+  - `tools/check_guard_mutations.py`:纪律守卫**自己的**变异验证——在仓库副本上逐个施加 **229 种**
+    变异(模块级一刀切跳过 / 别名跳过 / 无条件跳过 / **裸跳过** / 名单被摘 /
+    conftest 改收集 / **守卫视野变窄** / **名单采集漏条件块** /
+    **CI 接线那一族**(藏进 `bash -c` / 命令替换 / shell 函数 / `eval` /
+    绕开闸门直接跑 pytest / 闸门后接恒真后缀 / `set +e` / `exit 0` /
+    `continue-on-error: true` / `if: ""` / `shell:` / job 级 `if: false` /
+    删掉整个闸门步骤 / 报告写进仓库)/
+    **守卫自己判据那一族**(fail-closed 被放松 / 名单覆盖被去掉 /
+    「只有一条命令」被去掉 / 旁路键被允许 /
+    **不再要求自检调用不带参数** / **不再禁止触发器带过滤** /
+    **不再核对名单结构** / **不再判名单在仓库之外**)/ …),
+    条数口径以脚本实测为准:**229 = 225 红 + 4 绿**
+    (**按被改的文件**分组,相加正好 229:
+    接线自检工具 `tools/check_ci_wiring.py` 101 / 宪法层工具 `tools/check_constitution_history.py` 55 /
+    workflow 19 / 分档脚手架 `tools/check_mutations.py` 11 /
+    闭包套件 `tests/test_fs_capability_closure.py` 10 /
+    研究边界套件 `tests/test_research_boundary.py` 8 / CI 名单检查 `tools/check_ci_ran.py` 8 /
+    纪律脚手架 `tools/check_guard_mutations.py` 8 /
+    名单 `tests/guard_roster.json` 2 / 闸门工具 `tools/ci_gate.py` 2 / `tests/conftest.py` 1 /
+    账本维护入口 `risk/ledger_admin.py` 2 / 收菜 `scripts/research_collect.py` 1 /
+    裁决者 `tools/check_domain.py` 1)——
+    每种都必须让**钉死的见证用例**变红(第 49 轮:此前只数「红了几条」⇒ 走错原因的红也算数);
+    其中**四条**是**无害改动**(改注释、把闸门命令的解释器换成 `python3`、
+    把解释器的正则改写成另一种写法、**只改宪法层里的一个注释**),
+    必须**保持绿**且**通过数与基线相同**
+    (证明脚本不是「永远红」,空转的见证不算见证)。基线不绿或变异把文件改到收集阶段报错 ⇒ 退出码 2
+    (环境/规格问题,与「守卫有洞」分开说)。每条变异**只跑见证那一条**。
+    **基线有四组**(边界 / 闸门工具 / 接线 / **字符串程序那套**;第 55 轮之二十四补齐第四组:
+    此前那一套**整份不在基线里** ⇒ 它的绿对照**查不到基准** ⇒ 绿对照判据形同虚设
+    ⇒ 现在第四组**有载荷**:配了一条只改注释的**反向对照**)——
+    **同一个问题不许两个答案**:`run_outcome` 与 `baseline_failure_reason`
+    由**两个脚手架共用一份**(`tools/check_mutations.py`)。
+    **退出码 2 有两种含义**(第 55 轮之二十四,**实测** pytest 8.4.2):
+    收集阶段失败(`Interrupted: N error during collection`)与真·被打断(`KeyboardInterrupt`)
+    **只能靠输出文本**分开 ⇒ 不得把 2 一律归「环境不可用」;
+    超时用**带外**的哨兵退出码 `TIMEOUT_RETURNCODE = -1`。
+    **见证用例的 nodeid 必须是 ASCII**:pytest 的失败摘要行会把**非 ASCII** 的参数 id
+    转义成 `\uXXXX` ⇒ 参数化用例的 nodeid 在摘要里对不上(第 55 轮实测),
+    需要被单独钉的判定点因此要有**不参数化、名字全 ASCII** 的专属用例。
+  - `tests/test_check_guard_mutations.py`:上面那个脚手架**自己的**守卫(63 条):标签唯一 /
+    **两侧归一化后必须相等**(标签**可以**带单个 `*`——`except*` 是语法的一部分)/
+    每条锚点在当前仓库唯一命中 / **每条变异都钉了见证用例**且见证指向的函数真的存在 /
+    **跨行锚点**能落地(钉死脚本第一版那个洞)/ CRLF 与 LF 各自保持 /
+    **真实 ADR 表与脚本标签逐条对上**(秒级关卡:整套变异要十几分钟,标签对不上却在第 0 秒
+    就能发现——上一版就是拖到跑完全部变异才暴露的)/
+    **`main()` 的判定路径**(第 52 轮之二:此前这条**唯一决定结论**的路径**零覆盖**——
+    拦截侧/放行侧/无见证三头各一条,绿对照**保持绿**与**变红**各一条)/
+    **两套脚手架共用同一份判定与同一份复制**(同一个问题不许两个答案)/
+    共用的复制**必须把 `.github/` 带过去**(否则接线守卫读不到 workflow ⇒ 假绿)/
+    **跑用例之前必须清掉副本里的字节码缓存**(第 55 轮之十四之四:Python 的 `.pyc` 按
+    (源文件 mtime 的整秒, 源文件大小) 校验新鲜度 ⇒ 「同秒 + 同大小」的变异会被
+    **陈旧的 `.pyc`** 吃掉 ⇒ 变异根本没生效 ⇒ 见证保持绿 ⇒ 被误报成「守卫有洞」;
+    放行侧「缓存必须被清掉」+ 拦截侧「**原样复现**那个陷阱」各一条,
+    **两个脚手架各有专属的一条**(不许共用见证 ⇒ 不许「走错原因的红」)/
+    **清理动作本身的健壮性**(第 55 轮之十四之五,codex 第 2 轮 Low-1~Low-3:
+    删不掉的缓存**必须出声**(不许静默失效)、目录读不了**不许整体崩**、
+    环境里若有 `PYTHONDONTWRITEBYTECODE=1`(或 `-B`)子解释器**不写 `.pyc`**
+    ⇒ 拦截侧探针会**假红** ⇒ 两个脚手架都**显式摘掉**它))。
+  - **第 55 轮之二十五(codex CLI 第 2 轮 **38/50** 的六条 must-fix —— 全部本地复现后逐条修)**:
+    G8 第 2 轮(codex CLI,独立进程、另一族模型)给 **38/50**(质量 7 / 安全 6 / 性能 9 /
+    架构 8 / 文档 8)⇒ 落在「**需小修**」那一档(≥45 才可发布)。
+    **纪律**:外部复核者的结论**要自己复现** ⇒ 每一条先在 `%TEMP%` 里写**最小复现脚本**
+    (脚本**不进仓库**)⇒ 亲手跑一遍、确认是**漏判**还是**误报** ⇒ 才动手改 ⇒ 配**两侧探针**
+    ⇒ **一条变异 + 一个专属见证**。本轮 **11 条全部复现为真缺陷**(没有一条是 codex 的误报)。
+    - **H1** 元组/列表解包里的绑定:实测 `_string_bindings` 返回 `{}`、`_string_programs` 返回 `[]`
+      ⇒ **漏判** ⇒ 改为**逐位**绑定(左右数量一致才绑;带 `Starred` 或数量不一致 ⇒ 不猜)。
+    - **H2** 混淆原语的正则太窄:四种形态(`getattr(__import__(…), 'exec')`、
+      `getattr(builtins, 'ex'+'ec')`、`d['ex'+'ec']`、`getattr(builtins, ('exec'))`)实测**全部**返回 `set()`
+      ⇒ **漏判** ⇒ 改为把程序体**当 Python 解析**、对取值表达式**折叠**(字面量 / 拼接 /
+      单元素元组 / f-string)后再认;**只把 `builtins.compile` 当内建原语**
+      (`re.compile` / `py_compile.compile` 是**模块自己的函数** ⇒ 不报——报它就是逼人登记豁免
+      ⇒ 那正是这条规则要防的「守卫被调宽」)。
+    - **M1** 未闭合的 heredoc 被静默漏掉:shell 会给个 warning 但**照样执行** ⇒ 程序体列表为空
+      ⇒ **静默 fail-open** ⇒ 现在把剩下的全部当程序体扫。
+    - **M2** 读不了的 Python 文件被静默跳过 ⇒ 「查不了」被当成「干净」⇒ 现在**出声**
+      (与字符串程序那条判据**同一口径**)。
+    - **M3** 收菜的静态复检**比批准路径窄**:实测 `const.screen_source("import os")` 返回 `[]`
+      而 `rs.screen_source("import os")` 报「禁止导入 os」⇒ 一个只在沙盒层被拦的写法,
+      收菜那道关口**放过去了** ⇒ 改用**同一份调用**。
+    - **M4** 分档器**自己成了执行面**:`git status` **会应用 filter** ⇒ 候选在 `.git/config` 里
+      写一条命令,守卫跑的那次 `git status` 就**替它执行**(实测:标记文件**被写了出来**)
+      ⇒ 与本仓库**第 26 轮 Critical 1** 的既有 ADR 结论**直接冲突**
+      ⇒ **不发明新机制**,按那条结论办:环境关全局/系统配置 + `core.fsmonitor`/`core.pager` 关掉
+      + 仓库自己那份配置里的 filter 名字**逐个置空** ⇒ 实测标记文件**没有被写出来**,
+      而改动清单**照样列得出来**。
+    - 四条 Low:解释器名**只留一份实现**(删掉本地那份正则——它会把 `python3.` 认成解释器)、
+      放行侧用例**补上第二条断言**、批准账本落盘**补 `flush + fsync`**(与试验账本同一套口径)、
+      `_claimed_total()` 读不了账本**不许当 0 次**(那会让「防变小」的基准归零
+      ⇒ 一次悄悄变小反而看不出来)⇒ 改成**报出去**(fail-closed)。
+    - **残余**:不可降级清单没点名新守卫套件(codex **自己实测**那几份**当前都判执行域**
+      ⇒ **没有绕过**)⇒ 本轮**未补**、登记在案(不装作已修);H2 的兜底**仍是正则**
+      (程序体**解析不了**时退回那一层)⇒ 已知盲区。——但那一层现在**已有专属探针**
+      (以前那一层**没有任何探针**)⇒ **判据本身仍比 AST 窄**这个局限不变。
+    - **锚点漂移如实记**:修 L1 之后三条**老**变异的锚点**命中 0 次 / 2 次** ⇒ 被
+      「锚点必须唯一命中」那条用例**当场抓住** ⇒ **搬锚点,不删变异**。
+    - **纪律脚手架自己抓到的「见证空转」(实测)**:修 H2 后那条**老**变异
+      「字符串原语判据不再看 getattr 混淆」**不再让它的见证变红**
+      (`[!! 见证红了]`)⇒ 判定为**变异空转**(规则**换了实现**:AST 那层接走了
+      **可解析**的程序体)⇒ 处置:不删变异 ⇒ 给**兜底那一层**补一条**专属**探针
+      + **改指见证** + **改名**(名字要与实际效果一致)⇒ 实测**效果唯一**。
+    - **数量(实测)**:变异 220 → **229** 种(**225 红 + 4 绿**);ADR 变异表 **229** 行(双向核对);
+      名单 558 → **575** 条 `must_run`;字符串程序套件 63 → **74** 个函数;
+      `test_check_domain.py` 105 → **107**;`test_fs_capability_closure.py` 172 → **175**;
+      `test_research_collect.py` 20 → **21**。**没有动任何实盘防线的口径**。
+  - `tools/check_mutations.py`:分档清单的变异验证(`--verify` 还会核对 ADR 表格里的变异集合);
+    它与纪律那套**共用** `copy_repo` / `run_outcome` / `verify_mutation_table` /
+    **`_purge_bytecode_cache`**(第 55 轮之十四之四:同一个问题不许两个答案
+    ⇒ 「跑之前先清字节码缓存」只有**一份**实现,两套脚手架都调它);
+    **它自己的分档判定(`_tier_of`)也是靠 import 得到的** ⇒ 那里也必须先清缓存,
+    否则「变异前后的分档结果」会读成**旧字节码** ⇒ 被误报成「空操作变异」。
+    **第 50 轮**:它与上面那个脚手架是**同族工具**,此前却对同一件事给了两个答案——
+    ①**临时副本清理**:上面那套是「重试 3 次 → 强制改权限 → 报出路径」,这套还是老的
+    `ignore_errors=True`(Windows 上照样堆积整份仓库副本);②**pytest 的结果**:上面那套
+    **既数 FAILED 又看退出码**,这套**只数 FAILED** ⇒ 变异把文件改成语法错误时 pytest 在
+    **收集阶段**就炸(一条 FAILED 都没有)⇒ 被算成「探针没抓住」(退出码 1),实际是
+    **变异规格写错了**(应退出码 2)。现改为**共用同一份**:`cleanup_temp_dir`(清理)与
+    `run_outcome`(退出码分类 `ok` / `spec_broken`;第 52 轮之二起**公开**——纪律那套也改用它、自己那套关键词启发式已删)与 `copy_repo`(仓库复制;分档那套的复制清单第 52 轮之二起**也带上 `.github/`**);用例钉住「两边共用同一份」与
+    「收集失败必须归到 spec_broken」(**实测**校准,不靠静态推理)。
+  - **CI 接线守卫 = 规范形**(`tools/check_ci_wiring.py` + `tools/ci_gate.py`,第 55 轮):
+    第 48~54 轮那套是「**静态猜 shell**」:把 workflow 的 `run:` 切成逻辑命令行,
+    认出「哪一条在跑 pytest」「哪一条在调闸门」,再断言那些命令是**裸命令**。
+    **本轮实测**:把 pytest 与闸门**一起**藏进 `bash -c "…"` ⇒ 那套守卫**全部真空绿**
+    (红 = 0、异常 = 0)——守卫只认**它认得**的形态,认不出来的就当「没有 pytest、没有闸门」,
+    于是「这份套件没人跑」这件事**它自己看不见**。
+    枚举是**开集**(漏一种就漏一条防线)⇒ 现在改成**只允许一种形态**:
+    - 闸门步骤**只允许一条命令**:
+      `python tools/ci_gate.py --junitxml <报告> --roster <名单> --suite <套件> [--suite <套件> …]`,
+      选项**只有**这三个(多一个就是非规范形);
+    - `tools/ci_gate.py` **一条命令**里做完「跑 pytest → 生成报告 → 逐条点名核对名单 →
+      用退出码说话」:报告由它**自己**生成 ⇒「pytest 与闸门之间」没有缝隙可插
+      (此前报告可以在两者之间被改写/伪造);
+    - `if:` / `continue-on-error:` / `shell:` 按**键是否存在**判定(不是按值)⇒
+      连 `if: ""`、`continue-on-error: "false"` 都看得见;`exit 0` / `set +e` / `|| true`
+      因为**一条命令**而**没有位置可放**;
+    - 认不出来的命令(`bash -c` / `eval` / `$( )` / 函数)**fail-closed**:
+      命令判不了而文本里**提到** pytest/闸门 ⇒ 红;认不出来又**不涉及**危险命令的
+      (`rm -f`、`echo`)不红(否则全是假红);
+    - **名单覆盖**(codex C1):名单点名的**每一份**套件都必须真的被某个**规范**闸门步骤跑
+      ⇒ 把整个闸门步骤删掉,CI 会红;
+    - **守卫自己不许被自己收窄**(第 55 轮之二,G8 复核阶段**实测**):
+      接线自检的调用**必须不带任何选项**(`python tools/check_ci_wiring.py`),
+      `--workflow` 是**追加**不是**替换**。**实测过**:加 `--workflow <别处文件>`
+      ⇒ 真实的 workflow 压根没被查,工具却照样报「[OK]」——
+      这是「守卫可以被自己一键关掉,而没有任何用例会红」;
+    - **触发器不许带过滤**(第 55 轮之二):`pull_request` 带 `paths:` 等过滤 ⇒
+      不匹配的改动**根本不会触发**这个 workflow ⇒ 闸门压根没跑,而 CI 看上去是绿的;
+    - **外部输入形状不对 ⇒ 判红**(第 55 轮之三):名单结构不对(`must_run` 不是对象)
+      ⇒ 覆盖集合变成空集 ⇒ 覆盖检查**静默失效**;名单在仓库之外 ⇒ 崩在 `relative_to` 上
+      ⇒ 「崩掉」与「判为不合规」分不开。两条都 fail-closed:报出问题。
+    - **两个落点各归其位**(第 55 轮之四):研究 workflow 跑
+      `python tools/check_ci_wiring.py`(它读 workflow 的 YAML ⇒ 需要 PyYAML);
+      宪法 workflow 跑 `python tools/check_constitution_history.py`
+      (**纯标准库 + git**,一个依赖都不装 ⇒ 永远会跑)⇒ 宪法 workflow 里那处独立落点
+      **不装 PyYAML**(装了就会踩到「宪法层不许装交易环境依赖」那条既有铁律,
+      实测会把那条既有测试跑红)。宪法层用**纯文本**做同一件事:认出「研究 workflow 里
+      还有一处**规范形**的 `python tools/check_ci_wiring.py`」;研究层**动态导入**宪法层的
+      工具并**真的跑一遍**它的检查(导入失败 / 函数不在 / 调用崩了 ⇒ **fail-closed**)
+      ⇒ 独立落点不会变成**空壳**。宪法层**只认规范形**(带选项 / 藏进 `bash -c` ⇒ 报红)
+      ⇒ 「加 `--workflow` 就能缩小检查范围」那个洞,在这一层也堵住。
+    - **第 55 轮之五(codex 第 2 轮 34/50 的逐条处置)**:codex 那一轮挑出的
+      **2 Critical / 2 High / 3 Medium / 5 Low** 逐条处置完——
+      ①**禁 `needs:`**(闸门 job 与守卫 job 各一条):job 被 `needs:` 指向的上游跳过时
+      GitHub 把这个 job 一起跳过 ⇒ 记成 skipped ⇒ **分支保护视为通过** ⇒ 闸门压根没跑;
+      ②**禁 `env:`**(闸门步骤/闸门 job/守卫步骤/守卫 job 各一条)+ 禁 job 级
+      `defaults.run.shell`:`env: PATH: …/evil:$PATH` + 提交一个 `exit 0` 的 `python`
+      ⇒ **解释器被换掉** ⇒ 闸门没跑而工具照样报「[OK]」;
+      ③**触发器禁带 `types:`**(`pull_request: {types: [opened, closed]}` ⇒ PR 后续的
+      push(`synchronize`)**不触发**),同时**接受**合法的非字典 `on:` 写法
+      (`on: [push, pull_request]` / `on: pull_request`)——此前一律误判红;
+      ④**名单结构校验一份实现三处共用**(`tools/check_ci_ran.py::validate_roster`):
+      此前接线自检只判七种坏形态里的两种 ⇒ 接线自检报「[OK]」而闸门报红 ⇒
+      **误导性的绿**;现在闸门**先验**名单,坏 ⇒ **退出码 2**(压根不跑 pytest);
+      ⑤**规范形放宽**到允许解释器自己的选项(`-X utf8` / `-W error` / `py -3` / `-u`),
+      但**禁止** `-c` / `-m`(它们把脚本整个换掉 ⇒ 闸门压根没跑)——
+      此前一律误伤,与 ADR 的明文自相矛盾;
+      ⑥**覆盖判定统一成单文件**语义:闸门**只许**在 `research-guard.yml` 里,
+      别的 workflow 没有研究侧依赖 ⇒ 闸门跑不起来;
+      ⑦`run:` 不是字符串 ⇒ **报出问题**而不是崩(崩了与「判为不合规」在调用者眼里分不开)。
+    - **第 55 轮之六(claude 第 3 轮 34/50 + codex 第 3 轮 36/50 的逐条处置)**:
+      两个分数都落在「需改进 / 需小修」区间 ⇒ 按 G8 不许发布 ⇒ 本轮逐条处置
+      (改的全是**纪律守卫**,**没动任何实盘防线的口径**):
+      ①**workflow 级 `env:` 一律判红**(此前**完全没覆盖**——ADR 当时写着「顺带覆盖」是**错的**,
+      已改正:文档写下的防线必须在代码里真的接线);
+      ②**步骤级 / job 级 / workflow 级 `working-directory`** 一律判红
+      (否则规范形命令可能不在仓库根跑);
+      ③**仓库级扫描** `.github/workflows/*.yml|yaml`:闸门脚本出现在**任何非主文件**里 ⇒ 判红
+      (此前只扫被传入的那两个文件 ⇒ 第三个 workflow 压根不被扫);
+      ④**受保护脚本**(`tools/check_mutations.py` / `tools/check_guard_mutations.py`)
+      那两步与闸门步骤**同等纪律**(可被 `continue-on-error` 废掉 ⇒ 变异验证被跳过而 CI 照样绿);
+      ⑤**闸门命令尾部带 `&`** ⇒ 判红(退出码被丢弃 ⇒ 闸门判红进不了 CI 结论);
+      ⑥**`types:` 按效果判**(必须含 `opened` + `synchronize`),不再只看键名;
+      ⑦**脚本路径归一化**后再比较(`./tools/ci_gate.py` 不再被误判成非规范形);
+      ⑧**名单条目不许是空列表**、**未知顶层键**判红(共享校验器补两种坏形态);
+      ⑨**规范形接受连写的取值选项**(`-Werror` / `-Xutf8`,此前误伤);
+      ⑩**不存在的套件不算「已覆盖」**(此前 `covered.add` 在 `if/elif` 之外 ⇒
+      覆盖判定被一个根本不存在的文件顶掉)。
+      **本轮自己踩出来的坑**:⑬**断言少写一个 `in problem` ⇒ 见证变成空断言**
+      (只断言「路径出现过」⇒ 恒真 ⇒ 对应的变异打不红)⇒ **空断言比没有断言更糟**;
+      ⑭**两条规则管同一个症状 ⇒ 必须拆开各自见证**(否则一条规则被拆掉时,
+      另一条规则的红会**冒充**它)。
+    - **第 55 轮之七(claude 第 4 轮 35/50 + codex 第 4 轮 39/50 的逐条处置)**:
+      两个分数都落在「需小修」区间 ⇒ 按 G8 不许发布 ⇒ 本轮逐条处置
+      (改的全是**纪律守卫**,**没动任何实盘防线的口径**)。**本轮的主题**:
+      「闸门步骤的退出码到底由谁说了算」这一族——第 55 轮之六刚把 workflow 级 `env:`
+      升成一级规则(理由:「解释器 / 模块搜索路径可以被换掉」),两份复核立刻各找出
+      **同一立论的另外两条通道** ⇒ **规则的理由写的是一族能力,实现只堵了其中一条通道**
+      ⇒ 处置:按**能力**把通道列全,判据注释里**写能力、不写写法**:
+      ①**job 级 `container:` / `services:` 判红**(整个 job 可以跑在别人的镜像里
+      ⇒ `python` 是假的 ⇒ CI 全绿而什么都没跑);
+      ②**`$GITHUB_ENV` / `$GITHUB_PATH` 判红**(给后续所有步骤换掉解释器
+      ⇒ 与已禁的 `env:` 等价);
+      ③**重定向先剥掉**(`2>&1` / `2>/dev/null` 不影响退出码 ⇒ 合法写法不再被误杀);
+      ④**脚本身份按标识判**(模块形态 `python -m tools.ci_gate` 与 `tools/ci_gate.py`
+      是同一个脚本 ⇒ 不再隐形);
+      ⑤**fail-closed 收紧为「这条命令会不会执行它」**(列举 / 说明类命令
+      ——`grep -rn pytest tests/`、`echo "闸门是 ci_gate.py"`——不再误报;
+      **禁引用,不是禁出现**);
+      ⑥**job 级 `defaults.run.*` 提到逐 job 判**(不再依赖「该 job 有没有闸门步骤」);
+      ⑦**job 级问题按 job 归并**(一个 job 一条,不再按闸门步骤数报 N 遍);
+      ⑧**`push:` 触发器上的 `paths:` / `paths-ignore` 也判红**;
+      ⑨**尾部 `&` 的判定改成引号感知**;
+      ⑩**composite action(`.github/actions/**/action.yml`)纳入扫描范围**;
+      ⑪**受保护脚本那一步必须恰好是 `python tools/xxx.py --verify`**
+      (否则「ADR 变异表与脚本双向核对」这一步不再被 CI 执行);
+      ⑫**宪法层与研究层的「规范形」口径对齐**(normpath + 贴连取值选项)
+      ⇒ 并加**双向**两层一致用例;
+      ⑬**名单结构错的退出码统一成 2**(判不了 ≠ 失败);
+      ⑭**workflow 级 `env:` 的两条判据共用同一句** ⇒ 去重生效,只报一遍;
+      ⑮**裁决者(`tools/check_domain.py`)自己的冒烟关卡受旁路键纪律约束**。
+      **本轮自己踩出来的坑**:⑮**规则的理由写的是一族能力,实现只堵了其中一条通道**
+      ⇒ 同一族洞被指出三次;⑯**两条规则的文案被统一 ⇒ 变异锚点命中两处
+      ⇒ 变异成了「不知道改的是哪一处」** ⇒ 锚点**加上下文消歧**、**不许删那条变异**;
+      ⑰**规则重构 ⇒ 锚点失效的变异有 6 条** ⇒ **逐条重新锚定**,一条不删
+      (空操作比没有变异更坏);⑱**变异规格本身写错 ⇒ 脚手架中止(后面的变异根本没跑)**
+      ⇒ 用**静态**体检(施加后 `compile()`)一次列全,别一条一条试。
+    - **第 55 轮之八(**我自己实测**出来的三条洞 + 逐条处置)**:
+      这一轮**不是**外部复核提的,是把「后果域分档器冒烟」那一步的三个绕过写法
+      **逐个施加到仓库副本上**、跑**副本里的真守卫**发现的 ⇒ **三条全部漏过**
+      ⇒ CI 照样绿,而**后果域分档这条线在 CI 里没人管**。
+      **主题**:**「施加了一族纪律」不等于「这一族能力被守住了」**
+      (第 55 轮之七施加的是**旁路键纪律**,而 `set +e`、「或真」后缀、
+      「整步删掉」这三条通道**都不在键里**):
+      ①**分档器那一步里关掉 errexit ⇒ 判红**;
+      ②**分档器调用后面跟「或真」后缀 ⇒ 判红**
+      (「捕获退出码再判 2」的写法是**捕获**、不是吃掉 ⇒ 不误伤);
+      ③**被守的 workflow 里必须至少有一处裁决者冒烟调用**
+      (把那一步整个删掉也能被发现)。
+      **本轮自己踩出来的坑**:⑲**残余清单只写「施加了哪一族纪律」**
+      ⇒ 读的人以为剩下的被兜住了 ⇒ 残余清单**必须**写成
+      「已覆盖哪几条通道 + 还漏哪几条通道」;⑳**ADR 变异表的标签不许含竖线**
+      ⇒ 标签里的 `||` 会把 markdown 表格切开 ⇒ 改成「『或真』后缀」。
+      **仍然没变**:`tests/test_ci_wiring.py` **105** 个函数(采集项 164)、
+      名单 **383** 条 `must_run`(+1 `allow_skipped`=384)、
+      纪律守卫的变异 **105** 种(**102 红 + 3 绿**)、ADR 变异表 **105** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之九(实测发现的又五条通道 + 存在性口径收紧)**:
+      第 55 轮之八只堵了「**行尾**的 `|| true`」⇒ **实测**(仓库副本 + 真守卫)
+      发现同一族能力**还有五条通道**:`|| true;`、`|| true && …`、`; true`、
+      `||`(换行)`true`、「调用被包在 `if` 块里」⇒ 五条**全部漏过**。
+      处置:**R19a**(吃掉失败的后缀)、**R19b**(续行接后缀)、
+      **R19c**(被包在条件里)三条新判据;**R20** 把「存在性」口径收紧为
+      「**有闸门步骤的** workflow 必须**自己**带一处裁决者冒烟调用」
+      (否则可以在别的 workflow 里放一个**假调用**把真调用顶掉)。
+      **本轮自己踩出来的坑**:㉑**「这一族列全了」只有动态探针说得了**;
+      ㉒**规则改了 ⇒ 变异锚点漂移 ⇒ 不许删变异,只能搬**
+      ⇒ 第 55 轮之八那条变异**重新锚定 + 见证重指**。
+      **仍然没变**:`tests/test_ci_wiring.py` **111** 个函数(采集项 170)、
+      名单 **389** 条 `must_run`(+1 `allow_skipped`=390)、
+      纪律守卫的变异 **109** 种(**106 红 + 3 绿**)、ADR 变异表 **109** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之十(codex 第 5 轮实测出的七条通道 + 宪法层口径修复)**:
+      第 55 轮之七~之九收紧接线纪律 ⇒ codex CLI 在**仓库副本**上实测出**又七条**通道:
+      受保护脚本的**模块形态**(`--verify` 要求整条被跳过)/
+      `awk`·`sed`·`find`·`git` 被当成「不执行类命令」/ **复合动作**不受管/
+      `set +eo pipefail` 被放过 / 名单判不了时退出码 **1** vs **2** /
+      job 级键大写(`Container:`) / 转义的 `\&` 被当成后台执行;
+      外加**宪法层**把行尾注释与重定向判成「非规范形」⇒ **两层一起红**。
+      处置:**F1–F7** 七条判据 + 宪法层口径修复,各自配**双向**用例与**专属**变异。
+      **本轮自己踩出来的坑**:㉓「查要求的地方」没跟着「脚本标识」一起归一
+      ⇒ 模块形态永远查不到要求;㉔**规则改了 ⇒ 变异锚点漂移 ⇒ 不许删,只能搬**
+      ⇒ 本轮**四条**重新锚定(其中一条旧锚点**命中 2 次** ⇒ 不重锚的话
+      第 79 条之后的变异**永远跑不到**)。
+      **仍然没变**:`tests/test_ci_wiring.py` **127** 个函数(采集项 186)、
+      名单 **405** 条 `must_run`(+1 `allow_skipped`=406)、
+      纪律守卫的变异 **118** 种(**115 红 + 3 绿**)、ADR 变异表 **118** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之十一(第三轮独立复核实测出的 19 条通道 + 一条二次锚点漂移)**:
+      又一轮**独立复核**在**仓库副本**上**逐条施加绕过写法**、跑**副本里的真守卫**
+      ⇒ **19 条**新通道(C-1~C-7 / H-1~H-6 / M-1~M-3 / M-7)+ 6 条低危项
+      ⇒ 打分 **33 / 50**(质量 6 / 安全 4 / 性能 9 / 架构 6 / 文档 8)
+      ⇒ 「**挡得住『改一行写法』,挡不住『换一个等价载体』**」。
+      处置要点:`pytest.__main__` 的**模块形态身份**归一;「**有调用**」不再等于
+      「**有裁决**」(`--help` / `exit 0` 之后的死代码 / 从未被调用的函数体**都不算**);
+      判定从**物理行**搬到**逻辑行**(反斜杠续行);「失败被吃掉」按**能力**判
+      (`|| /bin/true`、`|| echo skipped` 也算);**步骤级** `container:` / `services:`
+      **照样**判红;闸门写法**非规范**的 job **也**要查 job 级键;受保护脚本按
+      **归一化完整路径**认(不许基名顶替);**复合动作**里的裁决者**同样**适用 R15/R17;
+      `git grep` / `sed -i` / `pip install` 这类**不可能执行** pytest 的写法**不再误伤**;
+      **单行** `if …; then …; fi` **不计入**嵌套深度。
+      **本轮自己踩出来的坑**:㉕**身份归一只做了一半**;㉖**「有没有调用」≠「有没有裁决」**;
+      ㉗**「失败被吃掉」是能力不是长相**;㉘**规则改了 ⇒ 变异锚点漂移 ⇒ 不许删,只能搬**
+      (本轮**一条**重新锚定);㉙**脚手架一次只报一个坏规格 ⇒ 自己先全量体检**。
+      **仍然没变**:`tests/test_ci_wiring.py` **151** 个函数(采集项 210)、
+      名单 **429** 条 `must_run`(+1 `allow_skipped`=430)、
+      纪律守卫的变异 **135** 种(**132 红 + 3 绿**)、ADR 变异表 **135** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之十二(codex 第 6 轮复核的 6 条高/中危 + 3 条低危)**:
+      处置要点:同一**逻辑行**里 `exit 0` **之后**的调用是**死代码**
+      ⇒ 裁决者那一步压根走不到 ⇒ 判据改成**遇到 exit 就不再收本行后面的段**;
+      `sed` 的 `e` 标志按「**三段 + 回引用分隔符**」重写(`/ 与 ,` 都认、引号在不在都认);
+      `rg --pre`(会**执行**预处理器)与 `awk` 管道给 shell 从「只读文本」名单里摘掉;
+      **新增** `uses:` 这一整类入口的登记(不在名单里的第三方动作 ⇒ 判红);
+      「只读命令**提到**闸门」不再等于「**在跑**闸门」;`rc="$?"` 与 `rc=$?` **同义**
+      ⇒ 退出码捕获的**语法**形态放宽而**语义**一点不放宽。
+      **本轮自己踩出来的坑**:㉛**等价写法要逐个覆盖**,而且**先查语法**再写正则
+      (第一版把 GNU sed 的 `s` 写成两段 ⇒ 真实语法是三段 ⇒ 不引号的写法压根匹配不上);
+      ㉜**新增一条规则 ⇒ 已有的变异可能变成空转**(顺手写的 `dead=True` 把跨行 `exit`
+      语义一并接管 ⇒ 旧变异失效)⇒ 每加一条规则都要**重跑全量锚点体检 + 脚手架**;
+      ㉝**外部复核者的结论要自己复现**,不能照抄(codex 说 `awk` 漏过 ⇒ 实测它此前是被
+      **分词失败**兜住的 ⇒ 洞确实存在但**理由**不同)⇒ 「**洞**」与「**描述**」分开验收。
+      **仍然没变**:`tests/test_ci_wiring.py` **166** 个函数(采集项 225)、
+      名单 **444** 条 `must_run`(+1 `allow_skipped`=445)、
+      纪律守卫的变异 **142** 种(**139 红 + 3 绿**)、ADR 变异表 **142** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之十三(变异脚手架打红 ⇒ 上一轮那条判据**是空转的**)**:
+      第 55 轮之十二的 `tools/check_guard_mutations.py --verify` **退出码 1**
+      ⇒ 脚手架报「以下变异**没有**产生预期效果(守卫有洞)」⇒ 那条变异的名字是
+      「**让接线自检不再认 awk 管道给 shell**」⇒ **那条判据压根没生效**
+      ⇒ 而上一轮把它写成「已补上」⇒ **文档写下的防线必须在代码里真的接线**。
+      根因:`logical_commands` 在 `|` 处**切开** ⇒ **管道右侧那个 shell 看不见**
+      ⇒ 判据作用在**切完之后的片段**上 ⇒ **永远匹配不到** ⇒ 整条判据**空转**。
+      修:①管道给 shell 的**逻辑行**改为**不在 `|` 处切**;②该判据**提到「只读名单」之前**
+      ⇒ `echo … | bash` 这种「只读头 + 管道给 shell」也不再免检;③正则改名
+      `_AWK_PIPE_TO_SHELL_RE` → `_PIPE_TO_SHELL_RE`。**真正漏过的形态**是
+      `awk 'BEGIN{print "python -m pytest …"}' | sh` —— 管道在**引号外** ⇒ 切开后左半段
+      引号**配对** ⇒ 分词**成功** ⇒ 头是 `awk` ⇒ 免检 ⇒ **闸门压根没跑而 CI 看上去是绿的**。
+      **本轮还修掉自己上一轮引入的缺陷**:`_SED_EXEC_RE` 用了 `(?x)` ⇒ 模式里**字面的空格被忽略**
+      ⇒ **分隔符结构根本没被约束** ⇒ `sed 's/.*/python -m pytest …/'`(只是**写文本**)
+      被误判成「可执行」⇒ 改成**回引用分隔符** + 标志位必须在**第三个分隔符之后**
+      ⇒ 上一轮登记的「`sed 's/date/e/'` 过宽」残余**这一轮清掉**。
+      **本轮自己踩出来的坑**:⑯「见证红了」与「见证没红」是两种**相反**的结论
+      (后者 = 那条规则**没人管** ⇒ 处置是**把规则接上**,不是改见证);
+      ⑰「加了判据」不等于「判据看得见它要判的东西」——判据若作用在**已经被切碎**的片段上
+      ⇒ **必然空转** ⇒ 落地后要问一句「它作用在哪个粒度上」;
+      ⑱**「把规则改宽」这件事本身也需要实测**——宽了**不等于**宽到了能骗过探针
+      (本轮**自己**新加的那条变异就是这样**空转**的 ⇒ 实测三种正则的**宽窄**
+      ⇒ 改成**真正**不分隔符的形态 + **另加一条**「分隔符写死成斜杠」
+      ⇒ 两条误伤形态**各有专属见证**)。
+      **仍然没变**:`tests/test_ci_wiring.py` **173** 个函数(采集项 232)、
+      名单 **451** 条 `must_run`(+1 `allow_skipped`=452)、
+      纪律守卫的变异 **145** 种(**142 红 + 3 绿**)、ADR 变异表 **145** 行。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    - **第 55 轮之十四(codex 第 2 轮的 6 条发现 ⇒ 9 条新规则 + 1 条自查⇒ 共 10 条)**:
+      第 55 轮之十一~之十三做完 ⇒ G8 双轮复核:**第 1 轮**(`zen codereview`)外部验证
+      **失败**(`429 RESOURCE_EXHAUSTED`)⇒ 本轮**没有**可用的第 1 轮结论(如实登记,
+      不拿旧批次结果充数);**第 2 轮**(codex CLI,自定义 provider `ark-code-latest`)
+      给 **35/50**(质量 7 / 安全 6 / 性能 9 / 架构 7 / 文档 6)⇒ 「**需小修**」区间
+      的最低分 ⇒ **未达 45 发布线** ⇒ 本轮**逐条处置**它的 6 条发现。
+      **每条都先自己复现**才动手改(复现脚本在 `%TEMP%`,**不进仓库**)⇒ 拆成 **10 条规则**(前 9 条来自 codex 的 6 条发现;第 ⑩ 条是**我自己**在实现过程中发现的,**不冒充 codex 的**):
+      ①**本地动作**(`uses: ./…`)在仓库里**找不到 `action.yml`** ⇒ 判红(R14-1);
+      ②本地动作**不是复合动作**(node/docker ⇒ 代码不在扫描面内)⇒ 判红(R14-2);
+      ③本地**复合**动作的 `run:` 块**没被扫** ⇒ 现在**受同一套纪律**(R14-3);
+      ④`eval`/`builtin`/`command` 里的 `exit` 同样**终止这个 shell** ⇒ 其后的裁决者调用
+      **是死代码**(R14-4);⑤awk 的 **co-process**(`| "命令"`)能执行任意命令 ⇒ 不再给它
+      「只读文本」的免检通道(R14-5);⑥**引号里**的 `|` 不切逻辑行(否则整条命令被切碎
+      ⇒ co-process 完全隐形)(R14-6);⑦`rg --pre=` 是 `--pre` 的等价写法 ⇒ 认(R14-7);
+      ⑧`sed` 的 `e` **命令**(不只是 `e` **标志**)也能执行 ⇒ 认(R14-8);
+      ⑨**here-doc 的正文是数据不是命令** ⇒ 剥掉正文再扫(R14-9);
+      ⑩复合动作里**认不出来**的命令**不再静默跳过** ⇒ 与 workflow 步骤那条路径
+      **同一口径**(R14-10,**自查**)。
+      **本轮自己踩出来的坑**:⑲**验证探针本身也要先跑一遍**——它测的是不是工具**真实走**的
+      那条路(R14-6 那条若只断言「报了红」,**兜底**消息也会让它绿 ⇒ 见证指错了理由
+      ⇒ 加 `_reported_commands()` 抠出**报出来的命令文本**再断言前缀);
+      ⑳**同一个 fail-closed 纪律写在两条路径上 ⇒ 口径必然分叉**——「认不出来 ⇒ 判红」
+      在步骤那条路径上有、在复合动作那条路径上**没有** ⇒ 两边各绿 ⇒ 没人发现
+      ⇒ 本轮把两条路径**对齐**。
+      **本轮实测**:`tests/test_ci_wiring.py` **187** 个函数(采集项 **246**)、
+      名单 **465** 条 `must_run`(+1 `allow_skipped`=466)、
+      纪律守卫的变异 **155** 种(**152 红 + 3 绿**)、ADR 变异表 **155** 行;
+      另**搬了 5 条锚点**(规则仍在 ⇒ 搬,不删)。
+      **本轮第一次全量跑脚手架 ⇒ 退出码 1 ⇒ 两条变异是空转的**:一条是「管道给 shell」
+      那条的**旧见证**被本轮新增的 **awk co-process** 规则**顺手兜住**了(⇒ 变异没效果
+      ⇒ 见证改指 `sed '…' | sh`);另一条是**上一轮我自己重锚**时锚点取错
+      (⇒ 锚点再搬一次,挪到真正实现「不切管道」的那一处)⇒ 两条**都不删**
+      (规则还在 ⇒ 搬锚点 / 改指见证)。
+      **教训(㉑)**:**见证必须指向唯一那一条规则**——新规则顺手兜住旧见证时,
+      旧变异会**静悄悄**变成空转;脚手架的「见证没红」= **变异空转**,
+      **不是**「守卫有洞」⇒ 处置是**搬锚点 / 改指见证**,不是删变异、也不是改规则。
+      **仍然没动的**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链的写入、沙盒筛查
+      ——改的**仍然全是纪律守卫**。
+    接线自检跑在**独立 job** 里(不是某个 pytest 套件里的一步)⇒ 删掉被守的那一步不会
+    连带删掉守卫;`research-guard.yml` 与 `constitution-guard.yml` **各有一处**互为兜底
+    (两处**一起**被删 ⇒ 仓库内无人发现,这是**已知残余**,只能靠评审与分支保护兜)。
+    第 48~54 轮那套「猜 shell」的接线守卫**整族退役**
+    (`tests/test_research_boundary.py` 少 515 行)。
 - `scripts/broker_test.py`、`scripts/broker_evidence.py`、`scripts/broker_report.py`:国信测试报告的取证运行器(18 项,证据渲染成图;每次运行向 `connection.json` 留痕实际连接的环境)、证据模型与渲染、docx 报告生成器(lxml 填国信原模板,不默认勾通过,不碰国信填写区)。
   取证运行器的硬约束:**发单前统一过空仓闸门**(有持仓一笔不发)、演示委托用唯一价格(不污染重复报单计数)、测试前置地址靠人工确认(脚本无法判别)、异常也清场(解除暂停标志、还原阈值)。
 - 标记区重写约定(演练/采集/无人值守报告共用):见 `docs/modules.md`「标记区重写的共同约定」。
@@ -348,6 +790,13 @@ sequenceDiagram
   代码改动,不是随手一句话。白名单由 `tools/verdict_graph.py` 的函数级 AST 分析盯着:
   任何自己拥有判定点(`check_gate` / `record_approval` / `screen_source` 等)的文件都必须判为
   不可降级,新增此类文件会让 `tests/test_check_domain.py` 的全仓不变量立刻变红。
+- **纪律守卫改了就跑变异验证**:`python tools/check_guard_mutations.py --verify`
+  (守卫松了必须被抓;它同时核对 ADR 里的变异集合)与 `python tools/check_mutations.py --verify`
+  (分档清单同上)。两者都在**仓库副本**上做,真工作树不动,但**慢**(各跑二十来次 pytest)——
+  这是「规则可复算」的价格。改动 `tests/test_research_boundary.py`、`tests/guard_roster.json`
+  或两份核心套件的用例集合后,必须重跑并同步 ADR 与 `tests/guard_roster.json`。
+  改了 `tools/check_guard_mutations.py` 里的**标签**必须同步 ADR 表格那一行(逐字一致,
+  且标签里不许带 `*` 或反引号——ADR 核对会先去掉它们)。
 - 临时文件:pip 异常中断会在 `%TEMP%` 残留 `pip-unpack-*`,可手动清理。
 - **本机网络**:走本地代理(127.0.0.1:7897)下载 PyPI/Docker 镜像这类大文件只有约 20 KB/s,直连约 4.7 MB/s。pip 安装与镜像拉取应绕过代理(`NO_PROXY=*`;WSL 里还要 `unset http_proxy https_proxy` 并忽略 pip 的旧代理配置)。
 - 运行与部署:见 `docs/runbook-simnow.md`、`docs/live-readiness.md`、`docker-compose.yml`;宿主机挂载目录需让 uid 1000 可写。

@@ -12,6 +12,7 @@ import pytest
 
 import research_config as rc
 import research_collect as collect
+import research_sandbox as rs
 
 CANDIDATE = '''from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
 
@@ -52,12 +53,15 @@ def _write_candidate(root: Path, name: str = "cand.py", source: str = CANDIDATE)
 
 
 def _approve(root: Path, path: Path, sha: str | None = None) -> str:
-    sha = sha or hashlib.sha256(path.read_bytes()).hexdigest()
+    """记一次人工批准——**走正式写入路径**(`rs.record_approval`)。
+
+    第 52 轮:此前这个 fixture 直接往账本 JSON 里塞一条 `{name, at}`——
+    那正是**没有链字段的旧账本**。收菜读的是**核链**的那条路径,
+    这种账本会被直接拒。所以 fixture 改成走 `record_approval`:
+    写链 + 写锚点,产出的才是**真正会被批准环节认**的那种账本。
+    """
     ledger = root / "data" / "research-control" / "approvals.json"
-    data = json.loads(ledger.read_text(encoding="utf-8"))
-    data[sha] = {"name": path.name, "at": "2026-11-14T00:00:00"}
-    ledger.write_text(json.dumps(data), encoding="utf-8")
-    return sha
+    return rs.record_approval(path, ledger, sha256=sha)
 
 
 def test_collect_moves_an_approved_candidate_into_approved_dir(sandbox, monkeypatch):
@@ -82,6 +86,129 @@ def test_collect_refuses_a_file_that_was_never_approved(sandbox, monkeypatch):
 
     assert "没有人工批准记录" in excinfo.value.message
     assert not (sandbox / "approved" / "cand.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# 第 52 轮(codex 第 2 轮 H1):收菜必须**核链**。
+#
+# 此前收菜读的是 `approval_ledger.load_approvals`——只解析 JSON、不核链。
+# 于是「批准环节核链、收菜环节不核链」:改写过账本仍能收菜。
+# 这三条把三种改写方式各钉一条:
+#   ① 改内容(记录被改)   ② 回滚/删行(账本比锚点短)   ③ 无链字段的旧账本/外部写入
+# ---------------------------------------------------------------------------
+
+
+def _ledger_path(root: Path) -> Path:
+    return root / "data" / "research-control" / "approvals.json"
+
+
+def test_collect_refuses_a_ledger_whose_record_was_tampered_with(sandbox, monkeypatch):
+    """① 记录内容被改过(哈希对不上)⇒ 拒绝。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+
+    ledger = _ledger_path(sandbox)
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    data[sha]["name"] = "别的名字.py"          # 记录内容被改了,hash 不再对得上
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    assert "防篡改" in excinfo.value.message
+    assert not (sandbox / "approved" / "cand.py").exists()
+
+
+def test_collect_refuses_a_ledger_that_was_rolled_back(sandbox, monkeypatch):
+    """② 账本被回滚(末条被删)⇒ 与锚点对不上 ⇒ 拒绝。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    first = _write_candidate(sandbox, name="a.py")
+    second = _write_candidate(sandbox, name="b.py")
+    _approve(sandbox, first)
+    sha_b = _approve(sandbox, second)
+
+    ledger = _ledger_path(sandbox)
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    data.pop(sha_b)                              # 回滚:末条批准被撤掉
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("b.py", input_fn=lambda _: sha_b, write=lambda _t: None)
+
+    assert "防篡改" in excinfo.value.message
+    assert not (sandbox / "approved" / "b.py").exists()
+
+
+def test_collect_refuses_a_ledger_without_chain_fields(sandbox, monkeypatch):
+    """③ 无链字段的账本(旧账本 / 外部写入)⇒ 不采信 ⇒ 拒绝。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    ledger = _ledger_path(sandbox)
+    ledger.write_text(json.dumps({sha: {"name": source.name, "at": "2026-11-14T00:00:00"}}),
+                      encoding="utf-8")
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    assert "防篡改" in excinfo.value.message
+    assert not (sandbox / "approved" / "cand.py").exists()
+
+
+def test_list_refuses_when_the_ledger_chain_is_broken(sandbox, monkeypatch):
+    """`list` 也走核链:核不过时不许报「账本命中」——那会把未核验的内容说成已批准。"""
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    ledger = _ledger_path(sandbox)
+    data = json.loads(ledger.read_text(encoding="utf-8"))
+    data[sha]["name"] = "别的名字.py"
+    ledger.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.list_job(write=lambda _t: None)
+
+    assert "防篡改" in excinfo.value.message
+
+
+def test_collect_and_list_use_the_chain_verified_reader(sandbox, monkeypatch):
+    """**接线探针**:收菜/列出读账本时必须调核链那条,不许调不核链那条。
+
+    这条是「实现对不对」的证据:上面几条钉的是**行为**(改了就红),
+    这条钉的是**读法本身**(换成 `approval_ledger.load_approvals` 就红)。
+    """
+    import risk.approval_ledger as ledger_module
+
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(sandbox)
+    sha = _approve(sandbox, source)
+
+    calls: list[str] = []
+    real_load = ledger_module.load_approvals
+
+    def spy(path):
+        calls.append("load_approvals")
+        return real_load(path)
+
+    monkeypatch.setattr(ledger_module, "load_approvals", spy)
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+    assert calls == [], "收菜调了不核链的 load_approvals ⇒ 哈希链校验被绕过了"
+
+    # 反向:核链那条确实被调到了(否则上面那条可能是「根本没读账本」的空转)
+    calls2: list[str] = []
+    real_verified = rs._load_approvals
+
+    def spy2(path):
+        calls2.append("verified")
+        return real_verified(path)
+
+    monkeypatch.setattr(rs, "_load_approvals", spy2)
+    collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+    assert calls2 == ["verified"], "收菜没有走核链读法"
 
 
 def test_collect_refuses_when_the_file_changed_after_approval(sandbox, monkeypatch):
@@ -260,3 +387,40 @@ def test_the_gateway_cannot_reach_the_collect_module():
         encoding="utf-8")
     assert "research_collect" not in gateway
     assert "collect" not in {route[1] for route in []}     # 网关的端点白名单里没有收菜
+
+
+# ---------------------------------------------------------------------------
+# 第 55 轮之二十五(codex 第 2 轮 M3):收菜的静态复检**不得比批准路径窄**
+# ---------------------------------------------------------------------------
+
+
+def test_collect_refuses_a_candidate_the_sandbox_screen_would_reject(sandbox, monkeypatch):
+    """**拦截侧**:沙盒层拦得住的写法,收菜时**也必须**拦得住。
+
+    第 55 轮之二十五(codex 第 2 轮 M3):收菜此前用 `const.screen_source(...)`
+    ——那是**宪法层**的筛查,**不含**沙盒层的「禁用模块 / 额外禁用调用 /
+    模块白名单 / 键用法核对」
+    ⇒ 实测 `const.screen_source("import os")` 返回 `[]`,
+    而 `rs.screen_source("import os")` 会报「禁止导入 os」
+    ⇒ 一个只在沙盒层被拦的写法,收菜这道关口**放过去了**。
+
+    ⇒ 现在收菜用**同一份调用**(与批准/导入路径一致)。
+    """
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(
+        sandbox, source="import os\n\n\ndef go():\n    os.listdir('.')\n")
+    sha = _approve(sandbox, source)
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    assert "静态筛查" in excinfo.value.message, excinfo.value.message
+    assert not (sandbox / "approved" / "cand.py").exists()
+
+    # **第二条断言**(放行侧):同一个候选,去掉那行 `import os` 就必须收得进来
+    # ⇒ 证明上面的拒绝确实是**筛查**造成的,不是别的原因(否则这条用例是空的)。
+    ok_source = _write_candidate(sandbox, name="ok.py", source=CANDIDATE)
+    ok_sha = _approve(sandbox, ok_source)
+    result = collect.collect_job("ok.py", input_fn=lambda _: ok_sha,
+                                 write=lambda _t: None)
+    assert result["collected"] is True

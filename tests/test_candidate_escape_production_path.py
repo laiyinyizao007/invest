@@ -31,6 +31,7 @@ import pytest
 # ("bootstrap 必须先于 vnpy.trader.database 导入")。所以这里先 import,与生产脚本的约定一致。
 import bootstrap  # noqa: E402,F401
 import research_api as api
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 def build(*parts):

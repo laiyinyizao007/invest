@@ -35,6 +35,7 @@ import pytest
 import bootstrap  # noqa: E402,F401
 import research_api as api
 import research_sandbox as rs
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 # --------------------------------------------------------------------------- 夹具

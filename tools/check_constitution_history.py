@@ -15,7 +15,11 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
+import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -91,7 +95,16 @@ BUILTIN_SHRINK_ONLY_SETS = ("BUILTIN_ALLOWED_OVERRIDES", "ALLOWED_REPO_IMPORT_DI
 # 同样是一份 deny 名单(它原先解析不了,所以"漏登记"的检查一直没报)。
 SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORBIDDEN_STRINGS",
                 "DANGEROUS_MODULE_NAMES", "FORBIDDEN_MODULE_PATHS", "CAPABILITY_MODULE_NAMES",
-                "FORBIDDEN_KEY_STRINGS")
+                "FORBIDDEN_KEY_STRINGS",
+                # Issue #31:候选执行窗口的审计钩子拒绝名单与"函数级能力库"名单。少一项 = 多放开一种能力,只增不减。
+                "AUDIT_DENIED_EVENTS", "AUDIT_DENIED_EVENT_PREFIXES", "CAPABILITY_LIB_ROOTS", "UNREACHABLE_MEMBERS",
+                "UNREACHABLE_ORIGINS", "BUILTIN_PRIMITIVE_NAMES", "AUDIT_DENIED_EVENTS_WINREG", "UNREACHABLE_QUALIFIED",
+                # Issue #31 第 40 轮:"按名求值的执行器"名单(对象层按"模块名.成员名"拒)。
+                # 少一项 = 少堵一个"把真内建递给候选"的执行器,只增不减。
+                "EVALUATOR_MEMBERS",
+                # Issue #31 第 40 轮:"禁止的求值帧"名单(事件层按"谁触发的这次 exec"拒)。
+                # 少一项 = 少堵一个"替候选求值候选给的字符串"的求值点,只增不减。
+                "FORBIDDEN_EVAL_FRAMES")
 
 # 沙盒层的**允许**集合(第 21 轮新增的仓库内导入白名单):语义与 deny set 相反——
 # 多一项 = 多放开一点仓库内的模块(候选能 import 的东西变多),所以它必须**只减不增**。
@@ -99,6 +112,19 @@ SANDBOX_SETS = ("FORBIDDEN_MODULES", "FORBIDDEN_CALLS", "FORBIDDEN_ATTRS", "FORB
 # 引用次数的守望(执行点不许消失)——按现有先例(`BUILTIN_ALLOWED_OVERRIDES`),
 # 两个方向都被冻住:要改这个白名单必须显式改守卫,不能顺手加一项。
 SANDBOX_ALLOW_SETS = ("ALLOWED_REPO_IMPORT_DIRS",)
+
+# **受保护的编译正则**(第 40 轮,Medium 3):`DATA_PRIMITIVE_PATTERN` 是编译后的正则,
+# 原来的提取器只认"字符串集合",于是它**从来没有被比对过**——把模式改宽(少拒几个名字)
+# 守卫照样全绿(与第 25 轮 `frozenset` 那次一样的"没登记 = 没守着")。
+# 正则没有"只增不减"的自然序(模式字符串与集合不同,无法逐项比较),所以按**冻结**处理:
+# 模式字符串与历史版本不同就报错——要改必须显式改守卫(而不是顺手把模式放宽)。
+SANDBOX_FROZEN_PATTERNS = ("DATA_PRIMITIVE_PATTERN",)
+
+# **受保护的映射**(第 40 轮,Medium 3):`AUDIT_PATH_MUTATION_EVENTS` 是 {事件: 参数下标元组}——
+# 审计钩子靠它决定"哪些事件要查哪个参数是不是落在允许目录里"。判据:
+# - **键只能增**:少一个事件 = 少查一种会改文件的动作(比如把 `os.remove` 删掉);
+# - **每个键的下标集合只能增**:少一个下标 = 少查一条路径(比如把 `os.rename` 的第二个下标删掉)。
+SANDBOX_PROTECTED_MAPS = ("AUDIT_PATH_MUTATION_EVENTS",)
 
 # 注册表:(文件相对路径, 该文件里受保护的常量名)
 BUILTIN_REGISTRY = (
@@ -223,6 +249,76 @@ def const_string_set(source: str, names) -> dict[str, set[str]]:
                 progressed = True
         if not progressed:
             break
+    return found
+
+
+def const_frozen_pattern(source: str, names) -> dict[str, str]:
+    """从源码里取出若干 `re.compile("字面量")` 形式的常量(第 40 轮)。
+
+    只认**单个位置参数是字符串字面量**的写法;`re.compile(常量)`、拼接出来的模式等一律取不到——
+    取不到就报"无法解析"(查不了等于没查),不能让它冒充通过。"""
+    found: dict[str, str] = {}
+    for node in ast.parse(source).body:
+        name = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        if name is None or name not in names or value is None:
+            continue
+        if not isinstance(value, ast.Call) or not (1 <= len(value.args) <= 2):
+            continue
+        func = value.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "compile"
+                and isinstance(func.value, ast.Name) and func.value.id == "re"):
+            continue
+        arg = value.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            found[name] = arg.value
+    return found
+
+
+def const_int_map(source: str, names) -> dict[str, dict[str, frozenset[int]]]:
+    """从源码里取出 {名称: {键: 下标集合}} 形式的常量(第 40 轮:`AUDIT_PATH_MUTATION_EVENTS`)。
+
+    值的元素必须是**整数常量**(布尔不算);其它形态取不到就报"无法解析"。"""
+    def eval_indexes(node):
+        if not isinstance(node, ast.Tuple) or not node.elts:
+            return None
+        out = set()
+        for elt in node.elts:
+            if not isinstance(elt, ast.Constant) or isinstance(elt.value, bool) \
+                    or not isinstance(elt.value, int):
+                return None
+            out.add(elt.value)
+        return frozenset(out)
+
+    found: dict[str, dict[str, frozenset[int]]] = {}
+    for node in ast.parse(source).body:
+        name = None
+        value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        if name is None or name not in names or value is None:
+            continue
+        if not isinstance(value, ast.Dict):
+            continue
+        out: dict[str, frozenset[int]] = {}
+        ok = True
+        for key, item in zip(value.keys, value.values):
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                ok = False
+                break
+            indexes = eval_indexes(item)
+            if indexes is None:
+                ok = False
+                break
+            out[key.value] = indexes
+        if ok:
+            found[name] = out
     return found
 
 
@@ -538,6 +634,67 @@ def check_builtin_protections(root: Path) -> list[str]:
     return problems
 
 
+def check_frozen_patterns(root: Path) -> list[str]:
+    """受保护的编译正则:模式字符串与历史版本不同就报错(冻结)。
+
+    第 40 轮(Medium 3):`DATA_PRIMITIVE_PATTERN` 此前**从未被比对过**——提取器不认 `re.compile`,
+    于是把模式改宽(少拒几个名字)守卫照样全绿。正则没有"只增不减"的自然序,
+    所以按冻结处理:要改必须显式改守卫。"""
+    problems: list[str] = []
+    rel = "scripts/research_sandbox.py"
+    current_source = (root / rel).read_text(encoding="utf-8")
+    current = const_frozen_pattern(current_source, SANDBOX_FROZEN_PATTERNS)
+    missing = [name for name in SANDBOX_FROZEN_PATTERNS if name not in current]
+    if missing:
+        problems.append(f"{rel} 里的受保护正则 {missing} 无法解析成字面量模式,历史比对对它们无效")
+        return problems
+    for rev in _commits_touching(root, rel):
+        older_source = _read_at(root, rev, rel)
+        if older_source is None:
+            continue
+        older = const_frozen_pattern(older_source, SANDBOX_FROZEN_PATTERNS)
+        for name, pattern in older.items():
+            if current[name] != pattern:
+                problems.append(
+                    f"{rel} 的 {name} 在提交 {rev[:8]} 之后被改动"
+                    f"(受保护的正则是冻结项:要改必须显式改守卫)")
+    return problems
+
+
+def check_protected_maps(root: Path) -> list[str]:
+    """受保护的映射({事件: 参数下标}):键只能增,每个键的下标集合只能增。
+
+    第 40 轮(Medium 3):`AUDIT_PATH_MUTATION_EVENTS` 此前**从未被比对过**——
+    删掉 `os.remove` 或删掉 `os.rename` 的第二个下标,守卫照样全绿。"""
+    problems: list[str] = []
+    rel = "scripts/research_sandbox.py"
+    current_source = (root / rel).read_text(encoding="utf-8")
+    current = const_int_map(current_source, SANDBOX_PROTECTED_MAPS)
+    missing = [name for name in SANDBOX_PROTECTED_MAPS if name not in current]
+    if missing:
+        problems.append(f"{rel} 里的受保护映射 {missing} 无法解析成 {{键: 下标}} 形式,历史比对对它们无效")
+        return problems
+    for rev in _commits_touching(root, rel):
+        older_source = _read_at(root, rev, rel)
+        if older_source is None:
+            continue
+        older = const_int_map(older_source, SANDBOX_PROTECTED_MAPS)
+        for name, values in older.items():
+            now = current[name]
+            for key, indexes in values.items():
+                if key not in now:
+                    problems.append(
+                        f"{rel} 的 {name} 里的事件 {key!r} 在提交 {rev[:8]} 之后被删除了"
+                        f"(受保护的映射只能增:少一个事件 = 少查一种改文件的动作)")
+                    continue
+                gone = indexes - now[key]
+                if gone:
+                    problems.append(
+                        f"{rel} 的 {name} 里事件 {key!r} 的参数下标 {sorted(gone)} 在提交 {rev[:8]} 之后被删除了"
+                        f"(受保护的映射只能增:少一个下标 = 少查一条路径)")
+    return problems
+
+
 def check_registry_completeness(root: Path) -> list[str]:
     """注册表必须覆盖源码里**全部**字符串集合型的内置保护常量。
 
@@ -560,6 +717,28 @@ def check_registry_completeness(root: Path) -> list[str]:
                 continue
             if const_string_set(source, (name,)).get(name) is not None:
                 problems.append(f"{rel} 的 {name} 是字符串集合型的内置保护常量,但没登记进历史守卫的注册表")
+
+    # 第 40 轮(Medium 3):字符串集合之外的两种保护形状也必须登记——
+    # **公开的编译正则**(拒谁靠它)与**公开的 {键: 下标} 映射**(查哪条路径靠它)。
+    # 这两种形状此前完全没有守护:改宽正则、删掉映射里的一个事件,守卫都全绿。
+    # 只管**公开名**(下划线开头的是解析/脱敏用的启发式,不属于"拒谁"的保护清单)。
+    rel = "scripts/research_sandbox.py"
+    source = (root / rel).read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+        else:
+            continue
+        if name.startswith("_"):
+            continue
+        if const_frozen_pattern(source, (name,)).get(name) is not None \
+                and name not in SANDBOX_FROZEN_PATTERNS:
+            problems.append(f"{rel} 的 {name} 是编译出来的保护正则,但没登记进历史守卫的冻结正则表")
+        if const_int_map(source, (name,)).get(name) is not None \
+                and name not in SANDBOX_PROTECTED_MAPS:
+            problems.append(f"{rel} 的 {name} 是 {{键: 下标}} 形态的保护映射,但没登记进历史守卫的映射表")
     return problems
 
 
@@ -1135,7 +1314,15 @@ def check_executor_completeness(root: Path) -> list[str]:
         try:
             source = path.read_text(encoding="utf-8")
             trees[rel] = ast.parse(source)
-        except (UnicodeDecodeError, SyntaxError):
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            # **查不了必须出声**(第 55 轮之二十五,codex 第 2 轮 M2):
+            # 上一版直接 `continue` ⇒ 一个**读不了**的文件(坏编码 / 语法错误)
+            # 能让「执行入口完备性」对它**报干净** ⇒ 那不是「没问题」,是「没看」。
+            # ⇒ 与 `check_string_program_primitives` **同一口径**(第 55 轮之二十一
+            # codex 第 2 轮 F4 已经为那条判据定过这条规矩)。
+            problems.append(
+                f"{rel} **查不了**({type(exc).__name__})⇒ "
+                "「查不了」不等于「干净」⇒ 必须先把它修好,再谈这条判据的结论")
             continue
         sources[rel] = source
 
@@ -1204,6 +1391,1302 @@ def check_executor_completeness(root: Path) -> list[str]:
     return problems
 
 
+# --------------------------------------------------------------------------
+# 第 55 轮之二十(codex 第 2 轮 M2):字符串里藏着的执行原语
+# --------------------------------------------------------------------------
+#
+# 宪法层按 **AST** 找执行入口 ⇒ 藏在**字符串**里的原语它**永远看不见**。
+# 典型规避形态(本仓库自己的 `_CHILD_COMPILE_PROGRAM` 就是这条通道的良性样板):
+#
+#     subprocess.run([sys.executable, "-c", "exec(compile(src, src, 'exec'))", ...])
+#
+# 那条通道**没有任何守卫看守** ⇒ 任何模块都能用同样的写法在字符串里塞
+# `exec(compile(...))` 而两层守卫全绿(实测:AST 判据 False、完备性检查 [])。
+#
+# **为什么不把整类 `-c` 一刀切禁掉**:本仓库自己的变异脚手架**必须**用
+# `python -c` 把「编译」这一步交给一次性子解释器(它只 compile + marshal,
+# **不执行**被编译的代码)⇒ 一刀切会把修法逼回死路。
+# ⇒ 改成:**藏起来 ⇒ 必须显式登记**:
+#   - `exec` / `eval` 出现在字符串程序里 ⇒ **一律报出来**(本仓库**没有**任何
+#     文件被允许在字符串里执行代码);
+#   - `compile` 出现在字符串程序里 ⇒ 必须**点名文件 + 写明理由**地登记
+#     (「只许编译、不许执行」)。
+#
+# **判据的边界(如实写明,别夸大)**:只认**静态可确定**的程序体
+# (字符串字面量、`%` 模板、f-string 的字面量段、指向它们的模块级/函数级常量)。
+# 运行时拼出来的程序体**判不了**——那是本条判据的已知盲区,不是「已覆盖」。
+_STRING_PROGRAM_EXEC_PRIMITIVES = ("exec", "eval")
+_STRING_PROGRAM_COMPILE_PRIMITIVE = "compile"
+# **三个原语名合起来的那一份**(第 55 轮之二十五,codex 第 2 轮 H2):
+# 由上面两个常量**拼出来** ⇒ 不另写一份字面量(免得又分叉)。
+_STRING_PROGRAM_PRIMITIVE_NAMES = (
+    *_STRING_PROGRAM_EXEC_PRIMITIVES, _STRING_PROGRAM_COMPILE_PRIMITIVE)
+
+# **混淆写法也要抓**(第 55 轮之二十一,codex 第 2 轮 F1-4):
+# 实测 `getattr(builtins, 'exec')(src)` 与 `d['exec'](src)` 都**躲过了**
+# 「找字面 `exec(`」的正则 ⇒ 原语名被拆开就看不见了。
+# ⇒ 这里额外认这两种形态(取括号/下标里那个**原语名**)。
+_STRING_PROGRAM_OBFUSCATED = re.compile(
+    r"getattr\s*\(\s*[^,()]+?\s*,\s*['\"](exec|eval|compile)['\"]"
+    r"|\[[\'\"]\s*(exec|eval|compile)\s*[\'\"]\s*\]")
+
+# 允许在字符串程序里出现 `compile` 的文件(点名 + 理由)。
+_STRING_COMPILE_ALLOWLIST: dict[str, str] = {
+    "tools/check_guard_mutations.py": (
+        "子解释器只做「编译 + marshal 序列化」,**不执行**被编译的代码"
+        "(见该文件 `_CHILD_COMPILE_PROGRAM` 上面的说明)"),
+}
+
+# **没有 `exec` / `eval` 的登记通道**(第 55 轮之二十一,codex 第 2 轮 F3):
+# 此前留着 `_STRING_EXEC_ALLOWLIST`(空表)+ 对应的 ADR 登记表列
+# ⇒ 「代码与 ADR 两边同时加一条」就能**永久放行**某个文件在字符串里 `exec`
+# ⇒ 与「豁免的口径是**只许编译、不许执行**」**直接矛盾**
+# ⇒ 现在**结构上**没有这条路:`exec`/`eval` 出现在字符串程序里**一律报出来**,
+# 谁也登记不了(改代码要改判定逻辑本身 ⇒ 会触发「宪法层不再把字符串原语检查
+# 挂进总检查」那条变异 ⇒ 会被抓住)。
+
+# **豁免表不许只活在代码里**(第 55 轮之二十之补):
+# codex 第 2 轮问「豁免表能不能被随手加条目」——**能** ⇒「登记」就是万能钥匙
+# (加一行 ⇒ 那个文件从此可以在字符串里 `exec`,而没有任何人看见)。
+# ⇒ 豁免表必须与 **ADR 里那张登记表逐条一致**(两个方向都查):
+# 代码加了条目而 ADR 没登记 ⇒ 报出来;ADR 登记了而代码没有 ⇒ 也报出来。
+_STRING_ALLOWLIST_ADR = "docs/adr/20261113-evolution-engine.md"
+_STRING_ALLOWLIST_BEGIN = "<!-- string-program-allowlist:begin -->"
+_STRING_ALLOWLIST_END = "<!-- string-program-allowlist:end -->"
+
+# `subprocess` 的那些入口(只认**模块路径**确定的调用:`subprocess.run`、
+# `from subprocess import run`)。
+_SUBPROCESS_PROGRAM_FUNCS = frozenset({
+    "subprocess.run", "subprocess.Popen", "subprocess.call",
+    "subprocess.check_call", "subprocess.check_output",
+})
+# 命令实参的**关键字名**(按函数):`subprocess.*` 用 `args`,
+# `os.popen` / `subprocess.getoutput` / `getstatusoutput` 用 `cmd`。
+# (`os.system` 的参数是**位置限定**的 ⇒ 那个键名只是兜底。)
+_COMMAND_KEYWORDS = {
+    "os.system": "command",
+    "os.popen": "cmd",
+    "subprocess.getoutput": "cmd",
+    "subprocess.getstatusoutput": "cmd",
+    "subprocess.run": "args",
+    "subprocess.Popen": "args",
+    "subprocess.call": "args",
+    "subprocess.check_call": "args",
+    "subprocess.check_output": "args",
+    # **asyncio 的 shell 入口**(第 55 轮之二十四,claude 第 1 轮复核):
+    # `await asyncio.create_subprocess_shell(cmd="python -c …")` 的命令是
+    # **关键字实参** `cmd` ⇒ 上一版只按位置参数取 ⇒ 漏判(实测)。
+    "asyncio.create_subprocess_shell": "cmd",
+}
+
+# **整条命令就是一个字符串**的入口。
+# `os.system` / `os.popen` 一直是;
+# 第 55 轮之二十一(codex 第 2 轮 F2-1)补上 `subprocess.getoutput` /
+# `subprocess.getstatusoutput` —— 实测这两个**漏判**:
+# 它们同样把整条命令当字符串交给 shell ⇒ 程序体就藏在里面。
+_SHELL_COMMAND_FUNCS = frozenset({
+    "os.system", "os.popen",
+    "subprocess.getoutput", "subprocess.getstatusoutput",
+    # **asyncio 的 shell 形态**(第 55 轮之二十三,codex 第 2 轮 M3):
+    # `await asyncio.create_subprocess_shell("python -c ...")` 与 `os.system` 同族。
+    "asyncio.create_subprocess_shell",
+})
+
+# **变参形态**的入口(第 55 轮之二十三,codex 第 2 轮 M3):
+# `asyncio.create_subprocess_exec(sys.executable, "-c", body)` 的命令是
+# **逐个位置参数**,不是一个列表 ⇒ 上一版按「列表」去找元素 ⇒ 整条漏判(实测)。
+_VARIADIC_PROGRAM_FUNCS = frozenset({
+    "asyncio.create_subprocess_exec",
+})
+
+# **`os.exec*` 族**(第 55 轮之二十三,codex 第 2 轮 M2):
+# `os.execv(path, argv)` / `os.execl(path, arg0, ...)` / `os.posix_spawn(path, argv, env)`
+# ⇒ 同样是「把程序体当字符串传给解释器」的入口,上一版整族不在表里 ⇒ 漏判(实测)。
+_EXEC_ARGV_FUNCS = frozenset({
+    "os.execv", "os.execve", "os.execl", "os.execle", "os.execlp",
+    "os.execlpe", "os.execvp", "os.execvpe",
+    "os.posix_spawn", "os.posix_spawnp",
+})
+
+# **星号导入**之后,裸名可能指的是哪个入口(第 55 轮之二十三,codex 第 2 轮 M1)。
+# 口径是**宁可多报**:那个模块被星号导入过 ⇒ 这个名字就按「可能是入口」算。
+_STAR_ENTRIES_BY_MODULE = {
+    "subprocess": {
+        "run": "subprocess.run", "Popen": "subprocess.Popen",
+        "call": "subprocess.call", "check_call": "subprocess.check_call",
+        "check_output": "subprocess.check_output",
+        "getoutput": "subprocess.getoutput",
+        "getstatusoutput": "subprocess.getstatusoutput",
+    },
+    "os": {
+        "system": "os.system", "popen": "os.popen",
+        "execv": "os.execv", "execve": "os.execve",
+        "execl": "os.execl", "execlp": "os.execlp",
+        "execvp": "os.execvp", "execvpe": "os.execvpe",
+        "posix_spawn": "os.posix_spawn", "posix_spawnp": "os.posix_spawnp",
+    },
+}
+
+
+def _static_string(node: ast.AST | None) -> str | None:
+    """这个节点的值**静态可确定**吗?可确定就返回它的字符串形态。
+
+    认三种:字符串字面量、`%` 模板(取模板本身)、f-string 的字面量段
+    (动态段用占位符隔开,免得两段拼出 `ex` + `ec(` 这种漏判)。
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+        # **bytes 程序体也是合法的 `python -c` 参数**
+        #(第 55 轮之二十一,codex 第 2 轮 F1-3:实测 `subprocess.run([sys.executable,
+        # "-c", b"exec(...)"])` 上一版**漏判** ⇒ bytes 也要解码后当程序体扫)。
+        # 解不开就按 latin-1 兜底(宁可多扫,不可漏扫)。
+        try:
+            return node.value.decode("utf-8")
+        except UnicodeDecodeError:
+            return node.value.decode("latin-1")
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _static_string(node.left)
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for piece in node.values:
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                parts.append(piece.value)
+            else:
+                parts.append("\x00")
+        return "".join(parts)
+    return None
+
+
+def _string_bindings(tree: ast.AST) -> dict[str, list[str]]:
+    """名字 → 它被赋成的**静态可确定的字符串**(**可能不止一个**)。
+
+    **为什么是列表而不是单个值**(第 55 轮之二十之补,实测出来的):
+    同一个名字可以在不同函数里被赋成**不同**的字符串
+    (实测:`payload` 在 `a()` 里是 `exec(...)`、在 `b()` 里是 `print(1)`
+    ⇒ 若只留最后一个,`a()` 里的原语就被**漏判**)
+    ⇒ 机器判不了「这次调用用的是哪一个」⇒ **全部**当作候选去扫
+    (宁可多报,不可漏报)。
+    """
+    bindings: dict[str, list[str]] = {}
+    assignments: list[tuple[ast.Name, ast.AST]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.NamedExpr):
+            # **海象赋值**(第 55 轮之二十一,codex 第 2 轮 F1-1):
+            # 上一版只认 `ast.Assign` / `ast.AnnAssign` ⇒ `if program := "exec(...)"`
+            # 这种写法**完全没进绑定表** ⇒ 程序体被判成「不可静态确定」⇒ 漏判。
+            targets, value = [node.target], node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                assignments.append((target, value))
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                # **元组/列表解包**(第 55 轮之二十五,codex 第 2 轮 H1):
+                # `A, B = "python", "exec(...)"` ⇒ 上一版只认 `ast.Name`
+                # ⇒ 解释器与程序体**双双漏判**(实测:`_string_bindings` 返回 `{}`)。
+                # ⇒ 这里**逐位**绑定:左右数量一致才绑。
+                # (数量不一致、或元素里带 `Starred` ⇒ 不绑——
+                #  机器判不了「哪个槽对应哪个值」⇒ 不猜。)
+                if not isinstance(value, (ast.Tuple, ast.List)):
+                    continue
+                if len(target.elts) != len(value.elts):
+                    continue
+                for sub_target, sub_value in zip(target.elts, value.elts):
+                    if isinstance(sub_target, ast.Name):
+                        assignments.append((sub_target, sub_value))
+    # **直接**的字面量绑定
+    for target, value in assignments:
+        text = _static_string(value)
+        if text is None:
+            continue
+        bucket = bindings.setdefault(target.id, [])
+        if text not in bucket:
+            bucket.append(text)
+    # **间接**的绑定(`A = "python"; B = A`)—— 第 55 轮之二十三(codex 第 2 轮 M1):
+    # 上一版只认**直接**字面量 ⇒ `B` 认不出是解释器 ⇒ 漏判(实测)
+    # ⇒ 这里做到**不动点**(多轮直到不再变化;每轮只增加候选 ⇒ 必然收敛)。
+    changed = True
+    while changed:
+        changed = False
+        for target, value in assignments:
+            if not isinstance(value, ast.Name):
+                continue
+            for text in bindings.get(value.id, ()):
+                bucket = bindings.setdefault(target.id, [])
+                if text not in bucket:
+                    bucket.append(text)
+                    changed = True
+    return bindings
+
+
+def _list_bindings(tree: ast.AST) -> dict[str, ast.AST]:
+    """名字 → 它被赋成的**列表/元组字面量**。
+
+    **为什么要有**(第 55 轮之二十三,codex 第 2 轮 High-1):
+    `CMD = [sys.executable, "-c", body]` 之后 `subprocess.run(CMD)`
+    ⇒ 上一版只展开**内联**的列表 ⇒ 整条漏判(实测)。
+    ⇒ 这是最常见的写法(把命令提成变量),必须认。
+    """
+    lists: dict[str, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, (ast.List, ast.Tuple)):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                lists[target.id] = value
+    return lists
+
+
+def _import_bindings(tree: ast.AST) -> dict[str, str]:
+    """名字 → 它是从哪儿导入的(`import subprocess` / `from subprocess import run`)。"""
+    imports: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                # **绑的是根名**(第 55 轮之二十二,自审 M4):
+                # `import os.path` 之后,名字 `os` 指的是**模块 `os`**(不是 `os.path`)
+                # ⇒ 上一版记成 `os` → `os.path` ⇒ `os.system(...)` 被算成
+                # `os.path.system` ⇒ **不在入口表里** ⇒ 整条漏判(实测)。
+                # ⇒ 没有 `as` 时取**根名**;有 `as` 时取**完整路径**
+                # (有 `as` 时那个名字确实指的是整个 `a.b` 模块)。
+                root = alias.name.split(".")[0]
+                imports[alias.asname or root] = alias.name if alias.asname else root
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name == "*":
+                    # **星号导入**(第 55 轮之二十三,codex 第 2 轮 M1):
+                    # `from subprocess import *` 之后名字 `run` 在这张表里查不到
+                    # ⇒ 上一版整条漏判(实测)⇒ 星号导入由 `_star_imported_modules`
+                    # 单独记,这里**不**登记成 `subprocess.*`
+                    # (代码里根本不会用到 `*` 这个名字)。
+                    continue
+                imports[alias.asname or alias.name] = "%s.%s" % (node.module, alias.name)
+    return imports
+
+
+def _star_imported_modules(tree: ast.AST) -> set[str]:
+    """哪些模块被**星号导入**过(`from subprocess import *`)。
+
+    **为什么要单独记**(第 55 轮之二十三,codex 第 2 轮 M1):
+    `from subprocess import *` 之后 `run([...])` 里的 `run` **没有任何来源可查**
+    ⇒ 上一版直接跳过 ⇒ 整条漏判(实测)。
+    """
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name == "*":
+                    modules.add(node.module)
+    return modules
+
+
+def _attribute_bindings(tree: ast.AST) -> dict[str, ast.Attribute]:
+    """名字 → 它被赋成的**属性值**(如 `EXE = sys.executable`)。
+
+    **为什么要有**(第 55 轮之二十二,自审 M2):
+    `EXE = sys.executable` 之后 `subprocess.run([EXE, "-c", body])`
+    ⇒ 绑定表只收**字符串** ⇒ 解释器认不出来 ⇒ 整条漏判(实测)。
+    """
+    attrs: dict[str, ast.AST] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.NamedExpr):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        # **名字之间的传递**(`A = sys.executable; B = A`)—— 第 55 轮之二十三
+        # (codex 第 2 轮 M1):上一版只收 `ast.Attribute` ⇒ `B` 这层**断了**
+        # ⇒ 解释器认不出 ⇒ 漏判(实测)⇒ 现在 `ast.Name` 的右端也收,
+        # 由 `_resolve_bound_attribute` 顺着链子解。
+        if not isinstance(value, (ast.Attribute, ast.Name)):
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                attrs[target.id] = value
+    return attrs
+
+
+def _resolve_bound_attribute(name: str,
+                             attributes: dict[str, ast.AST],
+                             seen: set[str] | None = None) -> ast.Attribute | None:
+    """顺着绑定链子把名字解成**属性值**(如 `B = A; A = sys.executable`)。
+
+    **为什么要顺链子**(第 55 轮之二十三,codex 第 2 轮 M1):
+    `A = sys.executable` 之后 `B = A` ⇒ 只解一层时 `B` 认不出是解释器
+    ⇒ 漏判(实测)。⇒ 这里**递归**解,带 `seen` 防环。
+    """
+    seen = set() if seen is None else seen
+    if name in seen:
+        return None
+    seen.add(name)
+    value = attributes.get(name)
+    if isinstance(value, ast.Attribute):
+        return value
+    if isinstance(value, ast.Name):
+        return _resolve_bound_attribute(value.id, attributes, seen)
+    return None
+
+
+def _call_aliases(tree: ast.AST, imports: dict[str, str]) -> dict[str, str]:
+    """名字 → 它指着的**调用点**(如 `run = subprocess.run`)。
+
+    **为什么要有**(第 55 轮之二十一,codex 第 2 轮 F2-2):
+    实测 `run = subprocess.run` 之后 `run([...])` ⇒ 上一版只看
+    `ast.Name` 是不是**导入**来的 ⇒ 这种**赋值别名**认不出来 ⇒ 整条漏判。
+    ⇒ 这里把「赋值的右端是某个模块的属性」也解析成点号路径。
+    """
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        value = node.value
+        if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            module = imports.get(value.value.id, value.value.id)
+            dotted = "%s.%s" % (module, value.attr)
+        elif isinstance(value, ast.Name) and value.id in imports:
+            # **模块别名**(第 55 轮之二十四,claude 第 1 轮复核):
+            # `mod = subprocess` 之后 `mod.run([...])` ⇒ 上一版把 `mod` 当成
+            # 一个**普通名字** ⇒ 入口名算成 `mod.run` ⇒ 不在入口表里 ⇒ 漏判(实测)。
+            # ⇒ 只有当右端**确实是一个被导入的模块**时才算别名
+            # (右端是本地变量 ⇒ 不是模块 ⇒ 不登记)。
+            dotted = imports[value.id]
+        elif _is_getattr_call(value):
+            # **`getattr` 取入口**(第 55 轮之二十三,codex 第 2 轮 M4):
+            # `run = getattr(subprocess, "run")` ⇒ 上一版只认**属性**形态的别名
+            # ⇒ 这条认不出 ⇒ 整条漏判(实测)
+            # ⇒ 原语侧有 getattr 的混淆正则,**入口侧**此前没有 ⇒ 现在补上。
+            dotted = _getattr_dotted(value, imports)
+            if dotted is None:
+                continue
+        else:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                aliases[target.id] = dotted
+    return aliases
+
+
+def _is_getattr_call(node: ast.AST) -> bool:
+    """这个节点是不是 `getattr(...)` 这种调用?"""
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2)
+
+
+def _getattr_dotted(node: ast.Call, imports: dict[str, str]) -> str | None:
+    """`getattr(模块, "名字")` → 点号路径(如 `subprocess.run`)。"""
+    base = node.args[0]
+    attr = _static_string(node.args[1])
+    if attr is None or not isinstance(base, ast.Name):
+        return None
+    module = imports.get(base.id, base.id)
+    return "%s.%s" % (module, attr)
+
+
+def _strings_of(node: ast.AST, bindings: dict[str, list[str]]) -> list[str]:
+    """取这个实参的字符串形态(**可能不止一个**)。
+
+    字面量 → 一个;指向绑定 → 该名字的**全部**候选(见 `_string_bindings` 的说明)。
+    """
+    if isinstance(node, ast.JoinedStr):
+        # **f-string 要先于 `_static_string`**(第 55 轮之二十四):
+        # `_static_string` 对 f-string 返回的是**占位符版**(动态段 ⇒ `\x00`)
+        # ⇒ 若先走它 ⇒ 动态段永远解析不了 ⇒ `f"-c{body}"` 认不出是 `-c`
+        # ⇒ 整条漏判(实测)。
+        return _joined_string_candidates(node, bindings)
+    text = _static_string(node)
+    if text is not None:
+        return [text]
+    if isinstance(node, ast.Name):
+        return list(bindings.get(node.id, ()))
+    if isinstance(node, ast.NamedExpr):
+        # **实参位置上的海象**(第 55 轮之二十二,自审 M3):
+        # `subprocess.run([..., (b := "exec(...)")])` ⇒ 上一版只认字面量与
+        # `ast.Name` ⇒ 这个实参两样都不是 ⇒ 整条漏判(实测)。
+        return _strings_of(node.value, bindings)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        # **字符串拼接**(第 55 轮之二十四,claude 第 1 轮复核):
+        # `["-c" + " " + body]` ⇒ 上一版只认**字面量**与**绑定名**
+        # ⇒ 这个实参两样都不是 ⇒ 整条漏判(实测)。
+        # ⇒ 左边与右边各自的候选**两两拼接**。
+        left = _strings_of(node.left, bindings)
+        right = _strings_of(node.right, bindings)
+        return [a + b for a in left for b in right]
+    return []
+
+
+def _joined_string_candidates(node: ast.JoinedStr,
+                              bindings: dict[str, list[str]]) -> list[str]:
+    """f-string 的取值(**能解析就解析,解析不了就退回占位符**)。
+
+    **为什么要解析**(第 55 轮之二十四,claude 第 1 轮复核):
+    `f"-c{body}"` ⇒ 上一版把动态段换成 `\\x00` ⇒ 元素变成 `"-c\\x00"`
+    ⇒ 认不出它是 `-c` ⇒ 整条漏判(实测)。
+    ⇒ 现在:动态段若指向一个**绑定着的字符串**,就**按它的取值**拼出来。
+
+    **解析不了时退回占位符**:那一版是刻意的(f-string 的动态段可能是任何东西
+    ⇒ 免得两段拼出一个假的原语名)⇒ 保留。
+    """
+    parts: list[str] = []
+    unresolved = False
+    for piece in node.values:
+        if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+            parts.append(piece.value)
+            continue
+        value = piece.value if isinstance(piece, ast.FormattedValue) else None
+        candidates = bindings.get(value.id) if isinstance(value, ast.Name) else None
+        if candidates and len(candidates) == 1:
+            parts.append(candidates[0])
+            continue
+        unresolved = True
+        parts.append("\x00")
+    if unresolved:
+        placeholder = _static_string(node)
+        return [placeholder] if placeholder is not None else []
+    return ["".join(parts)]
+
+
+# **「什么算 Python 解释器」的唯一定义**(第 55 轮之二十四,claude 第 1 轮复核):
+# 本仓库曾有**三个**互不相同的答案:
+#   - `tools/check_ci_wiring.py::_PYTHON_RE` 认 `pythonw`;
+#   - 本文件的 `_PYTHON_TOKEN_RE`(CI 接线判据)认 `pythonw`;
+#   - 本文件的 `_is_python_interpreter_name`(第 55 轮之二十三收紧过)两个都不认
+#     ⇒ `python.exe`(Windows 上**最常见**的写法)反而**漏判**(实测)⇒ **回归**。
+# ⇒ 现在**只有一份实现**:`tools/check_ci_wiring.py::is_python_interpreter_name`
+#   (本文件按**文件路径**加载那个兄弟工具,不靠 `sys.path`——
+#   与 `tools/check_ci_wiring.py::_load_sibling` 同一套办法);
+#   本文件的 `_PYTHON_TOKEN_RE` 只是它的**正则**那一半。
+_SHARED_PYTHON_NAMES: object | None = None
+_SHARED_PYTHON_NAMES_LOADED = False
+
+
+def _shared_python_names():
+    """加载 `tools/check_ci_wiring.py`(拿那一份解释器名实现)。"""
+    global _SHARED_PYTHON_NAMES, _SHARED_PYTHON_NAMES_LOADED
+    if not _SHARED_PYTHON_NAMES_LOADED:
+        _SHARED_PYTHON_NAMES_LOADED = True
+        path = Path(__file__).resolve().parent / "check_ci_wiring.py"
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "check_ci_wiring_shared", path)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _SHARED_PYTHON_NAMES = module
+        except Exception:                          # noqa: BLE001 - 拿不到 ⇒ 上层报红
+            _SHARED_PYTHON_NAMES = None
+    return _SHARED_PYTHON_NAMES
+
+
+def _python_name_regex():
+    """共享实现里的那一份正则(本文件的 `_PYTHON_TOKEN_RE` 用它)。"""
+    module = _shared_python_names()
+    if module is None:
+        return None
+    return getattr(module, "_PYTHON_RE", None)
+
+
+_PYTHON_NAME_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|py|pythonw)$")
+
+
+def _is_python_interpreter_name(text: str) -> bool:
+    """这个字符串看起来是不是 Python 解释器的名字。
+
+    **口径**(第 55 轮之二十四,claude 第 1 轮复核实测):
+    名字取 `python` / `python3` / `python3.11` / `py` / `pythonw`,
+    并且**允许 `.exe` 后缀**(Windows 上 `python.exe` / `pythonw.exe` 是常态
+    ⇒ 第 55 轮之二十三那次收紧把 `.exe` 收没了 ⇒ 实测漏判,那是**回归**)。
+
+    **仍然不认**:`pythonista-tool` 之类(第 55 轮之二十三实测的误报面)。
+
+    **实现只有一份**:调 `tools/check_ci_wiring.py::is_python_interpreter_name`
+    ⇒ 两边不会各认各的(claude 第 1 轮复核 ④)。
+    **拿不到那个兄弟工具时一律判「不是解释器」**——上层
+    (`check_string_program_primitives`)会把「查不了」**报出来**,
+    不许静悄悄放行。
+    """
+    module = _shared_python_names()
+    if module is None:
+        return False
+    return bool(module.is_python_interpreter_name(text))
+
+
+def _attribute_root_name(node: ast.AST) -> str | None:
+    """属性链最左边的那个名字(`sys.executable` → `sys`)。"""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _attribute_is_interpreter(node: ast.Attribute) -> bool:
+    """这个属性值看起来是不是 Python 解释器?
+
+    **口径收紧**(第 55 轮之二十三,codex 第 2 轮 Low-1):
+    上一版是「属性名在 {executable, python, python3} 里就算」⇒
+    `EXE = config.executable`(那个可执行文件**根本不是 Python**)
+    也被当解释器 ⇒ 实测误报 ⇒ 现在:
+      - `.python` / `.python3`:名字本身就是 python ⇒ 认;
+      - `.executable`:只认 **`sys.executable`**(根名字是 `sys`)。
+    """
+    if node.attr in ("python", "python3"):
+        return True
+    if node.attr == "executable":
+        return _attribute_root_name(node) == "sys"
+    return False
+
+
+def _looks_like_python_interpreter(node: ast.AST | None,
+                                   bindings: dict[str, list[str]] | None = None,
+                                   attributes: dict[str, ast.AST] | None = None) -> bool:
+    """这个实参看起来是不是 Python 解释器?
+
+    只为认出 `python -c` 这种形态 —— `git -c core.pager=cat` 的 `-c` 是
+    **配置项**,不是程序体 ⇒ 不能把它当程序体去扫。
+
+    **也要认绑定出来的名字**(第 55 轮之二十一,codex 第 2 轮 F1-2):
+    实测 `PY = "python"` 之后 `subprocess.run([PY, "-c", body])`
+    ⇒ 上一版只认字面量与属性 ⇒ 整条漏判。
+
+    **也要认 bytes 解释器**(第 55 轮之二十三,codex 第 2 轮 M1):
+    `[b"python3", b"-c", b"exec(...)"]` 在 POSIX 上是合法的 ⇒
+    上一版只认 `str` 字面量 ⇒ 漏判(实测)。
+    """
+    if node is None:
+        return False
+    if isinstance(node, ast.Starred):
+        return _looks_like_python_interpreter(node.value, bindings, attributes)
+    if isinstance(node, ast.Attribute):
+        return _attribute_is_interpreter(node)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return _is_python_interpreter_name(node.value)
+        if isinstance(node.value, bytes):
+            try:
+                return _is_python_interpreter_name(node.value.decode("utf-8"))
+            except UnicodeDecodeError:
+                return _is_python_interpreter_name(node.value.decode("latin-1"))
+    if isinstance(node, ast.Name):
+        if bindings is not None and any(_is_python_interpreter_name(text)
+                                        for text in bindings.get(node.id, ())):
+            return True
+        # **绑定出来的属性**(第 55 轮之二十二,自审 M2):
+        # `EXE = sys.executable` 之后 `subprocess.run([EXE, "-c", body])`
+        # ⇒ 只认字符串绑定 ⇒ 解释器认不出来 ⇒ 整条漏判(实测)。
+        # (第 55 轮之二十三:还要**顺着链子**解 `B = A; A = sys.executable`。)
+        if attributes is not None:
+            attr = _resolve_bound_attribute(node.id, attributes)
+            if attr is not None and _attribute_is_interpreter(attr):
+                return True
+    return False
+
+
+def _shell_is_true(node: ast.Call) -> bool:
+    """这个调用是不是 `shell=True`?
+
+    `shell=True` 时**整条命令就是一个字符串** ⇒ 程序体可能藏在里面
+    (实测:`subprocess.run("python -c \"exec(...)\"", shell=True)` 上一版漏判)。
+    `shell` 的值**运行时才确定** ⇒ 按「是」处理(fail-closed)。
+    """
+    for keyword in node.keywords:
+        if keyword.arg == "shell":
+            value = keyword.value
+            if isinstance(value, ast.Constant) and value.value is False:
+                return False
+            return True
+    return False
+
+
+def _command_argument(node: ast.Call, keyword_name: str) -> ast.AST | None:
+    """命令实参:位置参数的第一个,或**关键字参数** `keyword_name`。
+
+    **为什么要认关键字形式**(第 55 轮之二十二,自审 M1):
+    `subprocess.run(args=[...])` 是**合法的**(`args` 就是 `run` 的关键字参数)
+    ⇒ 上一版只看 `node.args` ⇒ 整条漏判(实测)。
+    `os.popen(cmd=...)` / `subprocess.getoutput(cmd=...)` 同理。
+
+    **还要认星号与字典展开**(第 55 轮之二十三,codex 第 2 轮 M1):
+    - `subprocess.run(*[...])` ⇒ 位置参数是 `ast.Starred` ⇒ 拆开;
+    - `subprocess.run(**{"args": [...]})` ⇒ 关键字参数的 `arg` 是 `None`
+      ⇒ 上一版两个分支都取不到 ⇒ 漏判(实测)⇒ 现在进字典字面量里找那个键。
+    """
+    if node.args:
+        argument = node.args[0]
+        if isinstance(argument, ast.Starred):
+            argument = argument.value
+        return argument
+    for keyword in node.keywords:
+        if keyword.arg == keyword_name:
+            return keyword.value
+        if keyword.arg is None:
+            # `**{...}` 展开
+            found = _dict_literal_entry(keyword.value, keyword_name)
+            if found is not None:
+                return found
+    return None
+
+
+def _dict_literal_entry(node: ast.AST, key: str) -> ast.AST | None:
+    """`{"args": [...]}` 这个字典字面量里,键 `key` 的那个值。"""
+    if not isinstance(node, ast.Dict):
+        return None
+    for dict_key, dict_value in zip(node.keys, node.values):
+        if isinstance(dict_key, ast.Constant) and dict_key.value == key:
+            return dict_value
+    return None
+
+
+def _command_elements(command: ast.AST | None,
+                      list_bindings: dict[str, ast.AST]) -> list[ast.AST] | None:
+    """命令表(一个列表/元组)里的元素;不是列表形态就返回 `None`。
+
+    **为什么要认绑定**(第 55 轮之二十三,codex 第 2 轮 High-1):
+    `CMD = [sys.executable, "-c", body]` 之后 `subprocess.run(CMD)`
+    ⇒ 上一版只展开**内联**列表 ⇒ 整条漏判(实测)。
+    """
+    if command is None:
+        return None
+    if isinstance(command, (ast.List, ast.Tuple)):
+        return list(command.elts)
+    if isinstance(command, ast.Name):
+        bound = list_bindings.get(command.id)
+        if isinstance(bound, (ast.List, ast.Tuple)):
+            return list(bound.elts)
+    if isinstance(command, ast.BinOp) and isinstance(command.op, ast.Add):
+        # **列表拼接**(第 55 轮之二十四,claude 第 1 轮复核):
+        # `subprocess.run([sys.executable] + ["-c", body])` ⇒ 上一版只认
+        # **字面列表**与**绑定到列表的名字** ⇒ 这个形态整条漏判(实测)。
+        left = _command_elements(command.left, list_bindings)
+        right = _command_elements(command.right, list_bindings)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _programs_in_stdin(node: ast.Call,
+                       elements: list[ast.AST],
+                       bindings: dict[str, list[str]],
+                       attributes: dict[str, ast.Attribute]) -> list[tuple[int, str]]:
+    """程序体走**标准输入**的形态(`input=` 关键字实参)。
+
+    **为什么要单列**(第 55 轮之二十四,claude 第 1 轮复核):
+    `subprocess.run([sys.executable], input="exec(...)")` ⇒ 程序体是
+    **喂给解释器的数据**,命令表里**没有** `-c`
+    ⇒ 靠「`-c` 后面那个元素」找程序体的整条路走不到 ⇒ 漏判(实测)。
+
+    **口径(避免误报)**:
+      - 命令表里**确实有解释器**才认(否则 `input=` 就是普通数据);
+      - **已经有 `-c` 程序体**时不认(那时 `input=` 是喂给程序的**数据**)。
+    """
+    if not any(_looks_like_python_interpreter(element, bindings, attributes)
+               for element in elements):
+        return []
+    found: list[tuple[int, str]] = []
+    for keyword in node.keywords:
+        if keyword.arg != "input":
+            continue
+        for text in _strings_of(keyword.value, bindings):
+            found.append((node.lineno, text))
+    return found
+
+
+def _entry_full_name(func: ast.AST,
+                     imports: dict[str, str],
+                     aliases: dict[str, str],
+                     star_modules: set[str]) -> str | None:
+    """这个调用点的**入口全名**(如 `subprocess.run`);认不出就返回 `None`。
+
+    **星号导入**(第 55 轮之二十三,codex 第 2 轮 M1):
+    `from subprocess import *` 之后 `run([...])` 里的 `run` 既不在 `imports`
+    也不在 `aliases` 里 ⇒ 上一版返回空串 ⇒ 整条漏判(实测)⇒ 现在按
+    「那个模块被星号导入过 ⇒ 这个名字可能是它的入口」算(**宁可多报**)。
+    """
+    if isinstance(func, ast.Attribute):
+        receiver = func.value
+        if not isinstance(receiver, ast.Name):
+            return None
+        # **模块别名也要认**(第 55 轮之二十四):`mod = subprocess` 之后
+        # `mod.run(...)` ⇒ 上一版算成 `mod.run` ⇒ 不在入口表里 ⇒ 漏判(实测)。
+        module = (imports.get(receiver.id)
+                  or aliases.get(receiver.id)
+                  or receiver.id)
+        return "%s.%s" % (module, func.attr)
+    if isinstance(func, ast.Name):
+        # **别名也要认**(第 55 轮之二十一,codex 第 2 轮 F2-2):
+        # `run = subprocess.run` ⇒ `run([...])` 同样是执行入口。
+        full = imports.get(func.id) or aliases.get(func.id)
+        if full:
+            return full
+        for module in star_modules:
+            dotted = _STAR_ENTRIES_BY_MODULE.get(module, {}).get(func.id)
+            if dotted:
+                return dotted
+    return None
+
+
+def _programs_in_elements(elements: list[ast.AST],
+                          lineno: int,
+                          bindings: dict[str, list[str]],
+                          attributes: dict[str, ast.AST],
+                          extra_interpreters: list[ast.AST]) -> list[tuple[int, str]]:
+    """在一串命令元素里找「`-c` 后面那个程序体」。
+
+    `extra_interpreters` 是**元素之外**的解释器候选
+    (如 `subprocess.Popen([...], executable=sys.executable)` 的 `executable=`)。
+    """
+    found: list[tuple[int, str]] = []
+    for index, element in enumerate(elements):
+        # `-c` **可以是被绑定的静态字符串**(第 55 轮之二十一,
+        # codex 第 2 轮 F1-2:实测 `FLAG = "-c"` ⇒ 上一版漏判)。
+        #
+        # **`-c` 可以和程序体粘在**同**一个元素里**(第 55 轮之二十四,
+        # claude 第 1 轮复核 R3/R4):python 的短选项解析允许 `-cVALUE`
+        # ⇒ `["python", "-c exec(...)"]` 里那个元素**同时**是 flag 和程序体。
+        # ⇒ 上一版只认「元素正好等于 `-c`,程序体在**下一个**元素」
+        # ⇒ `["-c" + body]` / `[f"-c{body}"]` 两种形态**整条漏判**(实测)。
+        texts = _strings_of(element, bindings)
+        flag = False
+        attached: str | None = None
+        for text in texts:
+            if text == "-c":
+                flag = True
+                break
+            if text.startswith("-c") and len(text) > 2:
+                flag = True
+                attached = text[2:].lstrip()
+                break
+        if not flag:
+            continue
+        # 解释器**可以在 `-c` 前面隔任意个 flag**
+        # (实测 `python -I -c ...` 上一版漏判)⇒ 往**前**看**任何**一个元素。
+        candidates = list(elements[:index]) + list(extra_interpreters)
+        if not any(_looks_like_python_interpreter(e, bindings, attributes)
+                   for e in candidates):
+            continue          # 不是 `python -c`(例如 `git -c key=value`)
+        if attached is not None:
+            found.append((lineno, attached))
+            continue
+        if index + 1 >= len(elements):
+            continue
+        for text in _strings_of(elements[index + 1], bindings):
+            found.append((lineno, text))
+    return found
+
+
+def _programs_in_exec_argv(node: ast.Call,
+                           bindings: dict[str, list[str]],
+                           attributes: dict[str, ast.AST],
+                           list_bindings: dict[str, ast.AST]) -> list[tuple[int, str]]:
+    """`os.execv(path, argv)` / `os.execl(path, arg0, …)` / `os.posix_spawn(path, argv, env)`。
+
+    **为什么要单列**(第 55 轮之二十三,codex 第 2 轮 M2):
+    这一族的命令**不是** `subprocess` 那种「列表第一个是程序」,
+    而是「第一个实参是**可执行文件路径**,第二个才是参数表」
+    ⇒ 解释器候选是**路径** ⇒ 单列一族处理。
+    """
+    args = list(node.args)
+    if not args:
+        return []
+    path = args[0]
+    rest = args[1:]
+    elements = _command_elements(rest[0], list_bindings) if rest else None
+    if elements is None:
+        elements = list(rest)
+    return _programs_in_elements(elements, node.lineno, bindings, attributes, [path])
+
+
+# **shell 命令里的解释器名也走共享实现**(第 55 轮之二十五,codex 第 2 轮 L1):
+# 上一版在**本地**又写了一份正则 ⇒ `python3.` 这种**根本不是解释器**的名字
+# 也会被认(实测)⇒ 两边对「什么算解释器」**各说各话**
+# ⇒ CHANGELOG 里「只留一份实现」那句话与代码**对不上**。
+# ⇒ 现在按 token 切开后**逐个**问共享实现
+# (`tools/check_ci_wiring.py::is_python_interpreter_name`)。
+#
+# **切分用的字符集**:空白 + 常见 shell 元字符 + 引号。
+# **刻意不切** `.` 与 `-` ⇒ `python3.11` / `python3.11.exe` 要**整块**保留。
+_SHELL_TOKEN_SPLIT_RE = re.compile(r"[\s;|&<>()\"'`${}\[\]!*,=]+")
+
+
+def _shell_has_python_interpreter(text: str) -> bool:
+    """这条 shell 命令里**有没有** python 解释器。
+
+    **口径只有一份**:共享实现 `is_python_interpreter_name`。
+    **共享实现拿不到 ⇒ 一律判「没有」**(上层会把「查不了」**报出来**,
+    不许静悄悄放行)。
+    """
+    module = _shared_python_names()
+    if module is None:
+        return False
+    for token in _SHELL_TOKEN_SPLIT_RE.split(text):
+        if token and module.is_python_interpreter_name(token):
+            return True
+    return False
+
+
+def _looks_like_shell_python_program(text: str) -> bool:
+    """这条 shell 命令**看起来是**在跑一个 python 程序吗?
+
+    **为什么要收紧**(第 55 轮之二十三,codex 第 2 轮 Low-1):
+    上一版把**任何**含 `exec(`/`eval(` 的 shell 字符串都当程序体
+    ⇒ `os.system("echo 'eval(' >> notes.txt")` 也被报出来(实测误报)
+    ⇒ 现在要求这条命令里**确实有一个 python 解释器 + `-c`**。
+    """
+    if "-c" not in text:
+        return False
+    return _shell_has_python_interpreter(text)
+
+
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _shell_heredoc_bodies(text: str) -> list[str]:
+    """shell 命令里 **heredoc** 的那一块内容。
+
+    `os.system("python - <<'EOF'\\nexec(...)\\nEOF")` ⇒ 程序体是**喂给解释器的
+    标准输入** ⇒ 命令里**没有** `-c` ⇒ `_looks_like_shell_python_program`
+    判 False ⇒ 整条漏判(第 55 轮之二十四,claude 第 1 轮复核 R8,实测)。
+
+    ⇒ 这里按 `<<标识` 找起点、按**同名的行**找终点,取出中间那块。
+
+    **没有终止行也要取**(第 55 轮之二十五,codex 第 2 轮 M1):
+    POSIX shell 对「到 EOF 才结束」的 heredoc 会给个 warning 但**照样执行**
+    ⇒ 上一版「找不到终止行 ⇒ 返回空列表」= **静默 fail-open**(实测:
+    `python - <<'EOF'\\nexec(open('p').read())\\n` ⇒ 程序体列表为空)
+    ⇒ 现在把**剩下的全部**当程序体扫(宁可多扫,不可漏扫)。
+    """
+    bodies: list[str] = []
+    for match in _HEREDOC_RE.finditer(text):
+        marker = match.group(2)
+        body: list[str] = []
+        for line in text[match.end():].splitlines():
+            if line.strip() == marker:
+                break
+            body.append(line)
+        if body:
+            bodies.append("\n".join(body))
+    return bodies
+
+
+def _shell_programs(text: str) -> list[str]:
+    """一条 shell 命令里**藏着的程序体**。
+
+    两种通道:
+      - `-c` ⇒ 程序体就在这条命令里;
+      - **heredoc** ⇒ 程序体是喂给标准输入的那一块。
+    """
+    if _looks_like_shell_python_program(text):
+        return [text]
+    if _shell_has_python_interpreter(text):
+        return _shell_heredoc_bodies(text)
+    return []
+
+
+def _string_programs(tree: ast.AST) -> list[tuple[int, str]]:
+    """找出所有「作为程序体传出去的字符串」:(行号, 程序体文本)。
+
+    覆盖的形态:
+      - `subprocess.run([python, …, "-c", "程序体", ...])`(**flag 可以隔在中间**);
+      - 同上,但命令表是**关键字参数**、**绑定到变量**、**星号展开**、
+        **字典展开**、或解释器在 `executable=` 里;
+      - `os.execv(path, argv)` / `os.execl(path, arg0, …)` / `os.posix_spawn(...)`;
+      - `asyncio.create_subprocess_exec(py, "-c", body)`(变参形态);
+      - `subprocess.run("python -c …", shell=True)`(整条命令是一个字符串);
+      - `os.system("…")` / `os.popen("…")`(整条命令就是一个字符串)。
+    """
+    bindings = _string_bindings(tree)
+    imports = _import_bindings(tree)
+    star_modules = _star_imported_modules(tree)
+    aliases = _call_aliases(tree, imports)
+    attributes = _attribute_bindings(tree)
+    list_bindings = _list_bindings(tree)
+    programs: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        full = _entry_full_name(node.func, imports, aliases, star_modules)
+        if full is None:
+            continue
+        if full in _SHELL_COMMAND_FUNCS:
+            command = _command_argument(node, _COMMAND_KEYWORDS.get(full, "command"))
+            if command is not None:
+                for text in _strings_of(command, bindings):
+                    for program in _shell_programs(text):
+                        programs.append((node.lineno, program))
+            continue
+        if full in _VARIADIC_PROGRAM_FUNCS:
+            # 命令是**逐个位置参数**(不是列表)⇒ 直接扫位置参数。
+            programs.extend(_programs_in_elements(
+                list(node.args), node.lineno, bindings, attributes, []))
+            continue
+        if full in _EXEC_ARGV_FUNCS:
+            programs.extend(_programs_in_exec_argv(
+                node, bindings, attributes, list_bindings))
+            continue
+        if full not in _SUBPROCESS_PROGRAM_FUNCS:
+            continue
+        command = _command_argument(node, _COMMAND_KEYWORDS.get(full, "args"))
+        if command is None:
+            continue
+        elements = _command_elements(command, list_bindings)
+        if elements is not None:
+            # 解释器也可能在 **`executable=` 关键字参数**里
+            # (第 55 轮之二十三,codex 第 2 轮 M1)。
+            extra = [keyword.value for keyword in node.keywords
+                     if keyword.arg == "executable"]
+            found = _programs_in_elements(
+                elements, node.lineno, bindings, attributes, extra)
+            programs.extend(found)
+            if not found:
+                # **程序体走标准输入**(第 55 轮之二十四):命令表里没有 `-c`
+                # ⇒ 程序体是 `input=` 里喂进去的东西。
+                programs.extend(
+                    _programs_in_stdin(node, elements, bindings, attributes))
+            continue
+        # **整条命令是一个字符串**(`shell=True` 形态)⇒ 程序体就藏在这条字符串里。
+        if not _shell_is_true(node):
+            continue
+        for text in _strings_of(command, bindings):
+            for program in _shell_programs(text):
+                programs.append((node.lineno, program))
+    return programs
+
+
+def _folded_string(node: ast.AST | None) -> str | None:
+    """把这个节点**静态折叠**成一条字符串;折不出来就返回 `None`。
+
+    认:字符串字面量 / **常量拼接**(`'ex' + 'ec'`)/ f-string 的字面量段 /
+    **单元素元组**(`('exec')`)/ 字节串。
+
+    **为什么要折叠**(第 55 轮之二十五,codex 第 2 轮 H2):
+    上一版用**单一正则**猜「原语名被拆开」⇒ 只要外层表达式稍复杂就绕过
+    (实测 `getattr(__import__('builtins'), 'exec')`、`getattr(builtins, 'ex' + 'ec')`、
+    `d['ex' + 'ec']`、`getattr(builtins, ('exec'))` **四种全部漏判**)
+    ⇒ 判据比它自己声明的**窄**。
+    ⇒ 现在把程序体**当 Python 解析**,对**取值用的那个表达式**做折叠。
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _folded_string(node.left)
+        right = _folded_string(node.right)
+        if left is None or right is None:
+            return None
+        return left + right
+    if isinstance(node, ast.Tuple) and len(node.elts) == 1:
+        # 单元素元组 ⇒ 就是那个元素本身(`('exec')`)
+        return _folded_string(node.elts[0])
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for piece in node.values:
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str):
+                parts.append(piece.value)
+            else:
+                parts.append("\x00")
+        return "".join(parts)
+    return None
+
+
+def _program_primitives(program: str) -> set[str]:
+    """这个字符串程序里出现了哪些**执行原语**。
+
+    认三种形态:
+      - 字面调用:`exec(` / `eval(` / `compile(`;
+      - **原语名被拆开**(第 55 轮之二十一,codex 第 2 轮 F1-4):
+        `getattr(builtins, 'exec')(...)`、`d['exec'](...)`
+        ⇒ 实测这两种上一版**完全漏判**;
+      - **折叠后才露出来的原语名**(第 55 轮之二十五,codex 第 2 轮 H2):
+        `getattr(__import__('builtins'), 'exec')(...)`、
+        `getattr(builtins, 'ex' + 'ec')(...)`、`d['ex' + 'ec'](...)`、
+        `getattr(builtins, ('exec'))(...)`
+        ⇒ 上一版那条**单一正则**认不出 ⇒ 全部漏判(实测)
+        ⇒ 现在把程序体**当 Python 解析**、对取值表达式**折叠**后再认。
+
+    **解析不了就退回正则**(程序体未必是合法 Python,例如整条 shell 命令)。
+    """
+    found: set[str] = set()
+    for name in _STRING_PROGRAM_EXEC_PRIMITIVES:
+        if re.search(r"\b%s\s*\(" % name, program):
+            found.add(name)
+    # **`compile` 前面带点号就不是内建原语**(第 55 轮之二十四,claude 第 1 轮复核):
+    # `re.compile(...)` / `py_compile.compile(...)` 是**模块自己的函数**
+    # ⇒ 上一版用 `\bcompile\s*\(` ⇒ `.` 是非词字符 ⇒ **词边界成立**
+    # ⇒ 被误报成「把 `compile` 藏在字符串程序里」⇒ 逼人去登记豁免
+    # ⇒ 那正是这条规则要防的「守卫被调宽」(实测)。
+    # ⇒ 现在要求 `compile` 前面**不是**点号、也不是别的词字符。
+    # (`exec` / `eval` **不**这么改:`builtins.exec(...)` 是**真的**执行原语。)
+    if re.search(r"(?<![.\w])%s\s*\(" % _STRING_PROGRAM_COMPILE_PRIMITIVE, program):
+        found.add(_STRING_PROGRAM_COMPILE_PRIMITIVE)
+    for match in _STRING_PROGRAM_OBFUSCATED.finditer(program):
+        found.add(match.group(1))
+    found |= _program_primitives_by_ast(program)
+    return found
+
+
+def _program_primitives_by_ast(program: str) -> set[str]:
+    """把程序体**当 Python 解析**,认**折叠后**才露出来的执行原语。
+
+    认的形态(全部经实测):
+      - `getattr(<任意对象>, 'exec')(...)` —— 第二个实参**折叠后**是原语名;
+      - `d['exec'](...)` / `d['ex' + 'ec'](...)` —— 下标**折叠后**是原语名;
+      - `exec(...)` / `eval(...)` / `compile(...)` —— 直接调用;
+      - `builtins.exec(...)` / `builtins.eval(...)` / `builtins.compile(...)`
+        —— **带点号**的**内建**原语(与 `re.compile(...)` 那种模块自己的函数**不同**)。
+
+    **解析不了就返回空集**(程序体未必是合法 Python)⇒ 调用方还有正则那一层兜底。
+    """
+    found: set[str] = set()
+    try:
+        tree = ast.parse(program)
+    except (SyntaxError, ValueError):
+        return found
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # `getattr(a, 'exec')(...)` —— func 是**调用**
+        if isinstance(func, ast.Call):
+            inner = func.func
+            if (isinstance(inner, ast.Name) and inner.id == "getattr"
+                    and len(func.args) >= 2):
+                name = _folded_string(func.args[1])
+                if name in _STRING_PROGRAM_PRIMITIVE_NAMES:
+                    found.add(name)
+            continue
+        # `getattr(a, 'exec')` 本身(还没调用)—— **不算执行**,不报
+        if isinstance(func, ast.Name):
+            if func.id in _STRING_PROGRAM_PRIMITIVE_NAMES:
+                found.add(func.id)
+            continue
+        # `d['exec'](...)` / `d['ex' + 'ec'](...)`
+        if isinstance(func, ast.Subscript):
+            name = _folded_string(func.slice)
+            if name in _STRING_PROGRAM_PRIMITIVE_NAMES:
+                found.add(name)
+            continue
+        # `obj.exec(...)` / `builtins.compile(...)`
+        if isinstance(func, ast.Attribute):
+            if func.attr in ("exec", "eval"):
+                # `x.exec(...)` 也算:`exec` / `eval` 没有「模块自己的函数」那种误报面
+                found.add(func.attr)
+            elif (func.attr == _STRING_PROGRAM_COMPILE_PRIMITIVE
+                  and isinstance(func.value, ast.Name)
+                  and func.value.id == "builtins"):
+                # `builtins.compile(...)` 是**内建**原语 ⇒ 要报;
+                # 而 `re.compile(...)` / `py_compile.compile(...)` 是**模块自己的函数**
+                # ⇒ **不报**(报它就是逼人去登记豁免 ⇒ 把守卫调宽)。
+                found.add(_STRING_PROGRAM_COMPILE_PRIMITIVE)
+    return found
+
+
+def check_string_program_primitives(root: Path) -> list[str]:
+    """字符串里藏着的执行原语必须**显式登记**(第 55 轮之二十,codex 第 2 轮 M2)。
+
+    宪法层按 AST 找执行入口 ⇒ 藏在字符串里的原语它**看不见**(实测:
+    `exec(compile(...))` 藏进 `python -c` 的程序体 ⇒ AST 判据 False、
+    完备性检查 []) ⇒ 那条通道必须有守卫。
+
+    口径:
+      - `exec` / `eval` 出现在字符串程序里 ⇒ **一律报出来**
+        (本仓库没有任何文件被允许在字符串里执行代码;
+        **也没有登记通道** —— 第 55 轮之二十一(codex 第 2 轮 F3)把 exec 侧
+        的登记表**删掉了**:留着它就等于「代码与 ADR 两边同时加一行」
+        ⇒ 永久放行 ⇒ 与「只许编译、不许执行」直接矛盾);
+      - `compile` 出现在字符串程序里 ⇒ 必须**点名文件 + 写明理由**地登记,
+        且登记必须与 ADR 里那张登记表**一致**(见
+        `check_string_program_allowlist_registry`);
+      - **原语名被拆开也要抓**(`getattr(builtins, 'exec')`、`d['exec']`);
+      - **读不了/语法错误的文件必须出声** ⇒ 「查不了」≠「干净」。
+    """
+    problems: list[str] = []
+    # **共享实现拿不到 ⇒ 出声**(第 55 轮之二十四):
+    # 「什么算 python 解释器」只有一份实现(`tools/check_ci_wiring.py`)⇒
+    # 拿不到它 ⇒ 本判据**判不了** ⇒ 「查不了」不等于「干净」。
+    if _shared_python_names() is None:
+        problems.append(
+            "tools/check_ci_wiring.py **读不到** ⇒ 「什么算 python 解释器」"
+            "那份**共享实现**没法用 ⇒ 字符串程序判据**判不了** ⇒ "
+            "「查不了」不等于「干净」⇒ 必须先把它修好,再谈这条判据的结论")
+        return problems
+    for path in _repo_python_files(root):
+        rel = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            # **查不了必须出声**(第 55 轮之二十一,codex 第 2 轮 F4):
+            # 上一版直接 `continue` ⇒ 一个语法错误的文件能让整条判据
+            # 对它「报干净」⇒ 那不是「没问题」,是「没看」。
+            problems.append(
+                f"{rel} **查不了**({type(exc).__name__})⇒ "
+                "「查不了」不等于「干净」⇒ 必须先把它修好,再谈这条判据的结论")
+            continue
+        for lineno, program in _string_programs(tree):
+            found = _program_primitives(program)
+            has_exec = bool(found & {"exec", "eval"})
+            has_compile = "compile" in found
+            if has_exec:
+                problems.append(
+                    f"{rel} 第 {lineno} 行把 `exec`/`eval` 藏在**字符串程序**里"
+                    "(AST 判据看不见它 ⇒ 宪法层对它失明)⇒ "
+                    "本仓库**不允许**在字符串程序里执行代码"
+                    "(没有登记通道;要执行请改用正常入口)")
+            if has_compile:
+                if rel in _STRING_COMPILE_ALLOWLIST:
+                    if has_exec:
+                        problems.append(
+                            f"{rel} 第 {lineno} 行的豁免只许**编译**、不许**执行**"
+                            "⇒ 同一个字符串程序里不许同时出现 `exec`/`eval`")
+                elif not has_exec:
+                    # 已经为同一行报过「exec/eval」⇒ 不再重复报「compile」
+                    problems.append(
+                        f"{rel} 第 {lineno} 行把 `compile` 藏在**字符串程序**里"
+                        "(AST 判据看不见它 ⇒ 宪法层对它失明)⇒ 必须先在"
+                        "`_STRING_COMPILE_ALLOWLIST` 里点名登记并写明理由"
+                        "(豁免的口径是「只许编译、不许执行」)")
+    return problems
+
+
+def _adr_allowlist_rows(root: Path) -> list[tuple[str, str, str]] | None:
+    """ADR 里那张登记表 ⇒ [(文件, 原语, 理由)];读不到/找不到就返回 None。
+
+    **行里的 `|` 怎么处理**(第 55 轮之二十四,claude 第 1 轮复核):
+    表格按 `|` 切列 ⇒ 单元格里的 `|` 会把**一行切成两行** ⇒
+    此前那条 `if "|" in reason:` 的检查**永远不可能触发**(死代码)——
+    它看起来像在守「理由里不许有竖线」,其实一行也拦不住。
+    ⇒ 现在**按列数**判:**不是三列**的行一律报出来
+    (那正是「有人在单元格里写了竖线」的形态)⇒ 规则**真的被执行**。
+    """
+    path = root / _STRING_ALLOWLIST_ADR
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if _STRING_ALLOWLIST_BEGIN not in text or _STRING_ALLOWLIST_END not in text:
+        return None
+    block = text.split(_STRING_ALLOWLIST_BEGIN, 1)[1].split(_STRING_ALLOWLIST_END, 1)[0]
+    rows: list[tuple[str, str, str]] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        if set("".join(cells)) <= set("-: "):
+            continue
+        if cells[0] in ("文件", "File"):
+            continue
+        rows.append((cells[0], cells[1], cells[2]))
+    return rows
+
+
+def _adr_allowlist_bad_width_rows(root: Path) -> list[str]:
+    """ADR 登记表里**列数不对**的行(第 55 轮之二十四)。
+
+    「理由里写了竖线」在这种表里**不是**一个字符的事:竖线会把行**切开**
+    ⇒ 那一行的后半截变成**新的一行**(列数不对)⇒ 登记内容被悄悄改形。
+    ⇒ 判据:数据行必须是**三列**。
+    """
+    path = root / _STRING_ALLOWLIST_ADR
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if _STRING_ALLOWLIST_BEGIN not in text or _STRING_ALLOWLIST_END not in text:
+        return []
+    block = text.split(_STRING_ALLOWLIST_BEGIN, 1)[1].split(_STRING_ALLOWLIST_END, 1)[0]
+    bad: list[str] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        if set("".join(cells)) <= set("-: "):
+            continue
+        if cells[0] in ("文件", "File"):
+            continue
+        if len(cells) != 3:
+            bad.append("ADR 登记表里有一行是 **%d 列**(应当三列:文件 | 原语 | 理由)"
+                       "⇒ 单元格里写了 `|` ⇒ 这一行会被**切开**成两行 ⇒ "
+                       "登记内容被悄悄改形:「%s」" % (len(cells), " | ".join(cells)))
+    return bad
+
+
+def check_string_program_allowlist_registry(root: Path) -> list[str]:
+    """豁免表必须与 **ADR 里那张登记表逐条一致**(两个方向都查)。
+
+    **为什么要有这条**(第 55 轮之二十之补):豁免表本来是**代码里的手写常量**
+    ⇒ 加一行就永久放行那个文件在字符串里 `exec`,**没有任何人看见**
+    ⇒「显式登记」实际是「万能钥匙」⇒ 与 ADR 挂钩:
+    代码加了条目而 ADR 没登记 ⇒ 报出来(文档比代码窄 = 隐形放行);
+    ADR 登记了而代码没有 ⇒ 也报出来(文档比代码宽 = 夸大)。
+    """
+    rows = _adr_allowlist_rows(root)
+    if rows is None:
+        return ["%s 里找不到豁免登记表(%s 与 %s 之间)⇒ 豁免表没有被登记"
+                "⇒ 「登记」就是万能钥匙(加一行即永久放行)"
+                % (_STRING_ALLOWLIST_ADR, _STRING_ALLOWLIST_BEGIN, _STRING_ALLOWLIST_END)]
+    problems: list[str] = []
+    # **列数不对的行**(第 55 轮之二十四):这一条**替掉**了此前那条
+    # `if "|" in reason:` 的**死代码**(竖线会把行切开 ⇒ 那个条件永远不成立)
+    # ⇒ 现在按**列数**判 ⇒ 规则真的被执行(死代码比没规则更坏:
+    # 它看起来在守,其实一行也拦不住)。
+    problems.extend(_adr_allowlist_bad_width_rows(root))
+    adr_tables: dict[str, dict[str, str]] = {
+        "compile": {},
+    }
+    for rel, primitive, reason in rows:
+        if primitive not in adr_tables:
+            # **没有 `exec` 的登记通道**(第 55 轮之二十一,codex 第 2 轮 F3)
+            # ⇒ ADR 里写 `exec` 一律是错的(写了也没用,还会给人「登记过就合法」
+            # 的错觉)。
+            problems.append("ADR 登记表里「%s」的原语写成「%s」⇒ 只认 `compile`"
+                            "(本仓库**没有** `exec`/`eval` 的登记通道)"
+                            % (rel, primitive))
+            continue
+        if not reason:
+            problems.append("ADR 登记表里「%s」**没有写理由** ⇒ 登记必须点名 + 写明理由" % rel)
+            continue
+        if rel in adr_tables[primitive]:
+            problems.append("ADR 登记表里「%s」登记了两次" % rel)
+        adr_tables[primitive][rel] = reason
+    for primitive, code_table in (("compile", _STRING_COMPILE_ALLOWLIST),):
+        adr_table = adr_tables[primitive]
+        for rel, reason in sorted(code_table.items()):
+            if rel not in adr_table:
+                problems.append(
+                    "代码里的 `%s` 豁免「%s」**没有登记在 ADR** ⇒ 删掉登记行它就永久放行"
+                    "⇒ 两边必须一致" % (primitive, rel))
+            elif adr_table[rel] != reason:
+                problems.append("「%s」的 `%s` 豁免理由**代码与 ADR 不一致** ⇒ 以 ADR 为准"
+                                % (rel, primitive))
+        for rel in sorted(set(adr_table) - set(code_table)):
+            problems.append("ADR 登记了「%s」的 `%s` 豁免,**代码里没有** ⇒ 文档比代码宽"
+                            % (rel, primitive))
+    return problems
+
+
 def check_constitution_module_is_clean(root: Path) -> list[str]:
     """宪法模块自己不得有**执行入口**(裸 `exec` / `eval` / `compile` 调用)。
 
@@ -1223,6 +2706,259 @@ def check_constitution_module_is_clean(root: Path) -> list[str]:
     return problems
 
 
+# --------------------------------------------------------------------------
+# 第 55 轮:接线自检的**独立落点**(这一层是纯标准库 + git,永远会跑)
+# --------------------------------------------------------------------------
+# **为什么放在宪法层**:宪法 workflow 是「纯标准库 + git」——不装 PyYAML、
+# 不装 pytest、不装整个交易环境 ⇒ 它**没有理由不跑** ⇒ 它是接线自检的
+# **独立落点**(研究层那一处被删掉时,这里还在;反之亦然)。
+#
+# **为什么是纯文本**:宪法层不许引入依赖(没有 PyYAML)。文本级足够——
+# 只需要认出「有没有一处规范形的调用」,不需要解析整个 YAML。
+#
+# **只认规范形**:第 55 轮**实测**的洞——接线自检的调用可以被加参数
+# (`--workflow` 曾是**替换**语义 ⇒ 真实的 workflow 压根没被查,
+#  而工具**照样报「[OK] CI 接线合规」**)⇒ 这里要求
+# `python tools/check_ci_wiring.py`,**一个选项都不许带**。
+RESEARCH_WORKFLOW_REL = ".github/workflows/research-guard.yml"
+WIRING_SCRIPT_REL = "tools/check_ci_wiring.py"
+_PYTHON_TOKEN_RE = _python_name_regex() or _PYTHON_NAME_RE
+
+# **规范形里允许的解释器选项**(第 55 轮之五,codex 第 2 轮的 M1):
+# `python -X utf8 …`、`py -3 …` 这些**合法**写法此前一律判红(误伤)。
+# **两层必须一致**:研究层(`tools/check_ci_wiring.py`)放宽了,这里也要放宽,
+# 否则同一处调用研究层说「合规」、宪法层说「不是规范形」⇒ CI 变红。
+# **禁止**的选项:`-c`(把脚本整个换掉)、`-m`(把脚本换成模块)。
+_INTERPRETER_VALUE_FLAGS = {"-W", "-X"}
+_INTERPRETER_NO_VALUE_FLAGS = {
+    "-3", "-u", "-B", "-E", "-s", "-I", "-O", "-OO", "-P", "-v",
+    "--check-hash-based-pycs",
+}
+_FORBIDDEN_INTERPRETER_FLAGS = {"-c", "-m"}
+
+
+def _run_blocks(text: str) -> list[str]:
+    """把 workflow 文本切成「每个 run 步骤的命令串」。
+
+    **为什么文本级**:宪法层没有 PyYAML。这里只需要认出
+    「有没有一处规范形的 `python tools/check_ci_wiring.py`」,
+    不需要解析整个 YAML ⇒ 文本级够用,而且**不引入依赖**。
+
+    块标量(`run: |`)按**缩进**收集后续行,拼成**一个**命令串
+    (这样 `ruff check ... tools/check_ci_wiring.py` 这种
+    「把脚本列进文件清单」的写法不会被误认成「在跑它」)。
+    """
+    lines = text.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped.startswith("run:"):
+            index += 1
+            continue
+        rest = stripped[len("run:"):].strip()
+        indent = len(line) - len(line.lstrip())
+        if rest and rest not in ("|", ">", "|-", ">-", "|+", ">+"):
+            blocks.append(rest)                 # `run: 一条命令`(行内写法)
+            index += 1
+            continue
+        cursor = index + 1
+        body: list[str] = []
+        while cursor < len(lines):
+            candidate = lines[cursor]
+            if not candidate.strip():
+                cursor += 1
+                continue
+            if len(candidate) - len(candidate.lstrip()) <= indent:
+                break                           # 缩进回退了 ⇒ 这一步结束
+            if not candidate.strip().startswith("#"):
+                body.append(candidate.strip())
+            cursor += 1
+        blocks.append("\n".join(body))
+        index = cursor
+    return blocks
+
+
+# **重定向词**:`2>&1` / `>out` / `&>log` / `2>` …… 它们**不是参数**
+# (研究层 `logical_commands` 早就把它们剥掉了 ⇒ 两层口径必须一致)。
+_REDIRECTION_TOKEN_RE = re.compile(r"^[0-9<>&()]*[<>][0-9<>&()]*$")
+
+
+def _command_tokens(text: str) -> list[str]:
+    """把一段文本切成「命令词」:去掉**行尾注释**与**重定向**。
+
+    **为什么**(第 55 轮之十,codex 第 5 轮的 M-5):
+    宪法层此前用 `shlex.split(block, comments=False)` ⇒ ①行尾注释
+    (`python tools/check_ci_wiring.py  # 接线自检`)②重定向(`… 2>&1`)
+    都**留在词里** ⇒ 「脚本后面不许再有任何词」那条 ⇒ 判成**非规范形**
+    ⇒ **误伤合法写法** ⇒ 而研究层会**动态跑**宪法层这条检查
+    ⇒ **两层一起红** ⇒ CI 变红(实测)。
+    ⇒ 现在:注释交给 shlex 的 `comments=True`,重定向词**整个丢掉**
+    ——与研究层 `logical_commands` 的口径**一致**。
+    """
+    try:
+        tokens = shlex.split(text, comments=True, posix=True)
+    except ValueError:
+        return []                    # 引号不配对 ⇒ 认不出来 ⇒ 交给上层判红
+    out: list[str] = []
+    for token in tokens:
+        token = token.strip()
+        if not token:
+            continue
+        if _REDIRECTION_TOKEN_RE.match(token):
+            continue                # 重定向 ⇒ 不是参数
+        out.append(token)
+    return out
+
+
+def _normalize_script_path(path: str) -> str:
+    """脚本路径**归一化**:统一分隔符、去掉 `./` 与 `..`。
+
+    **为什么**(第 55 轮之七,claude 第 4 轮的 M-1):
+    研究层(`tools/check_ci_wiring.py`)用的是 `os.path.normpath` ⇒
+    `python ./tools/check_ci_wiring.py` 与 `python tools/../tools/check_ci_wiring.py`
+    在**研究层**都算规范形;而宪法层此前只按**字面**比 ⇒ 同一处调用
+    **两层结论相反**(一层说合规、一层说不是规范形)⇒ CI 变红,
+    或者更糟:两层都判「压根没有」而真实调用还在。
+    ⇒ 两层**必须同一套口径**(仓库规矩:两层都要有,不能只靠一边)。
+    """
+    return os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+
+
+def _script_index(tokens: list[str]) -> int | None:
+    """命令位置上的那个脚本词(解释器**和它的选项**之后);认不出 ⇒ None。
+
+    **为什么要跳过解释器选项**(第 55 轮之五,codex 第 2 轮的 M1):
+    `python -X utf8 tools/check_ci_wiring.py` 里,脚本那个词**不紧跟**解释器
+    ⇒ 此前认不出「在跑它」⇒ 报「压根没有」⇒ **误伤合法写法**。
+
+    **连写的取值选项**(第 55 轮之七,claude 第 4 轮的 M-1):
+    CPython **也接受** `-Werror` / `-Xutf8` 这种「选项和值连在一起」的写法
+    ⇒ 研究层已经认 ⇒ 宪法层也要认 ⇒ 否则**两层结论相反**。
+    """
+    if not tokens:
+        return None
+    if not _PYTHON_TOKEN_RE.match(tokens[0].rsplit("/", 1)[-1].lower()):
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _FORBIDDEN_INTERPRETER_FLAGS:
+            return None
+        if token in _INTERPRETER_VALUE_FLAGS:
+            index += 2                      # 跳过选项**和它的值**
+            continue
+        if any(token.startswith(flag) and len(token) > len(flag)
+               for flag in _INTERPRETER_VALUE_FLAGS):
+            index += 1                      # 连写形式:`-Werror` / `-Xutf8`
+            continue
+        if token in _INTERPRETER_NO_VALUE_FLAGS or re.match(r"^-\d+(\.\d+)*$", token):
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _wiring_call_shapes(block: str) -> list[str]:
+    """这个步骤里「在跑接线自检」的写法(认不出规范形就返回**非规范形**的写法)。
+
+    - 规范形:`python tools/check_ci_wiring.py`(解释器是 python 系,
+      可以带解释器自己的选项,但脚本后面**不许**再有任何词);
+    - 其它一切**真的在跑那个脚本**的写法(带选项、直接执行脚本、
+      藏进 `bash -c "…"` 里)⇒ 都算「非规范形」。
+
+    **怎么区分「在跑它」和「只是把它列进文件清单」**:
+    只有当脚本那个词**在命令位置**(解释器及其选项之后)才算「在跑它」
+    ⇒ `ruff check … tools/check_ci_wiring.py` 不算。
+    """
+    tokens = _command_tokens(block)
+    if not tokens:
+        return []
+    # **为什么要 strip**:shlex 的 POSIX 模式会把行尾的续行反斜杠
+    # 当成转义 ⇒ 换行变成**词内的一个字面换行** ⇒
+    # `tools/check_ci_wiring.py` 会变成 "\ntools/check_ci_wiring.py"。
+    # 不 strip 就会把「只是把脚本列进文件清单」误认成「在跑它」。
+    tokens = [token.strip() for token in tokens]
+    script_index = _script_index(tokens)
+    shapes: list[str] = []
+    for index, cleaned in enumerate(tokens):
+        if _normalize_script_path(cleaned) == WIRING_SCRIPT_REL:
+            if script_index is None or index != script_index:
+                continue          # 不在命令位置 ⇒ 只是被列进文件清单 ⇒ 不算「在跑它」
+            if index == 0:
+                shapes.append(block)            # 直接执行脚本 ⇒ 非规范形
+            else:
+                rest = tokens[index + 1:]
+                if not rest:
+                    shapes.append(block)        # 规范形
+                else:
+                    shapes.append(" ".join([tokens[0], cleaned] + rest))  # 带了选项 ⇒ 非规范形
+        elif WIRING_SCRIPT_REL in cleaned and _normalize_script_path(cleaned) != WIRING_SCRIPT_REL:
+            # 藏在引号里(例如 `bash -c "python tools/check_ci_wiring.py"`)
+            shapes.append(block)
+    return shapes
+
+
+def check_ci_wiring_presence(root: Path) -> list[str]:
+    """研究 workflow 里必须**还在**跑接线自检(而且是规范形)。
+
+    **失败模式(都是第 55 轮实测过的)**:
+      - 调用被删 ⇒ 接线自检自己被悄悄拆掉;
+      - 调用被加上 `--workflow <别处文件>` ⇒ 检查范围被缩小,
+        真实的 workflow 压根没被查,而工具**照样报「[OK]」**。
+
+    **失败即 fail-closed**:文件读不到 ⇒ 报问题;不当作「没问题」。
+    """
+    workflow = root / RESEARCH_WORKFLOW_REL
+    if not workflow.exists():
+        return ["%s 不存在 ⇒ 宪法层无法核对接线自检是否还在(fail-closed)"
+                % RESEARCH_WORKFLOW_REL]
+    try:
+        text = workflow.read_text(encoding="utf-8")
+    except OSError as exc:
+        return ["%s 读不了:%s(fail-closed)" % (RESEARCH_WORKFLOW_REL, exc)]
+
+    canonical = False
+    non_canonical: list[str] = []
+    for block in _run_blocks(text):
+        shapes = _wiring_call_shapes(block)
+        if not shapes:
+            continue
+        for shape in shapes:
+            if _is_canonical_wiring_call(shape):
+                canonical = True
+            else:
+                non_canonical.append(shape)
+    if canonical:
+        return []
+    if non_canonical:
+        return ["%s 里跑接线自检的那处调用**不是规范形**:%s ⇒ "
+                "守卫的检查范围可以被缩小(实测:加 `--workflow <别处文件>` ⇒ "
+                "真实的 workflow 压根没被查,工具却照样报「[OK]」)"
+                % (RESEARCH_WORKFLOW_REL, " | ".join(non_canonical)[:200])]
+    return ["%s 里**没有任何**跑 `tools/check_ci_wiring.py` 的地方 ⇒ "
+            "接线自检自己可以被悄悄删掉" % RESEARCH_WORKFLOW_REL]
+
+
+def _is_canonical_wiring_call(shape: str) -> bool:
+    """这一段文本是不是规范形的 `python tools/check_ci_wiring.py`。
+
+    **允许解释器自己的选项**(第 55 轮之五):`python -X utf8 …`、`py -3 …` 算规范形;
+    **禁止** `-c`(把脚本整个换掉)与 `-m`(把脚本换成模块);
+    脚本后面**不许**再有任何词(那才是「缩小检查范围」的口子)。
+    """
+    tokens = _command_tokens(shape)
+    if not tokens:
+        return False
+    index = _script_index(tokens)
+    if index is None:
+        return False
+    if _normalize_script_path(tokens[index]) != WIRING_SCRIPT_REL:
+        return False
+    return index == len(tokens) - 1
+
+
 def check_all(root: Path) -> list[str]:
     """跑完全部检查,返回问题清单(空列表表示通过)。"""
     require_full_history(root)
@@ -1230,13 +2966,21 @@ def check_all(root: Path) -> list[str]:
     problems += check_constitution_file(root)
     problems += check_builtin_protections(root)
     problems += check_registry_completeness(root)
+    problems += check_frozen_patterns(root)
+    problems += check_protected_maps(root)
     problems += check_single_constants(root)
     problems += check_protected_usage(root)
     problems += check_call_site_shape(root)
     problems += check_run_call_order(root)
     problems += check_executor_completeness(root)
+    # 第 55 轮之二十(codex 第 2 轮 M2):字符串里藏着的执行原语也要被看见。
+    problems += check_string_program_primitives(root)
+    # 第 55 轮之二十之补:豁免表必须与 ADR 里那张登记表一致
+    # (否则「登记」就是万能钥匙:加一行即永久放行)。
+    problems += check_string_program_allowlist_registry(root)
     problems += check_constitution_module_is_clean(root)
     problems += check_shrink_only(root)
+    problems += check_ci_wiring_presence(root)   # 第 55 轮:接线自检的独立落点
     seen: set[str] = set()
     unique = []
     for problem in problems:            # 同一个问题可能对多个历史版本重复出现,报一次就够

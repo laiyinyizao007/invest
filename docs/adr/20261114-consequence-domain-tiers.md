@@ -175,7 +175,7 @@ Claude Code 加载用户级规则在前、项目级在后,**两者冲突时都�
   判据是**直接归属**(自己定义或直接调用),不是传递可达——
   传递可达会把助手的判定算到调用者头上(误伤),而**误伤的探针等于没有探针**。
   另有一支**数据流**分析(见下「已知局限」第 2 条)。
-- `tests/test_check_domain.py`:**99 条**,含双向探针(放行 + 拦截)、
+- `tests/test_check_domain.py`:**107 条**,含双向探针(放行 + 拦截)、
   全仓不变量(调用关系 + 数据流两支)、探针自身的准确性夹具。
 - `CLAUDE.md`:本仓库的分档规则与两档流程对照表。
 - CI:`research-guard.yml` 的 ruff 清单与测试清单**已**纳入这三个新文件;
@@ -206,6 +206,17 @@ python tools/check_mutations.py --verify   # 另核对「本表的变异集合 =
 | 把 `scripts/research_api.py` 移出不可降级 | `scripts/research_api.py` |
 | 把 `scripts/optimize.py` 移出研究白名单(落回默认拒绝) | `scripts/optimize.py` |
 | 把整个 `scripts/` 放进研究**目录**白名单 | `scripts/some_brand_new_thing.py` |
+| 把 `risk/ledger_chain.py` 移出不可降级 | `risk/ledger_chain.py` |
+| 把 `risk/ledger_admin.py` 移出不可降级 | `risk/ledger_admin.py` |
+| 把 `scripts/research_ledger.py` 移出不可降级 | `scripts/research_ledger.py` |
+| 把 `tests/test_fs_capability_closure.py` 移出不可降级 | `tests/test_fs_capability_closure.py` |
+| 把 `tests/test_research_mcp.py` 移出不可降级 | `tests/test_research_mcp.py` |
+| 把 `tools/check_domain.py` 移出不可降级 | `tools/check_domain.py` |
+| 把 `tools/check_ci_ran.py` 移出不可降级 | `tools/check_ci_ran.py` |
+| 把 `tools/check_guard_mutations.py` 移出不可降级 | `tools/check_guard_mutations.py` |
+| 把 `tests/guard_roster.json` 移出不可降级 | `tests/guard_roster.json` |
+| 把 `tests/test_check_ci_ran.py` 移出不可降级 | `tests/test_check_ci_ran.py` |
+| 把 `tests/test_check_guard_mutations.py` 移出不可降级 | `tests/test_check_guard_mutations.py` |
 | 新建一个直接调 `check_gate` 的文件(不入库) | 该新文件自身 |
 
 **表里不写「变红几条」**——那个数字随本文件的用例数变化(每加一条用例就变),
@@ -214,6 +225,11 @@ python tools/check_mutations.py --verify   # 另核对「本表的变异集合 =
 ①每种变异**都**被抓住(有一条没被抓住 → 脚本退出码 1 → 关卡红);
 ②每种变异**都真的翻转了判定**(见证路径的档位变了)——否则它只是空操作。
 `--verify` 另核对「本表列出的变异集合 == 脚本里的变异集合」,防止文档与实现各说各话。
+第 49 轮起这个核对是**双向**的(本表**多写**一行也红——文档比实现乐观是最容易骗过
+后来人的一种偏差)、**只看本表所在的那一节**(别的表里的一行不能顶替本轮标签),
+并且**逐格**归一化(只去反引号与成对的 `**`,**不去掉单个 `*`**——
+`except*` 里的星号是语法的一部分)。
+核对口径与纪律守卫那套**共用同一份实现**(`check_mutations.verify_mutation_table`)。
 
 最后一条尤其重要:它证明这条不变量对**尚未入库的新文件**也生效
 (扫描含 `git status --porcelain -uall` 的未跟踪文件,而不只是 `git ls-files`)。
@@ -345,5 +361,62 @@ PR 路径永远有改动(base != HEAD),所以这条分支**在 PR 的 CI 上从�
 - 任何「已覆盖 / 已验证 / 已复算」的措辞,都必须有一条**能在别处跑出同样结果**的机器检查;
 - 探针自身要有**反向**验证(准确性夹具、变异验证、cp1252 回归);
 - 数字(测试条数、变异条数、provider 数量)一律**由脚本实测**,文档只引用不手写。
+
+## 第 47 轮补记:#31 分支引入的账本链与两个新增用例
+
+Issue #31(候选能力收口)给仓库引入了三个新模块,并让一个既有用例改为**走唯一的写入者**。
+合并 main 的分档器之后,两条全仓不变量立刻变红——这是**它们在正常工作**,不是误报:
+
+| 文件 | 为什么必须不可降级 | 哪条探针抓住它 |
+|---|---|---|
+| `risk/ledger_chain.py` | 批准/试验账本的哈希链与外置锚点;批准账本的内容被实盘准入消费 | 数据流探针(`research_sandbox` 是判定点,它的值被喂进去) |
+| `risk/ledger_admin.py` | 人工迁移/重置两本账本,**能重写批准账本** | **图找不到** ⇒ 由 `tests/test_check_domain.py` 的点名断言兜住 |
+| `scripts/research_ledger.py` | 上面那个入口的 CLI 把手 | 同上 |
+| `tests/test_fs_capability_closure.py` | 核心防线套件,直接调 `screen_source` / `record_approval` | 调用关系探针 |
+| `tests/test_research_mcp.py` | 批准状态用例改为走 `record_approval`(唯一写入者) | 调用关系探针 |
+
+两条不变量**各自覆盖一半**,剩下的靠**人工清单 + 点名断言**——这是本 ADR 一贯的
+「图找得到的归图,图找不到的归清单,两层都要有」。
+
+**这次改动本身是执行域改动**(清单就是代码):走完整流程 + codex 双轮复核。
+它**不放松**任何防线——加进去的六条全部是**收紧**(把默认拒绝写死成不可降级),
+且每条都配了变异:从清单里删掉它,变异验证脚本必须看到**测试变红**。
+
+教训(与前几轮同源):**清单是会随仓库演进而失准的**,新增文件不会自动进清单。
+全仓不变量把这件事从「靠人记得」变成「机器拦」——代价是新分支必须先补清单才能过 CI,
+这正是它应有的摩擦。
+
+## 第 48 轮补记:分档器自己、以及「真的跑了吗」那一族闸门
+
+第 48 轮给仓库加了三样东西:CI 侧的「真的跑了吗」闸门(`tools/check_ci_ran.py`)、
+它据以核对的那份**机器可读名单**(`tests/guard_roster.json`)、以及把纪律守卫的
+「变异必须变红」变成可复算脚本的脚手架(`tools/check_guard_mutations.py`),
+外加它们各自的守卫用例。
+
+按本 ADR 的判据一句话——**这个文件的内容(或它的缺席)会不会改变一道判定/授权/隔离/风控的结果**——
+它们全部属于「会」:
+
+| 文件 | 它拥有什么 | 为什么图找不到 |
+|---|---|---|
+| `tools/check_domain.py` | 「什么算执行域」这个判定点**本身** | 判定点清单不在 `verdict_graph.py` 的 `VERDICT_SINKS` 里(那些是真钱链路的判定点) |
+| `tools/check_ci_ran.py` | 「CI 上那条防线到底跑没跑」的判定点 | 同上:它判的是**覆盖**,不是钱 |
+| `tests/guard_roster.json` | 上面那个判定点的**输入**(哪些用例必须真跑) | 数据文件,不被 import |
+| `tests/test_check_ci_ran.py` | 上面那个判定点的守卫用例 | 用例文件 |
+| `tools/check_guard_mutations.py` | 「纪律守卫有没有松」的判定点 | 同上 |
+| `tests/test_check_guard_mutations.py` | 上面那个脚手架**自己的**守卫用例 | 用例文件 |
+
+三条要说明的:
+
+1. **`tools/check_domain.py` 此前**并不**在不可降级清单里**(只有 `verdict_graph.py` 与
+   `check_mutations.py` 在)。它此前靠「默认拒绝」落进执行域——**结论对,但口子开着**:
+   不可降级优先于研究白名单,列进清单才真正堵住「把它塞进 `RESEARCH_FILES`」这条路。
+   顺带更正:项目 `CLAUDE.md` 里那句「守卫工具自身也在不可降级清单里」此前**只有一半是真的**,
+   这正是本仓库的老教训(写下的防线要在代码里真的接线)。
+2. **这一族文件的共同点**是它们判的是「**缺陷能不能被发现**」,不是「钱会不会动」。
+   把它们降级到研究域,等于让「削弱检出能力」的改动免走完整流程——那正是本 ADR §4
+   「任何削弱型改动一律升档」要拦的那一类。
+3. **这次改动是执行域改动**(清单就是代码):走完整流程 + codex 双轮复核。
+   它**不放松**任何防线——加进去的六条全部是**收紧**,且每条都配了变异
+   (从清单里删掉它 ⇒ 变异验证脚本必须看到**测试变红**;见上表的变异集合)。
 
 

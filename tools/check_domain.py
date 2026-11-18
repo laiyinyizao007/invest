@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import os
 import posixpath
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -101,6 +103,18 @@ NEVER_DOWNGRADE = (
     # 收菜:把候选收进 approved/(运行时唯一认的目录)。它**调用静态筛查**,
     # 并且判定「这份字节能不能进入受信目录」——那是批准链上的一个判定点。
     "scripts/research_collect.py",
+
+    # --- 账本防篡改与人工维护入口(第 47 轮补记)---
+    # 试验账本与批准账本的哈希链 + 外置锚点。批准账本的内容**被实盘准入消费**:
+    # 链断了却被当成没事发生 = 一条失效的批准被当成有效。改它 = 改批准的效力。
+    # **图找得到**:scripts/research_sandbox.py(record_approval 的唯一写入者)import 它,
+    # 它的值被喂进判定点 ⇒ verdict_graph 的数据流探针会把它算成 provider。
+    "risk/ledger_chain.py",
+    # 人工迁移/重置两本账本的入口:**能重写批准账本**(reset 会丢弃链外内容)。
+    # **图找不到**(判定点没有 import 它)⇒ 按「图找得到的归图,图找不到的归清单」兜住。
+    "risk/ledger_admin.py",
+    # 上面那个入口的 CLI 把手(与 research_console.py 同类:本身薄,但它是人操作的入口)。
+    "scripts/research_ledger.py",
 
     # --- 门槛评估的编排层 ---
     # 名字像"研究",但算出的东西直接喂进 check_gate
@@ -195,6 +209,29 @@ NEVER_DOWNGRADE = (
     # 准确性夹具也没点名全部判定点。
     "tools/verdict_graph.py",
     "tools/check_mutations.py",
+    # 分档器**自己**:它拥有「什么算执行域」这个判定点。
+    # (默认拒绝已经让它落进执行域,但那样它就还能被塞进研究白名单——
+    #  不可降级优先于研究白名单,列在这里才真正堵住那个口子。)
+    "tools/check_domain.py",
+    # 第 48 轮:CI 侧「真的跑了吗」闸门 + 它的名单 + 守卫自己的用例。
+    # 这三样共同决定「一条防线没跑」会不会被发现 = 改它们 = 改检出能力。
+    "tools/check_ci_ran.py",
+    "tests/guard_roster.json",
+    "tests/test_check_ci_ran.py",
+    # 第 48 轮:纪律守卫的变异验证脚手架(把"守卫松了"变成可复算的检查)。
+    "tools/check_guard_mutations.py",
+    # 上面那个脚手架**自己的**守卫用例:守卫工具的守卫也要有人守
+    # (仓库教训:新写的守卫工具自己也要有人守)。
+    "tests/test_check_guard_mutations.py",
+    # 第 55 轮:CI 接线的**规范形**闸门与它的自检。
+    # `tools/ci_gate.py` 是 CI 里那一步的**全部**内容(自己跑 pytest、自己核对名单、
+    # 用退出码说话)——改它 = 改「闸门判红会不会让 CI 红」。
+    "tools/ci_gate.py",
+    # `tools/check_ci_wiring.py` 是接线自检的本体:它断言「每个闸门步骤都是规范形」
+    # 与「名单里的套件都真的被跑到」——改它 = 改检出能力本身。
+    "tools/check_ci_wiring.py",
+    # 上面那个自检工具**自己**的用例。
+    "tests/test_ci_wiring.py",
     # 防线不变量与门槛相关的用例:改断言 = 削弱检出能力
     "tests/test_research_boundary.py",
     "tests/test_research_config.py",
@@ -233,6 +270,10 @@ NEVER_DOWNGRADE = (
     "tests/test_sandbox_module_view.py",
     "tests/test_sandbox_round25_rules.py",
     "tests/test_sandbox_round26_rules.py",
+    # 第 47 轮:核心防线套件——直接调 screen_source / record_approval
+    "tests/test_fs_capability_closure.py",
+    # 第 47 轮:批准状态用例改为走唯一的写入者(record_approval)⇒ 它直接调用判定点
+    "tests/test_research_mcp.py",
 )
 
 # --------------------------------------------------------------------------
@@ -376,18 +417,97 @@ def verdict(entries: list[tuple[str, str, str]]) -> str:
     return "research"
 
 
+def _safe_git_env() -> dict[str, str]:
+    """给 git 用的环境:**关掉一切能执行外部命令的配置**。
+
+    第 26 轮 Critical 1(ADR `docs/adr/20261113-evolution-engine.md`):
+    `git status` 会**应用 filter** ⇒ `.git/config` 里 `[filter "x"] clean = <命令>`
+    那条命令由 **git 自己去执行** ⇒ 守卫自己变成了**执行面**
+    (实测:候选只要写下一条 filter 命令,守卫跑的那次 `git status` 就替它执行了)。
+
+    ⇒ 这里按那条 ADR 的**第 2 条硬规矩**办:
+    系统级与全局级配置**全部指空** ⇒ 只有仓库自己的 `.git/config`
+    还能定义 filter ⇒ 而仓库里那份**正是候选可写的**
+    ⇒ 它的 filter 名字逐个**置空**(见 `_git_safe_args`)。
+    """
+    env = dict(os.environ)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    return env
+
+
+def _repo_filter_names() -> list[str]:
+    """当前配置里定义了哪些 **filter 名字**(那些名字背后可能有可执行命令)。
+
+    用 `git config --get-regexp` 读(它会跟随 `include.path`)⇒ 不漏
+    「include 进来的那份配置」里的 filter。`git config` **只读配置**,
+    不读工作区文件 ⇒ 不应用 filter ⇒ 自身**不会**变成执行面。
+    读不到就返回空列表(拿不到 ≠ 有 ⇒ 宁可少中和,也不静悄悄改口径:
+    真正兜底的是 `_safe_git_env` 把全局/系统配置指空)。
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(ROOT), "config", "--get-regexp",
+             r"^filter\..+\.(clean|smudge|process)$"],
+            capture_output=True, text=True, env=_safe_git_env(), check=False,
+        )
+    except OSError:
+        return []
+    names: list[str] = []
+    for line in res.stdout.splitlines():
+        match = re.match(r"^filter\.(.+)\.(clean|smudge|process)\s", line)
+        if match and match.group(1) not in names:
+            names.append(match.group(1))
+    return names
+
+
+def _git_safe_args() -> list[str]:
+    """每次调 git 都要带的那几项「不许执行外部命令」的开关。
+
+    - `core.fsmonitor=false`:`fsmonitor` 本身就是**一条命令**;
+    - `core.pager=cat`:不让 pager 插手;
+    - 每个 filter 名字:`clean`/`smudge`/`process` **全部置空**
+      ⇒ 即使 `.git/config` 里写着命令,**也没有命令可执行**;
+      `required=false` ⇒ 属性声明成必需时也不至于报错中断。
+    """
+    args = ["-c", "core.fsmonitor=false", "-c", "core.pager=cat"]
+    for name in _repo_filter_names():
+        args += [
+            "-c", f"filter.{name}.clean=",
+            "-c", f"filter.{name}.smudge=",
+            "-c", f"filter.{name}.process=",
+            "-c", f"filter.{name}.required=false",
+        ]
+    return args
+
+
 def git_changed_paths(base: str) -> list[str]:
-    """列出相对 base 的改动文件(含未跟踪)。失败抛 RuntimeError(fail-closed)。"""
+    """列出相对 base 的改动文件(含未跟踪)。失败抛 RuntimeError(fail-closed)。
+
+    **不许让 git 执行任何外部命令**(第 55 轮之二十五,codex 第 2 轮 M4):
+    `git status` 会应用 filter ⇒ 候选写一条 filter 命令,守卫就替它执行
+    ⇒ 与本仓库第 26 轮 Critical 1 的既有 ADR 结论**直接冲突**
+    ⇒ 现在按那条结论办:环境关掉全局/系统配置 + 逐个 filter **置空**
+    (实测:置空后 `git status` 照样正常列出改动,但**标记文件没有被写出来**)。
+    """
+    safe = _git_safe_args()
+    env = _safe_git_env()
     try:
         out = subprocess.run(
-            ["git", "-C", str(ROOT), "diff", "--name-only", f"{base}...HEAD"],
-            capture_output=True, text=True, check=True,
+            # `--no-ext-diff`:外部 diff 驱动也是**一条命令**。
+            # `base...HEAD` 是**提交对提交**的比对 ⇒ 只读对象库 ⇒ 不碰工作区。
+            ["git", "-C", str(ROOT), *safe, "diff", "--no-ext-diff",
+             "--name-only", f"{base}...HEAD"],
+            capture_output=True, text=True, check=True, env=env,
         ).stdout.splitlines()
         status = subprocess.run(
             # `-uall`:不带它,git 会把**未跟踪的整个目录**折叠成一行 `?? newpkg/`,
             # 目录里的文件就看不见了 —— 新建目录里的文件会绕过所有扫描。
-            ["git", "-C", str(ROOT), "status", "--porcelain", "-uall"],
-            capture_output=True, text=True, check=True,
+            ["git", "-C", str(ROOT), *safe, "status", "--porcelain", "-uall"],
+            capture_output=True, text=True, check=True, env=env,
         ).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"无法读取 git 改动(base={base!r}): {exc!r}") from exc
