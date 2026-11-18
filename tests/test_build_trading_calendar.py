@@ -83,7 +83,8 @@ def test_changes_to_existing_dates_are_conflicts(new, needle):
 def test_main_refuses_conflicting_update_without_flag(tmp_path, capsys):
     out = tmp_path / "cal.json"
     out.write_text(json.dumps(_cal(["2025-10-01"])), encoding="utf-8")
-    fake = lambda: weekdays(date(2025, 9, 29), date(2025, 10, 12))          # 数据源说 10/1 是交易日
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12))              # 数据源说 10/1 是交易日
     rc = b.main(["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)], fetch=fake, today="2026-11-17")
     assert rc == 1
     assert json.loads(out.read_text(encoding="utf-8"))["closed_weekdays"] == ["2025-10-01"]     # 原文件未被覆盖
@@ -93,7 +94,8 @@ def test_main_refuses_conflicting_update_without_flag(tmp_path, capsys):
 
 def test_main_writes_new_file_and_check_mode(tmp_path):
     out = tmp_path / "cal.json"
-    fake = lambda: weekdays(date(2025, 9, 29), date(2025, 10, 12), HOLIDAYS)
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12), HOLIDAYS)
     assert b.main(["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)], fetch=fake, today="2026-11-17") == 0
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["fetched_at"] == "2026-11-17" and data["closed_weekdays"] == ["2025-10-01", "2025-10-02", "2025-10-03"]
