@@ -1,6 +1,5 @@
 """国信测试报告 docx 填写器与证据模型/渲染的离线测试(用现场构造的迷你模板,真实模板不入库)。"""
 import struct
-import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -497,3 +496,189 @@ def test_official_report_name_is_refused_for_non_guosin_evidence(tmp_path):
         ' "market_front": "121.13.218.19:41293", "broker_id": "8030", "app_id": "guoxin_client"}]',
         encoding="utf-8")
     assert br.non_guoxin_connections(out_dir) == []
+
+
+# ---------- 真实运行截图(证据目录 manual/) ----------
+
+def _png(tmp_path, name="real.png"):
+    from PIL import Image
+    p = tmp_path / name
+    Image.new("RGB", (40, 30), "black").save(p)
+    return p.read_bytes()
+
+
+def _para_texts(doc):
+    paras = [el for el in doc.body if el.tag == br.P]
+    return ["DRAW" if el.find(f".//{{{br.W_NS}}}drawing") is not None else br.text_of(el).strip() for el in paras]
+
+
+def test_real_screenshots_follow_the_matching_card(tmp_path):
+    """manual/P1.2_平仓.png 紧跟「平仓」那张证据卡片之后,带说明标题;卡片本身保留。"""
+    evs = evidences()
+    evs["P1.2"] = be.Evidence("P1.2", be.PASS, "", "t", [be.Shot("开仓", ["o"]), be.Shot("平仓", ["c"]), be.Shot("撤单", ["x"])])
+    out_dir = render_images(tmp_path, evs)
+    (out_dir / "manual").mkdir()
+    (out_dir / "manual" / "P1.2_平仓.png").write_bytes(_png(tmp_path))
+    outcome, doc = build_from_dir(tmp_path, evs, out_dir)
+    texts = _para_texts(doc)
+    i = texts.index("2）平仓")
+    assert texts[i + 1] == "DRAW"                                   # 生成的证据卡片
+    assert texts[i + 2] == br.REAL_SHOT_CAPTION and texts[i + 3] == "DRAW"   # 紧跟真实截图
+    assert texts.index("3）撤单") > i + 3
+    assert not outcome.warnings
+
+
+def test_item_level_real_screenshots_go_after_the_items_last_card_in_name_order(tmp_path):
+    evs = evidences()
+    out_dir = render_images(tmp_path, evs)
+    (out_dir / "manual").mkdir()
+    for n in ("P1.3_2.png", "P1.3.png"):
+        (out_dir / "manual" / n).write_bytes(_png(tmp_path, n))
+    outcome, doc = build_from_dir(tmp_path, evs, out_dir)
+    texts = _para_texts(doc)
+    i = next(k for k, t in enumerate(texts) if t.startswith("2）持续下单200笔"))
+    assert texts[i + 1: i + 6] == ["DRAW", br.REAL_SHOT_CAPTION, "DRAW", br.REAL_SHOT_CAPTION, "DRAW"]
+    assert outcome.real_shots == ["P1.3.png", "P1.3_2.png"]
+
+
+def test_unmatched_real_screenshot_is_reported_not_dropped(tmp_path):
+    evs = evidences()
+    out_dir = render_images(tmp_path, evs)
+    (out_dir / "manual").mkdir()
+    (out_dir / "manual" / "P9.9_开仓.png").write_bytes(_png(tmp_path))
+    (out_dir / "manual" / "notes.txt").write_text("x", encoding="utf-8")
+    outcome, _ = build_from_dir(tmp_path, evs, out_dir)
+    assert any("P9.9_开仓.png" in w for w in outcome.warnings)
+    assert not any("notes.txt" in w for w in outcome.warnings)        # 只认 png
+
+
+def test_no_manual_dir_changes_nothing(tmp_path):
+    outcome, doc = build(tmp_path, evidences())
+    assert br.REAL_SHOT_CAPTION not in _para_texts(doc) and outcome.real_shots == []
+
+
+def _manual(tmp_path, evs, files: dict):
+    out_dir = render_images(tmp_path, evs)
+    (out_dir / "manual").mkdir()
+    for name, data in files.items():
+        target = out_dir / "manual" / name
+        if data is None:
+            target.mkdir()
+        else:
+            target.write_bytes(data)
+    return out_dir
+
+
+def test_xml_special_characters_in_names_do_not_break_the_report(tmp_path):
+    """文件名/小标题里的 & 必须转义进 XML(否则 etree 解析失败、整份报告生成不了)。"""
+    evs = evidences()
+    evs["P1.2"] = be.Evidence("P1.2", be.PASS, "", "t", [be.Shot("开仓", ["o"]), be.Shot("A&B", ["c"])])
+    out_dir = _manual(tmp_path, evs, {"P1.2_A&B.png": _png(tmp_path)})
+    outcome, _ = build_from_dir(tmp_path, evs, out_dir)
+    assert outcome.real_shots == ["P1.2_A&B.png"]
+    names = [d.get("name") for d in br.Docx(outcome.path).doc.iter(f"{{{br.WP_NS}}}docPr")]
+    assert "P1.2-real-P1.2_A&B" in names                    # 转义后再解析回来是原文
+
+
+def test_invalid_or_oversized_pngs_are_warned_and_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(br, "MAX_IMAGE_BYTES", 5000)
+    evs = evidences()
+    big = _png(tmp_path) + b"\0" * 6000
+    out_dir = _manual(tmp_path, evs, {"P1.1.png": b"not a png at all, definitely", "P1.2.png": big, "P1.3.png": _png(tmp_path)})
+    outcome, _ = build_from_dir(tmp_path, evs, out_dir)
+    assert outcome.real_shots == ["P1.3.png"]
+    assert any("P1.1.png" in w and "不是有效的 PNG" in w for w in outcome.warnings)
+    assert any("P1.2.png" in w and "过大" in w for w in outcome.warnings)
+
+
+def test_zero_sized_png_header_is_rejected():
+    import zlib
+    chunk = b"IHDR" + struct.pack(">IIBBBBB", 0, 16, 8, 2, 0, 0, 0)     # 宽 0、高 16,校验和正确
+    header = br.PNG_MAGIC + struct.pack(">I", 13) + chunk + struct.pack(">I", zlib.crc32(chunk))
+    assert "尺寸异常" in br.png_problem(header)
+
+
+def test_uppercase_extension_counts_and_directories_named_png_are_ignored(tmp_path):
+    evs = evidences()
+    out_dir = _manual(tmp_path, evs, {"P1.3.PNG": _png(tmp_path), "P1.1.png": None})
+    outcome, _ = build_from_dir(tmp_path, evs, out_dir)
+    assert outcome.real_shots == ["P1.3.PNG"]
+
+
+def test_new_image_ids_do_not_collide_with_the_template(tmp_path):
+    template = build_template(tmp_path / "t.docx")
+    d = br.Docx(template)
+    rel = br.etree.SubElement(d.rels, f"{{{br.REL_NS}}}Relationship")
+    rel.set("Id", "rIdBroker1")
+    rel.set("Type", br.IMAGE_REL_TYPE)
+    rel.set("Target", "media/broker_1.png")
+    d.members["word/media/broker_1.png"] = b"old"
+    d.names.append("word/media/broker_1.png")
+    para = br.picture_paragraph(d, _png(tmp_path), "x", d.next_pic_id())
+    d.body.append(para)
+    d.body.append(br.picture_paragraph(d, _png(tmp_path), "y", d.next_pic_id()))
+    rids = [r.get("Id") for r in d.rels]
+    assert len(rids) == len(set(rids)) and d.members["word/media/broker_1.png"] == b"old"
+    ids = [p.get("id") for p in d.doc.iter(f"{{{br.WP_NS}}}docPr")]
+    assert len(ids) == len(set(ids))
+
+
+def test_real_shots_are_named_in_warnings_when_proof_sections_are_missing(tmp_path):
+    template = build_template(tmp_path / "t.docx")
+    d = br.Docx(template)
+    for p in [el for el in d.body if el.tag == br.P and br.text_of(el).strip().startswith("测试总结报告证明材料")]:
+        d.body.remove(p)
+    d.save(tmp_path / "nohead.docx")
+    evs = evidences()
+    out_dir = _manual(tmp_path, evs, {"P1.3.png": _png(tmp_path)})
+    outcome = br.build_report(tmp_path / "nohead.docx", out_dir, tmp_path / "o.docx", ctx(), evs)
+    assert any("P1.3.png" in w for w in outcome.warnings)
+
+
+def test_non_numeric_elapsed_seconds_is_reported_not_crashing(tmp_path):
+    evs = evidences()
+    evs["P1.3"] = be.Evidence("P1.3", be.PASS, "", "t", [be.Shot("200笔", ["l"])], {"orders": 200, "elapsed_seconds": "about 20"})
+    outcome, _ = build(tmp_path, evs)
+    assert any("耗时不是数字" in m for m in outcome.missing)
+
+
+def test_numeric_string_elapsed_seconds_is_still_filled(tmp_path):
+    evs = evidences()
+    evs["P1.3"] = be.Evidence("P1.3", be.PASS, "", "t", [be.Shot("200笔", ["l"])], {"orders": 200, "elapsed_seconds": "20.6"})
+    _, doc = build(tmp_path, evs)
+    assert any("耗时约 20.6 秒" in br.text_of(p) for p in doc.body if p.tag == br.P)
+
+
+def test_tall_images_are_capped_in_height(tmp_path):
+    from PIL import Image
+    p = tmp_path / "tall.png"
+    Image.new("RGB", (10, 5000), "black").save(p)
+    d = br.Docx(build_template(tmp_path / "t.docx"))
+    para = br.picture_paragraph(d, p.read_bytes(), "tall", d.next_pic_id())
+    ext = para.find(f".//{{{br.WP_NS}}}extent")
+    assert int(ext.get("cy")) <= br.MAX_IMAGE_HEIGHT_EMU and int(ext.get("cx")) >= 1
+
+
+def test_png_with_a_corrupt_header_checksum_is_rejected(tmp_path):
+    good = bytearray(_png(tmp_path))
+    assert br.png_problem(bytes(good)) == ""
+    good[30] ^= 0xFF                                          # 破坏 IHDR 的 CRC
+    assert "校验和" in br.png_problem(bytes(good))
+
+
+def test_total_embedded_media_is_capped(tmp_path, monkeypatch):
+    evs = evidences()
+    out_dir = _manual(tmp_path, evs, {"P1.3.png": _png(tmp_path), "P1.3_2.png": _png(tmp_path, "b.png")})
+    monkeypatch.setattr(br, "MAX_TOTAL_MEDIA_BYTES", 0)       # 任何图都会超出总量
+    outcome, _ = build_from_dir(tmp_path, evs, out_dir)
+    assert outcome.real_shots == [] and any("总量" in w for w in outcome.warnings)
+
+
+def test_truncated_or_corrupted_png_body_is_rejected(tmp_path):
+    good = _png(tmp_path)
+    assert "截断" in br.png_problem(good[:-12])               # 去掉 IEND
+    assert "截断" in br.png_problem(good[:40])
+    bad = bytearray(good)
+    idat = bytes(bad).index(b"IDAT")
+    bad[idat + 6] ^= 0xFF                                      # 改坏 IDAT 数据
+    assert "IDAT" in br.png_problem(bytes(bad))

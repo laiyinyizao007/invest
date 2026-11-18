@@ -11,6 +11,9 @@
   必测项没有 PASS 时留空并在终端列出"报告里还缺什么";
 - **不碰国信填写区**:「信息科技中心评估意见」「测试评估」「测试人员(国信期货)」等表格原样保留;
 - 签字/盖章栏留空:需要人工签字盖章。
+- 真实运行截图:证据目录 `manual/` 下的 PNG(`<测试项>[_<小标题>][_<序号>].png`,如 `P1.2.png`、`P1.2_平仓.png`)
+  插在对应证据卡片之后、带「实际运行截图」标题;对不上测试项/小标题的文件只告警不插入。
+  截图必须与该项证据卡片出自**同一次运行**(卡片会被后来的运行覆盖,旧截图要一起换掉)。
 模板含国信测试环境的 IP/端口,**不入库**,用 --template 传路径(或环境变量 BROKER_REPORT_TEMPLATE)。
 """
 import argparse
@@ -20,9 +23,11 @@ import re
 import struct
 import sys
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -30,7 +35,7 @@ import bootstrap  # noqa: F401
 
 from lxml import etree
 
-from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, TEMPLATE_NO, Evidence, load_evidence
+from broker_evidence import FAIL, ITEMS, OPTIONAL_ITEMS, PASS, TEMPLATE_NO, Evidence, load_evidence
 from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
 from ctp_tools.profile import load_profile  # noqa: E402
 from ctp_tools.simnow import normalize_address  # noqa: E402
@@ -53,6 +58,7 @@ def w(tag: str) -> str:
 P, TBL, TR, TC, R, T, SYM, RPR, PPR = (w(x) for x in ("p", "tbl", "tr", "tc", "r", "t", "sym", "rPr", "pPr"))
 CHECKED, UNCHECKED = "0052", "00A3"      # Wingdings 2:☑ / □
 MAX_IMAGE_EMU = 5_600_000                  # 约 15.5 cm,不超过版心
+MAX_IMAGE_HEIGHT_EMU = 8_500_000           # 约 23.6 cm,不超过版心高度(极端长条图按比例缩小)
 SKIP_MARK_PREFIX = "（截图材料"
 
 
@@ -70,16 +76,29 @@ class Docx:
         self.rels = etree.fromstring(self.members["word/_rels/document.xml.rels"])
         self.content_types = etree.fromstring(self.members["[Content_Types].xml"])
         self._image_count = 0
+        self.media_bytes = 0                     # 已嵌入图片的总字节数(总量上限见 MAX_TOTAL_MEDIA_BYTES)
         self.missing_images: list[str] = []      # 证据里登记了、但磁盘上找不到的图
+        # 新加图片的关系 ID / 媒体文件名 / docPr id 不能与模板里已有的撞车(撞了 Word 会报文件损坏)
+        self._used_rids = {r.get("Id") for r in self.rels}
+        docpr_ids = [int(d.get("id")) for d in self.doc.iter(f"{{{WP_NS}}}docPr") if (d.get("id") or "").isdigit()]
+        self._pic_id = max(docpr_ids + [9000])
+
+    def next_pic_id(self) -> int:
+        self._pic_id += 1
+        return self._pic_id
 
     def add_image(self, png: bytes) -> str:
         """加入一张 PNG,返回关系 ID。"""
-        self._image_count += 1
-        name = f"word/media/broker_{self._image_count}.png"
+        while True:
+            self._image_count += 1
+            name = f"word/media/broker_{self._image_count}.png"
+            rid = f"rIdBroker{self._image_count}"
+            if name not in self.members and rid not in self._used_rids:
+                break
         self.members[name] = png
-        if name not in self.names:
-            self.names.append(name)
-        rid = f"rIdBroker{self._image_count}"
+        self.media_bytes += len(png)
+        self.names.append(name)
+        self._used_rids.add(rid)
         rel = etree.SubElement(self.rels, f"{{{REL_NS}}}Relationship")
         rel.set("Id", rid)
         rel.set("Type", IMAGE_REL_TYPE)
@@ -242,12 +261,60 @@ def png_size(png: bytes) -> tuple[int, int]:
     return struct.unpack(">II", png[16:24])
 
 
+PNG_MAGIC = bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A])
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_SIDE = 20000
+MAX_TOTAL_MEDIA_BYTES = 200 * 1024 * 1024   # 整份报告嵌入图片总量上限:超出的图告警跳过,避免生成数 GB 的 docx
+
+
+def read_image(doc: "Docx", path: Path) -> tuple[bytes | None, str]:
+    """读图并校验:先看文件大小(过大的不读进内存),再校验 PNG,最后核对整份报告的图片总量。"""
+    try:
+        size = path.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            return None, f"文件过大({size} 字节,上限 {MAX_IMAGE_BYTES})"
+        if doc.media_bytes + size > MAX_TOTAL_MEDIA_BYTES:
+            return None, f"报告嵌入图片总量将超过上限 {MAX_TOTAL_MEDIA_BYTES} 字节"
+        png = path.read_bytes()
+    except OSError as exc:
+        return None, f"读取失败({exc!r})"
+    problem = png_problem(png)
+    return (None, problem) if problem else (png, "")
+
+
+def png_problem(png: bytes) -> str:
+    """不是可插入的 PNG 时返回原因,否则空串。坏图只告警跳过,不能让整份报告生成失败。"""
+    if len(png) > MAX_IMAGE_BYTES:
+        return f"文件过大({len(png)} 字节,上限 {MAX_IMAGE_BYTES})"
+    if len(png) < 33 or not png.startswith(PNG_MAGIC) or png[12:16] != b"IHDR":
+        return "不是有效的 PNG 文件"
+    if struct.unpack(">I", png[8:12])[0] != 13 or zlib.crc32(png[12:29]) != struct.unpack(">I", png[29:33])[0]:
+        return "PNG 文件头损坏(IHDR 长度或校验和不对)"
+    width, height = png_size(png)
+    if not (0 < width <= MAX_IMAGE_SIDE and 0 < height <= MAX_IMAGE_SIDE):
+        return f"图片尺寸异常({width}x{height})"
+    # 逐个数据块核对长度与校验和,并要求以 IEND 结尾:截断或损坏的图插进去 Word 只会显示红叉
+    pos = 8
+    while pos + 12 <= len(png):
+        length = struct.unpack(">I", png[pos:pos + 4])[0]
+        end = pos + 12 + length
+        if end > len(png):
+            return "PNG 数据被截断"
+        kind = png[pos + 4:pos + 8]
+        if zlib.crc32(png[pos + 4:end - 4]) != struct.unpack(">I", png[end - 4:end])[0]:
+            return f"PNG 数据块 {kind.decode('latin-1')} 校验和不对"
+        if kind == b"IEND":
+            return ""
+        pos = end
+    return "PNG 数据被截断(缺少 IEND)"
+
+
 def inline_picture(rid: str, cx: int, cy: int, pic_id: int, name: str):
     xml = (
         f'<w:drawing xmlns:w="{W_NS}" xmlns:wp="{WP_NS}" xmlns:a="{A_NS}" xmlns:pic="{PIC_NS}" xmlns:r="{R_NS}">'
         f'<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/>'
-        f'<wp:docPr id="{pic_id}" name="{name}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
-        f'<a:graphic><a:graphicData uri="{PIC_NS}"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="{name}"/><pic:cNvPicPr/></pic:nvPicPr>'
+        f'<wp:docPr id="{pic_id}" name={quoteattr(name)}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+        f'<a:graphic><a:graphicData uri="{PIC_NS}"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name={quoteattr(name)}/><pic:cNvPicPr/></pic:nvPicPr>'
         f'<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
         f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
         f'</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>'
@@ -260,6 +327,8 @@ def picture_paragraph(doc: Docx, png: bytes, name: str, pic_id: int):
     width, height = png_size(png)
     cx = min(MAX_IMAGE_EMU, width * 9525)          # 96 dpi:1 px = 9525 EMU
     cy = int(cx * height / width)
+    if cy > MAX_IMAGE_HEIGHT_EMU:                  # 长条图:按高度上限等比缩小,不能撑出版心
+        cx, cy = max(1, int(cx * MAX_IMAGE_HEIGHT_EMU / cy)), MAX_IMAGE_HEIGHT_EMU
     p = etree.Element(P)
     ppr = etree.SubElement(p, PPR)
     jc = etree.SubElement(ppr, w("jc"))
@@ -305,6 +374,7 @@ class Outcome:
     path: Path
     missing: list[str] = field(default_factory=list)       # 报告里还缺什么(必测项没通过、需人工补的栏)
     warnings: list[str] = field(default_factory=list)
+    real_shots: list[str] = field(default_factory=list)    # 插入了哪些真实运行截图(manual/ 下的文件名)
 
 
 COVER2 = "程序化补充测试报告"
@@ -344,7 +414,45 @@ def _status_note(ev: Evidence | None) -> str:
     return f"{ev.status}({ev.summary})" if ev.summary else ev.status
 
 
-_PIC_ID = [9000]
+
+# 真实运行截图:证据目录 manual/ 下的 PNG,文件名 `<测试项>[_<小标题>][_<序号>].png`,
+# 例:P1.2_平仓.png、P1.3.png、P3.1_撤单总笔数_2.png。插在对应证据卡片**之后**(卡片是可读的摘要,截图是实证),
+# 同一位置多张按文件名排序;对不上任何测试项/小标题的文件进 warnings,不静默丢弃。
+# 文件名语法:小标题里不能有 `_`;紧跟测试项的段若是纯数字,按序号认(所以纯数字的小标题表达不了)。
+# 坏图(非 PNG / 过大 / 尺寸异常)只告警跳过。
+REAL_SHOT_DIR = "manual"
+REAL_SHOT_CAPTION = "实际运行截图(测试程序运行窗口):"
+
+
+def real_shots_by_item(evidence_dir: Path | None) -> dict[str, list[Path]]:
+    """manual/ 下的 PNG 按测试项分组(文件名排序)。测试项编号含点,按 `_` 前的部分认。"""
+    folder = Path(evidence_dir) / REAL_SHOT_DIR if evidence_dir is not None else None
+    if folder is None or not folder.is_dir():
+        return {}
+    groups: dict[str, list[Path]] = {}
+    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() == ".png"]   # 扩展名大小写不敏感,目录不算
+    for f in sorted(files, key=lambda x: x.name):
+        groups.setdefault(f.stem.split("_", 1)[0], []).append(f)
+    return groups
+
+
+def _real_shot_label(path: Path) -> str:
+    """文件名里的小标题部分(没有或只有序号时为空串)。"""
+    parts = path.stem.split("_")[1:]
+    return "" if not parts or parts[0].isdigit() else parts[0]
+
+
+def _insert_real_shot(doc: Docx, after, item: str, path: Path, outcome: Outcome):
+    png, problem = read_image(doc, path)
+    if problem:
+        outcome.warnings.append(f"真实截图 {path.name}:{problem},未插入")
+        return after
+    cap = caption_paragraph(REAL_SHOT_CAPTION)
+    after.addnext(cap)
+    pic = picture_paragraph(doc, png, f"{item}-real-{path.stem}", doc.next_pic_id())
+    cap.addnext(pic)
+    outcome.real_shots.append(path.name)
+    return pic
 
 
 def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
@@ -356,14 +464,16 @@ def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
     if not path.exists():
         doc.missing_images.append(f"{ev.item} {shot.label}".strip() + f":{shot.image}")
         return after
-    png = path.read_bytes()
+    png, problem = read_image(doc, path)
+    if problem:
+        doc.missing_images.append(f"{ev.item} {shot.label}".strip() + f":{shot.image}({problem})")
+        return after
     last = after
     if caption:
         cap = caption_paragraph(caption)
         last.addnext(cap)
         last = cap
-    _PIC_ID[0] += 1
-    pic = picture_paragraph(doc, png, f"{ev.item}-{shot.label or 'shot'}", _PIC_ID[0])
+    pic = picture_paragraph(doc, png, f"{ev.item}-{shot.label or 'shot'}", doc.next_pic_id())
     last.addnext(pic)
     return pic
 
@@ -480,8 +590,11 @@ def fill_report(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome
     proofs = [i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip().startswith("测试总结报告证明材料")]
     first = next((i for i in proofs if i < boundary), None)
     second = next((i for i in proofs if i > boundary), None)
+    real = real_shots_by_item(getattr(doc, "evidence_dir", None))
     if first is None or second is None:
         outcome.warnings.append("报告:找不到两处「测试总结报告证明材料」标题,证据图未插入")
+        for files in real.values():
+            outcome.warnings.extend(f"真实截图 {f.name}:报告里找不到证明材料部分,未插入" for f in files)
         return
     # 第二处标题自己也含「测试系统功能测试指引」字样,所以从下一段起找、且要求以它开头(正文里那段「测试系统功能测试指引:摘自…」)
     guide = next((i for i in range(second + 1, end) if kids[i].tag == P and text_of(kids[i]).strip().startswith("测试系统功能测试指引")), end)
@@ -503,10 +616,26 @@ def fill_report(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome
             continue
         last_after: dict[int, object] = {}
         default_anchor = next((p for p in paras if text_of(p).strip().startswith(SKIP_MARK_PREFIX)), paras[0])
+        pending = list(real.pop(item, []))
+        labels = {shot.label for shot in ev.shots if shot.label}
+        last = default_anchor
         for shot in ev.shots:
             anchor = next((p for p in paras[1:] if shot.label and shot.label in text_of(p)), default_anchor)
             base = last_after.get(id(anchor), anchor)
-            last_after[id(anchor)] = _insert_shot(doc, base, ev, shot)
+            last = _insert_shot(doc, base, ev, shot)
+            if shot.label:                      # 该小标题的真实截图紧跟它自己的卡片
+                for f in [f for f in pending if _real_shot_label(f) == shot.label]:
+                    pending.remove(f)
+                    last = _insert_real_shot(doc, last, item, f, outcome)
+            last_after[id(anchor)] = last
+        for f in [f for f in pending if _real_shot_label(f) and _real_shot_label(f) not in labels]:
+            pending.remove(f)
+            outcome.warnings.append(f"真实截图 {f.name}:测试项 {item} 没有小标题「{_real_shot_label(f)}」,未插入")
+        for f in pending:                       # 不带小标题的:接在本项最后一张图之后
+            last = _insert_real_shot(doc, last, item, f, outcome)
+    for item, files in real.items():
+        for f in files:
+            outcome.warnings.append(f"真实截图 {f.name}:报告里没有测试项 {item} 的小节,未插入")
     _fill_stability_seconds(evs.get("P1.3"), regions.get("P1.3"), outcome)
 
 
@@ -522,8 +651,13 @@ def _fill_stability_seconds(ev: Evidence | None, paras: list | None, outcome: Ou
     if target is None:
         outcome.warnings.append(f"报告:2.1 里找不到「持续下单{orders}笔」段落,耗时未填")
         return
+    try:
+        seconds_num = float(seconds)              # metrics 来自 JSON,类型不受约束:非数字时报缺,不能让整份报告失败
+    except (TypeError, ValueError):
+        outcome.missing.append(f"2.1 稳定运行:证据里的耗时不是数字({seconds!r}),「耗时约 N 秒」需人工填写")
+        return
     text = text_of(target)
-    filled, n = re.subn(r"(耗时约)\s*(秒)", rf"\1 {seconds:g} \2", text, count=1)
+    filled, n = re.subn(r"(耗时约)\s*(秒)", rf"\1 {seconds_num:g} \2", text, count=1)
     if n == 0:
         outcome.warnings.append("报告:2.1 段落里找不到「耗时约 秒」填空,耗时未填")
         return
@@ -682,6 +816,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     outcome = build_report(Path(args.template), args.evidence, out, ctx, watermark=args.watermark)
     print(f"报告已生成:{outcome.path}")
+    if outcome.real_shots:
+        print(f"已插入真实运行截图 {len(outcome.real_shots)} 张:{', '.join(outcome.real_shots)}")
     for line in outcome.warnings:
         print(f"  ⚠ {line}", file=sys.stderr)
     print("报告里还缺什么:")
