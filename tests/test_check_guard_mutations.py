@@ -411,6 +411,10 @@ def _fake_repo(dest: Path) -> None:
     # ⇒ 假仓库也得有它,否则基线跑不起来 ⇒ `main()` 退出码 2 ⇒ 这几条用例全红。
     (dest / "tests" / "test_fake_wiring.py").write_text(
         "def test_wiring():\n    assert True\n", encoding="utf-8")
+    # 第 55 轮之二十四:基线里多了**第四份**(字符串程序那套)⇒ 假仓库也得有它,
+    # 否则基线跑不起来 ⇒ `main()` 退出码 2 ⇒ 这几条用例全红。
+    (dest / "tests" / "test_fake_strings.py").write_text(
+        "def test_strings():\n    assert True\n", encoding="utf-8")
     (dest / "guard_target.py").write_text("VALUE = 1\n", encoding="utf-8")
 
 
@@ -421,6 +425,16 @@ def _run_main_with(monkeypatch, mutations, witnesses) -> int:
     monkeypatch.setattr(cgm, "BOUNDARY", "tests/test_fake_boundary.py")
     monkeypatch.setattr(cgm, "TOOL_TEST", "tests/test_fake_tool.py")
     monkeypatch.setattr(cgm, "WIRING", "tests/test_fake_wiring.py")
+    monkeypatch.setattr(cgm, "STRING_PROGRAMS", "tests/test_fake_strings.py")
+    # **基线组也要换成假套件**(第 55 轮之二十四):它是一个**在 import 时算死**
+    # 的常量 ⇒ 只换 `BOUNDARY` 等名字**换不掉**它 ⇒ 基线会拿**真套件**去跑
+    # (假仓库里根本没有)⇒ 基线直接炸 ⇒ 这几条用例全红。
+    monkeypatch.setattr(cgm, "BASELINE_GROUPS", (
+        ("tests/test_fake_boundary.py",),
+        ("tests/test_fake_tool.py",),
+        ("tests/test_fake_wiring.py",),
+        ("tests/test_fake_strings.py",),
+    ))
     monkeypatch.setattr(cgm, "copy_repo", _fake_repo)
     return cgm.main([])
 
@@ -950,3 +964,343 @@ def test_the_probe_says_so_when_there_is_no_cache_at_all(tmp_path) -> None:
     src.write_text("VALUE = 1\n", encoding="utf-8")
     out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
     assert "__pycache__" in out, out
+
+
+# --------------------------------------------------------------------------
+# 第 55 轮之二十:codex 第 2 轮的 M1 / L1 / L2 / L4 / L3
+# --------------------------------------------------------------------------
+#
+# 这一轮 codex 给 42/50(需小修),五条发现都落在**诊断与脚手架自己**身上:
+# M1 —— `PYTHONPYCACHEPREFIX` 让清缓存**整体错位**(而且无声);
+# L1 —— 诊断对**读不了**的 `.pyc` 静默跳过;
+# L2 —— 指纹漏了 `co_names` ⇒ 等长改名被误判成「缓存是新的」;
+# L4 —— 诊断的结论行与它自己打印的失败集合**自相矛盾**;
+# L3 —— 见证**共用**(159 条红变异只有 132 个唯一见证)而注释宣称「一条一条」。
+
+def test_the_domain_harness_neutralises_a_bytecode_cache_prefix(tmp_path, monkeypatch) -> None:
+    """**拦截侧(分档那套)**:环境里有 `PYTHONPYCACHEPREFIX` ⇒ 必须**摘掉**。
+
+    这个变量让解释器把 `.pyc` **写到前缀目录**去 ⇒ 副本里压根没有 `__pycache__`
+    ⇒ `_purge_bytecode_cache` 删 0 个**也不报错** ⇒「同秒 + 同大小」的变异
+    照样被陈旧字节码吃掉 ⇒ 脚手架会得出「**守卫有洞**」的错误结论
+    (它要根治的故障换了个环境开关就原样回归)。
+    """
+    prefix = tmp_path / "字节码前缀"
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", str(prefix))
+    root = tmp_path / "分档"
+    root.mkdir()
+    _mini_repo_with_a_value(root)
+    cm._run_tests(root)
+    assert _bytecode_written_by_the_child(root), (
+        "环境里有 `PYTHONPYCACHEPREFIX` ⇒ `.pyc` 被写到前缀目录 ⇒ 副本里的"
+        "清缓存**清不到它** ⇒ 同秒 + 同大小的变异会被陈旧字节码吃掉 ⇒ "
+        "脚手架会得出「守卫有洞」的错误结论。分档那套必须摘掉这个变量。")
+    stray = sorted(str(p) for p in prefix.rglob("*.pyc")) if prefix.exists() else []
+    assert not stray, "摘掉之后不该再有 `.pyc` 落到前缀目录:%s" % stray
+    # 再钉住「同秒 + 同大小的变异仍然看得见」(这才是脚手架真正要的结论)
+    _same_second_mutation_must_be_seen(
+        lambda r: _failed_and_output(cm._run_tests(r)), root, "分档那套")
+
+
+def test_the_discipline_harness_neutralises_a_bytecode_cache_prefix(
+        tmp_path, monkeypatch) -> None:
+    """**拦截侧(纪律那套)**:与分档那套**分成两条用例**。
+
+    两条变异各有**专属**见证 ⇒ 不会「走错原因的红」(仓库教训:
+    变异见证必须指向唯一那一条规则)。
+    """
+    prefix = tmp_path / "字节码前缀"
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", str(prefix))
+    root = tmp_path / "纪律"
+    root.mkdir()
+    _mini_repo_with_a_value(root)
+    cgm._run_tests(root, ["tests/test_check_domain.py"])
+    assert _bytecode_written_by_the_child(root), (
+        "环境里有 `PYTHONPYCACHEPREFIX` ⇒ `.pyc` 被写到前缀目录 ⇒ 副本里的"
+        "清缓存**清不到它** ⇒ 同秒 + 同大小的变异会被陈旧字节码吃掉 ⇒ "
+        "纪律脚手架会得出「守卫有洞」的错误结论。纪律那套必须摘掉这个变量。")
+    stray = sorted(str(p) for p in prefix.rglob("*.pyc")) if prefix.exists() else []
+    assert not stray, "摘掉之后不该再有 `.pyc` 落到前缀目录:%s" % stray
+    _same_second_mutation_must_be_seen(
+        lambda r: _failed_and_output(cgm._run_tests(r, ["tests/test_check_domain.py"])),
+        root, "纪律那套")
+
+
+def test_the_probe_says_it_cannot_tell_when_the_cache_file_is_unreadable(tmp_path) -> None:
+    """**读不了**的 `.pyc` 必须**出声**(codex L1)。
+
+    purge 侧早就修过「删不掉必须出声」,诊断侧却**静默跳过** ⇒ 一份恰好是
+    被复用的陈旧字节码(被锁/权限问题)会让诊断**完全失明**,还可能顺势说出
+    「缓存是新的」这种**反向**结论。**查不了 ≠ 结论干净**。
+    """
+    src, cache_dir = _mini_module_with_cache(tmp_path, "VALUE = 2\n")
+    pyc = cache_dir / "probe_mod.cpython-313.pyc"
+    pyc.unlink()
+    pyc.mkdir()                      # 变成同名目录 ⇒ 读它必然失败
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "读不了" in out, out
+    assert "查不了" in out, out
+    assert "缓存是新的" not in out, out
+
+
+def test_the_probe_says_it_cannot_tell_when_the_cache_header_is_malformed(tmp_path) -> None:
+    """**头部畸形**(不足 16 字节)的 `.pyc` 也必须**出声**。
+
+    头都读不出来 ⇒ 连「是不是时间戳型」都判不了 ⇒ 同样不许静默跳过。
+    """
+    src, cache_dir = _mini_module_with_cache(tmp_path, "VALUE = 2\n")
+    (cache_dir / "probe_mod.cpython-313.pyc").write_bytes(b"\x00" * 8)
+    out = "\n".join(cgm._probe_stale_pyc(tmp_path, src))
+    assert "查不了" in out, out
+    assert "缓存是新的" not in out, out
+
+
+def test_the_fingerprint_notices_an_equal_length_rename(tmp_path) -> None:
+    """**等长改名**(`g` → `h`)必须被指纹看出来(codex L2)。
+
+    `co_code` 与 `co_consts` 在这种改动下**完全不变**(只变 `co_names`)
+    ⇒ 只比这两样 ⇒ Python 会复用旧 `.pyc`,而探针却报「缓存是新的」
+    ⇒ **误判「旧→新」**。判据宣称「比内容分得出旧的与新的」,那就得真的比到。
+    """
+    src_a = tmp_path / "a_mod.py"
+    src_b = tmp_path / "b_mod.py"
+    src_a.write_text("def f(x):\n    return g(x)\n", encoding="utf-8")
+    src_b.write_text("def f(x):\n    return h(x)\n", encoding="utf-8")
+    assert src_a.stat().st_size == src_b.stat().st_size, "两份源码必须等长"
+    code_a, err_a = cgm._compile_current_source(src_a)
+    code_b, err_b = cgm._compile_current_source(src_b)
+    assert code_a is not None and code_b is not None, (err_a, err_b)
+    assert cgm._fingerprint(code_a) != cgm._fingerprint(code_b), (
+        "等长改名(全局名 g → h)必须被指纹看出来:它只改 `co_names`,"
+        "而 `co_code` 与 `co_consts` 完全不变 ⇒ 只比这两样会误判「缓存是新的」")
+
+
+def _diagnose_with_canned_runs(monkeypatch, suite_result, witness_result) -> str:
+    """让 `_diagnose_no_red` 跑在**两份 canned 结果**上(整份套件 / 见证)。
+
+    诊断要跑两次用例 ⇒ 真跑太慢也太重 ⇒ 这里把 `_run_tests` 换掉,
+    只测「结论那一行说的是不是证据支持的那句话」。
+    """
+    calls: list[list[str]] = []
+
+    def fake_run_tests(cwd, targets):
+        calls.append(list(targets))
+        return suite_result if len(calls) == 1 else witness_result
+
+    monkeypatch.setattr(cgm, "_run_tests", fake_run_tests)
+    monkeypatch.setattr(cgm, "_probe_stale_pyc", lambda repo, path: [])
+    monkeypatch.setattr(cgm, "_purge_bytecode_cache", lambda root: 0)
+    src = Path(cgm.__file__).resolve().parent / "check_mutations.py"
+    out = cgm._diagnose_no_red(Path(cgm.__file__).resolve().parent.parent, src,
+                               "tests/test_check_guard_mutations.py::test_witness",
+                               witness_result)
+    return "\n".join(out)
+
+
+def test_the_diagnosis_reports_a_witness_topped_by_another_failure(monkeypatch) -> None:
+    """见证没红、但**别的**用例红了 ⇒ 结论必须**引用失败集合**(codex L4)。
+
+    否则结论会与它自己刚打印的失败集合**直接矛盾**,还会把排障方向从
+    「守卫有洞 / 见证钉错」误导到「空转」。
+    """
+    text = _diagnose_with_canned_runs(
+        monkeypatch,
+        {"failed": 1, "output": "", "failed_nodes": ["tests/test_x.py::test_other"],
+         "returncode": 1, "passed": 3, "outcome": "ok", "timeout": False},
+        {"failed": 0, "output": "", "failed_nodes": [], "returncode": 0,
+         "passed": 3, "outcome": "ok", "timeout": False})
+    assert "test_other" in text, text
+    assert "见证被其他失败顶替" in text, text
+    assert "对**所有**用例都没影响" not in text, text
+
+
+def test_the_diagnosis_calls_an_untouched_suite_a_no_op(monkeypatch) -> None:
+    """整份套件**一条都没红** ⇒ 结论才可以说「空转」(放行侧)。
+
+    没有这一侧,上一条就成了「一律报有影响」——那会把排障引向另一个错误方向。
+    """
+    text = _diagnose_with_canned_runs(
+        monkeypatch,
+        {"failed": 0, "output": "", "failed_nodes": [], "returncode": 0,
+         "passed": 3, "outcome": "ok", "timeout": False},
+        {"failed": 0, "output": "", "failed_nodes": [], "returncode": 0,
+         "passed": 3, "outcome": "ok", "timeout": False})
+    assert "对**所有**用例都没影响" in text, text
+    assert "见证被其他失败顶替" not in text, text
+
+
+def test_the_witness_groups_declare_one_rule_each() -> None:
+    """**共用见证**只许发生在「同一族」里(codex L3 的自检)。
+
+    此前注释宣称「一条变异一条见证」,而实测 159 条红变异只有 132 个唯一见证
+    ⇒ 现状与宣称互相打脸。现状(按规则家族共用)可以保留,但必须**机器判定**:
+    共用同一个见证的变异必须声明**同一个规则** —— 否则「走错原因的红」
+    (别的规则的变异把见证弄红)就会静悄悄发生。
+
+    **口径说明(如实写明,别夸大)**:机器判定的只是「声明一致」,
+    **不是**「声明得对」——声明本身是人写的,机器看不出规则是否真的一样。
+    判据换成「同目标文件」也不行:有两族规则天然跨文件(守卫视野 ↔ CI 名单、
+    交易栈标记 ↔ 实际依赖)⇒ 用文件当判据会把**正确的**共用误报成问题。
+    """
+    problems = cgm.witness_group_problems()
+    assert problems == [], problems
+
+
+def test_the_witness_group_check_catches_a_mixed_rule_declaration() -> None:
+    """**拦截侧**:共用见证里混进**不同规则** ⇒ 必须报出来。
+
+    这条是上一条的**非空**版本:上一条只证明「现状是干净的」,
+    本条证明「检查器真的能看见混进来的一颗」(否则上一条可能空转)。
+    """
+    original = dict(cgm.WITNESS_RULES)
+    try:
+        # 找一组共用见证的变异,把其中一条改成另一个规则 id。
+        groups: dict[str, list[str]] = {}
+        for spec in cgm.MUTATIONS:
+            witness = cgm.WITNESSES.get(spec["label"])
+            if witness:
+                groups.setdefault(witness, []).append(spec["label"])
+        shared = [labels for labels in groups.values() if len(labels) >= 2]
+        assert shared, "没有共用见证的组 ⇒ 本条测试的前提不成立"
+        labels = shared[0]
+        cgm.WITNESS_RULES.clear()
+        cgm.WITNESS_RULES.update(original)
+        cgm.WITNESS_RULES[labels[0]] = "另一条规则"
+        problems = cgm.witness_group_problems()
+        assert problems, "混进不同规则却没报出来 ⇒ 检查器失明了"
+        assert any("不同的规则" in p for p in problems), problems
+    finally:
+        cgm.WITNESS_RULES.clear()
+        cgm.WITNESS_RULES.update(original)
+
+
+def test_the_witness_group_check_catches_a_missing_declaration() -> None:
+    """**拦截侧**:共用见证里有一条**没声明规则** ⇒ 必须报出来。
+
+    「少登记」和「登记错」是两种不同的漏 ⇒ 两条都要能看见。
+    """
+    original = dict(cgm.WITNESS_RULES)
+    try:
+        groups: dict[str, list[str]] = {}
+        for spec in cgm.MUTATIONS:
+            witness = cgm.WITNESSES.get(spec["label"])
+            if witness:
+                groups.setdefault(witness, []).append(spec["label"])
+        shared = [labels for labels in groups.values() if len(labels) >= 2]
+        assert shared, "没有共用见证的组 ⇒ 本条测试的前提不成立"
+        label = shared[0][0]
+        cgm.WITNESS_RULES.clear()
+        cgm.WITNESS_RULES.update(original)
+        cgm.WITNESS_RULES.pop(label, None)
+        problems = cgm.witness_group_problems()
+        assert problems, "少声明却没报出来 ⇒ 检查器失明了"
+        assert any("没有声明所属规则" in p for p in problems), problems
+    finally:
+        cgm.WITNESS_RULES.clear()
+        cgm.WITNESS_RULES.update(original)
+
+
+def test_the_harness_tells_a_timeout_apart_from_a_broken_spec() -> None:
+    """**拦截侧**:**超时**必须与「变异规格写错」**分开**。
+
+    第 55 轮之二十一(codex 第 2 轮 F5)实测:此前 `run_outcome` 把超时
+    归成 `spec_broken` ⇒ 脚手架打印「变异把文件改到收集阶段就报错了」
+    ⇒ **诊断是错的**(超时是**环境不可用**,与「规格写错」是两件事)。
+
+    **第 55 轮之二十二(实测发现的回归)**:第 55 轮之二十一用了「退出码 2」当
+    超时的信号,而 pytest 自己的**收集阶段失败****也是退出码 2**
+    ⇒ 于是「变异把文件改到收集阶段就炸」被**误诊**成「环境不可用」
+    ⇒ 现在超时用**带外**的哨兵退出码 `TIMEOUT_RETURNCODE`,
+    退出码 2 **恢复**成「规格写错」。
+    """
+    assert cm.run_outcome(0, cm.TIMEOUT_RETURNCODE) == "env_unavailable", (
+        "超时(哨兵退出码)必须归成『环境不可用』")
+    assert cgm.run_outcome(0, cm.TIMEOUT_RETURNCODE) == "env_unavailable", (
+        "两个脚手架共用同一份实现,口径必须一致")
+    # 收集阶段炸了(退出码 1 却一条 FAILED 没有)仍然是「变异规格写错」
+    assert cm.run_outcome(0, 1) == "spec_broken"
+    # **退出码 2 是 pytest 的「收集阶段失败」** ⇒ 也是「变异规格写错」
+    # (第 55 轮之二十二:这一条曾被误判成「环境不可用」⇒ 实测发现 ⇒ 恢复)
+    assert cm.run_outcome(0, 2) == "spec_broken", (
+        "退出码 2 是 pytest 的收集阶段失败 ⇒ 必须归成『规格写错』")
+    # 退出码 ≥ 3(内部错误/用法错误)仍然是「变异规格写错」
+    assert cm.run_outcome(0, 3) == "spec_broken"
+    # **第 55 轮之二十三**(codex 第 2 轮 Low-2,实测):POSIX 上 pytest 被
+    # 信号杀死(OOM-kill 等)时 returncode 是**负数**
+    # ⇒ 上一版把它归成 `spec_broken` ⇒ 打印的诊断是**错的**
+    # ⇒ 现在:任何负退出码都归「环境不可用」(方向仍是 fail-closed,只是话术对了)。
+    assert cm.run_outcome(0, -9) == "env_unavailable", (
+        "被信号杀死的 pytest 不是『变异规格写错了』⇒ 必须归成『环境不可用』")
+    assert cgm.run_outcome(0, -9) == "env_unavailable", (
+        "两个脚手架共用同一份实现,口径必须一致")
+
+
+def test_the_domain_harness_reports_a_timeout_as_an_unavailable_environment(
+        tmp_path, monkeypatch) -> None:
+    """**拦截侧**:分档那套的 pytest **真的挂死**时 ⇒ 报「环境不可用」。
+
+    不许把它说成「变异规格写错了」——那句话会让排障的人去查变异规格,
+    而真正的问题是**环境挂死了**。
+    """
+    import subprocess as _subprocess
+
+    def _boom(*args, **kwargs):
+        raise _subprocess.TimeoutExpired(cmd="pytest", timeout=1)
+
+    monkeypatch.setattr(cm.subprocess, "run", _boom)
+    failed, _output, rc = cm._run_tests(tmp_path)
+    assert rc == cm.TIMEOUT_RETURNCODE, (
+        "超时必须用**带外**的哨兵退出码(第 55 轮之二十二):pytest 的"
+        "「收集阶段失败」也是退出码 2 ⇒ 用 2 会把「规格写错」误诊成「环境不可用」")
+    assert cm.run_outcome(failed, rc) == "env_unavailable"
+
+
+def test_the_baseline_diagnosis_tells_a_hang_apart_from_a_failure() -> None:
+    """**拦截侧**:基线挂死(超时/被打断)必须说「环境不可用」,不能被说成「测试失败」。
+
+    第 55 轮之二十四(claude 第 1 轮复核 ⑤):这段判定此前在**两个**脚手架的
+    `main()` 里**各写一份** ⇒ 「基线挂死了」这件事**没有任何办法被钉住**
+    ⇒ 挂死会被说成「测试失败」⇒ **诊断是错的** ⇒ 排障的人会去查
+    「哪条用例红了」,而真正的问题是**环境挂死**。
+    ⇒ 现在是**一份共享实现**(`check_mutations.baseline_failure_reason`)
+    ⇒ 一条用例就能把它钉住(仓库教训:**诊断代码本身也会是死代码 ⇒ 诊断必须自己验**)。
+    """
+    reason = cm.baseline_failure_reason("env_unavailable", cm.TIMEOUT_RETURNCODE)
+    assert reason is not None, "环境不可用必须有诊断(不许静悄悄)"
+    assert "环境不可用" in reason, reason
+    assert "收集阶段" not in reason, (
+        "挂死被说成「收集阶段炸了」⇒ 诊断是错的:%s" % reason)
+
+    spec = cm.baseline_failure_reason("spec_broken", 2)
+    assert spec is not None, "收集阶段炸了必须有诊断"
+    assert "收集阶段" in spec, spec
+
+    assert cm.baseline_failure_reason("ok", 0) is None, (
+        "基线没问题时不该有诊断(否则每次都白报一句)")
+
+
+def test_the_baseline_covers_every_suite_that_hosts_a_witness() -> None:
+    """**拦截侧**:**基线组**必须覆盖绿对照变异的目标套件,且必须含字符串程序那套。
+
+    claude 第 1 轮复核 MEDIUM-3:此前基线组只有三份(边界 / 闸门工具 / 接线)
+    ⇒ **字符串程序那套整份不在基线里** ⇒ 它的「绿对照」在基线表里
+    **查不到基准** ⇒ 绿对照判据**读不出基准**(基准是 `None`)
+    ⇒ 脚手架却照样说「全绿」(**假绿**)。
+
+    ⇒ 基线组提成**常量**(`cgm.BASELINE_GROUPS`)⇒ 这条用例能盯着它;
+    再加一条**绿对照**变异(只改一个注释)跑字符串程序那套 ⇒ 少一份基线组,
+    脚手架**自己**就会叫(基准读不出来 ⇒ 绿对照判成「没保持绿」)。
+    """
+    baselines = {group[0] for group in cgm.BASELINE_GROUPS}
+    assert cgm.STRING_PROGRAMS in baselines, (
+        "字符串程序那套不在基线组里 ⇒ 它的绿对照没有基准:%s" % sorted(baselines))
+
+    # **绿对照变异的每个目标套件**都必须在基线组里:
+    # 否则那条绿对照的基准读不出来(None)⇒ 它恒判「没保持绿」或恒判「一致」
+    # ⇒ 两种都不对(前者误报、后者空转)。
+    green_targets = {suite for spec in cgm.MUTATIONS if spec["expect"] == "green"
+                     for suite in spec["targets"]}
+    missing = sorted(suite for suite in green_targets if suite not in baselines)
+    assert not missing, (
+        "这些套件是绿对照的目标,却**不在**基线组里 ⇒ 它们的绿对照没有基准:%s"
+        % missing)

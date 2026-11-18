@@ -181,8 +181,14 @@ def _claimed_total(path: Path) -> int:
             count = row.get("count")
             if isinstance(count, int) and not isinstance(count, bool) and count > 0:
                 total += count
-    except OSError:
-        return 0
+    except OSError as exc:
+        # **读不了不许当 0**(第 55 轮之二十五,codex 第 2 轮 L4):
+        # 上一版 `except OSError: return 0` ⇒ 读失败被当成「账本声称 0 次试验」
+        # ⇒ 「防变小」的基准**归零** ⇒ 一次悄悄变小反而**看不出来**
+        # ⇒ 那正是这段函数自己写的原则的反面
+        # (「宁可高估也不低估,放过一次悄悄变小」)。
+        # ⇒ 现在**报出去**(fail-closed):读不了就不许据此判断。
+        raise AdminError(f"账本无法读取,拒绝据此判断累计次数: {path.name}({exc})") from exc
     return total
 
 
@@ -281,9 +287,21 @@ def _load_dict(path: Path) -> dict:
 
 
 def _write_dict(path: Path, rows: list[dict]) -> None:
+    """批准账本的落盘。
+
+    **持久性口径与试验账本一致**(第 55 轮之二十五,codex 第 2 轮 L3):
+    上一版是 `write_text` + `os.replace` ⇒ **没有 flush + fsync**
+    ⇒ 断电/崩溃时可能落下一个**内容不完整**的文件(而试验账本那侧 `_write_lines`
+    是有的)⇒ 同一套维护动作的持久性口径**不一致**。
+    ⇒ 现在走同一套:唯一临时名 + `flush` + `os.fsync` + `os.replace`。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".admin.tmp")
-    tmp.write_text(json.dumps({r["sha"]: r for r in rows}, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8", newline="") as stream:
+        stream.write(json.dumps({r["sha"]: r for r in rows}, ensure_ascii=False,
+                                indent=2, sort_keys=True))
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(tmp, path)
 
 

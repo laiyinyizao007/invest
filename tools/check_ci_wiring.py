@@ -75,6 +75,25 @@ DEFAULT_ROSTER = ROOT / "tests" / "guard_roster.json"
 
 # 规范形里那一条命令的解释器:python / python3 / python3.12 / py
 _PYTHON_RE = re.compile(r"^(?:python(?:\d+(?:\.\d+)*)?|py|pythonw)$")
+
+
+def is_python_interpreter_name(text: str) -> bool:
+    """这个名字是不是**python 解释器**?
+
+    **口径只有这一份**(第 55 轮之二十四,claude 第 1 轮复核 ④):
+    `tools/check_constitution_history.py` 的字符串程序扫描**也调这一份**
+    ⇒ 两边不会各认各的。
+    (此前两边**各有一份**正则 ⇒ `python.exe` / `pythonw` / 带反斜杠的路径
+    只被一边认 ⇒ 同一台机器上的同一个解释器,两个守卫结论不同。)
+
+    **Windows 的两个细节**:
+      - 路径分隔符可能是 `\\` ⇒ 先归一成 `/` 再取**末段**;
+      - 可执行文件常带 `.exe` 后缀 ⇒ **剥掉**再比。
+    """
+    base = text.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return bool(_PYTHON_RE.match(base))
 # 「危险工具」的文本指纹:出现在**认不出来的**命令里 ⇒ 判红。
 _DANGEROUS_WORDS = ("pytest", "check_ci_ran", "ci_gate")
 # **「列举/说明」类命令**:它们**不会执行** pytest/闸门,只把它们当**参数或文本**
@@ -780,7 +799,8 @@ def script_of(tokens: list[str]) -> str | None:
     if not tokens:
         return None
     head = tokens[0].rsplit("/", 1)[-1].lower()
-    if _PYTHON_RE.match(head):
+    # **走共享的那一份**(第 55 轮之二十四):`.exe` 后缀与反斜杠路径也认。
+    if is_python_interpreter_name(tokens[0]):
         index = 1
         while index < len(tokens):
             token = tokens[index]
@@ -833,7 +853,7 @@ def _module_flag_value(tokens: list[str] | None) -> str | None:
     """这条命令是不是**模块形态**(`python -m 包.模块`)?是 ⇒ 返回那个模块名。"""
     if not tokens:
         return None
-    if not _PYTHON_RE.match(tokens[0].rsplit("/", 1)[-1].lower()):
+    if not is_python_interpreter_name(tokens[0]):
         return None
     index = 1
     while index < len(tokens):
@@ -1454,7 +1474,7 @@ def _split_interpreter(tokens: list[str] | None) -> tuple[int, str | None]:
     """
     if not tokens:
         return (-1, None)
-    if not _PYTHON_RE.match(tokens[0].rsplit("/", 1)[-1].lower()):
+    if not is_python_interpreter_name(tokens[0]):
         return (-1, None)
     index = 1
     while index < len(tokens):

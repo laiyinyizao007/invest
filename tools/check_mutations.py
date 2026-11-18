@@ -46,6 +46,14 @@ ROOT = Path(__file__).resolve().parent.parent
 CD_REL = "tools/check_domain.py"
 TEST_REL = "tests/test_check_domain.py"
 
+# pytest 子进程的超时秒数(**两个脚手架共用这一份**)。
+# 第 55 轮之二十(codex 第 2 轮 I1):子解释器有超时,pytest 却没有 ⇒
+# pytest 挂死时脚手架会**永久挂起**(不是失败,是不动了)⇒ CI 只能等到
+# 自己的 job 超时。超时按**环境不可用**报,fail-loud
+# (第 55 轮之二十二:超时用**带外**的哨兵退出码 `TIMEOUT_RETURNCODE`,
+# 不用 2 —— pytest 自己的「收集阶段失败」也是 2 ⇒ 用 2 会把两件事混为一谈)。
+PYTEST_TIMEOUT_SECONDS = 900
+
 # 变异规格:
 #   label    —— 人类可读的说明(也要出现在 ADR 表里,--verify 靠它匹配)
 #   rel      —— 要改的文件
@@ -186,24 +194,95 @@ def cleanup_temp_dir(path: Path) -> None:
               file=sys.stderr)
 
 
-def run_outcome(failed: int, returncode: int) -> str:
-    """把一次 pytest 的结果分类(第 50 轮):'ok' 或 'spec_broken'。
+# **本脚手架自己的「超时」信号**(第 55 轮之二十二):pytest 的退出码只在 0..5,
+# 所以用一个**越界**的哨兵值就不会与 pytest 的任何退出码相撞。
+#
+# **为什么必须挪到带外**(第 55 轮之二十二):第 55 轮之二十一曾把
+# 「退出码 2」直接判成「环境不可用」⇒ 而 pytest 自己的**收集阶段失败**
+# (收集到语法错误的文件)**也是退出码 2** ⇒ 「变异把文件改到收集阶段就炸」
+# 被**误诊**成「环境不可用」⇒ 第 50 轮定下的口径被顶掉了
+# ⇒ `tests/test_check_domain.py` 的两条老用例当场变红(**实测**发现的)。
+TIMEOUT_RETURNCODE = -1
+
+
+def run_outcome(failed: int, returncode: int, output: str = "") -> str:
+    """把一次 pytest 的结果分类(第 50 轮):'ok' / 'spec_broken' / 'env_unavailable'。
 
     **为什么要分这一类**:pytest 的退出码分不出「用例失败」与「收集阶段就炸了」。
     收集阶段炸掉时**一条 FAILED 都没有**(失败数 = 0)⇒ 此前会把它算成
     「探针没抓住」(守卫有洞)。其实那是**变异规格写错了**(把文件改成语法错误),
-    两者在「红了」这件事上无法区分 ⇒ 现在分开:spec_broken ⇒ 退出码 2。
+    两者在「红了」这件事上无法区分 ⇒ 现在分开:spec_broken。
 
     - 退出码 0 且没有失败 ⇒ ok(绿);
     - 退出码 1 且**有** FAILED ⇒ ok(红,是探针在工作);
     - 退出码 1 但**没有** FAILED ⇒ spec_broken(收集阶段炸了);
-    - 退出码 ≥ 2 ⇒ spec_broken(中断/用法错误/内部错误)。
+    - 退出码 **2** ⇒ **看输出**:
+        - 输出里有 `KeyboardInterrupt` ⇒ **env_unavailable**(真·被打断);
+        - 否则 ⇒ **spec_broken**(收集阶段失败)。
+      **为什么必须看输出**(第 55 轮之二十四,claude 第 1 轮复核 ⑤ +
+      **本地实测**):pytest 的 `ExitCode.INTERRUPTED`(= 2)这个**枚举名**
+      会让人以为「2 只可能是被打断」⇒ 复核者据此建议「2 一律 env_unavailable」。
+      ⇒ **实测**(pytest 8.4.2,见 `%TEMP%/r278_exitcodes.py`):
+      收集阶段失败(语法错误 / 导入时抛异常)**也是退出码 2**,
+      输出里是 `Interrupted: N error during collection`;
+      而 `KeyboardInterrupt` 也是退出码 2,输出里是 `KeyboardInterrupt`。
+      ⇒ 两者**只能靠输出文本**分开 ⇒ 若按复核者的建议把 2 一律归
+      env_unavailable,「变异把文件改到收集阶段就炸」会被**误诊**成
+      「环境不可用」⇒ 变异规格写错了却说成环境坏了 ⇒ **诊断是错的**。
+      ⇒ 所以这里**采纳「2 要分开」,不采纳「2 一律 env_unavailable」**;
+      另配一条变异见证把这条分界线**钉住**(见 ADR 第 55 轮之二十四)。
+    - 退出码 **TIMEOUT_RETURNCODE(-1)** ⇒ **env_unavailable**
+      (第 55 轮之二十一,codex 第 2 轮 F5:超时是**环境不可用**,
+      **不是**「变异规格写错了」⇒ 两者混为一谈 ⇒ 打印的诊断是**错的**;
+      第 55 轮之二十二把超时挪到**带外**的哨兵退出码,免得与 pytest 的 2 相撞);
+    - 退出码 ≥ 3 ⇒ spec_broken(用法错误/内部错误)。
+    - **退出码 < 0**(第 55 轮之二十三,codex 第 2 轮 Low-2)⇒ env_unavailable:
+      POSIX 上 pytest 被信号杀死(OOM-kill 等)时 returncode 是**负数**
+      ⇒ 上一版把它归成 spec_broken ⇒ 打印的诊断是**错的**
+      (「变异把文件改到收集阶段就报错了」与事实不符)
+      ⇒ 实测 `run_outcome(0, -9)` 原先返回 `spec_broken`。
+      ⇒ 现在:**任何**负退出码都归 env_unavailable(含超时哨兵 -1)。
     """
+    if returncode == TIMEOUT_RETURNCODE:
+        return "env_unavailable"
+    if returncode < 0:
+        # **被信号杀死**(不是本脚手架的超时哨兵)⇒ 仍然是「环境不可用」
+        return "env_unavailable"
+    if returncode == 2:
+        # **退出码 2 有两种含义**(实测,见上面 docstring):
+        # 收集阶段失败(spec_broken)与真·被打断(env_unavailable)
+        # ⇒ 靠**输出文本**分开。
+        if "KeyboardInterrupt" in output:
+            return "env_unavailable"
+        return "spec_broken"
     if returncode not in (0, 1):
         return "spec_broken"
     if returncode == 1 and failed == 0:
         return "spec_broken"
     return "ok"
+
+
+def baseline_failure_reason(outcome: str, returncode: int) -> str | None:
+    """基线(未变异的副本)有问题时的**诊断**;没问题 ⇒ `None`。
+
+    **为什么要抽成一份**(第 55 轮之二十四,claude 第 1 轮复核 ⑤):
+    此前这段判定写在**两个**脚手架的 `main()` 里(各写一份)⇒
+    「基线挂死了」这件事**没有任何办法被钉住**⇒ 挂死会被说成「测试失败」
+    ⇒ **诊断是错的**(仓库教训:**诊断代码本身也会是死代码 ⇒ 诊断必须自己验**)。
+    ⇒ 抽成**一份共享实现** ⇒ 一条用例就能把它钉住
+    (`tests/test_check_guard_mutations.py::test_the_baseline_diagnosis_tells_a_hang_apart_from_a_failure`)。
+
+    口径:
+      - `env_unavailable`(超时哨兵 / 被信号杀死 / 真·被打断)⇒ **环境不可用**;
+      - `spec_broken`(收集阶段就炸)⇒ **规格写错**;
+      - `ok` ⇒ `None`(基线没问题)。
+    """
+    if outcome == "env_unavailable":
+        return ("pytest 退出码 %s ⇒ **环境不可用**(超时或被打断),"
+                "变异验证无从谈起(这**不是**「测试失败」)" % returncode)
+    if outcome == "spec_broken":
+        return ("pytest 退出码 %s ⇒ 收集阶段就炸了,变异验证无从谈起:" % returncode)
+    return None
 
 
 def _purge_bytecode_cache(root: Path) -> int:
@@ -229,12 +308,18 @@ def _purge_bytecode_cache(root: Path) -> int:
 
     **实测(第 55 轮之十四之四/五)**:触发要**同时**满足两条——
     (a) 变异前后**字节数相同**;(b) 两次落在**同一整秒**。
-    158 条变异里**31 条**满足 (a)(这 158 条 = **CI 报错那时的集合**;
-    本轮又加 4 条 ⇒ 现共 162 条):29 条在 `tools/check_ci_wiring.py`、
-    1 条在 pytest 用例文件、1 条在 YAML——**YAML 不是 Python,没有字节码缓存,
-    天然不中招**。CI 上**恰好 17 条**同时满足 (b) ⇒
+    当时那 158 条里**31 条**满足 (a)(= **CI 报错那时的集合**;
+    29 条在 `tools/check_ci_wiring.py`、1 条在 pytest 用例文件、1 条在 YAML——
+    **YAML 不是 Python,没有字节码缓存,天然不中招**)。
+    CI 上**恰好 17 条**同时满足 (b) ⇒
     **CI 报错的 17 条全部落在这 31 条之内,且这 31 条之外无一条报错**
     ⇒ 机制被实测坐实(不是推测)。
+    **第 55 轮之二十复测(实测,不靠人记)**:纪律那套现在是 **174** 条,
+    撞字节数的**只剩 4 条**(`check_ci_ran.py` 1 / `check_ci_wiring.py` 2 /
+    `ci_gate.py` 1)——第 55 轮把接线那一族**整族换掉**时,锚点从「等长 token
+    改写」变成了「整行替换」⇒ 长度变了 ⇒ Python 必定重编
+    ⇒ **那个陷阱在现在的套件里几乎不成立**;但**清缓存这条规则仍然必须留着**
+    (它有自己的变异与见证,而且下一轮只要有人再写一条等长改写就会回来)。
     **只在本机的 CI 上犯**:一次变异循环只要 0.3~0.8 秒 ⇒ 常常落进同一整秒;
     本机 Windows 上 pytest 启动慢(>1 秒)⇒ 整秒总是错开 ⇒ 撞不上。
 
@@ -282,14 +367,36 @@ def _run_tests(cwd: Path) -> tuple[int, str, int]:
     # ⇒ 拦截侧探针的「第一次跑会写出 `.pyc`」前提不成立 ⇒ 探针假红
     # ⇒ 把「环境配置」误报成「变异被吃」。这里**显式摘掉**它。
     env.pop("PYTHONDONTWRITEBYTECODE", None)
+    # **也要摘掉 `PYTHONPYCACHEPREFIX`**(第 55 轮之二十,codex 第 2 轮 M1):
+    # 这个变量让解释器把 `.pyc` **写到前缀目录**去 ⇒ 副本里压根没有 `__pycache__`
+    # ⇒ `_purge_bytecode_cache` 删 0 个**也不报错** ⇒「同秒 + 同大小」的变异
+    # 照样被陈旧字节码吃掉 ⇒ 脚手架会得出「守卫有洞」的错误结论
+    # —— 正是这套脚手架要根治的故障,换了个环境开关就原样回归。
+    # 与 `PYTHONDONTWRITEBYTECODE` 同类处置:**显式摘掉**,并**出声**(不许无声)。
+    if env.pop("PYTHONPYCACHEPREFIX", None) is not None:
+        print("[提醒] 环境里有 `PYTHONPYCACHEPREFIX` ⇒ 已摘掉:否则字节码缓存写到"
+              "副本外 ⇒ 清缓存清不到它 ⇒ 同秒 + 同大小的变异会被陈旧字节码吃掉",
+              file=sys.stderr)
     # **先清字节码缓存**(第 55 轮之十四之四):否则「同秒 + 同大小」的变异
     # 会被**陈旧的 .pyc** 吃掉 ⇒ 变异空转 ⇒ 见证保持绿(假绿)。
     _purge_bytecode_cache(cwd)
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", TEST_REL, "-q", "-p", "no:cacheprovider"],
-        capture_output=True, text=True, cwd=str(cwd), env=env,
-        encoding="utf-8", errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", TEST_REL, "-q", "-p", "no:cacheprovider"],
+            capture_output=True, text=True, cwd=str(cwd), env=env,
+            encoding="utf-8", errors="replace",
+            # **pytest 子进程也要有超时**(第 55 轮之二十,codex 第 2 轮 I1):
+            # 挂死的 pytest 会让整个脚手架永久挂起(连失败都不是,只是不动了)。
+            # 超时按**环境不可用**报(哨兵退出码 `TIMEOUT_RETURNCODE`),
+            # fail-loud,不许装作「没抓住」。
+            timeout=PYTEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print("[FAIL] pytest 超过 %d 秒还没结束 ⇒ 环境不可用(挂死),变异验证无从谈起"
+              % PYTEST_TIMEOUT_SECONDS, file=sys.stderr)
+        # **哨兵退出码**(第 55 轮之二十二):不是 2 —— pytest 的「收集阶段失败」
+        # 也是 2 ⇒ 用 2 会把「规格写错」误诊成「环境不可用」。
+        return 0, "", TIMEOUT_RETURNCODE
     failed = [line for line in proc.stdout.splitlines() if line.startswith("FAILED")]
     # **退出码也要返回**(第 50 轮):此前只看 FAILED 行数 ⇒
     # pytest 在**收集阶段**就炸时(一条 FAILED 都没有)会被当成"基线全绿"。
@@ -344,6 +451,13 @@ def _apply(repo: Path, rel: str, token: str, new_line: str) -> str:
     定位靠**引号内的路径 token**,不靠整行相等——所以改行尾注释不会让脚本
     找不到锚点(第 3 轮的 Low-1:早期版本整行匹配,注释改一个字就 CI 变红,
     报错信息还 cryptic)。
+
+    **行尾会被归一化成 LF**(第 55 轮之二十,codex 第 2 轮 I2 的如实说明):
+    本函数按 `\\n` 切分再写回 ⇒ 副本里的 CRLF 文件一律变成 LF ⇒
+    **文件大小会变小**。后果:「同秒 + 同大小」这个陷阱在这套脚手架里
+    **几乎不成立**(长度必然变了 ⇒ Python 会重编)⇒ 这里的清缓存是**冗余保险**,
+    不是主力。**纪律那套**( `tools/check_guard_mutations.py::_apply` )**逐字节保
+    真行尾** ⇒ 「同字节数」的统计(现测 4 条)**只对纪律那套成立**,别照着错误前提推演。
     """
     path = repo / rel
     if not path.exists():
@@ -372,8 +486,14 @@ def _tier_of(repo: Path, rel: str) -> str:
         "import sys; sys.path.insert(0, 'tools'); "
         "import check_domain as cd; print(cd.classify(%r)[0])" % rel
     )
+    # **同样要摘掉 `PYTHONPYCACHEPREFIX`**(第 55 轮之二十,codex 第 2 轮 M1):
+    # 这个判定是**靠 import** 得到的 ⇒ 解释器若把 `.pyc` 写到前缀目录,
+    # 副本里的 `_purge_bytecode_cache` **清不到它** ⇒ 复用的仍是旧字节码
+    # ⇒ 变异前后的判定可能读的是**同一份**旧代码 ⇒ 空操作变异被误报。
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    env.pop("PYTHONPYCACHEPREFIX", None)
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                          cwd=str(repo), env={**os.environ, "PYTHONUTF8": "1"},
+                          cwd=str(repo), env=env,
                           encoding="utf-8", errors="replace")
     return proc.stdout.strip()
 
@@ -392,9 +512,21 @@ def main(argv: list[str] | None = None) -> int:
         copy_repo(repo)
 
         baseline, out, base_rc = _run_tests(repo)
-        if baseline != 0 or base_rc != 0:
-            print("基线就有测试失败(或 pytest 退出码非 0,例如收集阶段就炸了),"
-                  "变异验证无从谈起:", file=sys.stderr)
+        # **基线也要分三类**(第 55 轮之二十四,claude 第 1 轮复核 ⑤):
+        # 超时(哨兵退出码 `TIMEOUT_RETURNCODE`)、收集阶段失败、真·被打断
+        # 三者的**诊断不一样** ⇒ 上一版一句「基线就有测试失败」把它们**混成一句**
+        # ⇒ 挂死的 pytest 会被说成「测试失败」⇒ **诊断是错的**。
+        base_outcome = run_outcome(baseline, base_rc, out)
+        # **基线的诊断只有一份实现**(第 55 轮之二十四):此前这段判定在
+        # **两个**脚手架里各写一份 ⇒ 「基线挂死了」没有任何办法被钉住
+        # ⇒ 挂死会被说成「测试失败」⇒ **诊断是错的**。
+        reason = baseline_failure_reason(base_outcome, base_rc)
+        if reason:
+            print("基线(未变异的副本):" + reason, file=sys.stderr)
+            print(out[-1500:], file=sys.stderr)
+            return 2
+        if baseline != 0:
+            print("基线就有测试失败,变异验证无从谈起:", file=sys.stderr)
             print(out[-1500:], file=sys.stderr)
             return 2
         print("基线(未变异):全绿")
@@ -414,10 +546,18 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  [跳过] {label}:{msg}", file=sys.stderr)
                 return 2
             after = _tier_of(repo, witness)
-            n, _, rc = _run_tests(repo)
+            n, out, rc = _run_tests(repo)
             (repo / rel).write_text(orig, encoding="utf-8")
 
-            if run_outcome(n, rc) == "spec_broken":
+            outcome = run_outcome(n, rc, out)
+            if outcome == "env_unavailable":
+                # **环境不可用**(超时/中断)—— 与「变异规格写错」**不是一回事**
+                # (第 55 轮之二十一,codex 第 2 轮 F5)⇒ 分开报,fail-closed。
+                print(f"  [跳过] {label}:pytest 退出码 {rc} ⇒ **环境不可用**"
+                      f"(超时或被中断)⇒ 变异验证无从谈起"
+                      f"(这**不是**「变异规格写错了」)", file=sys.stderr)
+                return 2
+            if outcome == "spec_broken":
                 # **收集阶段就炸**:pytest 退出码非 0 且一条 FAILED 都没有
                 # ⇒ 不是"探针没抓住"(那是守卫有洞),而是**变异规格写错了**
                 # ⇒ 退出码 2(fail-closed,与纪律守卫那套同一口径)。
@@ -439,9 +579,13 @@ def main(argv: list[str] | None = None) -> int:
         # 额外场景:新建一个拥有判定点的文件(未入库)
         new_file = repo / "risk" / "zz_new_gate_probe.py"
         new_file.write_text(EXTRA_PROBE, encoding="utf-8")
-        n, _, rc = _run_tests(repo)
+        n, out, rc = _run_tests(repo)
         new_file.unlink()
-        if run_outcome(n, rc) == "spec_broken":
+        if run_outcome(n, rc, out) == "env_unavailable":
+            print(f"  [跳过] {EXTRA_PROBE_LABEL}:pytest 退出码 {rc} ⇒ "
+                  f"**环境不可用**(超时或被中断)⇒ 探针场景无从谈起", file=sys.stderr)
+            return 2
+        if run_outcome(n, rc, out) == "spec_broken":
             print(f"  [跳过] {EXTRA_PROBE_LABEL}:pytest 退出码 {rc} 且没有 FAILED ⇒ "
                   f"探针场景本身有问题(环境不可用)", file=sys.stderr)
             return 2

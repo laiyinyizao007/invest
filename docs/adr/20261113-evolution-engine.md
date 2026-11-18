@@ -2994,7 +2994,7 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 脚本在**仓库外**的临时目录里做,真工作树全程不动;行尾符按原样保留(仓库里 CRLF 与 LF 都有,
 统一改写会让 diff 全是行尾噪声)。
 
-#### 4. 纪律守卫的变异表(162 条)
+#### 4. 纪律守卫的变异表(229 条)
 
 | 变异 | 改的是哪个文件 | 见证 |
 |---|---|---|
@@ -3160,6 +3160,73 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 | 字节码缓存目录读不了时直接崩掉 | tools/check_mutations.py(共享实现) | 目录读不了不能整体崩 |
 | 分档守卫不再摘掉 PYTHONDONTWRITEBYTECODE | tools/check_mutations.py | 拦截侧(分档那套专属) |
 | 纪律守卫不再摘掉 PYTHONDONTWRITEBYTECODE | tools/check_guard_mutations.py | 拦截侧(纪律那套专属) |
+| 分档守卫不再摘掉 PYTHONPYCACHEPREFIX | tools/check_mutations.py | 拦截侧(分档那套专属) |
+| 纪律守卫不再摘掉 PYTHONPYCACHEPREFIX | tools/check_guard_mutations.py | 拦截侧(纪律那套专属) |
+| 宪法层不再扫字符串里藏的执行原语 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 宪法层不再把字符串原语检查挂进总检查 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 诊断不再把读不了的字节码缓存说出来 | tools/check_guard_mutations.py | 诊断自身的用例 |
+| 指纹不再比对 co_names | tools/check_guard_mutations.py | 诊断自身的用例 |
+| 诊断结论不再引用整份套件的失败集合 | tools/check_guard_mutations.py | 诊断自身的用例 |
+| 见证共用不再检查规则声明 | tools/check_guard_mutations.py | 纪律脚手架自身的用例 |
+| 字符串原语判据不再看解释器与 -c 之间的 flag | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再看 shell=True 的整条命令 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再合并同名变量的多个取值 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语豁免表不再与 ADR 登记核对 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再看海象赋值 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再看绑定出来的 -c | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再看绑定出来的解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再看 bytes 程序体 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再用正则兜底那层认混淆原语 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再扫 getoutput/getstatusoutput | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再解析调用别名 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再对读不了的文件出声 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再报出已登记文件里的 exec | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 脚手架不再把超时当成环境不可用 | tools/check_mutations.py | 脚手架自身的用例 |
+| 字符串原语判据不再认命令的关键字参数 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认绑定出来的属性解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认实参位置上的海象 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再把点号导入绑到根名 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 脚手架把收集阶段的失败误诊成环境不可用 | tools/check_mutations.py | 脚手架自身的用例 |
+| 字符串原语判据不再认绑定到变量的命令列表 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认星号导入之后的入口 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认 os.execv 族 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认 asyncio 的变参入口 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认 getattr 取到的入口 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再顺绑定链解解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认 bytes 解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认 executable= 关键字里的解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认星号实参里的命令列表 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再认字典展开的命令列表 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再顺字符串绑定链解解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再限死解释器名 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再限死 executable 属性 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串原语判据不再要求 shell 命令里有 python 解释器 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 脚手架不再把被信号杀死的 pytest 说成规格写错 | tools/check_mutations.py | 脚手架自身的用例 |
+| 解释器名不再剥掉 .exe 后缀 | tools/check_ci_wiring.py | 宪法层自身的用例 |
+| 解释器名不再认 pythonw | tools/check_ci_wiring.py | 宪法层自身的用例 |
+| 入口识别不再认模块别名 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 入口识别不再认 asyncio 的 cmd= 关键字 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 程序体通道不再认标准输入 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 程序体通道不再认字符串拼接 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 程序体通道不再认 f-string | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 程序体通道不再认粘在一起的 -c | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 程序体通道不再认 heredoc | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 字符串程序判据不再排除带点号的 compile | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 共享实现拿不到时不再出声 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| ADR 登记表列数不对不再被报出来 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 退出码 2 不再按输出文本分开 | tools/check_mutations.py | 脚手架自身的用例 |
+| 基线的诊断不再认环境不可用 | tools/check_mutations.py | 脚手架自身的用例 |
+| 基线组少了字符串程序那套 | tools/check_guard_mutations.py | 脚手架自身的用例 |
+| 只改宪法层里的一个注释(字符串程序那套照样全绿) | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让宪法层不再认元组解包里的绑定 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让宪法层不再认折叠后才露出来的原语名 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让宪法层不再扫未闭合的 heredoc | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让宪法层把读不了的文件当成干净 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让 shell 解释器名回到本地那份正则 | tools/check_constitution_history.py | 宪法层自身的用例 |
+| 让收菜退回宪法层那份筛查 | scripts/research_collect.py | 收菜自身的用例 |
+| 让分档器不再中和 git 的 filter 命令 | tools/check_domain.py | 分档器自身的用例 |
+| 让批准账本落盘不再 fsync | risk/ledger_admin.py | 账本维护入口自身的用例 |
+| 让读不了的账本被当成 0 次试验 | risk/ledger_admin.py | 账本维护入口自身的用例 |
 
 > **表里的标签不许含竖线**:`|` 会把 markdown 表格切开,解析器取到的第一格
 > 会被截断 ⇒ 核对必然对不上。第 54 轮那条「恒真后缀」因此写成中文,
@@ -5617,3 +5684,787 @@ ADR 的变异表:**155 → 162 行**(与脚本**双向**核对);
   排障时若看到这一条而见证确实没红,先怀疑它。
 - 子解释器每被调用一次多花 ~0.1 秒 ⇒ 只在「见证没红」这条**排障路径**上发生,
   不影响正常路径的耗时。
+
+### 第 55 轮之二十:codex 第 2 轮(42/50)的五条发现 —— 诊断的失明、环境开关、字符串里的原语
+
+第 55 轮之十九(codex 第 2 轮)给了 **42/50(需小修)**。五条发现里,
+两条是**Medium**、三条是 **Low**,但**没有一条是「文档写得比代码宽」**——
+它们全都落在**脚手架与诊断自己**身上。也就是说:这一轮修的不是「哪条纪律松了」,
+而是「**守纪律的那套工具自己有没有失明**」。
+
+#### 0. 五条发现(逐条处置)
+
+| 编号 | 发现 | 处置 |
+|---|---|---|
+| M1 | `PYTHONPYCACHEPREFIX` 没被摘掉 ⇒ `.pyc` 写到**副本之外** ⇒ 清缓存**清不到它** ⇒ 「同秒 + 同大小」的变异照样被陈旧字节码吃掉 ⇒ 脚手架会得出「**守卫有洞**」的错误结论 | **已做**:两个脚手架的 `_run_tests` 都**显式摘掉**它,并**出声**(不许无声);分档那套的 `_tier_of`(靠 import 得出判定)也摘掉 |
+| M2 | 藏在**字符串**里的执行原语(`python -c "exec(compile(...))"`)对 **AST** 判据**完全隐形** ⇒ 两层守卫全绿 | **已做**:宪法层新增 `check_string_program_primitives`——`exec`/`eval` 出现在字符串程序里**一律报出来**;`compile` 必须**点名文件 + 写明理由**地登记,且豁免**只许编译、不许执行** |
+| L1 | 诊断对**读不了**的 `.pyc` **静默跳过** ⇒ 一份恰好被复用的陈旧字节码会让诊断**完全失明**,还可能顺势说出「缓存是新的」这种**反向**结论 | **已做**:读不了与头部畸形都必须**出声**「查不了」(**查不了 ≠ 结论干净**) |
+| L2 | 指纹只比 `co_code` 与 `co_consts` ⇒ **等长改名**(`g` → `h`)时两者**完全不变** ⇒ 探针把「旧的」误判成「新的」 | **已做**:指纹补上 `co_names` 与 `co_varnames` |
+| L3 | 注释宣称「一条变异一条见证」,而实测 159 条红变异只有 **132** 个唯一见证(33 条共用 6 个)⇒ **现状与宣称互相打脸** | **已做**:口径改成「**按规则家族共用**」,并加机器判定(`witness_group_problems()`):共用一个见证的变异必须声明**同一个规则**;混进别的规则 ⇒ 退出码 2 |
+| L4 | 诊断的结论行无条件说「变异对**所有**用例都没影响」,却与它自己刚打印的失败集合**直接矛盾** | **已做**:结论改成**引用失败集合**——别的用例红了 ⇒ 说「见证被其他失败顶替(守卫有洞,或见证钉错了)」 |
+
+#### 1. L3 的判据为什么**不是**「同目标文件」
+
+codex 建议的是「同组 ⇒ 同规则」。落地时**先试了「同目标文件」**,结果**误报了 2 组正确的共用**:
+「守卫视野 ↔ CI 名单」与「交易栈标记 ↔ 实际依赖」这两族规则**天生跨文件**
+⇒ 用文件当判据会把**正确的**共用当成问题(⇒ 守卫被调宽 ⇒ 防线变松)。
+
+⇒ 改成**显式声明表**(`WITNESS_RULES`):共用一个见证的变异必须声明所属规则,
+同组的规则 id 必须**相同**;没声明 ⇒ 报出来;声明了不同的规则 ⇒ 报出来。
+**口径如实写明**:机器判定的只是「**声明一致**」,**不是**「声明得对」——
+声明是人写的,机器看不出规则是否真的一样。
+
+#### 2. M2 的豁免口径:**只许编译、不许执行**
+
+修法**不是**「一刀切禁掉 `-c`」——本仓库自己的变异脚手架**必须**用 `python -c`
+把「编译」交给一次性子解释器(只 compile + marshal,**不执行**)
+⇒ 一刀切会把修法逼回死路。⇒ 改成**显式登记**:
+`exec`/`eval` 出现在字符串程序里**一律报出来**;`compile` 必须**点名文件 + 写明理由**地登记。
+**豁免的边界**:登记过的文件若在字符串程序里**同时**藏了 `exec` ⇒ 豁免**罩不住**它
+(否则「登记」就变成了「万能钥匙」)。
+
+#### 2 之补.G8 第 1 轮**自己实测**出来的三条绕过 + 豁免表与 ADR 挂钩
+
+**这一节是本轮(第 55 轮之二十)的自审补记,不是 codex 提的**——
+是 G8 第 1 轮我自己用探针(%TEMP%/r190b_probe_holes.py)**实测复现**出来的。
+codex 第 2 轮问的那句「豁免表能不能被随手加条目」,上一版只答了**一半**。
+
+**三条绕过(全部实测复现 ⇒ 上一版会漏判)**:
+
+| 编号 | 绕过形态 | 上一版为什么漏 | 现在的判据 |
+|---|---|---|---|
+| B | `subprocess.run([sys.executable, "-I", "-c", "exec(...)"])` | 只看 `-c` 的**前一个元素** ⇒ 解释器与 `-c` 之间隔了 flag 就整条绕过 | 往**前**看**任意一个**元素是不是解释器(本仓库自己就有 `python -X utf8 -c …` 的写法 ⇒ 这个洞是**现实存在**的) |
+| C | `subprocess.run("python -c …", shell=True)`(整条命令是**一个字符串**) | 只处理**列表**形态的命令 | `shell=True` ⇒ 整条命令字符串**也**当程序体扫(`shell` 的值运行时才确定 ⇒ 按「是」处理,fail-closed) |
+| E | 同一个名字在两个函数里被赋成**不同**的字符串 | 只留**最后一个**取值 ⇒ 前一个里的原语被漏判 | 机器判不了「这次调用用的是哪一个」⇒ **全部**取值都扫(宁可多报,不可漏报) |
+
+**制度性的那条洞(比三条绕过更要紧)**:
+豁免表本来是**代码里的手写常量** ⇒ **加一行**就永久放行那个文件在字符串里 `exec`,
+而**没有任何人看见** ⇒「显式登记」实际是「**万能钥匙**」。
+⇒ 处置:豁免表必须与**本 ADR 里下面那张登记表逐条一致**(两个方向都查):
+代码加了条目而 ADR 没登记 ⇒ 报出来(隐形放行);ADR 登记了而代码没有 ⇒ 也报出来(文档比代码宽)。
+
+<!-- string-program-allowlist:begin -->
+| 文件 | 允许的原语 | 理由 |
+|---|---|---|
+| tools/check_guard_mutations.py | compile | 子解释器只做「编译 + marshal 序列化」,**不执行**被编译的代码(见该文件 `_CHILD_COMPILE_PROGRAM` 上面的说明) |
+<!-- string-program-allowlist:end -->
+
+(`exec` / `eval` 的豁免表**是空的** —— 本仓库没有任何文件被允许在字符串里执行代码。)
+
+**判据的边界(如实写明,别夸大)**:只认**静态可确定**的程序体
+(字符串字面量、`%` 模板、f-string 的字面量段、指向它们的模块级/函数级常量)。
+运行时拼出来的程序体**判不了**——那是本条判据的已知盲区,不是「已覆盖」。
+
+#### 3. 探针与变异(每条**双向**)
+
+| 方向 | 用例 | 钉住什么 |
+|---|---|---|
+| 拦截侧 | `test_the_domain_harness_neutralises_a_bytecode_cache_prefix` | 分档那套必须摘掉 `PYTHONPYCACHEPREFIX` |
+| 拦截侧 | `test_the_discipline_harness_neutralises_a_bytecode_cache_prefix` | 纪律那套必须摘掉它(两条**各有专属见证**) |
+| 拦截侧 | `test_the_guard_reports_a_primitive_hidden_in_a_string_program` | 藏在字符串里的 `exec` 必须被报出来(且**指名文件与行号**) |
+| 拦截侧 | `test_the_guard_reports_a_compile_that_is_not_registered` | 没登记的 `compile` 必须被报出来(并说清「去哪里登记」) |
+| 放行侧 | `test_the_guard_accepts_a_registered_compile_only_program` | 登记过的良性样板**不许**误报 |
+| 拦截侧 | `test_the_guard_refuses_to_let_a_registered_file_smuggle_exec` | 豁免只许**编译**、不许**执行** |
+| 放行侧 | `test_the_guard_does_not_treat_a_git_dash_c_as_a_program` | `git -c key=value` 的 `-c` 是**配置项**,不是程序体 |
+| 放行侧 | `test_the_shipped_repository_has_no_unregistered_string_program` | 仓库自身必须干净 |
+| 拦截侧 | `test_the_constitution_check_all_calls_the_string_program_check` | 总检查必须**真的**调它(否则是「写下了但没人跑」) |
+| 拦截侧 | `test_the_probe_says_it_cannot_tell_when_the_cache_file_is_unreadable` | 读不了的 `.pyc` 必须出声 |
+| 拦截侧 | `test_the_probe_says_it_cannot_tell_when_the_cache_header_is_malformed` | 头部畸形必须出声 |
+| 拦截侧 | `test_the_fingerprint_notices_an_equal_length_rename` | 等长改名必须被指纹看出来 |
+| 拦截侧 | `test_the_diagnosis_reports_a_witness_topped_by_another_failure` | 结论必须**引用失败集合** |
+| 放行侧 | `test_the_diagnosis_calls_an_untouched_suite_a_no_op` | 整份套件一条都没红时,才可以叫「空转」 |
+| 放行侧 | `test_the_witness_groups_declare_one_rule_each` | 共用的组必须声明**同一个规则** |
+| 拦截侧 | `test_the_witness_group_check_catches_a_mixed_rule_declaration` | 混进**不同规则**必须被报出来 |
+| 拦截侧 | `test_the_witness_group_check_catches_a_missing_declaration` | **少声明**必须被报出来(与「登记错」是两种漏) |
+| 拦截侧 | `test_the_mutation_harnesses_hold_no_execution_primitive_in_a_string` | 两个脚手架的**字符串程序**里不许有 `exec`/`eval` |
+| 拦截侧 | `test_the_guard_reports_a_primitive_hidden_behind_an_interpreter_flag` | 解释器与 `-c` 之间隔了 flag 的形态必须被报出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_hidden_in_a_shell_command` | `shell=True` 的整条命令字符串必须被报出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_hidden_in_a_name_bound_in_two_places` | 同名变量的**全部**取值都要扫 |
+| 放行侧 | `test_the_allowlist_matches_the_registry_in_the_adr` | 代码里的豁免表必须与 ADR 登记表一致 |
+| 拦截侧 | `test_the_registry_check_catches_an_unregistered_allowlist_entry` | 代码多出的豁免条目必须被报出来(万能钥匙的反证) |
+| 拦截侧 | `test_the_registry_check_catches_an_adr_entry_the_code_does_not_have` | ADR 多写的登记必须被报出来(文档比代码宽) |
+| 拦截侧 | `test_the_registry_check_requires_a_reason` | 登记**必须写明理由** |
+| 拦截侧 | `test_the_registry_check_reports_a_missing_registry` | 登记表缺席必须被报出来(查不了 ≠ 干净) |
+| 接线侧 | `test_the_constitution_check_all_calls_the_registry_check` | 总检查必须**真的**调豁免表核对 |
+
+**12 条新变异**(每条**各有专属见证**,禁止共用):
+「分档守卫不再摘掉 `PYTHONPYCACHEPREFIX`」「纪律守卫不再摘掉 `PYTHONPYCACHEPREFIX`」
+「宪法层不再扫字符串里藏的执行原语」「宪法层不再把字符串原语检查挂进总检查」
+「诊断不再把读不了的字节码缓存说出来」「指纹不再比对 `co_names`」
+「诊断结论不再引用整份套件的失败集合」「见证共用不再检查规则声明」
+「字符串原语判据不再看解释器与 `-c` 之间的 flag」
+「字符串原语判据不再看 `shell=True` 的整条命令」
+「字符串原语判据不再合并同名变量的多个取值」「字符串原语豁免表不再与 ADR 登记核对」。
+
+#### 4. 数量(实测,不靠人记)
+
+| 项 | 第 55 轮之十四之六 | 第 55 轮之二十(本次) |
+|---|---|---|
+| `tests/test_check_guard_mutations.py` | 49 个函数 | **59 个函数** |
+| `tests/test_constitution_string_programs.py` | —(新文件) | **17 个函数** |
+| `tests/guard_roster.json` | 480 条 `must_run`(+1 `allow_skipped`),8 份套件 | **507 条 `must_run`(+1 `allow_skipped`),9 份套件** |
+| 纪律守卫的变异 | 162 种(159 红 + 3 绿) | **174 种(171 红 + 3 绿)** |
+| ADR 的变异表 | 162 行(双向核对) | **174 行(双向核对)** |
+
+**「撞字节数」的条数也重测了**(实测,不靠人记):纪律那套现在 174 条里,
+**变异前后字节数相同的只剩 4 条**(`tools/check_ci_ran.py` 1 /
+`tools/check_ci_wiring.py` 2 / `tools/ci_gate.py` 1)——
+第 55 轮把接线那一族**整族换掉**时,锚点从「等长 token 改写」变成了「整行替换」
+⇒ 长度变了 ⇒ Python 必定重编。⇒ **那个陷阱在现在的套件里几乎不成立**;
+但**清缓存这条规则仍然必须留着**(它有自己的变异与见证,
+而且下一轮只要有人再写一条等长改写就会回来)。
+
+#### 5. 残余(如实登记)
+
+- **「写下了但没人跑」的洞还剩一处**(本轮**没有**修):`tests/test_constitution_round11.py`(20 条)
+  与 `tests/test_constitution_round12.py`(42 条)只在 ruff 清单里,
+  **没有任何 CI job 会跑它们**。原因是它们**需要交易栈**(round11 会经
+  `const.snapshot_protected_state()` 预加载 `vnpy_ctastrategy.backtesting`)
+  ⇒ 研究侧 CI(只装 numpy/pandas/mcp/pyyaml)装不了 ⇒ 硬接进去会让研究侧关卡**恒红**。
+  ⇒ 处置:**登记为已知缺口**,等交易侧那条线有一条「跑全套」的 job 时再接。
+  (本轮**新接**的 `tests/test_constitution_string_programs.py` 不需要交易栈 ⇒ 已接进 CI。)
+- 变异 `M1` 的两条用例只在**环境里真的设了 `PYTHONPYCACHEPREFIX`** 时才走到那一段
+  ⇒ 探针**自己**设了它 ⇒ 不依赖 CI runner 的环境。
+- `_probe_stale_pyc` 的「读不了」判定仍依赖 `read_bytes()` 抛 `OSError`;
+  权限类问题在 Windows 上可能表现为别的异常 ⇒ 已有的 `except Exception` 兜底仍在。
+
+### 第 55 轮之二十一:codex 第 2 轮(39/50)的六条发现 —— 判据比声明的**窄**、登记表能当万能钥匙、超时被误诊
+
+codex 第 2 轮给 **39/50(需小修)**。**六条发现我逐条本地复现,一条不落**
+(复现脚本放在 `%TEMP%`,**不进仓库**)⇒ 全部采信、全部修。
+
+| 编号 | 发现(复现结论) | 处置 |
+|---|---|---|
+| F1 Medium | 判据比声明的**窄**:ADR 说「只认静态可确定的程序体」,可实现连**静态可确定**的四种形态都不扫——海象赋值(`if program := "exec(...)"`)、解释器与 `-c` 被**绑定成静态字符串**、`bytes` 程序体、原语名被拆开(`getattr(builtins, 'exec')`)⇒ 四条**全部漏判** | 绑定表认海象(`ast.NamedExpr`);`-c` 与解释器都按**绑定后的取值**判;`bytes` 解码后照扫;混淆写法用正则**取回原语名** |
+| F2 Medium | 入口面不完整:`subprocess.getoutput` / `getstatusoutput` 不在表里;`run = subprocess.run` 这种**赋值别名**也不认 ⇒ 两条**全部漏判** | 两个入口并入「整条命令是一个字符串」那一族;别名解析成点号路径后再判 |
+| F3 Low | 「exec/eval 一律报出来」与实现矛盾:代码留着 exec 侧的登记通道,**两侧同时加一行**即可**永久放行** ⇒ 与「豁免只许编译、不许执行」直接矛盾 | **删掉 exec 侧的登记通道**(结构上不存在这条通道);ADR 登记表里写 `exec` 一律报出来 |
+| F4 Low | 语法/解码失败被**静默跳过** ⇒ 一个坏文件能让整条判据对它「报干净」⇒ 违反「查不了 ≠ 干净」 | 读不了必须**出声**「查不了」 |
+| F5 Low | 超时(退出码 2)被归成「变异规格写错了」⇒ **诊断是错的**(超时是**环境不可用**) | `run_outcome` 新增 `env_unavailable` 一类;两个脚手架**分开报** |
+| F6 Low | 文档数量口径有残留:PROJECTWIKI 的分组括号相加只有 162;CHANGELOG 同一条里留着**补记前**的 170 / 498 / 8 | 分组改成**按被改的文件**计数(相加正好 184);补记前的数字**明写**「补记前」 |
+
+**为什么 F1/F2 特别要紧**:上一版把「静态可确定」写在文档里,读者会以为
+**静态的程序体都被覆盖了**——实际漏掉了四种 ⇒ **文档比代码宽**
+⇒ 「文档里写下的防线必须在代码里真的接线」这条教训,这次落在**自己**身上。
+
+**F3 值得单独说一句**:上一轮的「豁免表与 ADR 挂钩」只解决了「**加一行没人看见**」,
+没解决「**加一行就能永久放行**」⇒ 现在是**结构上**没有 exec 登记通道
+(想开这条通道必须改判定逻辑本身 ⇒ 会触发「宪法层不再把字符串原语检查挂进总检查」
+那条变异 ⇒ 会被抓住)。
+
+#### 1. 探针(每条**双向**)
+
+| 方向 | 用例 | 钉住什么 |
+|---|---|---|
+| 拦截侧 | `test_the_guard_reports_a_primitive_bound_by_a_walrus` | 海象赋值里的原语必须被报出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_with_a_bound_dash_c` | 绑定出来的 `-c` 必须被认出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_with_a_bound_interpreter` | 绑定出来的解释器必须被认出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_in_a_bytes_program` | bytes 程序体必须被扫 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_hidden_behind_getattr` | 原语名被拆开也要抓 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_passed_to_getoutput` | `getoutput`/`getstatusoutput` 必须被扫 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_passed_through_an_alias` | 赋值别名必须被认出来 |
+| 拦截侧 | `test_the_guard_says_when_a_python_file_cannot_be_parsed` | 读不了必须出声「查不了」 |
+| 拦截侧 | `test_the_guard_reports_exec_even_for_a_registered_file` | 豁免**罩不住** exec |
+| 拦截侧 | `test_the_registry_check_refuses_an_exec_row` | ADR 里写 `exec` 必须被报出来 |
+| 拦截侧 | `test_the_guard_has_no_registration_channel_for_exec` | 结构上不存在 exec 登记通道 |
+| 放行侧 | `test_the_guard_does_not_report_a_program_without_primitives` | 没有原语的程序体不许误报 |
+| 放行侧 | `test_the_guard_does_not_treat_a_bound_flag_that_is_not_dash_c` | 绑定出来的 flag 若不是 `-c` 不许误报 |
+| 拦截侧 | `test_the_harness_tells_a_timeout_apart_from_a_broken_spec` | 超时 ≠ 变异规格写错 |
+| 拦截侧 | `test_the_domain_harness_reports_a_timeout_as_an_unavailable_environment` | 真挂死时必须报「环境不可用」 |
+
+#### 2. 新变异(10 条,每条**各有专属见证**)
+
+「字符串原语判据不再看海象赋值」、「字符串原语判据不再看绑定出来的 -c」、「字符串原语判据不再看绑定出来的解释器」、「字符串原语判据不再看 bytes 程序体」、「字符串原语判据不再用正则兜底那层认混淆原语」(第 55 轮之二十五改名:原名「不再看 getattr 混淆」在 H2 修完之后**已经不准**——AST 那层仍看;这条变异现在专门盯**正则兜底那一层**,见证改成那条**专属**探针)、「字符串原语判据不再扫 getoutput/getstatusoutput」、「字符串原语判据不再解析调用别名」、「字符串原语判据不再对读不了的文件出声」、「字符串原语判据不再报出已登记文件里的 exec」、「脚手架不再把超时当成环境不可用」。
+
+#### 3. 数量(实测,不靠人记)
+
+| 项 | 第 55 轮之二十 | 第 55 轮之二十一(本次) |
+|---|---|---|
+| `tests/test_constitution_string_programs.py` | 17 个函数 | **30 个函数** |
+| `tests/test_check_guard_mutations.py` | 59 个函数 | **61 个函数** |
+| `tests/guard_roster.json` | 507 条 `must_run`,9 份套件 | **522 条 `must_run`,9 份套件** |
+| 纪律守卫的变异 | 174 种(171 红 + 3 绿) | **184 种(181 红 + 3 绿)** |
+| ADR 的变异表 | 174 行(双向核对) | **184 行(双向核对)** |
+
+**按被改的文件分组**(相加正好 184,实测):
+接线自检工具 `tools/check_ci_wiring.py` 98 / 宪法层工具 `tools/check_constitution_history.py` 22 /
+workflow 19 / 闭包套件 `tests/test_fs_capability_closure.py` 10 /
+研究边界套件 `tests/test_research_boundary.py` 8 / CI 名单检查 `tools/check_ci_ran.py` 8 /
+分档脚手架 `tools/check_mutations.py` 7 / 纪律脚手架 `tools/check_guard_mutations.py` 7 /
+名单 `tests/guard_roster.json` 2 / 闸门工具 `tools/ci_gate.py` 2 / `tests/conftest.py` 1。
+
+#### 4. 残余(如实登记)
+
+- **运行时拼出来的程序体判不了**(例如把原语名拆成两半再拼、从环境变量读来的程序体)
+  ⇒ 仍是已知盲区,**不是**「已覆盖」。
+- `WITNESS_RULES` 的声明**内容**判不了对错(机器只判「声明一致」)。
+- `tests/test_constitution_round11.py` 与 `round12.py` 仍**没有任何 CI job 会跑**
+  (需要交易栈)⇒ 已知缺口。
+
+### 第 55 轮之二十二:G8 第 1 轮**自审实测**出来的四条漏判 —— 「修掉几条 ≠ 这一族收口」
+
+codex 第 2 轮(F1/F2)与我上一轮修的是**同一族**:「判据比声明的**窄**」。
+上一轮我以为「六条发现都修了,这一族就收口了」⇒ **实测证明没有**。
+本轮用**四组探针**(放在 `%TEMP%`,**不进仓库**)把这一族**按入口形态重新过了一遍**,
+四条**全部实测复现**(修复前 0 problems ⇒ 全部漏判):
+
+| 编号 | 形态 | 为什么漏 | 修法 |
+|---|---|---|---|
+| M1 | `subprocess.run(args=[sys.executable, "-c", body])` | 上一版只看**位置参数**(`node.args`)⇒ 位置参数为空 ⇒ 整条跳过 | 命令实参改由 `_command_argument()` 取:位置参数**或**关键字参数(`args` / `cmd`) |
+| M2 | `EXE = sys.executable` 之后 `subprocess.run([EXE, "-c", body])` | 绑定表只收**静态字符串**⇒ 解释器认不出来 | 新增**属性绑定表**(`_attribute_bindings`)⇒ 绑定出来的 `sys.executable` 认得出是解释器 |
+| M3 | `subprocess.run([sys.executable, "-c", (b := "exec(...)")])` | `_strings_of` 只认字面量与 `ast.Name`⇒ 海象两样都不是 | `_strings_of` 认**实参位置上的海象** |
+| M4 | `import os.path` 之后 `os.system("python -c \"exec(...)\"")` | 导入表把 `os` 记成 `os.path`⇒ `os.system` 被算成 `os.path.system`⇒ 不在入口表里 | `import a.b` 绑**根名**(`os` → `os`);有 `as` 时才绑整条路径 |
+
+**这一轮真正的教训不是那四条洞**,而是:
+**「修掉 reviewer 点名的那几条」≠「这一族收口了」**
+⇒ 一条规则漏过一次,就必须把**整族**的入口形态**重新过一遍**,
+而且**每条怀疑都要真跑**,不能靠推理(静态推理一定漏)。
+
+#### 1. 探针(每条**双向**)
+
+| 方向 | 用例 | 钉住什么 |
+|---|---|---|
+| 拦截侧 | `test_the_guard_reports_a_primitive_when_the_command_list_is_a_keyword_argument` | 命令列表是关键字参数时必须被报出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_when_the_interpreter_is_bound_to_an_attribute` | 解释器绑定成属性时必须被报出来 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_when_the_program_is_an_inline_walrus` | 实参位置上的海象必须被扫 |
+| 拦截侧 | `test_the_guard_reports_a_primitive_after_importing_a_dotted_module` | 点号导入之后的入口必须被扫 |
+| 放行侧 | `test_the_guard_sees_a_keyword_argument_program_without_reporting_it` | 关键字参数形式**要看得见**,但没有原语时**不许**报(两条断言缺一不可 ⇒ 不会变成空测试) |
+| 放行侧 | `test_the_guard_does_not_treat_a_bound_attribute_as_an_interpreter` | 绑定出来的属性**不是解释器**时**不许**当成 `python -c` |
+
+#### 2. 新变异(4 条,每条**各有专属见证**;另有第 5 节那一条)
+
+「字符串原语判据不再认命令的关键字参数」、「字符串原语判据不再认绑定出来的属性解释器」、
+「字符串原语判据不再认实参位置上的海象」、「字符串原语判据不再把点号导入绑到根名」。
+
+**搬锚点三次**(规则还在 ⇒ 搬锚点,**不删这条变异**):
+「字符串原语判据不再看解释器与 `-c` 之间的 flag」那条的锚点跟着本轮改动搬了第三次;
+「字符串原语判据不再看海象赋值」那条的锚点因新增 `_attribute_bindings` 而**命中两次**
+⇒ 加上上下文一行变唯一;「字符串原语判据不再看绑定出来的解释器」那条改锚到
+**函数内部**的绑定解析分支(语义更贴近它的名字)。
+
+#### 3. 数量(实测,不靠人记)
+
+| 项 | 第 55 轮之二十一 | 第 55 轮之二十二(本次) |
+|---|---|---|
+| `tests/test_constitution_string_programs.py` | 30 个函数 | **36 个函数** |
+| `tests/test_check_guard_mutations.py` | 61 个函数 | **61 个函数** |
+| `tests/guard_roster.json` | 522 条 `must_run`,9 份套件 | **528 条 `must_run`,9 份套件** |
+| 纪律守卫的变异 | 184 种(181 红 + 3 绿) | **189 种(186 红 + 3 绿)** |
+| ADR 的变异表 | 184 行(双向核对) | **189 行(双向核对)** |
+
+**按被改的文件分组**(相加正好 189,实测):
+接线自检工具 `tools/check_ci_wiring.py` 98 / 宪法层工具 `tools/check_constitution_history.py` 26 /
+workflow 19 / 闭包套件 `tests/test_fs_capability_closure.py` 10 /
+研究边界套件 `tests/test_research_boundary.py` 8 / CI 名单检查 `tools/check_ci_ran.py` 8 /
+分档脚手架 `tools/check_mutations.py` 8 / 纪律脚手架 `tools/check_guard_mutations.py` 7 /
+名单 `tests/guard_roster.json` 2 / 闸门工具 `tools/ci_gate.py` 2 / `tests/conftest.py` 1。
+
+#### 4. 顺带记下的两条补丁纪律
+
+- **补丁脚本不是幂等的**:本轮用**同一个锚点串**先后插「变异块」与「见证块」,
+  而第一处的替换文本**又包含同一个锚点串** ⇒ 第二次替换命中的是刚插进去的那个
+  ⇒ 见证块被塞进了 `MUTATIONS` 里(语法错)。⇒ **同一个锚点串不能连着用两次**;
+  中途失败后重跑必须先确认前一步没落地。
+- **锚点体检要有工具**:本轮另写了 `%TEMP%` 里的「锚点体检」脚本
+  (每条变异的锚点必须**恰好命中一次**)⇒ 一次跑出 188 条变异里的 2 条锚点漂移
+  ⇒ 静态推理没看出来。
+
+
+#### 5. 顺带修掉的**回归**:第 55 轮之二十一引入的「退出码 2 一刀切」
+
+跑 `tests/test_check_domain.py` 时**当场变红**的两条老用例把它顶了出来
+(第 50 轮定下的口径):第 55 轮之二十一把「**超时**」用**退出码 2**当信号,
+而 pytest 自己的**收集阶段失败**(收集到语法错误的文件)**也是退出码 2**
+⇒ 于是「变异把文件改到收集阶段就炸」被**误诊**成「环境不可用」
+⇒ 这与 F5 要修的是**同一类错误**(诊断错了),只是方向反了。
+
+**修法:把「超时」挪到带外**——超时是**本脚手架自己的**信号
+⇒ 用**自己的哨兵退出码** `TIMEOUT_RETURNCODE = -1`
+(pytest 的退出码只会是 0..5 ⇒ 不会相撞):
+
+| 退出码 | 含义 | 归类 |
+|---|---|---|
+| 0 且无失败 | 全绿 | ok |
+| 1 且**有** FAILED | 探针在工作 | ok |
+| 1 且**无** FAILED | 收集阶段炸了 | spec_broken |
+| **2** | pytest 的**收集阶段失败** | **spec_broken**(第 50 轮口径**恢复**) |
+| **-1**(`TIMEOUT_RETURNCODE`) | **本脚手架**的超时 | **env_unavailable** |
+| ≥ 3 | 用法错误 / 内部错误 | spec_broken |
+
+⇒ F5 的要求(超时**不许**被说成「规格写错」)与第 50 轮的要求
+(收集阶段失败**要**被说成「规格写错」)**同时**满足。
+**新变异一条**:「脚手架把收集阶段的失败误诊成环境不可用」(见证 =
+`tests/test_check_domain.py::test_run_outcome_separates_a_broken_spec_from_a_caught_mutation`)。
+
+**教训**:**同一个退出码不能同时代表两件事**。上一轮只想把「超时」从
+「规格写错」里分出来,却顺手用了 pytest **已经占用**的 2
+⇒ 分出来的是**别人的**语义。
+
+#### 6. 残余(如实登记)
+
+- **运行时拼出来的程序体仍然判不了**(把原语名拆成两半再拼、从环境变量读来的程序体)
+  ⇒ 已知盲区,**不是**「已覆盖」。
+- **属性绑定只认「属性名像解释器」**(`executable` / `python` / `python3`)
+  ⇒ `EXE = sys.executable` 认得出,`EXE = shutil.which("python3")` 认不出 ⇒ 已知盲区。
+- **导入绑定只解一层**:`import a.b.c` 绑的是 `a` ⇒ `a.b.c.f()` 这类**点号链**不在判据视野内。
+
+### 第 55 轮之二十三:G8 第 2 轮(codex CLI,39/50)的 13 条发现 —— **逐条本地复现**后逐条修
+
+#### 0. 这一轮为什么发生
+
+G8 第 2 轮由**外部复核者**(codex CLI,独立进程、另一族模型)在工作树
+`feat/31-fs-capability` 上做,报告 **39/50(需小修档)**,共 13 条发现:
+
+| 编号 | 数量 | 内容 |
+|---|---|---|
+| High-1 | 1 条 | **命令列表绑定到变量** ⇒ 「字符串程序」判据整条失明 |
+| Medium-1 | 8 条 | 同一族的**其余入口形态**漏判(star-import / `os.exec*` 族 / asyncio 变参入口 / 入口侧 getattr / 链式属性绑定 / bytes 解释器 / `executable=` 关键字 / 星号实参与字典展开) |
+| Low-1 | 3 条 | **误报面**(`config.executable` 被当解释器 / `pythonista-tool` 被 `startswith("python")` 匹配 / shell 字符串仅提到 `eval(` 就报) |
+| Low-2 | 1 条 | **负信号退出码**(`-9`)被并进 `spec_broken` 话术 |
+
+**处置纪律(沿用第 55 轮之十四的教训)**:**每一条我自己复现过才动手改**——
+探针写在 `%TEMP%`(**不进仓库**),修复前/后各跑一次:
+**修复前 漏判 10 条 / 误报 3 条**,**修复后 漏判 0 条 / 误报 0 条**。
+
+#### 1. 逐条处置
+
+| 编号 | 形态 | 复现 | 处置 |
+|---|---|---|---|
+| High-1 | `CMD = [sys.executable, "-c", body]` 后 `subprocess.run(CMD)` | 漏判 | 新增**列表绑定表**(`_list_bindings`):按变量名取回命令列表 |
+| M1 | `from subprocess import *` 后 `run([...])` | 漏判 | 新增**星号导入表**(`_STAR_ENTRIES_BY_MODULE`) |
+| M2 | `os.execv` / `os.execl` / `os.posix_spawn` 族 | 漏判 | 新增 `_EXEC_ARGV_FUNCS`(整族执行入口) |
+| M3 | `asyncio.create_subprocess_exec(...)` | 漏判 | 新增 `_VARIADIC_PROGRAM_FUNCS` |
+| M4 | `run = getattr(subprocess, "run")` 后 `run([...])` | 漏判 | 入口侧补 getattr 解析(`_is_getattr_call` / `_getattr_dotted`) |
+| M5 | `A = sys.executable; B = A` | 漏判 | 绑定链改成**不动点(fixpoint)**求解,不再只解一层 |
+| M6 | `[b"python3", b"-c", b"exec(...)"]` | 漏判 | 解释器名认**字节字面量** |
+| M7 | `subprocess.Popen(["-c", body], executable=sys.executable)` | 漏判 | 认 `executable=` **关键字参数**里的解释器 |
+| M8 | `run(*[...])` / `run(**{"args": [...]})` | 漏判 | 命令元素认**星号实参**与**字典展开** |
+| L1-a | `EXE = config.executable` | 误报 | `.executable` 属性**只认 `sys.executable`** |
+| L1-b | `"pythonista-tool"` 被当解释器 | 误报 | 解释器名改用**正则**(`python[0-9.]*` / `py`),不再 `startswith` |
+| L1-c | `os.system("echo 'eval(' >> notes.txt")` | 误报 | shell 命令必须**同时**含 python 解释器与 `-c` 才算「字符串程序」 |
+| Low-2 | `run_outcome(0, -9)` | 归类错 | **任何负退出码 ⇒ `env_unavailable`**(被信号杀死),不再并进 `spec_broken` |
+
+**注意 Low-1 的方向**:那三条是**误报**,而误报会让判据**变宽**
+(把无关的可执行文件当成解释器、把非程序字符串当成程序体)
+⇒ 按仓库的「**任何削弱型改动一律升档**」总则,收紧它们同样要**加变异、加见证**。
+
+#### 2. 本轮**自己**踩出来的坑(两条,都是动态探针打出来的,不是静态推理)
+
+- **6 条既有变异的锚点因本轮重构漂移**(0 命中 ⇒ **变异空转** = 假绿)
+  ⇒ 按纪律**搬锚点,不删变异**(规则还在、变异就在),搬完跑「锚点体检」:
+  **204 条变异、0 异常**(每条编辑的锚点恰好命中一次)。
+- **一条见证太弱 ⇒ 见证空转**:「字符串原语判据不再报出已登记文件里的 exec」那条见证,
+  断言写成 `"exec" in p and "字符串程序" in p`
+  ⇒ 而「豁免只许编译」那条报文**顺带**也满足它 ⇒ 变异把判据改坏时,这条见证**红了但红得不是它自己**
+  ⇒ 把断言收紧到**确切报文**(`"把 `exec`/`eval` 藏在"` / `"只许**编译**"`),
+  **而不是**把变异改弱。
+  ⇒ **教训:见证没红有可能是见证太弱,而不是变异空转**——两者要分开查。
+
+#### 3. 探针与变异(每条**双向**)
+
+- 探针 **14 条**(10 条拦截侧 + 4 条放行侧),落在 `tests/test_constitution_string_programs.py`
+  ⇒ 测试函数 **36 → 50**。放行侧那几条都带**第二断言**
+  (断言 `_string_programs(...)` 在**真变体**上非空)⇒ 判据退化成「什么都不看」时它们会红,
+  **不会变成空测试**。
+- 新变异 **15 条**(14 条在宪法层、1 条在分档脚手架),**每条各有专属见证**;
+  其中「被信号杀死」那条与既有的「超时」那条**共用一个规则** ⇒ 用 `WITNESS_RULES` **显式声明**共用关系
+  (规则 id:「退出码分类:超时/被信号杀死/规格写错必须分得开」)。
+
+#### 4. 数量(实测,不靠人记)
+
+| 项 | 第 55 轮之二十二 | 第 55 轮之二十三(本次) |
+|---|---|---|
+| `tests/test_constitution_string_programs.py` | 36 个函数 | **50 个函数** |
+| `tests/test_check_guard_mutations.py` | 61 个函数 | **61 个函数** |
+| `tests/guard_roster.json` | 528 条 `must_run`,9 份套件 | **542 条 `must_run`,9 份套件** |
+| 纪律守卫的变异 | 189 种(186 红 + 3 绿) | **204 种(201 红 + 3 绿)** |
+| ADR 的变异表 | 189 行(双向核对) | **204 行(双向核对)** |
+
+**按被改的文件分组**(相加正好 204,实测):
+接线自检工具 `tools/check_ci_wiring.py` 98 / 宪法层工具 `tools/check_constitution_history.py` 40 /
+workflow 19 / 分档脚手架 `tools/check_mutations.py` 9 /
+闭包套件 `tests/test_fs_capability_closure.py` 10 /
+研究边界套件 `tests/test_research_boundary.py` 8 / CI 名单检查 `tools/check_ci_ran.py` 8 /
+纪律脚手架 `tools/check_guard_mutations.py` 7 /
+名单 `tests/guard_roster.json` 2 / 闸门工具 `tools/ci_gate.py` 2 / `tests/conftest.py` 1。
+
+#### 5. G8 两轮(如实记分)
+
+| 轮次 | 复核者 | 结论 |
+|---|---|---|
+| 第 1 轮 | **外部复核者被供应商限流**(Gemini 族 429/404)⇒ 记为**阻塞**,**不是**「跳过」;主模型**自审 + 实测**(实读代码 + 探针真跑 + 五项独立机检) | 见 §「第 55 轮之二十三(记述)」 |
+| 第 2 轮 | **codex CLI**(独立进程、另一族模型) | **39/50**,13 条发现**全部本地复现**后逐条修 |
+
+**「阻塞」与「跳过」必须分开写**:阻塞 = 供应商侧 429/404,**客观、有原样返回码**;
+跳过 = 本机没去找、或找到了没读输出。把阻塞写成跳过 = **悄悄把 G8 第 1 轮降级成自审**却没留痕;
+把阻塞写成「已复核」则是**谎报**。
+
+#### 6. 残余(如实登记)
+
+- **运行时拼出来的程序体仍然判不了**(把原语名拆成两半再拼、从环境变量读来的程序体)
+  ⇒ 已知盲区,**不是**「已覆盖」。
+- **`shutil.which("python3")` 这类「函数调用结果」仍然不是解释器**
+  ⇒ 已知盲区(本轮**收紧**后比之前更窄,但这正是「调宽 ⇒ 防线变松」的反面)。
+- **多级点号链仍只解一层**(`import a.b.c` 绑的是 `a`;`a.b.c.f()` 不在视野内)。
+- **星号导入的歧义**:同一模块既被 `import *` 又被显式导入成别的名字时,
+  判据按**显式导入**优先(fail-closed 方向:宁可少认入口也不乱认)。
+- **本轮仍未跑过的**:codex 第 2 轮报告里「189 条变异全量真跑」当时**没跑**(它自己标注为可选);
+  本轮**204 条全量真跑**已跑(201 红 + 3 绿)。
+
+### 第 55 轮之二十三(记述):G8 第 1 轮的**外部复核者被供应商限流**,与「跳过」不是一回事
+
+本节记的是**流程事实**,不是新的规则改动。
+
+第 55 轮之二十二那四条漏判(M1~M4)是**第 1 轮**发现的,而第 1 轮按 G8 的定义应当是
+**独立于本模型**的一轮。本轮按纪律去找**外部复核者**(Gemini 族),结果**不是**复核者
+提不出问题,而是**供应商侧全部拒绝服务**:
+
+| 模型 | 返回 | 原样摘录(要点) |
+|---|---|---|
+| `gemini-2.5-pro` | HTTP 429 `RESOURCE_EXHAUSTED` | 免费额度耗尽,`quotaMetric: ...input_token_count`,`limit: 250000`,`model: gemini-2.5-pro` |
+| `gemini-3-pro-preview` | HTTP 404 `NOT_FOUND` | 该模型名已下线(返回体建议改用 `gemini-3.1-pro-preview`) |
+| `gemini-2.0-flash-lite` | HTTP 404 `NOT_FOUND` | 该模型名已下线(返回体建议改用 `gemini-3.5-flash-lite`) |
+| `gemini-2.5-flash` | HTTP 429 `RESOURCE_EXHAUSTED` | **每分钟**输入 token 上限 250000,`retryDelay: 35s` ⇒ 重试无效 |
+
+⇒ 换模型**换不掉**这个限制:429 是**配额**(等 8 小时级)与**每分钟限流**
+(等 35 秒也没用,输入本身就超限),404 是**模型下线**(不是别名写错)
+⇒ 这一路**在供应商侧被阻塞**。
+
+**为什么不把它算成「第 1 轮已做」**:G8 的第 1 轮要求的是**独立模型族**的外部复核。
+本机可用的 `claude` CLI 经环境变量指向**另一家同族代理**(与本会话同一模型族)
+⇒ 拿它当「第 1 轮」是**自审**换了个进程,**不构成独立性** ⇒ 只能作**非权威佐证**。
+
+**因此本轮 G8 第 1 轮的结论如实记为**:主模型**自审 + 实测**(实读代码 + 四组探针真跑 +
+五项独立机检:锚点体检、ADR↔脚本双向核对、退出码语义分离、探针双向性与非空性、文档数量复算),
+**外加**「外部复核者被供应商限流」这一**事实**;第 2 轮由**另一族模型**(codex CLI,
+独立进程)完成,结论**逐条本机复现**后才采纳。
+
+**教训(可复用)**:
+**「外部复核者不可用」必须区分「阻塞」与「跳过」**——
+阻塞 = 供应商侧 429/404,**客观、可复述、有原样返回码**;
+跳过 = 本机没去找、或者找到了但没读它的输出。
+把阻塞写成跳过,等于**悄悄把 G8 的第一轮降级成自审**却没留痕;
+把阻塞写成「已复核」则是**谎报**。
+⇒ 这一节存在的意义就是:让后来人知道**当时到底发生了什么**,而不是只看到一个结论。
+
+### 第 55 轮之二十四(claude CLI 第 1 轮复核的逐条复现、逐条修、逐条钉死)
+
+**这一轮的来源与它的性质(先说清楚,免得后来人误读)**
+
+G8 要求两轮**独立**复核。本机可用的外部复核者有两类:`claude` CLI(与本会话**同族**)
+与 `codex` CLI(**另一族**、独立进程)。第 55 轮之二十三已经记下:Gemini 族被供应商
+限流(429/404)⇒ 那时第 1 轮只能如实记成「自审 + 实测」。
+
+本轮**再跑了一次 `claude` CLI** 的第 1 轮复核 ⇒ 它报 **34/50**(低于 45 的可发布线,
+落在「不得发布」那一档)。**它的性质仍然是「非权威佐证」**:同族模型换个进程跑,
+不构成 G8 意义上的独立性(第 55 轮之二十三已定这个口径)⇒ G8 第 1 轮**仍如实记为**
+「自审 + 实测」,第 2 轮**仍**由 codex CLI 完成。
+但它**点名的族**很有价值:这一轮修掉的洞,大半是**判据比它自己声明的窄**
+(第 55 轮之二十一 / 之二十二那一族的延续),另有几条是**守卫与脚手架自己的失声**。
+
+⇒ **处置纪律(与前几轮一致)**:每一条**先复现**(最小复现脚本写在 `%TEMP%`,**不进仓库**)、
+确认到底是**漏判**还是**误报** ⇒ 才动手改 ⇒ 改完配**两侧探针**(拦截侧 + 放行侧)⇒
+**一条变异 + 一个专属见证** ⇒ 复现脚本与原始报告**都不入库**。
+
+#### 六条族(按 claude 第 1 轮点名的族整理)
+
+**① 「什么算 python 解释器」原来有**三份**互不相同的答案**
+
+- `tools/check_ci_wiring.py::_PYTHON_RE` 认 `pythonw`;
+- 本文件的 `_PYTHON_TOKEN_RE` 认 `pythonw`;
+- 本文件的 `_is_python_interpreter_name`(第 55 轮之二十三刚收紧过)**两个都不认**
+  ⇒ `python.exe`(Windows 上**最常见**的写法)反而**漏判** ⇒ 那是**回归**,不是漏判。
+
+**已做**:口径**只留一份**——`tools/check_ci_wiring.py::is_python_interpreter_name`
+(剥 `.exe` 后缀、`\` 归一成 `/` 再取末段、正则
+`^(?:python(?:\d+(?:\.\d+)*)?|py|pythonw)$`);本文件按**文件路径**加载那个兄弟工具
+(不靠 `sys.path`,与 `tools/check_ci_wiring.py::_load_sibling` 同一套办法)来用同一份。
+**拿不到就出声**:共享实现读不到 ⇒ 本判据**判不了** ⇒ 「查不了」≠「干净」⇒ 必须报出来。
+
+**② 入口识别**
+
+- `mod = subprocess` 之后的 `mod.run(...)`:上一版把 `mod` 当**普通名字** ⇒ 入口名算成
+  `mod.run` ⇒ 不在入口表里 ⇒ 漏判(实测)。⇒ 只有当右端**确实是一个被导入的模块**时才算别名。
+- `asyncio.create_subprocess_shell(cmd="python -c …")`:命令是**关键字实参** `cmd`
+  ⇒ 上一版只按位置参数取 ⇒ 漏判(实测)。
+
+**③ 程序体的通道**(程序体**不在命令表里** ⇒ 靠「`-c` 后面那个元素」找程序体的整条路走不到)
+
+- **标准输入**:`subprocess.run([sys.executable], input="exec(...)")` ⇒ 程序体是**喂给解释器的数据**;
+- **字符串拼接**:`["-c" + " " + body]`(上一版只认**字面量**与**绑定名**,两样都不是);
+- **f-string**:`f"-c{body}"`(上一版把动态段换成占位符 ⇒ 元素变成 `"-c\x00"` ⇒ 认不出是 `-c`);
+- **粘在一起的 `-c`**:`["python", "-c exec(...)"]` —— python 的短选项解析允许 `-cVALUE`
+  ⇒ 那个元素**同时**是 flag 和程序体;
+- **heredoc**:`os.system("python - <<'EOF'\nexec(...)\nEOF")` ⇒ 程序体是喂给标准输入的那一块;
+- 另加:`os.execv` 族与 asyncio 的可变参数形态。
+
+**④ 误报面**:`compile` 前面带**点号**(`re.compile(...)` / `py_compile.compile(...)`)时
+**不是内建原语** ⇒ 上一版用 `\bcompile\s*\(` ⇒ `.` 是非词字符 ⇒ 词边界成立 ⇒ 被误报
+⇒ 逼人去登记豁免 ⇒ 那正是这条规则要防的「**守卫被调宽**」(实测)。⇒ 现在要求 `compile`
+前面**不是**点号、也不是别的词字符。
+
+**⑤ 守卫自己的失声**
+
+- **一条死代码**:ADR 登记表里此前那条 `if "|" in reason:` 的检查**永远不可能触发**——
+  表格按 `|` 切列 ⇒ 单元格里写竖线会把**一行切成两行** ⇒ 「理由里不许有竖线」那个条件
+  **一行也拦不住**。**死代码比没规则更坏**:它看起来在守,其实拦不住。
+  ⇒ 现在**按列数**判:数据行必须是**三列**(不是三列 ⇒ 有人在单元格里写了竖线)。
+- 「共享实现拿不到 ⇒ 必须出声」(见 ①)。
+
+**⑥ 脚手架自己的失声**
+
+- **退出码 2 有两种含义**(实测,见下)⇒ 必须分开;
+- **基线的诊断只有一份实现**:此前这段判定写在**两个**脚手架的 `main()` 里(各写一份)
+  ⇒ 「基线挂死了」这件事**没有任何办法被钉住** ⇒ 挂死会被说成「测试失败」⇒ **诊断是错的**
+  ⇒ 现在是**一份共享实现**(`tools/check_mutations.py::baseline_failure_reason`)
+  ⇒ 一条用例就能把它钉住;
+- **基线组少了第四份**:字符串程序那套**整份不在基线里** ⇒ 它的「绿对照」在基线表里
+  **查不到基准** ⇒ 绿对照判据形同虚设 ⇒ 现在它是**第四组**,并且配了一条**反向对照**
+  (只改一个注释的无害改动 ⇒ 必须保持绿)⇒ 基线组不是摆设,是**有载荷**的。
+
+#### 一条被实测推翻的建议(照实记)
+
+claude 第 1 轮说:「pytest 的 `ExitCode.INTERRUPTED`(= 2)⇒ 一律 `env_unavailable`」。
+**实测不成立**(pytest 8.4.2,探针 `%TEMP%/r278_exitcodes.py`):**收集阶段失败**
+(语法错误 / 导入时抛异常)**也是退出码 2**,输出里是 `Interrupted: N error during collection`;
+而 `KeyboardInterrupt` 也是退出码 2,输出里是 `KeyboardInterrupt`。
+⇒ 两者**只能靠输出文本**分开 ⇒ **采纳「2 要分开」,不采纳「2 一律 env_unavailable」**。
+(若按后者,「变异把文件改到收集阶段就炸」会被**误诊**成「环境不可用」
+⇒ 变异规格写错了却说成环境坏了 ⇒ **诊断是错的**。)
+
+#### 顺带记下的三条
+
+- **`tests/guard_roster.json` 是陈旧的**:它自上次重生成后就没再更新 ⇒ 纪律那套 63 个函数
+  只登记了 **49** 条、字符串程序那套**整份不在名单里** ⇒ 「**写下了但没人跑**」
+  ⇒ 本轮**重生成**(口径用守卫自己的 `_expected_must_run`)。
+- **一句空操作掩盖了意图**:某条放行侧用例写的是 `EVIL.replace(X, X)`(**两边的字符串一模一样**
+  ⇒ 那次 replace **什么也没改**)⇒ 读代码时以为「拼出了一段新程序体」,其实用的还是 `EVIL`
+  ⇒ 改成直接用 `EVIL`。
+- **放行侧用例必须带第二条断言**(claude 第 1 轮 LOW-1):只断言「没报」⇒ **判据全盲**时
+  这条用例照样绿 ⇒ 是个**空测试** ⇒ 同一个形态**换上真原语 / 真解释器 / 真 `-c`** 时必须看得见。
+
+#### 搬锚点 4 处
+
+本轮重构(共享实现抽走、`-c` 的判据改写成「先取候选、再看是不是 `-c` / 以 `-c` 开头」)
+让 4 条既有变异的锚点**命中 0 次** ⇒ 变异变成**空操作**(假绿)
+⇒ 规则还在 ⇒ **搬锚点、不删变异** ⇒ 逐条重新锚定。
+
+#### 数量(实测)
+
+- 纪律守卫的变异 204 → **220** 种(**216 红 + 4 绿**);ADR 变异表 204 → **220** 行(双向核对);
+- `tests/test_constitution_string_programs.py` 50 → **63** 个函数;
+- `tests/test_check_guard_mutations.py` 61 → **63** 个函数;
+- `tests/test_check_domain.py` 采集 **104** → **105** 条;
+- 名单 542 → **558** 条 `must_run`(9 份套件)。
+
+#### 残余(如实登记)
+
+- **字符串程序判据不扫 `tests/`**(`_repo_python_files` 显式跳过 `tests/` 顶层):测试套件里
+  **故意**放着带 `exec` 的字符串程序当**探针素材** ⇒ 若不跳过,那套件自己会把守卫报红
+  ⇒ 判据就**永远红** ⇒ 没人再看它 ⇒ 这是**有意**的**范围限定**(只管**生产代码**),
+  不是遗漏;但它也意味着「`tests/` 里的字符串程序」**不受**这条判据管 ⇒ 登记在此。
+- 放行侧用例的「第二条断言」目前只覆盖**四种**形态(真解释器 / 真原语 / 真 `-c` /
+  真属性绑定);新增入口形态时**要一并补**。
+- **`claude` CLI 那一轮仍不是 G8 意义上的独立第 1 轮**(同族)⇒ 第 1 轮仍如实记为
+  「自审 + 实测」;第 2 轮由 codex CLI 完成。
+- **没有动任何实盘防线的口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链、沙盒筛查**全部未动**。
+
+### 第 55 轮之二十五(codex CLI 第 2 轮 38/50 的六条 must-fix —— 逐条本地复现、逐条修、逐条钉死)
+
+**这一轮的来源与它的性质**
+
+G8 第 2 轮由 **codex CLI** 完成(另一族模型、独立进程 ⇒ 权威)。
+本轮它给出 **38 / 50**(质量 7 / 安全 6 / 性能 9 / 架构 8 / 文档 8)——
+落在「**需小修**」那一档(≥45 才可发布)。它点名的 **must-fix** 是六条:
+H1、H2、M1、M2、M3、M4;另有四条 Low(L1~L4)与一条 Medium(M5)。
+
+**处置纪律(与前几轮一致,但这一轮更严)**:
+
+> **外部复核者的结论要自己复现。**
+> codex 说了**不等于**它成立 ⇒ 每一条都先在 `%TEMP%` 里写**最小复现脚本**
+> (脚本**不进仓库**)⇒ 亲手跑一遍、确认到底是**漏判**还是**误报**
+> ⇒ 才动手改 ⇒ 改完配**两侧探针**(拦截侧 + 放行侧)
+> ⇒ **一条变异 + 一个专属见证** ⇒ 复现脚本与原始报告**都不入库**。
+
+本轮 **11 条全部复现为真缺陷**(没有一条是 codex 的误报);处置见下。
+
+#### 一、六条 must-fix(逐条:codex 的说法 → 本地复现 → 处置)
+
+**H1 字符串程序绑定表不认元组/列表解包**
+
+- codex:只认 `ast.Name` 之类的目标 ⇒ `A, B = "python", "exec(...)"` 这条**双双漏判**。
+- 本地复现(实测):`_string_bindings(ast.parse(src))` 返回 `{}`、`_string_programs(...)` 返回 `[]`
+  ⇒ `check_string_program_primitives()` 不报 ⇒ **确认是漏判**。
+- 处置:`_string_bindings()` 认 `ast.Tuple` / `ast.List` 解包目标 ⇒ **逐位**绑定
+  (左右**数量一致**才绑;带 `Starred` 或数量不一致 ⇒ 不绑——机器判不了「哪个槽对应哪个值」⇒ **不猜**)。
+
+**H2 混淆原语的正则太窄**
+
+- codex:`getattr(__import__('builtins'), 'exec')(1)`、`getattr(builtins, 'ex' + 'ec')(1)`、
+  `d['ex' + 'ec'](1)`、`getattr(builtins, ('exec'))(1)` 四种形态**全部漏判**。
+- 本地复现(实测):`_program_primitives(...)` 对上述四种**全部**返回 `set()` ⇒ **确认是漏判**。
+- 处置:不再用单一正则猜 ⇒ 把程序体**当 Python 解析**、对取值表达式**折叠**
+  (字面量 / `+` 拼接 / 单元素元组 / f-string)后再认;
+  **只把 `builtins.compile` 当内建原语**——`re.compile(...)` / `py_compile.compile(...)`
+  是**模块自己的函数** ⇒ **不报**(报它就是逼人去登记豁免 ⇒ 那正是这条规则要防的
+  「守卫被调宽」,第 55 轮之二十四刚为此把 `compile` 的判据收紧过一次)。
+  解析不了(程序体未必是合法 Python)⇒ **退回正则那一层**,不假装判得了。
+
+**M1 未闭合的 heredoc 被静默漏掉**
+
+- codex:`os.system("python - <<'EOF'\nexec(open('p').read())\n")` ⇒ 找不到终止行就**返回空**。
+- 本地复现(实测):程序体列表**为空** ⇒ POSIX shell 明明会给个 warning 但**照样执行**
+  ⇒ **确认是静默 fail-open**。
+- 处置:把**剩下的全部**当程序体扫(宁可多扫,不可漏扫)。
+
+**M2 `check_executor_completeness` 对读不了的文件静默跳过**
+
+- codex:`except (UnicodeDecodeError, SyntaxError): continue` ⇒ 一个**坏编码**的文件
+  能让「执行入口完备性」对它**报干净**。
+- 本地复现(实测):真造一个 cp1252 字节的文件(`0xE9`)⇒ 该文件**不出声**
+  ⇒ 「查不了」被当成「干净」⇒ **确认是漏判**。
+- 处置:追加一条「`{rel} **查不了**({异常名})⇒ 「查不了」不等于「干净」」
+  的问题再 `continue`——与 `check_string_program_primitives` **同一口径**
+  (第 55 轮之二十一的 codex F4 已为那条判据定过这条规矩)。
+
+**M3 收菜的静态复检比批准/导入路径窄**
+
+- codex:`scripts/research_collect.py` 用的是 `const.screen_source(...)`(宪法层),
+  而批准与导入路径用的是 `rs.screen_source(...)`(沙盒层,含禁用模块 / 额外禁用调用 /
+  模块白名单 / 键用法核对)。
+- 本地复现(实测):`const.screen_source("import os")` 返回 `[]`,
+  而 `rs.screen_source("import os")` 报「禁止导入 os」⇒ **确认是漏判**
+  ⇒ 一个只在沙盒层被拦的写法,收菜这道关口**放过去了**。
+- 处置:改用**同一份调用**(与 `research_api.screen()` / `import_candidate()` 一致)。
+
+**M4 分档器自己成了执行面**
+
+- codex:`tools/check_domain.py::git_changed_paths()` 跑 `git status --porcelain -uall`
+  ⇒ `git status` **会应用 filter** ⇒ 候选只要在 `.git/config` 里写下一条 filter 命令,
+  **守卫跑的那次 `git status` 就替它执行** ⇒ 与本仓库**第 26 轮 Critical 1** 的
+  既有 ADR 结论**直接冲突**。
+- 本地复现(实测):临时仓库里 `.gitattributes` 写 `a.py filter=pwn`、
+  `.git/config` 写 `filter.pwn.clean = touch <marker>` ⇒ `git status` **确实把 marker 写了出来**
+  ⇒ **确认是真执行面**。
+- 处置:**不发明新机制**,按仓库**自己**那条 ADR 结论办:
+  ① 环境关掉一切能执行外部命令的配置(`GIT_CONFIG_NOSYSTEM=1`、
+  `GIT_CONFIG_GLOBAL`/`SYSTEM` → 空设备、`GIT_OPTIONAL_LOCKS=0`、`GIT_ATTR_NOSYSTEM=1`);
+  ② `core.fsmonitor=false`(`fsmonitor` 本身就是一条命令)、`core.pager=cat`;
+  ③ 仓库自己那份 `.git/config` 里的 filter 名字**逐个置空**
+  (`clean`/`smudge`/`process` 全清 + `required=false`)。
+  实测:**标记文件没有被写出来**,而**改动清单照样列得出来**(含未跟踪文件)。
+  (`--no-ext-diff` 必须放在 `diff` **子命令之后**——放在前面 git 直接 rc=129 报用法错。)
+
+#### 二、四条 Low(同样逐条复现、逐条处置)
+
+- **L1 解释器名还有第二份实现**:本地那份 `_SHELL_PYTHON_RE` 会把 `python3.`
+  认成解释器,而共享实现 `is_python_interpreter_name("python3.")` 返回 **False**
+  ⇒ 与 CHANGELOG 里「只留一份实现」那句话对不上 ⇒ **删掉本地那份正则**,
+  shell 里的解释器名**按 token 拆分**后交给共享实现判。
+- **L2 放行侧用例缺第二条断言**:只断「没报」⇒ **判据全盲**时照样绿 ⇒ 是个**空测试**
+  ⇒ 补上「同一形态换上真原语时必须看得见」。
+- **L3 `_write_dict` 缺 `fsync`**:试验账本那侧 `_write_lines` 有 `flush + fsync`,
+  批准账本这侧只有 `write_text + os.replace` ⇒ 同一套维护动作的**持久性口径不一致**
+  ⇒ 断电/崩溃时可能落下**内容不完整**的批准账本 ⇒ 改成**同一套写法**。
+- **L4 `_claimed_total()` 在 `OSError` 时返回 0**:读失败被当成「账本声称 0 次试验」
+  ⇒ 「防变小」的基准**归零** ⇒ 一次悄悄变小反而**看不出来**
+  ⇒ 与这段函数**自己写的原则**相反(「宁可高估也不低估」)⇒ 改成**报出去**(fail-closed)。
+
+#### 三、codex「实测后不作为缺陷」的项(照实记,并补上本轮自己实测到的)
+
+1. **不可降级清单没点名新套件**——codex 自己实测:那几个文件**当前都判 `execution`**
+   (默认拒绝)⇒ **没有直接绕过**。**但**按「改测试 = 改检出能力」的口径,点名列名更稳
+   ⇒ **本轮未改**(理由:默认拒绝已经把它们判成执行域;补进清单要各配一条变异
+   ⇒ 属下一轮的工作)⇒ **登记为残余**,不装作已修。
+2. **`risk/approved_guard.py` 用不核链的 `load_approvals()`** ⇒ 已登记的残余,归 **Issue #29**。
+3. **名单、变异锚点、见证分组「没有陈旧或空转」**——**这一条在它复核之后就不成立了**:
+   本轮又加了 16 条用例 ⇒ `tests/guard_roster.json` **又陈旧**了(它上一次重生成是第 55 轮之二十四)
+   ⇒ 本轮**按守卫自己的 `_expected_must_run` 重生成**(口径不靠人记)。
+4. **pytest 退出码 2 的两种含义已正确分开** ⇒ 与 ADR 记录一致,本轮不动。
+
+#### 四、探针与变异(每条**双向**)
+
+| 族 | 拦截侧(该拦的拦住) | 放行侧(不该误伤,且**带第二条断言**) | 变异 | 见证 |
+|---|---|---|---|---|
+| H1 元组解包 | `..._hidden_behind_a_tuple_unpacking` | `..._tuple_unpacking_without_any_primitive`(换上真原语必须看得见) | 让宪法层不再认元组解包里的绑定 | 同拦截侧 |
+| H2 折叠原语 | 四个形态各一条 | `..._module_compile_as_the_builtin_one` | 让宪法层不再认折叠后才露出来的原语名 | `..._behind_getattr_of_an_import` |
+| M1 未闭合 heredoc | `..._in_an_unclosed_heredoc` | (闭合形态仍照旧被扫) | 让宪法层不再扫未闭合的 heredoc | 同拦截侧 |
+| M2 查不了 | `..._says_when_a_file_cannot_be_read` | (能读的文件照旧判) | 让宪法层把读不了的文件当成干净 | 同拦截侧 |
+| L1 解释器口径 | `..._follows_the_shared_implementation`(第二段:`python3.` **不**许被认) | 同一条的第一段(真解释器认得) | 让 shell 解释器名回到本地那份正则 | 同拦截侧 |
+| M3 收菜筛查 | `test_collect_refuses_a_candidate_the_sandbox_screen_would_reject` | 同一条的第二段(去掉 `import os` 必须收得进来) | 让收菜退回宪法层那份筛查 | 同拦截侧 |
+| M4 分档器执行面 | `test_the_classifier_does_not_let_git_run_a_filter_command`(第二条:改动清单不许丢) | `test_the_classifier_still_reports_a_changed_file_without_filters` | 让分档器不再中和 git 的 filter 命令 | 同拦截侧 |
+| L3 fsync | `test_the_approval_ledger_write_flushes_and_fsyncs`(第二条:内容不许写坏) | 同一条 | 让批准账本落盘不再 fsync | 同拦截侧 |
+| L4 fail-closed | `test_the_claimed_total_refuses_to_call_an_unreadable_ledger_empty` | `test_the_claimed_total_still_sums_a_readable_ledger` | 让读不了的账本被当成 0 次试验 | 同拦截侧 |
+
+**纪律不变**:每条变异**一条专属见证**;共用见证只许发生在**同一族**里
+(`witness_group_problems()` 机器判定);**变异的唯一效果**必须是让那一条见证变红。
+
+**本轮实测到的一处「锚点漂移」(如实记,处置照旧)**:
+
+修 L1(删掉本地那份正则、改用共享实现)之后,三条**老**变异的锚点在
+`tools/check_constitution_history.py` 里**不再存在或不唯一**:
+
+| 变异 | 漂移形态 | 处置 |
+|---|---|---|
+| 「字符串原语判据不再要求 shell 命令里有 python 解释器」 | 锚点用的是**本地那份正则**(`_SHELL_PYTHON_RE`)⇒ 删掉后**命中 0 次** | **规则还在 ⇒ 搬锚点** ⇒ 锚到共享实现那份(`_shell_has_python_interpreter`) |
+| 「程序体通道不再认 heredoc」 | 同上(锚点用 `_SHELL_PYTHON_RE.search`)⇒ 命中 0 次 | **不删这条变异** ⇒ 搬锚点 |
+| 「程序体通道不再认字符串拼接」 | H2 新增的 `_folded_string()` 里**也有**一处同形的 `BinOp + Add` ⇒ 原来那条单行锚点**命中 2 次**(唯一性没了) | **不删这条变异** ⇒ 锚到 `_strings_of()` 里**带注释**的那一处 |
+| 「让宪法层把读不了的文件当成干净」(本轮新加) | 与第 55 轮之二十一那条 F4 的锚点**同形** ⇒ 命中 2 次 | 锚点**加长**(带上本轮那行注释)⇒ 命中 1 次 |
+
+**这正是「锚点必须唯一命中」那条用例存在的理由**:
+`tests/test_check_guard_mutations.py::test_every_mutation_anchor_hits_exactly_once`
+在**本轮改动落地后立刻变红**(先是 0 次、再是 2 次)⇒ **漂移是被发现的,不是被猜的**。
+**处置原则不变**:**规则还在 ⇒ 搬锚点 + 重指见证 ⇒ 绝不删变异**。
+(这也是「变异规格漂移要一次列全」的道理:漂移是**一族的**,不是一条一条冒出来的。)
+
+**另一处「见证空转」——靠纪律脚手架**自己**抓住(实测,不是推断)**:
+
+修完 H2(把字符串原语判据改成**AST 那层 + 正则兜底那层**两层)之后,
+那条**老**变异「字符串原语判据不再看 getattr 混淆」**不再让它的见证变红**
+⇒ 脚手架打印 `[!! 见证红了]`(见证还在绿)⇒ 判定为**变异空转**
+⇒ **不是**守卫有洞,而是**这条变异不再测它该测的东西**。
+
+**根因**:这条规则**换了实现**——原先只有**正则**那一层,
+现在有**AST 那层**接走了**可解析**的程序体 ⇒ 只关掉正则那一层,
+**可解析**形态照样被报出来 ⇒ 变异看不出来。
+
+**处置(规则还在 ⇒ 不删变异 ⇒ 搬锚点 + 重指见证 + 改名)**:
+
+1. **实测两层各自守的是不同的形态**(不看源码猜,用探针量):
+   - **AST 那层** ⇒ **可解析**的程序体(含折叠形态)⇒ 另有**专属**变异
+     「让宪法层不再认折叠后才露出来的原语名」;
+   - **正则兜底那层** ⇒ **解析不了**的程序体(整条 shell 命令之类)⇒ **兜底**。
+2. 给**兜底那一层**补一条**专属**探针
+   (`test_the_guard_reports_a_primitive_in_a_program_body_it_cannot_parse`):
+   此前那一层**没有任何探针** ⇒ ADR 里把「解析不了的程序体」登记成了盲区
+   ⇒ **写下了但没人跑** = 没有防线 ⇒ 这一层现在**有人在跑**。
+3. 把那条变异的**见证**改指那条新探针,并把**名字**改成与实际效果一致的说法
+   (旧名「不再看 getattr 混淆」在 H2 修完之后**已经不准**——AST 那层仍看)。
+   ⇒ 改名同时改三处:变异表那一行(机器**双向**核对用的就是那一行)+
+   ADR/CHANGELOG 两处历史清单。
+4. **实测效果唯一**:关掉正则兜底那层 ⇒ **只有**那条新探针变红(其余用例照旧绿)
+   ⇒ **不是**「见谁红杀谁」。
+
+#### 五、数量(实测,不靠人记)
+
+- 纪律守卫的变异 220 → **229** 种(**225 红 + 4 绿**);ADR 变异表 220 → **229** 行(双向核对);
+- `tests/test_constitution_string_programs.py` 63 → **74** 个函数;
+- `tests/test_check_domain.py` 采集 105 → **107** 条;
+- `tests/test_fs_capability_closure.py` 172 → **175** 条;
+- `tests/test_research_collect.py` 20 → **21** 条;
+- 名单 558 → **575** 条 `must_run`(9 份套件)。
+
+#### 六、残余(如实登记)
+
+- **M5(把新守卫套件点名列进不可降级清单)本轮未改**——理由与影响见第 3 节第 1 项:
+  当前它们**判为执行域**(默认拒绝)⇒ **没有绕过**;补进清单要各配一条变异 ⇒ 下一轮做。
+- **H2 的兜底仍是正则**:程序体**解析不了**时退回正则那一层 ⇒ 那一层**比 AST 判据窄**
+  ⇒ 「解析不了的程序体」仍是已知的盲区(登记在此)——
+  第 55 轮之二十五之补已给**那一层**补了一条**专属**探针
+  (兜底那一层不再「没人跑」),但**判据本身仍比 AST 窄**这个局限不变。
+- **字符串程序判据不扫 `tests/`**(有意:测试套件里**故意**放着带 `exec` 的字符串当探针素材
+  ⇒ 若不跳过,守卫会永远红 ⇒ 没人再看它)⇒ 这是**范围限定**,不是遗漏。
+- **放行侧用例的「第二条断言」** 目前只覆盖**几种**形态(真原语 / 真解释器 / 真 `-c`);
+  新增入口形态时**要一并补**。
+- **`claude` CLI 那一轮仍不是 G8 意义上的独立第 1 轮**(同族)⇒ 第 1 轮仍如实记为
+  「自审 + 实测」;第 2 轮由 codex CLI 完成。
+- **没有动任何实盘防线的口径**:DSR ≥ 0.95 与各门槛阈值、风控底线、批准链、沙盒筛查**全部未动**。

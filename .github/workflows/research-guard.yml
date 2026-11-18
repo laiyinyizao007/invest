@@ -117,6 +117,7 @@ jobs:
             tests/test_check_ci_ran.py \
             tests/test_ci_wiring.py \
             tests/test_check_guard_mutations.py \
+            tests/test_constitution_string_programs.py \
             tests/test_dashboard_app.py \
             tests/test_dashboard_collect_more.py \
             tests/test_constitution_round11.py \
@@ -204,8 +205,11 @@ jobs:
       #
       # 第 55 轮:加了 `tests/test_ci_wiring.py`(接线自检工具自己的用例)——
       # 新写的守卫工具**自己也要有人守**(仓库教训)。
+      # 第 55 轮之二十:加上 `tests/test_constitution_string_programs.py`
+      #(宪法层「字符串里藏着的执行原语」那条规则的用例)——
+      # 它守的是宪法层自己的判定点,同样不许被整份跳过。
       - name: 守卫工具自己的用例(分档器 / CI 闸门 / 接线自检 / 变异脚手架)
-        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/guards.xml" --roster tests/guard_roster.json --suite tests/test_check_domain.py --suite tests/test_check_ci_ran.py --suite tests/test_ci_wiring.py --suite tests/test_check_guard_mutations.py
+        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/guards.xml" --roster tests/guard_roster.json --suite tests/test_check_domain.py --suite tests/test_check_ci_ran.py --suite tests/test_ci_wiring.py --suite tests/test_check_guard_mutations.py --suite tests/test_constitution_string_programs.py
 
       - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
 

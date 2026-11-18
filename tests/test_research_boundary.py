@@ -2934,6 +2934,9 @@ GUARD_SUITE_ROSTER = (
     "tests/test_check_domain.py",
     "tests/test_check_ci_ran.py",
     "tests/test_check_guard_mutations.py",
+    # 第 55 轮之二十:宪法层「字符串里藏着的执行原语」那条规则的用例——
+    # 它守的是宪法层自己的判定点 ⇒ 同样不许被整份跳过。
+    "tests/test_constitution_string_programs.py",
     # 第 55 轮:接线自检工具(`tools/check_ci_wiring.py`)自己的用例——
     # 它守的是「CI 会不会红」这件事本身,同样不许被整份跳过。
     "tests/test_ci_wiring.py",
@@ -3124,6 +3127,7 @@ def test_the_guard_looks_at_every_suite_the_roster_names():
         "tests/test_check_domain.py",
         "tests/test_check_ci_ran.py",
         "tests/test_check_guard_mutations.py",
+        "tests/test_constitution_string_programs.py",
         "tests/test_ci_wiring.py",
         "tests/test_approval_ledger.py",
         "tests/test_research_collect.py",

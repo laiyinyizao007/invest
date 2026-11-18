@@ -387,3 +387,40 @@ def test_the_gateway_cannot_reach_the_collect_module():
         encoding="utf-8")
     assert "research_collect" not in gateway
     assert "collect" not in {route[1] for route in []}     # 网关的端点白名单里没有收菜
+
+
+# ---------------------------------------------------------------------------
+# 第 55 轮之二十五(codex 第 2 轮 M3):收菜的静态复检**不得比批准路径窄**
+# ---------------------------------------------------------------------------
+
+
+def test_collect_refuses_a_candidate_the_sandbox_screen_would_reject(sandbox, monkeypatch):
+    """**拦截侧**:沙盒层拦得住的写法,收菜时**也必须**拦得住。
+
+    第 55 轮之二十五(codex 第 2 轮 M3):收菜此前用 `const.screen_source(...)`
+    ——那是**宪法层**的筛查,**不含**沙盒层的「禁用模块 / 额外禁用调用 /
+    模块白名单 / 键用法核对」
+    ⇒ 实测 `const.screen_source("import os")` 返回 `[]`,
+    而 `rs.screen_source("import os")` 会报「禁止导入 os」
+    ⇒ 一个只在沙盒层被拦的写法,收菜这道关口**放过去了**。
+
+    ⇒ 现在收菜用**同一份调用**(与批准/导入路径一致)。
+    """
+    monkeypatch.setattr(collect.sys, "stdin", FakeTTY())
+    source = _write_candidate(
+        sandbox, source="import os\n\n\ndef go():\n    os.listdir('.')\n")
+    sha = _approve(sandbox, source)
+
+    with pytest.raises(collect.CollectError) as excinfo:
+        collect.collect_job("cand.py", input_fn=lambda _: sha, write=lambda _t: None)
+
+    assert "静态筛查" in excinfo.value.message, excinfo.value.message
+    assert not (sandbox / "approved" / "cand.py").exists()
+
+    # **第二条断言**(放行侧):同一个候选,去掉那行 `import os` 就必须收得进来
+    # ⇒ 证明上面的拒绝确实是**筛查**造成的,不是别的原因(否则这条用例是空的)。
+    ok_source = _write_candidate(sandbox, name="ok.py", source=CANDIDATE)
+    ok_sha = _approve(sandbox, ok_source)
+    result = collect.collect_job("ok.py", input_fn=lambda _: ok_sha,
+                                 write=lambda _t: None)
+    assert result["collected"] is True

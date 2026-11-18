@@ -2702,3 +2702,62 @@ def test_every_lock_caller_passes_the_staleness_limit_explicitly():
             (ROOT / "scripts" / "research_sandbox.py", "stale_seconds=LOCK_STALE_SECONDS")):
         source = path.read_text(encoding="utf-8")
         assert needle in source, f"{path.name} 没有显式传 stale_seconds:{needle}"
+
+
+# ---------------------------------------------------------------------------
+# 第 55 轮之二十五(codex 第 2 轮 L3/L4):账本维护入口的持久性与 fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_the_approval_ledger_write_flushes_and_fsyncs(tmp_path, monkeypatch):
+    """**拦截侧**:批准账本落盘**必须** flush + fsync。
+
+    第 55 轮之二十五(codex 第 2 轮 L3):试验账本那侧 `_write_lines` 有
+    `flush + os.fsync`,而批准账本这侧 `_write_dict` 只有 `write_text + os.replace`
+    ⇒ 同一套维护动作的持久性口径**不一致** ⇒ 断电/崩溃时可能落下**内容不完整**
+    的批准账本。
+
+    ⇒ 现在与试验账本**同一套**写法。
+    """
+    calls = []
+    real_fsync = os.fsync
+
+    def _spy(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(admin.os, "fsync", _spy)
+    target = tmp_path / "approvals.json"
+    admin._write_dict(target, [{"sha": "a" * 64, "name": "x.py"}])
+
+    assert calls, "批准账本落盘没有 fsync ⇒ 与试验账本那侧口径不一致"
+    # **第二条断言**(放行侧):内容**照样**是合法的 JSON(加了 fsync 不许写坏)
+    assert json.loads(target.read_text(encoding="utf-8"))["a" * 64]["name"] == "x.py"
+
+
+def test_the_claimed_total_refuses_to_call_an_unreadable_ledger_empty(tmp_path):
+    """**拦截侧**:账本**读不了**时不许假装它是「0 次试验」。
+
+    第 55 轮之二十五(codex 第 2 轮 L4):上一版 `except OSError: return 0`
+    ⇒ 读失败被当成「账本声称 0 次」⇒ 「防变小」的基准**归零**
+    ⇒ 一次悄悄变小反而**看不出来** ⇒ 与这段函数**自己写的原则**相反
+    (「宁可高估也不低估,放过一次悄悄变小」)。
+
+    ⇒ 现在**报出去**(fail-closed):读不了就不许据此判断。
+    """
+    as_dir = tmp_path / "ledger_is_a_dir"
+    as_dir.mkdir()
+    with pytest.raises(admin.AdminError):
+        admin._claimed_total(as_dir)
+
+
+def test_the_claimed_total_still_sums_a_readable_ledger(tmp_path):
+    """**放行侧**:账本读得了时,累计次数**照样**算得对。
+
+    没有这条 ⇒ 上一条可能把「读得了」也判成读不了 ⇒ 维护入口整个不可用
+    ⇒ 守卫被调宽。
+    """
+    ledger = tmp_path / "trials.jsonl"
+    ledger.write_text(
+        '{"count": 3}\n{"count": 4}\n', encoding="utf-8")
+    assert admin._claimed_total(ledger) == 7

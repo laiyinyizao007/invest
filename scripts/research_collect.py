@@ -48,7 +48,6 @@ from pathlib import Path
 import research_config as rc
 import research_sandbox as rs
 from risk import approval_ledger
-from risk import constitution as const
 from risk.approved_guard import SAFE_FILE_NAME
 
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 2, 3
@@ -190,7 +189,20 @@ def collect_job(strategy: str, input_fn=None, write=None, replace: bool = False)
 
     # 静态筛查复检:批准时筛过一遍,收菜时再筛一遍(批准与收菜之间文件可能被换过,
     # 而账本命中只保证「这份字节被批准过」,不保证「这份字节符合沙盒规则」)
-    findings = const.screen_source(raw.decode("utf-8", errors="replace"))
+    #
+    # **口径必须与批准/导入路径完全一致**(第 55 轮之二十五,codex 第 2 轮 M3):
+    # 上一版这里用的是 `const.screen_source(...)`——那是**宪法层**的筛查,
+    # **不含**沙盒层的「禁用模块 / 额外禁用调用 / 模块白名单 / 键用法核对」
+    # ⇒ 收菜这道关口比它声称要复检的那道**更窄**(实测:
+    # `const.screen_source("import os")` 返回 `[]`,而
+    # `rs.screen_source("import os")` 会报「禁止导入 os」)
+    # ⇒ 一个只在沙盒层被拦的写法,收菜时**放过去了**。
+    # ⇒ 现在用**同一份调用**(与 `research_api.screen()` / `import_candidate()` 一致)。
+    findings = rs.screen_source(
+        raw.decode("utf-8", errors="replace"),
+        cfg["screening"]["extra_forbidden_modules"],
+        cfg["screening"]["extra_forbidden_calls"],
+        cfg["screening"]["allowed_modules"])
     if findings:
         raise CollectError("静态筛查未通过,拒绝收菜:" + "\n  " + "\n  ".join(findings))
 

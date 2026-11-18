@@ -50,7 +50,10 @@ ROOT = Path(__file__).resolve().parent.parent
 # 同名函数口径不同——一处有反向断言、一处没有)。
 sys.path.insert(0, str(ROOT / "tools"))
 from check_mutations import (  # noqa: E402
+    PYTEST_TIMEOUT_SECONDS,
+    TIMEOUT_RETURNCODE,
     _purge_bytecode_cache,
+    baseline_failure_reason,
     cleanup_temp_dir,
     copy_repo,
     run_outcome,
@@ -64,6 +67,20 @@ TOOL_TEST = "tests/test_check_ci_ran.py"
 WORKFLOW = ".github/workflows/research-guard.yml"
 # 第 55 轮:接线自检工具**自己**的用例(接线这件事的见证用例在它里面)
 WIRING = "tests/test_ci_wiring.py"
+# 第 55 轮之二十四:claude 第 1 轮复核 MEDIUM-3 ——
+# **字符串程序那套**也必须进「基线必须全绿」的闸门。
+# 此前基线只有三组(边界 / 闸门工具 / 接线)⇒ 这一份**整份不在基线里**
+# ⇒ 它的「绿对照」在基线表里**查不到基准** ⇒ 绿对照判据形同虚设。
+STRING_PROGRAMS = "tests/test_constitution_string_programs.py"
+
+# **基线组**:每一组都必须在**未变异的副本**上全绿(绿对照要比的就是它们)。
+#
+# **为什么提成常量**(第 55 轮之二十四):此前这个清单写死在 `main()` 里
+# ⇒ 「基线组少了哪一份」这件事**没有任何办法被钉住**⇒ 少一份 ⇒
+# 那一组的绿对照**没有基准可比**⇒ 而脚手架照样说「全绿」(假绿)。
+# ⇒ 提成常量 ⇒ 才有**一条用例**能盯着它(见
+# `tests/test_check_guard_mutations.py::test_the_baseline_covers_every_suite_that_hosts_a_witness`)。
+BASELINE_GROUPS = ((BOUNDARY,), (TOOL_TEST,), (WIRING,), (STRING_PROGRAMS,))
 
 # 规范闸门命令在 workflow 里的**那一行**(第 55 轮的接线变异都锚在它上面)
 GATE_LINE = ('        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/boundary.xml"'
@@ -611,7 +628,12 @@ MUTATIONS = (
     _mutation(
         "让宪法层偷偷依赖第三方包(独立落点会因为装不上依赖而压根没跑)",
         "tools/check_constitution_history.py",
-        ("import ast\nimport json\n", "import ast\nimport json\nimport yaml\n"),
+        # **锚点搬了**(第 55 轮之二十四):本轮在 `import ast` 与 `import json`
+        # 之间插了 `import importlib.util`(共享那份解释器名实现要用它)
+        # ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+        # ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+        ("import ast\nimport importlib.util\nimport json\n",
+         "import ast\nimport importlib.util\nimport json\nimport yaml\n"),
         targets=[WIRING],
     ),
     _mutation(
@@ -634,7 +656,9 @@ MUTATIONS = (
     # ---- 第 55 轮之五:codex 第 2 轮的 C1 / C2 / H1 / H2 / M1 / L2 / L3 / L4 ----
     #
     # 这一族把 codex 第 2 轮指出的**每一个洞**都钉一条红变异:
-    # 见证用例逐条对应(见 WITNESSES),不许共用一条(共用 ⇒ 走错原因的红也算数)。
+    # 见证用例逐条对应(见 WITNESSES)。**共用是允许的,但必须同族**:
+    # 共用同一个见证的变异必须声明**同一个规则**(机器判定见
+    # `witness_group_problems()`)⇒ 混进别的规则会让「走错原因的红」静悄悄发生。
     #
     # **注意**:见证用例里带参数的那几条**必须显式给 ASCII 的 id**
     # (`pytest.param(..., id="utf8")`)——pytest 的失败摘要行会把非 ASCII 的
@@ -1384,7 +1408,9 @@ MUTATIONS = (
     # ---- 第 55 轮之十二:codex 第 6 轮的 H-1 / H-2 / H-3 / H-4 与 M-1 / M-2 ----
     #
     # 这一族把 codex 第 6 轮指出的**每一个新洞**都钉一条红变异:
-    # 见证用例逐条对应(见 WITNESSES),**一条变异一条见证**(共用 ⇒ 走错原因的红也算数)。
+    # 见证用例逐条对应(见 WITNESSES),**按规则家族共用**(第 55 轮之二十更正:
+    # 此前这里宣称「一条变异一条见证」,与实测(159 条红变异 / 132 个唯一见证)
+    # 不符;同组必须声明**同一个规则**,由 `witness_group_problems()` 机器判定)。
     _mutation(
         # H-1:同一逻辑行里 `exit 0` **之后**的调用是**死代码**
         # ⇒ 裁决者那一步压根走不到 ⇒ 而守卫此前恒把它当成活调用。
@@ -1509,7 +1535,8 @@ MUTATIONS = (
     # ---- 第 55 轮之十四:codex 第 2 轮的 6 条发现 ⇒ 10 条规则 ----
     #
     # **每条发现都先自己复现过**(见 %TEMP%/r64a_verify_codex.py)才动手改的。
-    # **一条变异一条见证**(共用 ⇒ 走错原因的红也算数)。
+    # **见证按规则家族共用**(第 55 轮之二十更正:此前这里宣称「一条变异一条
+    # 见证」,与实测不符;同组必须声明同一规则,由 `witness_group_problems()` 判定)。
     _mutation(
         # R14-1(C-1a):仓库里**不存在**的本地动作 ⇒ 判红。
         # 此前 `uses: ./…` **无条件放行** ⇒ 而扫描面只有
@@ -1643,8 +1670,8 @@ MUTATIONS = (
     # 少了它,「同秒 + 同大小」的变异会被上一次编译出的 `.pyc` 顶掉
     # ⇒ 变异根本没生效 ⇒ 见证保持绿 ⇒ 看起来像「守卫有洞」(实际是空转)。
     #
-    # **一条变异一条见证**:纪律那套与分档那套各有**专属**的拦截侧探针
-    # ⇒ 不会「走错原因的红」(仓库教训:变异见证必须指向唯一那一条规则)。
+    # **见证按规则家族共用**(第 55 轮之二十更正):纪律那套与分档那套各有**专属**
+    # 的拦截侧探针 ⇒ 不会「走错原因的红」(仓库教训:变异见证必须指向唯一那一条规则)。
     # (`targets` 只在**绿对照**时用;这三条是「应该变红」的变异 ⇒ 不写 targets。)
     _mutation(
         # 共享实现被掏空 ⇒ 两个脚手架都失去保护
@@ -1681,7 +1708,7 @@ MUTATIONS = (
     # 清理字节码缓存是**本轮修复的支点** ⇒ 它自己若「静悄悄地失败」,
     # 本轮修的坑就会**以更隐蔽的方式回来**(删不掉的没说 ⇒ 看起来像「守卫有洞」;
     # 环境变量让解释器压根不写缓存 ⇒ 拦截侧探针假红 ⇒ 误报成「变异被吃」)。
-    # ⇒ 这几条把「清理要么做对、要么出声」钉死。**一条变异一条见证**。
+    # ⇒ 这几条把「清理要么做对、要么出声」钉死。**见证按规则家族共用**。
     _mutation(
         # 删不掉的缓存**不再出声** ⇒ 防线无声失效
         "字节码缓存删不掉时不再出声",
@@ -1722,6 +1749,744 @@ MUTATIONS = (
             '    env.pop("PYTHONDONTWRITEBYTECODE", None)\n',
             '    pass  # (mutation: 不再摘掉 PYTHONDONTWRITEBYTECODE)\n'),
     ),
+
+    # ---- 第 55 轮之二十:codex 第 2 轮的 M1 / M2 / L1 / L2 / L3 / L4 ----
+    #
+    # 这一族把 codex 第 2 轮指出的**每一个洞**都钉一条红变异。
+    # 锚点是**目标文件里的原文**(逐字节一致)⇒ 改的是真代码,不是替身。
+    _mutation(
+        '分档守卫不再摘掉 PYTHONPYCACHEPREFIX',
+        'tools/check_mutations.py',
+        (
+            '    if env.pop("PYTHONPYCACHEPREFIX", None) is not None:\n',
+            '    if False and env.pop("PYTHONPYCACHEPREFIX", None) is not None:\n'),
+    ),
+    _mutation(
+        '纪律守卫不再摘掉 PYTHONPYCACHEPREFIX',
+        'tools/check_guard_mutations.py',
+        (
+            '    if env.pop("PYTHONPYCACHEPREFIX", None) is not None:\n',
+            '    if False and env.pop("PYTHONPYCACHEPREFIX", None) is not None:\n'),
+    ),
+    _mutation(
+        '宪法层不再扫字符串里藏的执行原语',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十四):本轮在 `problems` 与循环之间插了
+            # 「共享实现拿不到 ⇒ 出声」那一段 ⇒ 旧锚点命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            # 锚点必须**唯一** ⇒ 带上「共享实现拿不到」那段 ⇒ 全仓只此一处。
+            '        return problems\n    for path in _repo_python_files(root):\n        rel = path.relative_to(root).as_posix()\n',
+            '        return problems\n    for path in ():  # (mutation: 宪法层不再扫字符串里藏的执行原语)\n        rel = path.relative_to(root).as_posix()\n'),
+    ),
+    _mutation(
+        '宪法层不再把字符串原语检查挂进总检查',
+        'tools/check_constitution_history.py',
+        (
+            '    problems += check_string_program_primitives(root)\n',
+            '    # problems += check_string_program_primitives(root)  # (mutation: 宪法层不再把字符串原语检查挂进总检查)\n'),
+    ),
+    _mutation(
+        '诊断不再把读不了的字节码缓存说出来',
+        'tools/check_guard_mutations.py',
+        (
+            '        except OSError as exc:                     # noqa: BLE001 - 诊断不改变结论\n            # 【第 55 轮之二十,codex 第 2 轮 L1】**读不了必须出声**:\n            # purge 侧早就修过「删不掉必须出声」,诊断侧却**静默跳过** ⇒\n            # 一份恰好是被复用的陈旧字节码(被锁/权限问题)⇒ 诊断**完全失明**\n            # ⇒ 还可能顺势说出「缓存是新的」这种**反向**结论。\n            # **查不了 ≠ 结论干净**(仓库教训:守卫不许无声失效)。\n            out.append("%s 读不了(%r)⇒ 这条缓存**查不了**"\n                       "(查不了 ≠ 结论干净:它可能正是被复用的陈旧字节码)" % (pyc.name, exc))\n            continue\n',
+            '        except OSError as exc:                     # noqa: BLE001 - 诊断不改变结论\n            continue\n'),
+    ),
+    _mutation(
+        '指纹不再比对 co_names',
+        'tools/check_guard_mutations.py',
+        (
+            '    return (code.co_code, tuple(consts), tuple(code.co_names), tuple(code.co_varnames))\n',
+            '    return (code.co_code, tuple(consts))  # (mutation: 指纹不再比对 co_names)\n'),
+    ),
+    _mutation(
+        '诊断结论不再引用整份套件的失败集合',
+        'tools/check_guard_mutations.py',
+        (
+            '        other = whole.get("failed_nodes") or []\n        if other:\n            out.append("**显式清掉字节码缓存后,同一条见证仍然没红**,但整份套件里**有**别的用例红了"\n                       "(%s)⇒ 变异**确实有影响**,只是**见证没红** ⇒ "\n                       "见证被其他失败顶替(守卫有洞,或见证钉错了)" % ", ".join(other[:10]))\n        else:\n            out.append("**显式清掉字节码缓存后,同一条见证仍然没红**,且整份套件**一条都没红** ⇒ "\n                       "不是缓存的问题 ⇒ 变异对**所有**用例都没影响"\n                       "(空转,或改到的不是被执行的那份代码)")\n',
+            '        out.append("**显式清掉字节码缓存后,同一条见证仍然没红** ⇒ 不是缓存的问题 ⇒ "\n                   "变异对**所有**用例都没影响(空转,或改到的不是被执行的那份代码)")\n'),
+    ),
+    _mutation(
+        '见证共用不再检查规则声明',
+        'tools/check_guard_mutations.py',
+        (
+            '        if len(specs) < 2:\n',
+            '        if True:  # (mutation: 见证共用不再检查规则声明) ⇒ 所有组都被跳过\n'),
+    ),
+
+    # ---- 第 55 轮之二十之补:G8 第 1 轮**自己实测**出来的洞 ----
+    #
+    # 这一族钉的是**上一版判据自己**的三条绕过路径 + 豁免表与 ADR 的挂钩:
+    # 上一版的三条绕过**都是实测复现过的**(探针 %TEMP%/r190b_probe_holes.py)。
+    _mutation(
+        '字符串原语判据不再看解释器与 -c 之间的 flag',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点已搬**(第 55 轮之二十一):上一轮把这一行改成了
+            # `_looks_like_python_interpreter(e, bindings)` ⇒ 旧锚点命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ 空操作比没有变异更坏
+            # ⇒ 规则还在 ⇒ **搬锚点**,**不删这条变异**;
+            # 变异后的代码也**跟着改**(否则语法不成立)。
+            # **锚点又搬了一次**(第 55 轮之二十二):本轮把这一行改成
+            # `_looks_like_python_interpreter(e, bindings, attributes)`
+            # ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+            # ⇒ 空操作比没有变异更坏 ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            # **锚点又搬了一次**(第 55 轮之二十三):本轮把「扫命令表」抽成了
+            # `_programs_in_elements()` ⇒ 缩进变了 ⇒ 旧锚点命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            '        if not any(_looks_like_python_interpreter(e, bindings, attributes)\n'
+            '                   for e in candidates):\n',
+            '        if index == 0 or not _looks_like_python_interpreter(elements[index - 1], bindings, attributes):\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再看 shell=True 的整条命令',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十三):本轮把那段代码搬进了
+            # `_string_programs()` 的新结构 ⇒ 缩进变了 ⇒ 旧锚点命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            '        if not _shell_is_true(node):\n            continue\n',
+            '        if True:  # (mutation: 字符串原语判据不再看 shell=True 的整条命令)\n            continue\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再合并同名变量的多个取值',
+        'tools/check_constitution_history.py',
+        (
+            '        return list(bindings.get(node.id, ()))\n',
+            '        return list(bindings.get(node.id, ())[-1:])  # (mutation: 只留最后一个取值)\n'),
+    ),
+    _mutation(
+        '字符串原语豁免表不再与 ADR 登记核对',
+        'tools/check_constitution_history.py',
+        (
+            '    problems += check_string_program_allowlist_registry(root)\n',
+            '    # problems += check_string_program_allowlist_registry(root)  # (mutation: 不再与 ADR 核对)\n'),
+    ),
+
+
+    # ---- 第 55 轮之二十三:G8 第 2 轮(codex CLI,39/50)的逐条处置 ----
+    #
+    # codex 第 2 轮**实测复现**了 10 条漏判 + 3 条误报面;
+    # 我本地**逐条复现**(探针放 %TEMP%,不进仓库)⇒ 全部确认 ⇒ 逐条修 + 逐条配变异。
+    # 教训与第 55 轮之二十二**同一条**:
+    # **「修掉 reviewer 点名的那几条」≠「这一族收口了」**
+    # ⇒ 这一族(codex 点名的 4 条 + 我自己上一轮点名的 4 条)又被测出 10 条。
+    #
+    # 这一族钉的是**同一条规则**的又一批绕过路径:
+    #   H1 命令列表**绑定到变量**      S1 **星号导入**之后的裸名入口
+    #   X1 `os.execv` 族                V1 **变参形态**(asyncio)的入口
+    #   G1 入口用 **getattr** 取        C1 解释器**绑定链**(A = sys.executable; B = A)
+    #   Y1 **bytes 解释器**             E1 解释器在 **`executable=`** 里
+    #   S2 命令列表是**星号实参**        S3 命令列表是**字典展开**
+    #   S4 字符串绑定**链**(PY = "python"; Q = PY)
+    # 以及三条**收紧**(把误报面去掉):
+    #   N1 解释器名不再只判 `startswith("python")`
+    #   N2 `.executable` 不再**任意对象**都算
+    #   N3 shell 命令**必须真的有 python 解释器**
+    _mutation(
+        '字符串原语判据不再认绑定到变量的命令列表',
+        'tools/check_constitution_history.py',
+        (
+            '        bound = list_bindings.get(command.id)\n'
+            '        if isinstance(bound, (ast.List, ast.Tuple)):\n'
+            '            return list(bound.elts)\n',
+            '        bound = None  # (mutation: 不再认绑定到变量的命令列表)\n'
+            '        if isinstance(bound, (ast.List, ast.Tuple)):\n'
+            '            return list(bound.elts)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认星号导入之后的入口',
+        'tools/check_constitution_history.py',
+        (
+            '        for module in star_modules:\n'
+            '            dotted = _STAR_ENTRIES_BY_MODULE.get(module, {}).get(func.id)\n',
+            '        for module in ():  # (mutation: 不再认星号导入之后的入口)\n'
+            '            dotted = _STAR_ENTRIES_BY_MODULE.get(module, {}).get(func.id)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认 os.execv 族',
+        'tools/check_constitution_history.py',
+        (
+            '    "os.execv", "os.execve", "os.execl", "os.execle", "os.execlp",\n'
+            '    "os.execlpe", "os.execvp", "os.execvpe",\n'
+            '    "os.posix_spawn", "os.posix_spawnp",\n',
+            '    # (mutation: 不再认 os.execv 族)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认 asyncio 的变参入口',
+        'tools/check_constitution_history.py',
+        (
+            '    "asyncio.create_subprocess_exec",\n',
+            '    # (mutation: 不再认 asyncio 的变参入口)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认 getattr 取到的入口',
+        'tools/check_constitution_history.py',
+        (
+            '        elif _is_getattr_call(value):\n',
+            '        elif False and _is_getattr_call(value):  # (mutation: 不再认 getattr 取到的入口)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再顺绑定链解解释器',
+        'tools/check_constitution_history.py',
+        (
+            '    if isinstance(value, ast.Name):\n'
+            '        return _resolve_bound_attribute(value.id, attributes, seen)\n',
+            '    if isinstance(value, ast.Name):\n'
+            '        return None  # (mutation: 不再顺绑定链解解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认 bytes 解释器',
+        'tools/check_constitution_history.py',
+        (
+            '        if isinstance(node.value, bytes):\n',
+            '        if False:  # (mutation: 不再认 bytes 解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认 executable= 关键字里的解释器',
+        'tools/check_constitution_history.py',
+        (
+            '            extra = [keyword.value for keyword in node.keywords\n'
+            '                     if keyword.arg == "executable"]\n',
+            '            extra = []  # (mutation: 不再认 executable= 关键字里的解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认星号实参里的命令列表',
+        'tools/check_constitution_history.py',
+        (
+            '        argument = node.args[0]\n'
+            '        if isinstance(argument, ast.Starred):\n'
+            '            argument = argument.value\n',
+            '        argument = node.args[0]  # (mutation: 不再认星号实参里的命令列表)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认字典展开的命令列表',
+        'tools/check_constitution_history.py',
+        (
+            '        if keyword.arg is None:\n'
+            '            # `**{...}` 展开\n'
+            '            found = _dict_literal_entry(keyword.value, keyword_name)\n'
+            '            if found is not None:\n'
+            '                return found\n',
+            '        # (mutation: 不再认字典展开的命令列表)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再顺字符串绑定链解解释器',
+        'tools/check_constitution_history.py',
+        (
+            '            for text in bindings.get(value.id, ()):\n',
+            '            for text in ():  # (mutation: 不再顺字符串绑定链解解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再限死解释器名',
+        # **锚点搬了**(第 55 轮之二十四):「什么算 python 解释器」现在**只有一份实现**
+        # (`tools/check_ci_wiring.py::is_python_interpreter_name`)⇒ 原来的锚点
+        # (本文件里那份正则的实现)已经不存在 ⇒ 命中 0 次 ⇒ 变异变成**空操作**
+        # ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异** ⇒ 锚到**共享实现**那份。
+        'tools/check_ci_wiring.py',
+        (
+            '    return bool(_PYTHON_RE.match(base))\n',
+            '    return base.startswith("python")  # (mutation: 不再限死解释器名)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再限死 executable 属性',
+        'tools/check_constitution_history.py',
+        (
+            '    if node.attr == "executable":\n'
+            '        return _attribute_root_name(node) == "sys"\n',
+            '    if node.attr == "executable":\n'
+            '        return True  # (mutation: 不再限死 executable 属性)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再要求 shell 命令里有 python 解释器',
+        # **锚点搬了**(第 55 轮之二十五,codex 第 2 轮 L1):「什么算 python 解释器」
+        # 现在**只有一份实现**⇒ 本文件里那份**本地正则**已被删掉
+        # ⇒ 原来的锚点(`_SHELL_PYTHON_RE`)已经不存在 ⇒ 命中 0 次
+        # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**
+        # ⇒ 锚到**共享实现**那份(`_shell_has_python_interpreter`)。
+        'tools/check_constitution_history.py',
+        (
+            '    if "-c" not in text:\n'
+            '        return False\n'
+            '    return _shell_has_python_interpreter(text)\n',
+            '    return True  # (mutation: 不再要求 shell 命令里有 python 解释器)\n'),
+    ),
+    _mutation(
+        '脚手架不再把被信号杀死的 pytest 说成规格写错',
+        'tools/check_mutations.py',
+        (
+            '    if returncode < 0:\n'
+            '        # **被信号杀死**(不是本脚手架的超时哨兵)⇒ 仍然是「环境不可用」\n'
+            '        return "env_unavailable"\n',
+            '    if returncode < 0:\n'
+            '        # (mutation: 不再把被信号杀死的 pytest 说成规格写错)\n'
+            '        return "spec_broken"\n'),
+    ),
+
+    # ---- 第 55 轮之二十二:G8 第 1 轮**自审实测**出来的四条漏判 ----
+    #
+    # 这一族钉的是**同一条规则**的四条绕过路径(codex 第 2 轮 F1/F2 与我上一轮
+    # 修的是**同一族** ⇒ 「修掉几条漏判 ≠ 这一族收口」):
+    #   M1 命令列表是**关键字参数**(`args=[...]`)
+    #   M2 解释器绑定到**属性**(`EXE = sys.executable`)
+    #   M3 **实参位置上的海象**(`(b := "exec(...)")`)
+    #   M4 **点号导入**把名字绑错(`import os.path` 之后 `os.system` 认不出)
+    _mutation(
+        '字符串原语判据不再认命令的关键字参数',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十三):本轮给 `_command_argument` 加了
+            # `**{...}` 展开那一支 ⇒ 旧锚点(到 `return None` 为止)命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            '    for keyword in node.keywords:\n'
+            '        if keyword.arg == keyword_name:\n'
+            '            return keyword.value\n',
+            '    for keyword in node.keywords:\n'
+            '        if False:  # (mutation: 不再认命令的关键字参数)\n'
+            '            return keyword.value\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认绑定出来的属性解释器',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十三):本轮把「属性像不像解释器」抽成了
+            # `_attribute_is_interpreter()` ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+            # ⇒ 空操作比没有变异更坏 ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            # 新锚点落在**判定函数内部**(语义更贴近这条变异的名字)。
+            '    if node.attr == "executable":\n'
+            '        return _attribute_root_name(node) == "sys"\n',
+            '    if node.attr == "executable":\n'
+            '        return False  # (mutation: 不再认绑定出来的属性解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再认实参位置上的海象',
+        'tools/check_constitution_history.py',
+        (
+            '    if isinstance(node, ast.NamedExpr):\n'
+            '        # **实参位置上的海象**(第 55 轮之二十二,自审 M3):\n',
+            '    if False:  # (mutation: 不再认实参位置上的海象)\n'
+            '        # **实参位置上的海象**(第 55 轮之二十二,自审 M3):\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再把点号导入绑到根名',
+        'tools/check_constitution_history.py',
+        (
+            '                root = alias.name.split(".")[0]\n'
+            '                imports[alias.asname or root] = alias.name if alias.asname else root\n',
+            '                imports[alias.asname or alias.name.split(".")[0]] = alias.name  # (mutation: 不再把点号导入绑到根名)\n'),
+    ),
+
+    # ---- 第 55 轮之二十一:codex 第 2 轮 F1/F2/F3/F4/F5 ----
+    #
+    # 这一族钉的是**上一版判据自己的绕过路径**(codex 用探针实测复现过,
+    # 我本地也逐条复现过:全部漏判):
+    #   F1-1 海象赋值          F1-2 绑定出来的 `-c` / 解释器
+    #   F1-3 bytes 程序体      F1-4 `getattr` 混淆
+    #   F2-1 `getoutput`/`getstatusoutput`   F2-2 `run = subprocess.run` 别名
+    #   F4   读不了的文件必须出声「查不了」
+    #   F5   超时必须与「变异规格写错」分开
+    _mutation(
+        '字符串原语判据不再看海象赋值',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点加了上下文一行**(第 55 轮之二十二):本轮新增了
+            # `_attribute_bindings` ⇒ 同一行 `elif isinstance(node, ast.NamedExpr):`
+            # 出现**两次** ⇒ 命中 2 次 = 改的地方不唯一 ⇒ 锚点必须唯一。
+            '        elif isinstance(node, ast.NamedExpr):\n'
+            '            # **海象赋值**(第 55 轮之二十一,codex 第 2 轮 F1-1):\n',
+            '        elif False:  # (mutation: 不再看海象赋值)\n'
+            '            # **海象赋值**(第 55 轮之二十一,codex 第 2 轮 F1-1):\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再看绑定出来的 -c',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十三):本轮把「扫命令表」抽成了
+            # `_programs_in_elements()` ⇒ 缩进变了 ⇒ 旧锚点命中 0 次
+            # ⇒ 变异变成**空操作** ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            # **第 55 轮之二十四再搬一次**:本轮把「`-c` 是不是 flag」的判断
+            # 改写成「先取候选、再看是不是 `-c` / 以 `-c` 开头」⇒ 旧锚点又不命中了
+            # ⇒ 再搬 ⇒ 锚到**新形态**上(规则本身没变)。
+            '            if text == "-c":\n                flag = True\n                break\n',
+            '            if False:  # (mutation: 不再看绑定出来的 -c)\n                flag = True\n                break\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再看绑定出来的解释器',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十二):本轮把那处**调用点**改成了
+            # `_looks_like_python_interpreter(e, bindings, attributes)`
+            # ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+            # ⇒ 空操作比没有变异更坏 ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            # 改锚到**函数内部**的绑定解析分支(语义更贴近这条变异的名字:
+            # 「绑定出来的解释器」认不出了)。
+            '        if bindings is not None and any(_is_python_interpreter_name(text)\n'
+            '                                        for text in bindings.get(node.id, ())):\n',
+            '        if False:  # (mutation: 不再看绑定出来的解释器)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再看 bytes 程序体',
+        'tools/check_constitution_history.py',
+        (
+            '    if isinstance(node, ast.Constant) and isinstance(node.value, bytes):\n',
+            '    if False:  # (mutation: 不再看 bytes 程序体)\n'),
+    ),
+    _mutation(
+        # **改名 + 重指见证**(第 55 轮之二十五,codex 第 2 轮 H2 之后):
+        # H2 把原语识别改成「**当 Python 解析** + **折叠**取值表达式」⇒
+        # **可解析**的程序体由 AST 那层接走了 ⇒ 原来的见证(`getattr(builtins, 'exec')`
+        # 那种**可解析**形态)在关掉正则之后**照样被报出来** ⇒ 这条变异**空转**
+        # (第 55 轮之二十五的纪律脚手架实测抓到:「见证没红」)。
+        # ⇒ **规则还在 ⇒ 不删变异** ⇒
+        #   ① 这条变异现在专门盯**正则兜底那一层**(程序体**解析不了**时的那一层);
+        #   ② 见证改成那条**专属**探针(`..._in_a_program_body_it_cannot_parse`);
+        #   ③ 名字改成**与实际效果一致**的说法(旧名字「不再看 getattr 混淆」
+        #      在 H2 之后**已经不准**:AST 那层仍看)。
+        # (AST 那层另有专属变异:「让宪法层不再认折叠后才露出来的原语名」。)
+        '字符串原语判据不再用正则兜底那层认混淆原语',
+        'tools/check_constitution_history.py',
+        (
+            '    for match in _STRING_PROGRAM_OBFUSCATED.finditer(program):\n'
+            '        found.add(match.group(1))\n',
+            '    # (mutation: 不再用正则兜底那层认混淆原语)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再扫 getoutput/getstatusoutput',
+        'tools/check_constitution_history.py',
+        (
+            '    "os.system", "os.popen",\n'
+            '    "subprocess.getoutput", "subprocess.getstatusoutput",\n',
+            '    "os.system", "os.popen",\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再解析调用别名',
+        'tools/check_constitution_history.py',
+        (
+            # **锚点搬了**(第 55 轮之二十三):本轮把「入口全名怎么解析」抽成了
+            # `_entry_full_name()` ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+            # ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            '        full = imports.get(func.id) or aliases.get(func.id)\n',
+            '        full = imports.get(func.id)  # (mutation: 不再解析调用别名)\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再对读不了的文件出声',
+        'tools/check_constitution_history.py',
+        (
+            '        except (UnicodeDecodeError, SyntaxError) as exc:\n'
+            '            # **查不了必须出声**(第 55 轮之二十一,codex 第 2 轮 F4):\n'
+            '            # 上一版直接 `continue` ⇒ 一个语法错误的文件能让整条判据\n'
+            '            # 对它「报干净」⇒ 那不是「没问题」,是「没看」。\n'
+            '            problems.append(\n'
+            '                f"{rel} **查不了**({type(exc).__name__})⇒ "\n'
+            '                "「查不了」不等于「干净」⇒ 必须先把它修好,再谈这条判据的结论")\n'
+            '            continue\n',
+            '        except (UnicodeDecodeError, SyntaxError):\n'
+            '            # (mutation: 不再对读不了的文件出声)\n'
+            '            continue\n'),
+    ),
+    _mutation(
+        '字符串原语判据不再报出已登记文件里的 exec',
+        'tools/check_constitution_history.py',
+        (
+            '            if has_exec:\n'
+            '                problems.append(\n'
+            '                    f"{rel} 第 {lineno} 行把 `exec`/`eval` 藏在**字符串程序**里"\n',
+            '            if has_exec and rel not in _STRING_COMPILE_ALLOWLIST:  # (mutation: 已登记的文件可以藏 exec)\n'
+            '                problems.append(\n'
+            '                    f"{rel} 第 {lineno} 行把 `exec`/`eval` 藏在**字符串程序**里"\n'),
+    ),
+    _mutation(
+        '脚手架不再把超时当成环境不可用',
+        'tools/check_mutations.py',
+        (
+            # **锚点搬了**(第 55 轮之二十二):超时改用**带外**的哨兵退出码
+            # ⇒ 旧锚点命中 0 次 ⇒ 变异变成**空操作**
+            # ⇒ 空操作比没有变异更坏 ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+            '    if returncode == TIMEOUT_RETURNCODE:\n'
+            '        return "env_unavailable"\n',
+            '    if returncode == TIMEOUT_RETURNCODE:\n'
+            '        return "spec_broken"  # (mutation: 不再把超时当成环境不可用)\n'),
+    ),
+    _mutation(
+        '脚手架把收集阶段的失败误诊成环境不可用',
+        'tools/check_mutations.py',
+        (
+            '    if returncode not in (0, 1):\n'
+            '        return "spec_broken"\n',
+            '    if returncode not in (0, 1):\n'
+            '        return "env_unavailable"  # (mutation: 把收集阶段的失败误诊成环境不可用)\n'),
+    ),
+
+    # ---- 第 55 轮之二十四:claude CLI 第 1 轮复核(G8 第 1 轮)的逐条钉死 ----
+    #
+    # 这一族钉的是**本轮修的那批洞**。每一条都是**先复现、再修、再钉**:
+    # 复现脚本在 %TEMP%(不进仓库):`r277_replicate_round24.py`。
+    #
+    # **分类**(按 claude 第 1 轮点名的族整理):
+    #   ① 解释器名的口径(`.exe` / `pythonw`)—— 现在**只有一份实现**
+    #      (`tools/check_ci_wiring.py::is_python_interpreter_name`);
+    #   ② 入口识别(模块别名 / asyncio 的 `cmd=` 关键字);
+    #   ③ 程序体的通道(标准输入 / 字符串拼接 / f-string / 粘在一起的 `-c` / heredoc);
+    #   ④ 误报面(带点号的 `compile`);
+    #   ⑤ 守卫自身的失声(共享实现拿不到 ⇒ 必须出声;登记表列数不对 ⇒ 必须报);
+    #   ⑥ 脚手架自身的失声(退出码 2 要分两种;基线的诊断要认「环境不可用」;
+    #      基线组要有**第四份**:字符串程序那套)。
+    _mutation(
+        '解释器名不再剥掉 .exe 后缀',
+        'tools/check_ci_wiring.py',
+        (
+            # Windows 上 `python.exe` / `pythonw.exe` 是**最常见**的写法 ⇒
+            # 不剥 `.exe` ⇒ 实测漏判(第 55 轮之二十三那次收紧造成的**回归**)。
+            '    if base.endswith(".exe"):\n        base = base[:-4]\n',
+            '    if base.endswith(".exe"):\n'
+            '        pass  # (mutation: 不再剥掉 .exe 后缀)\n'),
+    ),
+    _mutation(
+        '解释器名不再认 pythonw',
+        'tools/check_ci_wiring.py',
+        (
+            '_PYTHON_RE = re.compile(r"^(?:python(?:\\d+(?:\\.\\d+)*)?|py|pythonw)$")',
+            '_PYTHON_RE = re.compile(r"^(?:python(?:\\d+(?:\\.\\d+)*)?|py)$")'),
+    ),
+    _mutation(
+        '入口识别不再认模块别名',
+        'tools/check_constitution_history.py',
+        (
+            '        module = (imports.get(receiver.id)\n'
+            '                  or aliases.get(receiver.id)\n'
+            '                  or receiver.id)\n',
+            '        module = (imports.get(receiver.id)\n'
+            '                  or receiver.id)  # (mutation: 不再认模块别名)\n'),
+    ),
+    _mutation(
+        '入口识别不再认 asyncio 的 cmd= 关键字',
+        'tools/check_constitution_history.py',
+        (
+            '    "asyncio.create_subprocess_shell": "cmd",\n',
+            '    # (mutation: 不再认 asyncio 的 cmd= 关键字)\n'),
+    ),
+    _mutation(
+        '程序体通道不再认标准输入',
+        'tools/check_constitution_history.py',
+        (
+            '                programs.extend(\n'
+            '                    _programs_in_stdin(node, elements, bindings, attributes))\n',
+            '                programs.extend([])  # (mutation: 不再认标准输入)\n'),
+    ),
+    _mutation(
+        '程序体通道不再认字符串拼接',
+        # **锚点搬了**(第 55 轮之二十五,codex 第 2 轮 H2):新增的
+        # `_folded_string()` 里**也**有一处同形的 `BinOp + Add`
+        # ⇒ 原来那条单行锚点**命中 2 次** ⇒ 变异规格**漂移**
+        # ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**
+        # ⇒ 锚到 `_strings_of()` 里**带注释**的那一处(唯一)。
+        'tools/check_constitution_history.py',
+        (
+            '    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):\n'
+            '        # **字符串拼接**(第 55 轮之二十四,claude 第 1 轮复核):\n',
+            '    if False and isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):\n'
+            '        # **字符串拼接**(第 55 轮之二十四,claude 第 1 轮复核):\n'),
+    ),
+    _mutation(
+        '程序体通道不再认 f-string',
+        'tools/check_constitution_history.py',
+        (
+            '    if isinstance(node, ast.JoinedStr):\n'
+            '        # **f-string 要先于 `_static_string`**(第 55 轮之二十四):\n',
+            '    if False and isinstance(node, ast.JoinedStr):  # (mutation: 不再认 f-string)\n'
+            '        # **f-string 要先于 `_static_string`**(第 55 轮之二十四):\n'),
+    ),
+    _mutation(
+        '程序体通道不再认粘在一起的 -c',
+        'tools/check_constitution_history.py',
+        (
+            '            if text.startswith("-c") and len(text) > 2:\n',
+            '            if False and text.startswith("-c") and len(text) > 2:\n'),
+    ),
+    _mutation(
+        '程序体通道不再认 heredoc',
+        # **锚点搬了**(第 55 轮之二十五,codex 第 2 轮 L1):本地那份
+        # `_SHELL_PYTHON_RE` 已删(口径只有一份)⇒ 锚到**共享实现**那份
+        # ⇒ **规则还在 ⇒ 搬锚点**,**不删这条变异**。
+        'tools/check_constitution_history.py',
+        (
+            '    if _shell_has_python_interpreter(text):\n'
+            '        return _shell_heredoc_bodies(text)\n',
+            '    if False and _shell_has_python_interpreter(text):\n'
+            '        return []  # (mutation: 不再认 heredoc)\n'),
+    ),
+    _mutation(
+        '字符串程序判据不再排除带点号的 compile',
+        'tools/check_constitution_history.py',
+        (
+            '    if re.search(r"(?<![.\\w])%s\\s*\\(" % _STRING_PROGRAM_COMPILE_PRIMITIVE, program):\n',
+            '    if re.search(r"\\b%s\\s*\\(" % _STRING_PROGRAM_COMPILE_PRIMITIVE, program):\n'),
+    ),
+    _mutation(
+        '共享实现拿不到时不再出声',
+        'tools/check_constitution_history.py',
+        (
+            '    if _shared_python_names() is None:\n',
+            '    if False and _shared_python_names() is None:  # (mutation: 不再出声)\n'),
+    ),
+    _mutation(
+        'ADR 登记表列数不对不再被报出来',
+        'tools/check_constitution_history.py',
+        (
+            '        if len(cells) != 3:\n',
+            '        if False and len(cells) != 3:  # (mutation: 不再报列数不对)\n'),
+    ),
+    _mutation(
+        '退出码 2 不再按输出文本分开',
+        'tools/check_mutations.py',
+        (
+            '        if "KeyboardInterrupt" in output:\n'
+            '            return "env_unavailable"\n',
+            '        if False and "KeyboardInterrupt" in output:  # (mutation: 不再分开)\n'
+            '            return "env_unavailable"\n'),
+    ),
+    _mutation(
+        '基线的诊断不再认环境不可用',
+        'tools/check_mutations.py',
+        (
+            '    if outcome == "env_unavailable":\n'
+            '        return ("pytest 退出码 %s ⇒ **环境不可用**(超时或被打断),"\n',
+            '    if False and outcome == "env_unavailable":  # (mutation: 不再认环境不可用)\n'
+            '        return ("pytest 退出码 %s ⇒ **环境不可用**(超时或被打断),"\n'),
+    ),
+    _mutation(
+        '基线组少了字符串程序那套',
+        'tools/check_guard_mutations.py',
+        (
+            'BASELINE_GROUPS = ((BOUNDARY,), (TOOL_TEST,), (WIRING,), (STRING_PROGRAMS,))\n',
+            'BASELINE_GROUPS = ((BOUNDARY,), (TOOL_TEST,), (WIRING,))\n'),
+    ),
+    # **反向对照:第四份基线组必须真的被用到**(第 55 轮之二十四):
+    # 这条**无害改动**(只改一个注释)跑的是**字符串程序那套** ⇒ 它的绿对照
+    # 要比的是**基线里那份** ⇒ 若基线组里没有它 ⇒ 基准读不出来(None)
+    # ⇒ 绿对照判据**读不出基准** ⇒ 脚手架会把这张**无害改动**判成
+    # 「没保持绿」⇒ **基线组少了谁,脚手架自己会叫**。
+    # ⇒ 基线组不是摆设,是**有载荷**的。
+    _mutation(
+        '只改宪法层里的一个注释(字符串程序那套照样全绿)',
+        'tools/check_constitution_history.py',
+        (
+            '    **口径(避免误报)**:\n',
+            '    **口径(避免误报;无害改动)**:\n'),
+        targets=[STRING_PROGRAMS],
+        expect="green",
+    ),
+    # ---- 第 55 轮之二十五(codex 第 2 轮 38/50 的 must-fix):六条族 ----
+    #
+    # 这一族把 codex 第 2 轮指出的每一个洞都钉一条红变异。
+    # 见证用例逐条对应(见 WITNESSES),**一条变异一条见证**。
+    #
+    # **纪律不变**:每条变异都必须先在**未变异的副本**上见证是绿的
+    # (基线组里那几份跑一遍),变异的唯一效果就是让那一条见证变红。
+    _mutation(
+        # H1:元组/列表解包里的绑定(解释器与程序体**一起**被绑走)。
+        "让宪法层不再认元组解包里的绑定",
+        "tools/check_constitution_history.py",
+        ("            elif isinstance(target, (ast.Tuple, ast.List)):\n",
+         "            elif False and isinstance(target, (ast.Tuple, ast.List)):\n"),
+    ),
+    _mutation(
+        # H2:原语名被藏起来(拼接 / 下标 / 单元素元组 / getattr 导入结果)。
+        "让宪法层不再认折叠后才露出来的原语名",
+        "tools/check_constitution_history.py",
+        ("    found |= _program_primitives_by_ast(program)\n",
+         "    found |= set()  # (removed by mutation)\n"),
+    ),
+    _mutation(
+        # M1:未闭合的 heredoc(shell 会给个 warning 但**照样执行**)。
+        "让宪法层不再扫未闭合的 heredoc",
+        "tools/check_constitution_history.py",
+        ("        body: list[str] = []\n"
+         "        for line in text[match.end():].splitlines():\n"
+         "            if line.strip() == marker:\n"
+         "                break\n"
+         "            body.append(line)\n"
+         "        if body:\n"
+         "            bodies.append(\"\\n\".join(body))\n",
+         "        body: list[str] = []\n"
+         "        closed = False\n"
+         "        for line in text[match.end():].splitlines():\n"
+         "            if line.strip() == marker:\n"
+         "                closed = True\n"
+         "                break\n"
+         "            body.append(line)\n"
+         "        if body and closed:\n"
+         "            bodies.append(\"\\n\".join(body))\n"),
+    ),
+    _mutation(
+        # M2:「查不了」被当成「干净」(读不了的文件被静悄悄跳过)。
+        "让宪法层把读不了的文件当成干净",
+        "tools/check_constitution_history.py",
+        ("            # **查不了必须出声**(第 55 轮之二十五,codex 第 2 轮 M2):\n"
+         "            # 上一版直接 `continue` ⇒ 一个**读不了**的文件(坏编码 / 语法错误)\n"
+         "            # 能让「执行入口完备性」对它**报干净** ⇒ 那不是「没问题」,是「没看」。\n"
+         "            # ⇒ 与 `check_string_program_primitives` **同一口径**(第 55 轮之二十一\n"
+         "            # codex 第 2 轮 F4 已经为那条判据定过这条规矩)。\n"
+         "            problems.append(\n"
+         "                f\"{rel} **查不了**({type(exc).__name__})⇒ \"\n"
+         "                \"「查不了」不等于「干净」⇒ 必须先把它修好,再谈这条判据的结论\")\n"
+         "            continue\n",
+         "            # **查不了必须出声**(第 55 轮之二十五,codex 第 2 轮 M2):\n"
+         "            # 上一版直接 `continue` ⇒ 一个**读不了**的文件(坏编码 / 语法错误)\n"
+         "            # 能让「执行入口完备性」对它**报干净** ⇒ 那不是「没问题」,是「没看」。\n"
+         "            # ⇒ 与 `check_string_program_primitives` **同一口径**(第 55 轮之二十一\n"
+         "            # codex 第 2 轮 F4 已经为那条判据定过这条规矩)。\n"
+         "            continue  # (removed by mutation: 查不了就当干净)\n"),
+    ),
+    _mutation(
+        # L1:shell 解释器名**只认一份实现**(本地又写了一份正则 ⇒ 口径漂移)。
+        "让 shell 解释器名回到本地那份正则",
+        "tools/check_constitution_history.py",
+        ("        if token and module.is_python_interpreter_name(token):\n",
+         "        if token and (module.is_python_interpreter_name(token)\n"
+         "                     or token.startswith(\"python\")):\n"),
+    ),
+    _mutation(
+        # M3:收菜的静态复检**比批准路径窄**(宪法层筛查不含沙盒层的那些判据)。
+        "让收菜退回宪法层那份筛查",
+        "scripts/research_collect.py",
+        [("import research_config as rc\nimport research_sandbox as rs\n",
+          "import research_config as rc\nimport research_sandbox as rs\n"
+          "from risk import constitution as const\n"),
+         ("    findings = rs.screen_source(\n"
+          "        raw.decode(\"utf-8\", errors=\"replace\"),\n"
+          "        cfg[\"screening\"][\"extra_forbidden_modules\"],\n"
+          "        cfg[\"screening\"][\"extra_forbidden_calls\"],\n"
+          "        cfg[\"screening\"][\"allowed_modules\"])\n",
+          "    findings = const.screen_source(raw.decode(\"utf-8\", errors=\"replace\"))\n")],
+    ),
+    _mutation(
+        # M4:分档器自己成了**执行面**(git status 会应用 filter ⇒ 候选写一条命令就执行)。
+        "让分档器不再中和 git 的 filter 命令",
+        "tools/check_domain.py",
+        ("    for name in _repo_filter_names():\n",
+         "    for name in ():  # (removed by mutation: 不再中和 filter)\n"),
+    ),
+    _mutation(
+        # L3:批准账本落盘**没有 flush + fsync**(与试验账本那侧口径不一致)。
+        "让批准账本落盘不再 fsync",
+        "risk/ledger_admin.py",
+        ("        stream.write(json.dumps({r[\"sha\"]: r for r in rows}, ensure_ascii=False,\n"
+         "                                indent=2, sort_keys=True))\n"
+         "        stream.flush()\n"
+         "        os.fsync(stream.fileno())\n",
+         "        stream.write(json.dumps({r[\"sha\"]: r for r in rows}, ensure_ascii=False,\n"
+         "                                indent=2, sort_keys=True))\n"
+         "        stream.flush()\n"),
+    ),
+    _mutation(
+        # L4:账本**读不了**时被当成「0 次试验」⇒「防变小」的基准归零。
+        "让读不了的账本被当成 0 次试验",
+        "risk/ledger_admin.py",
+        ("        raise AdminError(f\"账本无法读取,拒绝据此判断累计次数: {path.name}({exc})\") from exc\n",
+         "        return 0  # (removed by mutation: 读不了就当 0)\n"),
+    ),
 )
 
 
@@ -1739,6 +2504,25 @@ MUTATIONS = (
 # 钉死的好处:每条变异**只跑这一条**(而不是整份套件)⇒ CI 从 ~15 分钟降到 ~1 分钟;
 # 而且"红了"必须**指名道姓**,不能只是"红了几条"。
 WITNESSES: dict[str, str] = {
+    # ---- 第 55 轮之二十五(codex 第 2 轮 38/50 的 must-fix)----
+    "让宪法层不再认元组解包里的绑定":
+        "tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_behind_a_tuple_unpacking",
+    "让宪法层不再认折叠后才露出来的原语名":
+        "tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_behind_getattr_of_an_import",
+    "让宪法层不再扫未闭合的 heredoc":
+        "tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_in_an_unclosed_heredoc",
+    "让宪法层把读不了的文件当成干净":
+        "tests/test_constitution_string_programs.py::test_the_executor_check_says_when_a_file_cannot_be_read",
+    "让 shell 解释器名回到本地那份正则":
+        "tests/test_constitution_string_programs.py::test_the_shell_interpreter_check_follows_the_shared_implementation",
+    "让收菜退回宪法层那份筛查":
+        "tests/test_research_collect.py::test_collect_refuses_a_candidate_the_sandbox_screen_would_reject",
+    "让分档器不再中和 git 的 filter 命令":
+        "tests/test_check_domain.py::test_the_classifier_does_not_let_git_run_a_filter_command",
+    "让批准账本落盘不再 fsync":
+        "tests/test_fs_capability_closure.py::test_the_approval_ledger_write_flushes_and_fsyncs",
+    "让读不了的账本被当成 0 次试验":
+        "tests/test_fs_capability_closure.py::test_the_claimed_total_refuses_to_call_an_unreadable_ledger_empty",
     # ---- 第 55 轮之十 ----
     "让接线自检查不到模块形态的受保护脚本(它就不再要求 --verify 了)":
         "tests/test_ci_wiring.py::test_the_checker_reports_a_protected_script_in_module_form_without_verify",
@@ -2092,8 +2876,223 @@ WITNESSES: dict[str, str] = {
         "tests/test_check_guard_mutations.py::test_the_domain_harness_writes_bytecode_even_when_the_environment_forbids_it",
     "纪律守卫不再摘掉 PYTHONDONTWRITEBYTECODE":
         "tests/test_check_guard_mutations.py::test_the_discipline_harness_writes_bytecode_even_when_the_environment_forbids_it",
-
+    # ---- 第 55 轮之二十(codex 第 2 轮 M1 / M2 / L1 / L2 / L3 / L4)----
+    '分档守卫不再摘掉 PYTHONPYCACHEPREFIX':
+        'tests/test_check_guard_mutations.py::test_the_domain_harness_neutralises_a_bytecode_cache_prefix',
+    '纪律守卫不再摘掉 PYTHONPYCACHEPREFIX':
+        'tests/test_check_guard_mutations.py::test_the_discipline_harness_neutralises_a_bytecode_cache_prefix',
+    '宪法层不再扫字符串里藏的执行原语':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_in_a_string_program',
+    '宪法层不再把字符串原语检查挂进总检查':
+        'tests/test_constitution_string_programs.py::test_the_constitution_check_all_calls_the_string_program_check',
+    '诊断不再把读不了的字节码缓存说出来':
+        'tests/test_check_guard_mutations.py::test_the_probe_says_it_cannot_tell_when_the_cache_file_is_unreadable',
+    '指纹不再比对 co_names':
+        'tests/test_check_guard_mutations.py::test_the_fingerprint_notices_an_equal_length_rename',
+    '诊断结论不再引用整份套件的失败集合':
+        'tests/test_check_guard_mutations.py::test_the_diagnosis_reports_a_witness_topped_by_another_failure',
+    '见证共用不再检查规则声明':
+        'tests/test_check_guard_mutations.py::test_the_witness_group_check_catches_a_mixed_rule_declaration',
+    # ---- 第 55 轮之二十之补(G8 第 1 轮实测出来的洞)----
+    '字符串原语判据不再看解释器与 -c 之间的 flag':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_behind_an_interpreter_flag',
+    '字符串原语判据不再看 shell=True 的整条命令':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_in_a_shell_command',
+    '字符串原语判据不再合并同名变量的多个取值':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_in_a_name_bound_in_two_places',
+    '字符串原语豁免表不再与 ADR 登记核对':
+        'tests/test_constitution_string_programs.py::test_the_constitution_check_all_calls_the_registry_check',
+    '字符串原语判据不再看海象赋值':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_bound_by_a_walrus',
+    '字符串原语判据不再看绑定出来的 -c':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_with_a_bound_dash_c',
+    '字符串原语判据不再看绑定出来的解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_with_a_bound_interpreter',
+    '字符串原语判据不再看 bytes 程序体':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_in_a_bytes_program',
+    '字符串原语判据不再用正则兜底那层认混淆原语':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_in_a_program_body_it_cannot_parse',
+    '字符串原语判据不再扫 getoutput/getstatusoutput':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_passed_to_getoutput',
+    '字符串原语判据不再解析调用别名':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_passed_through_an_alias',
+    '字符串原语判据不再对读不了的文件出声':
+        'tests/test_constitution_string_programs.py::test_the_guard_says_when_a_python_file_cannot_be_parsed',
+    '字符串原语判据不再报出已登记文件里的 exec':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_exec_even_for_a_registered_file',
+    # ---- 第 55 轮之二十二:G8 第 1 轮**自审实测**出来的四条漏判 ----
+    '字符串原语判据不再认命令的关键字参数':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_command_list_is_a_keyword_argument',
+    '字符串原语判据不再认绑定出来的属性解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_interpreter_is_bound_to_an_attribute',
+    '字符串原语判据不再认实参位置上的海象':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_program_is_an_inline_walrus',
+    '字符串原语判据不再把点号导入绑到根名':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_after_importing_a_dotted_module',
+    '脚手架不再把超时当成环境不可用':
+        'tests/test_check_guard_mutations.py::test_the_harness_tells_a_timeout_apart_from_a_broken_spec',
+    '脚手架把收集阶段的失败误诊成环境不可用':
+        'tests/test_check_domain.py::test_run_outcome_separates_a_broken_spec_from_a_caught_mutation',
+    # ---- 第 55 轮之二十三:G8 第 2 轮(codex CLI,39/50)的逐条处置 ----
+    '字符串原语判据不再认绑定到变量的命令列表':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_command_list_is_bound_to_a_variable',
+    '字符串原语判据不再认星号导入之后的入口':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_after_a_star_import',
+    '字符串原语判据不再认 os.execv 族':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_in_an_os_execv_call',
+    '字符串原语判据不再认 asyncio 的变参入口':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_in_an_asyncio_subprocess',
+    '字符串原语判据不再认 getattr 取到的入口':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_entry_is_taken_by_getattr',
+    '字符串原语判据不再顺绑定链解解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_interpreter_is_bound_through_another_name',
+    '字符串原语判据不再认 bytes 解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_in_a_bytes_program_with_a_bytes_interpreter',
+    '字符串原语判据不再认 executable= 关键字里的解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_interpreter_is_the_executable_keyword',
+    '字符串原语判据不再认星号实参里的命令列表':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_command_list_is_starred',
+    '字符串原语判据不再认字典展开的命令列表':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_command_list_is_unpacked_from_a_dict',
+    '字符串原语判据不再顺字符串绑定链解解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_interpreter_is_bound_through_a_string',
+    '字符串原语判据不再限死解释器名':
+        'tests/test_constitution_string_programs.py::test_the_guard_does_not_treat_a_name_that_only_starts_with_python_as_an_interpreter',
+    '字符串原语判据不再限死 executable 属性':
+        'tests/test_constitution_string_programs.py::test_the_guard_does_not_treat_an_arbitrary_executable_attribute_as_an_interpreter',
+    '字符串原语判据不再要求 shell 命令里有 python 解释器':
+        'tests/test_constitution_string_programs.py::test_the_guard_does_not_treat_a_shell_command_that_merely_mentions_eval_as_a_program',
+    '脚手架不再把被信号杀死的 pytest 说成规格写错':
+        'tests/test_check_guard_mutations.py::test_the_harness_tells_a_timeout_apart_from_a_broken_spec',
+    # ---- 第 55 轮之二十四:claude CLI 第 1 轮复核(G8 第 1 轮)的逐条钉死 ----
+    '解释器名不再剥掉 .exe 后缀':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_behind_a_python_dot_exe_interpreter',
+    '解释器名不再认 pythonw':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_behind_a_pythonw_interpreter',
+    '入口识别不再认模块别名':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_behind_a_module_alias',
+    '入口识别不再认 asyncio 的 cmd= 关键字':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_behind_the_asyncio_shell_keyword',
+    '程序体通道不再认标准输入':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_passed_through_stdin',
+    '程序体通道不再认字符串拼接':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_flag_is_built_by_concatenation',
+    '程序体通道不再认 f-string':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_flag_is_built_by_an_f_string',
+    '程序体通道不再认粘在一起的 -c':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_when_the_flag_is_attached_to_the_program',
+    '程序体通道不再认 heredoc':
+        'tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_in_a_heredoc',
+    '字符串程序判据不再排除带点号的 compile':
+        'tests/test_constitution_string_programs.py::test_the_guard_does_not_treat_a_dotted_compile_as_the_builtin_primitive',
+    '共享实现拿不到时不再出声':
+        'tests/test_constitution_string_programs.py::test_the_guard_says_when_the_shared_interpreter_name_implementation_is_missing',
+    'ADR 登记表列数不对不再被报出来':
+        'tests/test_constitution_string_programs.py::test_the_registry_check_reports_a_row_with_the_wrong_number_of_columns',
+    '退出码 2 不再按输出文本分开':
+        'tests/test_check_domain.py::test_run_outcome_splits_exit_code_two_by_its_output',
+    '基线的诊断不再认环境不可用':
+        'tests/test_check_guard_mutations.py::test_the_baseline_diagnosis_tells_a_hang_apart_from_a_failure',
+    '基线组少了字符串程序那套':
+        'tests/test_check_guard_mutations.py::test_the_baseline_covers_every_suite_that_hosts_a_witness',
 }
+
+
+# 共用见证的变异必须**声明所属规则**(第 55 轮之二十,codex 第 2 轮 L3)。
+#
+# **为什么要有这张表**:旧注释宣称「一条变异一条见证(共用 ⇒ 走错原因的红也算数)」,
+# 而实测是 159 条红变异只有 132 个唯一见证 ⇒ **现状与宣称互相打脸**。
+# 现状(按规则家族共用见证)可以保留——同族变形看红仍可归因——
+# 但必须有**机器判定**:共用一个见证的变异必须声明**同一个规则**,
+# 否则哪天有人把**不同规则**的变异塞进同一见证组,「走错原因的红」就会
+# **静悄悄**发生(脚手架照样说「抓住了」)。
+#
+# **口径**:只有**共用**见证的变异才需要声明(一条变异一条见证的,没有共用风险)。
+# 声明写成这张表而不是改 170 个调用点 ⇒ 改动面小、可读、机器可核对。
+WITNESS_RULES: dict[str, str] = {
+    "脚手架不再把超时当成环境不可用": "退出码分类:超时/被信号杀死/规格写错必须分得开",
+    "脚手架不再把被信号杀死的 pytest 说成规格写错": "退出码分类:超时/被信号杀死/规格写错必须分得开",
+    "删掉整个闸门步骤(名单里的套件从此没人跑,而守卫自己也在那一步里)": "CI 闸门步骤的规范形",
+    "在核心防线套件顶部加一行模块级 pytestmark 一刀切跳过": "核心防线套件不许被整份跳过",
+    "在闸门命令之前加 set +e": "CI 闸门步骤的规范形",
+    "在闸门命令之后加 exit 0(强制判成功)": "CI 闸门步骤的规范形",
+    "在闸门命令后面接一个恒真后缀(判红也不算失败)": "CI 闸门步骤的规范形",
+    "把『没被包住』的判定反过来": "交易栈标记必须名实相符",
+    "把一份守卫套件从 CI 名单里改名": "守卫视野与 CI 名单必须一致",
+    "把报告写进仓库里(而不是 $RUNNER_TEMP)": "CI 闸门步骤的规范形",
+    "把模块级 pytestmark 包在 if 里(顶层扫描的老洞)": "核心防线套件不许被整份跳过",
+    "把登记过的平台跳过改成 skipif(1)": "条件跳过必须登记理由",
+    "把登记过的平台跳过改成 skipif(condition=True)": "条件跳过必须登记理由",
+    "把登记过的平台跳过改成无条件跳过(skipif(True))": "条件跳过必须登记理由",
+    "把闸门命令换成直接跑 pytest(绕开闸门)": "CI 闸门步骤的规范形",
+    "把闸门命令藏进 bash -c(第 55 轮实测:旧守卫全部真空绿)": "CI 闸门步骤的规范形",
+    "把闸门命令藏进 eval": "CI 闸门步骤的规范形",
+    "把闸门命令藏进 shell 函数": "CI 闸门步骤的规范形",
+    "把闸门命令藏进命令替换 $()": "CI 闸门步骤的规范形",
+    "用别名写法给一条没登记的用例加 skipif": "条件跳过必须登记理由",
+    "用版本化解释器直接跑 pytest(绕开闸门)": "CI 闸门步骤的规范形",
+    "用运行器直接跑 pytest(绕开闸门)": "CI 闸门步骤的规范形",
+    "给 pull_request 触发器加 paths: 过滤(闸门压根不会跑)": "CI 闸门步骤的规范形",
+    "给一条『期待入口拒绝候选』的用例加上 @requires_trading_stack": "交易栈标记必须名实相符",
+    "给一条不依赖交易栈的用例加上 @requires_trading_stack": "交易栈标记必须名实相符",
+    "给一条没登记的用例加条件 skipif": "条件跳过必须登记理由",
+    "给一条用例加裸 pytest.mark.skip": "条件跳过必须登记理由",
+    "给整个 job 加 if: false(这一步压根不跑)": "CI 闸门步骤的规范形",
+    "给闸门步骤加 continue-on-error: true(红了也不算数)": "CI 闸门步骤的规范形",
+    "给闸门步骤加 if: 空串(整步可以被跳过)": "CI 闸门步骤的规范形",
+    "给闸门步骤加 shell: bash(没有 errexit,闸门判红也不算数)": "CI 闸门步骤的规范形",
+    "让『被包住』的判定不认 contextlib.suppress": "吞异常的写法都要被看见",
+    "让『被包住』的判定不认 except* 语法": "吞异常的写法都要被看见",
+    "让『被包住』的判定不认裸名 raises": "吞异常的写法都要被看见",
+    "让守卫的视野退回只剩两份核心套件": "守卫视野与 CI 名单必须一致",
+}
+
+def witness_group_problems() -> list[str]:
+    """共用同一个见证的变异必须声明**同一个规则**(codex 第 2 轮 L3)。
+
+    **为什么要有这条**:旧注释宣称「一条变异一条见证(共用 ⇒ 走错原因的红也算数)」,
+    而实测是 159 条红变异只有 **132** 个唯一见证(33 条共用 6 个)⇒
+    **现状与宣称互相打脸**。现状(按规则家族共用见证)可以保留——同族变形看红
+    仍可归因——但必须有**机器判定**,否则哪天有人把**不同规则**的变异塞进同一
+    见证组,「走错原因的红」就会**静悄悄**发生(脚手架照样说「抓住了」)。
+
+    **判据**:共用一个见证 ⇒ 每条变异都要在 `WITNESS_RULES` 里声明所属规则,
+    且同组的规则 id 必须**相同**。
+    (声明只对**共用**的变异required —— 一条变异一条见证的没有共用风险。)
+
+    **为什么不是「同目标文件」**:实测有两组规则**天然跨文件**
+    (「守卫视野 ↔ CI 名单」与「交易栈标记 ↔ 实际依赖」都是**两份文件**之间的
+    一致性)⇒ 用文件当判据会把**正确的**共用误报成问题。
+    """
+    by_witness: dict[str, list[dict]] = {}
+    for spec in MUTATIONS:
+        witness = WITNESSES.get(spec["label"])
+        if witness is None:
+            continue              # 「没钉见证」由 `main()` 单独报(退出码 2)
+        by_witness.setdefault(witness, []).append(spec)
+    problems: list[str] = []
+    for witness, specs in sorted(by_witness.items()):
+        if len(specs) < 2:
+            continue              # 一条变异一条见证 ⇒ 没有共用风险
+        rules: dict[str, str] = {}
+        for spec in specs:
+            label = spec["label"]
+            rule = WITNESS_RULES.get(label)
+            if rule is None:
+                problems.append(
+                    "见证 %s 被 %d 条变异共用,但其中「%s」**没有声明所属规则**"
+                    "(在 `WITNESS_RULES` 里补上)⇒ 共用的边界没人守 ⇒ "
+                    "「走错原因的红」会静悄悄发生" % (witness, len(specs), label))
+                continue
+            rules[label] = rule
+        distinct = sorted(set(rules.values()))
+        if len(distinct) > 1:
+            problems.append(
+                "见证 %s 被共用,但这些变异声明了**不同的规则**(%s)⇒ "
+                "「走错原因的红」会静悄悄发生(共用见证只许发生在同一族里)"
+                % (witness, "; ".join("%s → %s" % (label, rule)
+                                      for label, rule in sorted(rules.items()))))
+    return problems
 
 
 def _reconfigure_stdio() -> None:
@@ -2121,7 +3120,12 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
     与 `tools/check_mutations.py` 那套**同名不同义**——同一份 pytest 输出,
     两个脚手架可能给出**相反**的结论。现在**共用同一份实现**
     (`check_mutations.run_outcome`):退出码 0 且无失败 ⇒ ok;退出码 1 且**有** FAILED ⇒ ok;
-    退出码 1 却一条 FAILED 没有(收集阶段炸了)或退出码 ≥ 2 ⇒ spec_broken。
+    退出码 1 却一条 FAILED 没有(收集阶段炸了)或退出码 **2**(pytest 自己的
+    **收集阶段失败**)或退出码 ≥ 3 ⇒ spec_broken;
+    **哨兵退出码 `TIMEOUT_RETURNCODE` ⇒ env_unavailable**(第 55 轮之二十一,
+    codex 第 2 轮 F5:那是**超时** ⇒ 环境不可用,不是「变异规格写错」;
+    第 55 轮之二十二:超时**不用退出码 2** —— pytest 的收集阶段失败也是 2
+    ⇒ 用 2 会把「规格写错」误诊成「环境不可用」)。
     """
     env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
@@ -2130,16 +3134,42 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
     # ⇒ 拦截侧探针的「第一次跑会写出 `.pyc`」前提不成立 ⇒ 探针假红
     # ⇒ 把「环境配置」误报成「变异被吃」。这里**显式摘掉**它。
     env.pop("PYTHONDONTWRITEBYTECODE", None)
+    # 【第 55 轮之二十,codex 第 2 轮 M1】**也要摘掉 `PYTHONPYCACHEPREFIX`**:
+    # 这个变量让解释器把 `.pyc` **写到前缀目录**去 ⇒ 副本里压根没有 `__pycache__`
+    # ⇒ `_purge_bytecode_cache` 删 0 个**也不报错** ⇒「同秒 + 同大小」的变异
+    # 照样被陈旧字节码吃掉 ⇒ 脚手架会得出「守卫有洞」的错误结论
+    # (它要根治的故障换了个环境开关就原样回归)。同类处置:**显式摘掉 + 出声**。
+    if env.pop("PYTHONPYCACHEPREFIX", None) is not None:
+        print("[提醒] 环境里有 `PYTHONPYCACHEPREFIX` ⇒ 已摘掉:否则字节码缓存写到"
+              "副本外 ⇒ 清缓存清不到它 ⇒ 同秒 + 同大小的变异会被陈旧字节码吃掉",
+              file=sys.stderr)
     # 【第 55 轮之十四之四】**先清字节码缓存**再跑:
     # 否则「同秒 + 同大小」的变异会被**陈旧的 .pyc** 吃掉 ⇒ 变异空转
     # ⇒ 见证保持绿(假绿)。共享实现见 `check_mutations._purge_bytecode_cache`
     # (两个脚手架共用一份 ⇒ 不会只改一边)。
     _purge_bytecode_cache(cwd)
-    proc = subprocess.run(
-        [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider"],
-        capture_output=True, text=True, cwd=str(cwd), env=env,
-        encoding="utf-8", errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider"],
+            capture_output=True, text=True, cwd=str(cwd), env=env,
+            encoding="utf-8", errors="replace",
+            # 【第 55 轮之二十,codex 第 2 轮 I1】pytest 子进程也要有超时:
+            # 挂死的 pytest 会让脚手架**永久挂起**(不是失败,是不动了)。
+            # 超时按**环境不可用**(哨兵退出码 `TIMEOUT_RETURNCODE`)报,fail-loud。
+            timeout=PYTEST_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print("[FAIL] pytest 超过 %d 秒还没结束 ⇒ 环境不可用(挂死),变异验证无从谈起"
+              % PYTEST_TIMEOUT_SECONDS, file=sys.stderr)
+        return {
+            "failed": 0, "output": "pytest 超时(%d 秒)" % PYTEST_TIMEOUT_SECONDS,
+            # **哨兵退出码**(第 55 轮之二十二):不用 2 —— pytest 的「收集阶段失败」
+            # 也是 2 ⇒ 用 2 会把「规格写错」误诊成「环境不可用」。
+            "failed_nodes": [], "returncode": TIMEOUT_RETURNCODE, "passed": None,
+            # 【第 55 轮之二十一,codex 第 2 轮 F5】超时是**环境不可用**,
+            # 不是「变异规格写错」⇒ 这一类单独成类(共用 `run_outcome` 的口径)。
+            "outcome": "env_unavailable", "timeout": True,
+        }
     output = proc.stdout + proc.stderr
     failed = [line for line in proc.stdout.splitlines() if line.startswith("FAILED")]
     # **见证用例的 nodeid**:pytest 的短摘要行是 "FAILED tests/x.py::test_y - 原因",
@@ -2156,7 +3186,9 @@ def _run_tests(cwd: Path, targets: list[str]) -> dict:
         "returncode": proc.returncode,
         "passed": _passed_count(output),
         # **共用**分档那套脚手架的判定(第 52 轮):不再自己写一套关键词启发式。
-        "outcome": run_outcome(len(failed), proc.returncode),
+        "outcome": run_outcome(len(failed), proc.returncode, output),
+        # 【第 55 轮之二十】超时是**环境不可用**,与「变异把文件改炸了」要分开报。
+        "timeout": False,
     }
 
 
@@ -2232,8 +3264,19 @@ def _diagnose_no_red(repo: Path, path: Path, witness: str, res: dict) -> list[st
                    "**陈旧的 `.pyc` 把变异吃掉了**(变异空转,不是守卫有洞)"
                    % again["failed"])
     else:
-        out.append("**显式清掉字节码缓存后,同一条见证仍然没红** ⇒ 不是缓存的问题 ⇒ "
-                   "变异对**所有**用例都没影响(空转,或改到的不是被执行的那份代码)")
+        # 【第 55 轮之二十,codex 第 2 轮 L4】结论必须**引用证据**(整份套件的失败集),
+        # 不能无条件说「对所有用例都没影响」——若**别的**用例红了而唯独见证没红,
+        # 那个说法会与上一行打印的失败集合**直接矛盾**,还会把排障方向
+        # 从「守卫有洞 / 见证钉错」误导到「空转」。
+        other = whole.get("failed_nodes") or []
+        if other:
+            out.append("**显式清掉字节码缓存后,同一条见证仍然没红**,但整份套件里**有**别的用例红了"
+                       "(%s)⇒ 变异**确实有影响**,只是**见证没红** ⇒ "
+                       "见证被其他失败顶替(守卫有洞,或见证钉错了)" % ", ".join(other[:10]))
+        else:
+            out.append("**显式清掉字节码缓存后,同一条见证仍然没红**,且整份套件**一条都没红** ⇒ "
+                       "不是缓存的问题 ⇒ 变异对**所有**用例都没影响"
+                       "(空转,或改到的不是被执行的那份代码)")
     return out
 
 
@@ -2259,6 +3302,12 @@ def _fingerprint(code) -> tuple:
     用来判断「`.pyc` 里的代码是不是当前源文件编译出来的那一份」。
     **刻意不包含 `co_filename`**(同一份代码在不同路径下编译出来的
     `co_filename` 不同 ⇒ 会造成假的不一致)。
+
+    【第 55 轮之二十,codex 第 2 轮 L2】**补上 `co_names` 与 `co_varnames`**:
+    原先只比 `co_code` 与 `co_consts` ⇒ **等长改名**(`g` → `h`)时两者
+    **完全不变**(只变 `co_names`)⇒ Python 会复用旧 `.pyc`,而探针却报
+    「缓存是新的」⇒ **误判「旧→新」**。判据宣称「比内容分得出旧的与新的」,
+    那个宣称比实际比过的字段宽 ⇒ 这里把缺的字段补上。
     """
     consts = []
     for const in code.co_consts:
@@ -2266,7 +3315,7 @@ def _fingerprint(code) -> tuple:
             consts.append(_fingerprint(const))
         else:
             consts.append(_const_key(const))
-    return (code.co_code, tuple(consts))
+    return (code.co_code, tuple(consts), tuple(code.co_names), tuple(code.co_varnames))
 
 
 # 「把当前源文件编译成代码对象」这一步交给**一次性子解释器**做
@@ -2345,9 +3394,18 @@ def _probe_stale_pyc(repo: Path, src: Path) -> list[str]:
     for pyc in sorted(cache_dir.glob(src.stem + ".*.pyc")):
         try:
             raw = pyc.read_bytes()
-        except OSError:                            # noqa: BLE001 - 诊断不改变结论
+        except OSError as exc:                     # noqa: BLE001 - 诊断不改变结论
+            # 【第 55 轮之二十,codex 第 2 轮 L1】**读不了必须出声**:
+            # purge 侧早就修过「删不掉必须出声」,诊断侧却**静默跳过** ⇒
+            # 一份恰好是被复用的陈旧字节码(被锁/权限问题)⇒ 诊断**完全失明**
+            # ⇒ 还可能顺势说出「缓存是新的」这种**反向**结论。
+            # **查不了 ≠ 结论干净**(仓库教训:守卫不许无声失效)。
+            out.append("%s 读不了(%r)⇒ 这条缓存**查不了**"
+                       "(查不了 ≠ 结论干净:它可能正是被复用的陈旧字节码)" % (pyc.name, exc))
             continue
         if len(raw) < 16:
+            out.append("%s 只有 %d 字节(不足 16 字节的头)⇒ 头部畸形 ⇒ "
+                       "这条缓存**查不了**(查不了 ≠ 结论干净)" % (pyc.name, len(raw)))
             continue
         flags = int.from_bytes(raw[4:8], "little")
         if flags != 0:
@@ -2455,6 +3513,18 @@ def main(argv: list[str] | None = None) -> int:
             print("  - %s" % label, file=sys.stderr)
         return 2
 
+    # 【第 55 轮之二十,codex 第 2 轮 L3】共用见证**只许发生在同一族**里:
+    # 同组必须声明**同一个规则**(见 `WITNESS_RULES`)⇒ 混进别的规则
+    # ⇒ 在跑变异之前就报出来(fail-closed)。
+    # (判据**不是**「同目标文件」——实测会误报 2 组**正确的**跨文件共用;
+    #  理由见 ADR「第 55 轮之二十」第 1 节。)
+    group_problems = witness_group_problems()
+    if group_problems:
+        print("见证分组的自检没过:", file=sys.stderr)
+        for problem in group_problems:
+            print("  - %s" % problem, file=sys.stderr)
+        return 2
+
     tmp = Path(tempfile.mkdtemp(prefix="guard_mutations_"))
     repo = tmp / "repo"
     repo.mkdir(parents=True, exist_ok=True)
@@ -2465,7 +3535,7 @@ def main(argv: list[str] | None = None) -> int:
         # 见证用例在基线里就该绿——否则"红了"分不清是变异造成的还是本来就红
         # (第 49 轮 codex M4:绿对照要比**基线的通过数**,不只是"没红")。
         baselines: dict[tuple[str, ...], int] = {}
-        for targets in ((BOUNDARY,), (TOOL_TEST,), (WIRING,)):
+        for targets in BASELINE_GROUPS:
             res = _run_tests(repo, list(targets))
             # **基线必须全绿**:一条失败都不许有。
             #
@@ -2477,6 +3547,20 @@ def main(argv: list[str] | None = None) -> int:
             # 本轮第一次写这里时用了 `outcome != "ok"` ⇒ **红基线被当成了绿基线**,
             # 脚手架据此说「全绿」——**假绿**。它是被那条「无害改动必须保持绿」的
             # 反向对照逮住的(改完之后绿对照自己红了,才暴露出基线本来就是红的)。
+            # **基线也要认「环境不可用」**(第 55 轮之二十四,claude 第 1 轮复核 ⑤):
+            # 超时(哨兵退出码 `TIMEOUT_RETURNCODE`)/被打断 与「测试失败」是
+            # **三件不同的事** ⇒ 上一版一句「就有测试失败/收集错误」把它们
+            # **混成一句** ⇒ 挂死的 pytest 会被说成「测试失败」⇒ 诊断是错的。
+            # **基线的诊断只有一份实现**(第 55 轮之二十四):上面两段判定
+            # 此前在**两个**脚手架里各写一份 ⇒ 「基线挂死了」没有任何办法
+            # 被钉住 ⇒ 挂死会被说成「测试失败」⇒ **诊断是错的**。
+            # ⇒ 改用共享实现 `check_mutations.baseline_failure_reason`
+            # (那条口径由 `tests/test_check_guard_mutations.py` 里的用例钉住)。
+            reason = baseline_failure_reason(res["outcome"], res["returncode"])
+            if reason:
+                print("基线(未变异的副本):" + reason, file=sys.stderr)
+                print(res["output"][-2000:], file=sys.stderr)
+                return 2
             if res["failed"] or res["returncode"] != 0:
                 print("基线(未变异的副本)就有测试失败/收集错误,变异验证无从谈起:", file=sys.stderr)
                 print(res["output"][-2000:], file=sys.stderr)
@@ -2517,6 +3601,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 run_targets = list(spec["targets"])
             res = _run_tests(repo, run_targets)
+            # 【第 55 轮之二十,codex 第 2 轮 I1】**超时**是**环境不可用**,
+            # 与「变异把文件改到收集阶段就炸了」不是一回事 ⇒ 分开报(退出码 2)。
+            if res.get("timeout"):
+                path.write_bytes(orig)
+                print("  [跳过] %s:pytest 超时 ⇒ 环境不可用(挂死),不是「没被抓住」" % label,
+                      file=sys.stderr)
+                return 2
             # 【第 55 轮之十四之三】见证没红时,先把「变异到底生效了没有」查清楚
             # (诊断必须在**还原之前**做:还原了就看不到变异的效果了)。
             diag: list[str] = []
@@ -2524,6 +3615,14 @@ def main(argv: list[str] | None = None) -> int:
                 diag = _diagnose_no_red(repo, path, WITNESSES[label], res)
             path.write_bytes(orig)
 
+            # 【第 55 轮之二十一,codex 第 2 轮 F5】**环境不可用**(退出码 2)
+            # 与「变异规格写错」分开报 ⇒ 不再拿后者的话术误导。
+            if res["outcome"] == "env_unavailable":
+                path.write_bytes(orig)
+                print("  [跳过] %s:pytest 退出码 %d ⇒ **环境不可用**(超时或被中断)"
+                      "⇒ 变异验证无从谈起(这**不是**「变异规格写错了」)"
+                      % (label, res["returncode"]), file=sys.stderr)
+                return 2
             # **共用**分档那套的判定(第 52 轮 codex M1/L2):
             # spec_broken = 变异把文件改到收集阶段就炸了 ⇒ 变异规格写错了(不是守卫有洞)。
             if res["outcome"] == "spec_broken":
