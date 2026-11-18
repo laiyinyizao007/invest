@@ -90,6 +90,7 @@ jobs:
             tools/check_domain.py \
             tools/verdict_graph.py \
             tools/check_mutations.py \
+            tools/build_trading_calendar.py \
             dashboard/__init__.py \
             dashboard/safe.py \
             notify \
@@ -108,7 +109,14 @@ jobs:
             tests/test_research_grid.py \
             tests/test_research_mcp.py \
             tests/test_research_sandbox.py \
-            tests/test_segment_ledger.py
+            tests/test_segment_ledger.py \
+            tests/test_sessions.py \
+            tests/test_build_trading_calendar.py \
+            tests/test_roll.py \
+            tests/test_holdout_guard.py \
+            tests/test_tick_filter.py \
+            tests/test_accounting.py \
+            tests/test_heartbeat.py
 
       # 边界闸门(第 7 轮 codex 的 C1/H1):**先单跑边界不变量那一份**,再跑其余研究侧测试。
       #
@@ -149,7 +157,14 @@ jobs:
             tests/test_research_api.py \
             tests/test_research_mcp.py \
             tests/test_research_gate.py \
-            tests/test_research_grid.py
+            tests/test_research_grid.py \
+            tests/test_sessions.py \
+            tests/test_build_trading_calendar.py \
+            tests/test_roll.py \
+            tests/test_holdout_guard.py \
+            tests/test_tick_filter.py \
+            tests/test_accounting.py \
+            tests/test_heartbeat.py
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #

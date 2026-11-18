@@ -38,6 +38,11 @@
 - **外部心跳发送端**(Issue #54,F-a 的 M6):新增 `notify/heartbeat.py`。定期向外部端点推送经 `redact_obj` 结构化脱敏的心跳;
   **只发不收**(不解析回包、无任何按回包执行的入口),外部只负责超时告警,不接管、不平仓。间隔须 ≤60 秒(外部 3 分钟阈值前
   至少能漏两次)、外部端点须 https(回环地址除外);发送失败不抛异常、不阻塞,只累计连续失败次数。接入交易进程定时器属 F-b。
+- **F-a 收尾**(Issue #54,M7):`tools/check_domain.py` 不可降级清单新增 `risk/sessions.py`、`config/trading_calendar.json`、
+  `risk/roll.py`、`risk/tick_filter.py`、`risk/accounting/`(风控底线组)与 `risk/holdout_guard.py`(方法学闸门组),
+  `tests/test_check_domain.py` 逐个点名;`check_mutations --verify` 11 种变异全部被抓住。结构化脱敏 `redact_obj` 从
+  `notify/webhook.py` 移到 `notify/redact.py`(webhook 重新导出保持兼容),使心跳模块不依赖 requests(研究侧 CI 不装它)。
+  新测试与生成脚本纳入 CI 的 ruff 与研究侧 pytest 清单;新模块覆盖率合计 95%。
 - **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
   (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。
   自愈层用**用户级守护进程**(每 10 分钟 `ensure`;Windows 计划任务注册被拒 `0x80070005 Access Denied`),

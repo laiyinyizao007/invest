@@ -401,6 +401,15 @@ def test_critical_defense_files_are_never_downgrade() -> None:
         "scripts/segment_ledger.py",
         "config/immutable_constitution.json",
         "config/test_segment_usage.json",
+        # 阶段 F-a(Issue #54)新增的实盘就绪防线:日历/时段决定交易日与熔断日界线,换月决定启动校验,
+        # 异常值决定什么行情进策略,核算决定对账结论,封存段决定研究回路能看见哪些数据
+        "risk/sessions.py",
+        "config/trading_calendar.json",
+        "risk/roll.py",
+        "risk/tick_filter.py",
+        "risk/holdout_guard.py",
+        "risk/accounting/attribution.py",
+        "risk/accounting/settlement.py",
     ]
     for path in critical:
         assert cd.classify(path)[0] == "never_downgrade", path

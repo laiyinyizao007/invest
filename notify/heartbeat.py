@@ -6,7 +6,7 @@
 约束:
 - 间隔 ≤60 秒:外部 3 分钟阈值内至少能漏两次才告警,避免偶发丢包误报;
 - 外部端点必须 https(本机回环地址除外,便于测试与本地中继);
-- 载荷经 `notify.webhook.redact_obj` 结构化脱敏;
+- 载荷经 `notify.redact.redact_obj` 结构化脱敏(不依赖 requests);
 - 发送失败不抛异常、不阻塞调用方,只累计连续失败次数(失败不占用间隔,下次调用立即重试)。
 
 接入交易进程的定时器属阶段 F-b;外部接收端(超时告警)不在本仓库内。只依赖标准库与 notify 包。
@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from urllib.parse import urlparse
 
-from notify.webhook import redact_obj
+from notify.redact import redact_obj
 
 MAX_INTERVAL_SECONDS = 60
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}

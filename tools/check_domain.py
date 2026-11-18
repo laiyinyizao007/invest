@@ -128,12 +128,19 @@ NEVER_DOWNGRADE = (
     "scripts/segment_windows.py",
     "scripts/segment_ledger.py",
     "config/test_segment_usage.json",
+    "risk/holdout_guard.py",        # 封存前向留出集:研究回路能看见哪些数据、留出段只用一次(Issue #54)
 
     # --- 风控底线 ---
     "risk/risk_guard.py",
     "risk/account_guard.py",
     "risk/order_policy.py",
     "risk/positions.py",
+    # 阶段 F-a(Issue #54)的实盘就绪模块:交易日/熔断日界线、启动换月校验、行情准入、对账结论
+    "risk/sessions.py",
+    "config/trading_calendar.json",
+    "risk/roll.py",
+    "risk/tick_filter.py",
+    "risk/accounting/",
 
     # --- 人类读的判定呈现面 ---
     # 报告里的「结论: 通过全部门槛」是给人看的判定表述,被 dashboard 消费
