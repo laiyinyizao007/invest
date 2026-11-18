@@ -1,0 +1,145 @@
+# 交易日历自动更新提醒(Issue #54,阶段 F-a)
+#
+# config/trading_calendar.json 是 risk/sessions.py 的唯一数据源,覆盖区间外的日期一律判为「未知」(fail-closed)。
+# 交易所每年公布来年休市安排后要更新一次。本工作流每天:
+#   1. 用 AKShare 拉取交易日并运行 tools/build_trading_calendar.py(内容没变时不写文件);
+#   2. 出现新数据 → 开 PR,**由人核对后合并**(从不直接改写 main 上的入库文件);
+#   3. 数据源改动了已有日期(脚本退出码 1)→ 开 Issue,人工对照交易所公告核对;
+#   4. 覆盖进入到期前 30 天窗口、且没有待合并的更新 PR → 开 Issue 提醒。
+# 同一事项只开一个 PR / Issue(按标题去重)。脚本失败(退出码 2,如数据源不可用)时本工作流失败,GitHub 会发通知。
+#
+# 注意:由 GITHUB_TOKEN 开的 PR 不会自动触发其它工作流(GitHub 的限制),合并前请在 PR 页面手动重跑检查或推一个空提交。
+
+name: trading-calendar
+
+on:
+  schedule:
+    - cron: '30 1 * * *'          # 每天 UTC 01:30 = 北京时间 09:30
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: trading-calendar
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CAL: config/trading_calendar.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 只在生成时需要 akshare;运行时不依赖它。版本钉死,升级须记录在 CHANGELOG(G5)。
+      - name: 安装 akshare
+        run: python -m pip install --quiet akshare==1.20.36
+
+      - name: 拉取并生成
+        id: build
+        run: |
+          set +e
+          python tools/build_trading_calendar.py > build.log 2>&1
+          rc=$?
+          set -e
+          cat build.log
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::生成失败(数据或文件不合法),见上方输出"
+            exit 1
+          fi
+
+      - name: 有新数据 → 开 PR
+        if: steps.build.outputs.rc == '0'
+        run: |
+          if git diff --quiet -- "$CAL"; then
+            echo "日历无变化"
+            exit 0
+          fi
+          end=$(python -c "import json; print(json.load(open('$CAL', encoding='utf-8'))['coverage']['end'])")
+          branch="chore/trading-calendar-$end"
+          open=$(gh pr list --head "$branch" --state open --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "已有待合并的 PR($branch)"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "$CAL"
+          git commit -m "chore(calendar): 交易日历覆盖延长到 $end(自动生成,待人工核对)"
+          git push --force origin "$branch"
+          {
+            echo "交易日历出现新数据,覆盖延长到 **$end**。由定时任务自动生成(\`tools/build_trading_calendar.py\`),**请人工核对后合并**:"
+            echo ""
+            echo "1. 对照大商所/郑商所公布的休市安排,逐个核对新增的 \`closed_weekdays\`(只应新增,不应改动已有日期——脚本已保证);"
+            echo "2. 由 GITHUB_TOKEN 开的 PR 不会自动触发其它检查:请在本 PR 手动重跑 research-guard 或推一个空提交;"
+            echo "3. 合并后 risk/sessions.py 立即按新覆盖区间判定。"
+            echo ""
+            echo "生成输出:"
+            echo '```'
+            cat build.log
+            echo '```'
+          } > pr_body.md
+          gh pr create --base main --head "$branch" --title "[calendar] 交易日历覆盖延长到 $end" --body-file pr_body.md
+
+      - name: 与旧日期冲突 → 开 Issue
+        if: steps.build.outputs.rc == '1'
+        run: |
+          title="[calendar] 数据源改动了交易日历里已有的日期,需人工核对"
+          open=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "已有待处理的 Issue"
+            exit 0
+          fi
+          {
+            echo "定时任务拉取的交易日与入库日历在**已有日期**上不一致,脚本拒绝写入(这可能是数据源出错,也可能是交易所临时调整了休市安排)。"
+            echo ""
+            echo "请对照交易所公告核对;确认无误后在本机运行 \`python tools/build_trading_calendar.py --allow-changes\` 并提交。"
+            echo ""
+            echo '```'
+            cat build.log
+            echo '```'
+          } > issue_body.md
+          gh issue create --title "$title" --label "type: task" --body-file issue_body.md
+
+      - name: 覆盖即将到期 → 开 Issue
+        run: |
+          set +e
+          python tools/build_trading_calendar.py --check --fail-on-warning > check.log 2>&1
+          rc=$?
+          set -e
+          cat check.log
+          if [ "$rc" -ne 3 ]; then
+            exit 0
+          fi
+          pending=$(gh pr list --state open --search "in:title \"[calendar] 交易日历覆盖延长到\"" --json number --jq 'length')
+          if [ "$pending" != "0" ]; then
+            echo "已有待合并的更新 PR,不再重复提醒"
+            exit 0
+          fi
+          title="[calendar] 交易日历覆盖即将到期,来年休市安排尚未就绪"
+          open=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "已有待处理的提醒 Issue"
+            exit 0
+          fi
+          {
+            echo "入库交易日历的覆盖即将结束,而数据源里还没有来年的交易日。覆盖结束后,依赖日历的功能会把之后的日期判为「未知」并拒绝运行。"
+            echo ""
+            echo '```'
+            cat check.log
+            echo '```'
+            echo ""
+            echo "交易所公布来年休市安排后,本工作流会自动开 PR;也可以在本机运行 \`python tools/build_trading_calendar.py\`。"
+          } > issue_body.md
+          gh issue create --title "$title" --label "type: task" --body-file issue_body.md

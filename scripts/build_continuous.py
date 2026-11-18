@@ -17,7 +17,6 @@
 """
 import argparse
 import os
-import re
 import sys
 import time
 import warnings
@@ -35,6 +34,7 @@ import pandas as pd
 import akshare as ak
 from fetch_data import SYMBOLS, fetch_with_retry, normalize, to_bars
 from strategies.instruments import INSTRUMENTS
+from risk.roll import choose_main, contract_expiry  # noqa: F401  (contract_expiry 由 import_minute 经本模块导入)
 from vnpy.trader.constant import Interval
 from vnpy.trader.database import get_database
 
@@ -44,40 +44,8 @@ REQUEST_INTERVAL = 1.0
 CACHE_TTL_SECONDS = 24 * 3600  # 未到期合约的缓存有效期;已到期合约的数据不会再变,永久有效
 
 
-def contract_expiry(code: str) -> int:
-    """合约代码末四位 YYMM -> 可比较的整数(如 C2509 -> 2509)。"""
-    m = re.search(r"(\d{4})$", code)
-    if not m:
-        raise ValueError(f"无法解析合约月份: {code}")
-    return int(m.group(1))
-
-
-def _choose_main(current, avail, prev_oi, expiry, last_day, day):
-    """决定 day 日使用哪个合约;返回 None 表示该日跳过(不产生 K 线)。只使用截至前一交易日的持仓量。"""
-    cands = [c for c in avail if current is None or expiry[c] >= expiry[current]]
-    if not cands:
-        return None
-
-    def key(c):
-        return (prev_oi.get(c, -1.0), expiry[c])
-
-    if current is None:
-        known = [c for c in cands if c in prev_oi]
-        if known:
-            return max(known, key=key)
-        # 序列的第一天没有"前一日"可参考,只能用当日持仓量(仅影响起点)
-        return max(cands, key=lambda c: (avail[c]["open_interest"], expiry[c]))
-
-    if current in avail:
-        best = max(cands, key=key)
-        if expiry[best] > expiry[current] and prev_oi.get(best, -1.0) > prev_oi.get(current, -1.0):
-            return best
-        return current
-
-    # 当前主力今天没有成交:之后还会有数据 → 停牌/无量,跳过当日;不再有数据(到期) → 强制换月
-    if last_day[current] > day:
-        return None
-    return max(cands, key=key)
+# 主力选择规则挪到 risk/roll.py(只依赖标准库,实盘启动的换月校验共用同一份规则);这里保留原名以兼容既有调用方。
+_choose_main = choose_main
 
 
 def build_continuous(frames: dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:

@@ -201,6 +201,12 @@ flowchart LR
 - `risk/account_guard.py`:账户级双层熔断(当日 600 / 累计 2000)、原子落盘、解锁冷却与历史、非策略委托计数。
 - `risk/order_policy.py`:CTP 错误码优先的废单三级分类与有限重试策略。
 - `risk/live_admission.py`:生产 API 的实盘准入检查(需晋级门槛批准文件)。
+- **实盘就绪模块(阶段 F-a,Issue #54;只建模块与测试,接线属 F-b)**:
+  - `risk/sessions.py` + `config/trading_calendar.json`(由 `tools/build_trading_calendar.py` 离线生成):交易日历与统一交易时段的**唯一来源**——日期状态(交易/休市/未知)、夜盘由日历推导(节前无夜盘)、20:00 日界线归属交易日、表外日期 fail-closed、覆盖结束前 30 天告警(当前覆盖到 2026-12-31)。
+  - `risk/roll.py`:主力选择规则(从 `scripts/build_continuous.py` 挪入,唯一一份)、新浪→CTP 代码规范化、`validate_roll`(一致/不一致/未知)。
+  - `risk/holdout_guard.py` + `config/holdout_usage.json`(首次使用时生成):封存前向留出集(2026-06-15 之后)对研究回路不可见;留出段按区间只用一次。
+  - `risk/tick_filter.py`:行情异常值判定纯函数(阈值由调用方给出,启用策略随 F-b 的 ADR 定)。
+  - `risk/accounting/`:权益历史、盈亏归因(FIFO 往返交易)、结算单核对、真实滑点对比。
 - `trading/guard_rule.py`、`trading/safe_risk.py`:挂在 vnpy_riskmanager 发单链上的账户风控规则(拦开仓放平仓、废单分类、紧急平仓状态机、非策略委托检测)。
 
 **运行时与运维**
@@ -208,6 +214,7 @@ flowchart LR
 - `scripts/unlock_account.py`、`scripts/record_promotion.py`、`scripts/pause_trading.py`:人工解锁(冷却/强制/历史)、实盘准入批准记录、手动暂停/恢复新开仓(标志文件,平仓放行)。
 - `trading/graceful_exit.py`:退出前向交易/行情前置发 `ReqUserLogout`(vnpy_ctp 的 `close()` 只断开连接),供运行时与脚本共用。
 - `notify/webhook.py`:非阻塞 Webhook 通知(通用/飞书/Telegram),发送前脱敏。
+- `notify/heartbeat.py`:外部心跳发送端(脱敏、≤60 秒间隔、只发不收;外部只负责超时告警,不接管、不平仓)。`notify/redact.py` 是脱敏(含结构化 `redact_obj`)的唯一出处,不依赖 requests。
 - `scripts/run_gui.py`:图形界面(人工观察用,含算法单/价差应用,不得用于无人值守)。
 
 **验证与接入工具**
