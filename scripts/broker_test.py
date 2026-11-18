@@ -77,6 +77,9 @@ DAILY_RULE, SIZE_RULE, DUP_RULE = "每日上限检查", "委托规模检查", "�
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_LOGIN, EXIT_CRASH = 0, 1, 2, 3, 4
 # 会向柜台发委托的测试项:这些步骤之前必须先确认账户空仓
 ORDER_ITEMS = frozenset({"T3", "T4", "T5", "P1.2", "P1.3", "P2.3", "P3.1", "T6", "P4.2", "P5.1", "P5.2"})
+# 需要 Tick 的项:发单类(要取对手价/探测价)+ 5.1 指令检查(按涨跌停构造越界价)。
+# 只按这张表决定是否订阅行情——按旧编号 T2–T5 判断会让 `--only P1.2` 等新编号单跑时全部因「没有 Tick」SKIP。
+TICK_ITEMS = ORDER_ITEMS | {"T2", "P4.1"}
 STABILITY_ORDERS = 200                     # 国信 2.1 稳定运行:程序化系统持续下单 200 笔(非程序化 50 笔)
 FINAL_CANCEL_WAIT = 15.0                   # 收尾撤单:轮询等确认的上限(秒)
 STABILITY_LIMIT = 10_000_000               # 稳定运行演示期间临时抬高的风控上限(演示后还原)
@@ -1590,7 +1593,7 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
                     book.add(name, FAIL, reason, [Shot("", [reason])], ctx.now())
             return True, None
 
-    if want("T2", "T3", "T4", "T5"):
+    if want(*TICK_ITEMS):
         guarded(("T2",), step_market, ctx, book)
     order_items = ORDER_ITEMS if only is None else (only & ORDER_ITEMS)
     gated = False

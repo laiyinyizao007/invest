@@ -832,7 +832,7 @@ def test_run_steps_only_filter(tmp_path):
     try:
         e.collector.log_lines.extend([text for _k, text in bt.MILESTONES])
         assert bt.run_steps(e.ctx, e.book, only={"P4.1"}) is True
-        assert set(e.book.items) == {"T1", "P1.1", "P4.1"}
+        assert set(e.book.items) == {"T1", "P1.1", "T2", "P4.1"}   # 5.1 要按涨跌停构造越界价 ⇒ 先订阅行情(T2)
     finally:
         e.main.close()
 
@@ -2331,3 +2331,27 @@ def test_main_persists_evidence_before_closing_the_engine():
     import inspect
     src = inspect.getsource(bt.main)
     assert src.index("persist_evidence(") < src.index("close_engine(main_engine)")
+
+
+@pytest.mark.parametrize("item", sorted(bt.TICK_ITEMS))
+def test_items_that_need_a_tick_subscribe_market_data(env, monkeypatch, item):
+    """`--only P1.2` 等新编号单跑时也必须先订阅行情:否则没有 Tick,发单类演示全部 SKIP(2026-11-18 国信实测)。"""
+    calls: list[str] = []
+    monkeypatch.setattr(bt, "step_login", lambda ctx, book: True)
+    monkeypatch.setattr(bt, "ensure_flat", lambda ctx: True)
+    for name in ("step_market", "step_basic_trade", "step_cancel", "step_counts", "step_duplicate", "step_threshold",
+                 "step_validity", "step_counter_errors", "step_pause", "step_batch_cancel", "step_stability",
+                 "step_connection", "step_exit", "step_logs"):
+        monkeypatch.setattr(bt, name, lambda *a, _n=name: calls.append(_n) or {})
+    bt.run_steps(env.ctx, env.book, only={item})
+    assert calls and calls[0] == "step_market"
+
+
+@pytest.mark.parametrize("item", ["P1.1", "P2.1", "P2.2", "P6.1", "T7"])
+def test_items_without_orders_do_not_subscribe(env, monkeypatch, item):
+    calls: list[str] = []
+    monkeypatch.setattr(bt, "step_login", lambda ctx, book: True)
+    for name in ("step_market", "step_counts", "step_connection", "step_exit", "step_logs"):
+        monkeypatch.setattr(bt, name, lambda *a, _n=name: calls.append(_n) or {})
+    bt.run_steps(env.ctx, env.book, only={item})
+    assert "step_market" not in calls
