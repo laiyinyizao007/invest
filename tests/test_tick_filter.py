@@ -116,3 +116,9 @@ def test_broken_limit_data_is_bad_not_silently_skipped(up, down):
 def test_pricetick_must_be_finite():
     with pytest.raises(ValueError):
         tf.classify(Tick(), PREV, pricetick=float("inf"), rules=RULES)
+
+
+def test_missing_volume_or_time_is_bad_not_an_exception():
+    """Low(G8 复核):成交量或时间字段为 None 时原先抛 TypeError。"""
+    v = tf.classify(replace(Tick(), volume=None, datetime=None, localtime=None), PREV, pricetick=1.0, rules=RULES)
+    assert not v.ok and any("字段" in r for r in v.reasons)

@@ -1,7 +1,13 @@
 """权益历史:按时间只追加的 jsonl(路线图「权益曲线」的数据源;交易进程定期写入属 F-b)。
 
 每行一条 {"ts": ISO 时间, "equity": 数值}。写入要求时间严格递增、数值有限;
-读取时跳过损坏的行并**计数**(调用方据此提示「有 N 行读不出来」,而不是当作完整)。
+读取时跳过损坏或乱序的行并**计数**(调用方据此提示「有 N 行读不出来」,而不是当作完整)。
+
+两种写法,接受规则完全相同(都以 read() 为准,保证写进去的每一行 read() 都会接受):
+- `append(path, ...)`:每次整文件读取再追加。简单、无状态,适合低频或一次性写入;
+- `EquityWriter(path)`:打开时整文件读**一次**,之后在内存里记住最后时间,每次追加 O(1)。
+  **单写者约定**:同一文件只能由一个进程写(F-b 接线时由交易进程独占,进程锁保证)。
+  G8 复核曾指出「只读文件尾部」的快路径在旧位置藏着坏行时与 read() 结论不一致,所以不再用尾部推断。
 """
 from __future__ import annotations
 
@@ -55,48 +61,42 @@ def read(path: Path | str) -> EquityHistory:
     return EquityHistory(records, skipped)
 
 
-_TAIL_BYTES = 64 * 1024
-
-
 def last_point(path: Path | str) -> EquityPoint | None:
-    """最后一条被 read() 接受的记录。只读文件末尾一段:按分钟写一年约 50 万行,每次追加都整文件重读会越来越慢。
-
-    接受规则与 read() 相同(可解析且时间严格递增)。尾部里的有效行只要不是严格递增(说明有乱序或手工改动)、
-    或者一条有效行都没有,就退回整文件读取——宁可慢,也不能与 read() 的结论不一致
-    (否则会在乱序行之后追加,而 read() 又把新记录当乱序跳过,新写的权益悄悄丢失)。
-    残余:乱序行若藏在尾部窗口之前且时间比尾部全部记录都晚,这里看不出来;append 本身保证递增,
-    只有人工改文件或损坏才会出现,read() 的 skipped 计数会把它暴露出来。
-    """
-    path = Path(path)
-    if not path.exists():
-        return None
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - _TAIL_BYTES))
-        tail = fh.read().decode("utf-8", errors="replace")
-    lines = tail.splitlines()
-    if size > _TAIL_BYTES:
-        lines = lines[1:]                       # 第一行可能被截断
-    points = [pt for pt in (_parse(line) for line in lines if line.strip()) if pt is not None]
-    if points and all(a.ts < b.ts for a, b in zip(points, points[1:])):
-        return points[-1]
-    full = read(path).records
-    return full[-1] if full else None
+    """最后一条被 read() 接受的记录(整文件读,与 read() 同一规则)。"""
+    records = read(path).records
+    return records[-1] if records else None
 
 
-def append(path: Path | str, ts: datetime, equity: float) -> None:
-    """追加一条。**单写者约定**:同一文件只能由一个进程写(F-b 接线时由交易进程独占,进程锁保证),
-    否则两个进程可能同时通过递增检查。"""
+def _check(ts: datetime, equity: float, last: EquityPoint | None) -> None:
     if not _finite_number(equity):
         raise ValueError(f"权益必须是有限数值:{equity!r}")
-    path = Path(path)
-    last = last_point(path)
     if last is not None and ts <= last.ts:
         raise ValueError(f"时间必须严格递增:{ts} <= 上一条 {last.ts}")
+
+
+def _write_line(path: Path, ts: datetime, equity: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps({"ts": ts.isoformat(timespec="seconds"), "equity": float(equity)}) + "\n"
     with open(path, "a", encoding="utf-8") as fh:          # 单次写入一整行并落盘
         fh.write(line)
         fh.flush()
         os.fsync(fh.fileno())
+
+
+def append(path: Path | str, ts: datetime, equity: float) -> None:
+    path = Path(path)
+    _check(ts, equity, last_point(path))
+    _write_line(path, ts, equity)
+
+
+class EquityWriter:
+    """高频追加用:打开时整文件读一次,之后内存缓存最后时间。单写者(见模块说明)。"""
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self.last = last_point(self.path)
+
+    def append(self, ts: datetime, equity: float) -> None:
+        _check(ts, equity, self.last)
+        _write_line(self.path, ts, equity)
+        self.last = EquityPoint(ts, float(equity))

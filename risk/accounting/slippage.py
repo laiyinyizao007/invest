@@ -44,6 +44,11 @@ def compare(orders: list[OrderRef], fills: dict[str, list[tuple[float, int]]]) -
     skipped = 0
     for o in orders:
         done = fills.get(o.order_id) or []
+        for price, vol in done:
+            if isinstance(vol, bool) or not isinstance(vol, int) or vol <= 0:
+                raise ValueError(f"委托 {o.order_id} 的成交量必须是正整数:{vol!r}")
+            if not (isinstance(price, (int, float)) and math.isfinite(price) and price > 0):
+                raise ValueError(f"委托 {o.order_id} 的成交价必须是正的有限数:{price!r}")
         volume = sum(v for _, v in done)
         if not volume:
             continue

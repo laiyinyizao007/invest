@@ -212,3 +212,37 @@ def test_order_ref_validation(kwargs):
 def test_settlement_rejects_non_integer_or_negative_volumes(volume):
     with pytest.raises(ValueError):
         st.reconcile({("c2701.DCE", "long"): volume}, {})
+
+
+# ---------------------------------------------------------------- G8 第 2 轮复核(codex 44/50)复现后补的回归
+
+def test_last_point_matches_read_even_with_old_future_corruption(tmp_path):
+    """Low:尾部窗口之前藏着一条「未来时间」的坏行、尾部又严格递增时,原先的尾部快路径与 read() 结论不同。
+    现在 last_point 整文件读(与 read 同一规则);高频追加用 EquityWriter(打开时读一次,之后内存缓存)。"""
+    p = tmp_path / "equity.jsonl"
+    lines = [json.dumps({"ts": "2030-01-01T00:00:00", "equity": 9.0})]
+    lines += [json.dumps({"ts": datetime(2026, 1, 1).replace(hour=i // 3600 % 24, minute=i // 60 % 60, second=i % 60).isoformat(),
+                          "equity": 1.0}) for i in range(3000)]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert eh.last_point(p) == eh.read(p).records[-1]
+    with pytest.raises(ValueError):
+        eh.append(p, datetime(2026, 6, 1), 1.0)              # 会被 read() 当乱序跳过的写入,一律拒绝
+
+
+def test_equity_writer_caches_last_timestamp_after_one_full_read(tmp_path):
+    p = tmp_path / "equity.jsonl"
+    eh.append(p, T, 10000.0)
+    w = eh.EquityWriter(p)
+    assert w.last is not None and w.last.ts == T
+    w.append(datetime(2026, 11, 16, 10, 1), 10001.0)
+    with pytest.raises(ValueError):
+        w.append(datetime(2026, 11, 16, 10, 1), 10002.0)
+    w.append(datetime(2026, 11, 16, 10, 2), 10002.0)
+    assert [r.equity for r in eh.read(p).records] == [10000.0, 10001.0, 10002.0]
+
+
+def test_slippage_rejects_bad_fills():
+    o = [sl.OrderRef("o", "buy", 1.0, 1.0)]
+    for bad in ([(2.0, -1)], [(float("nan"), 1)], [(2.0, 1.5)], [(0.0, 1)]):
+        with pytest.raises(ValueError):
+            sl.compare(o, {"o": bad})

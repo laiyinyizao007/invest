@@ -85,6 +85,10 @@ def _load(path: Path) -> list[dict]:
             # 语义也要对:倒置、起点不在封存段、sha 不完整的记录说明台账被人改坏了
             if start > end or not is_sealed(start) or not _SHA_RE.match(str(e.get("sha256", ""))):
                 raise ValueError(f"记录语义无效:{e}")
+        spans = sorted((date.fromisoformat(e["start"]), date.fromisoformat(e["end"])) for e in data)
+        for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+            if b0 <= a1:                     # 台账自身出现重叠:说明被人改坏了(正常写入不可能产生)
+                raise ValueError(f"台账内区间重叠:{a0}~{a1} 与 {b0}~{b1}")
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise LedgerError(f"留出段台账无法读取,拒绝继续(fail-closed):{path}:{exc}") from exc
     return data

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 
 _EPS = 1e-9
 
@@ -53,6 +54,11 @@ def classify(tick, prev, *, pricetick: float, rules: TickRules) -> TickVerdict:
     steps = price / pricetick
     if abs(steps - round(steps)) > 1e-6:
         reasons.append(f"价格 {price} 与最小变动价位 {pricetick} 不对齐")
+
+    vol, ts = getattr(tick, "volume", None), getattr(tick, "datetime", None)
+    if isinstance(vol, bool) or not isinstance(vol, (int, float)) or not math.isfinite(vol) or not isinstance(ts, datetime):
+        reasons.append(f"成交量或时间字段缺失或类型异常:volume={vol!r},datetime={ts!r}")
+        return TickVerdict(False, tuple(reasons))             # 下面的比较都依赖这两个字段
 
     if prev is not None:
         base = prev.last_price

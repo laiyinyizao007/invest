@@ -97,6 +97,9 @@ def test_record_use_rejects_bad_requests(tmp_path, start, end, sha):
     '[{"start": "2026-12-01", "end": "2026-07-01", "sha256": "%s"}]' % ("a" * 64),     # 倒置
     '[{"start": "2026-06-01", "end": "2026-07-01", "sha256": "%s"}]' % ("a" * 64),     # 起点不在封存段
     '[{"start": "2026-06-16", "end": "2026-07-01", "sha256": "abc"}]',                # sha 不完整
+    # G8 复核:台账内部的区间互相重叠(人工改坏)原先也被接受
+    '[{"start": "2026-06-16", "end": "2026-09-01", "sha256": "%s"}, {"start": "2026-08-01", "end": "2026-10-01", "sha256": "%s"}]'
+    % ("a" * 64, "a" * 64),
 ])
 def test_corrupt_ledger_fails_closed(tmp_path, body):
     ledger = tmp_path / "l.json"
