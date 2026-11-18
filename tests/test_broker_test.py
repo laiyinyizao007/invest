@@ -2417,3 +2417,32 @@ def test_final_safety_also_cancels_orders_the_engine_has_not_seen_yet(env):
     notes = bt.final_safety(env.ctx)
     assert oid.split(".", 1)[1] in [r.orderid for r in env.gw.cancel_requests]
     assert any("未收到回报" in n for n in notes), notes
+
+
+def test_book_echoes_each_items_evidence_lines_redacted():
+    """证据行要同时打到控制台:3.2/7.1 等项只有这样才能有真实运行截图。打印的是脱敏后的文本。"""
+    out: list[str] = []
+    book = bt.Book(clean=lambda t: t.replace("SECRET", "***"), echo=out.append)
+    book.add("P2.2", be.PASS, "", [be.Shot("报单笔数统计", ["汇总报单笔数 5", "账号 SECRET"])], "t")
+    text = "\n".join(out)
+    assert "P2.2" in text and "报单笔数统计" in text and "汇总报单笔数 5" in text
+    assert "SECRET" not in text and "***" in text
+
+
+def test_book_is_silent_by_default(capsys):
+    book = bt.Book()
+    book.add("P2.2", be.PASS, "", [be.Shot("x", ["y"])], "t")          # 测试与预演默认静默
+    assert capsys.readouterr().out == ""
+
+
+def test_book_redacts_shot_labels_in_echo_and_storage():
+    out: list[str] = []
+    book = bt.Book(clean=lambda t: t.replace("SECRET", "***"), echo=out.append)
+    book.add("P2.2", be.PASS, "", [be.Shot("账号 SECRET", ["l"])], "t")
+    assert all("SECRET" not in line for line in out)
+    assert book.items["P2.2"].shots[0].label == "账号 ***"
+
+
+def test_main_echoes_evidence_to_the_console():
+    import inspect
+    assert "Book(clean=ctx.clean, echo=" in inspect.getsource(bt.main)

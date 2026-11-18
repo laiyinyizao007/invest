@@ -50,7 +50,7 @@ from vnpy.trader.utility import round_to  # noqa: E402
 import cancel_all_orders  # noqa: E402
 import pause_trading  # noqa: E402
 from broker_evidence import (  # noqa: E402
-    FAIL, ITEMS, MANUAL, PASS, SKIP, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
+    FAIL, ITEMS, MANUAL, PASS, SKIP, STATUS_LABEL, Evidence, Shot, load_evidence, merge_evidence, render_all, save_connection_info, save_evidence,
 )
 from ctp_tools.collector import (  # noqa: E402
     Collector, build_cases, check_positions, close_engine, direction_text, in_trading_session,
@@ -167,13 +167,21 @@ class Ctx:
 class Book:
     """按测试项累积证据(一个测试项可由多个步骤贡献图片与状态)。"""
 
-    def __init__(self, clean: Callable[[str], str] | None = None) -> None:
+    def __init__(self, clean: Callable[[str], str] | None = None, echo: Callable[[str], None] | None = None) -> None:
         self.items: dict[str, Evidence] = {}
         self._clean = clean or (lambda text: text)       # 落盘即脱敏:evidence.json 里不留未脱敏文本
+        # 证据行同步打到控制台(脱敏后的文本):3.2 计数、7.1 日志等项只有这样才能在运行窗口里看到、截到真图。
+        self._echo = echo
 
     def add(self, item: str, status: str, summary: str, shots: list[Shot], started_at: str, metrics: dict | None = None) -> None:
         summary = self._clean(summary)
-        shots = [Shot(s.label, [self._clean(line) for line in s.lines], s.image) for s in shots]
+        shots = [Shot(self._clean(s.label), [self._clean(line) for line in s.lines], s.image) for s in shots]   # 小标题也脱敏
+        if self._echo is not None:
+            title = ITEMS.get(item, "")
+            for shot in shots:
+                self._echo(f"[{item} {title}] {STATUS_LABEL.get(status, status)}" + (f" · {shot.label}" if shot.label else ""))
+                for line in shot.lines:
+                    self._echo(f"    {line}")
         old = self.items.get(item)
         if old is None:
             self.items[item] = Evidence(item, status, summary, started_at, list(shots), dict(metrics or {}))
@@ -1676,7 +1684,6 @@ def run_steps(ctx: Ctx, book: Book, only: set[str] | None = None) -> bool:
 # ======================= 入口 =======================
 
 def print_summary(evs: list[Evidence]) -> None:
-    from broker_evidence import STATUS_LABEL
     print("\n=== 取证结果 ===")
     for ev in evs:
         print(f"  {ev.item:<5} {STATUS_LABEL.get(ev.status, ev.status):<4} {ev.title}" + (f"  — {ev.summary}" if ev.summary else ""))
@@ -1836,7 +1843,7 @@ def main(argv: list[str] | None = None) -> int:
     started_at = beijing_now()
     print(f"连接 {symbol}(账号 {mask_account(env.get('CTP_USERNAME', ''))})...")
     main_engine.connect(setting, "CTP")
-    book = Book(clean=ctx.clean)
+    book = Book(clean=ctx.clean, echo=lambda text: print(text, flush=True))
     closed = False
     logged_in = False
     notes: list[str] = []
