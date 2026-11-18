@@ -72,7 +72,8 @@ def test_main_as_of_without_records_is_unknown():
 
 @pytest.mark.parametrize("live,day,status", [
     ("c2701.DCE", date(2026, 11, 16), r.OK),
-    ("C2701.DCE", date(2026, 11, 16), r.OK),           # 大小写不影响
+    ("C2701.DCE", date(2026, 11, 16), r.MISMATCH),     # CTP 规范是 DCE 小写:大写就是写错了(G8 第 2 轮)
+    (" c2701.DCE ", date(2026, 11, 16), r.OK),         # 只容忍首尾空白
     ("c2609.DCE", date(2026, 11, 16), r.MISMATCH),     # 还挂着旧主力
     ("c2701.DCE", date(2026, 7, 1), r.MISMATCH),       # 换月前就切到远月也算不一致
 ])
@@ -105,6 +106,10 @@ def test_load_rolls_csv(tmp_path):
     "date,from,to,gap,gap_exact\nbad,C2605,C2609,1,True\n",            # 日期坏
     "date,from,to,gap,gap_exact\n2026-07-20,C2609,C2701,1,True\n2026-03-18,C2605,C2609,1,True\n",   # 乱序
     "date,from,to,gap,gap_exact\n2026-03-18,C2605,C2609,1,True\n2026-07-20,C2605,C2701,1,True\n",   # 链条断了
+    "date,from,to,gap,gap_exact\n2026-03-18,C2605,MA2609,1,True\n",                                    # 跨品种(G8 第 2 轮)
+    "date,from,to,gap,gap_exact\n2026-03-18,C2609,C2605,1,True\n",                                     # 往回换
+    "date,from,to,gap,gap_exact\n2026-03-18,C2605,,1,True\n",                                          # 空合约
+    "date,from,to,gap,gap_exact\n2026-03-18,XX2605,XX2609,1,True\n",                                   # 时段表外品种
 ])
 def test_load_rolls_csv_rejects_bad_files(tmp_path, body):
     p = tmp_path / "C_rolls.csv"

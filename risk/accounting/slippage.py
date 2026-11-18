@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -14,6 +15,14 @@ class OrderRef:
     side: str                    # buy / sell
     reference_price: float | None
     pricetick: float
+
+    def __post_init__(self):
+        if self.side not in ("buy", "sell"):
+            raise ValueError(f"side 必须是 buy/sell:{self.side!r}")
+        if not (math.isfinite(self.pricetick) and self.pricetick > 0):
+            raise ValueError(f"最小变动价位必须为正的有限数:{self.pricetick!r}")
+        if self.reference_price is not None and not (math.isfinite(self.reference_price) and self.reference_price > 0):
+            raise ValueError(f"参照价必须为正的有限数或 None:{self.reference_price!r}")
 
 
 @dataclass(frozen=True)

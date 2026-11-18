@@ -59,9 +59,13 @@ _TAIL_BYTES = 64 * 1024
 
 
 def last_point(path: Path | str) -> EquityPoint | None:
-    """最后一条有效记录。只读文件末尾一段:按分钟写一年约 50 万行,每次追加都整文件重读会越来越慢。
+    """最后一条被 read() 接受的记录。只读文件末尾一段:按分钟写一年约 50 万行,每次追加都整文件重读会越来越慢。
 
-    末尾一段里一条有效行都没有(例如尾部整段损坏)时,退回整文件读取,保证结论与 read() 一致。
+    接受规则与 read() 相同(可解析且时间严格递增)。尾部里的有效行只要不是严格递增(说明有乱序或手工改动)、
+    或者一条有效行都没有,就退回整文件读取——宁可慢,也不能与 read() 的结论不一致
+    (否则会在乱序行之后追加,而 read() 又把新记录当乱序跳过,新写的权益悄悄丢失)。
+    残余:乱序行若藏在尾部窗口之前且时间比尾部全部记录都晚,这里看不出来;append 本身保证递增,
+    只有人工改文件或损坏才会出现,read() 的 skipped 计数会把它暴露出来。
     """
     path = Path(path)
     if not path.exists():
@@ -74,16 +78,16 @@ def last_point(path: Path | str) -> EquityPoint | None:
     lines = tail.splitlines()
     if size > _TAIL_BYTES:
         lines = lines[1:]                       # 第一行可能被截断
-    for line in reversed(lines):
-        if line.strip():
-            point = _parse(line)
-            if point is not None:
-                return point
+    points = [pt for pt in (_parse(line) for line in lines if line.strip()) if pt is not None]
+    if points and all(a.ts < b.ts for a, b in zip(points, points[1:])):
+        return points[-1]
     full = read(path).records
     return full[-1] if full else None
 
 
 def append(path: Path | str, ts: datetime, equity: float) -> None:
+    """追加一条。**单写者约定**:同一文件只能由一个进程写(F-b 接线时由交易进程独占,进程锁保证),
+    否则两个进程可能同时通过递增检查。"""
     if not _finite_number(equity):
         raise ValueError(f"权益必须是有限数值:{equity!r}")
     path = Path(path)

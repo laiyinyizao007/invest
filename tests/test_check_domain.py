@@ -410,6 +410,9 @@ def test_critical_defense_files_are_never_downgrade() -> None:
         "risk/holdout_guard.py",
         "risk/accounting/attribution.py",
         "risk/accounting/settlement.py",
+        "risk/accounting/equity_history.py",
+        "risk/accounting/slippage.py",
+        "tools/build_trading_calendar.py",
     ]
     for path in critical:
         assert cd.classify(path)[0] == "never_downgrade", path

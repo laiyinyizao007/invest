@@ -114,7 +114,7 @@ def validate_roll(live_vt_symbol: str, rolls: list[dict], *, data_end: date, day
     if product_of(live_vt_symbol) != product_of(expected):
         return RollCheck(MISMATCH, expected, f"实盘合约 {live_vt_symbol} 与换月记录的品种不同(记录主力 {expected})")
     want = sina_to_ctp(expected)
-    if live_vt_symbol.strip().lower() != want.lower():
+    if live_vt_symbol.strip() != want:                 # 精确比较(DCE 小写、CZCE 大写是 CTP 规范),只容忍首尾空白
         return RollCheck(MISMATCH, expected, f"实盘合约 {live_vt_symbol} 不是当前主力 {expected}({want}):请确认是否已换月")
     return RollCheck(OK, expected, f"实盘合约 {live_vt_symbol} 与当前主力 {expected} 一致")
 
@@ -132,7 +132,17 @@ def load_rolls_csv(path: Path | str) -> list[dict]:
             rec = {"date": date.fromisoformat(row["date"]), "from": row["from"].strip(), "to": row["to"].strip()}
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise RollDataError(f"{path} 第 {i} 行格式不对:{row}") from exc
+        for code in (rec["from"], rec["to"]):
+            m = _SINA_RE.match(code)
+            if not m or m.group(1).upper() not in SESSIONS:
+                raise RollDataError(f"{path} 第 {i} 行合约代码无效或品种不在时段表:{code!r}")
+        if product_of(rec["from"]) != product_of(rec["to"]):
+            raise RollDataError(f"{path} 第 {i} 行跨品种换月:{rec['from']} → {rec['to']}")
+        if contract_expiry(rec["to"]) <= contract_expiry(rec["from"]):
+            raise RollDataError(f"{path} 第 {i} 行没有换到更远月:{rec['from']} → {rec['to']}(主力只向前换)")
         if out:
+            if product_of(rec["from"]) != product_of(out[0]["from"]):
+                raise RollDataError(f"{path} 第 {i} 行品种与前面的记录不同")
             if rec["date"] <= out[-1]["date"]:
                 raise RollDataError(f"{path} 第 {i} 行日期没有递增:{rec['date']}")
             if rec["from"] != out[-1]["to"]:

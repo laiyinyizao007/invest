@@ -81,7 +81,10 @@ def _load(path: Path) -> list[dict]:
         if not isinstance(data, list):
             raise ValueError("顶层必须是列表")
         for e in data:
-            date.fromisoformat(e["start"]), date.fromisoformat(e["end"])
+            start, end = date.fromisoformat(e["start"]), date.fromisoformat(e["end"])
+            # 语义也要对:倒置、起点不在封存段、sha 不完整的记录说明台账被人改坏了
+            if start > end or not is_sealed(start) or not _SHA_RE.match(str(e.get("sha256", ""))):
+                raise ValueError(f"记录语义无效:{e}")
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise LedgerError(f"留出段台账无法读取,拒绝继续(fail-closed):{path}:{exc}") from exc
     return data

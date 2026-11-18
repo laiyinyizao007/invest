@@ -56,7 +56,7 @@ def test_failures_never_raise_and_are_counted():
     assert s.beat({}) is False and s.consecutive_failures == 2
 
 
-def test_failure_does_not_consume_the_interval_and_success_resets_counter():
+def test_failure_waits_only_the_retry_backoff_and_success_resets_counter():
     calls, clock = {"n": 0}, Clock()
 
     def flaky(url, body):
@@ -65,8 +65,8 @@ def test_failure_does_not_consume_the_interval_and_success_resets_counter():
             raise OSError("once")
     s = make(flaky, clock=clock)
     assert s.beat({}) is False
-    clock.t += 1
-    assert s.beat({}) is True and s.consecutive_failures == 0      # 失败后不必等满间隔再重试
+    clock.t += hb.RETRY_SECONDS
+    assert s.beat({}) is True and s.consecutive_failures == 0      # 失败后只需等退避时间,不必等满间隔
 
 
 def test_response_body_is_never_interpreted():
@@ -90,3 +90,49 @@ def test_rejects_unsafe_configuration(kwargs):
 
 def test_loopback_http_is_allowed_for_local_relay():
     hb.HeartbeatSender("http://127.0.0.1:9000/ping", interval_seconds=30, post=lambda u, b: None)
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex 39/50)复现后补的回归
+
+def test_unserializable_status_never_raises():
+    """High:payload 的脱敏/序列化原先在 try 之外,循环引用会把 RecursionError 抛给交易进程。"""
+    s = make(lambda url, body: None)
+    status = {}
+    status["self"] = status
+    assert s.beat(status) is False and s.consecutive_failures == 1
+
+
+def test_non_string_and_numeric_secrets_are_redacted():
+    """Medium:数字型敏感值(如账户号)在值里是整数时原先不脱敏;非字符串 secret 原先会让 redact 抛 TypeError。"""
+    from notify.redact import redact, redact_obj
+    assert redact("账户 12345678", [12345678]) == "账户 ***"
+    assert redact_obj({"account": 12345678, "ratio": 1.5, "ok": True}, ["12345678"]) == {"account": "***", "ratio": 1.5, "ok": True}
+    sent = []
+    s = hb.HeartbeatSender("https://hb.example.com/ping", secrets=[12345678], post=lambda u, b: sent.append(b))
+    assert s.beat({"account": 12345678}) is True and b"12345678" not in sent[0]
+
+
+def test_redirects_are_not_followed():
+    """Medium:默认 urlopen 会跟随重定向,构造时的 https/回环限制就失效了。"""
+    import urllib.request
+    opener = hb._build_opener()
+    assert not any(isinstance(h, urllib.request.HTTPRedirectHandler) and type(h) is urllib.request.HTTPRedirectHandler
+                   for h in opener.handlers)
+    req = urllib.request.Request("https://a.example.com/x", data=b"{}", method="POST")
+    redirect = hb._NoRedirect()
+    with pytest.raises(Exception):
+        redirect.redirect_request(req, None, 302, "Found", {}, "https://evil.example.com/")
+
+
+def test_failed_send_backs_off_before_retrying():
+    """Low:失败后原先下一次调用立即重试,高频调用会形成重试风暴;现在至少隔 RETRY_SECONDS。"""
+    clock = Clock()
+
+    def boom(url, body):
+        raise OSError("down")
+    s = make(boom, clock=clock)
+    assert s.beat({}) is False and s.consecutive_failures == 1
+    clock.t += 1
+    assert s.beat({}) is False and s.consecutive_failures == 1      # 退避期内不发送
+    clock.t += hb.RETRY_SECONDS
+    assert s.beat({}) is False and s.consecutive_failures == 2

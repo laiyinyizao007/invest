@@ -23,6 +23,13 @@ class ProductCost:
     size: float             # 合约乘数(吨/手)
     pricetick: float        # 最小变动价位
 
+    def __post_init__(self):
+        values = (self.fee_per_lot, self.size, self.pricetick)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values):
+            raise ValueError(f"费率参数必须是有限数值:{values}")
+        if self.fee_per_lot < 0 or self.size <= 0 or self.pricetick <= 0:
+            raise ValueError(f"手续费不得为负,合约乘数与最小变动价位必须为正:{values}")
+
 
 @dataclass(frozen=True)
 class Fill:

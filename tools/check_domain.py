@@ -138,6 +138,7 @@ NEVER_DOWNGRADE = (
     # 阶段 F-a(Issue #54)的实盘就绪模块:交易日/熔断日界线、启动换月校验、行情准入、对账结论
     "risk/sessions.py",
     "config/trading_calendar.json",
+    "tools/build_trading_calendar.py",   # 日历的唯一生成者:「只许延长」的校验在它里面
     "risk/roll.py",
     "risk/tick_filter.py",
     "risk/accounting/",

@@ -13,7 +13,9 @@ def redact(text: str, secrets: Iterable[str]) -> str:
 
     长值优先替换，避免短密钥是长密钥前缀时留下后缀。
     """
-    for secret in sorted({s for s in secrets if s and len(s) >= 3}, key=len, reverse=True):
+    # 非字符串的敏感值(如整数账户号)先转成字符串再比对——直接忽略会漏脱敏,直接用会让 str.replace 抛 TypeError
+    names = {str(s) for s in secrets if s is not None and not isinstance(s, bool)}
+    for secret in sorted({s for s in names if len(s) >= 3}, key=len, reverse=True):
         text = text.replace(secret, "***")
     return text
 
@@ -56,7 +58,7 @@ def redact_obj(value, secrets: Iterable[str]):
     - dict 的**键**也可能含密钥(_redact_key);
     - 非 JSON 标量(datetime、Decimal、自定义对象…)最终会被 `json.dumps(default=str)`
       转成字符串 —— 必须**先转成字符串再脱敏**,否则 `str(obj)` 里带的密码会原样发出去;
-    - 数字、布尔、None 原样保留(转成字符串会改变语义,也可能引入无意义的信息泄漏)。
+    - 布尔、None 原样保留;数字只有在其 JSON 形态命中敏感值时才替换(如整型账户号),其余原样保留。
     """
     if isinstance(value, str):
         return redact(value, secrets)
@@ -64,8 +66,13 @@ def redact_obj(value, secrets: Iterable[str]):
         return {_redact_key(k, secrets): redact_obj(v, secrets) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [redact_obj(v, secrets) for v in value]
-    if value is None or isinstance(value, (int, float, bool)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        # 数字值恰好等于某个敏感值(如整型账户号)时,按 JSON 形态比对后脱敏;其余数字原样保留
+        canonical = json.dumps(value)
+        safe = redact(canonical, secrets)
+        return safe if safe != canonical else value
     # 其它类型最终会被 json.dumps(default=str) 转成字符串:先转再脱敏,顺序不能反。
     try:
         text = str(value)

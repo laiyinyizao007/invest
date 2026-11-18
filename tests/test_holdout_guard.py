@@ -91,7 +91,13 @@ def test_record_use_rejects_bad_requests(tmp_path, start, end, sha):
         h.record_use(start, end, sha256=sha, path=tmp_path / "l.json")
 
 
-@pytest.mark.parametrize("body", ["{", '{"a": 1}', '[{"start": "bad", "end": "2026-07-01"}]'])
+@pytest.mark.parametrize("body", [
+    "{", '{"a": 1}', '[{"start": "bad", "end": "2026-07-01"}]',
+    # G8 第 2 轮:语义无效的记录原先也被接受
+    '[{"start": "2026-12-01", "end": "2026-07-01", "sha256": "%s"}]' % ("a" * 64),     # 倒置
+    '[{"start": "2026-06-01", "end": "2026-07-01", "sha256": "%s"}]' % ("a" * 64),     # 起点不在封存段
+    '[{"start": "2026-06-16", "end": "2026-07-01", "sha256": "abc"}]',                # sha 不完整
+])
 def test_corrupt_ledger_fails_closed(tmp_path, body):
     ledger = tmp_path / "l.json"
     ledger.write_text(body, encoding="utf-8")

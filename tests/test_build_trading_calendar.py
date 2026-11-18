@@ -136,3 +136,61 @@ def test_check_can_fail_on_coverage_warning(tmp_path):
     assert b.main(["--check", "--fail-on-warning", "--out", str(out)], fetch=None, today="2025-09-01") == 0     # 还早
     assert b.main(["--check", "--fail-on-warning", "--out", str(out)], fetch=None, today="2025-10-01") == 3     # 进入 30 天窗口
     assert b.main(["--check", "--out", str(out)], fetch=None, today="2025-10-01") == 0                         # 不加开关只告警
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex 39/50)复现后补的回归
+
+def test_fetch_failure_is_exit_code_2_not_a_conflict(tmp_path):
+    """Medium:数据源网络异常原先未捕获,Python 以退出码 1 结束,被定时任务误当成「与旧日期冲突」。"""
+    def boom():
+        raise ConnectionError("sina down")
+    assert b.main(["--out", str(tmp_path / "c.json")], fetch=boom, today="2026-11-17") == 2
+
+
+def test_deleting_the_committed_file_does_not_bypass_the_extend_only_rule(tmp_path, monkeypatch):
+    """Medium:原先只在文件存在时比较,删掉文件再生成就绕过了「只许延长」。现在缺文件时以 git 里的入库版本为基线。"""
+    out = tmp_path / "cal.json"
+    monkeypatch.setattr(b, "_git_baseline", lambda path: _cal(["2025-10-01"]))
+
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12))          # 数据源说 10/1 是交易日
+    args = ["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)]
+    assert b.main(args, fetch=fake, today="2026-11-17") == 1 and not out.exists()
+    assert b.main(args + ["--allow-changes"], fetch=fake, today="2026-11-17") == 0
+
+
+def test_manual_closures_are_merged_and_survive_regeneration(tmp_path):
+    """Medium:A 股日历表达不了交易所临时休市。允许人工追加休市日(只能加不能减,必须写原因),重新生成时保留。"""
+    out = tmp_path / "cal.json"
+
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12), HOLIDAYS)
+    args = ["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)]
+    assert b.main(args, fetch=fake, today="2026-11-17") == 0
+    data = json.loads(out.read_text(encoding="utf-8"))
+    data["manual_closed"] = [{"date": "2025-10-09", "reason": "交易所临时休市公告(示例)"}]
+    out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert s.load_calendar(out).status(date(2025, 10, 9)) == s.CLOSED
+    assert b.main(args, fetch=fake, today="2026-11-18") == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["manual_closed"][0]["date"] == "2025-10-09"
+
+
+@pytest.mark.parametrize("entry", [
+    {"date": "2025-10-09"},                                  # 没写原因
+    {"date": "2025-10-09", "reason": ""},
+    {"date": "2025-10-11", "reason": "周六"},                 # 周末
+    {"date": "2026-01-05", "reason": "区间外"},
+])
+def test_bad_manual_closures_are_rejected(entry):
+    payload = _cal(["2025-10-01"])
+    payload["manual_closed"] = [entry]
+    with pytest.raises(s.CalendarError):
+        s.calendar_from_dict(payload)
+
+
+@pytest.mark.parametrize("field", ["source", "fetched_at"])
+def test_metadata_must_be_present(field):
+    payload = _cal(["2025-10-01"])
+    payload[field] = ""
+    with pytest.raises(s.CalendarError):
+        s.calendar_from_dict(payload)

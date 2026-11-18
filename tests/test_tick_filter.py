@@ -89,3 +89,30 @@ def test_rules_must_be_positive(kwargs):
 def test_pricetick_must_be_positive():
     with pytest.raises(ValueError):
         tf.classify(Tick(), PREV, pricetick=0.0, rules=RULES)
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex 39/50)复现后补的回归
+
+@pytest.mark.parametrize("kwargs", [
+    dict(max_jump_pct=float("inf"), max_clock_skew_seconds=30.0),     # 无穷大阈值等于关掉检查
+    dict(max_jump_pct=0.03, max_clock_skew_seconds=float("nan")),
+])
+def test_rules_must_be_finite(kwargs):
+    with pytest.raises(ValueError):
+        tf.TickRules(**kwargs)
+
+
+def test_infinite_price_is_bad_not_an_exception():
+    v = tf.classify(replace(Tick(), last_price=float("inf")), PREV, pricetick=1.0, rules=RULES)
+    assert not v.ok and any("非正" in r for r in v.reasons)
+
+
+@pytest.mark.parametrize("up,down", [(float("nan"), 2120.0), (2480.0, float("inf")), (2120.0, 2480.0)])
+def test_broken_limit_data_is_bad_not_silently_skipped(up, down):
+    v = tf.classify(replace(Tick(), limit_up=up, limit_down=down), PREV, pricetick=1.0, rules=RULES)
+    assert not v.ok and any("涨跌停数据异常" in r for r in v.reasons)
+
+
+def test_pricetick_must_be_finite():
+    with pytest.raises(ValueError):
+        tf.classify(Tick(), PREV, pricetick=float("inf"), rules=RULES)

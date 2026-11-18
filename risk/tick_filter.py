@@ -22,8 +22,9 @@ class TickRules:
     max_clock_skew_seconds: float    # 交易所时间与本地接收时间的最大偏差
 
     def __post_init__(self):
-        if not self.max_jump_pct > 0 or not self.max_clock_skew_seconds > 0:
-            raise ValueError("阈值必须为正数")
+        for v in (self.max_jump_pct, self.max_clock_skew_seconds):
+            if not (isinstance(v, (int, float)) and math.isfinite(v) and v > 0):
+                raise ValueError(f"阈值必须是正的有限数(无穷大等于关掉检查):{v!r}")
 
 
 @dataclass(frozen=True)
@@ -33,16 +34,20 @@ class TickVerdict:
 
 
 def classify(tick, prev, *, pricetick: float, rules: TickRules) -> TickVerdict:
-    if not pricetick > 0:
-        raise ValueError("pricetick 必须为正数")
+    if not (isinstance(pricetick, (int, float)) and math.isfinite(pricetick) and pricetick > 0):
+        raise ValueError(f"pricetick 必须是正的有限数:{pricetick!r}")
     reasons: list[str] = []
     price = tick.last_price
-    if not isinstance(price, (int, float)) or math.isnan(price) or price <= 0:
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
         reasons.append(f"价格非正或非数:{price!r}")
         return TickVerdict(False, tuple(reasons))            # 后续检查都依赖有效价格
 
     up, down = getattr(tick, "limit_up", 0) or 0, getattr(tick, "limit_down", 0) or 0
-    if (up > 0 and price > up + _EPS) or (down > 0 and price < down - _EPS):
+    # 0/None 表示交易所没给涨跌停,跳过;给了就必须是有限数且 跌停 <= 涨停,否则涨跌停数据本身就坏了(NaN 比较恒为假会静默放行)
+    limits_given = [x for x in (up, down) if x]
+    if any(not math.isfinite(x) for x in limits_given) or (up and down and down > up):
+        reasons.append(f"涨跌停数据异常:跌停 {down!r},涨停 {up!r}")
+    elif (up > 0 and price > up + _EPS) or (down > 0 and price < down - _EPS):
         reasons.append(f"价格 {price} 越过涨跌停 [{down}, {up}]")
 
     steps = price / pricetick

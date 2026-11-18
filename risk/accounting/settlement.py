@@ -19,9 +19,13 @@ class PositionDiff:
 def _normalize(rows: dict) -> dict:
     out: dict = {}
     for (symbol, side), volume in rows.items():
+        if isinstance(volume, bool) or not isinstance(volume, int) or volume < 0:
+            raise ValueError(f"手数必须是非负整数:{symbol} {side} {volume!r}(小数会被截断、负数无意义,一律拒绝)")
+        if side not in ("long", "short"):
+            raise ValueError(f"持仓方向必须是 long/short:{side!r}")
         if volume:
             key = (symbol.strip().lower(), side)
-            out[key] = out.get(key, 0) + int(volume)
+            out[key] = out.get(key, 0) + volume
     return out
 
 

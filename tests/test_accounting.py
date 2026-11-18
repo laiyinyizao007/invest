@@ -169,3 +169,46 @@ def test_slippage_in_ticks_adverse_positive():
 def test_slippage_unfilled_orders_are_ignored():
     rep = sl.compare([sl.OrderRef("o1", "buy", 2300.0, pricetick=1.0)], {})
     assert rep.rows == [] and rep.mean_ticks is None
+
+
+# ---------------------------------------------------------------- G8 第 2 轮(codex 39/50)复现后补的回归
+
+def test_append_after_an_out_of_order_tail_line_is_refused(tmp_path):
+    """High:last_point 原先只找最后一条可解析的行、不管它是否递增,于是乱序行之后还能追加,
+    而 read() 会把新记录当乱序跳过——新写的权益悄悄丢了。现在 last_point 与 read() 同一套接受规则。"""
+    p = tmp_path / "equity.jsonl"
+    eh.append(p, datetime(2026, 1, 2), 1.0)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": "2026-01-01T00:00:00", "equity": 2.0}) + "\n")
+    assert eh.last_point(p).ts == datetime(2026, 1, 2)
+    with pytest.raises(ValueError):
+        eh.append(p, datetime(2026, 1, 1, 12), 3.0)
+    eh.append(p, datetime(2026, 1, 3), 3.0)
+    assert eh.read(p).records[-1].equity == 3.0
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(fee_per_lot=float("nan"), size=10, pricetick=1.0),
+    dict(fee_per_lot=-1.0, size=10, pricetick=1.0),
+    dict(fee_per_lot=1.0, size=0, pricetick=1.0),
+    dict(fee_per_lot=1.0, size=10, pricetick=0.0),
+])
+def test_product_cost_validation(kwargs):
+    with pytest.raises(ValueError):
+        at.ProductCost(**kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(order_id="o", side="hold", reference_price=1.0, pricetick=1.0),
+    dict(order_id="o", side="buy", reference_price=1.0, pricetick=0.0),
+    dict(order_id="o", side="buy", reference_price=float("nan"), pricetick=1.0),
+])
+def test_order_ref_validation(kwargs):
+    with pytest.raises(ValueError):
+        sl.OrderRef(**kwargs)
+
+
+@pytest.mark.parametrize("volume", [1.9, -1, "2", True])
+def test_settlement_rejects_non_integer_or_negative_volumes(volume):
+    with pytest.raises(ValueError):
+        st.reconcile({("c2701.DCE", "long"): volume}, {})

@@ -151,7 +151,21 @@ def calendar_from_dict(raw) -> TradingCalendar:
         if not start <= d <= end:
             raise CalendarError(f"休市日 {d} 不在覆盖区间 {start}~{end} 内")
         closed.add(d)
-    return TradingCalendar(start, end, frozenset(closed), str(raw.get("source", "")), str(raw.get("fetched_at", "")))
+    # 人工追加的休市日:A 股日历表达不了交易所临时休市/品种级安排。只能加不能减(加休市只会让系统更保守),必须写原因。
+    manual = raw.get("manual_closed", [])
+    if not isinstance(manual, list):
+        raise CalendarError("manual_closed 必须是列表")
+    for entry in manual:
+        if not isinstance(entry, dict) or not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            raise CalendarError(f"manual_closed 每一项都必须有日期与非空原因:{entry!r}")
+        d = _parse_date(entry.get("date"), "manual_closed.date")
+        if d.weekday() >= 5 or not start <= d <= end:
+            raise CalendarError(f"人工休市日 {d} 必须是覆盖区间 {start}~{end} 内的工作日")
+        closed.add(d)
+    source, fetched_at = raw.get("source"), raw.get("fetched_at")
+    if not (isinstance(source, str) and source.strip() and isinstance(fetched_at, str) and fetched_at.strip()):
+        raise CalendarError("缺少数据来源 source 或抓取日期 fetched_at:日历必须可追溯")
+    return TradingCalendar(start, end, frozenset(closed), source, fetched_at)
 
 
 def load_calendar(path: Path | str = DEFAULT_CALENDAR) -> TradingCalendar:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -85,6 +86,16 @@ def _fetch_akshare() -> list[date]:
     return [d if isinstance(d, date) else date.fromisoformat(str(d)[:10]) for d in ak.tool_trade_date_hist_sina()["trade_date"]]
 
 
+def _git_baseline(path: Path) -> dict | None:
+    """入库版本(git HEAD 里的同一路径)。文件被删掉或改名时用它做比较基线,堵住「删文件绕过只许延长」;取不到返回 None。"""
+    try:
+        rel = path.resolve().relative_to(ROOT).as_posix()
+        out = subprocess.run(["git", "-C", str(ROOT), "show", f"HEAD:{rel}"], capture_output=True, timeout=30)
+        return json.loads(out.stdout.decode("utf-8")) if out.returncode == 0 else None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None
+
+
 def _write_atomic(path: Path, payload: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
@@ -129,19 +140,38 @@ def main(argv: list[str] | None = None, fetch: Callable[[], Iterable[date]] | No
 
     try:
         days = list(fetch())
+    except Exception as exc:                      # noqa: BLE001  数据源不可用(网络等)是退出码 2,不能被当成「冲突」
+        print(f"[错误] 数据源不可用:{type(exc).__name__}: {exc}")
+        return 2
+    try:
         end = args.end or max(days)
         new = build(days, args.start, end, source=SOURCE, fetched_at=today_s)
     except (CalendarBuildError, ValueError) as exc:
         print(f"[错误] {exc}")
         return 2
+    old = None
     if args.out.exists():
         try:
             old = json.loads(args.out.read_text(encoding="utf-8"))
-            found = conflicts(old, new)
-        except (ValueError, sessions.CalendarError) as exc:
-            print(f"[错误] 现有文件不合法,无法比较:{exc}(人工核对后删除再生成)")
+        except ValueError as exc:
+            print(f"[错误] 现有文件不合法,无法比较:{exc}")
             return 2
-        if not found and old.get("coverage") == new["coverage"] and old.get("closed_weekdays") == new["closed_weekdays"]:
+    else:
+        old = _git_baseline(args.out)
+        if old is not None:
+            print(f"[提示] {args.out} 不存在,以 git 里的入库版本为比较基线")
+    if old is not None:
+        if old.get("manual_closed"):
+            new["manual_closed"] = old["manual_closed"]          # 人工追加的休市日原样保留
+        try:
+            sessions.calendar_from_dict(new)
+            found = conflicts(old, new)
+        except sessions.CalendarError as exc:
+            print(f"[错误] 无法与上一版比较:{exc}")
+            return 2
+        unchanged = (old.get("coverage") == new["coverage"] and old.get("closed_weekdays") == new["closed_weekdays"]
+                     and old.get("manual_closed", []) == new.get("manual_closed", []))
+        if not found and args.out.exists() and unchanged:
             print(f"[无变化] {args.out}:覆盖 {new['coverage']['start']}~{new['coverage']['end']},未写入")
             return 0
         if found and not args.allow_changes:
