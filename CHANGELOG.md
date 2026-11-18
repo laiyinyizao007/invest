@@ -43,6 +43,11 @@
   `tests/test_check_domain.py` 逐个点名;`check_mutations --verify` 11 种变异全部被抓住。结构化脱敏 `redact_obj` 从
   `notify/webhook.py` 移到 `notify/redact.py`(webhook 重新导出保持兼容),使心跳模块不依赖 requests(研究侧 CI 不装它)。
   新测试与生成脚本纳入 CI 的 ruff 与研究侧 pytest 清单;新模块覆盖率合计 95%。
+- **交易日历自动更新提醒**(Issue #54):新增 `.github/workflows/trading-calendar.yml`,每天北京时间 09:30 用 AKShare
+  (**钉 `akshare==1.20.36`**,只在生成时安装,运行时不依赖)拉取交易日并运行生成脚本:出现新数据开 PR **由人核对合并**、
+  与已有日期冲突开 Issue、覆盖进入到期前 30 天且无待合并 PR 时开 Issue 提醒;同一事项按标题去重;**从不直接改写 main 上的入库文件**。
+  生成脚本配套:内容没变时不写文件(避免每天一个空 PR)、`--check --fail-on-warning` 在 30 天窗口内以退出码 3 返回。
+  限制:GITHUB_TOKEN 开的 PR 不会自动触发其它工作流,合并前需手动重跑检查;工作流的 shell 逻辑要在合并后用 workflow_dispatch 实跑一次验证。
 - **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
   (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。
   自愈层用**用户级守护进程**(每 10 分钟 `ensure`;Windows 计划任务注册被拒 `0x80070005 Access Denied`),

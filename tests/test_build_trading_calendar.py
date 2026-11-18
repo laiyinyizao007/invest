@@ -111,3 +111,28 @@ def test_cli_check_survives_a_non_utf8_console():
     r = subprocess.run([sys.executable, str(script), "--check"], capture_output=True, env=env, timeout=60)
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")
     assert "OK" in r.stdout.decode("utf-8", "replace")
+
+
+def test_unchanged_data_does_not_rewrite_the_file(tmp_path):
+    """内容没变时不写文件(否则抓取日期每天都变,定时任务会每天开一个空 PR)。"""
+    out = tmp_path / "cal.json"
+
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12), HOLIDAYS)
+    args = ["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)]
+    assert b.main(args, fetch=fake, today="2026-11-17") == 0
+    before = out.read_bytes()
+    assert b.main(args, fetch=fake, today="2026-11-18") == 0
+    assert out.read_bytes() == before                                  # fetched_at 仍是第一次的
+
+
+def test_check_can_fail_on_coverage_warning(tmp_path):
+    out = tmp_path / "cal.json"
+
+    def fake():
+        return weekdays(date(2025, 9, 29), date(2025, 10, 12), HOLIDAYS)
+    b.main(["--start", "2025-09-29", "--end", "2025-10-12", "--out", str(out)], fetch=fake, today="2025-09-01")
+    assert b.main(["--check", "--out", str(out)], fetch=None, today="2025-09-01") == 0
+    assert b.main(["--check", "--fail-on-warning", "--out", str(out)], fetch=None, today="2025-09-01") == 0     # 还早
+    assert b.main(["--check", "--fail-on-warning", "--out", str(out)], fetch=None, today="2025-10-01") == 3     # 进入 30 天窗口
+    assert b.main(["--check", "--out", str(out)], fetch=None, today="2025-10-01") == 0                         # 不加开关只告警

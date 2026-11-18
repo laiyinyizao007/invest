@@ -7,10 +7,12 @@
     python tools/build_trading_calendar.py                  # 拉取并更新(只允许延长覆盖区间)
     python tools/build_trading_calendar.py --allow-changes  # 数据源改动了已有日期时,人工核对后才用
     python tools/build_trading_calendar.py --check          # 只校验现有文件并显示覆盖告警(不联网)
+    python tools/build_trading_calendar.py --check --fail-on-warning   # 进入到期前 30 天窗口时以退出码 3 返回
 
-退出码:0 成功 / 1 与上一版冲突(未写入)/ 2 数据或文件不合法。
+退出码:0 成功(内容没变时不写文件)/ 1 与上一版冲突(未写入)/ 2 数据或文件不合法 / 3 覆盖即将到期(仅 --fail-on-warning)。
 
-每年交易所公布来年休市安排后运行一次;覆盖结束前 30 天起,risk/sessions.py 会给出告警。
+每年交易所公布来年休市安排后需更新一次。`.github/workflows/trading-calendar.yml` 每天自动拉取:
+出现新数据就开 PR 由人确认合并,与旧日期冲突或覆盖即将到期就开 Issue 提醒——**从不直接改写入库文件**。
 """
 from __future__ import annotations
 
@@ -107,6 +109,7 @@ def main(argv: list[str] | None = None, fetch: Callable[[], Iterable[date]] | No
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--allow-changes", action="store_true", help="允许改动已有日期(须先人工核对官方公告)")
     ap.add_argument("--check", action="store_true", help="只校验现有文件,不联网")
+    ap.add_argument("--fail-on-warning", action="store_true", help="与 --check 合用:覆盖即将到期时以退出码 3 返回")
     args = ap.parse_args(argv)
     today_s = today or date.today().isoformat()
 
@@ -120,6 +123,8 @@ def main(argv: list[str] | None = None, fetch: Callable[[], Iterable[date]] | No
         warning = cal.coverage_warning(date.fromisoformat(today_s))
         if warning:
             print(f"[告警] {warning}")
+            if args.fail_on_warning:
+                return 3
         return 0
 
     try:
@@ -136,6 +141,9 @@ def main(argv: list[str] | None = None, fetch: Callable[[], Iterable[date]] | No
         except (ValueError, sessions.CalendarError) as exc:
             print(f"[错误] 现有文件不合法,无法比较:{exc}(人工核对后删除再生成)")
             return 2
+        if not found and old.get("coverage") == new["coverage"] and old.get("closed_weekdays") == new["closed_weekdays"]:
+            print(f"[无变化] {args.out}:覆盖 {new['coverage']['start']}~{new['coverage']['end']},未写入")
+            return 0
         if found and not args.allow_changes:
             print("[拒绝] 新数据改动了已有日期,未写入。核对官方公告后用 --allow-changes 重跑:")
             for line in found:
