@@ -159,3 +159,5 @@ A 与 B 相互独立,各自提交(`ref #57`),同一个 PR。
   - A5 原写「登记进 `tools/check_mutations.py`」——该脚本只管分档清单,不适用;改为当场变异验证(删 DEVNULL ⇒ A1、A2 变红)并记入 CHANGELOG;
   - 启动脚本的模型密钥改为只从 Desktop 凭据读 `MINIMAX_CN_API_KEY` 一项(用户要求「直接用 DSH 配的模型」);
   - 严格模式下「模型实际可见工具」的真实会话枚举未做(用户改走 Desktop),登记为残留。
+  - A2 原写「自造『被阻塞读的管道』夹具」——匿名管道与 asyncio(overlapped)管道两种夹具在未修复代码上都**复现不出**卡死;改为 MCP 官方 stdio 客户端跑真实会话(仅 Windows),修复前 32.6 s 失败、修复后通过。
+- 2026-11-19 G8 第 1 轮(codex A 41/50、B 39/50,无 Critical)后修订:模板显式转发 `DSH_HOME`(H);检查器改为与模板逐字段比对、展开 `cordis:group`、白名单记 id → 包名并核对 dsh-base 版本、拒绝非映射条目、递归查嵌套 MCP;日常 Desktop 的脱敏组装结果入库作回归夹具;ADR 旧段落标为历史快照。TOCTOU(检查与启动之间)登记为残留。

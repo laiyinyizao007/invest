@@ -63,6 +63,9 @@
                 BISHENG_OPENAPI_KEY: !!js process.env.BISHENG_OPENAPI_KEY
                 BISHENG_BASE_URL: !!js process.env.BISHENG_BASE_URL
                 BISHENG_WORKFLOW_ID: !!js process.env.BISHENG_WORKFLOW_ID
+                # DSH 给子进程的环境会剔除**所有 `DSH_*`**(dsh-subprocess 的 scrubbedParentEnv),
+                # research-mcp 要靠它判断自己是否在严格模式的专用 DSH_HOME 下,必须显式转发(Issue #57)。
+                DSH_HOME: !!js process.env.DSH_HOME
               startupTimeoutMs: 60000
               # 最坏情况:一次研究要 2 轮毕昇回测,每轮上限 900 秒,加上审批等待余量。
               # 低于 2×900 秒会让长研究被工具层超时掐断(表现为「研究失败」而不是真的失败)。

@@ -752,3 +752,9 @@ def test_server_still_serves_outside_the_dedicated_home_but_says_so(tmp_path):
                           stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-500:]
     assert "严格模式" in proc.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("value", ["undefined", "null", "  ", "Undefined"])
+def test_deployment_treats_js_undefined_as_missing(value):
+    """模板写的是 `process.env.DSH_HOME`(守卫不许字面量兜底):日常 Desktop 没设它时,DSH 传来的是字符串 "undefined"。"""
+    assert "没有 DSH_HOME" in mcp_server.deployment_problem({"DSH_HOME": value})

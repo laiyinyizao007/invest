@@ -1929,8 +1929,10 @@ def test_the_rendered_preset_references_secrets_only_through_the_environment():
     config = _load_preset()[0]["insert"][0]["config"]
     mcp = next(p for p in config["plugins"] if p["id"] == "research-mcp")["config"]
     env = mcp["env"]
+    # DSH_HOME(Issue #57):DSH 给子进程的环境会剔除所有 DSH_*,research-mcp 要靠它判断是否在严格模式下,
+    # 必须显式转发;它同样只能是环境变量引用(下面的逐值检查对它一视同仁)。
     assert set(env) == {"INVEST_ROOT", "BISHENG_OPENAPI_KEY",
-                        "BISHENG_BASE_URL", "BISHENG_WORKFLOW_ID"}
+                        "BISHENG_BASE_URL", "BISHENG_WORKFLOW_ID", "DSH_HOME"}
     for key, value in env.items():
         assert "process.env." in value, f"{key} must be an env reference: {value!r}"
         # 每一段兜底都只能是环境变量或工作目录,**不许出现明文字面量**:

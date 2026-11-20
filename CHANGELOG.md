@@ -3158,7 +3158,7 @@ ADR 的保留字清单补齐 `FORBIDDEN_STRINGS`/`UNSAFE_BUILTINS`/`EXTRA_FORBID
   模型实测拿到 130+ 个工具(终端、桌面操控、子代理……),并曾用终端绕开 MCP 拉起批准页、把绕法写进记忆
   (已清理;**未发生自批**,批准账本未变)。新增**严格模式**:`tools/research_mcp/start-research-dsh.ps1`
   在专用 DSH_HOME 启动,`profile_check.py` 以**白名单**核对实际组装结果(禁用内置 standard/ptc/minimal/cordis Preset),
-  不通过不启动;对日常 Desktop profile 判出 49 项。日常 Desktop 方式保留——**用户 2026-11-19 明确接受其风险**
+  并要求 research Preset 与仓库模板**逐字段相同**、展开 `cordis:group` 逐个判子条目、核对 dsh-base 版本,不通过不启动;对日常 Desktop profile(脱敏夹具入库作回归)判出 54 项。日常 Desktop 方式保留——**用户 2026-11-19 明确接受其风险**
   (「只有人能批准」在那里是「不该做 + 有记录」,不是「做不到」),research-mcp 只在本机 stderr 提示。
 - 账号、密码、AuthCode 仅放 `.env`(已 `.gitignore`),仓库只提供 `config/.env.example` 模板。
 - **演练脚本与实盘状态彻底隔离**:`scripts/drill.py` 用独立的 `.vntrader_drill/` 目录(策略数据、日志、心跳)与独立的

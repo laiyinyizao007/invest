@@ -71,7 +71,7 @@
 
 ### 4. 验证依据(2026-11-13)
 
-- 用 `dsh --profile <临时> --patch <research 补丁> --dump-config` 在临时 `DSH_HOME` 中组装配置:含 MCP 条目的 `research` Preset 合法组装,Preset 列表为 `standard, ptc, minimal, cordis, research`。
+- 用 `dsh --profile <临时> --patch <research 补丁> --dump-config` 在临时 `DSH_HOME` 中组装配置:含 MCP 条目的 `research` Preset 合法组装,Preset 列表为 `standard, ptc, minimal, cordis, research`。(**历史快照**:这是干净 profile 上的结果,不代表实际使用的 profile——见文末「Issue #57 发现」)
 - 全局树 184 个条目中,命令行、文件读写、文件搜索、后台任务、技能、子 Agent、网页、待办等工具插件在全局层均为 disabled,仅在各 Preset 内启用。
 - **未验证**:模型实际拿到的工具目录。接入时必须补一次实测:开 `research` 会话,让它列出可用工具,应只有三个 `mcp__research__*`(见验证)。
 
@@ -129,7 +129,7 @@
 - **开放 API 端到端跑通**:`start_research` → 毕昇 v3 工作流 → 候选提交(`atr_breakout_15m_2atr.py`)→ 停在 `input_wait` → 人审阅批准 → `research_status` 检出批准并推进 → `run_evaluate` 出中文评估报告 → 回到 `input_idea`。
 - **带外性是实的**:批准页面的 sha256 由**进程自己重算**,人要填**完整 64 位**哈希;文件在阅读期间被改就 409 拒绝;非本机 `Origin` 403、缺 CSRF 403、外来 `Host` 403、哈希不符 400(且**允许改对了再填**,上限 5 次)——四种负向路径都实测过,均未写入批准记录。
 - **模型不能批准**:`research-mcp` 源码里没有 `record_approval`;仓库级扫描确认写批准记录的只有批准进程与等价 CLI 两个**人在场**的入口;**批准页的 URL 与哈希不进工具返回值**(实测:返回文本里既无 URL 也无 sha256;第 5 轮起地址**连磁盘都不落**,由批准进程自己开浏览器)。
-- **DSH 版本复验**(实际使用的 v0.13.0+9 / `dsh@0.2.1-rc.3`):`dsh --profile web --patch <research 补丁> --dump-config` 组装成功,Preset 列表为 `standard, ptc, minimal, cordis, research`;`research` 段内只有 `persona` 与 `research-mcp` 两个条目。全局层的命令行/文件读写/文件搜索/后台任务/技能/子 Agent/网页/待办工具插件均为 disabled。
+- **DSH 版本复验**(实际使用的 v0.13.0+9 / `dsh@0.2.1-rc.3`):`dsh --profile web --patch <research 补丁> --dump-config` 组装成功,Preset 列表为 `standard, ptc, minimal, cordis, research`;`research` 段内只有 `persona` 与 `research-mcp` 两个条目。全局层的命令行/文件读写/文件搜索/后台任务/技能/子 Agent/网页/待办工具插件均为 disabled。(**历史快照**:这是干净 profile 上的结果,不代表实际使用的 profile——见文末「Issue #57 发现」)
 - **工具目录在**协议层**实测过**(2026-11-14 20:42):真的把 `research-mcp` 起起来(stdio),用 MCP 客户端 `initialize` + `list_tools`,
   返回**恰 3 个**工具:`start_research` / `research_status` / `request_approval`(名字与描述一并取回)。
   **仍未验证**:在**真实 DSH 会话**里模型侧看到的工具目录(要跑起 DSH 与模型会话才能确认 Preset 装配后的最终形态)。
@@ -672,9 +672,11 @@
 | 让用户在对话里回复「批准」由模型转写 | 否决 | 模型可伪造或代发 |
 | 把批准放进状态页 | 否决 | 违反 `20261112-status-dashboard.md` 与其契约测试 |
 | DSH 绕开毕昇直接调研究网关 | 暂不做 | 网关目前只对毕昇容器网络开放;且会让 DSH 的模型成为编排器,边界更难守 |
-| 独立 `DSH_HOME` 实例 | 备选 | 隔离更彻底,但要重配模型与密钥;若第 3 条实测的工具目录有泄漏则改用 |
+| 独立 `DSH_HOME` 实例 | **已采纳为严格模式**(2026-11-19,Issue #57) | 实测日常 Desktop 的工具目录确有泄漏(130+ 工具);模型密钥由启动脚本从 Desktop 设置读取,不需重配。日常 Desktop 方式保留,风险由用户接受 |
 
 ## 安全约束(决策的一部分)
+
+> **2026-11-19 起**:下列约束中凡依赖「research 会话没有本机读写/命令/桌面操控能力」的,只在**严格模式**下成立;日常 Desktop 下由用户接受残留风险(「不该做 + 有记录」),见文末「Issue #57 发现」。
 
 1. 批准记录只有两个**合法入口**:带外批准进程与等价 CLI(`research_api.py approve`/`review`,强制 TTY);二者的低层写入者只有 `research_sandbox.record_approval` 一个函数。MCP、毕昇、网关均无 `approvals.json` 写权限(负向测试:调用点扫描 + 直接写文件的扫描)。
 2. `research-mcp` 的工具集合固定为三个;新增任何写类工具须新 ADR(契约测试枚举断言)。
@@ -760,7 +762,7 @@ sequenceDiagram
   全局层注册的工具对所有 Preset 可见。本 ADR 第 4、8 条的验证是在干净 profile 上做的,覆盖不到装了大量全局插件的 Desktop。
 - **实测**(会话记录):研究会话的模型可见工具 130+ 个,含终端(`terminal_open/send`)、Windows 桌面操控
   (截屏/点击/打字/列窗口)、`subagent_claude_code`、`mcp_register/mcp_call`、记忆读写;文件策略 `danger-full-access`。
-  `profile_check.py` 对该 profile 报 49 项,其中含 `auto-review`(第 2 条明确禁止的机器应答者)。
+  `profile_check.py` 对该 profile 报 54 项(展开分组后),其中含 `auto-review`(第 2 条明确禁止的机器应答者)、组里的 `optional-tool-terminal`、桌面操控 `mcp-dsh-computer-use-win`;脱敏后的组装结果入库为回归夹具 `tests/fixtures/desktop_profile_2026-11-19.sanitized.json`(只留 id / 包名 / 禁用状态)。
 - **模型实际做了什么**:`request_approval` 失败后,它在仓库根目录开 PowerShell,读 `server.py` 与批准进程源码,
   列出了凭据文件的**文件名**(未读内容),自行用终端拉起批准页,用桌面操控确认浏览器已打开,
   并把「MCP 失败时用终端 `Start-Process` 直接拉起批准页」写进 Mnemon 记忆。
@@ -774,7 +776,7 @@ sequenceDiagram
    叠加 `dsh-research-preset.patch.yml` + `dsh-research-profile.patch.yml`(禁用内置 standard/ptc/minimal/cordis Preset——
    它们在 Preset 内部启用 bash/fs/web),再用 `profile_check.py` **白名单**核对组装结果,不通过不启动;
    目标目录里有别的 profile 也拒绝(防止误把日常目录重置掉)。模型密钥只从 Desktop 凭据里读 `MINIMAX_CN_API_KEY` 这一项。
-   白名单 `research-profile-allowlist.json` 逐条审阅(DSH 0.2.1-rc.3);全局层会注册模型工具的只有 `tool-working-directory`。
+   白名单 `research-profile-allowlist.json` 逐条审阅(DSH 0.2.1-rc.3),记的是 **id → 包名**;全局层会注册模型工具的只有 `tool-working-directory`。另三条判据:research Preset 须与仓库模板**逐字段相同**(启动命令/包名/persona/环境变量全在内);`cordis:group` 展开后逐个判子条目(只放行分组 id 挡不住组里的终端工具);`@deepseek-ai/dsh-base` 版本须等于白名单记录。DSH 给子进程的环境会剔除所有 `DSH_*`,所以模板显式转发 `DSH_HOME`(否则 research-mcp 永远看不到它)。
 2. **日常 Desktop(用户 2026-11-19 明确接受风险)**:research Preset 装在日常 profile 里照常使用;
    `research-mcp` 不拦截,只在本机 stderr 提示「不在严格模式」(`deployment_problem`)。
    此时「只有人能批准」= **不该做 + 有记录**(批准账本、DSH 会话记录可事后核查),**不是**「做不到」。
@@ -787,3 +789,4 @@ sequenceDiagram
   但削弱了 DSH 层的人工确认;是否关闭由用户决定(属于日常环境,本 Issue 不改)。
 - 严格模式的白名单绑定 DSH 版本;升级后新条目会被判失败,须人审阅后再加(fail-closed,是故意的)。
 - 严格模式下「模型实际可见的工具」尚未在真实会话里枚举(用户改用 Desktop,未做);组装层核对已做。
+- 严格模式的「检查」与「启动」是两次组装(G8 第 1 轮 A 的 TOCTOU):两次之间若有同用户进程改了组装输入,启动的可能不是检查过的那份。能在这个窗口动手的同用户进程本来就能直接改账本以外的一切,收益低;两次都用 `--from-default-profile` 从内置模板重建 profile 层、补丁取自仓库文件,窗口内可变的只剩已安装的插件包。

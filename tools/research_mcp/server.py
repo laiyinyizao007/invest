@@ -593,9 +593,10 @@ def _request_approval(strategy: str) -> str:
         # 这里只剩「没吐 ready 就退出」与「到时限仍无响应」——原先一律说「候选可能不存在」,误导排查。
         if exit_code is None:
             print(f"[research-mcp] 批准进程 {READY_TIMEOUT_SECONDS} 秒内无响应,已终止", file=sys.stderr)
-            return (f"批准进程无响应({READY_TIMEOUT_SECONDS} 秒内没有就绪),已终止。"
-                    "请让用户查看本机 MCP 日志,或在本机终端里重新拉起批准页。")
-        return f"批准进程未就绪即退出(退出码 {exit_code}),详细原因见本机 MCP 日志。"
+            # 文案是静态的,仍过一遍 redact_for_model:「所有工具返回都经清洗」这条不变量不留例外。
+            return redact_for_model(f"批准进程无响应({READY_TIMEOUT_SECONDS} 秒内没有就绪),已终止。"
+                                    "请让用户查看本机 MCP 日志,或在本机终端里重新拉起批准页。")
+        return redact_for_model(f"批准进程未就绪即退出(退出码 {exit_code}),详细原因见本机 MCP 日志。")
     # **页面地址不落盘、不进模型通道**(第 5 轮 codex 的 H1):
     # 批准进程自己开浏览器,URL 压根不离开那个进程;这里也就没有 URL 可写文件。
     # 之前把 URL 写进 `.local/research-mcp/approval-page.txt`,而那个文件只在
@@ -693,6 +694,9 @@ def deployment_problem(env=None) -> str | None:
     """
     env = os.environ if env is None else env
     home = (env.get("DSH_HOME") or "").strip()
+    # 模板里是 `!!js process.env.DSH_HOME`(守卫不许字面量兜底):没设时 DSH 传来的是字符串 "undefined"。
+    if home.lower() in ("undefined", "null"):
+        home = ""
     if not home:
         return ("没有 DSH_HOME:research-mcp 只在专用 research DSH_HOME 下提供服务,"
                 "请用 tools/research_mcp/start-research-dsh.ps1 启动。")
