@@ -1859,6 +1859,13 @@
     不存在"为了凑一个数去调阈值"的情况。
 
 ### Fixed（修复）
+- **DSH 里请求批准时批准进程启动即卡死**(Issue [#57](https://github.com/laiyinyizao007/invest/issues/57);
+  ADR [`20261113-dsh-research-entry-and-out-of-band-approval`](docs/adr/20261113-dsh-research-entry-and-out-of-band-approval.md)
+  「Issue #57 发现」):`tools/research_mcp/server.py` 拉起批准进程时没指定 `stdin`,子进程继承了 MCP 的
+  stdio 协议管道,Windows 上启动即卡死——不吐 ready、不退出、不报错,30 秒后报「批准进程没起来(候选可能不存在…)」。
+  修法:`stdin=subprocess.DEVNULL`;失败提示拆成「拒绝(含候选不存在)/ 未就绪即退出(带退出码)/ 无响应」三种。
+  新增 4 条测试,其中一条用 **MCP 官方 stdio 客户端**真实复现(仅 Windows;自造的「被阻塞读的管道」夹具复现不出,
+  已实测);删掉 `DEVNULL` 的变异使两条用例变红(当场验证)。
 - **CI 上 17 条变异「见证没红」的真正成因:陈旧的 `.pyc` 把变异吃掉了**(第 55 轮之十四之四;
   ADR `20261113-evolution-engine`「第 55 轮之十四之四」一节)。PR #32 的 `research` 关卡里,
   `tools/check_guard_mutations.py --verify` 报 17 条变异「见证没红」,而本机 155/155 全绿。

@@ -522,11 +522,14 @@ def _request_approval(strategy: str) -> str:
     env["INVEST_ROOT"] = str(ROOT)            # 批准进程读的是网关实际挂载的那棵目录树
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
+        # stdin **必须**是 DEVNULL(Issue #57):本服务跑在 stdio 上,自己的 stdin 是 DSH 的协议管道,
+        # SDK 的读线程一直阻塞在上面。不指定 stdin 时子进程会继承这条管道,Windows 上子进程
+        # 启动即卡死——不吐 ready、不退出、不报错,30 秒后这里只能报「没起来」(2026-11-19 实测)。
         proc = subprocess.Popen(
             [sys.executable, str(script), "--strategy", name, "--timeout", str(APPROVAL_WAIT_SECONDS),
              "--hide-url"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            cwd=str(CODE_ROOT), env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", cwd=str(CODE_ROOT), env=env,
         )
     except OSError as exc:
         return redact_for_model(f"拉不起批准进程:{exc}")
@@ -575,6 +578,7 @@ def _request_approval(strategy: str) -> str:
             error_event = ready
             break
     if not ready or ready.get("event") != "ready":
+        exit_code = proc.poll()               # 先取退出码再 kill:None = 到时限仍活着(无响应)
         proc.kill()
         if error_event:
             message = str(error_event.get("message") or "")
@@ -585,7 +589,13 @@ def _request_approval(strategy: str) -> str:
         # 只留在本机日志里。
         if err_lines:
             print("[research-mcp] 批准进程异常:" + err_lines[-1].strip(), file=sys.stderr)
-        return "批准进程没起来(候选可能不存在,或不在候选目录里)。"
+        # 三种失败分开说(Issue #57):「候选不存在」由批准进程的 error 事件报(上面那支);
+        # 这里只剩「没吐 ready 就退出」与「到时限仍无响应」——原先一律说「候选可能不存在」,误导排查。
+        if exit_code is None:
+            print(f"[research-mcp] 批准进程 {READY_TIMEOUT_SECONDS} 秒内无响应,已终止", file=sys.stderr)
+            return (f"批准进程无响应({READY_TIMEOUT_SECONDS} 秒内没有就绪),已终止。"
+                    "请让用户查看本机 MCP 日志,或在本机终端里重新拉起批准页。")
+        return f"批准进程未就绪即退出(退出码 {exit_code}),详细原因见本机 MCP 日志。"
     # **页面地址不落盘、不进模型通道**(第 5 轮 codex 的 H1):
     # 批准进程自己开浏览器,URL 压根不离开那个进程;这里也就没有 URL 可写文件。
     # 之前把 URL 写进 `.local/research-mcp/approval-page.txt`,而那个文件只在

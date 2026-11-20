@@ -455,6 +455,68 @@ def test_request_approval_passes_hide_url_to_the_approval_process(clean_state, m
     assert "--hide-url" in calls[0]
 
 
+def test_request_approval_detaches_stdin_from_the_approval_process(clean_state, monkeypatch):
+    """批准进程的 stdin 必须是 DEVNULL(Issue #57)。
+
+    MCP 跑在 stdio 上:它自己的 stdin 是 DSH 的协议管道,SDK 的读线程一直阻塞在上面读。
+    不指定 stdin 时子进程会**继承**这条管道,Windows 上子进程在启动阶段就卡住——
+    不吐 ready、不退出、不报错,MCP 等满 30 秒后报「没起来」(2026-11-19 实测复现)。
+    """
+    seen = []
+    ready = {"event": "ready", "strategy": "cand.py", "screening_passed": True, "findings": []}
+
+    def fake_popen(argv, **kwargs):
+        seen.append(kwargs)
+        return FakeApprovalProc(ready)
+
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", fake_popen)
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+
+    mcp_server._request_approval("cand.py")
+
+    assert seen, "没有拉起批准进程"
+    assert seen[0].get("stdin") is mcp_server.subprocess.DEVNULL
+
+
+class SilentApprovalProc(FakeApprovalProc):
+    """不吐任何一行 stdout 的批准进程:`alive=True` 表示一直不退出(卡住),否则立刻以 rc 退出。"""
+
+    def __init__(self, alive: bool, rc: int = 1):
+        super().__init__({})
+        self.stdout = []
+        self._alive = alive
+        self.returncode = None if alive else rc
+
+    def poll(self):
+        return None if self._alive else self.returncode
+
+
+def test_request_approval_says_unresponsive_when_the_child_hangs(clean_state, monkeypatch):
+    """子进程活着却一直不吐 ready ⇒ 提示「无响应」,不再误导成「候选可能不存在」(Issue #57)。"""
+    monkeypatch.setattr(mcp_server, "READY_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=True))
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+
+    out = mcp_server._request_approval("cand.py")
+
+    assert "无响应" in out
+    assert "候选可能不存在" not in out
+
+
+def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, monkeypatch):
+    """子进程没吐 ready 就退出 ⇒ 提示「已退出」并带退出码(原因细节只进本机 stderr)。"""
+    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=False, rc=3))
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+
+    out = mcp_server._request_approval("cand.py")
+
+    assert "退出" in out and "3" in out
+    assert "候选可能不存在" not in out
+
+
 def test_request_approval_only_approves_the_current_candidate(clean_state, monkeypatch):
     """不能拿批准流程去批别的文件:只能批本轮研究的候选。"""
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
@@ -553,3 +615,86 @@ def test_approval_state_requires_the_same_content_hash(clean_state, monkeypatch)
 def test_long_idea_is_rejected(clean_state):
     out = mcp_server._start_research("x" * (mcp_server.MAX_IDEA_LEN + 1))
     assert "太长" in out
+
+
+# ---------- Issue #57:stdio 父进程里拉起批准进程(真实子进程,仅 Windows) ----------
+
+_CANDIDATE = """from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+
+
+class Candidate(TrendAtr15mStrategy):
+    fast_window = 16
+
+    def entry_signal(self) -> int:
+        return 0
+"""
+
+# 包装脚本:原样运行 server.py(就是 DSH 拉起的那个 MCP 服务),只对**批准进程**的 argv 动两处——
+# 追加 `--no-browser`(测试不弹浏览器)、把 `--timeout` 缩到 3 秒(无人批准时快速收尾)。
+# Popen 的 kwargs(尤其 stdin)**原样**交给真正的 Popen:测的是生产代码怎么拉子进程。
+_WRAPPER = """
+import runpy, subprocess, sys
+_Real = subprocess.Popen
+
+
+class _Popen(_Real):
+    def __init__(self, argv, *a, **k):
+        if any("research_approval_server" in str(x) for x in argv):
+            argv = list(argv)
+            if "--timeout" in argv:
+                argv[argv.index("--timeout") + 1] = "3"
+            argv.append("--no-browser")
+        super().__init__(argv, *a, **k)
+
+
+subprocess.Popen = _Popen
+sys.argv = [sys.argv[1]]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="卡死依赖 Windows 上继承 overlapped 命名管道句柄的语义")
+def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
+    """Issue #57 的现场条件:research-mcp 跑在 stdio 上(stdin 是客户端的管道、SDK 正在读),
+    经 MCP 协议调用 `request_approval`,批准进程必须吐出 ready、批准页必须拉得起来。
+
+    修复前(2026-11-19 实测):30 秒后返回「批准进程没起来」——子进程继承 MCP 的 stdin,启动即卡死。
+    修复后:批准进程 stdin=DEVNULL ⇒ 数秒内拿到 ready,随后因无人批准 3 秒超时退出。
+
+    用 MCP 官方客户端而不是自造「有线程阻塞读的管道」夹具:后者**复现不出**这个卡死
+    (同一份未修复代码在匿名管道与 asyncio 管道夹具下都照常拿到 ready),只有真实 stdio 会话复现。
+    """
+    import asyncio
+    import os
+    import time
+
+    mcp_client = pytest.importorskip("mcp.client.stdio")
+    from mcp import ClientSession, StdioServerParameters
+
+    (tmp_path / "pending_strategies").mkdir()
+    (tmp_path / "pending_strategies" / "cand.py").write_text(_CANDIDATE, encoding="utf-8")
+    state = tmp_path / ".local" / "research-mcp"
+    state.mkdir(parents=True)
+    (state / "sessions.json").write_text(json.dumps({"current": {
+        "session_id": "s1", "idea": "x", "candidate": "cand.py",
+        "waiting_node": "input_wait", "waiting_message_id": 1}}), encoding="utf-8")
+    wrapper = tmp_path / "wrap_server.py"
+    wrapper.write_text(_WRAPPER, encoding="utf-8")
+    server_py = str(Path(mcp_server.__file__).resolve())
+    params = StdioServerParameters(command=sys.executable, args=[str(wrapper), server_py],
+                                   env=dict(os.environ, INVEST_ROOT=str(tmp_path)))
+
+    async def call() -> tuple[str, float]:
+        with open(tmp_path / "mcp_err.txt", "w", encoding="utf-8") as errlog:
+            async with mcp_client.stdio_client(params, errlog=errlog) as (r, w):
+                async with ClientSession(r, w) as session:
+                    await session.initialize()
+                    t0 = time.monotonic()
+                    res = await asyncio.wait_for(
+                        session.call_tool("request_approval", {"strategy": "cand.py"}), timeout=60)
+                    return res.content[0].text, time.monotonic() - t0
+
+    out, elapsed = asyncio.run(call())
+    assert "已在本机浏览器打开候选" in out, out
+    assert "没起来" not in out and "无响应" not in out, out
+    assert elapsed < mcp_server.READY_TIMEOUT_SECONDS, elapsed
