@@ -407,7 +407,7 @@ class ApprovalApp:
                 return self._decide(400, "rejected", "静态筛查未通过,不予批准。")
             try:
                 # 传的是**刚刚核对过的那个哈希**:不再重读一次文件,避免两次读之间内容被改。
-                rs.record_approval(self.path, self.approvals_file, sha256=sha_now)
+                rs.record_approval(self.path, self.approvals_file, sha256=sha_now, via="page")
             except rs.SandboxError as exc:
                 return self._decide(400, "error", f"写入批准记录失败:{exc}")
             return self._decide(200, "approved", "已批准(绑定到当前文件内容)。")

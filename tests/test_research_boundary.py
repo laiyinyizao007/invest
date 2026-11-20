@@ -576,26 +576,30 @@ def test_the_child_entrypoint_exceptions_are_actually_seen():
 
 
 def test_approval_writers_are_only_human_facing_entrypoints():
-    """能写批准记录的只有两个**人在场**的入口:带外批准进程与等价命令行。
+    """能写批准记录的只有三个**人在场**的入口:带外批准进程、等价命令行、
+    会话内哈希回贴(Issue #59 方案 A:人**亲自**把哈希粘贴进会话;
+    哈希绑定与唯一写入者不变,削弱面由 ADR 20261120 记录、用户已接受)。
 
-    模型能碰到的一侧(毕昇、DSH、MCP)一律不许有写路径。
+    毕昇与网关仍一律不许有写路径。
     """
     callers: list[str] = []
     for path in _repo_files():
         callers.extend(_record_approval_calls(path))
     # 按**相对路径**去重:按文件名去重会把不同目录下的同名文件混成一个写者。
     writers = sorted({c.rsplit(":", 1)[0] for c in callers})
-    assert set(writers) == {_rel(APPROVAL_SCRIPT), "scripts/research_api.py"}, (
-        f"批准记录的写入者必须只有带外批准进程与等价 CLI,实际:{writers}"
+    assert set(writers) == {_rel(APPROVAL_SCRIPT), "scripts/research_api.py",
+                            "tools/research_mcp/server.py"}, (
+        f"批准记录的写入者必须只有带外批准进程、等价 CLI 与会话内回贴入口,实际:{writers}"
     )
 
 
 def test_only_the_two_human_facing_entrypoints_even_mention_the_approval_writer():
-    """连「拿到写入函数」都不许:引用即能力(第 10 轮 codex 的 M4)。
+    """除了三个人在场入口,别处连「拿到写入函数」都不许:引用即能力(第 10 轮 codex 的 M4)。
 
     `writer = rs.record_approval` 之后由框架代为调用,调用点不在这个文件里,
     只查调用点会漏掉这一类。"""
-    allowed = {_rel(APPROVAL_SCRIPT), "scripts/research_api.py"}
+    allowed = {_rel(APPROVAL_SCRIPT), "scripts/research_api.py",
+               "tools/research_mcp/server.py"}
     holders: list[str] = []
     for path in _repo_files():
         tree = ast.parse(_read_source(path))     # 解析失败就报错,不许静默跳过
@@ -1159,7 +1163,16 @@ def test_every_import_walker_sees_imports_in_except_star_and_match(tmp_path, sni
 
 
 def test_mcp_never_reaches_approval_writer():
-    """MCP 侧没有任何路径能写到 approvals.json。
+    """MCP 写 approvals.json 的**唯一**路径:会话内哈希回贴的第二阶段(Issue #59 方案 A)。
+
+    原不变量「MCP 完全无写路径」被 Issue #59 **有意修订**(用户 2026-11-20 明确接受削弱,
+    ADR 20261120 记录)。修订后的形态约束:
+      - `record_approval` 调用点**恰好一个**,且带 `via="inline-chat"`(唯一写入者仍只有
+        `research_sandbox.record_approval`,MCP 只是它的新调用方之一);
+      - 不许有第二条门:判定器认得 `getattr(rs, "record_" + "approval")`、`__dict__` 下标、
+        别名持有等形态——出现任何一种,调用点计数就会超过 1,这里立刻红;
+      - 回贴值必须先过**常数时间比较**才落账(防时序侧信道);
+      - 页面模式的 URL 照旧不进返回值(由另一条测试管)。
 
     用**仓库里那套判定器**(`_record_approval_call_lines`),不是自己另写一套词法禁令:
     词法禁令挡不住 `getattr(rs, "record_" + "approval")` 这种写法——两个常量都不含
@@ -1167,16 +1180,11 @@ def test_mcp_never_reaches_approval_writer():
     """
     source = (MCP_DIR / "server.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    assert _record_approval_call_lines(tree) == [], "MCP 不许调用 record_approval"
-    # 再叠一层更严的词法约束:连"提到"都不许(提到就该有人来解释它是干什么的)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
-            assert node.attr != "record_approval", "MCP 不许碰 record_approval"
-        elif isinstance(node, ast.Name):
-            assert node.id != "record_approval", "MCP 不许碰 record_approval"
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            assert "record_approval" not in node.value, "MCP 不许提到 record_approval"
-    # 批准记录的文件路径只用来**读**
+    lines = _record_approval_call_lines(tree)
+    assert len(lines) == 1, f"record_approval 调用点必须恰好一个(inline 回贴),实际:{lines}"
+    assert 'via="inline-chat"' in source, "唯一调用点必须带 via=inline-chat(审计批准通道)"
+    assert "secrets.compare_digest" in source, "回贴哈希必须先过常数时间比较再落账"
+    # 批准记录的文件路径既用于读(is_approved_sha)也只流向唯一写入者
     assert "approvals_file" in source
     assert "is_approved_sha" in source
 
