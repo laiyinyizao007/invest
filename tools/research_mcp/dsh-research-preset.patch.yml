@@ -1,8 +1,11 @@
 # DSH `research` Preset 模板(ADR 20261113-dsh-research-entry-and-out-of-band-approval 第 3 条)
 #
-# 用法:
-#   dsh --profile web --patch tools/research_mcp/dsh-research-preset.patch.yml
-#   (或在 ~/.dsh/profiles/<profile>/cordis.patch.yml 里把本文件的内容粘进去)
+# 两种装法(Issue #57;ADR 20261113「Issue #57 发现」):
+# - **严格模式**(模型「做不到」自批):用 tools/research_mcp/start-research-dsh.ps1 在专用 DSH_HOME 启动,
+#   与 dsh-research-profile.patch.yml 一起叠加、profile_check.py 白名单核对通过才启动。
+# - **日常 Desktop**(用户 2026-11-19 接受的风险):把本文件的 insert 段粘进日常 profile。
+#   dsh-agent-preset 不能屏蔽全局插件,那里装了什么(终端、桌面操控、子代理……)研究会话的模型
+#   就看得见什么(实测 130+ 个工具)——「只有人能批准」退为「不该做 + 有记录」,不再是「做不到」。
 #
 # 这个 Preset 只挂两样东西:persona 与 research-mcp 的 MCP 条目。
 # **不要**在这里加 tool-pwsh / tool-bash / tool-fs / tool-fs-search / tool-jobs /

@@ -681,8 +681,10 @@ def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
     wrapper = tmp_path / "wrap_server.py"
     wrapper.write_text(_WRAPPER, encoding="utf-8")
     server_py = str(Path(mcp_server.__file__).resolve())
+    dsh_home = tmp_path / "dsh-home"
+    (dsh_home / "profiles" / "research").mkdir(parents=True)
     params = StdioServerParameters(command=sys.executable, args=[str(wrapper), server_py],
-                                   env=dict(os.environ, INVEST_ROOT=str(tmp_path)))
+                                   env=dict(os.environ, INVEST_ROOT=str(tmp_path), DSH_HOME=str(dsh_home)))
 
     async def call() -> tuple[str, float]:
         with open(tmp_path / "mcp_err.txt", "w", encoding="utf-8") as errlog:
@@ -698,3 +700,55 @@ def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
     assert "已在本机浏览器打开候选" in out, out
     assert "没起来" not in out and "无响应" not in out, out
     assert elapsed < mcp_server.READY_TIMEOUT_SECONDS, elapsed
+
+
+# ---------- Issue #57:只在专用 research DSH_HOME 下提供服务 ----------
+
+def _home(tmp_path, *profiles):
+    home = tmp_path / "dsh-home"
+    for name in profiles:
+        (home / "profiles" / name).mkdir(parents=True)
+    home.mkdir(exist_ok=True)
+    return home
+
+
+def test_deployment_requires_dsh_home(tmp_path):
+    """日常 Desktop 不设 DSH_HOME(实测);research-mcp 只认启动脚本设好的专用目录。"""
+    assert "DSH_HOME" in mcp_server.deployment_problem({})
+
+
+def test_deployment_accepts_a_dedicated_research_home(tmp_path):
+    home = _home(tmp_path, "research", ".generations")
+    assert mcp_server.deployment_problem({"DSH_HOME": str(home)}) is None
+
+
+def test_deployment_rejects_a_home_with_other_profiles(tmp_path):
+    """带别的 profile(web/lifehub……)的目录 = 日常环境:全局插件会混进研究会话。"""
+    home = _home(tmp_path, "research", "web")
+    out = mcp_server.deployment_problem({"DSH_HOME": str(home)})
+    assert out and "web" in out
+
+
+def test_deployment_rejects_a_home_without_the_research_profile(tmp_path):
+    home = _home(tmp_path, "web")
+    assert mcp_server.deployment_problem({"DSH_HOME": str(home)})
+
+
+def test_deployment_rejects_a_missing_home(tmp_path):
+    assert mcp_server.deployment_problem({"DSH_HOME": str(tmp_path / "nope")})
+
+
+def test_server_still_serves_outside_the_dedicated_home_but_says_so(tmp_path):
+    """用户已接受日常 Desktop 下的风险(2026-11-19):不在专用环境时**照常服务**,只在本机 stderr 留提示。
+
+    这条用例锁的是「不拦截」这个决定本身——以后若改回拦截,必须先改 ADR 里的风险接受记录。
+    """
+    import os
+    import subprocess
+
+    env = {k: v for k, v in os.environ.items() if k != "DSH_HOME"}
+    env["INVEST_ROOT"] = str(tmp_path)
+    proc = subprocess.run([sys.executable, str(Path(mcp_server.__file__).resolve())], env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")[-500:]
+    assert "严格模式" in proc.stderr.decode("utf-8", "replace")

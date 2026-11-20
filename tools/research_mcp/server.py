@@ -679,9 +679,42 @@ def _diagnose(events: list[dict]) -> str:
     return ""
 
 
+RESEARCH_PROFILE = "research"
+
+
+def deployment_problem(env=None) -> str | None:
+    """本服务只在**专用 research DSH_HOME** 下提供服务(Issue #57);不满足时返回原因。
+
+    「批准只能由人做」成立于前提:研究会话里的模型没有本机读写、命令执行、桌面操控能力。
+    `dsh-agent-preset` 不能屏蔽全局插件,所以这条前提只能由「整个 DSH_HOME 只为研究而建」来保证
+    (启动脚本 `start-research-dsh.ps1` 负责建它并用 profile_check 核对)。日常 Desktop 不设 DSH_HOME
+    (实测),而且它的目录下有 web/lifehub 等多个 profile——两种情况在这里都会被拒。
+    以 `.` 开头的目录是 DSH 自己的内部目录(如 `.generations`),不算 profile。
+    """
+    env = os.environ if env is None else env
+    home = (env.get("DSH_HOME") or "").strip()
+    if not home:
+        return ("没有 DSH_HOME:research-mcp 只在专用 research DSH_HOME 下提供服务,"
+                "请用 tools/research_mcp/start-research-dsh.ps1 启动。")
+    profiles = Path(home) / "profiles"
+    if not profiles.is_dir():
+        return "DSH_HOME 下没有 profiles 目录,不是由启动脚本建立的专用 research 环境。"
+    names = sorted(p.name for p in profiles.iterdir() if p.is_dir() and not p.name.startswith("."))
+    if names != [RESEARCH_PROFILE]:
+        return (f"DSH_HOME 下的 profile 必须只有 {RESEARCH_PROFILE!r},实际 {names}:"
+                "这不是专用 research 环境(全局插件会混进研究会话)。")
+    return None
+
+
 if __name__ == "__main__":
     # 本机日志走 stderr,Windows 的 cp1252 控制台会把中文变成 \uXXXX 转义,
     # 看不清「批准进程拒绝」之类的原因。stdout 交给 MCP SDK(它自己按 UTF-8 重包一层),
     # 这里改 stdout 的编码不影响协议。
     rconsole.reconfigure_stdio()
+    problem = deployment_problem()
+    if problem:
+        # **不拦截**(2026-11-19 用户决定接受风险,ADR「Issue #57 发现」):日常 Desktop 里照常提供服务,
+        # 只在本机 stderr 留一行提示——这里的模型可能拿得到终端/桌面操控,「只有人能批准」靠的是
+        # 「不该做 + 有记录」,不再是「做不到」。要「做不到」就用 start-research-dsh.ps1(严格模式)。
+        print("[research-mcp] 注意:不在专用 research 环境(严格模式)下运行:" + problem, file=sys.stderr)
     mcp.run()

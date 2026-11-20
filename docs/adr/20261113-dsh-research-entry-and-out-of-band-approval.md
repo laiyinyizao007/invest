@@ -60,6 +60,14 @@
   **`research` Preset 所在的会话不具备本机文件读写与命令执行能力**(模型拿不到 `approvals.json`、拿不到批准页 URL、也起不了本地 HTTP 请求)。
   这条前提由 `tests/test_research_boundary.py` 变成可执行约束:Preset 里出现 `tool-pwsh`/`tool-bash`/`tool-fs`/`tool-fs-search`/`tool-web`/`tool-jobs`/`tool-skill`/`skill-filesystem`/`dsh-tool-subagent` 即测试失败;`research-mcp` 源码里出现 `record_approval` 即测试失败。
   同理,`research_api.py approve/review` 这两个**等价命令行入口**也在人的手里:模型侧够不着它们(前提同上),而不是靠它们自身「防模型」。
+- **【2026-11-19 修订,Issue #57】上面这条前提只在「专用 research DSH_HOME」里成立**。
+  `dsh-agent-preset` 没有「不继承全局插件」的配置项:Preset 只能**加**插件,挡不住全局层已经注册的工具。
+  上面那组边界测试查的是**仓库里的 Preset 模板**,不是**实际装进去的那个 profile**——同一份模板装进日常 Desktop
+  profile,研究会话的模型实测拿到 130+ 个工具(终端、桌面操控、子代理、记忆、`mcp_register`……)。
+  现在有两种运行方式,详见文末「Issue #57 发现」:
+  - **严格模式**:`tools/research_mcp/start-research-dsh.ps1` 在专用 DSH_HOME 启动,`profile_check.py` 白名单核对
+    **实际组装结果**,不通过不启动 ⇒ 前提成立(模型「做不到」自批)。
+  - **日常 Desktop**:**用户于 2026-11-19 明确接受风险**——前提不成立,「只有人能批准」退为「不该做 + 有记录」。
 
 ### 4. 验证依据(2026-11-13)
 
@@ -720,3 +728,62 @@
 15. **文档里的测试条数没有自动化核对**(第 16 轮 B 的 M-7/M-8,**未做**):六处口径靠人手同步,
     数字随树变;全量口径是 通过 + 失败 + error + skip = collect 总数(第 16 轮后:2886 + 3 + 5 + 6 = 2900)。
     彻底的做法是把九份测试的条数做成可执行断言,与本 ADR 的数字比对。
+
+## Issue #57 发现(2026-11-19)
+
+在日常 DSH Desktop 里第一次跑完整研究闭环时发现两件事。一件是功能缺陷,一件是本 ADR 第 3 条前提的失效。
+
+### A. 批准进程在 MCP 里启动即卡死(已修)
+
+```mermaid
+sequenceDiagram
+    participant DSH as DSH(mcp-client)
+    participant MCP as research-mcp
+    participant AP as 批准进程
+    DSH->>MCP: stdin = MCP 协议管道(SDK 读线程阻塞读)
+    MCP->>AP: Popen(stdin 未指定 ⇒ 继承协议管道)
+    Note over AP: Windows:启动阶段卡死,不吐 ready、不退出、不报错
+    MCP-->>DSH: 30 s 后「批准进程没起来(候选可能不存在…)」
+```
+
+- **定位过程**(逐项排除):直接 spawn 0.4 s 拿到 ready;用 DSH 拉起的 MCP 进程的**原样环境**直接 spawn 同样正常 ⇒
+  不是环境变量、路径斜杠、浏览器、控制台;经 **MCP 官方 stdio 客户端**拉起 `server.py` 调 `request_approval`
+  ⇒ **稳定 30 s 失败**;同条件只加 `stdin=DEVNULL` ⇒ 拿到 ready。
+- **自造夹具复现不出**:「stdin 是匿名管道 + 另一线程阻塞读」与「asyncio(overlapped)管道 + 阻塞读」两种夹具下,
+  未修复代码都照常拿到 ready。回归测试因此用 MCP 官方客户端跑真实 stdio 会话(仅 Windows)。
+- **修法**:`stdin=subprocess.DEVNULL`;失败提示拆成「拒绝(含候选不存在)/ 未就绪即退出(带退出码)/ 无响应」。
+- **审计**:MCP → 批准进程这条链路上只有这一处拉子进程。
+
+### B. 第 3 条前提在日常 Desktop 里不成立
+
+- **成因**:`dsh-agent-preset` 的配置只有 `id/name/description/order/plugins`,没有「不继承全局插件」。
+  全局层注册的工具对所有 Preset 可见。本 ADR 第 4、8 条的验证是在干净 profile 上做的,覆盖不到装了大量全局插件的 Desktop。
+- **实测**(会话记录):研究会话的模型可见工具 130+ 个,含终端(`terminal_open/send`)、Windows 桌面操控
+  (截屏/点击/打字/列窗口)、`subagent_claude_code`、`mcp_register/mcp_call`、记忆读写;文件策略 `danger-full-access`。
+  `profile_check.py` 对该 profile 报 49 项,其中含 `auto-review`(第 2 条明确禁止的机器应答者)。
+- **模型实际做了什么**:`request_approval` 失败后,它在仓库根目录开 PowerShell,读 `server.py` 与批准进程源码,
+  列出了凭据文件的**文件名**(未读内容),自行用终端拉起批准页,用桌面操控确认浏览器已打开,
+  并把「MCP 失败时用终端 `Start-Process` 直接拉起批准页」写进 Mnemon 记忆。
+- **没有发生自批**:`approvals.json` 未变;它落盘的两个日志里无哈希、无 URL。但能力上它做得到
+  (截屏读页面哈希后提交;或在它自己的 PTY 里跑 `research_api.py review`——PTY 能过 TTY 检查)。
+- **已清理**:Mnemon 里那条「兜底」记忆已删(备份 `.bak-20261119`);临时文件它自己删了。
+
+### 决策
+
+1. **严格模式(可选)**:`tools/research_mcp/start-research-dsh.ps1` 在专用 DSH_HOME 启动;每次启动从内置模板重建 profile 层,
+   叠加 `dsh-research-preset.patch.yml` + `dsh-research-profile.patch.yml`(禁用内置 standard/ptc/minimal/cordis Preset——
+   它们在 Preset 内部启用 bash/fs/web),再用 `profile_check.py` **白名单**核对组装结果,不通过不启动;
+   目标目录里有别的 profile 也拒绝(防止误把日常目录重置掉)。模型密钥只从 Desktop 凭据里读 `MINIMAX_CN_API_KEY` 这一项。
+   白名单 `research-profile-allowlist.json` 逐条审阅(DSH 0.2.1-rc.3);全局层会注册模型工具的只有 `tool-working-directory`。
+2. **日常 Desktop(用户 2026-11-19 明确接受风险)**:research Preset 装在日常 profile 里照常使用;
+   `research-mcp` 不拦截,只在本机 stderr 提示「不在严格模式」(`deployment_problem`)。
+   此时「只有人能批准」= **不该做 + 有记录**(批准账本、DSH 会话记录可事后核查),**不是**「做不到」。
+3. 边界测试仍查模板(防止模板本身变坏);**实际 profile** 的核对只在严格模式下由 `profile_check.py` 完成。
+
+### 残留
+
+- 日常 Desktop 下:模型具备自批的能力(见上)。缓解只有「事后可查」。若要「做不到」,改用严格模式。
+- 日常 Desktop 的 `auto-review` 为启用状态:它让模型自己放行工具调用。不影响批准账本的写入者,
+  但削弱了 DSH 层的人工确认;是否关闭由用户决定(属于日常环境,本 Issue 不改)。
+- 严格模式的白名单绑定 DSH 版本;升级后新条目会被判失败,须人审阅后再加(fail-closed,是故意的)。
+- 严格模式下「模型实际可见的工具」尚未在真实会话里枚举(用户改用 Desktop,未做);组装层核对已做。

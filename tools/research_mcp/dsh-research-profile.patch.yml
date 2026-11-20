@@ -1,0 +1,34 @@
+# 专用 research profile 的补丁层(Issue #57;ADR 20261113-dsh-research-entry-and-out-of-band-approval「Issue #57 发现」)
+#
+# 只能用在**专用 DSH_HOME** 里,并与 dsh-research-preset.patch.yml 一起叠加:
+#   tools/research_mcp/start-research-dsh.ps1 会先 --dump-config + profile_check 核对,通过才启动。
+#
+# 为什么要专用 profile:dsh-agent-preset 没有「不继承全局插件」的配置项,
+# 全局层装了什么(终端、桌面操控、子代理、记忆、别的 MCP……)研究会话里的模型就看得见什么。
+# 日常 Desktop profile 实测 130+ 个工具——「批准只能由人做」的前提在那里不成立。
+#
+# 这里做三件事:
+#   1. 禁用内置的 standard/ptc/minimal/cordis Preset——它们在 Preset 内部启用 bash/文件读写等工具,
+#      在专用 profile 里切过去就等于绕开 research 的边界;禁用后 research 是唯一可选的 Preset。
+#   2. 模型路由:只配一条(minimax-cn),密钥只按**变量名**引用,值由启动脚本从本机 env 文件导出。
+#   3. 不加任何别的东西。要加 → 先改 profile_check 的白名单(那是一次执行域改动)。
+
+- id: preset-standard
+  disabled: true
+- id: preset-ptc
+  disabled: true
+- id: preset-minimal
+  disabled: true
+- id: preset-cordis
+  disabled: true
+
+- id: llm-pi-ai
+  config:
+    providers:
+      minimax-cn:
+        apiKeyEnv: MINIMAX_CN_API_KEY
+
+- id: agent-default-model
+  config:
+    provider: minimax-cn
+    model: MiniMax-M3
