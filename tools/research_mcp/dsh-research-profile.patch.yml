@@ -7,11 +7,19 @@
 # 全局层装了什么(终端、桌面操控、子代理、记忆、别的 MCP……)研究会话里的模型就看得见什么。
 # 日常 Desktop profile 实测 130+ 个工具——「批准只能由人做」的前提在那里不成立。
 #
-# 这里做三件事:
+# 这里做四件事:
 #   1. 禁用内置的 standard/ptc/minimal/cordis Preset——它们在 Preset 内部启用 bash/文件读写等工具,
 #      在专用 profile 里切过去就等于绕开 research 的边界;禁用后 research 是唯一可选的 Preset。
 #   2. 模型路由:只配一条(minimax-cn),密钥只按**变量名**引用,值由启动脚本从本机 env 文件导出。
-#   3. 不加任何别的东西。要加 → 先改 profile_check 的白名单(那是一次执行域改动)。
+#   3. 禁用三个**会向模型注册工具**的全局条目(逐条证据见 research-profile-allowlist.json 的
+#      model_tool_registrants):
+#        - plugin-manager        → plugin_manager:能列出/启停/安装插件 ⇒ 能间接扩大模型可见的工具集
+#        - tool-working-directory→ working_directory:能读也能 cd(不是只读)
+#        - mcp-resources         → list_mcp_resources / list_mcp_resource_templates / read_mcp_resource:
+#                                  只要有 MCP 服务器连上就注册;research-mcp 不暴露任何资源 ⇒ 必然报错
+#      禁掉这三个之后,**全局层不再有任何条目向模型注册工具** ⇒ 研究会话里的模型工具
+#      全部来自 research-mcp 这一个服务器(三个),与 persona 的说法一致。
+#   4. 不加任何别的东西。要加 → 先改 profile_check 的白名单(那是一次执行域改动)。
 
 - id: preset-standard
   disabled: true
@@ -20,6 +28,13 @@
 - id: preset-minimal
   disabled: true
 - id: preset-cordis
+  disabled: true
+
+- id: plugin-manager
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: mcp-resources
   disabled: true
 
 - id: llm-pi-ai

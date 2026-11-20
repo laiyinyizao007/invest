@@ -124,6 +124,11 @@ MUTATIONS: tuple[Mutation, ...] = (
     ("把 tests/test_check_guard_mutations.py 移出不可降级",
      CD_REL, '"tests/test_check_guard_mutations.py",', '    # (moved by mutation)',
      "tests/test_check_guard_mutations.py", "never_downgrade"),
+    # Issue #57:research profile 白名单检查器自己的用例——它钉死的是
+    # 「模型看得见的工具边界」这个不变式(降级 = 改断言 = 绕开完整流程)。
+    ("把 tests/test_research_profile_check.py 移出不可降级",
+     CD_REL, '"tests/test_research_profile_check.py",', '    # (moved by mutation)',
+     "tests/test_research_profile_check.py", "never_downgrade"),
     ("把 scripts/optimize.py 移出研究白名单(落回默认拒绝)",
      CD_REL, '"scripts/optimize.py",', '    # (moved by mutation)',
      "scripts/optimize.py", "research"),

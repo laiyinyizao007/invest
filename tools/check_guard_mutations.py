@@ -2487,6 +2487,74 @@ MUTATIONS = (
         ("        raise AdminError(f\"账本无法读取,拒绝据此判断累计次数: {path.name}({exc})\") from exc\n",
          "        return 0  # (removed by mutation: 读不了就当 0)\n"),
     ),
+
+    # ---- 第 56 轮:专用 research profile 的「模型工具」边界(G8 第 3 轮 codex 的 MEDIUM)----
+    #
+    # 此前 ADR 里那句「全局层会注册模型工具的只有 tool-working-directory」是**假的**:
+    # `plugin-manager` 不叫 tool-,却在 apply() 里**无条件**注册了 plugin_manager
+    # ⇒ 专用 profile 的「模型看不见终端/桌面操控」这个前提上有个洞。
+    # 现在补了两条规则(组装结果那一路 + 白名单那一路)与三份清单之间的接缝,
+    # **每一路都要有一条变异钉住**——否则「写下了但没人跑」等于没有防线。
+    _mutation(
+        # 组装结果那一路:白名单里没有它、但组装结果里它是启用的 ⇒ 必须判失败。
+        # 见证用例的白名单**故意不含**它 ⇒ 只有这条规则能命中 ⇒ 红了就是它红的。
+        "让白名单检查器不再拦「启用的工具注册方」",
+        "tools/research_mcp/profile_check.py",
+        ("        if entry_id in forbidden:",
+         "        if False:  # (removed by mutation: 不再拦「启用的工具注册方」)"),
+    ),
+    _mutation(
+        # 白名单那一路:白名单自己混进注册方 ⇒ 不必等组装结果出来就该判失败。
+        "让白名单检查器不再拦「白名单里混进注册方」",
+        "tools/research_mcp/profile_check.py",
+        ("    if mixed_in:",
+         "    if False:  # (removed by mutation: 不再拦「白名单里混进注册方」)"),
+    ),
+    _mutation(
+        # 三份清单的接缝之一:白名单说「谁可以启用」⇒ 注册方**不得**在里面。
+        "把 plugin-manager 放回专用 profile 的白名单",
+        "tools/research_mcp/research-profile-allowlist.json",
+        (' "enabled_global": {',
+         ' "enabled_global": {\n  "plugin-manager": "@deepseek-ai/dsh-plugin-manager",'),
+    ),
+    _mutation(
+        # 接缝之二:白名单说「这几个必须禁用」⇒ profile 补丁里就得**真的**禁用。
+        "去掉专用 profile 补丁里对 plugin-manager 的禁用",
+        "tools/research_mcp/dsh-research-profile.patch.yml",
+        ("- id: plugin-manager\n  disabled: true",
+         "- id: plugin-manager\n  # (removed by mutation: 禁用被去掉)"),
+    ),
+
+    _mutation(
+        # 第 57 轮(G8 第 4 轮 codex 的必须改 #1):注册方的**包名**也要对得上。
+        # 清单里 `package` 这一栏此前只存不用 ⇒「同一个 id 换了实现」没人管,
+        # 而登记的源码证据已经不适用于那个包了。
+        "让白名单检查器不再核对注册方的包名",
+        "tools/research_mcp/profile_check.py",
+        ("            if recorded and recorded != _name(entry):",
+         "            if False:  # (removed by mutation: 不再核对注册方的包名)"),
+    ),
+    _mutation(
+        # 第 57 轮(G8 第 4 轮 codex 的必须改 #2):插件条目只允许出现在三个地方
+        # (顶层 / 分组的 config 列表 / Preset 的 config.plugins 列表);
+        # 别的形状读不懂 ⇒ 不放行。这一条不判,那些形状就悄悄放行了。
+        "让白名单检查器不再拦「配置里嵌着插件条目」",
+        "tools/research_mcp/profile_check.py",
+        ("        if nested_lists:",
+         "        if False:  # (removed by mutation: 不再拦「配置里嵌着插件条目」)"),
+    ),
+    # ---- Issue #57 的 A5:批准进程的 stdin 必须与 MCP 的协议管道脱开 ----
+    #
+    # 方案里的 A5 要求「删掉 stdin=DEVNULL ⇒ 必定变红」,但当时只做了**当场**的一次变异
+    # ⇒ **写下了却没人常跑**——正是这个仓库反复吃亏的那一种。
+    # 现在补成常驻变异:去掉它 ⇒ 批准进程继承 MCP 的 stdin 管道
+    # ⇒ Windows 上启动即卡死(2026-11-19 实测复现:不吐 ready、不退出、不报错)。
+    _mutation(
+        "让批准进程不再把 stdin 与 MCP 的协议管道脱开",
+        "tools/research_mcp/server.py",
+        ("            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n",
+         "            stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"),
+    ),
 )
 
 
@@ -2504,6 +2572,21 @@ MUTATIONS = (
 # 钉死的好处:每条变异**只跑这一条**(而不是整份套件)⇒ CI 从 ~15 分钟降到 ~1 分钟;
 # 而且"红了"必须**指名道姓**,不能只是"红了几条"。
 WITNESSES: dict[str, str] = {
+    # ---- 第 56 轮:专用 research profile 的「模型工具」边界(G8 第 3 轮 codex 的 MEDIUM)----
+    "让白名单检查器不再拦「启用的工具注册方」":
+        "tests/test_research_profile_check.py::test_an_enabled_tool_registrant_fails",
+    "让白名单检查器不再拦「白名单里混进注册方」":
+        "tests/test_research_profile_check.py::test_allowlisting_a_tool_registrant_fails",
+    "把 plugin-manager 放回专用 profile 的白名单":
+        "tests/test_research_profile_check.py::test_the_global_layer_registers_no_model_tool",
+    "去掉专用 profile 补丁里对 plugin-manager 的禁用":
+        "tests/test_research_profile_check.py::test_the_profile_patch_disables_every_tool_registrant",
+    "让白名单检查器不再核对注册方的包名":
+        "tests/test_research_profile_check.py::test_a_registrant_whose_package_changed_fails",
+    "让白名单检查器不再拦「配置里嵌着插件条目」":
+        "tests/test_research_profile_check.py::test_an_entry_with_a_nested_plugin_list_fails",
+    "让批准进程不再把 stdin 与 MCP 的协议管道脱开":
+        "tests/test_research_mcp.py::test_request_approval_detaches_stdin_from_the_approval_process",
     # ---- 第 55 轮之二十五(codex 第 2 轮 38/50 的 must-fix)----
     "让宪法层不再认元组解包里的绑定":
         "tests/test_constitution_string_programs.py::test_the_guard_reports_a_primitive_hidden_behind_a_tuple_unpacking",

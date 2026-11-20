@@ -1,5 +1,5 @@
 {
-  "_说明": "「CI 上必须真跑的用例」名单。CI 侧 tools/check_ci_ran.py 按这份名单核对 junit 报告:名单点名的用例没有出现在报告里、或出现了却是 skipped ⇒ CI 直接红。研究侧 CI 上会跳过的用例(需要交易栈的、平台相关的)**不进**这份名单。改动套件的用例集合时,这份名单要一起改——守卫生成侧会断言两者完全一致(见 tests/test_research_boundary.py)。第 55 轮起新增 tests/test_ci_wiring.py(接线自检工具自己的用例)。第 55 轮之二十起新增 tests/test_constitution_string_programs.py(宪法层「字符串里藏着的执行原语」这条规则的用例;新套件不许被整份跳过 ⇒ 它也进名单)。",
+  "_说明": "「CI 上必须真跑的用例」名单。CI 侧 tools/check_ci_ran.py 按这份名单核对 junit 报告:名单点名的用例没有出现在报告里、或出现了却是 skipped ⇒ CI 直接红。研究侧 CI 上会跳过的用例(需要交易栈的、平台相关的)**不进**这份名单。改动套件的用例集合时,这份名单要一起改——守卫生成侧会断言两者完全一致(见 tests/test_research_boundary.py)。第 55 轮起新增 tests/test_ci_wiring.py(接线自检工具自己的用例)。第 55 轮之二十起新增 tests/test_constitution_string_programs.py(宪法层「字符串里藏着的执行原语」这条规则的用例;新套件不许被整份跳过 ⇒ 它也进名单)。Issue #57 起新增 tests/test_research_profile_check.py(research profile 白名单检查器自己的用例;它守的是「模型看得见的工具边界」这个判定点 ⇒ 同样逐条点名)。",
   "must_run": {
     "tests/test_approval_ledger.py": [
       "test_broken_ledger_is_rejected_fail_closed",
@@ -593,11 +593,65 @@
       "test_list_refuses_when_the_ledger_chain_is_broken",
       "test_list_reports_the_ledger_state",
       "test_the_gateway_cannot_reach_the_collect_module"
+    ],
+    "tests/test_research_profile_check.py": [
+      "test_a_different_dsh_base_version_fails",
+      "test_a_disabled_group_is_not_expanded",
+      "test_a_disabled_nested_entry_list_is_fine",
+      "test_a_disabled_nested_mcp_is_fine",
+      "test_a_disabled_unlisted_entry_is_fine",
+      "test_a_global_mcp_server_fails_even_if_someone_allowlisted_its_id",
+      "test_a_group_that_is_also_named_like_an_mcp_client_is_not_passed_silently",
+      "test_a_group_whose_config_is_not_a_list_fails",
+      "test_a_missing_dsh_base_version_fails",
+      "test_a_missing_research_preset_fails",
+      "test_a_non_mapping_entry_fails",
+      "test_a_registrant_whose_package_changed_fails",
+      "test_a_registrant_with_the_recorded_package_is_not_flagged_for_its_package",
+      "test_a_string_disabled_value_is_not_treated_as_true",
+      "test_allowlisting_a_group_id_does_not_let_its_children_through",
+      "test_allowlisting_a_tool_registrant_fails",
+      "test_an_allowlisted_id_with_a_different_package_fails",
+      "test_an_allowlisted_tool_registrant_still_fails_when_enabled",
+      "test_an_enabled_builtin_preset_fails",
+      "test_an_enabled_tool_registrant_fails",
+      "test_an_entry_with_a_nested_plugin_list_fails",
+      "test_an_entry_with_a_plain_list_config_is_fine",
+      "test_an_entry_without_id_fails",
+      "test_an_mcp_nested_inside_an_allowlisted_entry_fails",
+      "test_any_deviation_of_the_research_preset_from_the_template_fails",
+      "test_any_unlisted_enabled_global_entry_fails",
+      "test_broken_allowlist_is_unusable",
+      "test_cli_exit_codes",
+      "test_cli_reports_cannot_judge_as_exit_2",
+      "test_dsh_meta_keys_are_ignored_when_comparing_with_the_template",
+      "test_each_privacy_pattern_actually_catches_its_shape",
+      "test_every_model_tool_registrant_carries_its_evidence",
+      "test_load_dump_reads_js_tags",
+      "test_load_dump_rejects_non_list",
+      "test_platform_conditions_are_evaluated",
+      "test_the_dedicated_profile_passes",
+      "test_the_documents_quote_the_same_problem_count",
+      "test_the_fixture_carries_no_local_paths_or_secrets",
+      "test_the_fixture_is_scanned_in_both_forms",
+      "test_the_fixture_only_names_known_vendor_scopes",
+      "test_the_global_layer_registers_no_model_tool",
+      "test_the_profile_patch_disables_every_tool_registrant",
+      "test_the_real_daily_desktop_profile_is_rejected",
+      "test_the_real_template_file_is_parsed",
+      "test_the_research_presets_plugin_list_is_a_legal_nesting",
+      "test_the_template_forwards_dsh_home_to_the_mcp_server",
+      "test_the_template_preset_mounts_persona_and_research_mcp_only",
+      "test_unknown_js_condition_counts_as_enabled"
     ]
   },
   "allow_skipped": {
     "tests/test_approval_ledger.py": [
       "test_reading_is_consistent_with_the_research_side"
+    ],
+    "tests/test_research_profile_check.py": [
+      "test_the_repo_patches_compose_into_a_passing_profile",
+      "test_the_source_scan_matches_the_recorded_registrants"
     ]
   }
 }

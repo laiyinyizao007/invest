@@ -2,15 +2,67 @@
  "_说明": [
   "专用 research profile 里 Preset 之外允许启用的条目 id(白名单;没列进来的启用条目一律判失败)。",
   "来源:DSH 内置 web 模板 + dsh-research-preset.patch.yml + dsh-research-profile.patch.yml 的组装结果,逐条人工审阅。",
-  "全局层会向模型注册工具的只有 tool-working-directory(只读当前工作目录);bash/pwsh/fs/web/jobs/skill/subagent 等工具插件在全局层均禁用,",
-  "且内置的 standard/ptc/minimal/cordis Preset 已由 profile 补丁禁用。terminal-controller/ui-sidebar-terminal 是给人用的界面接口,不是模型工具。",
+  "全局层**没有任何条目会向模型注册工具**:plugin-manager / tool-working-directory / mcp-resources 三个已由 profile 补丁禁用(逐条证据见 model_tool_registrants);bash/pwsh/fs/web/jobs/skill/subagent 等工具插件在全局层均禁用,内置的 standard/ptc/minimal/cordis Preset 也已禁用。terminal-controller/ui-sidebar-terminal 是给人用的界面接口,不是模型工具。",
+  "因此研究会话里的模型工具全部来自 research-mcp 这一个服务器(三个)——与 persona 里「你唯一的对外接口是三个工具」一致。",
   "改这个文件 = 执行域改动(走完整流程 + codex 复核);DSH 升级后出现新条目会被判失败,须重新审阅而不是照单加入。",
   "格式:id → 包名;包名变了(同一个 id 换了实现)也判失败。dsh_version 对的是 @deepseek-ai/dsh-base 的版本。"
  ],
  "dsh_version": "0.2.1-rc.3",
- "reviewed": "2026-11-19",
+ "reviewed": "2026-11-20",
+ "source_scan": {
+  "dsh_version": "0.2.1-rc.3",
+  "packages_scanned": 163,
+  "packages_still_enabled": 160,
+  "packages_with_registration_calls": 5,
+  "method": "在每个 @deepseek-ai/* 包的 lib/ 里搜 .tools.register( / registerTool( / addTool(,再逐个读源码判定注册到哪个作用域(全局会话 / 子代理 / 沙盒门面)",
+  "scanned_at": "2026-11-20"
+ },
+ "model_tool_registrants": {
+  "plugin-manager": {
+   "package": "@deepseek-ai/dsh-plugin-manager",
+   "tools": [
+    "plugin_manager"
+   ],
+   "evidence": "dsh-plugin-manager/lib/types/tools.js:74",
+   "decision": "must-disable",
+   "note": "apply(ctx) 里**无条件**注册 plugin_manager:能列出/启停/安装插件 ⇒ 能间接扩大模型可见的工具集。动作本身要批准,但批准一旦给出去,profile 就变了 ⇒ 不该让模型看得见。"
+  },
+  "tool-working-directory": {
+   "package": "@deepseek-ai/dsh-tool-working-directory",
+   "tools": [
+    "working_directory"
+   ],
+   "evidence": "dsh-tool-working-directory/lib/index.js:16",
+   "decision": "must-disable",
+   "note": "注册 working_directory:能读当前目录,**也能 cd**(不是只读)。"
+  },
+  "mcp-resources": {
+   "package": "@deepseek-ai/dsh-mcp-resources",
+   "tools": [
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource"
+   ],
+   "evidence": "dsh-mcp-resources/lib/index.js:55,65,75",
+   "decision": "must-disable",
+   "note": "只要作用域里有 MCP 服务器连上就注册这三个工具(同一服务器的只读资源操作)。research-mcp 一个资源都没暴露 ⇒ 三个工具必然 method not found ⇒ 只添噪声。"
+  },
+  "subagent": {
+   "package": "@deepseek-ai/dsh-subagent",
+   "tools": [],
+   "evidence": "dsh-subagent/lib/index.js:908,lib/types/structured.js:52",
+   "decision": "child-only",
+   "note": "只往 childCtx 注册子代理的结构化输出工具,父会话看不到;模型侧的委派工具在 dsh-tool-subagent(不在白名单里)。"
+  },
+  "cordis-host-runner": {
+   "package": "@deepseek-ai/dsh-cordis-host-runner",
+   "tools": [],
+   "evidence": "dsh-cordis-host-runner/lib/index.js:543,lib/types/guard.js:562",
+   "decision": "facade-only",
+   "note": "只提供 harness.registerTool 这道沙盒门面;白名单里**没有任何包调用它**(唯一会调用的 dsh-plugin-market 不在白名单)⇒ 宿主动态工具为 0。"
+  }
+ },
  "enabled_global": {
-  "plugin-manager": "@deepseek-ai/dsh-plugin-manager",
   "timer": "@deepseek-ai/cordis-plugin-timer",
   "hmr": "@deepseek-ai/dsh-hmr",
   "llm": "@deepseek-ai/dsh-llm",
@@ -39,7 +91,6 @@
   "attachment-local": "@deepseek-ai/dsh-attachment-local",
   "session-query-sqlite": "@deepseek-ai/dsh-session-query-sqlite",
   "working-directory": "@deepseek-ai/dsh-working-directory",
-  "tool-working-directory": "@deepseek-ai/dsh-tool-working-directory",
   "session-projection": "@deepseek-ai/dsh-session-projection",
   "storage": "@deepseek-ai/dsh-storage",
   "storage-json": "@deepseek-ai/dsh-storage-json",
@@ -75,7 +126,6 @@
   "web-search-deepseek": "@deepseek-ai/dsh-web-search-deepseek",
   "web-deepseek-api": "@deepseek-ai/dsh-web-deepseek-api",
   "web-fetch-http": "@deepseek-ai/dsh-web-fetch-http",
-  "mcp-resources": "@deepseek-ai/dsh-mcp-resources",
   "tools": "@deepseek-ai/dsh-tools",
   "system-prompt": "@deepseek-ai/dsh-system-prompt",
   "agent-loop": "@deepseek-ai/dsh-agent-loop",

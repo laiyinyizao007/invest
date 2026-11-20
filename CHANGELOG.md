@@ -3158,8 +3158,87 @@ ADR 的保留字清单补齐 `FORBIDDEN_STRINGS`/`UNSAFE_BUILTINS`/`EXTRA_FORBID
   模型实测拿到 130+ 个工具(终端、桌面操控、子代理……),并曾用终端绕开 MCP 拉起批准页、把绕法写进记忆
   (已清理;**未发生自批**,批准账本未变)。新增**严格模式**:`tools/research_mcp/start-research-dsh.ps1`
   在专用 DSH_HOME 启动,`profile_check.py` 以**白名单**核对实际组装结果(禁用内置 standard/ptc/minimal/cordis Preset),
-  并要求 research Preset 与仓库模板**逐字段相同**、展开 `cordis:group` 逐个判子条目、核对 dsh-base 版本,不通过不启动;对日常 Desktop profile(脱敏夹具入库作回归)判出 54 项。日常 Desktop 方式保留——**用户 2026-11-19 明确接受其风险**
+  并要求 research Preset 与仓库模板**逐字段相同**、展开 `cordis:group` 逐个判子条目、核对 dsh-base 版本,不通过不启动;对日常 Desktop profile(脱敏夹具入库作回归)判出 60 项。日常 Desktop 方式保留——**用户 2026-11-19 明确接受其风险**
   (「只有人能批准」在那里是「不该做 + 有记录」,不是「做不到」),research-mcp 只在本机 stderr 提示。
+- **G8 第 2 轮 codex 的三条 Low 全部落地**(Issue [#57](https://github.com/laiyinyizao007/invest/issues/57);
+  ADR [`20261113-dsh-research-entry-and-out-of-band-approval`](docs/adr/20261113-dsh-research-entry-and-out-of-band-approval.md))。
+  三条都是「文档/断言与实测对不上」这一族,处置一律是**让机器来对账**:
+  - **问题数不再写死成「≥40」**:钉成**精确 60**,并新增一条用例把 ADR 与本文件里写的那个数
+    **取出来**跟实测比——文档里的数漂了(夹具/白名单/模板变了)先红的是这条用例。
+  - **脱敏夹具的隐私检查按形态列全**(此前只查 `C:/`、`:\\`、`Users` 三种粗形态,邮箱/IPv4/GUID/UNC/
+    各类 token 都能溜过去):现在逐条正则命中即红,并要求夹具**纯 ASCII**;
+    第三方插件的 npm scope 也脱敏成 `@third-party` 占位(「谁发布的」属于「这台机器装了什么」,
+    不是检查器需要的;插件 id 与包名主干留着——检查器报的是 id)。
+  - **新套件进名单**: `tests/test_research_profile_check.py` 进 `tests/guard_roster.json` 的
+    **逐条点名**名单与纪律守卫的视野(此前它在 CI 上只被「出现过/没整份跳过」看着,
+    某一条被跳过时没人发现);那条要真跑 dsh CLI 的用例改成**运行期**跳过
+    (标记类跳过一律不许——那不是数据依赖,是整条永远不跑)并登记理由;
+    该套件同时进**不可降级**清单(移出后落回**默认拒绝(执行域)**——`tests/*` 不在研究白名单里,
+    所以不是「降级到研究域」而是「不再享受不可降级豁免」;改断言 = 削弱检出能力 = 该走完整流程),
+    并配了一条变异验证。
+  - G8 评分:第 1 轮 A 41/50、B 39/50;第 2 轮 A 44/50、B 45/50。第 2 轮 A 的残余一条:
+    `deployment_problem` 只检查**目录结构**(有没有 DSH_HOME / 有没有 profiles 目录 /
+    里面是不是只有一个叫 `research` 的 profile),**不检查组装内容**(那个 profile 里的
+    preset 与全局插件是否仍与仓库模板逐字段相同——那是启动时 `profile_check.py` 的活)。
+    审查者自己也指出这不会带来新的提权路径(日常 Desktop 下模型本来就有终端,风险已接受)⇒
+    登记为已知残余,不在本轮修。
+- **G8 第 3 轮 codex 的三条 Low 与一条 MEDIUM 全部落地**(Issue [#57](https://github.com/laiyinyizao007/invest/issues/57);
+  ADR [`20261113-dsh-research-entry-and-out-of-band-approval`](docs/adr/20261113-dsh-research-entry-and-out-of-band-approval.md)「Issue #57 发现 · C」)。
+  MEDIUM 那条**实测坐实了**,结论与复核者的怀疑一致,但比它更具体:
+  - **「全局层只有 `tool-working-directory` 注册模型工具」是假的**。按 DSH 0.2.1-rc.3 源码逐包扫
+    `.tools.register(` / `registerTool(` / `addTool(`,白名单里的包只有 5 个含注册调用:
+    `plugin-manager`(**无条件**注册 `plugin_manager`,能列出/启停/安装插件 ⇒ 模型能间接扩大自己的工具集)、
+    `tool-working-directory`(`working_directory`,能读也能 cd)、`mcp-resources`(有 MCP 服务器连上就注册三个资源工具)、
+    `subagent`(只往 `childCtx` 注册,父会话看不到)、`cordis-host-runner`(只是 `harness.registerTool` 的沙盒门面)。
+    真实组装里 `plugin-manager` 是**启用**的(`disabled` 表达式 `!!js '!ctx.get(''profileContext'')'` 在 profile 启动路径下为假)。
+    ⇒ 修法:前三个由 profile 补丁**禁用**并从白名单移除;白名单新增 `model_tool_registrants` 一节,逐条记下源码位置、
+    注册了什么、判定是什么;检查器加两条判据——组装结果里不得有**启用**的注册方、白名单本身不得混入注册方(两路都堵)。
+  - **旧文档说 `working_directory`「只读当前目录」不准确**(它也能 `cd`)——该条目现已禁用,那句话一并删掉。
+  - **源码级核对变成机器可判**:一条用例把本机 DSH 的包目录重扫一遍,含注册调用的包必须与清单登记的**完全一致**
+    (多一个 = 某个包新学会了注册工具;少一个 = 证据过期)。只在装了 DSH 的机器上跑(CI 上运行期跳过并登记理由)。
+  - 三条 Low:脱敏夹具的「盘符路径」「Windows 用户目录」两条正则此前**写在字符类里的单个反斜杠被当成转义**
+    ⇒ 那两条检查在真实形态上永远是空转(探针当场逮住);现在写成 `{1,2}` 分隔符、并让夹具在**原文与反序列化后**
+    两种形态下都扫;`file:///e:/x.js` 明确列为「该命中」(Windows 上带盘符的 file URL 就是真路径),
+    `file:///a/b.js` 是「不该命中」的反向对照。
+  - `profile_check.py` 的退出码此前把「**判不了**」与「判出问题了」混成 1(未捕获的 traceback 走 Python 默认退出码 1)
+    ⇒ 现在 `check()` 也在 try 里,判不了一律返回 **2**,并配了一条会在修复前失败的用例。
+    启动脚本 `start-research-dsh.ps1` 也把 1 与 2 **分开说**(两种都拒绝启动,fail-closed 不变):
+    「判不了」不是「这个 profile 不合规」——混成一句会让人以为改 profile 就能过(真正坏的是检查器自己的输入)。
+  - **外部复核被限流,如实登记**:`mcp__zen__codereview` 的外部验证(Gemini 族)返回
+    `429 RESOURCE_EXHAUSTED … Please retry in 22h56m8.211588268s` ⇒ 该轮的**外部**结论**没有**拿到,
+    不写成「已复核」;本轮结论只来自 codex CLI(`mcp__zen__clink` → codex)与本地实测。
+  - **这条新不变量是被变异验证钉住的,不只是「有用例」**:`tools/check_guard_mutations.py` 加了 4 条变异
+    ——「让检查器不再拦「启用的工具注册方」」「让检查器不再拦「白名单里混进注册方」」
+    「把 plugin-manager 放回专用 profile 的白名单」「去掉 profile 补丁里对 plugin-manager 的禁用」;
+    见证用例**为那条规则而红**(见证用的白名单**故意不含** plugin-manager ⇒ 只有「会向模型注册工具」
+    那条规则能命中,「未列入白名单」顶替不了它)。ADR
+    [`20261113-evolution-engine.md`](docs/adr/20261113-evolution-engine.md) §4 的变异表同步加了 4 行
+    (229 → 233),标签与脚本**双向**核对。
+  - **方案里的 A5 补成常驻变异**:A5 要求「删掉 `stdin=subprocess.DEVNULL` ⇒ 必定变红」,
+    但当时只做了**当场**的一次变异 ⇒ 写下了却没人常跑(本仓库反复吃亏的那一种)。
+    现在它是变异表里的一条:去掉它 ⇒ 批准进程继承 MCP 的 stdin 管道 ⇒ Windows 上启动即卡死
+    (变异表 233 → 234 条)。
+  - **G8 第 4 轮 codex(40/50)的两条「必须改」已落地**:
+    - **清单里 `package` 这一栏此前只存不用**(`model_tool_registrants[*].package` 只校验「非空」,
+      从不与组装结果里的包名比对)⇒「同一个 id 换了实现」没人管,而登记的源码证据已不适用于那个包。
+      现在:命中注册方 id 时,包名必须与登记一致,否则判失败(须重新审阅)。
+    - **插件条目只允许出现在三个地方**(顶层 / 分组的 `config` 列表 / Preset 的 `config.plugins` 列表);
+      此前 `_flatten` 只展开 `cordis:group`,其余嵌套形状没人看 ⇒ 注册方可以藏在里面。
+      真实组装(266 条目)里带 `id` + `name` 的映射共 501 个:顶层 241 个,其余**全在**分组或 Preset 里
+      ⇒「三个地方」在真实组装里成立 ⇒ 把这条形状**写成判据**(读不懂 = 不放行)。被禁用的子树整棵不算。
+  - 这两条**各配一条红变异 + 一条为那条规则而红的见证 + 反向对照**(变异表 234 → 236 条):
+    包名对得上时不报、配置里是普通列表时不报、Preset 自己的 `config.plugins` 不报 ⇒ 守卫不是「一律报红」。
+  - **残留(如实登记,不写成「已修」)**:白名单是**自证**的——「哪个包会注册模型工具」与「它该怎么判」写在同一份文件里,
+    有人把 `decision` 改成 `child-only` 再把 id 加进 `enabled_global`,检查器里的任何一条规则都不会红。
+    这是白名单式设计固有的边界;外部锚点三条:`tools/research_mcp/` 在**不可降级**清单里(改它走执行域全套流程)、
+    源码级重扫把**注册方的集合**钉死、`dsh_version` 一变先红。
+  - **G8 第 5 轮 codex(只审第 4 轮那两处增量,44/50)判定:无「必须改」**——
+    包名核对落在「命中注册方 id」的分支内,而那个 id 本来就必判失败 ⇒ 它只是**证据过期**的额外信号,
+    不可能让不安全的注册方通过,也不在合法条目上误报;形状规则保守(读不懂 = 不放行),
+    顶层与分组子条目都被展开检查、Preset 被模板钉死 ⇒ 没有绕过路径。
+    唯一一条**可选加固**已落地:把形状规则依赖的两条**实测**假设写进代码文档串
+    (插件条目必带 `id`+`name`、必作为 `config` 下的列表元素),并写明「若 DSH 将来放开别的形状,
+    这条判据就**不够宽**、那种形状会漏过 ⇒ 升级时必须同步复核」。**没有新增判据 ⇒ 变异表仍是 236 条。**
 - 账号、密码、AuthCode 仅放 `.env`(已 `.gitignore`),仓库只提供 `config/.env.example` 模板。
 - **演练脚本与实盘状态彻底隔离**:`scripts/drill.py` 用独立的 `.vntrader_drill/` 目录(策略数据、日志、心跳)与独立的
   `account_guard.json`,演练触发的熔断/硬锁定**不会污染实盘的 `data/state/account_guard.json`**。

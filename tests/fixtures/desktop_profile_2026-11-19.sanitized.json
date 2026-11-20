@@ -2132,35 +2132,35 @@
  },
  {
   "id": "ui-skill-explorer",
-  "name": "@linxin666/dsh-client-ui-skill-explorer"
+  "name": "@third-party/dsh-client-ui-skill-explorer"
  },
  {
   "id": "ui-task-board",
-  "name": "@linxin666/dsh-client-ui-task-board"
+  "name": "@third-party/dsh-client-ui-task-board"
  },
  {
   "id": "capital-config",
-  "name": "file:///<local>/node_modules/@v587d/capital-generation/config/index.js"
+  "name": "file:///<local>/node_modules/@third-party/capital-generation/config/index.js"
  },
  {
   "id": "capital-charts",
-  "name": "file:///<local>/node_modules/@v587d/capital-generation/chart-ui/index.js"
+  "name": "file:///<local>/node_modules/@third-party/capital-generation/chart-ui/index.js"
  },
  {
   "id": "capital-watchlist",
-  "name": "file:///<local>/node_modules/@v587d/capital-generation/watchlist/index.js"
+  "name": "file:///<local>/node_modules/@third-party/capital-generation/watchlist/index.js"
  },
  {
   "id": "capital-automation",
-  "name": "file:///<local>/node_modules/@v587d/capital-generation/automation/index.js"
+  "name": "file:///<local>/node_modules/@third-party/capital-generation/automation/index.js"
  },
  {
   "id": "capital-runtime",
-  "name": "@v587d/capital-generation/runtime"
+  "name": "@third-party/capital-generation/runtime"
  },
  {
   "id": "capital-policy",
-  "name": "@v587d/capital-generation/policy"
+  "name": "@third-party/capital-generation/policy"
  },
  {
   "id": "preset-capital-data-collector",
@@ -2212,13 +2212,13 @@
      "config": [
       {
        "id": "capital-collect-tools",
-       "name": "@v587d/capital-generation/tools/collect"
+       "name": "@third-party/capital-generation/tools/collect"
       }
      ]
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     }
    ]
   }
@@ -2247,7 +2247,7 @@
     },
     {
      "id": "capital-selected-skills",
-     "name": "@v587d/capital-generation/tools/selected-skills"
+     "name": "@third-party/capital-generation/tools/selected-skills"
     },
     {
      "id": "tool-presentation",
@@ -2281,15 +2281,15 @@
     },
     {
      "id": "capital-dataset-read-tools",
-     "name": "@v587d/capital-generation/tools/dataset-read"
+     "name": "@third-party/capital-generation/tools/dataset-read"
     },
     {
      "id": "capital-chart-source-tools",
-     "name": "@v587d/capital-generation/tools/chart-source"
+     "name": "@third-party/capital-generation/tools/chart-source"
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     }
    ]
   }
@@ -2332,11 +2332,11 @@
     },
     {
      "id": "capital-chart-render-tools",
-     "name": "@v587d/capital-generation/tools/chart-render"
+     "name": "@third-party/capital-generation/tools/chart-render"
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     }
    ]
   }
@@ -2365,7 +2365,7 @@
     },
     {
      "id": "capital-selected-skills",
-     "name": "@v587d/capital-generation/tools/selected-skills"
+     "name": "@third-party/capital-generation/tools/selected-skills"
     },
     {
      "id": "compaction",
@@ -2391,19 +2391,19 @@
     },
     {
      "id": "capital-retrieve-search-tools",
-     "name": "@v587d/capital-generation/tools/retrieve-search"
+     "name": "@third-party/capital-generation/tools/retrieve-search"
     },
     {
      "id": "capital-retrieve-sources-tools",
-     "name": "@v587d/capital-generation/tools/retrieve-sources"
+     "name": "@third-party/capital-generation/tools/retrieve-sources"
     },
     {
      "id": "capital-ocr-tools",
-     "name": "@v587d/capital-generation/tools/ocr"
+     "name": "@third-party/capital-generation/tools/ocr"
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     }
    ]
   }
@@ -2433,7 +2433,7 @@
     },
     {
      "id": "capital-selected-skills",
-     "name": "@v587d/capital-generation/tools/selected-skills"
+     "name": "@third-party/capital-generation/tools/selected-skills"
     },
     {
      "id": "compaction",
@@ -2459,11 +2459,11 @@
     },
     {
      "id": "capital-dataset-read-tools",
-     "name": "@v587d/capital-generation/tools/dataset-read"
+     "name": "@third-party/capital-generation/tools/dataset-read"
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     }
    ]
   }
@@ -2543,7 +2543,7 @@
     },
     {
      "id": "capital-selected-skills",
-     "name": "@v587d/capital-generation/tools/selected-skills"
+     "name": "@third-party/capital-generation/tools/selected-skills"
     },
     {
      "id": "compaction",
@@ -2565,27 +2565,27 @@
     },
     {
      "id": "capital-time-tools",
-     "name": "@v587d/capital-generation/tools/time"
+     "name": "@third-party/capital-generation/tools/time"
     },
     {
      "id": "capital-ocr-tools",
-     "name": "@v587d/capital-generation/tools/ocr"
+     "name": "@third-party/capital-generation/tools/ocr"
     },
     {
      "id": "capital-watchlist-tools",
-     "name": "@v587d/capital-generation/tools/watchlist"
+     "name": "@third-party/capital-generation/tools/watchlist"
     },
     {
      "id": "capital-present-tools",
-     "name": "@v587d/capital-generation/tools/present"
+     "name": "@third-party/capital-generation/tools/present"
     },
     {
      "id": "capital-orchestration-tools",
-     "name": "@v587d/capital-generation/tools/orchestration"
+     "name": "@third-party/capital-generation/tools/orchestration"
     },
     {
      "id": "capital-root-extras",
-     "name": "@v587d/capital-generation/tools/root-extras"
+     "name": "@third-party/capital-generation/tools/root-extras"
     }
    ]
   }

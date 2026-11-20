@@ -2994,7 +2994,7 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 脚本在**仓库外**的临时目录里做,真工作树全程不动;行尾符按原样保留(仓库里 CRLF 与 LF 都有,
 统一改写会让 diff 全是行尾噪声)。
 
-#### 4. 纪律守卫的变异表(229 条)
+#### 4. 纪律守卫的变异表(236 条)
 
 | 变异 | 改的是哪个文件 | 见证 |
 |---|---|---|
@@ -3227,6 +3227,13 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 | 让分档器不再中和 git 的 filter 命令 | tools/check_domain.py | 分档器自身的用例 |
 | 让批准账本落盘不再 fsync | risk/ledger_admin.py | 账本维护入口自身的用例 |
 | 让读不了的账本被当成 0 次试验 | risk/ledger_admin.py | 账本维护入口自身的用例 |
+| 让白名单检查器不再拦「启用的工具注册方」 | tools/research_mcp/profile_check.py | 专用 profile 检查器自身的用例 |
+| 让白名单检查器不再拦「白名单里混进注册方」 | tools/research_mcp/profile_check.py | 专用 profile 检查器自身的用例 |
+| 把 plugin-manager 放回专用 profile 的白名单 | tools/research_mcp/research-profile-allowlist.json | 专用 profile 检查器自身的用例 |
+| 去掉专用 profile 补丁里对 plugin-manager 的禁用 | tools/research_mcp/dsh-research-profile.patch.yml | 专用 profile 检查器自身的用例 |
+| 让批准进程不再把 stdin 与 MCP 的协议管道脱开 | tools/research_mcp/server.py | 批准进程自身的用例 |
+| 让白名单检查器不再核对注册方的包名 | tools/research_mcp/profile_check.py | 专用 profile 检查器自身的用例 |
+| 让白名单检查器不再拦「配置里嵌着插件条目」 | tools/research_mcp/profile_check.py | 专用 profile 检查器自身的用例 |
 
 > **表里的标签不许含竖线**:`|` 会把 markdown 表格切开,解析器取到的第一格
 > 会被截断 ⇒ 核对必然对不上。第 54 轮那条「恒真后缀」因此写成中文,
@@ -3303,6 +3310,46 @@ codex L6 指出:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异�
 > **两条反向对照**(必须保持绿):把闸门命令的解释器从 `python` 换成 `python3`
 > (规范形认的是**形态**不是字面),以及把解释器的正则改写成另一种写法
 > (守卫不能认死字符串)。若它们变红,说明守卫变成了「一律报红」。
+>
+> **第 56 轮(G8 第 3 轮 codex 的 MEDIUM 之后加的一族)**:专用 research profile 的
+> 「模型工具」边界。那句「全局层会注册模型工具的只有 `tool-working-directory`」**是假的**
+> (`plugin-manager` 不叫 tool-,却在 `apply()` 里**无条件**注册了 `plugin_manager`),
+> ⇒ 补了两条判据(组装结果那一路 + 白名单那一路)与三份清单之间的接缝,
+> 并给**每一路**配一条红变异:
+>
+> | 变异 | 钉住的是哪条规则 |
+> |---|---|
+> | 让白名单检查器不再拦「启用的工具注册方」 | 组装结果那一路(`profile_check.py` 的 `if entry_id in forbidden`) |
+> | 让白名单检查器不再拦「白名单里混进注册方」 | 白名单那一路(`if mixed_in`) |
+> | 把 plugin-manager 放回专用 profile 的白名单 | 白名单**不得混入**注册方(集合用 `==` 钉死) |
+> | 去掉专用 profile 补丁里对 plugin-manager 的禁用 | 白名单与补丁之间的接缝(补丁里必须真的 `disabled: true`) |
+>
+> **见证用例必须是「为那条规则而红」的**(仓库教训:见证断言太宽 ⇒ 红了却没证明那条规则活着):
+> 「启用的工具注册方」那条见证用的白名单**故意不含** `plugin-manager`
+> ⇒ 只有「会向模型注册工具」那条规则能命中它,
+> 「未列入白名单的启用条目」那条消息顶替不了(它的消息里没有这几个字)⇒ 断言就写死这几个字。
+>
+> **Issue #57 方案里的 A5 补成常驻变异**:A5 写的是「删掉 `stdin=subprocess.DEVNULL` ⇒ 必定变红」,
+> 当时只做了**当场**的一次变异(写在了方案的修订记录里)⇒ **写下了却没人常跑**——
+> 正是这个仓库反复吃亏的那一种。现在它是表里的一条:
+> 去掉 `stdin=subprocess.DEVNULL` ⇒ 批准进程继承 MCP 的 stdin 管道
+> ⇒ Windows 上启动即卡死(2026-11-19 实测:不吐 ready、不退出、不报错)。
+>
+> **第 57 轮(G8 第 4 轮 codex 的两条必须改之后加的一族)**:G8 第 4 轮 codex 判 40/50,
+> 两条「必须改」都落在检查器身上,各自配一条红变异:
+>
+> | 变异 | 钉住的是哪条规则 |
+> |---|---|
+> | 让白名单检查器不再核对注册方的包名 | 清单里 `package` 这一栏**只存不用**⇒「同一个 id 换了实现」没人管(登记的源码证据已不适用) |
+> | 让白名单检查器不再拦「配置里嵌着插件条目」 | 插件条目只允许出现在三个地方(顶层 / 分组的 config 列表 / Preset 的 config.plugins);别的形状**读不懂** ⇒ 不放行 |
+>
+> 第二条的形状判据是**实测**出来的:2026-11-19 的日常 Desktop 组装结果(266 条目)
+> 里,带 `id` + `name` 的映射共 501 个,其中顶层 241 个、其余全在**分组**或 **Preset** 里
+> ⇒ 「插件条目只出现在那三个地方」在真实组装里成立,于是可以把这条形状**写成判据**
+> 而不是留在「假定」上。**禁用的子树整棵不算**(与 `_nested_mcp` 同一口径)。
+>
+> 这两条也是**反向对照**齐全的:包名对得上时不报「包名不一致」、配置里是普通列表时不报
+> 「嵌着插件条目」、Preset 自己的 `config.plugins` 不报 ⇒ 守卫不是「一律报红」。
 
 这张表与 `tools/check_guard_mutations.py --verify` 的实测集合**必须一致**,
 而且是**双向**一致(第 49 轮 codex H2:此前只查「脚本里的每一条都在表里」,

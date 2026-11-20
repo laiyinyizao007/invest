@@ -57,6 +57,10 @@ try {
   & $DshCli @composeArgs --dump-config | Out-File -LiteralPath $dump -Encoding utf8
   if ($LASTEXITCODE -ne 0) { throw "dsh --dump-config failed (exit $LASTEXITCODE)" }
   & $Python $checker $dump
+  # 退出码分三种:0 = 通过;1 = 判出问题了;2 = **判不了**(输入不可用/白名单坏了)。
+  # 2 与 1 都要拒绝启动(fail-closed),但**说法必须分开**——「判不了」不是「这个 profile 不合规」,
+  # 混成一句会让人以为改 profile 就能过(真正的原因是检查器自己的输入坏了)。
+  if ($LASTEXITCODE -eq 2) { throw "profile_check could not judge this profile (exit 2); not starting" }
   if ($LASTEXITCODE -ne 0) { throw "profile_check refused this profile (exit $LASTEXITCODE); not starting" }
 } finally {
   Remove-Item -LiteralPath $dump -ErrorAction SilentlyContinue

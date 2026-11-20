@@ -274,6 +274,13 @@ NEVER_DOWNGRADE = (
     "tests/test_fs_capability_closure.py",
     # 第 47 轮:批准状态用例改为走唯一的写入者(record_approval)⇒ 它直接调用判定点
     "tests/test_research_mcp.py",
+    # Issue #57:research profile 白名单检查器(`tools/research_mcp/profile_check.py`,
+    # 上面 `tools/research_mcp/` 那一条已经覆盖它)**自己的用例**。
+    # 它是「模型看得见的工具边界」这个不变式的**唯一**钉死处(全局层不得有会向模型注册工具的条目、
+    # research Preset 要逐字段等于模板、日常 Desktop profile 判出的问题数要与文档一致)
+    # ——改断言 = 削弱检出能力。
+    # 它同时在 `tests/guard_roster.json` 的逐条点名名单里(不许被整份/逐条跳过)。
+    "tests/test_research_profile_check.py",
 )
 
 # --------------------------------------------------------------------------

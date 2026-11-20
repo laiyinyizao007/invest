@@ -217,6 +217,7 @@ python tools/check_mutations.py --verify   # 另核对「本表的变异集合 =
 | 把 `tests/guard_roster.json` 移出不可降级 | `tests/guard_roster.json` |
 | 把 `tests/test_check_ci_ran.py` 移出不可降级 | `tests/test_check_ci_ran.py` |
 | 把 `tests/test_check_guard_mutations.py` 移出不可降级 | `tests/test_check_guard_mutations.py` |
+| 把 `tests/test_research_profile_check.py` 移出不可降级 | `tests/test_research_profile_check.py` |
 | 新建一个直接调 `check_gate` 的文件(不入库) | 该新文件自身 |
 
 **表里不写「变红几条」**——那个数字随本文件的用例数变化(每加一条用例就变),

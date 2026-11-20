@@ -14,7 +14,14 @@
    (persona 文案、research-mcp 的包名/serverName/启动命令/环境变量全在内——不靠「路径里含某段字符串」);
 3. Preset 之外每个**启用**条目都必须在白名单里,且**包名**与白名单记录一致(同一个 id 换了实现也判失败);
 4. 任何启用条目的配置里(递归)都不得出现 `research-mcp` 以外的 `dsh-mcp-client`;
-5. `@deepseek-ai/dsh-base` 的版本必须等于白名单记录的版本(DSH 升级后须重新审阅,fail-closed)。
+5. `@deepseek-ai/dsh-base` 的版本必须等于白名单记录的版本(DSH 升级后须重新审阅,fail-closed);
+6. **任何会向模型注册工具的条目都不得启用**(清单 `model_tool_registrants` 里逐条记着源码证据);
+7. 白名单本身不得混入这种条目(两份清单互相矛盾 ⇒ 判失败);
+8. 注册方的**包名**必须与清单登记的一致(同一个 id 换了实现 ⇒ 登记的源码证据已不适用,须重新审阅);
+9. 插件条目只允许出现在三个地方:顶层、分组(`cordis:group`)的 config 列表、Preset 的
+   `config.plugins` 列表;别的形状**读不懂** ⇒ 判失败(不假定它无害)。
+   (这条依赖两条**实测**出来的形状假设:条目必带 `id`+`name`、必作为 `config` 下的列表元素;
+   DSH 若放开别的形状,这条判据就**不够宽** ⇒ 升级时必须同步复核。)
 
 `disabled` 的 `!!js` 表达式只精确求值 `process.platform` 两种写法;其余一律按**启用**算(保守)。
 
@@ -34,6 +41,14 @@ PRESET_PACKAGE = "@deepseek-ai/dsh-agent-preset"
 MCP_PACKAGE = "@deepseek-ai/dsh-mcp-client"
 BASE_PACKAGE = "@deepseek-ai/dsh-base"
 RESEARCH_PRESET_ID = "preset-research"
+
+# 白名单里 `model_tool_registrants` 的判定取值:
+#   must-disable —— 该条目**自己**向模型注册工具 ⇒ 专用 profile 里必须禁用;
+#   child-only  —— 只往子作用域注册(父会话看不到);
+#   facade-only —— 只是给别的包用的门面(它自己不注册模型工具)。
+# 认不出的取值 ⇒ 白名单加载时就报错(fail-closed:判不了 = 不放行)。
+MUST_DISABLE = "must-disable"
+REGISTRANT_DECISIONS = (MUST_DISABLE, "child-only", "facade-only")
 
 
 class Js(str):
@@ -107,6 +122,46 @@ def _nested_mcp(value, platform: str, path: str) -> list[str]:
     return found
 
 
+def _looks_like_entry(value) -> bool:
+    """像不像一条插件条目:带 id 和 name 的映射。"""
+    return isinstance(value, dict) and "id" in value and "name" in value
+
+
+def _entry_like_lists(value, path: str, platform: str) -> list[str]:
+    """找出「可能装着插件条目」的列表,返回它们的路径。
+
+    **为什么要这条**(G8 第 4 轮 codex 的必须改 #2):DSH 的组装结果里,插件条目只出现在
+    三个地方——顶层、`cordis:group` 的 config 列表、Agent Preset 的 config.plugins 列表。
+    前两个由 `_flatten` 展开、第三个由「与模板逐字段相同」钉住。
+    别的形状(某个普通条目的 config 里塞了一个列表)就**读不懂**那是配置还是插件 ⇒
+    按本文件的规矩「读不懂 = 不放行」判失败,而不是假定它无害。
+
+    被禁用的子树整棵不算(它不会被加载)——与 `_nested_mcp` 同一口径。
+
+    **本判据依赖的两条形状假设**(G8 第 5 轮 codex 要求写明,44/50):
+    ① DSH 的插件条目**总是**同时带 `id` 与 `name`;
+    ② 插件条目**总是**作为 `config` 下的**列表元素**出现。
+    这两条是**实测**出来的(日常 Desktop 组装:带 id+name 的映射 501 个,顶层 241 个,
+    其余全在分组或 Preset 里),不是从 DSH 源码推出来的。
+    ⇒ 若将来 DSH 允许「独立于列表的映射」或「不带 `name` 的条目」被加载,
+    这条形状规则就**不够宽**,那种形状会**漏过**——届时必须同步放宽判据并重跑变异验证。
+    """
+    found: list[str] = []
+    if isinstance(value, dict):
+        if value.get("disabled") is not None and is_disabled(value, platform):
+            return found
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if isinstance(child, list) and any(
+                    _looks_like_entry(x) and not is_disabled(x, platform) for x in child):
+                found.append(child_path)
+            found += _entry_like_lists(child, child_path, platform)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found += _entry_like_lists(child, f"{path}[{index}]", platform)
+    return found
+
+
 GROUP_NAME = "cordis:group"
 
 
@@ -143,6 +198,20 @@ def check(dump: list, allowlist: dict, template: dict | None = None, platform: s
     enabled_presets: list[dict] = []
     base_versions: set[str] = set()
 
+    # 会向模型注册工具的条目(清单里逐条记着源码证据)。
+    # 判定分两路:
+    #   (a) 白名单**本身**不得混入它们 —— 否则「白名单 = 可启用的东西」这个前提就漏了;
+    #   (b) 组装结果里它们不得是**启用**状态 —— 否则模型就看得见它们注册的工具。
+    # 两路都要:只做 (a) 时,有人把白名单改了又忘了改补丁 ⇒ 靠 (b) 兜住;反之亦然。
+    registrants: dict = allowlist.get("model_tool_registrants") or {}
+    forbidden = {k for k, rec in registrants.items() if rec.get("decision") == MUST_DISABLE}
+    mixed_in = sorted(forbidden & set(allowed))
+    if mixed_in:
+        problems.append(
+            "白名单里混进了会向模型注册工具的条目:"
+            + ", ".join(repr(x) for x in mixed_in)
+            + "(它们必须在 dsh-research-profile.patch.yml 里禁用)")
+
     for entry in _flatten(dump, platform, problems):
         owner = entry.get("__dshPluginOwner")
         if isinstance(owner, dict) and owner.get("packageName") == BASE_PACKAGE:
@@ -156,6 +225,25 @@ def check(dump: list, allowlist: dict, template: dict | None = None, platform: s
         if _name(entry) == MCP_PACKAGE:
             problems.append(f"全局层有启用的 MCP 条目 {entry_id!r}(只允许 research Preset 内的 research-mcp)")
             continue
+        if entry_id in forbidden:
+            record = registrants[entry_id]
+            # 包名也要对(G8 第 4 轮 codex 的必须改 #1):清单里 `package` 这一栏此前**只存不用**,
+            # 于是「同一个 id 换了实现」这件事没人管——登记的源码证据已经不适用于这个包了。
+            recorded = str(record.get("package") or "")
+            if recorded and recorded != _name(entry):
+                problems.append(
+                    f"条目 {entry_id!r} 的包名与清单记录不一致:{_name(entry)!r} ≠ 记录的 {recorded!r}"
+                    "(登记的源码证据已不适用,须重新审阅 model_tool_registrants)")
+            tools = record.get("tools") or []
+            problems.append(
+                f"条目 {entry_id!r} 会向模型注册工具({'、'.join(map(str, tools)) or '未登记'})"
+                f" ⇒ 专用 profile 里必须禁用")
+        nested_lists = _entry_like_lists(entry.get("config"), f"{entry_id}.config", platform)
+        if nested_lists:
+            problems.append(
+                f"条目 {entry_id!r} 的配置里嵌着看起来像插件条目的列表:{', '.join(nested_lists)}"
+                "(插件条目只允许出现在顶层、分组的 config 列表、Preset 的 config.plugins 列表;"
+                "读不懂 = 不放行)")
         if entry_id not in allowed:
             problems.append(f"未列入白名单的启用条目:{entry_id!r}({_name(entry)})")
         elif allowed[entry_id] != _name(entry):
@@ -186,6 +274,20 @@ def load_allowlist(path: Path = ALLOWLIST_FILE) -> dict:
         raise ValueError("白名单文件缺 enabled_global(id → 包名)映射")
     if not isinstance(data.get("dsh_version"), str):
         raise ValueError("白名单文件缺 dsh_version")
+    registrants = data.get("model_tool_registrants")
+    if not isinstance(registrants, dict) or not registrants:
+        raise ValueError("白名单文件缺 model_tool_registrants(会向模型注册工具的条目清单)")
+    for key, record in registrants.items():
+        if not isinstance(record, dict):
+            raise ValueError(f"model_tool_registrants[{key!r}] 不是映射")
+        if not isinstance(record.get("package"), str) or not record["package"]:
+            raise ValueError(f"model_tool_registrants[{key!r}] 缺 package")
+        if not isinstance(record.get("tools"), list):
+            raise ValueError(f"model_tool_registrants[{key!r}] 缺 tools 列表")
+        if not isinstance(record.get("evidence"), str) or not record["evidence"]:
+            raise ValueError(f"model_tool_registrants[{key!r}] 缺 evidence(源码位置)")
+        if record.get("decision") not in REGISTRANT_DECISIONS:
+            raise ValueError(f"model_tool_registrants[{key!r}] 的 decision 认不出:{record.get('decision')!r}")
     return data
 
 
@@ -209,10 +311,14 @@ def main(argv: list[str] | None = None) -> int:
         dump = load_dump(Path(args[0]).read_text(encoding="utf-8"))
         allowlist = load_allowlist()
         template = load_template_preset()
+        # `check()` 也在这个 try 里:它内部若抛异常(比如某个条目形状怪到让它自己崩),
+        # 那是「**判不了**」,不是「判出问题了」⇒ 退出码必须是 2。
+        # 漏掉它 ⇒ 未捕获的 traceback 会走 Python 默认退出码 1,和「判出 N 项问题」撞码
+        # ⇒ 调用方分不清「拒绝」与「崩了」(启动脚本两种都不启动,但诊断信息会误导)。
+        problems = check(dump, allowlist, template)
     except Exception as exc:                                  # noqa: BLE001 - 判不了 = 不放行
         print(f"[profile_check] 输入不可用:{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    problems = check(dump, allowlist, template)
     for line in problems:
         print("[profile_check] " + line, file=sys.stderr)
     if problems:

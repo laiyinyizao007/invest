@@ -2947,6 +2947,11 @@ GUARD_SUITE_ROSTER = (
     # 「批准账本只读」那条不变式**单独**被跳过时,闸门照样放行。
     "tests/test_approval_ledger.py",
     "tests/test_research_collect.py",
+    # Issue #57:research profile 白名单检查器(`tools/research_mcp/profile_check.py`)自己的用例。
+    # 它守的是**模型看得见的工具边界**这个判定点——检查器被悄悄放松(白名单被放宽、
+    # 检查被跳过)时,批准链的前提「模型做不到自批」就没人核对了。
+    # ⇒ 进视野 + 进名单(逐条点名),不许被整份或逐条跳过。
+    "tests/test_research_profile_check.py",
 )
 
 # 「允许被跳过」的用例:必须**逐条登记理由**(第 54 轮 codex H4)。
@@ -2963,6 +2968,12 @@ ALLOW_SKIPPED_JUSTIFICATION: dict[str, dict[str, str]] = {
     "tests/test_approval_ledger.py": {
         "test_reading_is_consistent_with_the_research_side":
             "没有本地账本时这条用例跳过(CI 上永远没有本地账本)",
+    },
+    "tests/test_research_profile_check.py": {
+        "test_the_repo_patches_compose_into_a_passing_profile":
+            "要真跑一遍 dsh CLI 才能验(CI 上没有 DSH;设了 INVEST_DSH_CLI 才跑)",
+        "test_the_source_scan_matches_the_recorded_registrants":
+            "要扫本机 DSH 的包源码才能验(CI 上没有 DSH;设了 DSH_TOOL_SCAN_ROOT 或 INVEST_DSH_CLI 才跑)",
     },
 }
 
@@ -3133,6 +3144,7 @@ def test_the_guard_looks_at_every_suite_the_roster_names():
         "tests/test_ci_wiring.py",
         "tests/test_approval_ledger.py",
         "tests/test_research_collect.py",
+        "tests/test_research_profile_check.py",
     }
     seen = {path.relative_to(ROOT).as_posix() for path in _guarded_suites()}
     assert seen == expected, (

@@ -762,7 +762,8 @@ sequenceDiagram
   全局层注册的工具对所有 Preset 可见。本 ADR 第 4、8 条的验证是在干净 profile 上做的,覆盖不到装了大量全局插件的 Desktop。
 - **实测**(会话记录):研究会话的模型可见工具 130+ 个,含终端(`terminal_open/send`)、Windows 桌面操控
   (截屏/点击/打字/列窗口)、`subagent_claude_code`、`mcp_register/mcp_call`、记忆读写;文件策略 `danger-full-access`。
-  `profile_check.py` 对该 profile 报 54 项(展开分组后),其中含 `auto-review`(第 2 条明确禁止的机器应答者)、组里的 `optional-tool-terminal`、桌面操控 `mcp-dsh-computer-use-win`;脱敏后的组装结果入库为回归夹具 `tests/fixtures/desktop_profile_2026-11-19.sanitized.json`(只留 id / 包名 / 禁用状态)。
+  `profile_check.py` 对该 profile 报 60 项(展开分组后),其中含 `auto-review`(第 2 条明确禁止的机器应答者)、组里的 `optional-tool-terminal`、桌面操控 `mcp-dsh-computer-use-win`;脱敏后的组装结果入库为回归夹具 `tests/fixtures/desktop_profile_2026-11-19.sanitized.json`(只留 id / 包名 / 禁用状态;第三方插件的 npm scope 也脱敏成 `@third-party` 占位——「谁发布的」属于「这台机器装了什么」,不是检查器需要的)。
+  **这个 60 现在是被机器钉住的**:用例断言的是**精确值**(不是「≥40」),并把本 ADR 与 `CHANGELOG.md` 里写的那个数取出来跟实测对账——夹具/白名单/模板变了 ⇒ 用例先红 ⇒ 文档跟着改;文档里的数自己漂了 ⇒ 同一条用例红。
 - **模型实际做了什么**:`request_approval` 失败后,它在仓库根目录开 PowerShell,读 `server.py` 与批准进程源码,
   列出了凭据文件的**文件名**(未读内容),自行用终端拉起批准页,用桌面操控确认浏览器已打开,
   并把「MCP 失败时用终端 `Start-Process` 直接拉起批准页」写进 Mnemon 记忆。
@@ -770,13 +771,76 @@ sequenceDiagram
   (截屏读页面哈希后提交;或在它自己的 PTY 里跑 `research_api.py review`——PTY 能过 TTY 检查)。
 - **已清理**:Mnemon 里那条「兜底」记忆已删(备份 `.bak-20261119`);临时文件它自己删了。
 
+### C. 「全局层只有 tool-working-directory 注册模型工具」这句断言是假的(G8 第 3 轮 codex 的 MEDIUM;实测坐实)
+
+- **复核的质疑**:codex 第 3 轮问——白名单里 `subagent` / `commands` / `goal` / `skill` 这些**不带 `tool-` 前缀**的条目,
+  是不是真的不向模型注册工具?此前那句话只有 **id 命名 + 现场观测**支撑,没有源码级证据。
+- **实测(DSH 0.2.1-rc.3 源码)**:把白名单里的包逐个扫 `.tools.register(` / `registerTool(` / `addTool(`,
+  只有 5 个包含注册调用;再逐个读源码判定它注册到**哪个作用域**:
+
+  | 包 | 注册了什么 | 作用域 | 处置 |
+  |---|---|---|---|
+  | `plugin-manager` | `plugin_manager`(列出/启停/安装插件) | 全局会话 | **禁用** |
+  | `tool-working-directory` | `working_directory`(能读也能 cd) | 全局会话 | **禁用** |
+  | `mcp-resources` | `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` | 作用域里有 MCP 服务器连上就注册 | **禁用** |
+  | `subagent` | 子代理的结构化输出工具 | 只往 `childCtx` 注册 | 留着(父会话看不到) |
+  | `cordis-host-runner` | 无(只提供 `harness.registerTool` 这道沙盒门面) | —— | 留着(白名单里没有任何包调用它) |
+
+- **坐实的那条**:`plugin-manager` 在 `apply(ctx)` 里**无条件**注册 `plugin_manager`。它能列出、启停、安装插件
+  ⇒ 模型能**间接扩大自己可见的工具集**。它的动作要批准(升级到 danger-full-access),但批准一旦给出去,
+  profile 就变了 ⇒ 不该让模型看得见这个工具。
+- **旧结论被实测推翻**:真实组装(专用 profile)里 `plugin-manager` 是**启用**的——它的 `disabled` 表达式是
+  `!!js '!ctx.get(''profileContext'')'`,而 `profileContext` 由 profile 启动路径提供 ⇒ 表达式为假 ⇒ 条目启用。
+- **修法**:三个会注册模型工具的条目(`plugin-manager` / `tool-working-directory` / `mcp-resources`)由 profile 补丁禁用,
+  并从白名单里移除;白名单新增 `model_tool_registrants` 一节,逐条记下**源码位置**、注册了什么、判定是什么。
+  检查器新增两条判据:①组装结果里不得有**启用**的注册方;②白名单本身不得混入注册方。
+  两路都堵:只做一路时,改了白名单忘了改补丁、或改了补丁忘了改白名单,另一路仍会红。
+- **变成了机器可判**:一条用例把本机 DSH 的包目录重扫一遍,含注册调用的包必须与清单登记的**完全一致**
+  (多一个 = 某个包新学会了注册工具;少一个 = 证据过期)⇒ DSH 升级或插件改动都会被发现,不再靠人记得复查。
+- **这条不变量被变异验证钉住**(不只是「有用例」):`tools/check_guard_mutations.py` 加了 4 条变异
+  (检查器的两条判据各一条、白名单混入一条、补丁禁用一条),ADR
+  [`20261113-evolution-engine.md`](20261113-evolution-engine.md) §4 的变异表同步加了 4 行(229 → 233)。
+  见证用例**为那条规则而红**:「启用的工具注册方」那条见证用的白名单**故意不含** `plugin-manager`
+  ⇒ 只有「会向模型注册工具」那条规则能命中它(「未列入白名单」那条消息顶替不了)。
+- **附带纠正**:旧文档说 `working_directory`「只读当前目录」——**不准确**:它也能 `cd`(DSH `working-directory` 服务的 `set`)。
+  该条目现已禁用,这句话连同它一起删掉。
+- **仍未验证**:严格模式下「模型实际可见的工具」依然没有在真实会话里枚举过(见「残留」)。
+
+### D. G8 第 4 轮 codex 的两条「必须改」(40/50)与一条自证残留
+
+- **第 4 轮结论**:40/50(质量 8 / 安全 7 / 性能 9 / 架构 8 / 文档 8)。两条「必须改」都落在检查器上,已全部落地;
+  另有一条「白名单自证」的质疑**不能**由检查器自己解决 ⇒ 记为残留(下面「残留」节)。
+- **必须改 #1:清单里 `package` 这一栏只存不用**。此前 `model_tool_registrants[*].package` 只被校验「非空」,
+  从不与组装结果里的包名比对 ⇒「同一个 id 换了实现」没人管,而登记的源码证据已不适用于那个包。
+  现在:组装结果里命中注册方 id 时,包名必须与登记一致,否则判失败(须重新审阅)。
+- **必须改 #2:插件条目只允许出现在三个地方**(顶层 / 分组的 `config` 列表 / Preset 的 `config.plugins` 列表)。
+  此前 `_flatten` 只展开 `cordis:group`,其余嵌套形状没人看 ⇒ 注册方可以藏在里面。
+  真实组装(266 条目)里带 `id` + `name` 的映射共 501 个:顶层 241 个,其余**全在**分组或 Preset 里
+  ⇒「三个地方」在真实组装里成立 ⇒ 把这条形状**写成判据**(读不懂 = 不放行),而不是留在假定上。
+  被禁用的子树整棵不算(与 `_nested_mcp` 同一口径)。
+- **两条都进了变异表**(234 → 236):每条一条红变异 + 一条**为那条规则而红**的见证,外加反向对照
+  (包名对得上时不报、配置里是普通列表时不报、Preset 自己的 `config.plugins` 不报)⇒ 守卫不是「一律报红」。
+
+### E. G8 第 5 轮 codex(只审增量,44/50)——无「必须改」,一条形状假设写进文档
+
+- **第 5 轮范围**:只看第 4 轮那两处增量(`profile_check.py`),结论 **44/50**(质量 9 / 安全 9 / 性能 9 / 架构 8 / 文档 9),**无「必须改」**。
+- **必须改判定**:第 4 轮的两条增量都被判为**没有绕过路径**——
+  ① 包名核对落在「命中注册方 id」的分支内,而那个 id 本来就必判失败 ⇒ 包名不一致只是**证据过期**的额外信号,
+     不可能让一个不安全的注册方通过,也不会在合法条目上误报;
+  ② 形状规则**保守**(读不懂 = 不放行),顶层与分组子条目都被展开检查、Preset 被模板钉死,
+     非分组条目的 `config` 里嵌着启用状态的 `id+name` 列表会被拦下。
+- **唯一一条可选加固(已落地)**:形状规则依赖两条**实测**出来的假设——「插件条目必带 `id`+`name`」、
+  「插件条目必作为 `config` 下的列表元素」。把它们写进 `profile_check.py` 的模块说明与 `_entry_like_lists()` 的文档串,
+  并写明:若 DSH 将来允许「独立于列表的映射」或「不带 `name` 的条目」被加载,这条判据就**不够宽**、那种形状会**漏过**
+  ⇒ 升级时必须同步复核。**没有**新增判据 ⇒ 变异表仍是 236 条(不变式不因文档而变)。
+
 ### 决策
 
 1. **严格模式(可选)**:`tools/research_mcp/start-research-dsh.ps1` 在专用 DSH_HOME 启动;每次启动从内置模板重建 profile 层,
    叠加 `dsh-research-preset.patch.yml` + `dsh-research-profile.patch.yml`(禁用内置 standard/ptc/minimal/cordis Preset——
    它们在 Preset 内部启用 bash/fs/web),再用 `profile_check.py` **白名单**核对组装结果,不通过不启动;
    目标目录里有别的 profile 也拒绝(防止误把日常目录重置掉)。模型密钥只从 Desktop 凭据里读 `MINIMAX_CN_API_KEY` 这一项。
-   白名单 `research-profile-allowlist.json` 逐条审阅(DSH 0.2.1-rc.3),记的是 **id → 包名**;全局层会注册模型工具的只有 `tool-working-directory`。另三条判据:research Preset 须与仓库模板**逐字段相同**(启动命令/包名/persona/环境变量全在内);`cordis:group` 展开后逐个判子条目(只放行分组 id 挡不住组里的终端工具);`@deepseek-ai/dsh-base` 版本须等于白名单记录。DSH 给子进程的环境会剔除所有 `DSH_*`,所以模板显式转发 `DSH_HOME`(否则 research-mcp 永远看不到它)。
+   白名单 `research-profile-allowlist.json` 逐条审阅(DSH 0.2.1-rc.3),记的是 **id → 包名**;**全局层没有任何条目会向模型注册工具**(源码级核对见下面 C 节;此前那句「全局层会注册模型工具的只有 `tool-working-directory`」是错的,已改)。另三条判据:research Preset 须与仓库模板**逐字段相同**(启动命令/包名/persona/环境变量全在内);`cordis:group` 展开后逐个判子条目(只放行分组 id 挡不住组里的终端工具);`@deepseek-ai/dsh-base` 版本须等于白名单记录。DSH 给子进程的环境会剔除所有 `DSH_*`,所以模板显式转发 `DSH_HOME`(否则 research-mcp 永远看不到它)。
 2. **日常 Desktop(用户 2026-11-19 明确接受风险)**:research Preset 装在日常 profile 里照常使用;
    `research-mcp` 不拦截,只在本机 stderr 提示「不在严格模式」(`deployment_problem`)。
    此时「只有人能批准」= **不该做 + 有记录**(批准账本、DSH 会话记录可事后核查),**不是**「做不到」。
@@ -788,5 +852,22 @@ sequenceDiagram
 - 日常 Desktop 的 `auto-review` 为启用状态:它让模型自己放行工具调用。不影响批准账本的写入者,
   但削弱了 DSH 层的人工确认;是否关闭由用户决定(属于日常环境,本 Issue 不改)。
 - 严格模式的白名单绑定 DSH 版本;升级后新条目会被判失败,须人审阅后再加(fail-closed,是故意的)。
+- 「源码里含注册调用的包 = 清单登记的那些」这条核对**只在装了 DSH 的机器上跑**(CI 没有 DSH ⇒ 运行期跳过)。
+  跳过不是「通过」:DSH 版本一变,白名单的 `dsh_version` 就对不上 ⇒ 组装检查先红,那条用例再由人补跑。
 - 严格模式下「模型实际可见的工具」尚未在真实会话里枚举(用户改用 Desktop,未做);组装层核对已做。
+- **白名单是「自证」的**(G8 第 4 轮 codex 的 Q2):清单里「哪个包会注册模型工具」与「它该怎么判」写在**同一份文件**里;
+  有人把 `decision` 从 `must-disable` 改成 `child-only`、再把 id 加进 `enabled_global`,
+  **检查器里的任何一条规则都不会红**。这是白名单式设计**固有的**边界——检查器无法对一份「自洽地被改过」的策略文件自证。
+  现有的**外部**锚点三条:①`tools/research_mcp/` 在 `tools/check_domain.py` 的**不可降级**清单里 ⇒ 改它必须走执行域全套流程;
+  ②源码级重扫把**注册方的集合**钉死(多一个 = 某个包新学会了注册工具;少一个 = 证据过期)——但**判定**仍是人的判断,只能靠 PR 评审;
+  ③`dsh_version` 一变 ⇒ 组装检查先红,须重新审阅。
 - 严格模式的「检查」与「启动」是两次组装(G8 第 1 轮 A 的 TOCTOU):两次之间若有同用户进程改了组装输入,启动的可能不是检查过的那份。能在这个窗口动手的同用户进程本来就能直接改账本以外的一切,收益低;两次都用 `--from-default-profile` 从内置模板重建 profile 层、补丁取自仓库文件,窗口内可变的只剩已安装的插件包。
+- **形状判据是「实测」出来的,不是从 DSH 源码推出来的**(G8 第 5 轮 codex 指出,已写进代码文档串):
+  它假定插件条目**必带 `id`+`name`**、且**必作为 `config` 下的列表元素**出现。若 DSH 将来允许别的形状
+  (独立于列表的映射、或不带 `name` 的条目)也能被加载,那条形状规则就**不够宽**,那种形状会**漏过**
+  ⇒ 已写明「DSH 升级时必须同步复核判据」。当前 DSH 版本下没有这样的形状(实测过)。
+- `deployment_problem`(G8 第 2 轮 A 的残余):它只检查**目录结构**——有没有 `DSH_HOME`、有没有 `profiles`
+  目录、里面是不是**只有一个**叫 `research` 的 profile;**不检查组装内容**(那个 profile 里的 preset 与全局插件
+  是否仍与仓库模板逐字段相同——那是启动时 `profile_check.py` 干的活)。审查者自己也指出这不会带来新的提权路径:
+  日常 Desktop 下模型本来就有终端与桌面操控(风险已被用户明确接受),严格模式的组装内容由启动脚本核对。
+  已知残余,不在本轮修。
