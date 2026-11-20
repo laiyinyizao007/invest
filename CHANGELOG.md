@@ -595,6 +595,13 @@
     不存在"为了凑一个数去调阈值"的情况。
 
 ### Fixed（修复）
+- **毕昇研究工作流 v3 在网页里无法运行**(`tools/bisheng/build_v3.py`,线上工作流 `1194f854…` 已同步):
+  `end_v1` 没有任何入边(回环把 `output_result → end_v1` 换成了 `→ input_idea`),毕昇网页的运行前校验报
+  「有节点未连接」;开放 API 不做该校验,所以 DSH 经 `research-mcp` 一直能跑。修法:`input_idea` 之后加条件节点
+  `cond_stop`,想法输入恰为「结束」→ `end_v1`,其余走默认出口照常研究;不新增 INPUT 节点,MCP 续跑协议不变。
+  实测「结束」分支以 `close/end` 收尾。同时对齐仓库与线上的漂移:线上 `llm_code` 提示词有、仓库缺的第 9 条
+  (不得把行情数组切片传给函数)补回仓库;仓库有、线上缺的 `llm_name`「已有候选名不得复用」(防 409 中止)补回线上。
+  线上改动均为在线上数据上的最小补丁,未整份覆盖;改前版本备份在 `.local/bisheng-backup/`(不入库)。
 - **提交基准不许再用 `git status`(第 26 轮 codex 的 Critical 1)**:第 25 轮把"跨轮次逃逸"的基准
   定成"仓库提交里的那份",实现上用的是 `git status --porcelain` + `git ls-tree`。
   **但 `git status` 会应用 filter**:filter 的 `clean=` 是一条**命令**,由 git 自己去执行,
