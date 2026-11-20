@@ -522,11 +522,14 @@ def _request_approval(strategy: str) -> str:
     env["INVEST_ROOT"] = str(ROOT)            # 批准进程读的是网关实际挂载的那棵目录树
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
+        # stdin **必须**是 DEVNULL(Issue #57):本服务跑在 stdio 上,自己的 stdin 是 DSH 的协议管道,
+        # SDK 的读线程一直阻塞在上面。不指定 stdin 时子进程会继承这条管道,Windows 上子进程
+        # 启动即卡死——不吐 ready、不退出、不报错,30 秒后这里只能报「没起来」(2026-11-19 实测)。
         proc = subprocess.Popen(
             [sys.executable, str(script), "--strategy", name, "--timeout", str(APPROVAL_WAIT_SECONDS),
              "--hide-url"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            cwd=str(CODE_ROOT), env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", cwd=str(CODE_ROOT), env=env,
         )
     except OSError as exc:
         return redact_for_model(f"拉不起批准进程:{exc}")
@@ -575,6 +578,7 @@ def _request_approval(strategy: str) -> str:
             error_event = ready
             break
     if not ready or ready.get("event") != "ready":
+        exit_code = proc.poll()               # 先取退出码再 kill:None = 到时限仍活着(无响应)
         proc.kill()
         if error_event:
             message = str(error_event.get("message") or "")
@@ -585,7 +589,14 @@ def _request_approval(strategy: str) -> str:
         # 只留在本机日志里。
         if err_lines:
             print("[research-mcp] 批准进程异常:" + err_lines[-1].strip(), file=sys.stderr)
-        return "批准进程没起来(候选可能不存在,或不在候选目录里)。"
+        # 三种失败分开说(Issue #57):「候选不存在」由批准进程的 error 事件报(上面那支);
+        # 这里只剩「没吐 ready 就退出」与「到时限仍无响应」——原先一律说「候选可能不存在」,误导排查。
+        if exit_code is None:
+            print(f"[research-mcp] 批准进程 {READY_TIMEOUT_SECONDS} 秒内无响应,已终止", file=sys.stderr)
+            # 文案是静态的,仍过一遍 redact_for_model:「所有工具返回都经清洗」这条不变量不留例外。
+            return redact_for_model(f"批准进程无响应({READY_TIMEOUT_SECONDS} 秒内没有就绪),已终止。"
+                                    "请让用户查看本机 MCP 日志,或在本机终端里重新拉起批准页。")
+        return redact_for_model(f"批准进程未就绪即退出(退出码 {exit_code}),详细原因见本机 MCP 日志。")
     # **页面地址不落盘、不进模型通道**(第 5 轮 codex 的 H1):
     # 批准进程自己开浏览器,URL 压根不离开那个进程;这里也就没有 URL 可写文件。
     # 之前把 URL 写进 `.local/research-mcp/approval-page.txt`,而那个文件只在
@@ -669,9 +680,45 @@ def _diagnose(events: list[dict]) -> str:
     return ""
 
 
+RESEARCH_PROFILE = "research"
+
+
+def deployment_problem(env=None) -> str | None:
+    """本服务只在**专用 research DSH_HOME** 下提供服务(Issue #57);不满足时返回原因。
+
+    「批准只能由人做」成立于前提:研究会话里的模型没有本机读写、命令执行、桌面操控能力。
+    `dsh-agent-preset` 不能屏蔽全局插件,所以这条前提只能由「整个 DSH_HOME 只为研究而建」来保证
+    (启动脚本 `start-research-dsh.ps1` 负责建它并用 profile_check 核对)。日常 Desktop 不设 DSH_HOME
+    (实测),而且它的目录下有 web/lifehub 等多个 profile——两种情况在这里都会被拒。
+    以 `.` 开头的目录是 DSH 自己的内部目录(如 `.generations`),不算 profile。
+    """
+    env = os.environ if env is None else env
+    home = (env.get("DSH_HOME") or "").strip()
+    # 模板里是 `!!js process.env.DSH_HOME`(守卫不许字面量兜底):没设时 DSH 传来的是字符串 "undefined"。
+    if home.lower() in ("undefined", "null"):
+        home = ""
+    if not home:
+        return ("没有 DSH_HOME:research-mcp 只在专用 research DSH_HOME 下提供服务,"
+                "请用 tools/research_mcp/start-research-dsh.ps1 启动。")
+    profiles = Path(home) / "profiles"
+    if not profiles.is_dir():
+        return "DSH_HOME 下没有 profiles 目录,不是由启动脚本建立的专用 research 环境。"
+    names = sorted(p.name for p in profiles.iterdir() if p.is_dir() and not p.name.startswith("."))
+    if names != [RESEARCH_PROFILE]:
+        return (f"DSH_HOME 下的 profile 必须只有 {RESEARCH_PROFILE!r},实际 {names}:"
+                "这不是专用 research 环境(全局插件会混进研究会话)。")
+    return None
+
+
 if __name__ == "__main__":
     # 本机日志走 stderr,Windows 的 cp1252 控制台会把中文变成 \uXXXX 转义,
     # 看不清「批准进程拒绝」之类的原因。stdout 交给 MCP SDK(它自己按 UTF-8 重包一层),
     # 这里改 stdout 的编码不影响协议。
     rconsole.reconfigure_stdio()
+    problem = deployment_problem()
+    if problem:
+        # **不拦截**(2026-11-19 用户决定接受风险,ADR「Issue #57 发现」):日常 Desktop 里照常提供服务,
+        # 只在本机 stderr 留一行提示——这里的模型可能拿得到终端/桌面操控,「只有人能批准」靠的是
+        # 「不该做 + 有记录」,不再是「做不到」。要「做不到」就用 start-research-dsh.ps1(严格模式)。
+        print("[research-mcp] 注意:不在专用 research 环境(严格模式)下运行:" + problem, file=sys.stderr)
     mcp.run()

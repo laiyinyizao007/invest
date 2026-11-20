@@ -134,6 +134,7 @@ jobs:
             tests/test_approval_ledger.py \
             tests/test_research_collect.py \
             tests/test_research_mcp.py \
+            tests/test_research_profile_check.py \
             tests/test_research_sandbox.py \
             tests/test_segment_ledger.py
 
@@ -218,10 +219,10 @@ jobs:
           # `tests/test_research_collect.py` 已经**进名单** ⇒ 闸门对它们做
           # **逐条点名**核对(账本那份里「没有本地账本就跳过」的那一条
           # 登记在名单的 `allow_skipped` 段里,理由写在守卫文件里)。
-          # 其余 8 份**故意不在名单**里(它们有平台/依赖相关的跳过)⇒
+          # 其余几份**故意不在名单**里(它们有平台/依赖相关的跳过)⇒
           # 只做全局核对 + 「必须真的跑过」。
           #
-          # 第 55 轮:这一步也变成**一条**命令(十份套件一次 pytest,
+          # 第 55 轮:这一步也变成**一条**命令(全部套件一次 pytest,
           # 报告自己生成、自己核对)。`--continue-on-collection-errors`
           # 现在由 `tools/ci_gate.py` 统一带上:某个文件收不起来时其余文件
           # 仍然要跑,但**收不起来的那一份**会在名单核对里被点名报红。
@@ -230,7 +231,7 @@ jobs:
           # `tests/test_strategy_skeleton_contract.py`——它们 import `bootstrap`,
           # 会把 vnpy 交易栈拖进来 ⇒ 这个 job 装不了(也不该装:研究侧刻意不依赖交易栈);
           # 那两份属于交易侧,归实盘那条线。
-          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py
+          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #

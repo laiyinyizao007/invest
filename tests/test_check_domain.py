@@ -415,6 +415,9 @@ def test_critical_defense_files_are_never_downgrade() -> None:
         "tools/check_guard_mutations.py",
         "tests/guard_roster.json",
         "tests/test_check_ci_ran.py",
+        # Issue #57:research profile 白名单检查器自己的用例——它钉死的是
+        # 「模型看得见的工具边界」这个不变式(降级 = 改断言 = 绕开完整流程)。
+        "tests/test_research_profile_check.py",
     ]
     for path in critical:
         assert cd.classify(path)[0] == "never_downgrade", path
