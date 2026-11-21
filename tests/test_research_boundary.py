@@ -1182,8 +1182,34 @@ def test_mcp_never_reaches_approval_writer():
     tree = ast.parse(source)
     lines = _record_approval_call_lines(tree)
     assert len(lines) == 1, f"record_approval 调用点必须恰好一个(inline 回贴),实际:{lines}"
-    assert 'via="inline-chat"' in source, "唯一调用点必须带 via=inline-chat(审计批准通道)"
-    assert "secrets.compare_digest" in source, "回贴哈希必须先过常数时间比较再落账"
+    # --- AST 级绑定(第 15 轮 codex 的 High:子串断言 + 别名绕过) ---
+    # 1) server.py 里**所有**提到 record_approval 的节点(属性/名字/导入名/整串常量)恰好一处:
+    #    就是那个调用本身。`fn = rs.record_approval; fn(...)` 会多出一处提及 ⇒ 红
+    #    (判定器认不出赋值别名,所以这里按「提及」数,不按「调用」数)。
+    mentions = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "record_approval":
+            mentions.append(node.lineno)
+        elif isinstance(node, ast.Name) and node.id == "record_approval":
+            mentions.append(node.lineno)
+        elif isinstance(node, ast.alias) and node.name == "record_approval":
+            mentions.append(getattr(node, "lineno", 0))
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str)                 and node.value in {"record_approval", "record_", "approval"}:
+            mentions.append(node.lineno)
+    assert len(mentions) == 1, f"server.py 对 record_approval 的提及必须恰好一处(那个调用),实际:{mentions}"
+    # 2) 唯一调用点必须以关键字实参 via="inline-chat"(字面量)调用,而不是子串碰巧出现在注释里。
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and n.lineno == lines[0]
+                and isinstance(n.func, ast.Attribute) and n.func.attr == "record_approval")
+    via_kw = [k for k in call.keywords if k.arg == "via"]
+    assert len(via_kw) == 1 and isinstance(via_kw[0].value, ast.Constant)         and via_kw[0].value.value == "inline-chat", "唯一调用点必须带关键字 via=\"inline-chat\"(审计批准通道)"
+    # 3) 同一函数里,常数时间比较必须出现在该调用**之前**(先比对、后落账),
+    #    且不在注释/字符串里——要的是一个真实的 secrets.compare_digest 调用。
+    fn = next(f for f in ast.walk(tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and f.lineno <= call.lineno <= (f.end_lineno or f.lineno))
+    digest_lines = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "compare_digest"
+                    and isinstance(n.func.value, ast.Name) and n.func.value.id == "secrets"]
+    assert digest_lines and min(digest_lines) < call.lineno, "回贴哈希必须先过 secrets.compare_digest 再落账"
     # 批准记录的文件路径既用于读(is_approved_sha)也只流向唯一写入者
     assert "approvals_file" in source
     assert "is_approved_sha" in source
