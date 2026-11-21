@@ -926,6 +926,13 @@ def collect_research(settings: Settings, now: float) -> Result:
         sec = m.section("corrupt", None, as_of=m.mtime(approvals_file), now=now, message="批准记录文件损坏或格式不符:无法判断哪些候选已批准")
         return Result(sec, "unknown", "批准记录损坏", [_reason("research", "unknown", "批准记录损坏:无法判断哪些候选已批准,请人工检查")])
     approved_hashes = set(approvals) if isinstance(approvals, dict) else set()
+    # 批准通道计数(Issue #59):账本条目新增 via 字段后,审阅时能看出批准走的是
+    # 哪条通道(page/cli/inline-chat);旧条目没有 via,显示为 legacy。只读展示,不参与判定。
+    approval_channels: dict[str, int] = {}
+    for row in (approvals.values() if isinstance(approvals, dict) else []):
+        if isinstance(row, dict):
+            ch = str(row.get("via") or "legacy")
+            approval_channels[ch] = approval_channels.get(ch, 0) + 1
 
     # 两个计数必须分开:**读不出来**(文件坏了/超上限,→ state=unknown)与**没列出**(超出显示上限,
     # 文件其实完好,→ state=ok + level=warn)。混在一起时,超出上限的文件会被说成『无法读取』——假话。
@@ -949,7 +956,8 @@ def collect_research(settings: Settings, now: float) -> Result:
     unscanned = max(len(runs) - MAX_RUNS_SCANNED, 0)
     data = {"quota": {"used": used, "limit": limit, "window_hours": int(cfg["iteration"]["window_hours"]),
                       "next_release_in_seconds": None if oldest_in_window is None else int(round(oldest_in_window + window - now))},
-            "approvals_count": len(approved_hashes), "pending": pending, "recent_runs": recent}
+            "approvals_count": len(approved_hashes), "approval_channels": approval_channels,
+            "pending": pending, "recent_runs": recent}
 
     problems, notes = [], []
     if unscanned:

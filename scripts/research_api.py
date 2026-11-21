@@ -261,7 +261,7 @@ def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = 
                 raise JobError(EXIT_REFUSED, "哈希不匹配,未批准。")
             # 记的是**已经读出来并核对过的那份**的哈希:不在这里重读文件,
             # 免得"核对的内容"与"记下的内容"之间出现时间差(TOCTOU)。
-            rs.record_approval(path, paths["approvals_file"], sha256=sha)
+            rs.record_approval(path, paths["approvals_file"], sha256=sha, via="cli")
         elif sha256 is not None:
             if sha256 not in rs._load_approvals(paths["approvals_file"]):
                 raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
@@ -625,7 +625,7 @@ def approve_job(strategy: str, input_fn=None, write=None) -> dict:
         say("哈希不匹配,未批准。")
         return {"approved": False, "name": path.name}
     try:
-        rs.record_approval(path, paths["approvals_file"], sha256=sha)
+        rs.record_approval(path, paths["approvals_file"], sha256=sha, via="cli")
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
     say("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")
@@ -677,7 +677,7 @@ def review_job(strategy: str, input_fn=None, write=None) -> dict:
             return {"approved": False, "name": path.name}
         if rs.file_sha256(path) != sha:                       # 批准必须绑定到用户刚读过的内容
             raise JobError(EXIT_REFUSED, "文件在阅读期间被改动,未批准;请重新运行 review")
-        rs.record_approval(path, paths["approvals_file"], sha256=sha)
+        rs.record_approval(path, paths["approvals_file"], sha256=sha, via="cli")
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
     say("已批准(绑定到上面的 sha256;代码改动后需要重新批准)。")

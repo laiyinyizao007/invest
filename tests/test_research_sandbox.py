@@ -371,6 +371,51 @@ def test_recording_twice_keeps_one_entry(tmp_path):
     assert len(json.loads(approvals.read_text(encoding="utf-8"))) == 1
 
 
+def test_approval_records_the_channel_in_via(tmp_path):
+    """via 字段:批准通道进账本(Issue #59),不参与任何判定,只供审计。"""
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+
+    import json
+    sha = rs.record_approval(f, approvals, via="inline-chat")
+    row = json.loads(approvals.read_text(encoding="utf-8"))[sha]
+    assert row["via"] == "inline-chat"
+    assert rs.is_approved_sha(sha, approvals) is True          # 判定只看键,不看 via
+
+    # 通道标记格式受约束:进链式账本的载荷不许是任意文本
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(f, approvals, via="坏!标记")
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(f, approvals, via="x" * 40)
+
+
+def test_approval_ledger_rows_without_via_still_read(tmp_path):
+    """旧条目没有 via(Issue #59 之前的账本):读取方一律兼容,判定不受影响。"""
+    import json
+    from risk import ledger_chain as chain
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    sha = rs.file_sha256(f)
+    # 手工封一条**旧格式**(无 via)的链上条目——正是旧版 record_approval 产出的形状
+    row = chain.seal({"sha": sha, "name": f.name,
+                      "at": datetime(2026, 11, 12, 21, 0).isoformat(timespec="seconds")},
+                     chain.GENESIS, 1)
+    approvals.write_text(json.dumps({sha: row}, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 旧版 record_approval 同样会写锚点:锚点缺失会被判「账本被换进来」(fail-closed),不是这里的场景
+    chain.write_anchor(chain.anchor_path_for(approvals), row["seq"], row["hash"])
+
+    assert rs.is_approved_sha(sha, approvals) is True
+    assert rs.is_approved(f, approvals) is True
+    # 在旧账本上继续追加(via 落进新条目,旧条目原样保留)
+    f2 = tmp_path / "t.py"
+    f2.write_text("a = 2\n", encoding="utf-8")
+    sha2 = rs.record_approval(f2, approvals, via="cli")
+    rows = json.loads(approvals.read_text(encoding="utf-8"))
+    assert rows[sha].get("via") is None and rows[sha2]["via"] == "cli"
+
+
 def test_a_stale_lock_does_not_block_approvals_forever(tmp_path):
     """进程崩了会留下锁文件:不认残留锁的话,一次崩溃就让**之后所有**批准永久失败。
 
