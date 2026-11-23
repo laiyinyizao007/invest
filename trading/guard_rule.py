@@ -352,8 +352,10 @@ class AccountGuardRule(RuleTemplate):
     def _reject_key(order: OrderData) -> str:
         """已处理废单的登记键:委托号 + 指纹(合约/方向/开平/手数/价格)。回放的是同一笔,字段一模一样;
         委托号撞号的另一笔新废单,指纹对不上 ⇒ 查不到 ⇒ 照常判定(fail-closed)。"""
-        return (f"{order.vt_orderid}|{order.vt_symbol}|{order.direction.value if order.direction else ''}|"
-                f"{order.offset.value}|{order.volume}|{order.price}")
+        # 枚举取 .name 不取 .value:.value 是显示文案,随 vnpy 版本/语言可能变('Long'/'多'),键会跟着漂;
+        # 且本函数在每个委托事件的 on_order 路径上,字段缺失不能抛异常(会带停事件引擎线程)
+        return (f"{order.vt_orderid}|{order.vt_symbol}|{getattr(order.direction, 'name', '')}|"
+                f"{getattr(order.offset, 'name', '')}|{order.volume}|{order.price}")
 
     def on_order(self, order: OrderData) -> None:
         now = self.mono()

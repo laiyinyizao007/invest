@@ -846,7 +846,7 @@ def test_first_time_reject_locks_and_is_recorded_after_the_lock(env):
     assert s["daily_locked_day"] == "2026-11-09"
     keys = s["handled_rejects"]["2026-11-09"]
     assert list(s["handled_rejects"]) == ["2026-11-09"] and len(keys) == 1
-    assert keys[0].startswith("FAKE.5_1_9|c2601.DCE|Long|Open|")
+    assert keys[0].startswith("FAKE.5_1_9|c2601.DCE|LONG|OPEN|")
 
 
 def test_same_reject_pushed_again_is_not_judged_again(env):
@@ -998,3 +998,16 @@ def test_load_truncates_an_oversized_handled_list(tmp_path):
     g = AccountGuard(state_path=f)
     assert len(g.handled_rejects["2026-11-09"]) == ag.HANDLED_REJECTS_PER_DAY
     assert g.is_reject_handled(datetime(2026, 11, 9).date(), f"o{ag.HANDLED_REJECTS_PER_DAY + 9}")
+
+
+def test_reject_key_does_not_depend_on_enum_display_values_or_crash_on_missing_fields():
+    """登记键用枚举的 .name(与 vnpy 版本/语言无关:不同版本的 .value 可能是 'Long' 也可能是 '多'),
+    且 offset/direction 缺失时不抛异常——它在每个委托事件的 on_order 路径上,抛了会带停事件引擎线程
+    (2026-11-23 codex 第三轮)。"""
+    o = OrderData(symbol="c2601", exchange=Exchange.DCE, orderid="5_1_9", type=OrderType.LIMIT,
+                  direction=Direction.LONG, offset=Offset.OPEN, price=2185.0, volume=1, status=Status.REJECTED,
+                  gateway_name="FAKE")
+    assert AccountGuardRule._reject_key(o) == "FAKE.5_1_9|c2601.DCE|LONG|OPEN|1|2185.0"
+    o.offset = None
+    o.direction = None
+    assert AccountGuardRule._reject_key(o) == "FAKE.5_1_9|c2601.DCE|||1|2185.0"
