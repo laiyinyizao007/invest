@@ -34,7 +34,10 @@ def hard_locked_guard(path: Path) -> AccountGuard:
 def test_hard_lock_records_trigger_time_and_survives_restart(tmp_path):
     path = tmp_path / "g.json"
     hard_locked_guard(path)
-    assert AccountGuard(AccountLimits(), path).hard_locked_at == "2026-11-09T11:00:00"
+    # 触发时刻一律带 `+08:00`:与 `sampled_at` 同一套时刻契约(状态文件里不再有两种基准)。
+    # 之前是 naive 北京时间,调用方若传了带其它偏移的 `now`,存下来的偏移会被
+    # `trading_day(fromisoformat(...))` 当成北京时间比交易日 ⇒ 冷却期被放宽(fail-open)。
+    assert AccountGuard(AccountLimits(), path).hard_locked_at == "2026-11-09T11:00:00+08:00"
 
 
 def test_cooldown_blocks_same_trading_day_and_allows_next_day(tmp_path):
@@ -56,7 +59,7 @@ def test_unlock_appends_history_and_caps_it(tmp_path):
     g = hard_locked_guard(path)
     g.unlock_hard(TUE_10AM, forced=True)
     entry = AccountGuard(AccountLimits(), path).unlock_history[-1]
-    assert entry["forced"] is True and entry["locked_at"] == "2026-11-09T11:00:00" and "回撤" in entry["reason"]
+    assert entry["forced"] is True and entry["locked_at"] == "2026-11-09T11:00:00+08:00" and "回撤" in entry["reason"]
     for _ in range(UNLOCK_HISTORY_LIMIT + 5):
         g.hard_locked = True
         g.unlock_hard(TUE_10AM)
@@ -235,3 +238,39 @@ def test_counted_manual_order_is_not_counted_again_after_seen_eviction(env, monk
     env.gw.on_order(foreign_order("1_1_100"))                    # 断线重连后的回放
     env.tick(5)
     assert sum(env.rule.guard.manual_orders.values()) == 1
+
+
+def test_the_unlock_script_uses_the_beijing_clock(tmp_path, monkeypatch):
+    """冷却期按**交易日**算,交易日是北京时间的日期:解锁脚本必须用同一个时钟。
+
+    2026-11-16 codex 复核 M4:锁定时刻写的是北京时间(AccountGuard 用 `beijing_now()`),
+    解锁脚本却按**本机时间**比 —— UTC-8 宿主机上会把「已经隔夜」的解锁多拒最多 8 小时,
+    同一份状态文件里还混着两种时间基准。
+    """
+    from risk import account_guard
+
+    assert unlock_account.beijing_now is account_guard.beijing_now
+
+    path = tmp_path / "g.json"
+    guard = hard_locked_guard(path)
+    # 锁定发生在**夜盘时段**(北京时间 21:00)⇒ 交易日算到次日 2026-11-10
+    guard.hard_locked_at = datetime(2026, 11, 9, 21, 0).isoformat()
+    guard._save()
+
+    # 已经隔夜(北京时间 2026-11-11 上午 —— 11-10 的夜盘属于 11-10 这个交易日,
+    # 要到下一个交易日才能解锁)⇒ 应当放行
+    monkeypatch.setattr(unlock_account, "beijing_now", lambda: datetime(2026, 11, 11, 9, 0))
+    assert unlock_account.unlock(path, assume_yes=True) == 0
+    assert not AccountGuard(AccountLimits(), path).hard_locked
+
+
+def test_the_unlock_script_still_refuses_inside_the_same_trading_day(tmp_path, monkeypatch):
+    """同一个交易日里解锁仍然要拒绝 —— 换了时钟不等于放宽冷却期。"""
+    path = tmp_path / "g.json"
+    guard = hard_locked_guard(path)
+    guard.hard_locked_at = datetime(2026, 11, 9, 21, 0).isoformat()
+    guard._save()
+
+    monkeypatch.setattr(unlock_account, "beijing_now", lambda: datetime(2026, 11, 9, 22, 0))
+    assert unlock_account.unlock(path, assume_yes=True) == unlock_account.EXIT_COOLDOWN
+    assert AccountGuard(AccountLimits(), path).hard_locked

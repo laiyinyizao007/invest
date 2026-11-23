@@ -280,7 +280,7 @@ flowchart TB
 | 周期性 `ReqQryOrder` 对账 | `trading/runtime.py` 定时查询委托,与本会话委托号对账,补上外部终端下单的检测 | runbook 第 5 节第 11 项实测发现收不到外部会话的委托回报 | 同上 ADR(codex 审查 H1) |
 | 非策略委托白名单扩展 | `trading/guard_rule.py::STRATEGY_REF_PREFIX` 由单个前缀扩为集合(`AlgoTrading_`/`SpreadTrading_`) | 无头路径启用算法单/价差应用 | 同上 ADR |
 | 测试段使用次数持久化 — **已落地(2026-11-12)** | `scripts/segment_ledger.py` + 入库登记 `config/test_segment_usage.json`;`optimize.py`/`optimize_15m.py` 的 `--test` 先查后登记再运行,重复即拒绝;15 分钟基准测试段已补登记。`walk_forward_optimizer.py` 无 `--test`,不适用 | — | §4「测试段只看一次靠人工纪律」 |
-| 批量撤单入口(国信 5.2,选测) | 操作员入口(类似 `pause_trading.py`,请求文件由运行时消费)撤销全部未成交开仓单 | 国信要求该选测项,或需要应急一键撤单时 | `docs/adr/20261111-broker-test-compliance.md` |
+| 批量撤单入口(国信 6.2,选测) — **已落地(2026-11-17)** | `scripts/cancel_all_orders.py` 写请求文件,`AccountGuardRule` 定时器撤销全部开仓挂单 | — | `docs/adr/20261111-broker-test-compliance.md` |
 | 连接断开的全自动演练(国信 2.1) | `scripts/broker_test.py` 中程序化断开交易连接并断言告警与恢复 | 取证运行器已落地(Issue #9),现为半自动(`--interactive` 提示操作者断网/恢复);全自动需可靠的断连注入手段 | 同上 |
 | 紧急平仓失败态的恢复与限频提醒;持仓模式做成显式启动不变量 | `trading/guard_rule.py` 失败态继续观察持仓,确认空仓后发 `flat=True`、限频重复 FATAL;`RuntimeConfig` 增持仓模式并在启动时核对 | SimNow 实测出账户形态结论之后;涉及紧急平仓状态机(实盘安全路径) | codex 审查 2026-11-11,见 `docs/adr/20261109-account-risk-lock.md` |
 | 脚本层去重:PART — 共享实现已下沉并由两个 CLI 使用；函数拆分与脚本间通知依赖仍待后续整理 | 新包 `ctp_tools/`(位于 `scripts/` 之外),`bootstrap.py` 增 `isolate_state(name)`(含 `ISOLATED` 自检,`drill.py` 同样获得)与 `load_env()` | 下一批重构(Issue 另开);剩余违例见 `docs/architecture.md` §1 | 架构审视 2026-11-11 |

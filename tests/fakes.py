@@ -52,8 +52,8 @@ class SyncEventEngine(EventEngine):
 
 
 class FakeGateway(BaseGateway):
-    """mode: accept(挂单不成交) / fill(立即全部成交) / reject(废单并输出错误日志) /
-    silent(不产生任何回报) / disconnected(模拟断连:发单本地快速失败)。
+    """mode: accept(挂单不成交) / fill(立即全部成交) / partial(部分成交,余量还挂着) /
+    reject(废单并输出错误日志) / silent(不产生任何回报) / disconnected(模拟断连:发单本地快速失败)。
 
     复现真实 CTP 的三个行为(codex 审查指出过,曾被乐观的假件掩盖):
     - 废单时先推送委托回报(REJECTED),之后才写错误日志(error_after_order);
@@ -126,17 +126,24 @@ class FakeGateway(BaseGateway):
             return order.vt_orderid
         elif self.mode == "fill":
             order.status, order.traded = Status.ALLTRADED, order.volume
+        elif self.mode == "partial":
+            # 部分成交:成交了一部分,余量还挂着 —— 撤单也撤不掉(整单撤单对部分成交单不成立)。
+            # 这个形态的后果**有两个**:账户已经多出一部分持仓 + 余量可能还挂在柜台上,
+            # 报告里两个都要说(2026-11-16 codex 复核 M6)。
+            order.status, order.traded = Status.PARTTRADED, max(1, order.volume // 2)
         else:
             order.status = Status.NOTTRADED
         self.on_order(copy.copy(order))
         if self.mode == "fill":
             self._apply_fill(order)
+        elif self.mode == "partial":
+            self._apply_fill(order, volume=order.traded)
         return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
         self.cancel_requests.append(req)
         order = self.orders.get(req.orderid)
-        if self.cancel_works and order is not None and order.is_active():
+        if self.cancel_works and self.mode != "partial" and order is not None and order.is_active():
             order.status = Status.CANCELLED
             self.on_order(copy.copy(order))
 
@@ -147,17 +154,18 @@ class FakeGateway(BaseGateway):
         # 假网关若用 ERROR,就会掩盖"只认 ERROR 级别会漏掉全部拒单文本"这个真实缺陷。
         self.on_event(EVENT_LOG, LogData(msg=f"交易委托失败,信息:{self.reject_text}", level=INFO, gateway_name=self.gateway_name))
 
-    def _apply_fill(self, order) -> None:
+    def _apply_fill(self, order, volume: float | None = None) -> None:
+        volume = order.volume if volume is None else volume
         self.on_trade(TradeData(
             symbol=order.symbol, exchange=order.exchange, orderid=order.orderid, tradeid=f"T{order.orderid}",
-            direction=order.direction, offset=order.offset, price=order.price, volume=order.volume,
+            direction=order.direction, offset=order.offset, price=order.price, volume=volume,
             datetime=datetime.now(), gateway_name=self.gateway_name,
         ))
         if order.offset == Offset.OPEN:
-            self.positions[order.direction] += order.volume
+            self.positions[order.direction] += volume
         else:                                  # 平仓:减少相反方向的持仓
             opposite = Direction.SHORT if order.direction == Direction.LONG else Direction.LONG
-            self.positions[opposite] = max(0.0, self.positions[opposite] - order.volume)
+            self.positions[opposite] = max(0.0, self.positions[opposite] - volume)
         if not self.position_lag:
             self.push_positions(order.symbol, order.exchange)
 

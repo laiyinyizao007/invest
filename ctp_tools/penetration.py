@@ -21,13 +21,13 @@
 """
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 
 from vnpy.trader.constant import Direction, Offset, OrderType, Status
 from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest
 from vnpy.trader.utility import round_to
 
-from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session
+from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session, trade_live
+from risk.account_guard import beijing_now
 from notify.webhook import redact
 from ctp_tools.simnow import is_simnow_address, normalize_address
 
@@ -80,11 +80,28 @@ class Run:
         return any(s.status == "FAIL" for s in self.steps)
 
 
-def check_target(environment: str, td_address: str, confirmed: bool) -> tuple[bool, str]:
-    """目标环境闸门。返回 (是否放行, 说明)。生产 API 没有任何强制放行的出口。"""
+def check_target(environment: str, td_address: str, confirmed: bool,
+                 allowed_td: set[str] | frozenset[str] | None = None) -> tuple[bool, str]:
+    """目标环境闸门。返回 (是否放行, 说明)。生产 API 没有任何强制放行的出口。
+
+    allowed_td:本次允许连接的前置地址表(已归一化的 host:port)。
+
+    **必须给,而且不能是空的**——以前 allowed_td 可以传 None,于是
+    「柜台环境=测试」这一句就成了唯一依据:那台机器只按环境变量判断,
+    连到哪台都不管,等于没有闸门。调用方应该用
+    `ctp_tools.broker_targets.resolve_allowed()` 算出这张表
+    (用户白名单 ∩ 代码里写死的可信地址全集),而不是直接把 `.env` 原样传进来。
+    """
     if not confirmed:
         return False, "未加 --confirm-broker-test。本脚本会连接并发出测试委托,请确认目标是期货公司的测试环境。"
     address = normalize_address(td_address)
+    if not allowed_td:
+        return False, (f"没有可用的交易前置地址白名单,无法确认交易前置 {address} 是不是期货公司的测试机,拒绝连接。"
+                       "白名单由 BROKER_TEST_ALLOWED_TD 指定(一键流程会自动注入),"
+                       "并且只能取「可信地址全集」里的地址——白名单与地址同源,采信它等于自证清白。")
+    if address not in allowed_td:
+        return False, (f"交易前置 {address} 不在本次允许的前置地址表 {sorted(allowed_td)} 内,拒绝连接。"
+                       "地址表由 BROKER_TEST_ALLOWED_TD 指定(一键流程会自动注入)。")
     if environment == "测试":
         return True, f"目标:期货公司看穿式测试环境(柜台环境=测试),交易前置 {address}。"
     if is_simnow_address(address):
@@ -213,9 +230,9 @@ def do_order_cancel(run: Run, main_engine, collector: Collector, contract, tick)
 
 def trade_connected(main_engine) -> bool:
     """交易通道是否仍在线。vnpy_ctp 断线只清 login_status、不清 connect_status,
-    所以不能沿用 check_positions 返回的 connected(它读 connect_status,断线后仍为 True)。"""
-    td_api = getattr(main_engine.get_gateway("CTP"), "td_api", None)
-    return bool(getattr(td_api, "login_status", False))
+    所以不能沿用 connect_status 判活(断线后它仍是 True)。
+    判活逻辑统一放在 collector.trade_live,这里只做转发。"""
+    return trade_live(main_engine)
 
 
 def run_checks(args, symbol: str, main_engine, collector: Collector,
@@ -253,7 +270,10 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
         if tick is not None:
             break
         time.sleep(0.5)
-    in_session = session_func(datetime.now())
+    # 盘中判定必须用**北京时间**:宿主机不在北京时,本机时间会把「盘中」判成「非盘中」,
+    # 于是「盘中没收到 Tick」被从 FAIL 降级成 WARN —— 少报一个真问题
+    # (2026-11-16 codex 复核 L8)。broker_test.py 走的是同一个口径。
+    in_session = session_func(beijing_now())
     if tick is not None:
         run.add("订阅行情", "PASS", f"收到 Tick,最新价 {tick.last_price}", time.monotonic() - t1)
     elif in_session:
@@ -274,10 +294,12 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
             "已收到账户资金回报" if accounts else "10 秒内没有收到账户资金回报", time.monotonic() - t2)
 
     t3 = time.monotonic()
-    positions, _ = check_positions(main_engine, symbol, wait=args.position_wait, early_exit=False)
-    connected = trade_connected(main_engine)
+    positions, trusted = check_positions(main_engine, wait=args.position_wait, early_exit=False,
+                                         collector=collector)
+    # 可信度以 check_positions 的第二个返回值为准(含「柜台没应答」),不能只看通道在线
+    connected = trusted and trade_connected(main_engine)
     if not connected:
-        run.add("查询持仓", "FAIL", "交易连接已断开,查询结果不可信", time.monotonic() - t3)
+        run.add("查询持仓", "FAIL", "交易连接已断开或柜台没有应答,查询结果不可信", time.monotonic() - t3)
     else:
         run.add("查询持仓", "PASS", f"当前持仓 {len(positions)} 项", time.monotonic() - t3)
 
@@ -287,15 +309,22 @@ def run_checks(args, symbol: str, main_engine, collector: Collector,
             run.add("报单/撤单", "SKIP", "非交易时段,报单会被拒绝,请在交易时段补测")
         elif tick is None:
             run.add("报单/撤单", "SKIP", "没有 Tick,无法取跌停价")
+        elif positions or not connected:
+            # 空仓闸门:与取证运行器/采集工具同一口径。账户上有持仓、或查不准时,
+            # 一笔不发 —— 报单步骤在有持仓的账户上多一笔委托就多一分误伤的可能。
+            why = f"账户已有持仓 {positions}" if positions else "交易连接不在线或柜台没有应答,无法确认账户空仓"
+            run.add("报单/撤单", "FAIL", f"已中止:{why}(穿透演练的报单只在确认空仓后进行)")
+            code = EXIT_STEP_FAILED
         else:
             code = do_order_cancel(run, main_engine, collector, contract, tick)
-            after, _ = check_positions(main_engine, symbol, wait=args.position_wait, early_exit=False)
-            ok = trade_connected(main_engine)
+            after, after_trusted = check_positions(main_engine, wait=args.position_wait, early_exit=False,
+                                                   collector=collector)
+            ok = after_trusted and trade_connected(main_engine)
             if after:
                 run.add("收尾持仓检查", "FAIL", f"发现持仓 {len(after)} 项,请立即人工核对并平仓")
                 code = EXIT_POSITION
             elif not ok:
-                run.add("收尾持仓检查", "WARN", "连接已断开,无法确认是否留下持仓,请人工核对")
+                run.add("收尾持仓检查", "WARN", "连接已断开或柜台没有应答,无法确认是否留下持仓,请人工核对")
     else:
         run.add("报单/撤单", "SKIP", "未加 --with-order")
     return run, code

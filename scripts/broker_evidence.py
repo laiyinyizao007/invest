@@ -18,18 +18,25 @@ PASS, FAIL, SKIP, MANUAL = "PASS", "FAIL", "SKIP", "MANUAL"
 STATUS_LABEL = {PASS: "通过", FAIL: "未通过", SKIP: "未测试", MANUAL: "待人工"}
 STATUS_COLOR = {PASS: (34, 139, 34), FAIL: (200, 30, 30), SKIP: (120, 120, 120), MANUAL: (210, 120, 0)}
 
-# 测试项目录:穿透式测试 T1–T7,程序化测试 P*(与国信模板的编号一致)
+# 测试项目录。内部 ID 保持稳定(T* 为穿透式演示,P* 为外部接入/程序化补充测试);标题与报告里的编号取国信 20260717 版模板
+# (外部接入 1.1/1.2/2.1,程序化补充 3.1–7.1),内部 ID → 模板编号见 TEMPLATE_NO。
 ITEMS: dict[str, str] = {
     "T1": "①登录", "T2": "②行情", "T3": "③委托(开/平仓)", "T4": "④撤单", "T5": "⑤成交",
     "T6": "⑥具备流量控制功能", "T7": "⑦具备自动退出功能(异常时)",
     "P1.1": "1.1 连通性(系统登录)", "P1.2": "1.2 基础交易功能(开仓/平仓/撤单)",
-    "P2.1": "2.1 系统连接状态异常监测功能", "P2.2": "2.2 报撤单笔数监测功能", "P2.3": "2.3 重复报单监测功能(选测)",
-    "P3.1": "3.1 阈值设置及预警功能",
-    "P4.1": "4.1 交易指令检查功能", "P4.2": "4.2 接收柜台错误提示功能",
-    "P5.1": "5.1 暂停交易功能", "P5.2": "5.2 批量撤单功能(选测)",
-    "P6.1": "6.1 日志记录功能",
+    "P1.3": "2.1 稳定运行(持续下单)",
+    "P2.1": "3.1 系统连接状态异常监测功能", "P2.2": "3.2 报撤单笔数监测功能", "P2.3": "3.3 重复报单监测功能(选测)",
+    "P3.1": "4.1 阈值设置及预警功能",
+    "P4.1": "5.1 交易指令检查功能", "P4.2": "5.2 接收柜台错误提示功能",
+    "P5.1": "6.1 暂停交易功能", "P5.2": "6.2 批量撤单功能(选测)",
+    "P6.1": "7.1 日志记录功能",
 }
 OPTIONAL_ITEMS = frozenset({"P2.3", "P5.2"})      # 国信模板里的选测项:可以「未测试」
+# 内部 ID → 国信 20260717 版模板里的章节编号(报告填写器按它定位结果行与证据区)
+TEMPLATE_NO: dict[str, str] = {
+    "P1.1": "1.1", "P1.2": "1.2", "P1.3": "2.1", "P2.1": "3.1", "P2.2": "3.2", "P2.3": "3.3", "P3.1": "4.1",
+    "P4.1": "5.1", "P4.2": "5.2", "P5.1": "6.1", "P5.2": "6.2", "P6.1": "7.1",
+}
 
 FONT_CANDIDATES = (
     r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\simsun.ttc",
@@ -56,6 +63,7 @@ class Evidence:
     summary: str = ""
     started_at: str = ""
     shots: list[Shot] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)     # 结构化数字(如稳定运行的下单笔数/耗时),报告里的填空用它
 
     @property
     def title(self) -> str:
@@ -172,7 +180,7 @@ def load_evidence(out_dir: Path) -> dict[str, Evidence]:
     result: dict[str, Evidence] = {}
     for raw in json.loads(path.read_text(encoding="utf-8")):
         shots = [Shot(**s) for s in raw.get("shots", [])]
-        result[raw["item"]] = Evidence(raw["item"], raw["status"], raw.get("summary", ""), raw.get("started_at", ""), shots)
+        result[raw["item"]] = Evidence(raw["item"], raw["status"], raw.get("summary", ""), raw.get("started_at", ""), shots, dict(raw.get("metrics") or {}))
     return result
 
 

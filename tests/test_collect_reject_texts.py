@@ -170,12 +170,14 @@ def test_gateway_traceback_is_captured_as_an_error():
 
 class _FakeApi:
     connect_status = True
+    login_status = True       # 判活看 login_status(见 ctp_tools.collector.trade_live)
 
 
 class _FakeGateway:
     def __init__(self, connect_status=True):
         self.td_api = _FakeApi()
         self.td_api.connect_status = connect_status
+        self.td_api.login_status = connect_status     # 假「断线」:两个标志一起关
         self.queried = False
 
     def query_position(self):
@@ -197,7 +199,7 @@ class _FakeEngine:
 def test_check_positions_reports_the_connection_state():
     """连接断了就查不到持仓,这时"没查到"不等于"没有持仓",必须能区分。"""
     engine = _FakeEngine(connect_status=False)
-    positions, connected = c.check_positions(engine, "c2701.DCE", wait=0.2)
+    positions, connected = c.check_positions(engine, wait=0.2)
     assert positions == [] and connected is False
     assert engine.gateway.queried
 
@@ -210,7 +212,7 @@ def test_check_positions_returns_non_zero_positions():
             self.volume = volume
 
     engine = _FakeEngine([_Pos("c2701.DCE", Direction.LONG, 1), _Pos("c2701.DCE", Direction.SHORT, 0)])
-    positions, connected = c.check_positions(engine, "c2701.DCE", wait=0.2)
+    positions, connected = c.check_positions(engine, wait=0.2)
     assert positions and "c2701.DCE" in positions[0] and connected is True
 
 
@@ -357,6 +359,15 @@ def test_collect_aborts_when_the_symbol_already_has_a_position():
     collector = c.Collector()
     collector.contracts["c2701.DCE"] = _fake_contract()
     engine = _CollectEngine(positions=[_Pos("c2701.DCE", Direction.LONG, 2)])
+    # 真网关是在持仓查询回报里把行推给采集器的,假网关照做,
+    # 否则采集器只会读到「没有行」(空仓),闸门就形同虚设。
+    from vnpy.event import Event
+    from vnpy.trader.event import EVENT_POSITION
+
+    def _push_position():
+        collector.on_position(Event(EVENT_POSITION, _Pos("c2701.DCE", Direction.LONG, 2)))
+
+    engine.gateway.query_position = _push_position
     code = c._collect(args, "c2701.DCE", {}, None, engine, collector)
     assert code == 5
     assert engine.sent == [], "有持仓时不能发任何委托"
@@ -400,8 +411,15 @@ def test_write_collected_keeps_the_begin_marker_so_the_second_run_still_updates(
     assert not (tmp_path / "doc-raw.md").exists()
 
 
+def _profile_from_os():
+    from ctp_tools.profile import Profile
+
+    return Profile(env=dict(os.environ), hard_conflicts=[], notes=[])
+
+
 def test_without_confirm_flag_it_refuses_to_run(monkeypatch, capsys):
     """没有 --confirm-simnow 就直接拒绝执行:这个脚本只允许在模拟盘上跑。"""
+    monkeypatch.setattr(c, "load_profile", lambda profile="", root=None: _profile_from_os())
     monkeypatch.setenv("CTP_ENVIRONMENT", "实盘")
     assert c.main(["--symbol", "c2701.DCE"]) == 2
     assert "模拟盘" in capsys.readouterr().err
@@ -409,7 +427,83 @@ def test_without_confirm_flag_it_refuses_to_run(monkeypatch, capsys):
 
 def test_missing_symbol_is_reported(monkeypatch, capsys):
     # 不加载真实的 .env(里面有 LIVE_VT_SYMBOL),也不去连 CTP
-    monkeypatch.setattr(c.bootstrap, "load_env", lambda: os.environ)
+    monkeypatch.setattr(c, "load_profile", lambda profile="", root=None: _profile_from_os())
     monkeypatch.delenv("LIVE_VT_SYMBOL", raising=False)
     assert c.main(["--confirm-simnow"]) == 2
     assert "未指定合约" in capsys.readouterr().err
+
+
+def test_symbol_has_position_uses_the_query_report_and_ignores_the_stale_oms_cache():
+    """给了采集器就按「本次查询回报」判断,不读 vn.py 的 OMS 快照。
+
+    OMS 里的旧仓位是「平掉了但没删」的残留:按它判断会让采集脚本
+    以为自己有持仓而白白中止一次采集(安全方向,但白跑一趟)。
+    """
+    class _Pos:
+        def __init__(self, symbol, direction, volume):
+            self.vt_symbol = symbol
+            self.direction = direction
+            self.volume = volume
+
+    class _QueryCollector:
+        def __init__(self):
+            self.rows = []
+
+        def mark_positions(self):
+            return len(self.rows)
+
+        def positions_since(self, mark):
+            return list(self.rows[mark:])
+
+    class _QueryGateway(_FakeGateway):
+        def query_position(self):
+            self.queried = True
+            collector.rows.extend(rows)
+
+    engine = _FakeEngine([_Pos("c2701.DCE", Direction.LONG, 1)])   # OMS 里的残留
+    collector = _QueryCollector()
+    rows = []                                                     # 本次查询回报:没有持仓
+    engine.gateway = _QueryGateway()
+    has_pos, connected = c.symbol_has_position(engine, "c2701.DCE", wait=0.2, collector=collector)
+    assert has_pos is False and connected is True
+
+
+def test_symbol_has_position_reports_a_position_the_broker_actually_returned():
+    class _Pos:
+        def __init__(self, symbol, direction, volume):
+            self.vt_symbol = symbol
+            self.direction = direction
+            self.volume = volume
+
+    class _QueryCollector:
+        def __init__(self):
+            self.rows = []
+
+        def mark_positions(self):
+            return len(self.rows)
+
+        def positions_since(self, mark):
+            return list(self.rows[mark:])
+
+    engine = _FakeEngine()
+    collector = _QueryCollector()
+    rows = [_Pos("c2701.DCE", Direction.LONG, 1)]
+
+    class _QueryGateway(_FakeGateway):
+        def query_position(self):
+            self.queried = True
+            collector.rows.extend(rows)
+
+    engine.gateway = _QueryGateway()
+    has_pos, connected = c.symbol_has_position(engine, "c2701.DCE", wait=0.3, collector=collector)
+    assert has_pos is True and connected is True
+
+
+def test_a_hard_profile_conflict_stops_the_collector_before_anything_is_sent(monkeypatch, capsys):
+    """进程环境与 .env 打架又没指定档案 = 不知道连哪个账户 → 一笔都不发。"""
+    from ctp_tools.profile import Profile
+
+    monkeypatch.setattr(c, "load_profile", lambda profile="", root=None: Profile(
+        env={}, hard_conflicts=["CTP_TD_ADDRESS:进程环境里是 'a',项目 .env 里是 'b'(取 .env 的值)"], notes=[]))
+    assert c.main(["--confirm-simnow", "--symbol", "c2701.DCE"]) == 2
+    assert "不一致" in capsys.readouterr().err

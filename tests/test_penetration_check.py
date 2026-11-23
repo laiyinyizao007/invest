@@ -23,18 +23,68 @@ def test_gate_requires_confirm_flag():
 
 
 def test_gate_allows_broker_test_environment():
-    ok, note = pc.check_target("测试", "tcp://10.0.0.1:41205", confirmed=True)
+    ok, note = pc.check_target("测试", "tcp://10.0.0.1:41205", confirmed=True, allowed_td={"10.0.0.1:41205"})
     assert ok and "测试环境" in note
 
 
 def test_gate_allows_simnow_rehearsal_even_in_production_mode():
-    ok, note = pc.check_target("实盘", SIMNOW, confirmed=True)
+    ok, note = pc.check_target("实盘", SIMNOW, confirmed=True, allowed_td={SIMNOW})
     assert ok and "SimNow" in note
 
 
 def test_gate_refuses_production_api_with_no_override():
-    ok, note = pc.check_target("实盘", "10.0.0.1:41205", confirmed=True)
+    ok, note = pc.check_target("实盘", "10.0.0.1:41205", confirmed=True, allowed_td={"10.0.0.1:41205"})
     assert not ok and "生产 API" in note
+
+
+def test_gate_refuses_an_address_outside_the_whitelist():
+    """「柜台环境=测试」不说明连的是哪台机器,必须再查一次地址。"""
+    ok, note = pc.check_target("测试", "10.0.0.1:41205", confirmed=True, allowed_td={"121.13.218.19:41285"})
+    assert not ok and "不在本次允许的前置地址表" in note
+
+
+
+def _profile_from_os():
+    """配置解析只走 ctp_tools.profile.load_profile(不再走 bootstrap.load_env)。"""
+    import os
+
+    from ctp_tools.profile import Profile
+
+    return Profile(env=dict(os.environ), hard_conflicts=[], notes=[])
+
+def test_gate_refuses_when_no_whitelist_is_given():
+    """没有白名单 = 无法确认连的是哪台机器,必须拒绝。
+
+    以前 allowed_td 可以传 None,于是「柜台环境=测试」这一句就成了唯一依据——
+    那台机器只按环境变量判断,不校验地址,等于没有闸门。
+    """
+    ok, note = pc.check_target("测试", "10.0.0.1:41205", confirmed=True)
+    assert not ok and "白名单" in note
+    ok, note = pc.check_target("测试", "10.0.0.1:41205", confirmed=True, allowed_td=set())
+    assert not ok and "白名单" in note
+
+
+def test_penetration_script_requires_the_front_whitelist(monkeypatch, capsys):
+    """穿透演练脚本会真的报撤单,没有地址白名单时必须拒绝连接。"""
+    monkeypatch.setattr(pc, "load_profile", lambda profile="", root=None: _profile_from_os())
+    monkeypatch.setenv("CTP_ENVIRONMENT", "测试")
+    monkeypatch.setenv("CTP_BROKER_ID", "8030")
+    monkeypatch.setenv("CTP_TD_ADDRESS", "121.13.218.19:41285")
+    monkeypatch.setenv("CTP_MD_ADDRESS", "121.13.218.19:41293")
+    monkeypatch.setenv("CTP_USERNAME", "u")
+    monkeypatch.setenv("CTP_PASSWORD", "p")
+    monkeypatch.setenv("CTP_APP_ID", "a")
+    monkeypatch.setenv("CTP_AUTH_CODE", "c")
+    monkeypatch.setenv("LIVE_VT_SYMBOL", "c2701.DCE")
+    monkeypatch.delenv("BROKER_TEST_ALLOWED_TD", raising=False)
+    monkeypatch.delenv("BROKER_TEST_ALLOWED_MD", raising=False)
+    assert pc.main(["--confirm-broker-test"]) == pc.EXIT_CONFIG
+    assert "白名单" in capsys.readouterr().err
+
+    monkeypatch.setenv("BROKER_TEST_ALLOWED_TD", "121.13.218.19:41285")
+    assert pc.main(["--confirm-broker-test"]) == pc.EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "行情前置" in err and "BROKER_TEST_ALLOWED_MD" in err
 
 
 def test_redact_replaces_all_secrets_and_ignores_short_values():
@@ -241,3 +291,131 @@ def test_console_output_is_redacted(capsys):
     run = pc.Run(secrets=("user123",))
     run.add("交易登录", "FAIL", "用户 user123 登录失败")
     assert "user123" not in capsys.readouterr().out
+
+
+# ---------- 脚本整体走一遍(假引擎,不联网) ----------
+
+class _FakeCollector:
+    """冒充 ctp_tools.collector.Collector:里程碑日志已经在手里。"""
+
+    def __init__(self):
+        import threading
+
+        self.lock = threading.Lock()
+        self.log_lines = list(ALL_LOGS)
+        self.contracts = {"c2701.DCE": SimpleNamespace(symbol="c2701", exchange=Exchange.DCE,
+                                                       pricetick=1.0, max_volume=1000)}
+        self.ticks = {"c2701.DCE": TickData(gateway_name="CTP", symbol="c2701", exchange=Exchange.DCE,
+                                            datetime=datetime.now(), last_price=2200.0, limit_down=2100.0)}
+        self.orders = {}
+
+    def on_log(self, event): ...
+    def on_order(self, event): ...
+    def on_tick(self, event): ...
+    def on_contract(self, event): ...
+    def on_position(self, event): ...
+    def on_account(self, event): ...
+
+    def contract_of(self, vt_symbol):
+        return self.contracts.get(vt_symbol)
+
+    def tick_of(self, vt_symbol):
+        return self.ticks.get(vt_symbol)
+
+    def order_of(self, vt_orderid):
+        return self.orders.get(vt_orderid)
+
+
+class _FakeEngine:
+    def __init__(self):
+        self.subscribed = []
+
+    def add_gateway(self, gateway): ...
+    def connect(self, setting, gateway_name): ...
+    def get_gateway(self, name):
+        return SimpleNamespace(td_api=SimpleNamespace(connect_status=True, login_status=True),
+                               query_account=lambda: None, query_position=lambda: None)
+    def get_all_accounts(self): return [object()]
+    def get_all_positions(self): return []
+    def subscribe(self, req, gateway): self.subscribed.append(req)
+
+
+def test_the_script_runs_end_to_end_and_writes_a_redacted_report(monkeypatch, tmp_path):
+    """连接 → 里程碑 → 查账户/持仓 → 写报告:整条路都要能走通。"""
+    monkeypatch.setattr(pc, "load_profile", lambda profile="", root=None: _profile_from_os())
+    monkeypatch.setattr(pc, "Collector", _FakeCollector)
+    monkeypatch.setattr(pc, "EventEngine", lambda: SimpleNamespace(register=lambda *a: None))
+    monkeypatch.setattr(pc, "MainEngine", lambda event_engine=None: _FakeEngine())
+    monkeypatch.setattr(pc, "close_engine", lambda engine: True)
+    monkeypatch.setattr(pc, "in_trading_session", lambda dt: True)
+
+    class _FakeCtpGateway:
+        default_setting = {"柜台环境": "测试"}
+
+    monkeypatch.setattr("vnpy_ctp.CtpGateway", _FakeCtpGateway)
+    for key, value in {"CTP_ENVIRONMENT": "测试", "CTP_BROKER_ID": "8030",
+                       "CTP_TD_ADDRESS": "121.13.218.19:41285",
+                       "CTP_MD_ADDRESS": "121.13.218.19:41293",
+                       "CTP_USERNAME": "012345678", "CTP_PASSWORD": "hunter22",
+                       "CTP_APP_ID": "simnow_app", "CTP_AUTH_CODE": "AUTHCODE9",
+                       "LIVE_VT_SYMBOL": "c2701.DCE",
+                       "BROKER_TEST_ALLOWED_TD": "121.13.218.19:41285",
+                       "BROKER_TEST_ALLOWED_MD": "121.13.218.19:41293"}.items():
+        monkeypatch.setenv(key, value)
+
+    code = pc.main(["--confirm-broker-test", "--out-dir", str(tmp_path), "--position-wait", "0.1"])
+    assert code == pc.EXIT_OK
+    reports = list(tmp_path.glob("penetration-*.md"))
+    assert len(reports) == 1
+    text = reports[0].read_text(encoding="utf-8")
+    assert "交易登录" in text
+    assert "hunter22" not in text and "AUTHCODE9" not in text    # 凭据不能进报告
+    assert "simnow_app" not in text
+
+
+def test_the_penetration_script_actually_collects_the_position_reports():
+    """穿透演练的持仓检查按「本次查询回报」判空仓,必须真的收持仓回报。
+
+    不注册 `EVENT_POSITION` 的话,采集器永远收不到行 → 永远判成「账户空仓」,
+    而穿透演练里有「无持仓时平仓」的场景 —— 判错就可能真的把仓位平掉。
+    """
+    src = Path(pc.__file__).read_text(encoding="utf-8")
+    assert "EVENT_POSITION, collector.on_position" in src
+    assert "EVENT_POSITION" in src.split("from vnpy.trader.event import", 1)[1].split("\n", 1)[0]
+
+
+class _HeldEngine(StubEngine):
+    """账户上有持仓:查询回报里带一行。"""
+
+    def get_gateway(self, name):
+        collector = self.collector
+
+        def query_position():          # 持仓查询回报:把一行推进采集器
+            collector.position_rows.append(
+                SimpleNamespace(vt_symbol="c2701.DCE", direction=Direction.LONG, volume=2))
+
+        return SimpleNamespace(td_api=SimpleNamespace(connect_status=True, login_status=True),
+                               query_position=query_position, query_account=lambda: None)
+
+
+def test_order_is_not_sent_when_the_account_already_holds_a_position(monkeypatch):
+    """穿透演练与取证运行器同口径:有持仓(或查不准)就一笔不发。"""
+    monkeypatch.setattr(pc, "in_trading_session", lambda dt: True)
+    collector = make_collector(ALL_LOGS)
+    engine = _HeldEngine(collector)
+    run, code = pc.run_checks(args(with_order=True), "c2701.DCE", engine, collector)
+    names = {s.name: s.status for s in run.steps}
+    assert not engine.sent and names["报单/撤单"] == "FAIL" and code == pc.EXIT_STEP_FAILED
+
+
+def test_order_is_not_sent_when_the_position_query_is_untrusted(monkeypatch):
+    """通道在线但柜台没有应答(查询被流控拒):check_positions 判不可信 → 一笔不发,里程碑记 FAIL。"""
+    monkeypatch.setattr(pc, "in_trading_session", lambda dt: True)
+    import ctp_tools.penetration as pen
+
+    monkeypatch.setattr(pen, "check_positions", lambda *a, **k: ([], False))
+    collector = make_collector(ALL_LOGS)
+    engine = StubEngine(collector)
+    run, code = pc.run_checks(args(with_order=True), "c2701.DCE", engine, collector)
+    names = {s.name: s.status for s in run.steps}
+    assert not engine.sent and names["查询持仓"] == "FAIL" and names["报单/撤单"] == "FAIL"

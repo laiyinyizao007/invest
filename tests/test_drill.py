@@ -207,18 +207,45 @@ def test_the_drill_logs_and_strategy_data_do_not_land_in_the_live_directory():
 
     演练的日志写进实盘的 .vntrader/log 会直接污染"无人值守每日证据表"
     (演练的"已启动"会被当成实盘的启动次数),所以这条必须守住。
+
+    这条**在独立进程里验**:同一个 pytest 进程里还会导入别的工具
+    (取证运行器、一键流程……),它们各自也会切 TEMP_DIR,
+    在进程内断言就成了"谁最后导入谁赢",测不出真实行为。
+    演练脚本本来就是独立进程跑的,所以就用独立进程验。
     """
-    import vnpy.trader.utility as utility
+    import json
+    import subprocess
+    import sys
 
-    assert utility.TEMP_DIR == d.DRILL_ROOT, "TEMP_DIR 没被改到演练目录"
+    code = (
+        "import json, sys;"
+        "sys.path.insert(0, 'scripts'); sys.path.insert(0, '.');"
+        "import drill;"
+        "import vnpy.trader.utility as utility;"
+        "import vnpy_sqlite.sqlite_database as sqlite_db;"
+        "from bootstrap import logger_log_dir;"
+        "print(json.dumps({"
+        "'temp_dir': str(utility.TEMP_DIR),"
+        "'log_folder': str(utility.get_folder_path('log')),"
+        "'cta_file': str(utility.get_file_path('cta_strategy_data.json')),"
+        "'sqlite': str(sqlite_db.path),"
+        "'logger_dir': str(logger_log_dir() or ''),"
+        "}, ensure_ascii=False))"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=180)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    info = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert info["temp_dir"] == str(d.DRILL_ROOT), info
     # 日志目录:vnpy.trader.logger 在导入时就算死了路径
-    assert utility.get_folder_path("log") == d.DRILL_ROOT / "log"
+    assert info["log_folder"] == str(d.DRILL_ROOT / "log"), info
+    # 日志文件本身也要落在演练目录里(隔离要真的生效,不能只是 TEMP_DIR 改了名字)
+    assert info["logger_dir"].startswith(str(d.DRILL_ROOT)), info
     # CTA 策略数据文件:load_json/save_json 走 get_file_path
-    assert utility.get_file_path("cta_strategy_data.json") == d.DRILL_ROOT / "cta_strategy_data.json"
+    assert info["cta_file"] == str(d.DRILL_ROOT / "cta_strategy_data.json"), info
     # 数据库:vnpy_sqlite 在导入时就把路径算死了
-    import vnpy_sqlite.sqlite_database as sqlite_db
-
-    assert str(sqlite_db.path).startswith(str(d.DRILL_ROOT)), sqlite_db.path
+    assert info["sqlite"].startswith(str(d.DRILL_ROOT)), info
 
 
 def test_the_live_directory_is_not_the_drill_directory():

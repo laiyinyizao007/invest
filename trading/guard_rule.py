@@ -10,6 +10,8 @@
 5. 阈值预警:vn.py 内置规则触达上限时只写日志并拒单,这里把这类日志转成 WARN 告警(按指标节流),
    满足「达到阈值后预警」(国信程序化测试 3.1)。
 6. 手动暂停:`pause_trading.flag` 存在时拒绝新开仓,平仓放行(国信程序化测试 5.1)。
+7. 批量撤单:`cancel_all.request` 出现时,在下一次定时器周期撤销全部**开仓**挂单(平仓单不动)并删除请求、
+   发一次 WARN 告警(国信程序化测试 6.2;`scripts/cancel_all_orders.py` 写请求)。
 
 紧急平仓走 risk_engine._send_order(绕过风控规则的原始发单通道):平仓只会降低风险,不能被限流拦住。
 紧急平仓状态机的关键约束(防止重复下单):
@@ -17,7 +19,9 @@
 - 上一轮每笔平仓委托都被观察到处于终态后才可能重试(最多 3 次,间隔 1/3/5 秒);
 - 状态未知(无回报)绝不重发,超时升级人工;成交量已覆盖持仓但持仓回报迟迟不清零,同样不重发,主动查询持仓并升级人工。
 """
+import hashlib
 import math
+import os
 import re
 import time
 from collections import deque
@@ -27,14 +31,15 @@ from pathlib import Path
 from vnpy.event import Event
 from vnpy.trader.constant import Direction, Offset, OrderType, Status
 from vnpy.trader.event import EVENT_ACCOUNT, EVENT_LOG
-from vnpy.trader.logger import ERROR
+from logging import ERROR  # 标准库的级别常量:不要从 vnpy.trader.logger 引,
+# 那会把日志模块(在导入时就按 TEMP_DIR 建好文件 sink)提前拉进来,隔离目录就名不副实了
 from vnpy.trader.object import LogData, OrderData, OrderRequest
 from vnpy.trader.utility import round_to
 from vnpy_ctastrategy.base import APP_NAME as CTA_APP_NAME
 from vnpy_riskmanager.base import APP_NAME
 from vnpy_riskmanager.template import RuleTemplate
 
-from risk.account_guard import AccountGuard, AccountLimits, LockEvent, trading_day
+from risk.account_guard import AccountGuard, AccountLimits, LockEvent, beijing_now, trading_day
 from risk.positions import describe, undirected
 from risk.order_policy import (
     RejectKind,
@@ -53,6 +58,9 @@ ERROR_WINDOW = 3.0                      # 废单与其错误日志的最大时�
 MIN_POSITION_REFRESH_TIMEOUT = 3.0     # 等持仓回报的下限(秒)
 CANCEL_RETRY_SECONDS = 10.0             # 撤单请求发出后多久仍未终结则允许再次撤单
 PAUSE_FLAG_NAME = "pause_trading.flag"  # 与状态文件同目录;存在 = 手动暂停开仓(scripts/pause_trading.py 写/删)
+CANCEL_ALL_REQUEST_NAME = "cancel_all.request"  # 与状态文件同目录;出现 = 一次性批量撤销开仓挂单(scripts/cancel_all_orders.py 写)
+CANCEL_ALL_MAX_BYTES = 1024             # 批量撤单请求只读这么多字节(本地文件内容进告警前要有上限)
+CANCEL_ALL_REASON_CHARS = 120           # 告警里的撤单原因最长字符数
 THRESHOLD_LOG_PREFIX = "委托被拦截，"      # vnpy_riskmanager 的 RiskEngine.write_log 统一前缀
 THRESHOLD_LOG_MARKERS = ("达到上限", "超过上限")   # 笔数/手数/金额类阈值(含合约级笔数/撤单/成交上限);合约代码不存在、价位不合规不属于阈值
 THRESHOLD_ALERT_INTERVAL = 300.0        # 同一指标的阈值预警最短间隔(秒),避免每笔被拒都推一条
@@ -75,6 +83,27 @@ REJECT_LOG_MARKERS = ("交易委托失败", "交易撤单失败", "状态更新"
 # 运行时"网关错误"告警用的宽措辞:这里只是给人看,分类错误没有后果,所以可以宽一点。
 GATEWAY_ERROR_MARKERS = ("失败", "被拒绝", "拒绝", "不支持", "非法")
 
+
+
+_REQUEST_STAMP = re.compile(r"^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\s*")
+
+
+def _read_bounded(path: Path) -> bytes | None:
+    """读请求文件的前 CANCEL_ALL_MAX_BYTES 字节;文件不存在或读不了返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(CANCEL_ALL_MAX_BYTES)
+    except OSError:
+        return None
+
+
+def _clean_reason(raw: bytes) -> str:
+    """请求里的原因文本:按 UTF-8 宽松解码、控制字符换成空格、截断——它会原样进告警。"""
+    text = raw.decode("utf-8", errors="replace")
+    text = _REQUEST_STAMP.sub("", text, count=1)       # 去掉 CLI 写入的时间戳前缀:上限只作用于原因本身
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    text = " ".join(text.split())
+    return text[:CANCEL_ALL_REASON_CHARS]
 
 class AccountGuardRule(RuleTemplate):
     """账户风控规则"""
@@ -122,7 +151,9 @@ class AccountGuardRule(RuleTemplate):
         self.day_start_equity: float = 0.0
         self.cancel_count: int = 0
 
-        self.clock = datetime.now             # 测试可替换
+        # 交易日按**交易所所在时区**算:宿主机本地时间可能是 UTC-8,夜盘时段会与北京时间
+        # 分属不同的交易日 ⇒ 当日熔断/硬锁定的「当天」与预检对不上(2026-11-16 codex 复核 M2)。
+        self.clock = beijing_now              # 测试可替换
         self.mono = time.monotonic            # 测试可替换
         self.retry_policy = RetryPolicy()
         self.guard = AccountGuard()
@@ -139,6 +170,8 @@ class AccountGuardRule(RuleTemplate):
         self._manual_armed = False
         self._threshold_alerted: dict[str, float] = {}   # 指标 -> 上次预警的单调时刻
         self._pause_active = False
+        self._cancel_all_done: str | None = None          # 已处理但移除不掉的请求:其(有界)内容的 sha256,避免每秒重复处理
+        self._cancel_all_unlink_alerted: str | None = None  # 已告警过「删不掉」的 .processing 内容指纹:同一文件只告警一次
         self._seen_orders: dict[str, None] = {}      # 保持插入顺序,超限时丢最旧的
         self._own_orders: set[str] = set()
         self._manual_counted: set[str] = set()      # 已计数的非策略委托号:不随 _seen_orders 淘汰,防回放重复计数
@@ -207,6 +240,68 @@ class AccountGuardRule(RuleTemplate):
         else:
             self._alert("WARN", "交易已恢复", "暂停标志已解除,允许新开仓")
 
+    # ---------- 批量撤单 ----------
+
+    def _process_cancel_all_request(self) -> None:
+        """批量撤单请求(国信 6.2):撤销全部开仓挂单 → 移除请求 → 告警一次。
+
+        撤销集合与熔断/行情看门狗共用 `_cancel_all_open_orders`:平仓单与紧急平仓单不撤
+        (「平仓永远放行」,批量撤单不能让持仓失去离场委托)。
+
+        - 先**原子认领**(改名为 `.processing`)再处理:处理期间新写入的请求是新文件,下一周期照常处理。
+        - **认领后崩溃可恢复**:上一轮认领了但没处理完(进程崩溃/异常)会留下 `.processing`,
+          下一周期(含重启后)发现它就**再处理一次**——重复撤单是幂等的,丢掉应急请求不行。
+        - 认领失败:文件已不在(别的消费者先拿走)→ 什么都不做;被占用 → 按内容指纹只处理一次并告警。
+        - 请求内容只读前 `CANCEL_ALL_MAX_BYTES` 字节,原因去掉控制字符并截断后才进告警。
+        """
+        state_path = self.guard.state_path
+        if state_path is None:
+            return
+        path = state_path.parent / CANCEL_ALL_REQUEST_NAME
+        claimed = path.with_name(CANCEL_ALL_REQUEST_NAME + ".processing")
+        if claimed.exists():
+            source, claim_error, stamp = claimed, None, None      # 上一轮认领后没处理完:恢复执行
+        else:
+            self._cancel_all_unlink_alerted = None                 # 卡住的 .processing 已被处理掉/人工删掉:恢复告警
+            raw = _read_bounded(path)
+            if raw is None:
+                self._cancel_all_done = None
+                return
+            stamp = hashlib.sha256(raw).hexdigest()
+            if stamp == self._cancel_all_done:
+                return
+            try:
+                os.replace(path, claimed)
+                source, claim_error = claimed, None
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                source, claim_error = path, exc
+        content = _read_bounded(source) or b""
+        reason = _clean_reason(content)
+        eligible, sent = self._cancel_all_open_orders()
+        if claim_error is None:
+            self._cancel_all_done = None
+            try:
+                claimed.unlink(missing_ok=True)
+                self._cancel_all_unlink_alerted = None
+            except OSError as exc:
+                digest = hashlib.sha256(content).hexdigest()
+                if digest == self._cancel_all_unlink_alerted:
+                    return                       # 同一份删不掉的请求:继续每周期撤单(幂等),但不再刷告警
+                self._cancel_all_unlink_alerted = digest
+                self._alert("ERROR", "批量撤单请求无法删除",
+                            f"{claimed.name} 删除失败({exc!r}),在删除前每个周期都会再执行一次批量撤单(幂等);请手动删除该文件")
+        else:
+            self._cancel_all_done = stamp
+            self._alert("ERROR", "批量撤单请求无法删除",
+                        f"{CANCEL_ALL_REQUEST_NAME} 已处理但无法移除({claim_error!r}),同一份请求不会重复执行;请手动删除该文件")
+        pending = eligible - sent
+        self._alert("WARN", "批量撤单",
+                    f"收到批量撤单请求{f'({reason})' if reason else ''}:开仓挂单 {eligible} 笔,本次发出撤单 {sent} 笔"
+                    + (f"({pending} 笔此前已在撤单中)" if pending > 0 else "")
+                    + ",平仓委托不撤。撤单结果以委托回报为准")
+
     # ---------- 事件 ----------
 
     def arm_manual_detection(self) -> None:
@@ -253,6 +348,15 @@ class AccountGuardRule(RuleTemplate):
                         f"{order.volume}@{order.price}(委托号 {oid},reference={order.reference!r})。"
                         f"今日第 {today} 笔。这不是本系统发出的单:人工干预会使无人值守验收作废,请核对账户与持仓。")
 
+    @staticmethod
+    def _reject_key(order: OrderData) -> str:
+        """已处理废单的登记键:委托号 + 指纹(合约/方向/开平/手数/价格)。回放的是同一笔,字段一模一样;
+        委托号撞号的另一笔新废单,指纹对不上 ⇒ 查不到 ⇒ 照常判定(fail-closed)。"""
+        # 枚举取 .name 不取 .value:.value 是显示文案,随 vnpy 版本/语言可能变('Long'/'多'),键会跟着漂;
+        # 且本函数在每个委托事件的 on_order 路径上,字段缺失不能抛异常(会带停事件引擎线程)
+        return (f"{order.vt_orderid}|{order.vt_symbol}|{getattr(order.direction, 'name', '')}|"
+                f"{getattr(order.offset, 'name', '')}|{order.volume}|{order.price}")
+
     def on_order(self, order: OrderData) -> None:
         now = self.mono()
         self._track_manual_order(order, now)
@@ -266,6 +370,13 @@ class AccountGuardRule(RuleTemplate):
         if order.status == Status.CANCELLED:
             self._count_cancel()
         elif order.status == Status.REJECTED:
+            # 登录/重连后柜台会把当日委托整体回放。已处理过的废单(委托号已按交易日落盘)不再判一遍:
+            # 当时若触发了锁定,锁定已落盘;再判只会把人工解锁过的当日重新锁上。
+            # 判据是「委托号处理过没有」,不看报单时间/启动时刻(那些会被重连重推、夜盘交易日时间戳、
+            # 时钟偏差绕过);查不到 = 当新废单照常判定(fail-closed)。
+            if self.guard.is_reject_handled(trading_day(self.clock()), self._reject_key(order)):
+                self.write_log(f"已处理过的废单 {order.vt_orderid} 被回放,不再重复判定锁定")
+                return
             self._pending_rejects[order.vt_orderid] = (now, order)   # 稍后(等错误日志到达)再分类
 
     def _on_threshold_log(self, msg: str) -> None:
@@ -338,6 +449,8 @@ class AccountGuardRule(RuleTemplate):
                 continue
             del self._pending_rejects[oid]
             self._handle_reject(order, self._error_text_near(t, order.gateway_name), t)
+            # 先判定(含锁定落盘)后登记:反过来的话,中间崩溃会让这笔废单此后永远不再触发锁定
+            self.guard.mark_reject_handled(trading_day(self.clock()), self._reject_key(order))
 
     def _handle_reject(self, order: OrderData, text: str | None, ts: float) -> None:
         kind = classify_reject(text)
@@ -391,6 +504,7 @@ class AccountGuardRule(RuleTemplate):
         self._process_pending_rejects(now)
         self._process_manual_pending(now)
         self._sync_pause_state()
+        self._process_cancel_all_request()
         in_session = self.session_active()
         if in_session and not self._was_in_session:
             # 非交易→交易时段边沿:休市期间没有成交/撤单回报是正常的,挂单年龄要从开盘时刻重新计。
@@ -448,11 +562,20 @@ class AccountGuardRule(RuleTemplate):
         if flatten:
             self._begin_flatten(hard=False)
 
-    def _cancel_all_open_orders(self) -> None:
+    def _cancel_all_open_orders(self) -> tuple[int, int]:
+        """撤销全部开仓挂单;返回 (撤销集合里的开仓挂单数, 本次实际发出的撤单请求数)——
+        两个数取自**同一次**遍历,不会因前后快照不同而对不上(重试间隔内、已终结的不计入后者)。"""
         now = self.mono()
-        for order in self.risk_engine.main_engine.get_all_active_orders():
+        eligible = sent = 0
+        main = self.risk_engine.main_engine
+        for order in main.get_all_active_orders():
             if order.offset not in CLOSING_OFFSETS:
-                self._cancel_order(order.vt_orderid, now)
+                current = main.get_order(order.vt_orderid)      # 以撤单这一刻的状态为准,快照后已终结的不计入
+                if current is None or not current.is_active():
+                    continue
+                eligible += 1
+                sent += self._cancel_order(order.vt_orderid, now)
+        return eligible, sent
 
     def cancel_open_orders_on_stale_tick(self) -> None:
         """行情假死看门狗(运行时定时器)撤单的**唯一公开入口**。
@@ -462,17 +585,19 @@ class AccountGuardRule(RuleTemplate):
         """
         self._cancel_all_open_orders()
 
-    def _cancel_order(self, vt_orderid: str, now: float) -> None:
-        """撤单;撤单请求发出后超过 CANCEL_RETRY_SECONDS 仍未终结(CTP 撤单失败只有错误日志、没有终态)则允许再撤。"""
+    def _cancel_order(self, vt_orderid: str, now: float) -> bool:
+        """撤单;撤单请求发出后超过 CANCEL_RETRY_SECONDS 仍未终结(CTP 撤单失败只有错误日志、没有终态)则允许再撤。
+        返回是否真的发出了撤单请求。"""
         last = self._cancel_requested.get(vt_orderid)
         if last is not None and now - last < CANCEL_RETRY_SECONDS:
-            return
+            return False
         main = self.risk_engine.main_engine
         order = main.get_order(vt_orderid)
         if order is None or not order.is_active():
-            return
+            return False
         self._cancel_requested[vt_orderid] = now
         main.cancel_order(order.create_cancel_request(), order.gateway_name)
+        return True
 
     # ---------- 紧急平仓状态机 ----------
 

@@ -793,3 +793,221 @@ def test_cached_account_without_any_event_since_start_is_not_stamped_as_fresh(tm
         assert saved is None or datetime.fromisoformat(saved).replace(tzinfo=None) != e.clock.dt
     finally:
         e.main.close()
+
+
+# ---- 登录回放的当日历史废单(2026-11-18 国信实测:11:35 休市被拒的一笔,之后每次登录都重新锁定) ----
+# 判据:这笔废单的委托号是否已被处理过(处理完才按交易日落盘)。不看报单时间/启动时刻——
+# 那样会被重连重推、夜盘交易日时间戳、时钟偏差绕过(2026-11-23 codex 复核)。查不到 = 照常判定(fail-closed)。
+
+from datetime import timedelta  # noqa: E402
+
+from vnpy.trader.constant import Status  # noqa: E402
+from vnpy.trader.object import LogData, OrderData  # noqa: E402
+
+from risk.account_guard import AccountGuard  # noqa: E402
+
+_EXCHANGE_PAUSED = "委托 5_485432688_2 状态更新，40052:已撤单报单被拒绝DCE:该合约当前是连续交易暂停"
+_LOCKED = "严重错误,已停止策略开仓"
+
+
+def _push_counter_order(env, orderid: str, status=Status.REJECTED, offset=Offset.OPEN, inserted=None):
+    """像 CTP onRtnOrder 那样推一笔柜台回报,拒单时随后写「状态更新」日志。"""
+    from vnpy.trader.event import EVENT_LOG
+    order = OrderData(symbol="c2601", exchange=Exchange.DCE, orderid=orderid, type=OrderType.LIMIT,
+                      direction=Direction.LONG, offset=offset, price=2185.0, volume=1, status=status,
+                      datetime=inserted, gateway_name="FAKE")
+    env.gw.on_order(order)
+    if status == Status.REJECTED:
+        env.gw.on_event(EVENT_LOG, LogData(msg=_EXCHANGE_PAUSED, gateway_name="FAKE"))
+
+
+def _clear_daily_lock_on_disk(env) -> None:
+    """模拟「人工只解除当日锁定、保留状态文件其余内容」:改 daily_locked_day,不删文件。"""
+    import json
+    s = json.loads(env.state_file.read_text(encoding="utf-8"))
+    s["daily_locked_day"] = None
+    env.state_file.write_text(json.dumps(s, ensure_ascii=False), encoding="utf-8")
+
+
+def _restart(env) -> AccountGuardRule:
+    r = AccountGuardRule(env.engine, {"state_file": str(env.state_file)})
+    r.clock, r.mono = env.clock.now, env.clock.mono
+    return r
+
+
+def test_first_time_reject_locks_and_is_recorded_after_the_lock(env):
+    """第一次见到的废单照常锁定;处理完才把委托号写进状态文件(锁定已落盘在先,崩溃窗口不会丢锁)。"""
+    import json
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    assert _LOCKED in env.alert_titles()
+    assert env.send(make_req()) == ""
+    s = json.loads(env.state_file.read_text(encoding="utf-8"))
+    assert s["daily_locked_day"] == "2026-11-09"
+    keys = s["handled_rejects"]["2026-11-09"]
+    assert list(s["handled_rejects"]) == ["2026-11-09"] and len(keys) == 1
+    assert keys[0].startswith("FAKE.5_1_9|c2601.DCE|LONG|OPEN|")
+
+
+def test_same_reject_pushed_again_is_not_judged_again(env):
+    """断线重连会把当日委托整体重推:已处理过的废单第二次上报不再判定(此前会再次 DAILY_LOCKED)。"""
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    _clear_daily_lock_on_disk(env)
+    env.rule.guard.daily_locked_day = None
+    n = len(env.alerts)
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    assert env.send(make_req()) != ""
+    assert [a["title"] for a in env.alerts[n:]] == []
+
+
+def test_replay_after_restart_is_not_judged_again(env):
+    """重启后登录回放:状态文件里已处理的废单不再重复锁定(2026-11-18 国信实测的场景)。"""
+    _push_counter_order(env, "5_485432688_2")
+    env.tick(seconds=2)
+    _clear_daily_lock_on_disk(env)
+    env.main.close()
+    e2 = Env(env.state_file.parent / "second")
+    e2.state_file = env.state_file
+    e2.rule.update_setting({"state_file": str(env.state_file)})
+    e2.rule.clock, e2.rule.mono = e2.clock.now, e2.clock.mono
+    try:
+        e2.tick()
+        _push_counter_order(e2, "5_485432688_2")
+        e2.tick(seconds=2)
+        assert _LOCKED not in e2.alert_titles()
+        assert e2.send(make_req()) != ""
+    finally:
+        e2.main.close()
+
+
+def test_replay_is_logged_not_silent(env):
+    logs: list[str] = []
+    from vnpy.trader.event import EVENT_LOG
+    _push_counter_order(env, "5_485432688_2")
+    env.tick(seconds=2)
+    env.event_engine.register(EVENT_LOG, lambda e: logs.append(e.data.msg))
+    _push_counter_order(env, "5_485432688_2")
+    assert any("已处理过的废单" in m and "5_485432688_2" in m for m in logs)
+
+
+def test_a_different_reject_still_locks_after_one_was_handled(env):
+    """已处理的只是那一个委托号;别的新废单仍照常锁定。"""
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    _clear_daily_lock_on_disk(env)
+    env.rule.guard.daily_locked_day = None
+    _push_counter_order(env, "5_1_10")
+    env.tick(seconds=2)
+    assert env.send(make_req()) == ""
+
+
+def test_reject_time_and_clock_no_longer_matter(env):
+    """不再按报单时间判历史:无时间、未来时间(夜盘交易日)、很久以前的废单,第一次见到一律照常锁定。"""
+    for i, ts in enumerate((None, env.clock.dt + timedelta(hours=14), env.clock.dt - timedelta(days=1))):
+        _clear_daily_lock_on_disk(env)
+        env.rule.guard.daily_locked_day = None
+        _push_counter_order(env, f"5_2_{i}", inserted=ts)
+        env.tick(seconds=2)
+        assert env.send(make_req()) == "", ts
+
+
+def test_handled_ids_are_per_trading_day(env):
+    """同一个委托号换了交易日不算已处理(fail-closed)。"""
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    _clear_daily_lock_on_disk(env)
+    env.rule.guard.daily_locked_day = None
+    env.clock.dt = datetime(2026, 11, 10, 10, 0)
+    env.tick()
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    assert env.send(make_req()) == ""
+
+
+def test_close_order_reject_replay_is_not_alerted_twice(env):
+    """平仓单被拒只告警:同一笔回放时不再重复告警。"""
+    _push_counter_order(env, "5_3_1", offset=Offset.CLOSE)
+    env.tick(seconds=2)
+    n = len([t for t in env.alert_titles() if t == "委托被拒"])
+    _push_counter_order(env, "5_3_1", offset=Offset.CLOSE)
+    env.tick(seconds=2)
+    assert len([t for t in env.alert_titles() if t == "委托被拒"]) == n
+
+
+def test_replayed_cancels_are_still_counted(env):
+    """撤单计数不受本机制影响:回放的撤单照常计入当日撤单数(CHANGELOG 声称「撤单计数不变」)。"""
+    _push_counter_order(env, "5_4_1", status=Status.CANCELLED)
+    _push_counter_order(env, "5_4_2", status=Status.CANCELLED)
+    assert env.rule.cancel_count == 2
+
+
+def test_reject_of_unknown_state_file_field_shape_is_fail_closed(tmp_path):
+    """状态文件里 handled_rejects 形状不对(损坏/手改)⇒ 视为一个都没处理过,不能让整个文件读失败。"""
+    import json
+    f = tmp_path / "g.json"
+    AccountGuard(state_path=f).record_manual_order(datetime(2026, 11, 9, 10, 0))   # 先写出一份合法文件
+    s = json.loads(f.read_text(encoding="utf-8"))
+    s["handled_rejects"] = ["not", "a", "dict"]
+    f.write_text(json.dumps(s), encoding="utf-8")
+    g = AccountGuard(state_path=f)
+    assert not g.is_reject_handled(datetime(2026, 11, 9).date(), "x")
+
+
+def test_handled_ids_are_bounded_and_eviction_is_fail_closed(tmp_path):
+    """每天最多留 HANDLED_REJECTS_PER_DAY 个:被挤掉的最旧一个视为未处理(再判一次,多锁不漏锁);旧日期被清理。"""
+    from risk import account_guard as ag
+    g = AccountGuard(state_path=tmp_path / "g.json")
+    d = datetime(2026, 11, 9).date()
+    for i in range(ag.HANDLED_REJECTS_PER_DAY + 1):
+        g.mark_reject_handled(d, f"o{i}")
+    assert not g.is_reject_handled(d, "o0")
+    assert g.is_reject_handled(d, f"o{ag.HANDLED_REJECTS_PER_DAY}")
+    for k in range(ag.HANDLED_REJECTS_DAYS + 2):
+        g.mark_reject_handled(datetime(2026, 12, 1 + k).date(), "x")
+    assert len(g.handled_rejects) == ag.HANDLED_REJECTS_DAYS
+
+
+def test_reused_order_id_with_a_different_order_is_not_taken_as_handled(env):
+    """委托号撞号(柜台复用 SessionID + 客户端 OrderRef 重数)时,另一笔【新】废单不能被当成已处理而漏锁:
+    登记的是委托号 + 指纹(合约/方向/开平/手数/价格),指纹不符 = 新废单(2026-11-23 codex 第二轮)。"""
+    from vnpy.trader.event import EVENT_LOG
+    _push_counter_order(env, "5_1_9")
+    env.tick(seconds=2)
+    _clear_daily_lock_on_disk(env)
+    env.rule.guard.daily_locked_day = None
+    other = OrderData(symbol="c2601", exchange=Exchange.DCE, orderid="5_1_9", type=OrderType.LIMIT,
+                      direction=Direction.SHORT, offset=Offset.OPEN, price=2190.0, volume=3, status=Status.REJECTED,
+                      gateway_name="FAKE")
+    env.gw.on_order(other)
+    env.gw.on_event(EVENT_LOG, LogData(msg=_EXCHANGE_PAUSED, gateway_name="FAKE"))
+    env.tick(seconds=2)
+    assert env.send(make_req()) == ""
+
+
+def test_load_truncates_an_oversized_handled_list(tmp_path):
+    """手改/损坏的状态文件灌进超大列表:加载时同样按每日上限截断(留最新的),查询不退化。"""
+    import json
+    from risk import account_guard as ag
+    f = tmp_path / "g.json"
+    AccountGuard(state_path=f).record_manual_order(datetime(2026, 11, 9, 10, 0))
+    s = json.loads(f.read_text(encoding="utf-8"))
+    s["handled_rejects"] = {"2026-11-09": [f"o{i}" for i in range(ag.HANDLED_REJECTS_PER_DAY + 10)]}
+    f.write_text(json.dumps(s), encoding="utf-8")
+    g = AccountGuard(state_path=f)
+    assert len(g.handled_rejects["2026-11-09"]) == ag.HANDLED_REJECTS_PER_DAY
+    assert g.is_reject_handled(datetime(2026, 11, 9).date(), f"o{ag.HANDLED_REJECTS_PER_DAY + 9}")
+
+
+def test_reject_key_does_not_depend_on_enum_display_values_or_crash_on_missing_fields():
+    """登记键用枚举的 .name(与 vnpy 版本/语言无关:不同版本的 .value 可能是 'Long' 也可能是 '多'),
+    且 offset/direction 缺失时不抛异常——它在每个委托事件的 on_order 路径上,抛了会带停事件引擎线程
+    (2026-11-23 codex 第三轮)。"""
+    o = OrderData(symbol="c2601", exchange=Exchange.DCE, orderid="5_1_9", type=OrderType.LIMIT,
+                  direction=Direction.LONG, offset=Offset.OPEN, price=2185.0, volume=1, status=Status.REJECTED,
+                  gateway_name="FAKE")
+    assert AccountGuardRule._reject_key(o) == "FAKE.5_1_9|c2601.DCE|LONG|OPEN|1|2185.0"
+    o.offset = None
+    o.direction = None
+    assert AccountGuardRule._reject_key(o) == "FAKE.5_1_9|c2601.DCE|||1|2185.0"

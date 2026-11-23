@@ -10,6 +10,44 @@ def isolated_segment_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(segment_ledger, "LEDGER", tmp_path / "segment_usage.json")
 
 
+_REAL_PROBE: dict = {}
+
+
+def _collector_module():
+    """懒加载 ctp_tools.collector:它会连锁 import bootstrap → vnpy。
+
+    研究侧 CI(research-guard.yml)刻意不装 vnpy,全局 conftest 在**模块顶层**碰它会让整个收集阶段崩掉
+    (2026-11-23 合并 main 后 research 闸门红)。所以只在夹具里导入;没有 vnpy 就返回 None
+    (研究侧用例不碰 collector,不需要这个桩)。只吞「缺 vnpy」这一种导入失败,别的原样抛。"""
+    try:
+        from ctp_tools import collector
+    except ImportError as exc:
+        if (exc.name or "").split(".")[0] != "vnpy":
+            raise
+        return None
+    _REAL_PROBE.setdefault("probe", collector._probe_counter_replies)
+    return collector
+
+
+@pytest.fixture(autouse=True)
+def stub_counter_probe(monkeypatch):
+    """持仓查询「没有行」时的账户探针会 sleep 1.1s(躲柜台查询流控)。
+
+    绝大多数假引擎用例只关心别的逻辑,统一桩成「柜台在应答」;
+    要测探针本身的用例请求 `real_probe` 夹具把真函数换回来。
+    """
+    collector = _collector_module()
+    if collector is not None:
+        monkeypatch.setattr(collector, "_probe_counter_replies", lambda *a, **k: True)
+
+
+@pytest.fixture
+def real_probe(monkeypatch):
+    collector = _collector_module()
+    assert collector is not None, "real_probe 需要 vnpy 环境"
+    monkeypatch.setattr(collector, "_probe_counter_replies", _REAL_PROBE["probe"])
+    return _REAL_PROBE["probe"]
+
 
 @pytest.fixture()
 def numpy_on_allowlist(monkeypatch):

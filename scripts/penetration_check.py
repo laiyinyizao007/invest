@@ -24,7 +24,6 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import sys
@@ -34,16 +33,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bootstrap
 
-sys.path.insert(0, str(bootstrap.ROOT / "scripts"))
 
 from vnpy.event import EventEngine  # noqa: E402
 from vnpy.trader.constant import Direction, Offset, OrderType, Status  # noqa: E402
 from vnpy.trader.engine import MainEngine  # noqa: E402
-from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_TICK  # noqa: E402
+from vnpy.trader.event import EVENT_ACCOUNT, EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK  # noqa: E402
 from vnpy.trader.object import CancelRequest, OrderRequest, SubscribeRequest  # noqa: E402
 from vnpy.trader.utility import round_to  # noqa: E402
 
 from ctp_tools.collector import Collector, check_positions, close_engine, in_trading_session  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 from notify.webhook import redact  # noqa: E402
 from ctp_tools.simnow import is_simnow_address, normalize_address  # noqa: E402
 from trading.runtime import build_ctp_setting  # noqa: E402
@@ -55,6 +54,7 @@ EXIT_STEP_FAILED = 1
 EXIT_CONFIG = 2
 EXIT_LOGIN = 3
 EXIT_POSITION = 5
+EXIT_CRASH = 4
 
 # vnpy_ctp 网关写出的里程碑日志(措辞取自 vnpy_ctp 6.7.11.4 的 ctp_gateway.py)。
 MILESTONES = (
@@ -75,11 +75,14 @@ MILESTONE_LABELS = {
 FAILURE_MARKERS = ("授权验证失败", "交易服务器登录失败", "行情服务器登录失败")
 
 
+from ctp_tools.broker_targets import resolve_allowed_for_broker
 from ctp_tools.penetration import (
     Run, check_target, do_order_cancel, failure_lines, limit_down_price, mask_account,
     milestone_status, package_version, render_report, run_checks as _run_checks,
     trade_connected, wait_milestones,
 )
+from ctp_tools.simnow import normalize_address
+from ctp_tools.profile import load_profile
 
 
 def run_checks(args, symbol, main_engine, collector, secrets=()):
@@ -90,17 +93,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbol", default="", help="测试合约,如 c2701.DCE(默认取 .env 的 LIVE_VT_SYMBOL)")
     parser.add_argument("--confirm-broker-test", action="store_true", help="确认目标是期货公司的测试环境")
     parser.add_argument("--with-order", action="store_true", help="交易时段内报一张跌停价买单并撤销")
-    parser.add_argument("--connect-timeout", type=float, default=120.0, help="等待登录全流程的最长时间(秒)")
+    parser.add_argument("--connect-timeout", type=float, default=300.0,
+                        help="等待登录全流程(含合约表查询)的最长时间(秒);柜台的合约表查询实测要 90 秒以上")
     parser.add_argument("--tick-timeout", type=float, default=30.0, help="等待 Tick 的最长时间(秒)")
     parser.add_argument("--position-wait", type=float, default=8.0, help="持仓查询等待窗口(秒)")
     parser.add_argument("--out-dir", default="", help=f"报告目录(默认 {REPORT_DIR})")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin);默认用项目 .env")
     args = parser.parse_args(argv)
     # 非 UTF-8 控制台(管道/英文系统)下中文输出不应让脚本崩溃
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
 
-    bootstrap.load_env()
-    env = os.environ
+    # 配置解析只走 ctp_tools.profile:与取证运行器、清场工具同一套优先级
+    # (档案 > .env > 进程环境),三处必须连到同一个账户。
+    try:
+        profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_CONFIG
+    if profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断该连哪台机器,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for c in profile.hard_conflicts:
+            print(f"  - {c}", file=sys.stderr)
+        return EXIT_CONFIG
+    for note in profile.notes:
+        print(f"⚠ {note}(已按档案取值)", file=sys.stderr)
+    env = profile.env
 
     symbol = args.symbol or env.get("LIVE_VT_SYMBOL", "")
     if not symbol:
@@ -112,9 +131,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return EXIT_CONFIG
 
-    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test)
+    # 前置地址白名单:「柜台环境=测试」只是一个标记,不说明连的是哪台机器。
+    # 交易前置与行情前置都要在表内——行情前置喂回来的盘口价会直接变成委托价。
+    # 白名单**只能收窄不能放宽**:它与 CTP_TD_ADDRESS 同在 .env 里,采信它
+    # 等于自己给自己发通行证,所以与代码里写死的可信地址全集求交集。
+    allowed_td, allowed_md, dropped_td, dropped_md = resolve_allowed_for_broker(
+        setting["经纪商代码"], env.get("BROKER_TEST_ALLOWED_TD", ""), env.get("BROKER_TEST_ALLOWED_MD", ""))
+    for label, dropped in (("交易", dropped_td), ("行情", dropped_md)):
+        if dropped:
+            print(f"⚠ {label}前置白名单里的 {dropped} 不属于经纪商代码 {setting['经纪商代码']!r} "
+                  "对应的可信地址表,已丢弃。", file=sys.stderr)
+    ok, note = check_target(setting["柜台环境"], setting["交易服务器"], args.confirm_broker_test, allowed_td)
     print(note, file=sys.stderr if not ok else sys.stdout)
     if not ok:
+        return EXIT_CONFIG
+    md_address = normalize_address(setting["行情服务器"])
+    if not allowed_md:
+        print("行情前置白名单为空(BROKER_TEST_ALLOWED_MD 没配,或里面没有可信地址),拒绝连接:"
+              "行情前置的盘口价会直接变成委托价。", file=sys.stderr)
+        return EXIT_CONFIG
+    if md_address not in allowed_md:
+        print(f"行情前置 {md_address} 不在可信前置地址表 {sorted(allowed_md)} 内,拒绝连接:"
+              "行情前置的盘口价会直接变成委托价。", file=sys.stderr)
         return EXIT_CONFIG
 
     secrets = [env.get("CTP_PASSWORD", ""), env.get("CTP_AUTH_CODE", ""), env.get("CTP_APP_ID", ""),
@@ -133,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     event_engine.register(EVENT_ORDER, collector.on_order)
     event_engine.register(EVENT_TICK, collector.on_tick)
     event_engine.register(EVENT_CONTRACT, collector.on_contract)
+    # 持仓回报必须自己收:vn.py 的 OMS 只写不删,平掉的仓位永远留在缓存里,
+    # 按它判断会一直说「账户有持仓」;按它判断成「空仓」更糟 ——
+    # 穿透演练里有「无持仓时平仓」的场景,判错就可能真的平掉仓位。
+    event_engine.register(EVENT_POSITION, collector.on_position)
+    event_engine.register(EVENT_ACCOUNT, collector.on_account)   # 持仓查询「没有行」时用账户回报证明柜台在应答
 
     print(f"连接 {symbol} ...")
     main_engine.connect(setting, "CTP")
@@ -147,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
     import platform
     import socket
     meta = {
-        "time": f"{datetime.now():%Y-%m-%d %H:%M:%S}", "target": note,
+        # 时间戳一律**北京时间**:与其它证据目录(条目时间、连接记录)同一基准,
+        # 宿主机不在北京时不会差 16 小时(2026-11-16 codex 复核 L5)。
+        "time": f"{beijing_now():%Y-%m-%d %H:%M:%S}", "target": note,
         "account": mask_account(env.get("CTP_USERNAME", "")), "symbol": symbol,
         "vnpy": package_version("vnpy"), "vnpy_ctp": package_version("vnpy_ctp"),
         "python": platform.python_version(), "host": socket.gethostname(),
@@ -157,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     report = render_report(run, meta, log_lines, secrets)
     out_dir = Path(args.out_dir) if args.out_dir else REPORT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"penetration-{datetime.now():%Y%m%d-%H%M%S}.md"
+    out = out_dir / f"penetration-{beijing_now():%Y%m%d-%H%M%S}.md"
     out.write_text(report, encoding="utf-8")
     print(f"\n报告已写入 {out}")
     if code == EXIT_OK and run.failed():
@@ -171,10 +216,10 @@ if __name__ == "__main__":
         code = main()
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-    except Exception:
+    except BaseException:      # noqa: BLE001  崩溃/被中断 ≠ 有失败项
         import traceback
         traceback.print_exc()
-        code = 1
+        code = 4
     finally:
         sys.stdout.flush()
         sys.stderr.flush()

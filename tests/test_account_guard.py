@@ -319,6 +319,57 @@ def test_empty_account_id_is_ignored():
     assert g.bind_account("") is None and g.account_id == "A"
 
 
+def test_switching_account_clears_the_unusable_sampling_stamp(tmp_path):
+    """换账户时,旧账户「采样时刻用不了」的留痕也要一并作废。
+
+    2026-11-16 codex 第九轮复核 L4:`bind_account()` 换了账户会清 `last_sampled_at`,
+    却留着旧账户的 `sampled_at_unusable` ⇒ 状态文件里出现「新账户 + 旧账户的坏采样理由」
+    这种自相矛盾的组合,读状态页的人会以为**新账户**的采样时刻也有问题。
+    """
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.bind_account("A")
+    g.update(10_000, MON_10AM)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["sampled_at"] = "不是一个时刻"          # 坏值 ⇒ 读回时进 sampled_at_unusable
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.sampled_at_unusable == "不是一个时刻"      # 留痕确实读回来了
+    g2.bind_account("B")
+    assert g2.sampled_at_unusable == "" and g2.last_sampled_at is None
+
+
+def test_first_binding_keeps_the_ownerless_unusable_sampling_stamp(tmp_path):
+    """旧状态文件**没有 account_id** 时,首次绑定**故意保留**那条坏采样留痕。
+
+    2026-11-16 codex 第十轮复核 L-7:作废 `sampled_at_unusable` 只覆盖「previous 非空」
+    那一支;旧文件(无 account_id)走的是首次绑定那一支 ⇒ 留痕留着。codex 给了两个选项:
+    一并作废,或写明「无主留痕按保留处理是有意为之」。这里取后者 ——
+    首次绑定那一支本来就**整体沿用**旧文件的基准(peak_equity / day_start_equity /
+    last_sampled_at 一个都不清),只把留痕单独抹掉会让状态变成「旧基准 + 新解释」的
+    半新半旧;而且这条留痕是「这里曾经有个值、只是格式不对」的审计线索,抹掉反而丢证据。
+
+    该字段**不参与任何判定**(can_open / status / is_daily_locked 都不读它)⇒ 实盘防线零影响。
+    """
+    path = tmp_path / "guard.json"
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g.update(10_000, MON_10AM)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["sampled_at"] = "不是一个时刻"          # 坏值 ⇒ 读回时进 sampled_at_unusable
+    state.pop("account_id", None)                # 旧版本的状态文件没有账户
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    g2 = AccountGuard(AccountLimits(600, 2000), path)
+    assert g2.sampled_at_unusable == "不是一个时刻"      # 无主留痕读回来了
+    assert g2.account_id == ""
+    g2.bind_account("A")                              # 首次绑定
+    assert g2.account_id == "A"
+    # 留痕**保留**(有意为之,见 docstring);基准也整体沿用 ⇒ 不是半新半旧
+    assert g2.sampled_at_unusable == "不是一个时刻"
+    assert g2.peak_equity == 10_000
+
+
 # ---------- 废单分类 ----------
 
 @pytest.mark.parametrize("text", ["CTP:资金不足", "合约不存在", "平仓量超过持仓量", "不在交易时段", "报单价格不在涨跌停板内"])
@@ -491,3 +542,272 @@ def test_a_corrupt_sampled_at_in_the_state_file_is_dropped_not_invented(tmp_path
     path.write_text(json.dumps(state), encoding="utf-8")
     g = AccountGuard(AccountLimits(600, 2000), path)
     assert g.last_sampled_at is None and g.peak_equity == 10_000          # 其余状态照常加载
+
+
+def test_the_beijing_clock_does_not_depend_on_the_tz_database():
+    """时区**不能**依赖 `tzdata`:Windows 上它常常只装在用户目录,而 `-I` 隔离模式启动的进程
+    (仪表盘 `scripts/status_server.py` 就是这种)拿不到用户目录 ⇒ 一 import 就
+    `ZoneInfoNotFoundError`,把仪表盘带崩(2026-11-16 全量 pytest 抓到的回归)。
+    中国自 1991 年起不用夏令时,固定 UTC+8 偏移与 `Asia/Shanghai` 在交易日口径上等价。"""
+    import subprocess
+
+    root = str(Path(__file__).resolve().parents[1])
+    # 断言的是 **`zoneinfo` 这个模块本身**没被 import,而不是 `tzdata`:
+    # ① `ZoneInfo` 只有在**查不到**系统时区库时才去 import `tzdata`,而查不到时它直接抛异常,
+    #    失败的 import **不会**留在 sys.modules 里 ⇒ 断言 `'tzdata' not in sys.modules` 永远是空的;
+    # ② 有系统时区库(Linux/macOS/装了 tzdata 的 Windows)时,`ZoneInfo` 根本不 import `tzdata`,
+    #    把代码改回 `ZoneInfo("Asia/Shanghai")` 这个用例照样绿 —— 守卫名存实亡
+    #    (2026-11-16 codex 复核 M4)。
+    # `zoneinfo` 一旦被 import 就说明代码又用回 ZoneInfo 了,这条在**所有平台**都成立。
+    code = (
+        "import sys; sys.path.insert(0, %r); import risk.account_guard as g; "
+        "assert 'zoneinfo' not in sys.modules, 'the clock must not use the zoneinfo module'; "
+        "print(g.beijing_now().isoformat())" % root
+    )
+    proc = subprocess.run([sys.executable, "-I", "-c", code],
+                          capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert proc.stdout.strip()
+
+
+def test_the_sampled_at_timestamp_keeps_the_beijing_offset(tmp_path):
+    """落盘的采样时刻必须带着**北京时间的偏移**写出去。
+
+    2026-11-16 codex 复核 M5:采样时刻是 naive 的北京时间,原先用 `.astimezone()` 落盘 ——
+    而 `.astimezone()` 对 naive 值一律按**本机时区**解释,于是落盘时刻被平移了
+    (北京 − 本地)。非北京宿主机上,状态页的「权益新鲜度」会一直显示陈旧 ——
+    而那是操作员判断「风控还活着吗」的唯一依据。
+    """
+    path = tmp_path / "guard.json"
+    guard = AccountGuard(AccountLimits(), path)
+    guard.last_sampled_at = datetime(2026, 11, 10, 21, 30)      # 北京时间(naive)
+    guard._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["sampled_at"].startswith("2026-11-10T21:30:00"), saved["sampled_at"]
+    assert saved["sampled_at"].endswith("+08:00"), saved["sampled_at"]
+
+
+def test_the_dashboard_and_evidence_modules_do_not_need_the_tz_database():
+    """状态页与证据统计也不能依赖 `tzdata`:它们在 `-I` 隔离进程里被 import。
+
+    2026-11-16 codex 复核 H1:原先只把 `risk/account_guard` 摘出去了,
+    `dashboard/models.py` 与 `evidence/logstats.py` 仍在 import 期求值
+    `ZoneInfo("Asia/Shanghai")` ⇒ `python -I -c "from dashboard import collectors"`
+    直接 `ZoneInfoNotFoundError`,**仪表盘照旧起不来**。
+    """
+    import subprocess
+
+    root = str(Path(__file__).resolve().parents[1])
+    # 同上:断言 `zoneinfo` 没被 import(而不是 `tzdata`)—— 详见上一个用例的注释
+    # (2026-11-16 codex 复核 M4)。
+    code = (
+        "import sys; sys.path.insert(0, %r); "
+        "import dashboard.models, evidence.logstats; "
+        "assert 'zoneinfo' not in sys.modules, 'the dashboard must not use the zoneinfo module'; "
+        "print(dashboard.models.BEIJING.utcoffset(None), evidence.logstats.EXCHANGE_TZ.utcoffset(None))" % root
+    )
+    proc = subprocess.run([sys.executable, "-I", "-c", code],
+                          capture_output=True, text=True, encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr[-800:]
+    assert "8:00:00" in proc.stdout
+
+
+# ---------- 采样时刻的时区归一(2026-11-16 codex 复核 M1) ----------
+
+def test_an_old_state_file_with_a_local_offset_keeps_the_same_instant(tmp_path):
+    """旧状态文件里的 `sampled_at` 带的是**本机偏移**(`-08:00`),不是 `+08:00`。
+
+    读回来再落盘时,瞬时值必须**不变**:2026-11-16 codex 复核 M1 指出,原先的
+    `.replace(tzinfo=BEIJING)` 对**带时区**的值是「换标签不换时区」——
+    `-08:00` 被换成 `+08:00` 而墙钟不动 ⇒ 瞬时值平移 16 小时,
+    状态页的「权益新鲜度」立刻显示成陈旧值(那正是当初要修的症状)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T05:00:00-08:00",        # = 北京时间 2026-11-16 21:00
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at == datetime(2026, 11, 16, 21, 0)      # 瞬时值不变,只是换成了北京时间
+    g._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))["sampled_at"]
+    assert saved == "2026-11-16T21:00:00+08:00", saved
+
+
+def test_a_legacy_state_file_cannot_prove_the_unlock_cooldown_has_passed(tmp_path):
+    """旧状态文件里的 `hard_locked_at` 是**本机本地时间**,不能拿它跟北京时间的 now 比交易日。
+
+    2026-11-16 codex 复核 L2:旧代码用 `datetime.now()` 落盘,宿主机 UTC-8 时那个值比北京时间
+    最多晚 16 小时 ⇒ 交易日可能**早一个交易日** ⇒ 冷却期被放宽(fail-open)。
+    旧文件一律按「触发时间未知」处理:保守拒绝,需 --force。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",          # 本机本地时间(旧代码的 datetime.now())
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.hard_locked_at_legacy is True
+    reason = g.unlock_cooldown(datetime(2026, 11, 16, 21, 0))   # 早就过了「下一个交易日」
+    assert reason, "旧文件证明不了冷却期已过,必须保守拒绝"
+    assert "--force" in reason
+
+
+def test_a_legacy_marker_survives_the_next_save(tmp_path):
+    """旧文件的「本地时间」标记必须**跟着文件一起存**:否则下一次落盘写上 state_version=2,
+    旧时间戳就被当成北京时间了(标记丢失 = 冷却期又被放宽)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    g._save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["state_version"] == 2
+    assert saved["hard_locked_at_legacy"] is True
+    again = AccountGuard(AccountLimits(600, 2000), path)
+    assert again.hard_locked_at_legacy is True
+
+
+def test_a_broken_state_version_is_treated_as_an_old_file(tmp_path):
+    """`state_version` 是垃圾值(字符串/None/对象)时,按**旧文件**处理,不能让程序崩。
+
+    2026-11-16 codex 复核 L3:直接 `int(s["state_version"])` 遇到坏值会抛 ValueError,
+    而这个文件在 `_load()` 里 —— 崩了就等于**状态读不出来**,方向上比「保守当旧文件」差得多
+    (读不出来会被上层当成文件损坏 ⇒ 误触硬锁定)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",
+        "state_version": "not-a-number",
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    # 坏版本号 ⇒ 当成旧文件 ⇒ 时间戳不可信 ⇒ 保守拒绝,冷却期要 --force
+    assert g.hard_locked is True
+    assert g.hard_locked_at_legacy is True
+    assert "--force" in g.unlock_cooldown(datetime(2026, 11, 16, 21, 0))
+
+
+def test_the_unusable_sample_time_survives_a_save_and_a_restart(tmp_path):
+    """留痕必须**跨落盘存活**:只写不读的话,一次落盘(≤60 秒)或一次重启就把它抹了。
+
+    2026-11-16 codex 第八轮复核 L1:上一轮只把原值写进状态文件,`_load()` 从不回读
+    ⇒ 留痕活不过一次 `_save()`,恰好死在运维最需要它的时候。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "",
+        "hard_locked_at": "", "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",          # 坏格式(naive 且不是 ISO)
+    }), encoding="utf-8")
+    guard = AccountGuard(AccountLimits(), path)
+    assert guard.sampled_at_unusable == "2026-11-16T21:00:00"
+    guard._save()
+    # 落盘后重新读:留痕还在(而不是被下一次落盘抹成 null)
+    again = AccountGuard(AccountLimits(), path)
+    assert again.sampled_at_unusable == "2026-11-16T21:00:00", again.sampled_at_unusable
+    # 有了新的可用采样时刻,旧留痕作废
+    again.update(10_000.0, datetime(2026, 11, 16, 10, 0), sampled_at=datetime(2026, 11, 16, 10, 0))
+    assert again.sampled_at_unusable == ""
+
+
+def test_an_aware_sample_time_is_converted_to_the_beijing_offset(tmp_path):
+    """带时区的采样时刻一律换算到北京时间再落盘(内部契约是 naive 北京时间)。"""
+    from datetime import timedelta, timezone
+
+    path = tmp_path / "guard.json"
+    guard = AccountGuard(AccountLimits(), path)
+    aware = datetime(2026, 11, 10, 21, 30, tzinfo=timezone(timedelta(hours=8)))
+    guard.update(10_000, MON_10AM, sampled_at=aware)
+    saved = json.loads(path.read_text(encoding="utf-8"))["sampled_at"]
+    assert saved == "2026-11-10T21:30:00+08:00", saved
+
+
+def test_a_naive_sample_time_in_the_state_file_is_dropped_not_guessed(tmp_path):
+    """状态文件里的采样时刻必须带时区,否则无法与其他时刻比较 ⇒ 丢弃,不猜。
+
+    丢的是**纯可观测字段**:不能因此触发「状态文件损坏 → 硬锁定」。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",          # 没有时区
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at is None
+    assert g.hard_locked is False                    # 不能因此当成状态文件损坏
+
+
+def test_a_new_hard_lock_writes_a_beijing_stamp_and_clears_the_legacy_marker(tmp_path):
+    """新发生的硬锁定:时刻一律写成 `+08:00`,且**不再继承**旧文件的「本地时间」标记。
+
+    2026-11-16 codex 复核(第一轮自查):新锁原先原样写 `now.isoformat()` —— 调用方若传了
+    非北京偏移,存下来的偏移会被后面 `trading_day(fromisoformat(...))` 当成北京时间比交易日
+    (与旧状态文件同一类 fail-open);而且从旧文件升级上来时,新锁会继承 legacy 标记 ⇒
+    冷却期永远要 `--force`(方向保守,但属于「卡住」)。
+    """
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": True, "hard_reason": "旧版本锁定",
+        "hard_locked_at": "2026-11-10T05:00:00",          # 本机本地时间(旧代码的 datetime.now())
+        "unlock_history": [], "manual_orders": {}, "sampled_at": None,
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.hard_locked_at_legacy is True
+
+    g.hard_locked = False                        # 模拟一次**新**的硬锁定
+    g.update(5_000, datetime(2026, 11, 17, 9, 0))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["hard_locked_at"].endswith("+08:00"), saved["hard_locked_at"]
+    assert saved["hard_locked_at_legacy"] is False
+    # 新锁的时刻是北京时间 ⇒ 冷却期可以正常判定,不再一律要 --force
+    assert g.unlock_cooldown(datetime(2026, 11, 18, 9, 0)) == ""
+
+
+def test_an_unusable_sample_time_is_kept_for_the_record(tmp_path):
+    """用不了的采样时刻**留痕**:值被丢掉是保守的,但「曾经有、只是格式不对」不该被抹掉。"""
+    path = tmp_path / "guard.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "account_id": "1", "last_equity": 10_000.0, "peak_equity": 10_000.0,
+        "day": "2026-11-16", "day_start_equity": 10_000.0, "daily_locked_day": None,
+        "hard_locked": False, "hard_reason": "", "hard_locked_at": "",
+        "unlock_history": [], "manual_orders": {},
+        "sampled_at": "2026-11-16T21:00:00",               # 没有时区 ⇒ 用不了
+    }), encoding="utf-8")
+    g = AccountGuard(AccountLimits(600, 2000), path)
+    assert g.last_sampled_at is None
+    assert g.sampled_at_unusable == "2026-11-16T21:00:00"
+    g.update(10_000, datetime(2026, 11, 16, 21, 0), sampled_at=datetime(2026, 11, 16, 21, 0))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["sampled_at_unusable"] is None            # 有了可用的采样时刻,旧留痕作废
+    assert saved["sampled_at"] == "2026-11-16T21:00:00+08:00"

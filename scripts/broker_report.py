@@ -1,29 +1,33 @@
-"""把取证结果填进国信《外部接入系统技术测试报告》模板(docx),生成「穿透式测试 + 程序化测试」报告。
+"""把取证结果填进国信《外部接入系统技术测试报告》模板(docx),生成「外部接入系统测试 + 程序化补充测试」报告(国信 20260717 版模板)。
 
 用法(项目根目录):
     python scripts/broker_report.py --template <国信模板.docx> --evidence data/broker_test/<时间戳>
     python scripts/broker_report.py --template <模板> --evidence <目录> --out <输出.docx>
 
 做法:直接用 lxml 改 docx 的 XML,**不引入新依赖**;以单元格文字定位表格行(不写死下标),模板改版时更稳。
-- 填写:封面占位、测试接入信息、测试记录(正常/异常)、程序化测试总结与 11 项结果、各项证据图;
+- 填写:封面占位、测试接入信息、两部分的测试结果(1.1/1.2/2.1 与 3.1–7.1)、2.1 稳定运行的「耗时约 N 秒」、各项证据图;
+- 只支持 20260717 版模板(单文档两部分,无穿透专章);旧版模板会明确报错,不会按旧编号错填;
 - **绝不默认勾通过**:模板里预勾选的结果一律重置,只有取证结果为 PASS 才勾「通过/正常」;选测项未测勾「未测试」;
   必测项没有 PASS 时留空并在终端列出"报告里还缺什么";
 - **不碰国信填写区**:「信息科技中心评估意见」「测试评估」「测试人员(国信期货)」等表格原样保留;
 - 签字/盖章栏留空:需要人工签字盖章。
+- 真实运行截图:证据目录 `manual/` 下的 PNG(`<测试项>[_<小标题>][_<序号>].png`,如 `P1.2.png`、`P1.2_平仓.png`)
+  插在对应证据卡片之后、带「实际运行截图」标题;对不上测试项/小标题的文件只告警不插入。
+  截图必须与该项证据卡片出自**同一次运行**(卡片会被后来的运行覆盖,旧截图要一起换掉)。
 模板含国信测试环境的 IP/端口,**不入库**,用 --template 传路径(或环境变量 BROKER_REPORT_TEMPLATE)。
 """
 import argparse
+import json
 import os
 import re
 import struct
 import sys
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-
-import sys
-from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,7 +35,11 @@ import bootstrap  # noqa: F401
 
 from lxml import etree
 
-from broker_evidence import FAIL, ITEMS, MANUAL, OPTIONAL_ITEMS, PASS, SKIP, Evidence, load_evidence
+from broker_evidence import FAIL, ITEMS, OPTIONAL_ITEMS, PASS, TEMPLATE_NO, Evidence, load_evidence
+from ctp_tools.broker_targets import GUOXIN_TEST_BROKER_ID, GUOXIN_TEST_TD  # noqa: E402
+from ctp_tools.profile import load_profile  # noqa: E402
+from ctp_tools.simnow import normalize_address  # noqa: E402
+from risk.account_guard import beijing_now  # noqa: E402
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -50,6 +58,7 @@ def w(tag: str) -> str:
 P, TBL, TR, TC, R, T, SYM, RPR, PPR = (w(x) for x in ("p", "tbl", "tr", "tc", "r", "t", "sym", "rPr", "pPr"))
 CHECKED, UNCHECKED = "0052", "00A3"      # Wingdings 2:☑ / □
 MAX_IMAGE_EMU = 5_600_000                  # 约 15.5 cm,不超过版心
+MAX_IMAGE_HEIGHT_EMU = 8_500_000           # 约 23.6 cm,不超过版心高度(极端长条图按比例缩小)
 SKIP_MARK_PREFIX = "（截图材料"
 
 
@@ -67,16 +76,29 @@ class Docx:
         self.rels = etree.fromstring(self.members["word/_rels/document.xml.rels"])
         self.content_types = etree.fromstring(self.members["[Content_Types].xml"])
         self._image_count = 0
+        self.media_bytes = 0                     # 已嵌入图片的总字节数(总量上限见 MAX_TOTAL_MEDIA_BYTES)
         self.missing_images: list[str] = []      # 证据里登记了、但磁盘上找不到的图
+        # 新加图片的关系 ID / 媒体文件名 / docPr id 不能与模板里已有的撞车(撞了 Word 会报文件损坏)
+        self._used_rids = {r.get("Id") for r in self.rels}
+        docpr_ids = [int(d.get("id")) for d in self.doc.iter(f"{{{WP_NS}}}docPr") if (d.get("id") or "").isdigit()]
+        self._pic_id = max(docpr_ids + [9000])
+
+    def next_pic_id(self) -> int:
+        self._pic_id += 1
+        return self._pic_id
 
     def add_image(self, png: bytes) -> str:
         """加入一张 PNG,返回关系 ID。"""
-        self._image_count += 1
-        name = f"word/media/broker_{self._image_count}.png"
+        while True:
+            self._image_count += 1
+            name = f"word/media/broker_{self._image_count}.png"
+            rid = f"rIdBroker{self._image_count}"
+            if name not in self.members and rid not in self._used_rids:
+                break
         self.members[name] = png
-        if name not in self.names:
-            self.names.append(name)
-        rid = f"rIdBroker{self._image_count}"
+        self.media_bytes += len(png)
+        self.names.append(name)
+        self._used_rids.add(rid)
         rel = etree.SubElement(self.rels, f"{{{REL_NS}}}Relationship")
         rel.set("Id", rid)
         rel.set("Type", IMAGE_REL_TYPE)
@@ -239,12 +261,60 @@ def png_size(png: bytes) -> tuple[int, int]:
     return struct.unpack(">II", png[16:24])
 
 
+PNG_MAGIC = bytes([0x89]) + b"PNG" + bytes([0x0D, 0x0A, 0x1A, 0x0A])
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_SIDE = 20000
+MAX_TOTAL_MEDIA_BYTES = 200 * 1024 * 1024   # 整份报告嵌入图片总量上限:超出的图告警跳过,避免生成数 GB 的 docx
+
+
+def read_image(doc: "Docx", path: Path) -> tuple[bytes | None, str]:
+    """读图并校验:先看文件大小(过大的不读进内存),再校验 PNG,最后核对整份报告的图片总量。"""
+    try:
+        size = path.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            return None, f"文件过大({size} 字节,上限 {MAX_IMAGE_BYTES})"
+        if doc.media_bytes + size > MAX_TOTAL_MEDIA_BYTES:
+            return None, f"报告嵌入图片总量将超过上限 {MAX_TOTAL_MEDIA_BYTES} 字节"
+        png = path.read_bytes()
+    except OSError as exc:
+        return None, f"读取失败({exc!r})"
+    problem = png_problem(png)
+    return (None, problem) if problem else (png, "")
+
+
+def png_problem(png: bytes) -> str:
+    """不是可插入的 PNG 时返回原因,否则空串。坏图只告警跳过,不能让整份报告生成失败。"""
+    if len(png) > MAX_IMAGE_BYTES:
+        return f"文件过大({len(png)} 字节,上限 {MAX_IMAGE_BYTES})"
+    if len(png) < 33 or not png.startswith(PNG_MAGIC) or png[12:16] != b"IHDR":
+        return "不是有效的 PNG 文件"
+    if struct.unpack(">I", png[8:12])[0] != 13 or zlib.crc32(png[12:29]) != struct.unpack(">I", png[29:33])[0]:
+        return "PNG 文件头损坏(IHDR 长度或校验和不对)"
+    width, height = png_size(png)
+    if not (0 < width <= MAX_IMAGE_SIDE and 0 < height <= MAX_IMAGE_SIDE):
+        return f"图片尺寸异常({width}x{height})"
+    # 逐个数据块核对长度与校验和,并要求以 IEND 结尾:截断或损坏的图插进去 Word 只会显示红叉
+    pos = 8
+    while pos + 12 <= len(png):
+        length = struct.unpack(">I", png[pos:pos + 4])[0]
+        end = pos + 12 + length
+        if end > len(png):
+            return "PNG 数据被截断"
+        kind = png[pos + 4:pos + 8]
+        if zlib.crc32(png[pos + 4:end - 4]) != struct.unpack(">I", png[end - 4:end])[0]:
+            return f"PNG 数据块 {kind.decode('latin-1')} 校验和不对"
+        if kind == b"IEND":
+            return ""
+        pos = end
+    return "PNG 数据被截断(缺少 IEND)"
+
+
 def inline_picture(rid: str, cx: int, cy: int, pic_id: int, name: str):
     xml = (
         f'<w:drawing xmlns:w="{W_NS}" xmlns:wp="{WP_NS}" xmlns:a="{A_NS}" xmlns:pic="{PIC_NS}" xmlns:r="{R_NS}">'
         f'<wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/>'
-        f'<wp:docPr id="{pic_id}" name="{name}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
-        f'<a:graphic><a:graphicData uri="{PIC_NS}"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="{name}"/><pic:cNvPicPr/></pic:nvPicPr>'
+        f'<wp:docPr id="{pic_id}" name={quoteattr(name)}/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr>'
+        f'<a:graphic><a:graphicData uri="{PIC_NS}"><pic:pic><pic:nvPicPr><pic:cNvPr id="0" name={quoteattr(name)}/><pic:cNvPicPr/></pic:nvPicPr>'
         f'<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>'
         f'<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>'
         f'</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing>'
@@ -257,6 +327,8 @@ def picture_paragraph(doc: Docx, png: bytes, name: str, pic_id: int):
     width, height = png_size(png)
     cx = min(MAX_IMAGE_EMU, width * 9525)          # 96 dpi:1 px = 9525 EMU
     cy = int(cx * height / width)
+    if cy > MAX_IMAGE_HEIGHT_EMU:                  # 长条图:按高度上限等比缩小,不能撑出版心
+        cx, cy = max(1, int(cx * MAX_IMAGE_HEIGHT_EMU / cy)), MAX_IMAGE_HEIGHT_EMU
     p = etree.Element(P)
     ppr = etree.SubElement(p, PPR)
     jc = etree.SubElement(ppr, w("jc"))
@@ -294,7 +366,7 @@ class ReportContext:
     test_time: str = ""
     access_system: str = "CTP"
     functions: tuple[str, ...] = ("自动开平仓", "止盈止损", "交易模型编写", "二次开发")
-    report_date: datetime = field(default_factory=datetime.now)
+    report_date: datetime = field(default_factory=beijing_now)
 
 
 @dataclass
@@ -302,14 +374,22 @@ class Outcome:
     path: Path
     missing: list[str] = field(default_factory=list)       # 报告里还缺什么(必测项没通过、需人工补的栏)
     warnings: list[str] = field(default_factory=list)
+    real_shots: list[str] = field(default_factory=list)    # 插入了哪些真实运行截图(manual/ 下的文件名)
+
+
+COVER2 = "程序化补充测试报告"
+EXTERNAL_ITEMS = ("P1.1", "P1.2", "P1.3")              # 「外部接入系统测试」部分(模板 1.1/1.2/2.1);其余为程序化补充测试
+SECTION_NO = {no: item for item, no in TEMPLATE_NO.items()}
+HEADING = re.compile(r"^([1-7])\.([1-9])(?!\d)")
 
 
 def split_parts(doc: Docx) -> tuple[int, int, int]:
-    """返回 (穿透部分起点, 程序化部分起点, 文末):以第二封面「程序化测试报告」为界。"""
+    """返回 (外部接入部分起点, 程序化补充部分起点, 文末):以第二封面「程序化补充测试报告」为界。"""
     kids = children(doc.body)
-    boundary = next((i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip() == "程序化测试报告"), None)
+    boundary = next((i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip() == COVER2), None)
     if boundary is None:
-        raise ValueError("模板里找不到「程序化测试报告」封面,无法区分两部分——模板版式可能改了")
+        raise ValueError(f"模板里找不到「{COVER2}」封面,无法区分两部分——本脚本只支持国信 20260717 版模板"
+                         "(外部接入 1.1/1.2/2.1 + 程序化补充 3.1–7.1),旧版模板的章节编号不同,不能按新编号填")
     return 0, boundary, len(kids)
 
 
@@ -328,57 +408,51 @@ def result_choice(ev: Evidence | None, item: str, *, three_way: bool) -> str | N
     return None
 
 
-def fill_penetration(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, start: int, end: int) -> None:
-    tables = tables_in(doc.body, start, end)
-    for label, value in (("测试账户", ctx.account), ("测试系统名称", ctx.system_name), ("AppID/RelayAppID", ctx.app_id)):
-        hit = find_row_in_tables(tables, label)
-        if hit:
-            set_cell_text(hit[1][1], value)
-        else:
-            outcome.warnings.append(f"穿透报告:找不到「{label}」行")
-    for label, selected in (("AppID类型", {"直连的交易者"}), ("测试接入系统名称", {ctx.access_system}),
-                            ("软件功能", set(ctx.functions))):
-        hit = find_row_in_tables(tables, label)
-        if hit:
-            set_checks(hit[1][1], selected)
-    hit = find_row_in_tables(tables, "联系方式")
-    if hit:
-        set_cell_text(hit[1][1], " / ".join(x for x in (ctx.contact_name, ctx.contact_phone, ctx.contact_email) if x))
-    # 测试记录 ①–⑦:行内「正常」「异常:」两个勾选
-    for item, label in (("T1", "①"), ("T2", "②"), ("T3", "③"), ("T4", "④"), ("T5", "⑤"), ("T6", "⑥"), ("T7", "⑦")):
-        hit = find_row_in_tables(tables, label)
-        if not hit:
-            outcome.warnings.append(f"穿透报告:找不到「{label}」行")
-            continue
-        _, cells, col = hit
-        ev = evs.get(item)
-        normal, abnormal = cells[col + 1], cells[col + 2]
-        set_checks(normal, {"正常"} if ev is not None and ev.status == PASS else set())
-        set_checks(abnormal, {"异常"} if ev is not None and ev.status == FAIL else set())
-        if ev is not None and ev.status == FAIL:
-            append_text(abnormal, ev.summary)
-        if ev is None or ev.status != PASS:
-            outcome.missing.append(f"穿透 {ITEMS[item]}:{_status_note(ev)}")
-    # 证据图:统一放在「请按序号附截图」之后,逐张加标题
-    kids = children(doc.body)[start:end]
-    anchor = next((el for el in kids if el.tag == P and "请按序号附截图" in text_of(el)), None)
-    if anchor is None:
-        outcome.warnings.append("穿透报告:找不到「请按序号附截图」锚点,证据图未插入")
-        return
-    last = anchor
-    for item in ("T1", "T3", "T4", "T5", "T2", "T6", "T7"):
-        ev = evs.get(item)
-        for shot in (ev.shots if ev else []):
-            last = _insert_shot(doc, last, ev, shot, caption=f"{ITEMS[item]}" + (f" · {shot.label}" if shot.label else ""))
-
-
 def _status_note(ev: Evidence | None) -> str:
     if ev is None:
         return "没有取证结果"
     return f"{ev.status}({ev.summary})" if ev.summary else ev.status
 
 
-_PIC_ID = [9000]
+
+# 真实运行截图:证据目录 manual/ 下的 PNG,文件名 `<测试项>[_<小标题>][_<序号>].png`,
+# 例:P1.2_平仓.png、P1.3.png、P3.1_撤单总笔数_2.png。插在对应证据卡片**之后**(卡片是可读的摘要,截图是实证),
+# 同一位置多张按文件名排序;对不上任何测试项/小标题的文件进 warnings,不静默丢弃。
+# 文件名语法:小标题里不能有 `_`;紧跟测试项的段若是纯数字,按序号认(所以纯数字的小标题表达不了)。
+# 坏图(非 PNG / 过大 / 尺寸异常)只告警跳过。
+REAL_SHOT_DIR = "manual"
+REAL_SHOT_CAPTION = "实际运行截图(测试程序运行窗口):"
+
+
+def real_shots_by_item(evidence_dir: Path | None) -> dict[str, list[Path]]:
+    """manual/ 下的 PNG 按测试项分组(文件名排序)。测试项编号含点,按 `_` 前的部分认。"""
+    folder = Path(evidence_dir) / REAL_SHOT_DIR if evidence_dir is not None else None
+    if folder is None or not folder.is_dir():
+        return {}
+    groups: dict[str, list[Path]] = {}
+    files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() == ".png"]   # 扩展名大小写不敏感,目录不算
+    for f in sorted(files, key=lambda x: x.name):
+        groups.setdefault(f.stem.split("_", 1)[0], []).append(f)
+    return groups
+
+
+def _real_shot_label(path: Path) -> str:
+    """文件名里的小标题部分(没有或只有序号时为空串)。"""
+    parts = path.stem.split("_")[1:]
+    return "" if not parts or parts[0].isdigit() else parts[0]
+
+
+def _insert_real_shot(doc: Docx, after, item: str, path: Path, outcome: Outcome):
+    png, problem = read_image(doc, path)
+    if problem:
+        outcome.warnings.append(f"真实截图 {path.name}:{problem},未插入")
+        return after
+    cap = caption_paragraph(REAL_SHOT_CAPTION)
+    after.addnext(cap)
+    pic = picture_paragraph(doc, png, f"{item}-real-{path.stem}", doc.next_pic_id())
+    cap.addnext(pic)
+    outcome.real_shots.append(path.name)
+    return pic
 
 
 def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
@@ -390,25 +464,45 @@ def _insert_shot(doc: Docx, after, ev: Evidence, shot, caption: str = ""):
     if not path.exists():
         doc.missing_images.append(f"{ev.item} {shot.label}".strip() + f":{shot.image}")
         return after
-    png = path.read_bytes()
+    png, problem = read_image(doc, path)
+    if problem:
+        doc.missing_images.append(f"{ev.item} {shot.label}".strip() + f":{shot.image}({problem})")
+        return after
     last = after
     if caption:
         cap = caption_paragraph(caption)
         last.addnext(cap)
         last = cap
-    _PIC_ID[0] += 1
-    pic = picture_paragraph(doc, png, f"{ev.item}-{shot.label or 'shot'}", _PIC_ID[0])
+    pic = picture_paragraph(doc, png, f"{ev.item}-{shot.label or 'shot'}", doc.next_pic_id())
     last.addnext(pic)
     return pic
 
 
-def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, start: int, end: int) -> None:
-    tables = tables_in(doc.body, start, end)
+def find_numbered_row(table, number: str):
+    """按章节编号找行:编号后不能紧跟数字(「1.1」不能命中「1.10」)。"""
+    pattern = re.compile(rf"^{re.escape(number)}(?!\d)")
+    for tr in table.findall(TR):
+        cells = tr.findall(TC)
+        for idx, tc in enumerate(cells):
+            if pattern.match(text_of(tc).strip()):
+                return tr, cells, idx
+    return None
+
+
+def _results_table(tables: list):
+    for table in tables:
+        if find_row(table, "1.1") and find_row(table, "测试结论"):
+            return table
+    return None
+
+
+def fill_report(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], outcome: Outcome, boundary: int, end: int) -> None:
+    tables = tables_in(doc.body, 0, end)
 
     def cell_at(label: str, col_offset: int = 1):
         hit = find_row_in_tables(tables, label)
         if not hit:
-            outcome.warnings.append(f"程序化报告:找不到「{label}」行")
+            outcome.warnings.append(f"报告:找不到「{label}」行")
             return None
         return hit[1][hit[2] + col_offset] if hit[2] + col_offset < len(hit[1]) else None
 
@@ -431,6 +525,9 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
     cell = cell_at("交易信息系统名称")
     if cell is not None:
         set_checks(cell, {ctx.access_system})
+    cell = cell_at("测试系统功能")
+    if cell is not None:
+        set_checks(cell, set(ctx.functions))
     for label, value in (("名称", ctx.submitter_name), ("联系人", ctx.contact_name)):
         hit = find_row_in_tables(tables, label)
         if hit and hit[2] + 1 < len(hit[1]) and text_of(hit[1][hit[2] + 1]).strip() == "":
@@ -441,65 +538,157 @@ def fill_programmatic(doc: Docx, ctx: ReportContext, evs: dict[str, Evidence], o
         set_cell_text(cells[hit[2] + 1], ctx.contact_phone)
         if hit[2] + 3 < len(cells):
             set_cell_text(cells[hit[2] + 3], ctx.contact_email)
-    cell = cell_at("程序化交易系统")
+    cell = cell_at("测试系统设备")
     if cell is not None:
         set_cell_text(cell, f"测试机型号:{ctx.machine} 操作系统:{ctx.os_name} CPU:{ctx.cpu} 内存:{ctx.memory} 硬盘:{ctx.disk}")
 
-    # 11 项结果
-    prefixes = {"P1.1": "1.1", "P1.2": "1.2", "P2.1": "2.1", "P2.2": "2.2", "P2.3": "2.3", "P3.1": "3.1",
-                "P4.1": "4.1", "P4.2": "4.2", "P5.1": "5.1", "P5.2": "5.2", "P6.1": "6.1"}
-    all_mandatory_pass = True
-    for item, prefix in prefixes.items():
-        hit = find_row_in_tables(tables, prefix)
-        if not hit:
-            outcome.warnings.append(f"程序化报告:找不到「{prefix}」结果行")
-            continue
-        cells, col = hit[1], hit[2]
-        ev = evs.get(item)
-        choice = result_choice(ev, item, three_way=True)
-        set_checks(cells[col + 1], {choice} if choice else set())
-        if is_mandatory(item) and (ev is None or ev.status != PASS):
-            all_mandatory_pass = False
-            outcome.missing.append(f"程序化 {ITEMS[item]}:{_status_note(ev)}")
-    optional_failed = [i for i in OPTIONAL_ITEMS if evs.get(i) is not None and evs[i].status == FAIL]
-    hit = find_row_in_tables(tables, "测试结论")
-    if hit:
-        set_checks(hit[1][hit[2] + 1], {"通过"} if all_mandatory_pass and not optional_failed else set())
-    if not all_mandatory_pass:
-        outcome.missing.append("程序化 测试结论:必测项未全部通过,未勾「通过」")
-    if optional_failed:
-        outcome.missing.append(f"程序化 测试结论:选测项 {', '.join(sorted(optional_failed))} 未通过,未勾「通过」,需人工判断")
+    # 测试结果:按模板编号(1.1…7.1)在结果表里定位,内部 ID → 编号见 TEMPLATE_NO
+    results = _results_table(tables)
+    if results is None:
+        outcome.warnings.append("报告:找不到测试结果表(含「1.1」与「测试结论」行)")
+    else:
+        passed = {"external": True, "programmatic": True}
+        for item, number in TEMPLATE_NO.items():
+            part = "external" if item in EXTERNAL_ITEMS else "programmatic"
+            hit = find_numbered_row(results, number)
+            if not hit:
+                outcome.warnings.append(f"报告:找不到「{number}」结果行")
+                if is_mandatory(item):                 # 必测项的行都找不到:结论不可判定,绝不能勾「通过」
+                    passed[part] = False
+                    outcome.missing.append(f"{ITEMS[item]}:模板里找不到「{number}」结果行,结论不可判定")
+                continue
+            cells, col = hit[1], hit[2]
+            ev = evs.get(item)
+            choice = result_choice(ev, item, three_way=not is_mandatory(item))
+            set_checks(cells[col + 1], {choice} if choice else set())
+            if is_mandatory(item) and (ev is None or ev.status != PASS):
+                passed[part] = False
+                outcome.missing.append(f"{ITEMS[item]}:{_status_note(ev)}")
+        optional_failed = sorted(i for i in OPTIONAL_ITEMS if evs.get(i) is not None and evs[i].status == FAIL)
+        if optional_failed:
+            passed["programmatic"] = False
+        conclusions = [tr.findall(TC) for tr in results.findall(TR) if text_of(tr.findall(TC)[0]).strip().startswith("测试结论")]
+        if len(conclusions) != 2:
+            outcome.warnings.append(f"报告:应有 2 个「测试结论」行(外部接入、程序化补充),实际 {len(conclusions)} 个,结论栏未勾")
+        else:
+            for cells, part in zip(conclusions, ("external", "programmatic")):
+                set_checks(cells[1], {"通过"} if passed[part] else set())
+        if not passed["external"]:
+            outcome.missing.append("外部接入 测试结论:必测项未全部通过,未勾「通过」")
+        if not passed["programmatic"]:
+            outcome.missing.append("程序化补充 测试结论:必测项未全部通过,未勾「通过」")
+        if optional_failed:
+            outcome.missing.append(f"程序化补充 测试结论:选测项 {', '.join(optional_failed)} 未通过,未勾「通过」,需人工判断")
+        for label in ("采集信息的完整性", "采集信息的正确性"):       # 模板预勾选了「通过」:是否通过由国信评估,本脚本一律重置、不代勾
+            hit = find_row(results, label)
+            if hit:
+                set_checks(hit[1][hit[2] + 1], set())
+        outcome.missing.append("看穿式采集(完整性/正确性):不由本脚本勾选,以国信对采集结果的评估为准(模板预勾选的「通过」已重置)")
 
-    # 证据图:按各项小标题锚点插入
+    # 证据图:两部分各自从「测试总结报告证明材料」标题起,按各项小标题锚点插入
     kids = children(doc.body)
-    section_start = next((i for i in range(start, end) if kids[i].tag == P and "测试总结报告证明材料" in text_of(kids[i])), None)
-    if section_start is None:
-        outcome.warnings.append("程序化报告:找不到「测试总结报告证明材料」,证据图未插入")
+    proofs = [i for i, el in enumerate(kids) if el.tag == P and text_of(el).strip().startswith("测试总结报告证明材料")]
+    first = next((i for i in proofs if i < boundary), None)
+    second = next((i for i in proofs if i > boundary), None)
+    real = real_shots_by_item(getattr(doc, "evidence_dir", None))
+    if first is None or second is None:
+        outcome.warnings.append("报告:找不到两处「测试总结报告证明材料」标题,证据图未插入")
+        for files in real.values():
+            outcome.warnings.extend(f"真实截图 {f.name}:报告里找不到证明材料部分,未插入" for f in files)
         return
-    # 证明材料标题自己也含「测试系统功能测试指引」字样,所以从下一段起找、且要求以它开头(正文里那段「测试系统功能测试指引:摘自…」)
-    guide = next((i for i in range(section_start + 1, end) if kids[i].tag == P and text_of(kids[i]).strip().startswith("测试系统功能测试指引")), end)
-    heading = re.compile(r"^([1-6])\.([1-9])")
+    # 第二处标题自己也含「测试系统功能测试指引」字样,所以从下一段起找、且要求以它开头(正文里那段「测试系统功能测试指引:摘自…」)
+    guide = next((i for i in range(second + 1, end) if kids[i].tag == P and text_of(kids[i]).strip().startswith("测试系统功能测试指引")), end)
     regions: dict[str, list] = {}
-    current = None
-    for el in kids[section_start:guide]:
-        if el.tag != P:
-            continue
-        m = heading.match(text_of(el).strip())
-        if m:
-            current = f"P{m.group(1)}.{m.group(2)}"
-            regions[current] = [el]
-        elif current:
-            regions[current].append(el)
+    for lo, hi in ((first, boundary), (second, guide)):
+        current = None
+        for el in kids[lo:hi]:
+            if el.tag != P:
+                continue
+            m = HEADING.match(text_of(el).strip())
+            if m and f"{m.group(1)}.{m.group(2)}" in SECTION_NO:
+                current = SECTION_NO[f"{m.group(1)}.{m.group(2)}"]
+                regions[current] = [el]
+            elif current:
+                regions[current].append(el)
     for item, paras in regions.items():
         ev = evs.get(item)
         if ev is None:
             continue
         last_after: dict[int, object] = {}
         default_anchor = next((p for p in paras if text_of(p).strip().startswith(SKIP_MARK_PREFIX)), paras[0])
+        pending = list(real.pop(item, []))
+        labels = {shot.label for shot in ev.shots if shot.label}
+        last = default_anchor
         for shot in ev.shots:
             anchor = next((p for p in paras[1:] if shot.label and shot.label in text_of(p)), default_anchor)
             base = last_after.get(id(anchor), anchor)
-            last_after[id(anchor)] = _insert_shot(doc, base, ev, shot)
+            last = _insert_shot(doc, base, ev, shot)
+            if shot.label:                      # 该小标题的真实截图紧跟它自己的卡片
+                for f in [f for f in pending if _real_shot_label(f) == shot.label]:
+                    pending.remove(f)
+                    last = _insert_real_shot(doc, last, item, f, outcome)
+            last_after[id(anchor)] = last
+        for f in [f for f in pending if _real_shot_label(f) and _real_shot_label(f) not in labels]:
+            pending.remove(f)
+            outcome.warnings.append(f"真实截图 {f.name}:测试项 {item} 没有小标题「{_real_shot_label(f)}」,未插入")
+        for f in pending:                       # 不带小标题的:接在本项最后一张图之后
+            last = _insert_real_shot(doc, last, item, f, outcome)
+    for item, files in real.items():
+        for f in files:
+            outcome.warnings.append(f"真实截图 {f.name}:报告里没有测试项 {item} 的小节,未插入")
+    _fill_stability_seconds(evs.get("P1.3"), regions.get("P1.3"), outcome)
+
+
+def _fill_stability_seconds(ev: Evidence | None, paras: list | None, outcome: Outcome) -> None:
+    """2.1 稳定运行:把「持续下单200笔,耗时约     秒」的空格换成取证实测的秒数(没有实测值就保持空白并报缺)。"""
+    if ev is None or ev.status not in (PASS, FAIL):
+        return
+    orders, seconds = ev.metrics.get("orders"), ev.metrics.get("elapsed_seconds")
+    if not orders or seconds is None:
+        outcome.missing.append("2.1 稳定运行:证据里没有下单笔数/耗时,「耗时约 N 秒」需人工填写")
+        return
+    target = next((p for p in (paras or []) if f"持续下单{orders}笔" in re.sub(r"\s", "", text_of(p))), None)
+    if target is None:
+        outcome.warnings.append(f"报告:2.1 里找不到「持续下单{orders}笔」段落,耗时未填")
+        return
+    try:
+        seconds_num = float(seconds)              # metrics 来自 JSON,类型不受约束:非数字时报缺,不能让整份报告失败
+    except (TypeError, ValueError):
+        outcome.missing.append(f"2.1 稳定运行:证据里的耗时不是数字({seconds!r}),「耗时约 N 秒」需人工填写")
+        return
+    text = text_of(target)
+    filled, n = re.subn(r"(耗时约)\s*(秒)", rf"\1 {seconds_num:g} \2", text, count=1)
+    if n == 0:
+        outcome.warnings.append("报告:2.1 段落里找不到「耗时约 秒」填空,耗时未填")
+        return
+    set_paragraph_text(target, filled)
+
+
+def add_banner(doc: Docx, text: str) -> None:
+    """在正文最前面插一段醒目的提示(预演报告用)。
+
+    模板正文里预填的是国信的 BrokerID/前置地址,预演跑在 SimNow 上时,不加提示就会变成
+    一份「自称国信环境」的报告,存在误交的风险。
+    """
+    body = doc.body
+    p = etree.Element(P)
+    ppr = etree.SubElement(p, PPR)
+    jc = etree.SubElement(ppr, w("jc"))
+    jc.set(w("val"), "center")
+    run = etree.SubElement(p, R)
+    rpr = etree.SubElement(run, RPR)
+    etree.SubElement(rpr, w("b"))
+    color = etree.SubElement(rpr, w("color"))
+    color.set(w("val"), "C00000")
+    sz = etree.SubElement(rpr, w("sz"))
+    sz.set(w("val"), "32")
+    t = etree.SubElement(run, T)
+    t.text = text
+    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    if len(body):
+        body[0].addprevious(p)
+    else:
+        body.append(p)
 
 
 def fill_covers(doc: Docx, ctx: ReportContext) -> None:
@@ -511,16 +700,16 @@ def fill_covers(doc: Docx, ctx: ReportContext) -> None:
 
 
 def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: ReportContext,
-                 evidences: dict[str, Evidence] | None = None) -> Outcome:
+                 evidences: dict[str, Evidence] | None = None, watermark: str = "") -> Outcome:
     doc = Docx(template)
     doc.evidence_dir = evidence_dir
     evs = evidences if evidences is not None else load_evidence(evidence_dir)
     outcome = Outcome(path=out_path)
-    start, boundary, end = split_parts(doc)
-    # 先填程序化部分(后半),再填穿透部分:插入图片会改变 body 下标,从后往前填不影响前半部分的下标
-    fill_programmatic(doc, ctx, evs, outcome, boundary, end)
-    fill_penetration(doc, ctx, evs, outcome, start, boundary)
+    _, boundary, end = split_parts(doc)
+    fill_report(doc, ctx, evs, outcome, boundary, end)
     fill_covers(doc, ctx)
+    if watermark:
+        add_banner(doc, watermark)
     for missing_image in doc.missing_images:
         outcome.warnings.append(f"证据图缺失,未插入:{missing_image}")
         outcome.missing.append(f"证据图缺失:{missing_image}")
@@ -528,7 +717,7 @@ def build_report(template: Path, evidence_dir: Path, out_path: Path, ctx: Report
                          ("联系人", ctx.contact_name), ("联系电话", ctx.contact_phone)):
         if not value:
             outcome.missing.append(f"{label} 没有提供,对应栏留空")
-    outcome.missing.append("签字/盖章栏(穿透报告「测试人签字」、程序化报告「提测方签字/盖章」)需人工签字盖章")
+    outcome.missing.append("签字/盖章栏(第五页提测方签字、法人户盖章四处:第五页、两份报告首页、骑缝章)需人工签字盖章")
     doc.save(out_path)
     return outcome
 
@@ -550,8 +739,33 @@ def context_from_env(env, info: dict | None = None) -> ReportContext:
         os_name=f"{os_info.get('name', '')} {os_info.get('version', '')}".strip(),
         cpu=(cpus[0]["name"] if cpus else ""), memory=(f"{machine.get('memory_gb')} GB" if machine.get("memory_gb") else ""),
         disk="; ".join(f"{d['model']} {d['size_gb']}GB" for d in disks[:2]),
-        test_time=datetime.now().strftime("%Y-%m-%d"), functions=functions,
+        # 「测试时间」是**报告表头**,与证据链其余部分同一基准(北京时间):
+        # 本机本地时间会让夜盘时段出的报告日期比证据目录早一天
+        # (2026-11-16 codex 第八轮复核 L5)。
+        test_time=beijing_now().strftime("%Y-%m-%d"), functions=functions,
     )
+
+
+def non_guoxin_connections(evidence_dir: Path) -> list[str]:
+    """证据目录里记录了「不是国信测试环境」的连接记录(预演/其它环境),返回可读描述。"""
+    path = evidence_dir / "connection.json"
+    if not path.exists():
+        return []
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(records, dict):
+        records = [records]
+    bad = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        broker_id = str(record.get("broker_id", ""))
+        front = normalize_address(str(record.get("trade_front", "")))
+        if broker_id != GUOXIN_TEST_BROKER_ID or front not in GUOXIN_TEST_TD:
+            bad.append(f"BrokerID={broker_id} 交易前置={front or '未知'}")
+    return bad
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -560,7 +774,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="国信模板 docx(不入库;也可用环境变量 BROKER_REPORT_TEMPLATE)")
     parser.add_argument("--evidence", type=Path, required=True, help="broker_test.py 生成的证据目录")
     parser.add_argument("--out", type=Path, default=None, help="输出 docx(默认在证据目录里)")
+    parser.add_argument("--profile", default="", help="用指定档案(如 .env.guoxin)取账号/AppID 等;默认用项目 .env")
     parser.add_argument("--no-terminal-info", action="store_true", help="不采集本机终端信息(机型/CPU/内存/硬盘栏留空)")
+    parser.add_argument("--watermark", default="", help="在正文最前面插入的提示文字(预演报告用它标明不可提交国信)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(errors="replace")
@@ -570,15 +786,38 @@ def main(argv: list[str] | None = None) -> int:
     if not (args.evidence / "evidence.json").exists():
         print(f"证据目录里没有 evidence.json:{args.evidence}。请先运行 scripts/broker_test.py。", file=sys.stderr)
         return 2
-    bootstrap.load_env()
+    # 配置解析只走 ctp_tools.profile(档案 > .env > 进程环境),与取证/清场/探针一致。
+    try:
+        _profile = load_profile(args.profile, root=bootstrap.ROOT)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if _profile.hard_conflicts:
+        print("进程环境变量与项目 .env 不一致(又没有指定档案),无法判断报告里该填哪个账户,已退出:"
+              "请清掉这些环境变量(set VAR= 后重开终端),或用 --profile 明确指定档案。", file=sys.stderr)
+        for _conflict in _profile.hard_conflicts:
+            print(f"  - {_conflict}", file=sys.stderr)
+        return 2
+    for _note in _profile.notes:
+        print(f"⚠ {_note}(已按档案取值)", file=sys.stderr)
     info = None
     if not args.no_terminal_info and sys.platform == "win32":
         import collect_terminal_info
         info = collect_terminal_info.collect()
-    ctx = context_from_env(os.environ, info)
+    ctx = context_from_env(_profile.env, info)
     out = args.out or (args.evidence / f"国信外部接入系统技术测试报告-{ctx.app_id or 'noappid'}.docx")
-    outcome = build_report(Path(args.template), args.evidence, out, ctx)
+    if args.out is None:
+        # 正式报告名 + 模板正文里预填的国信 BrokerID/前置 = 一份「自称国信环境」的文件。
+        # 证据不是国信环境(预演等)时,拒绝用正式文件名。
+        bad = non_guoxin_connections(args.evidence)
+        if bad:
+            print(f"拒绝用正式报告文件名:证据里的连接不是国信测试环境({'; '.join(bad)})。"
+                  "预演或其它环境的证据请用 --out 指定带「预演」字样的文件名。", file=sys.stderr)
+            return 2
+    outcome = build_report(Path(args.template), args.evidence, out, ctx, watermark=args.watermark)
     print(f"报告已生成:{outcome.path}")
+    if outcome.real_shots:
+        print(f"已插入真实运行截图 {len(outcome.real_shots)} 张:{', '.join(outcome.real_shots)}")
     for line in outcome.warnings:
         print(f"  ⚠ {line}", file=sys.stderr)
     print("报告里还缺什么:")
