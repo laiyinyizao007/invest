@@ -3263,10 +3263,18 @@ def _parse_approvals(approvals_file: Path) -> list[dict]:
     return rows
 
 
+AUTO_APPROVALS_TOOL_HINT = ("自动批准账 auto_approvals.json 不在 research_ledger.py 的管理范围内:"
+                            "人工核对后,把该文件与 data/ledger_anchor 下对应锚点一并移走备份,"
+                            "下一次自动批准会从空账重新开始(旧批准失效,候选需重新批准)")
+
+
 def _verified_approval_rows(approvals_file: Path) -> list[dict]:
+    is_auto = Path(approvals_file).name == AUTO_APPROVALS_FILE_NAME
     try:
-        return chain.read_verified(Path(approvals_file), _parse_approvals, what="批准记录",
-                                   allow_ahead=False, tool_hint=APPROVALS_TOOL_HINT)
+        return chain.read_verified(Path(approvals_file), _parse_approvals,
+                                   what="自动批准记录" if is_auto else "批准记录",
+                                   allow_ahead=False,
+                                   tool_hint=AUTO_APPROVALS_TOOL_HINT if is_auto else APPROVALS_TOOL_HINT)
     except chain.LedgerChainError as exc:
         raise SandboxError(f"批准记录的防篡改核对未通过,拒绝采信(fail-closed): {exc}") from exc
 
@@ -3317,11 +3325,12 @@ def is_approved_sha_any(sha256: str, approvals_file: Path, auto_approvals_file: 
     自动批准的候选没有人读过源码,不得借此进入装载链路。两本账各自核链、各自 fail-closed:
     任何一本读不了都抛 SandboxError,不会因为另一本命中而放行。
     """
-    if sha256 in _load_approvals(approvals_file):
-        return True
+    human = _load_approvals(approvals_file)
+    # 两本账**都读**再判定:人工账命中也不能跳过自动账的核链(任何一本坏了都 fail-closed)。
+    auto: dict = {}
     if auto_approvals_file is not None and Path(auto_approvals_file).exists():
-        return sha256 in _load_approvals(auto_approvals_file)
-    return False
+        auto = _load_approvals(auto_approvals_file)
+    return sha256 in human or sha256 in auto
 
 
 def _record_row(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
@@ -3343,6 +3352,11 @@ def _record_row(path: Path, approvals_file: Path, now: datetime | None = None, s
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", via):
         raise SandboxError(f"批准通道标记格式不对(应为小写字母开头的短标记): {via!r}")
     approvals_file = Path(approvals_file)
+    # 通道与目标文件**在共用底层**强制配对(Issue #67 复核 H2):auto-research 只能写自动账,
+    # 其余通道一律不得写自动账。放在包装层会被「直接调 _record_row」绕过。
+    if (via == AUTO_APPROVAL_VIA) != (approvals_file.name == AUTO_APPROVALS_FILE_NAME):
+        raise SandboxError(f"通道 {via!r} 与目标账本 {approvals_file.name!r} 不匹配:"
+                           f"{AUTO_APPROVAL_VIA!r} 只写 {AUTO_APPROVALS_FILE_NAME},人工通道只写人工账")
     sha = str(sha256).strip().lower() if sha256 else file_sha256(path)
     if not re.fullmatch(r"[0-9a-f]{64}", sha):
         raise SandboxError(f"批准的哈希格式不对(应为 64 位小写十六进制): {sha!r}")

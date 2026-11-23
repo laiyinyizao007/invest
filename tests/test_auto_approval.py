@@ -178,8 +178,8 @@ def test_switch_on_auto_approves_into_the_auto_ledger_and_records_the_attempt(en
     assert rs._load_approvals(auto)[sha]["via"] == "auto-research"
     assert not human.exists()
     rows = ra.read(attempts)
-    assert [r["event"] for r in rows] == ["auto_approved"]
-    assert rows[0]["sha"] == sha and rows[0]["via"] == "auto-research"
+    assert [r["event"] for r in rows] == ["approval_requested", "auto_approved"]
+    assert all(r["sha"] == sha and r["via"] == "auto-research" for r in rows)
     assert "已经批准过" in mcp_server._request_approval_inline("cand_1.py", None)
 
 
@@ -248,3 +248,94 @@ def test_candidate_window_cannot_write_the_auto_ledger(tmp_path):
         with pytest.raises(OSError):
             auto.write_text("{}", encoding="utf-8")
     assert not auto.exists()
+
+
+# ---- 外部复核(codex)指出的缺口 ----
+
+def test_record_row_enforces_the_channel_to_file_pairing_itself(tmp_path):
+    """H2:配对校验在共用底层,不能靠包装层——直接调 _record_row 也写不进错的账。"""
+    cand = tmp_path / "c.py"
+    cand.write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(rs.SandboxError):
+        rs._record_row(cand, tmp_path / "approvals.json", via="auto-research")
+    with pytest.raises(rs.SandboxError):
+        rs._record_row(cand, tmp_path / "auto_approvals.json", via="cli")
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(cand, tmp_path / "auto_approvals.json", via="cli")      # L1:人工写入者写不进自动账
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(cand, tmp_path / "approvals.json", via="auto-research")
+    assert not (tmp_path / "approvals.json").exists() and not (tmp_path / "auto_approvals.json").exists()
+
+
+def test_the_screened_bytes_are_the_hashed_bytes(env, monkeypatch):
+    """H1:哈希取自被筛查的同一份字节,不再二次读文件。"""
+    cand, sha, _human, _auto, _attempts = env
+
+    def boom(_path):
+        raise AssertionError("不应再读一次文件算哈希")
+    monkeypatch.setattr(rs, "file_sha256", boom)
+    path, got, findings, err = mcp_server._inline_approval_target("cand_1.py", mcp_server.current_session())
+    assert err == "" and got == sha and findings == []
+
+
+def test_attempt_log_never_runs_ahead_of_the_ledger(env, monkeypatch):
+    """M1:批准写入失败时,日志里不得出现 auto_approved。"""
+    _cand, _sha, _human, _auto, attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+
+    def fail(*_a, **_k):
+        raise rs.SandboxError("磁盘满")
+    monkeypatch.setattr(mcp_server.rs, "record_auto_approval", fail)
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+    assert "写入失败" in out
+    events = [r["event"] for r in ra.read(attempts)]
+    assert events == ["approval_requested", "failure"]
+    assert "auto_approved" not in events
+
+
+def test_a_successful_auto_approval_logs_request_then_approved(env, monkeypatch):
+    _cand, _sha, _human, _auto, attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    mcp_server._request_approval_inline("cand_1.py", None)
+    assert [r["event"] for r in ra.read(attempts)] == ["approval_requested", "auto_approved"]
+
+
+def test_a_corrupt_auto_ledger_fails_closed_even_when_the_human_ledger_hits(tmp_path):
+    """M4:人工账命中也不能跳过自动账的核链。"""
+    cand = tmp_path / "c.py"
+    cand.write_text("x = 1\n", encoding="utf-8")
+    human, auto = tmp_path / "approvals.json", tmp_path / "auto_approvals.json"
+    sha = rs.record_approval(cand, human, via="cli")
+    other = tmp_path / "d.py"
+    other.write_text("y = 1\n", encoding="utf-8")
+    rs.record_auto_approval(other, auto)
+    auto.write_text("{ not json", encoding="utf-8")
+    with pytest.raises(rs.SandboxError):
+        rs.is_approved_sha_any(sha, human, auto)
+
+
+def test_constants_are_not_drifting_between_config_and_sandbox():
+    assert rs.AUTO_APPROVALS_FILE_NAME == rc.AUTO_APPROVALS_FILE_NAME
+
+
+def test_the_repo_config_names_the_switch_explicitly_and_it_is_off():
+    cfg = json.loads((ROOT / "config" / "research_sandbox.json").read_text(encoding="utf-8"))
+    assert cfg["auto_approve"] == {"enabled": False}
+
+
+def test_newest_pending_is_deterministic_on_equal_mtimes(env):
+    import os
+    pending = mcp_server.pending_dir()
+    for name in ("a.py", "b.py"):
+        (pending / name).write_text("x\n", encoding="utf-8")
+        os.utime(pending / name, (1_700_000_000, 1_700_000_000))
+    for _ in range(3):
+        assert mcp_server.newest_pending({"a.py", "b.py"}) == "b.py"
+
+
+def test_the_shared_writer_references_both_pairing_constants():
+    """守卫由「白名单」补成「不变式」:_record_row 必须自己做通道/文件名配对。"""
+    tree = ast.parse((ROOT / "scripts/research_sandbox.py").read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_record_row")
+    names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+    assert {"AUTO_APPROVAL_VIA", "AUTO_APPROVALS_FILE_NAME"} <= names

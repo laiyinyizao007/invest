@@ -34,6 +34,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -86,6 +87,8 @@ APPROVAL_ENV_ALLOW = (
 mcp = FastMCP("research-mcp", instructions=(
     "研究入口:把研究想法交给毕昇工作流跑,由人在本机审阅并批准候选策略。"
     "你只能发起研究、查进度、请求批准;批准动作由人完成,你无权批准。"
+    "例外:本机配置打开了自动批准时,请求批准会由服务端按配置直接落账(不经人审阅),返回里会明说;"
+    "没有明说「已自动批准」就按人工流程走。"
 ))
 
 
@@ -147,7 +150,7 @@ def auto_approve_enabled() -> bool:
 
 def _attempt(event: str, **fields) -> str:
     """追加一条尝试记录。返回空串=成功;失败返回一句话(调用方决定是拒绝还是只提示)。"""
-    clean = {k: (redact_for_model(str(v)) if isinstance(v, str) and k in ("idea", "note") else v)
+    clean = {k: (redact_for_model(v) if isinstance(v, str) and k != "sha256" else v)
              for k, v in fields.items()}
     try:
         ra.record_attempt(attempts_file(), event, **clean)
@@ -352,14 +355,14 @@ def pending_snapshot() -> set[str]:
 def newest_pending(names: set[str]) -> str | None:
     """多个新候选时取**最新**的那个(按修改时间),不是字典序第一个。"""
     best: str | None = None
-    best_mtime: float | None = None
-    for name in names:
+    best_key: tuple[float, str] | None = None
+    for name in sorted(names):                     # 排序后遍历 + (mtime, 名字) 比较:mtime 并列时结果确定
         try:
-            mtime = (pending_dir() / name).stat().st_mtime
+            key = ((pending_dir() / name).stat().st_mtime, name)
         except OSError:
             continue
-        if best_mtime is None or mtime > best_mtime:
-            best, best_mtime = name, mtime
+        if best_key is None or key > best_key:
+            best, best_key = name, key
     return best
 
 
@@ -593,10 +596,9 @@ def _inline_approval_target(name: str, session: dict) -> tuple[Path | None, str,
                                     scr["extra_forbidden_calls"], scr["allowed_modules"])
     except KeyError:
         return None, "", [], "筛查配置缺失,拒绝批准(fail-closed)。"
-    try:
-        sha = rs.file_sha256(path)
-    except OSError as exc:
-        return None, "", [], f"策略文件哈希计算失败:{exc}"
+    # 哈希取自**被筛查的同一份字节**(不再读第二次):否则筛查与落账之间文件被换掉,
+    # 未筛查的内容就会被记成已批准(自动模式下筛查是唯一内容关卡)。
+    sha = hashlib.sha256(raw).hexdigest()
     recorded = session.get("candidate_sha")
     if recorded and recorded != sha:
         return None, "", [], "候选文件在发起研究后被改动过,批准对不上;请重新发起研究。"
@@ -642,14 +644,22 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
     if auto_approve_enabled():
         # 自动批准(Issue #67):静态筛查已过。**先落尝试记录,记不下就不批**(fail-closed),
         # 再写**独立的自动账**(不是人工账)。落账哈希仍是服务端自算值,与盘上文件绑定。
-        warn = _attempt("auto_approved", session=session.get("session_id"), candidate=name, sha256=sha,
+        warn = _attempt("approval_requested", session=session.get("session_id"), candidate=name, sha256=sha,
                         via="auto-research", idea=session.get("idea"))
         if warn:
             return redact_for_model("自动批准未执行(尝试记录写不进去,拒绝在无记录的情况下批准):" + warn)
         try:
             rs.record_auto_approval(path, auto_approvals_file(), sha256=sha)
         except rs.SandboxError as exc:
+            _attempt("failure", session=session.get("session_id"), candidate=name, sha256=sha,
+                     via="auto-research", note=f"自动批准写入失败:{exc}")
             return redact_for_model(f"自动批准写入失败:{exc}")
+        # 批准**已落账**之后才记「已批准」:日志不得比账本领先。记不下时账里有批准而日志缺一行,
+        # 如实告诉调用方(前一行 approval_requested 已在)。
+        confirm_warn = _attempt("auto_approved", session=session.get("session_id"), candidate=name,
+                                sha256=sha, via="auto-research")
+        if confirm_warn:
+            return redact_for_model(f"已自动批准候选 {name},但「已批准」那条尝试记录没写进去:" + confirm_warn)
         return redact_for_model("\n".join([
             f"已按本机配置自动批准候选 {name}(自动账 via=auto-research,不经人工审阅;每次尝试都已记入尝试记录)。",
             "批准绑定到当前文件内容;代码再改一个字节,批准即失效。现在可以用 research_status 推进工作流。",
@@ -849,6 +859,8 @@ async def request_approval(strategy: str, confirm_sha256: str | None = None, mod
       2. 模型带 confirm_sha256=<人粘贴的哈希> 再次调用:服务端与自算哈希比对一致,
          且静态筛查通过时,经 record_approval(唯一写入者)落账(via=inline-chat)。
       只能批准当前会话本轮的候选;粘贴的哈希与文件不符、筛查不过、文件在发起研究后被改过,都拒绝。
+      **自动批准例外**(本机配置 auto_approve.enabled,默认关):第一次调用即由服务端写入独立的自动账
+      (via=auto-research)并在返回里明说;此时不返回哈希、无需人粘贴。每次尝试都会记入尝试记录。
     - page(带外页面,原样保留):拉起本机批准页(只监听 127.0.0.1),页面展示完整源码、
       静态筛查结果与父策略差异;人输入完整 sha256 确认。页面地址与哈希不在返回值里。
 
