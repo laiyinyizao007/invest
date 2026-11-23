@@ -371,6 +371,7 @@
 ### 纪律机制补缺(Issue #6,详见 `docs/adr/20261111-discipline-enforcement.md`)
 - **解锁问责**:`AccountGuard` 记录 `hard_locked_at` 与 `unlock_history`;`scripts/unlock_account.py` 在硬锁定当个交易日内拒绝解锁(退出码 3),`--force` 须交互输入 `FORCE` 且不能与 `--yes` 同用;解锁后峰值重置的语义不变。
 - **非策略委托检测**:`AccountGuardRule._track_manual_order`——reference 不是 `CtaStrategy_*`/`FLATTEN_REF` 的新委托,经 3 秒确认窗口后告警并按交易日计数(`guard.manual_orders`);只告警不锁定;启动对账通过后才 arm;每日证据表记为严重事件。
+- **已处理废单去重**:`AccountGuardRule.on_order` 对 REJECTED 先查 `guard.is_reject_handled(交易日, 委托号)`,命中即只写日志;废单经 `_process_pending_rejects` 判定(含锁定落盘)**之后**才 `guard.mark_reject_handled` 登记(状态文件 `handled_rejects`,按交易日、每日 ≤5000、保留 3 个交易日)。用来挡登录/重连时柜台对当日委托的整体回放;查不到一律照常判定(fail-closed)。人工同日解锁只清 `daily_locked_day`,不要删状态文件。
 - **实盘准入**:`risk/live_admission.py` + `scripts/record_promotion.py`——`run_headless` 连接生产 API(`实盘` 且非 SimNow)前要求 `data/state/promotion_approval.json`,该文件仅在 `check_gate` 全部通过时写出;SimNow 与 `测试` 环境豁免。
 
 ### `scripts/collect_terminal_info.py` 与 `scripts/penetration_check.py`(穿透式监管接入,Issue #5)

@@ -63,6 +63,8 @@ def trading_day(dt: datetime) -> date:
 
 UNLOCK_HISTORY_LIMIT = 20      # 状态文件里最多保留的解锁记录条数
 MANUAL_DAYS_LIMIT = 60         # 非策略委托按日计数,最多保留的天数
+HANDLED_REJECTS_DAYS = 3       # 「已处理过的废单委托号」最多保留的交易日数(登录回放只回放当日)
+HANDLED_REJECTS_PER_DAY = 5000  # 每个交易日最多留多少个;超了丢最旧的(被丢的下次当新废单再判一次:多锁不漏锁)
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,9 @@ class AccountGuard:
         self.hard_locked_at_legacy: bool = False   # 旧状态文件里的 hard_locked_at 是**本机本地时间**,交易日不可信
         self.unlock_history: list[dict] = []   # 人工解锁记录:{at, locked_at, reason, forced}
         self.manual_orders: dict[str, int] = {}  # 交易日(ISO) -> 当日检测到的非策略委托笔数
+        # 交易日(ISO) -> 已处理过(分类并做完锁定决策)的废单委托号。登录/重连后柜台会把当日委托整体回放,
+        # 已处理的废单不能再判一遍(2026-11-18 国信实测:每次登录都重新 DAILY_LOCKED)。查不到 = 当新废单照常判定。
+        self.handled_rejects: dict[str, list[str]] = {}
         self.last_equity: float = 0.0          # 前一次有效采样的权益,作为新交易日的开盘基准
         # 该权益『被采样』的时刻(账户回报到达柜台网关的时间),不是文件写入时间。只供状态页判断权益是否新鲜:
         # 网关断开后 vn.py 仍缓存着旧账户对象,定时器照常读到它并落盘,文件 mtime 因此一直是新的。纯可观测字段,不参与任何熔断判断。
@@ -279,6 +284,24 @@ class AccountGuard:
         self._save()
         return self.manual_orders[key]
 
+    # ---------- 已处理的废单(抗登录/重连回放) ----------
+
+    def is_reject_handled(self, day: date, key: str) -> bool:
+        """key = 委托号 + 指纹(见 AccountGuardRule._reject_key)。只有委托号会在柜台复用 SessionID、
+        客户端 OrderRef 重数时撞号,把另一笔【新】废单当成已处理 ⇒ 漏锁;指纹不符就查不到 = 当新废单。"""
+        return key in self.handled_rejects.get(day.isoformat(), ())
+
+    def mark_reject_handled(self, day: date, key: str) -> None:
+        """记下「这笔废单已处理完」。必须在锁定决策**之后**调用:先记后锁,中间崩溃会让该废单永远不再触发锁定。"""
+        ids = self.handled_rejects.setdefault(day.isoformat(), [])
+        if key in ids:
+            return
+        ids.append(key)
+        del ids[:-HANDLED_REJECTS_PER_DAY]
+        for old in sorted(self.handled_rejects)[:-HANDLED_REJECTS_DAYS]:
+            del self.handled_rejects[old]
+        self._save()
+
     # ---------- 持久化 ----------
 
     def _save(self) -> None:
@@ -314,6 +337,7 @@ class AccountGuard:
             "hard_locked_at_legacy": self.hard_locked_at_legacy,
             "unlock_history": self.unlock_history,
             "manual_orders": self.manual_orders,
+            "handled_rejects": self.handled_rejects,
         }
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,6 +418,11 @@ class AccountGuard:
                 bool(self.hard_locked_at) and state_version < 2)
             self.unlock_history = [dict(h) for h in s.get("unlock_history", [])][-UNLOCK_HISTORY_LIMIT:]
             self.manual_orders = {str(k): int(v) for k, v in s.get("manual_orders", {}).items()}
+            # 形状不对(损坏/手改)⇒ 一个都没处理过(fail-closed:废单照常判定),不让它把整份状态判成损坏
+            raw_handled = s.get("handled_rejects")
+            self.handled_rejects = ({str(k): [str(x) for x in v][-HANDLED_REJECTS_PER_DAY:]
+                                     for k, v in raw_handled.items() if isinstance(v, list)}
+                                    if isinstance(raw_handled, dict) else {})
             raw_sampled = s.get("sampled_at")
             self.last_sampled_at = self._parse_sampled_at(raw_sampled)
             # 用不了的采样时刻**留痕**(纯可观测):值被丢掉本身是保守的(状态页显示「无法确认」),

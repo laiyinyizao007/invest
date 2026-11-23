@@ -348,6 +348,13 @@ class AccountGuardRule(RuleTemplate):
                         f"{order.volume}@{order.price}(委托号 {oid},reference={order.reference!r})。"
                         f"今日第 {today} 笔。这不是本系统发出的单:人工干预会使无人值守验收作废,请核对账户与持仓。")
 
+    @staticmethod
+    def _reject_key(order: OrderData) -> str:
+        """已处理废单的登记键:委托号 + 指纹(合约/方向/开平/手数/价格)。回放的是同一笔,字段一模一样;
+        委托号撞号的另一笔新废单,指纹对不上 ⇒ 查不到 ⇒ 照常判定(fail-closed)。"""
+        return (f"{order.vt_orderid}|{order.vt_symbol}|{order.direction.value if order.direction else ''}|"
+                f"{order.offset.value}|{order.volume}|{order.price}")
+
     def on_order(self, order: OrderData) -> None:
         now = self.mono()
         self._track_manual_order(order, now)
@@ -361,6 +368,13 @@ class AccountGuardRule(RuleTemplate):
         if order.status == Status.CANCELLED:
             self._count_cancel()
         elif order.status == Status.REJECTED:
+            # 登录/重连后柜台会把当日委托整体回放。已处理过的废单(委托号已按交易日落盘)不再判一遍:
+            # 当时若触发了锁定,锁定已落盘;再判只会把人工解锁过的当日重新锁上。
+            # 判据是「委托号处理过没有」,不看报单时间/启动时刻(那些会被重连重推、夜盘交易日时间戳、
+            # 时钟偏差绕过);查不到 = 当新废单照常判定(fail-closed)。
+            if self.guard.is_reject_handled(trading_day(self.clock()), self._reject_key(order)):
+                self.write_log(f"已处理过的废单 {order.vt_orderid} 被回放,不再重复判定锁定")
+                return
             self._pending_rejects[order.vt_orderid] = (now, order)   # 稍后(等错误日志到达)再分类
 
     def _on_threshold_log(self, msg: str) -> None:
@@ -433,6 +447,8 @@ class AccountGuardRule(RuleTemplate):
                 continue
             del self._pending_rejects[oid]
             self._handle_reject(order, self._error_text_near(t, order.gateway_name), t)
+            # 先判定(含锁定落盘)后登记:反过来的话,中间崩溃会让这笔废单此后永远不再触发锁定
+            self.guard.mark_reject_handled(trading_day(self.clock()), self._reject_key(order))
 
     def _handle_reject(self, order: OrderData, text: str | None, ts: float) -> None:
         kind = classify_reject(text)
