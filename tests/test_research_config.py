@@ -103,7 +103,7 @@ def test_resolved_paths_stay_inside_project_root(tmp_path):
     assert all(tmp_path in p.parents for p in paths.values())
     # approved_dir 是收菜的目标目录(运行时唯一认的目录);它固定在项目根下,不可配置到别处
     assert set(paths) == {"pending_dir", "results_dir", "approvals_file", "token_file",
-                          "approved_dir", "collected_file"}
+                          "approved_dir", "collected_file", "auto_approvals_file", "attempts_file"}
 
 
 def test_config_path_can_be_overridden_by_environment(tmp_path, monkeypatch):

@@ -6,6 +6,7 @@
 
 ## [Unreleased]
 ### Added（新增）
+- 研究沙盒**自动批准**(Issue #67,默认关):`auto_approve.enabled` 打开后,通过静态筛查的候选写入**独立的自动账** `auto_approvals.json`(`via=auto-research`),不写人工账;运行侧/装载门/实盘准入不读自动账。新增每次研究尝试的哈希链记录 `data/research/attempts.jsonl`(含被拒/失败,记不下就不批)。风险与取代预注册 §2 上限见 `docs/adr/20261123-research-auto-approval.md`。
 - **第一轮有界研究的预注册**(新 ADR [`docs/adr/20261123-research-round-1-preregistration.md`](docs/adr/20261123-research-round-1-preregistration.md),研究域,写于看任何本轮候选的回测结果之前):用户要求「研究直到产出合格可上线的策略」,但「跑到合格为止」是多重检验,改为有界:仅 EB/EG/V/PP/M 的 15 分钟;**试验次数最多再加 3 次**(3→6),重调参重提同一想法也计一次;每次提交前先写假设与失败判据;研究轮内不碰测试段,只有「通过验证筛选+击败两条基准+用户明确同意」的候选才看测试段一次;到上限或有候选走完测试段即停。**合法结果包括「证明不了有优势」。**不改任何风控常量与晋级门槛;「上线」(装载门、SimNow、穿透测试、期货公司)与实盘切换不在范围内,须用户另行授权。含两条需人工确认的声明(EG 候选批准后的回测是否已被看过)。
 - **录制已起(2026-11-16 23:11,SimNow 第一套前置)**:`.env` 补上持久化的 `CTP_RECORD_*`
   (profile=simnow、合约 `C2701.DCE`+`MA701.CZCE`、Tick+1 分钟、独立库 `.vntrader_record`)。

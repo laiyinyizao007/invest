@@ -87,6 +87,7 @@ jobs:
           python -m ruff check \
             scripts/backtest_lib.py \
             scripts/research_api.py \
+            scripts/research_attempts.py \
             scripts/research_approval_server.py \
             scripts/research_config.py \
             scripts/research_console.py \
@@ -132,6 +133,7 @@ jobs:
             tests/test_research_gateway.py \
             tests/test_research_grid.py \
             tests/test_approval_ledger.py \
+            tests/test_auto_approval.py \
             tests/test_research_collect.py \
             tests/test_research_mcp.py \
             tests/test_research_profile_check.py \
@@ -231,7 +233,7 @@ jobs:
           # `tests/test_strategy_skeleton_contract.py`——它们 import `bootstrap`,
           # 会把 vnpy 交易栈拖进来 ⇒ 这个 job 装不了(也不该装:研究侧刻意不依赖交易栈);
           # 那两份属于交易侧,归实盘那条线。
-          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py
+          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py --suite tests/test_auto_approval.py
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #

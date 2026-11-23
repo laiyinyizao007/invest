@@ -655,9 +655,10 @@ _OS_FLAG_VALUES = {
     "O_CREAT": 0o40, "O_EXCL": 0o100, "O_TRUNC": 0o1000,
 }
 # 只允许这两个作用域写「与批准记录有关」的文件:
-#   - record_approval:批准记录本身
+#   - _record_row:批准记录本身(人工账 `record_approval` 与自动账 `record_auto_approval` 共用的底层写入;
+#     两个公开入口自己都不写文件,只做通道/文件名校验后委托它——Issue #67)
 #   - _approvals_lock:批准记录的独占锁文件
-_ALLOWED_SCOPES = {("scripts/research_sandbox.py", "record_approval"),
+_ALLOWED_SCOPES = {("scripts/research_sandbox.py", "_record_row"),
                    ("scripts/research_sandbox.py", "_approvals_lock")}
 
 

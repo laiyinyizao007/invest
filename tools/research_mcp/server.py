@@ -2,13 +2,17 @@
 
 边界(ADR 20261113-dsh-research-entry-and-out-of-band-approval;Issue #59 修订,见 ADR 20261120):
   - DSH 只是对话入口,毕昇仍是编排器。本服务把「想法」交给毕昇工作流,读回结构化结果。
-  - **模型不能授予批准;批准由人触发。** 写 approvals.json 的路径有两条:
+  - **默认:模型不能授予批准;批准由人触发。** 写 approvals.json(人工账)的路径有两条:
     a) 带外批准页(独立进程 `scripts/research_approval_server.py`,人输完整哈希);
     b) 会话内哈希回贴(Issue #59 方案 A,用户明确接受其削弱):人**亲自**把工具返回的
        64 位哈希粘贴进会话,模型带 confirm_sha256 调用本工具,服务端比对自算哈希后经
        `record_approval`(唯一写入者)落账。落账哈希用的是**服务端自算值**,
        与盘上文件绑定;模型无法让账本记录与文件内容不符。
     两者都只认当前会话本轮的候选,都要求静态筛查先通过。
+  - **自动批准(Issue #67,默认关,用户明确接受其风险):** 本机配置 `auto_approve.enabled=true` 时,
+    通过静态筛查的候选由服务端写入**独立的自动账** auto_approvals.json(via=auto-research),**不写人工账**。
+    自动账只被研究沙盒读;运行侧/装载门/实盘准入仍只认人工账。每次尝试(含被拒/失败)追加到 attempts.jsonl,
+    记不下就不批。开关在配置文件里,不是工具参数,模型改不了。
   - 不暴露提交源码、回测、门槛、装载策略、读写任意文件、任意命令。
   - **批准页的 URL 一律不进工具返回值**(codex 第 2 轮实测复现的 Critical:模型拿到
     URL+哈希就能自己 POST 批准页)。inline 模式的**候选哈希有意放行**——人要粘贴的就是它;
@@ -30,6 +34,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -58,6 +63,7 @@ if str(CODE_ROOT / "scripts") not in sys.path:
 import research_config as rc           # noqa: E402
 import research_console as rconsole    # noqa: E402
 import research_sandbox as rs          # noqa: E402
+import research_attempts as ra         # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7860/api/v2"
 DEFAULT_WORKFLOW_ID = "1194f8540b9944fea4353b07f0493cbf"     # invest 研究工作流 v3(15分钟+门槛)
@@ -81,6 +87,8 @@ APPROVAL_ENV_ALLOW = (
 mcp = FastMCP("research-mcp", instructions=(
     "研究入口:把研究想法交给毕昇工作流跑,由人在本机审阅并批准候选策略。"
     "你只能发起研究、查进度、请求批准;批准动作由人完成,你无权批准。"
+    "例外:本机配置打开了自动批准时,请求批准会由服务端按配置直接落账(不经人审阅),返回里会明说;"
+    "没有明说「已自动批准」就按人工流程走。"
 ))
 
 
@@ -122,6 +130,33 @@ def load_config() -> dict:
 def approvals_file() -> Path:
     cfg = load_config()
     return rc.resolve_paths(cfg, ROOT)["approvals_file"]
+
+
+def auto_approvals_file() -> Path:
+    return rc.resolve_paths(load_config(), ROOT)["auto_approvals_file"]
+
+
+def attempts_file() -> Path:
+    return rc.resolve_paths(load_config(), ROOT)["attempts_file"]
+
+
+def auto_approve_enabled() -> bool:
+    """自动批准开关(Issue #67):读本机配置,**任何读取/校验失败都当作关闭**(fail-closed)。"""
+    try:
+        return load_config()["auto_approve"]["enabled"] is True
+    except Exception:                                   # noqa: BLE001 — 读不到配置 = 关
+        return False
+
+
+def _attempt(event: str, **fields) -> str:
+    """追加一条尝试记录。返回空串=成功;失败返回一句话(调用方决定是拒绝还是只提示)。"""
+    clean = {k: (redact_for_model(v) if isinstance(v, str) and k != "sha256" else v)
+             for k, v in fields.items()}
+    try:
+        ra.record_attempt(attempts_file(), event, **clean)
+    except Exception as exc:                            # noqa: BLE001
+        return redact_for_model(f"尝试记录写入失败:{exc}")
+    return ""
 
 
 def pending_dir() -> Path:
@@ -320,14 +355,14 @@ def pending_snapshot() -> set[str]:
 def newest_pending(names: set[str]) -> str | None:
     """多个新候选时取**最新**的那个(按修改时间),不是字典序第一个。"""
     best: str | None = None
-    best_mtime: float | None = None
-    for name in names:
+    best_key: tuple[float, str] | None = None
+    for name in sorted(names):                     # 排序后遍历 + (mtime, 名字) 比较:mtime 并列时结果确定
         try:
-            mtime = (pending_dir() / name).stat().st_mtime
+            key = ((pending_dir() / name).stat().st_mtime, name)
         except OSError:
             continue
-        if best_mtime is None or mtime > best_mtime:
-            best, best_mtime = name, mtime
+        if best_key is None or key > best_key:
+            best, best_key = name, key
     return best
 
 
@@ -358,7 +393,7 @@ def approval_state(session: dict) -> tuple[bool, str]:
     if recorded and recorded != sha:
         return False, "候选文件在发起研究后被改动过,批准对不上"
     try:
-        approved = rs.is_approved_sha(sha, approvals_file())
+        approved = rs.is_approved_sha_any(sha, approvals_file(), auto_approvals_file())
     except rs.SandboxError:
         # 批准记录损坏/不可读:fail-closed(不推进工作流),但给模型一句能读懂的话。
         return False, "批准记录读不到或已损坏,拒绝继续"
@@ -375,8 +410,8 @@ def is_candidate_approved(name: str) -> bool:
     if not sha:
         return False
     try:
-        return rs.is_approved_sha(sha, approvals_file())
-    except OSError:
+        return rs.is_approved_sha_any(sha, approvals_file(), auto_approvals_file())
+    except (OSError, rs.SandboxError):
         return False
 
 
@@ -446,7 +481,11 @@ def _start_research(idea: str) -> str:
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         set_current(session)
+        warn = _attempt("start", session=session["session_id"], idea=idea, candidate=candidate or "",
+                        sha256=session["candidate_sha"], note="; ".join(failures[:3]))
         lines = [f"已发起研究。想法:{idea}", f"毕昇会话:{session['session_id']}"]
+        if warn:
+            lines.append(warn)
         if resumed:
             lines.append("(接着上一轮继续,反馈已带在会话上下文里)")
         if candidate:
@@ -498,6 +537,11 @@ def _research_status() -> str:
             lines.append("输出:" + text[:1200])
         if failures:
             lines.append("有节点失败:" + "; ".join(failures[:3]))
+        warn = _attempt("failure" if failures else "advanced", session=session.get("session_id"),
+                        candidate=candidate, sha256=session.get("candidate_sha"),
+                        note="; ".join(failures[:3]) if failures else (texts[-1][:500] if texts else ""))
+        if warn:
+            lines.append(warn)
     elif waiting == "input_wait":
         lines.append("当前停在「等待批准」节点;批准前不会继续。用 request_approval 请求人工审阅。")
     return "\n".join(lines)
@@ -552,10 +596,9 @@ def _inline_approval_target(name: str, session: dict) -> tuple[Path | None, str,
                                     scr["extra_forbidden_calls"], scr["allowed_modules"])
     except KeyError:
         return None, "", [], "筛查配置缺失,拒绝批准(fail-closed)。"
-    try:
-        sha = rs.file_sha256(path)
-    except OSError as exc:
-        return None, "", [], f"策略文件哈希计算失败:{exc}"
+    # 哈希取自**被筛查的同一份字节**(不再读第二次):否则筛查与落账之间文件被换掉,
+    # 未筛查的内容就会被记成已批准(自动模式下筛查是唯一内容关卡)。
+    sha = hashlib.sha256(raw).hexdigest()
     recorded = session.get("candidate_sha")
     if recorded and recorded != sha:
         return None, "", [], "候选文件在发起研究后被改动过,批准对不上;请重新发起研究。"
@@ -594,8 +637,33 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
         return redact_for_model(err)
     if findings:
         # 静态筛查不过 = 与 CLI approve 同一拒绝口径:不给哈希,更不给批准。
+        _attempt("screening_rejected", session=session.get("session_id"), candidate=name, sha256=sha,
+                 note="; ".join(findings[:5]))
         return redact_for_model("静态筛查未通过,不予批准:" + "; ".join(findings)
                                 + "。修正候选后需要重新发起研究。")
+    if auto_approve_enabled():
+        # 自动批准(Issue #67):静态筛查已过。**先落尝试记录,记不下就不批**(fail-closed),
+        # 再写**独立的自动账**(不是人工账)。落账哈希仍是服务端自算值,与盘上文件绑定。
+        warn = _attempt("approval_requested", session=session.get("session_id"), candidate=name, sha256=sha,
+                        via="auto-research", idea=session.get("idea"))
+        if warn:
+            return redact_for_model("自动批准未执行(尝试记录写不进去,拒绝在无记录的情况下批准):" + warn)
+        try:
+            rs.record_auto_approval(path, auto_approvals_file(), sha256=sha)
+        except rs.SandboxError as exc:
+            _attempt("failure", session=session.get("session_id"), candidate=name, sha256=sha,
+                     via="auto-research", note=f"自动批准写入失败:{exc}")
+            return redact_for_model(f"自动批准写入失败:{exc}")
+        # 批准**已落账**之后才记「已批准」:日志不得比账本领先。记不下时账里有批准而日志缺一行,
+        # 如实告诉调用方(前一行 approval_requested 已在)。
+        confirm_warn = _attempt("auto_approved", session=session.get("session_id"), candidate=name,
+                                sha256=sha, via="auto-research")
+        if confirm_warn:
+            return redact_for_model(f"已自动批准候选 {name},但「已批准」那条尝试记录没写进去:" + confirm_warn)
+        return redact_for_model("\n".join([
+            f"已按本机配置自动批准候选 {name}(自动账 via=auto-research,不经人工审阅;每次尝试都已记入尝试记录)。",
+            "批准绑定到当前文件内容;代码再改一个字节,批准即失效。现在可以用 research_status 推进工作流。",
+        ]))
     confirm = (confirm_sha256 or "").strip().lower()
     if not confirm:
         # 第一阶段:发哈希与位置,**不发源码**——源码由人在本机编辑器里直接读盘上文件
@@ -622,6 +690,7 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
         rs.record_approval(path, approvals_file(), sha256=sha, via="inline-chat")
     except rs.SandboxError as exc:
         return redact_for_model(f"写入批准记录失败:{exc}")
+    _attempt("manual_approved", session=session.get("session_id"), candidate=name, sha256=sha, via="inline-chat")
     return redact_for_model("\n".join([
         f"人工已通过会话内哈希回贴批准候选 {name}(账本 via=inline-chat)。",
         "批准绑定到当前文件内容;代码再改一个字节,批准即失效。",
@@ -790,6 +859,8 @@ async def request_approval(strategy: str, confirm_sha256: str | None = None, mod
       2. 模型带 confirm_sha256=<人粘贴的哈希> 再次调用:服务端与自算哈希比对一致,
          且静态筛查通过时,经 record_approval(唯一写入者)落账(via=inline-chat)。
       只能批准当前会话本轮的候选;粘贴的哈希与文件不符、筛查不过、文件在发起研究后被改过,都拒绝。
+      **自动批准例外**(本机配置 auto_approve.enabled,默认关):第一次调用即由服务端写入独立的自动账
+      (via=auto-research)并在返回里明说;此时不返回哈希、无需人粘贴。每次尝试都会记入尝试记录。
     - page(带外页面,原样保留):拉起本机批准页(只监听 127.0.0.1),页面展示完整源码、
       静态筛查结果与父策略差异;人输入完整 sha256 确认。页面地址与哈希不在返回值里。
 

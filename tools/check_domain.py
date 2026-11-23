@@ -252,6 +252,8 @@ NEVER_DOWNGRADE = (
     "tests/test_approved_loading.py",
     "tests/test_research_collect.py",
     "tests/test_approval_ledger.py",
+    # 自动批准(Issue #67)的隔离不变量:断言「运行侧不读自动账」「自动账只有一处写入点且先判开关」。
+    "tests/test_auto_approval.py",
     "tests/test_candidate_eval.py",
     "tests/test_diagnosis.py",
     "tests/test_dsr.py",
