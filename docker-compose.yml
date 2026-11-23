@@ -16,6 +16,8 @@ services:
     volumes:
       - ./runtime/vntrader:/app/.vntrader     # 策略状态、日志、本地数据库
       - ./runtime/data:/app/data              # 账户风控状态文件、心跳
+      - ./approved:/app/approved:ro           # 批准目录(运行时唯一认的策略目录);宿主机的收菜结果。**只读**:运行时不写它
+      - ./data/research-control:/app/data/research-control:ro   # 批准账本:装载时复核批准记录(只读)
     restart: on-failure:3
     stop_grace_period: 60s
     init: true

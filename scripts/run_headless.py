@@ -67,6 +67,19 @@ def parse_args(argv: list[str] | None, env: Mapping[str, str]) -> argparse.Names
                         help="预热用的历史日线代码,如 CADJ.DCE(由 build_continuous.py --save 写入数据库)")
     parser.add_argument("--setting", default="{}", help='策略参数 JSON,如 \'{"fast_window":10,"slow_window":40}\'')
     parser.add_argument("--heartbeat", type=float, default=float(env.get("HEARTBEAT_SECONDS", "0") or 0))
+    parser.add_argument("--approved", default="", help="从批准目录装载策略:approved/ 里的文件名,如 my_candidate.py")
+    parser.add_argument("--approved-dir", default="",
+                        help="批准目录路径(必须解析到 <项目根>/approved;钉死是为了不让候选目录与受信目录混为一谈)")
+    parser.add_argument("--approved-class", default="Candidate", help="批准文件里的类名(默认 Candidate)")
+    parser.add_argument("--approved-key", default="",
+                        help="本次要跑的品种(如 C15);给了就与装载门批准记录的 key 核对")
+    parser.add_argument("--approved-template", default="",
+                        help="装载用的骨架(模块:类);缺省用宪法指定的默认骨架——"
+                             "那是**仅研究回测**的 15m 骨架,会被拒绝装载;"
+                             "实盘用日线骨架:strategies.trend_atr_strategy:TrendAtrStrategy")
+    parser.add_argument("--strategy-name", default="trend_atr",
+                        help="策略实例名(持久化状态的命名空间);装载批准策略时默认按批准哈希派生,"
+                             "换版本自动换命名空间")
     parser.add_argument("--check", action="store_true", help="只校验配置与依赖,不连接、不交易")
     return parser.parse_args(argv)
 
@@ -129,10 +142,26 @@ def main(
         vt_symbol=args.symbol,
         strategy_setting=strategy_setting,
         gateway_setting=gateway_setting,
+        strategy_name=args.strategy_name,
         heartbeat_seconds=args.heartbeat,
         heartbeat_file=bootstrap.ROOT / "data" / "state" / "heartbeat",
+        approved_file=args.approved or None,
+        approved_dir=Path(args.approved_dir) if args.approved_dir else None,
+        approved_class_in_file=args.approved_class,
+        approved_key=args.approved_key or None,
+        approved_template=args.approved_template or None,
     )
     if args.check:
+        # 批准目录的组合也要在 --check 里校验:配置错误不该等到真启动(那时已经连上前置)才暴露
+        if config.approved_file:
+            approved_dir = config.approved_dir or (bootstrap.ROOT / "approved")
+            if Path(approved_dir).resolve() != (bootstrap.ROOT / "approved").resolve():
+                print(f"配置错误: 批准目录必须固定为 {bootstrap.ROOT / 'approved'},"
+                      f"当前是 {approved_dir}", file=sys.stderr)
+                return 2
+            if not (Path(approved_dir) / config.approved_file).is_file():
+                print(f"配置错误: 批准目录里没有 {config.approved_file}", file=sys.stderr)
+                return 2
         print(f"配置检查通过: 合约 {args.symbol},历史 {args.history or '(同合约)'},"
               f"通知 {'已配置' if notifier.enabled else '未配置'},账户风控: 当日 600 元 / 累计 2000 元")
         return 0

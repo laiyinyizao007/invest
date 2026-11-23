@@ -2,6 +2,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import importlib.util
+
 import pytest
 
 import research_gate as rg
@@ -41,6 +43,20 @@ def run(**kw):
                 runner=make_runner(), random_cls=Rand, random_runs=5, data_adjusted=True, on_plateau=True, capital=10_000)
     args.update(kw)
     return rg.run_gate(**args)
+
+
+# 这两条用例要 import 交易栈(walk_forward_optimizer / strategies.*)才能核对常量:
+# CI 的研究侧闸门不装交易环境,那里**跳过**而不是失败(缺依赖 ≠ 行为不对)。
+def _trading_stack_missing() -> bool:
+    try:
+        return importlib.util.find_spec("vnpy_ctastrategy") is None
+    except (ImportError, ValueError):
+        return True
+
+
+requires_trading_stack = pytest.mark.skipif(
+    _trading_stack_missing(),
+    reason="需要交易栈:CI 的研究侧闸门不装交易环境")
 
 
 def test_windows_slice_bars_and_never_pass_bars_past_test_start():
@@ -107,11 +123,13 @@ def test_output_includes_windows_and_diagnosis_and_is_json_serialisable():
     json.dumps(result, ensure_ascii=False)
 
 
+@requires_trading_stack
 def test_test_segment_start_is_locked_to_walk_forward_constant():
     import walk_forward_optimizer as wf
     assert rg.TEST_SEGMENT_START == wf.TEST_SEGMENT_START
 
 
+@requires_trading_stack
 def test_random_entry_15m_strategy_exposes_seed_and_entry_prob_parameters():
     from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
     from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy

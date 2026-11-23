@@ -60,6 +60,11 @@ def run_engine(
         pricetick=inst.pricetick,
         capital=capital,
     )
+    # 行情在候选的 `__init__` 跑**之前**读成引擎里的局部数据(第 38 轮:与 gate/evaluate 入口的"先取定再让候选运行"同一模式)。
+    # `load_data` 只依赖 set_parameters 设好的区间/品种,不依赖策略实例,所以前置不改变回测语义。
+    engine.load_data()
+    if not engine.history_data:
+        raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
     # 第四层的"回测前"基准要在**构造实例之前**拍:
     # 实例构造(__init__)也是候选能碰到的时机,构造期改写的东西如果发生在拍快照之后,
     # 就成了"基线",指纹再也看不出来(第 10 轮 codex 的 Medium 3)。
@@ -67,9 +72,6 @@ def run_engine(
     engine.add_strategy(strategy_class, setting)
     _snapshot = _risk_floor_snapshot(engine.strategy)
     _market = _install_market_baseline(engine)
-    engine.load_data()
-    if not engine.history_data:
-        raise RuntimeError(f"{key} 在 {start:%Y-%m-%d}~{end:%Y-%m-%d} 没有日线数据,请先运行 fetch_data.py")
 
     engine.run_backtesting()
     _raise_if_strategy_failed(messages)
@@ -78,6 +80,20 @@ def run_engine(
                                market_baseline=_market.get("market"),
                                market_findings=_market["findings"])
     return engine
+
+
+def vnpy_database_paths() -> list:
+    """vnpy 库文件路径(peewee 的连接是惰性打开的:第一次查询才 connect)。
+
+    放在**交易侧**模块里而不是 `research_api`:常驻研究进程(网关/MCP/批准进程)不许 import vnpy,
+    而研究侧只在这一条路径上需要这个路径(回测子进程的窗口里给"框架读库"一条窄豁免)。
+    取不到就返回空表:那时窗口里的回测读库会被钩子拒(fail-closed,不是放开)。"""
+    try:
+        from vnpy.trader.setting import SETTINGS
+        from vnpy.trader.utility import get_file_path
+        return [get_file_path(SETTINGS["database.database"])]
+    except Exception:                                # noqa: BLE001
+        return []
 
 
 def load_bars_csv(path, symbol: str, exchange: Exchange, interval: Interval = Interval.MINUTE) -> list[BarData]:

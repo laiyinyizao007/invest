@@ -28,5 +28,17 @@ jobs:
           python-version: '3.11'
 
       # 宪法层是纯标准库 + git:这里不需要装 pytest,更不需要装整个交易环境。
+      #
+      # 【第 55 轮之四】接线自检的**独立落点**就在**这一步**里:
+      # `tools/check_constitution_history.py` 里有一条**纯文本**的检查
+      # (`check_ci_wiring_presence`)——它断言
+      # 「`.github/workflows/research-guard.yml` 里必须**还在**跑
+      # `python tools/check_ci_wiring.py`(规范形:一个选项都不许带)」。
+      #
+      # **为什么不另开一个步骤**:接线自检要读 workflow 的 YAML ⇒ 需要 PyYAML ⇒
+      # 宪法层就得 `pip install` ⇒ 违反「宪法层是纯标准库」这条约定
+      # (仓库里 `tests/test_constitution.py` 就钉着它:宪法层不许装交易环境依赖)，
+      # 而且**给一个「守卫会不会跑」的判断加上网络依赖**本身就是倒退。
+      # 纯文本核对**不需要任何依赖** ⇒ 放在这个工具里,宪法 workflow 一个依赖都不装。
       - name: Check the constitution is append-only
         run: python tools/check_constitution_history.py

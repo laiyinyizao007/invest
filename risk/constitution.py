@@ -229,6 +229,19 @@ BUILTIN_PROTECTED_READ_ATTRS = (
     "DailyLossGuard", "TrailingStop", "trading_day",
 )
 
+# **闸门函数**:它们是「拒绝」这件事的执行者。
+# 改写它们 = 把筛查/比对换成一个听话的版本,于是「静态筛查: 通过」「没有改写受保护对象」
+# 这两个**给人看的信号**都能变成谎言(第 3 轮 codex 实测:候选把 `check_protected_state`
+# 换成「调用时把原函数装回去并返回 []」的假函数,指纹结论恒为空,事后身份核对也看不出)。
+# 所以这类名字:**写**它要拒,`setattr(obj, "名字", ...)` 这种按字符串写的也要拒。
+BUILTIN_PROTECTED_GATE_ATTRS = (
+    "check_protected_state", "snapshot_protected_state",
+    "screen_source", "check_class", "check_params", "load_template",
+    "safe_builtins", "record_approval",
+    "is_approved", "is_approved_sha", "file_sha256", "load_approvals",
+    "BUILTIN_ALLOWED_TEMPLATES", "BUILTIN_PROTECTED_NAMES", "BUILTIN_PROTECTED_PARAMETERS",
+)
+
 # 候选可以重写的模板成员(白名单);不是白名单的**模板成员**一律不许重写
 BUILTIN_ALLOWED_OVERRIDES = (
     "entry_signal", "param_grid", "parameters", "fast_window", "slow_window", "atr_mult", "take_profit_r",
@@ -266,6 +279,15 @@ BUILTIN_FORBIDDEN_DUNDERS = (
     #    运行时第三层的"家族判定"直接判成"不适用"而放行(第 10 轮 codex 实测)。
     #    第三层已改成按 MRO 判定(结构判定,没有可改写的入口),这里再加一道静态保险。
     "__instancecheck__", "__subclasscheck__", "__subclasshook__", "__prepare__",
+    # ⑥ 异常回溯帧(第 11 轮 codex 实测的 Critical):候选在自己代码里
+    # `except BaseException as e:` 中顺着 `e.__traceback__.tb_frame.f_globals`
+    # 拿回**真 os**(numpy 内部帧的全局命名空间里有 os),于是任意写文件
+    # (可伪造 approvals.json)、读文件(.env、网关令牌)、执行命令,
+    # 而**两层静态筛查零告警**——这条路上一个禁用名都不出现。
+    # 拿到帧**必经**这几个名字,它们是必经之路而不是可选路径。
+    "__traceback__", "__context__", "__cause__",
+    "tb_frame", "tb_next", "tb_lasti",
+    "f_globals", "f_locals", "f_builtins", "f_back", "f_code", "f_lineno",
 )
 
 # 框架自带的"按名 setter":这类方法把调用方给的字典**按键名** setattr 到实例上。
@@ -284,6 +306,10 @@ BUILTIN_FORBIDDEN_DUNDERS = (
 # (第 7 轮实测:经异常回溯拿到 frame.f_builtins 里的 setattr;以及 unittest.mock.patch.object)。
 # 真正把能力收走的是**执行时不给这些内建**(scripts/research_sandbox.py::safe_builtins):
 # 候选的内建字典里没有 setattr,那些路径就都不成立。
+#
+# **准确口径**(第 22 轮补记,Issue #26):收走的是**候选自己那些帧**里的能力。
+# 别人的帧(导入机制、第三方库)里仍然是真实内建——所以这一层是纵深防御,不是边界;
+# 真正的边界是人工审批 + 容器隔离。
 BUILTIN_FORBIDDEN_BY_NAME_SETTERS = ("update_setting",)
 
 # 由元类自动注入类字典的成员(ABCMeta 会给每个类塞一个 _abc_impl)。
@@ -556,6 +582,80 @@ def _self_instance_attr(node: ast.AST) -> bool:
     前者是全局函数,后者改不到它。"""
     path = _attr_path(node)
     return bool(path) and len(path) == 2 and path[0] == "self"
+
+
+def _gate_attr_violations(tree: ast.AST) -> list[str]:
+    """闸门函数名的**任何**写入形态都要拒(第 4 轮 codex 实测的 M1)。
+
+    只看 `x.attr = v` 是不够的——实测这几种改法全都绕过了:
+      - `x.attr: int = v`(AnnAssign)
+      - `a, b = v`(元组解包)
+      - `x.attr += v`(AugAssign)
+      - `del x.attr`
+      - `setattr(obj, "attr", v)` / `delattr(obj, "attr")`
+      - `vars(obj)["attr"] = v`
+    名字是**字符串**或藏在容器里时,按属性名查黑名单看不见它。
+    """
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        # ① 属性写入/删除(含 AnnAssign 与元组解包里的元素)
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        for target in targets:
+            for element in (target.elts if isinstance(target, (ast.Tuple, ast.List)) else [target]):
+                if isinstance(element, ast.Attribute) and element.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 改写了闸门函数 {element.attr}"
+                                    "(把「拒绝」这件事的执行者换掉)")
+        # ② `del x.attr`
+        if isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                    findings.append(f"第 {node.lineno} 行: 删除了闸门函数 {target.attr}")
+        # ③ `setattr(obj, "名字", v)` / `delattr(obj, "名字")`
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in ("setattr", "delattr") and len(node.args) >= 2:
+            name_node = node.args[1]
+            if isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) \
+                    and name_node.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                findings.append(f"第 {node.lineno} 行: 按名改写了闸门函数 {name_node.value}"
+                                "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
+        # ④ `vars(obj)["名字"] = v`
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Call) \
+                        and isinstance(target.value.func, ast.Name) and target.value.func.id == "vars":
+                    key = target.slice
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str) \
+                            and key.value in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(f"第 {node.lineno} 行: 通过 vars() 改写了闸门函数 {key.value}")
+    return findings
+
+
+def _setattr_protected_name(node: ast.Call, c: Constitution) -> str | None:
+    """`setattr(obj, "名字", 值)` 里的「名字」是不是受保护成员。
+
+    名字是**字符串**,按属性名查黑名单看不见它——第 3 轮 codex 实测:
+    候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)` 把 300 元
+    单笔预算换成一个恒 0 的函数,静态层对那条载荷返回 []。
+    """
+    if not (isinstance(node.func, ast.Name) and node.func.id == "setattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    name_node = node.args[1]
+    if not (isinstance(name_node, ast.Constant) and isinstance(name_node.value, str)):
+        return None
+    name = name_node.value
+    if name in BUILTIN_PROTECTED_GATE_ATTRS:
+        return name
+    if name in c.protected_module_attrs and _module_attr_owner_ok(name, []):
+        return name
+    return None
 
 
 def _write_violation(target: ast.AST, c: Constitution) -> str | None:
@@ -878,6 +978,10 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     violation = _write_violation(target, c)
                     if violation:
                         findings.append(f"第 {node.lineno} 行: 改写了受保护属性 {violation}")
+                    elif target.attr in BUILTIN_PROTECTED_GATE_ATTRS:
+                        findings.append(
+                            f"第 {node.lineno} 行: 改写了闸门函数 {target.attr}"
+                            "(把「拒绝」这件事的执行者换掉)")
                     elif target.attr in c.protected_module_attrs and _module_attr_owner_ok(
                             target.attr, _attr_path(target) or []) and not _self_instance_attr(target):
                         findings.append(f"第 {node.lineno} 行: 改写了受保护的风控函数 {target.attr}")
@@ -899,6 +1003,14 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
                     and not _bare_local_allowed(target.id, id(target), class_body_targets):
                 findings.append(f"第 {node.lineno} 行: 覆盖了受保护成员 {target.id}")
         elif isinstance(node, ast.Call):
+            # `setattr(对象, "名字", 值)`:名字是**字符串**,按属性名查黑名单看不见它。
+            # 第 3 轮 codex 实测:候选用 `setattr(sys.modules['risk.risk_guard'], 'within_budget', ...)`
+            # 把 300 元预算换掉,静态层对这条载荷返回 []。
+            setattr_name = _setattr_protected_name(node, c)
+            if setattr_name:
+                findings.append(
+                    f"第 {node.lineno} 行: 按名改写了受保护成员 {setattr_name}"
+                    "(setattr 的名字是字符串,按属性名查黑名单看不见它)")
             # 对受保护容器调用**变更型方法**:`self.am.update_bar(fake_bar)` 会往回测里
             # 插一根假 K 线,而它既不是属性赋值也不是取别名(第 11 轮 codex 的 High 1)。
             violation = _container_mutator_call(node, c)
@@ -977,6 +1089,9 @@ def screen_source(source: str, c: Constitution | None = None) -> list[str]:
     # 而位置信息只有走完整棵树才认得全(赋值、海象、调用实参、返回、字面量)。
     for lineno, message in _container_escape_findings(tree):
         findings.append(f"第 {lineno} 行: {message}(拿到之后可以原地改写它, 伪造回测结果)")
+    # 闸门函数名的**任何**写入形态(AnnAssign / 元组解包 / AugAssign / del /
+    # setattr / delattr / vars()[...])——第 4 轮 codex 实测:只挡 `x.attr = v` 会被绕开。
+    findings.extend(_gate_attr_violations(tree))
     return findings
 
 
@@ -1133,7 +1248,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # 候选目录不得落在这些仓库目录里。与 `scripts/research_config.py` 的 `RESERVED_DIRS` **必须一致**
 # (宪法模块不能 import 它:它依赖 bootstrap/vnpy;一致性由
 # `tests/test_constitution_round12.py::test_the_pending_dir_reserved_names_match_the_sandbox_config` 守)。
-_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config"})
+# `.git` 也在内:候选目录指到版本库里,等于让受保护对象躲进"没人会去看的目录"。
+_PENDING_DIR_RESERVED = frozenset({"strategies", "approved", "risk", "trading", "scripts", "tests", "config", ".git"})
 _DEFAULT_PENDING_DIR = "pending_strategies"
 
 

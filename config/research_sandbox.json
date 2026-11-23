@@ -31,7 +31,8 @@
   },
   "screening": {
     "extra_forbidden_modules": [],
-    "extra_forbidden_calls": []
+    "extra_forbidden_calls": [],
+    "allowed_modules": []
   },
   "grid": {
     "min_round_trips": 10,

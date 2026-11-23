@@ -1,0 +1,360 @@
+name: Research Guard
+# 研究侧(毕昇工作流 / DSH Preset / research-mcp / 带外批准进程)的**语法、静态检查与边界测试**关卡。
+#
+# 为什么要有这个 job:第 8 轮 codex 复核期间,tools/research_mcp/server.py 带着一处
+# SyntaxError(`except/elif` 写在 try 里)进了工作树,整个 MCP 模块 import 不了,
+# 而当时仓库里**没有任何 job 会跑 ruff 或 compileall**——ruff 本身能报它,只是没人跑。
+#
+# 为什么不直接跑 `pytest tests/`:整套测试里有大量用例要交易栈(vnpy)。
+# 研究侧那几份已经与交易栈解耦(见下面「边界闸门」步骤的说明),只跑它们——跑得轻、失败得准。
+# 需要交易栈的用例会**跳过**,所以这一步在只装 pytest + mcp SDK 的 runner 上也是绿的。
+#
+# 第 7 轮 codex 的 High:边界不变量(批准记录只有一个写入者 / Preset 不挂危险工具 /
+# 工具目录恰为三项 / 研究栈不 import vnpy)**写成了测试却没有任何 job 会跑它**,
+# 于是"看起来有防线、实际随时能改坏"。这里把它们纳入闸门。
+#
+# 【第 55 轮:闸门步骤改成「规范形」】
+# 此前这一步是「pytest 一段 + 闸门一段」的**两段** shell(中间夹着 `rm -f`、
+# 续行、for 循环)。第 55 轮**实测**:把两者**一起**藏进 `bash -c "…"` ⇒
+# 七条纪律守卫**全部真空绿**(守卫只认它认得的命令形态,认不出来的就当"没有")。
+# 现在每个闸门步骤是**一条**命令:
+#     python tools/ci_gate.py --junitxml <报告> --roster <名单> --suite <套件> …
+# 这一条命令自己跑 pytest、自己核对名单、用**退出码**说话 ⇒
+# 「闸门能不能让 CI 红」不再取决于 shell 的写法。
+# 「规范形」由 `tools/check_ci_wiring.py` 强制(见下面 `wiring` 那个 job)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 连续推送时只跑最新一次:闸门是"有没有坏"的判据,不是"跑了几次"的账本
+# (第 10 轮 codex 的 Low)。
+concurrency:
+  group: research-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 —— **必须**:默认的浅克隆(fetch-depth: 1)在 `pull_request`
+          # 事件下只检出 `refs/pull/N/merge`,**没有 origin/main 这个引用**,
+          # 后面那步「按后果域分档」跑 `git diff origin/main...HEAD` 会 rc=128 →
+          # 分档器 fail-closed 退出 2 → **CI 永久变红**(codex 第 2 轮的 Critical-1)。
+          # 完整历史也让那一步能真的比对出改动。
+          # 与 constitution-guard.yml 同一条口径(它也需要完整历史)。
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 起「无效转义」才是 SyntaxWarning;3.11 上它只是 DeprecationWarning,
+          # `-W error::SyntaxWarning` 在 3.11 上是空操作(第 10 轮 codex 的 High:
+          # 闸门注释承诺的检查在 CI 上根本没生效)。
+          python-version: '3.12'
+
+      # 语法关卡:整个仓库都要能编译。-W error::SyntaxWarning 让无效转义也算失败
+      # (无效转义是「这行字面量其实不是你以为的那个」的常见来源)。
+      # 路径清单要覆盖**研究闭包**里的全部目录:研究侧会 import dashboard/safe.py、
+      # notify/redact.py、risk/constitution.py,它们不在 scripts/tools/tests 之下
+      # (第 10 轮 codex 的 Medium)。
+      #
+      # 这是**预防网**,不是保证:它只保证「现在这个提交里的这些文件能编译」。
+      # 别把它当成「已经修好的缺陷」的证明——它拦的是**下一次**同类问题。
+      # -f:强制重编译,不复用上一次的 .pyc(缓存命中时坏文件可能蒙混过关)。
+      # `.github` 也在清单里(仓库自带两个脚本):第 12 轮 codex 的 L4——
+      # 注释承诺的是「整个仓库都要能编译」,清单却漏了这一处。
+      - name: 语法编译(研究闭包全部目录,含告警即失败)
+        run: python -W error::SyntaxWarning -m compileall -qf scripts tools tests dashboard risk notify strategies trading ctp_tools evidence .github
+
+      # ruff 的**清单是显式的**,不是 `ruff check .`:仓库里还留着大量与本研究侧
+      # 无关的历史脚本(penetration_check / collect_reject_texts / unattended_report …),
+      # 它们各有 3~25 条存量风格债,一次性清理会把本 issue 的改动撑大好几倍。
+      # 清单覆盖:研究侧全部模块、本 issue 改过的文件、宪法守卫工具本身,
+      # 以及研究闭包里的 risk/ 与 notify/(第 10 轮 codex 的 Medium:清单漏了它们)。
+      # dashboard/ 只有 safe.py 与 __init__.py 进了 ruff(其余文件各有 5 条与本研究无关的
+      # 存量风格债 F841/E741/F541,清债不属于本 issue);evidence/ 只进了 compileall。
+      #
+      # 第 55 轮:清单里多了 `tools/ci_gate.py` 与 `tools/check_ci_wiring.py`
+      # (这两个就是闸门本身,它们坏了,闸门就坏了)。
+      - name: 静态检查(研究侧与本 issue 涉及的文件)
+        run: |
+          python -m pip install --quiet ruff==0.14.8
+          python -m ruff check \
+            scripts/backtest_lib.py \
+            scripts/research_api.py \
+            scripts/research_approval_server.py \
+            scripts/research_config.py \
+            scripts/research_console.py \
+            scripts/research_gate.py \
+            scripts/research_gateway.py \
+            scripts/research_grid.py \
+            scripts/research_ledger.py \
+            scripts/research_sandbox.py \
+            scripts/segment_windows.py \
+            scripts/segment_ledger.py \
+            scripts/optimize.py \
+            tools/research_mcp \
+            tools/bisheng/build_v3.py \
+            tools/bisheng/bs.py \
+            tools/check_constitution_history.py \
+            tools/check_domain.py \
+            tools/verdict_graph.py \
+            tools/check_mutations.py \
+            tools/check_ci_ran.py \
+            tools/ci_gate.py \
+            tools/check_ci_wiring.py \
+            tools/check_guard_mutations.py \
+            dashboard/__init__.py \
+            dashboard/safe.py \
+            notify \
+            risk \
+            tests/test_check_domain.py \
+            tests/test_check_ci_ran.py \
+            tests/test_ci_wiring.py \
+            tests/test_check_guard_mutations.py \
+            tests/test_constitution_string_programs.py \
+            tests/test_dashboard_app.py \
+            tests/test_dashboard_collect_more.py \
+            tests/test_constitution_round11.py \
+            tests/test_constitution_round12.py \
+            tests/test_fs_capability_closure.py \
+            tests/test_merge_main_sandbox_union.py \
+            tests/test_research_api.py \
+            tests/test_research_approval_server.py \
+            tests/test_research_boundary.py \
+            tests/test_research_config.py \
+            tests/test_research_gate.py \
+            tests/test_research_gateway.py \
+            tests/test_research_grid.py \
+            tests/test_approval_ledger.py \
+            tests/test_research_collect.py \
+            tests/test_research_mcp.py \
+            tests/test_research_profile_check.py \
+            tests/test_research_sandbox.py \
+            tests/test_segment_ledger.py
+
+      # 研究侧依赖(**从 requirements-research.txt 装**,不在这儿重复写一遍 pin
+      # ——第 12 轮 codex 的 L5:声明的依赖与被测的依赖长期不一致,
+      # 改了这个文件 CI 却不会发现)。pytest 单独钉版本(它不在那个文件里)。
+      #
+      # 第 55 轮:这一步**独立**成一步。闸门步骤必须**只有一条命令**
+      # (规范形),装依赖的命令不能混进去。
+      - name: 安装研究侧依赖(requirements-research.txt + pytest)
+        run: python -m pip install --quiet -r requirements-research.txt pytest==8.3.4
+
+      # 边界闸门(第 7 轮 codex 的 C1/H1):**先单跑边界不变量那一份**,再跑其余研究侧测试。
+      #
+      # 为什么要拆成多步:同一个 pytest 调用里只要有一个文件在**收集阶段**报错
+      # (比如模块级 import 了交易栈),整轮 session 就中止、**一个测试都不会跑**——
+      # 闸门看上去配好了,实际一次都没执行过(仓库里 constitution-guard.yml 的注释
+      # 已经记过同一个教训,这里不重犯)。拆开之后,边界不变量那一层永远先跑。
+      #
+      # 为什么这里能跑研究侧测试:研究侧与交易栈已经解耦——
+      #   - scripts/segment_windows.py:窗口常量(纯数据),不再经 optimize → bootstrap → vnpy;
+      #   - scripts/segment_ledger.py:不再 import bootstrap,于是全局 conftest 也不碰 vnpy
+      #     (**不用** --noconftest:那样会丢掉 conftest 里隔离测试段登记文件的夹具,
+      #     本地按这条命令跑就会污染仓库真实的 config/test_segment_usage.json);
+      #   - 需要交易栈的用例(vnpy_ctastrategy 等)在没有交易栈时**跳过**,不是失败。
+      #
+      # 【第 55 轮】这一步是**一条**命令 `tools/ci_gate.py`:
+      #   自己跑 pytest(报告自己生成)→ 立刻按名单**逐条点名**核对 → 退出码说话。
+      # 「一条没跑 / 全被跳过 / 名单点名的用例没跑或被跳过」⇒ 退出码非 0 ⇒ 这一步红。
+      # 名单在 tests/guard_roster.json(与守卫侧共读同一份)。
+      - name: 研究侧边界不变量(批准唯一写入者 / Preset 边界 / 工具目录 / 不 import vnpy)
+        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/boundary.xml" --roster tests/guard_roster.json --suite tests/test_research_boundary.py
+
+      # 核心防线套件(Issue #31):候选能力收口。它此前**一次都没在 CI 上跑过**——
+      # 文件头 `import bootstrap` 会拖进 vnpy,而这个 job 只装 numpy/pandas/mcp/pyyaml,
+      # 于是整份文件在收集阶段就 ModuleNotFoundError:**闸门看上去配好了,实际没跑**
+      # (第 7 轮 codex 的 High 同族:边界不变量写成了测试却没有任何 job 会跑它)。
+      #
+      # 现在把"需要交易栈的用例"逐条用 `@requires_trading_stack` 显式标出来
+      # (缺标记的用例在 CI 上会**直接失败**,不会被静默跳过),
+      # 其余与交易栈无关的防线用例在这里真的跑。
+      #
+      # 单独一步(不与其它文件合跑):这份文件是核心防线,它收集失败就必须**整步红**,
+      # 不能被吞掉。
+      - name: 研究侧核心防线(候选能力收口,Issue #31)
+        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/closure.xml" --roster tests/guard_roster.json --suite tests/test_fs_capability_closure.py
+
+      # 并集回归套件:main(#22 导入白名单 + 模块代理)与 #26(按路径的导入裁决 +
+      # 对象层)加固**同一个**沙盒后的合流行为。**本分支也改 research_sandbox**,
+      # 所以这套并集回归正是本分支的回归风险面——它此前同样没在 CI 上跑过。
+      #
+      # 单独一步(收集失败必须整步红,不被别的文件的收集错误吞掉):
+      # 两条依赖 matplotlib/psutil 的冲突用例在研究侧依赖里没有这两个模块,
+      # 按用例自身的说明跳过(缺真模块判不了准入审计)。
+      #
+      # 这一份**不在**名单里 ⇒ 闸门对它只做全局核对(一条没跑 / 全被跳过 / 有失败 ⇒ 红)
+      # 加上「这一份自己的核对」(必须在报告里、不能整份被跳过)。
+      - name: 研究侧并集回归(main 白名单 x #26 路径裁决)
+        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/union.xml" --roster tests/guard_roster.json --suite tests/test_merge_main_sandbox_union.py
+
+      # 守卫工具**自己**的用例(第 49 轮):它们各自守着一个判定点
+      # (分档器 / 「真的跑了吗」闸门 / 变异脚手架)。
+      #
+      # 为什么单独一步:**整份被跳过**时 pytest 的退出码仍是 0 ⇒ CI 照样绿
+      # (与第 46~47 轮消灭的失败模式同类)。此前这三份不在
+      # `tests/guard_roster.json` 里 ⇒ CI 侧那道「点名核对」碰不到它们
+      # ⇒ **守卫的守卫自己没有被兜底**。
+      # 现在:名单点名逐条核对(没出现 / 出现却是 skipped ⇒ 红)。
+      #
+      # 第 55 轮:加了 `tests/test_ci_wiring.py`(接线自检工具自己的用例)——
+      # 新写的守卫工具**自己也要有人守**(仓库教训)。
+      # 第 55 轮之二十:加上 `tests/test_constitution_string_programs.py`
+      #(宪法层「字符串里藏着的执行原语」那条规则的用例)——
+      # 它守的是宪法层自己的判定点,同样不许被整份跳过。
+      - name: 守卫工具自己的用例(分档器 / CI 闸门 / 接线自检 / 变异脚手架)
+        run: python tools/ci_gate.py --junitxml "$RUNNER_TEMP/guards.xml" --roster tests/guard_roster.json --suite tests/test_check_domain.py --suite tests/test_check_ci_ran.py --suite tests/test_ci_wiring.py --suite tests/test_check_guard_mutations.py --suite tests/test_constitution_string_programs.py
+
+      - name: 研究侧其余测试(沙盒/网关/批准进程/MCP/配置)
+
+        run: |
+          # 第 54 轮(codex H4):`tests/test_approval_ledger.py` 与
+          # `tests/test_research_collect.py` 已经**进名单** ⇒ 闸门对它们做
+          # **逐条点名**核对(账本那份里「没有本地账本就跳过」的那一条
+          # 登记在名单的 `allow_skipped` 段里,理由写在守卫文件里)。
+          # 其余几份**故意不在名单**里(它们有平台/依赖相关的跳过)⇒
+          # 只做全局核对 + 「必须真的跑过」。
+          #
+          # 第 55 轮:这一步也变成**一条**命令(全部套件一次 pytest,
+          # 报告自己生成、自己核对)。`--continue-on-collection-errors`
+          # 现在由 `tools/ci_gate.py` 统一带上:某个文件收不起来时其余文件
+          # 仍然要跑,但**收不起来的那一份**会在名单核对里被点名报红。
+          #
+          # **不进来的两份**:`tests/test_approved_loading.py` 与
+          # `tests/test_strategy_skeleton_contract.py`——它们 import `bootstrap`,
+          # 会把 vnpy 交易栈拖进来 ⇒ 这个 job 装不了(也不该装:研究侧刻意不依赖交易栈);
+          # 那两份属于交易侧,归实盘那条线。
+          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py
+
+      # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
+      #
+      # 为什么要有这一步:上面那一步只是**测**分档器(单元测试 + 探针),
+      # 但分档器作为 CLI 的那条路径——`--diff` 读 git、打印中文档位、
+      # 按退出码表态——**没有任何 CI 跑过**。而 CLAUDE.md 文档里给出的命令
+      # 正是这条路径(codex 的 M5:它在 Windows cp1252 控制台上直接崩,
+      # 退出码变成 1,与「判为执行域」无法区分)。
+      #
+      # 这一步跑的是**真实 CLI**:非 UTF-8 控制台下不得崩溃、退出码语义必须对得上。
+      #
+      # **退出码语义**(三条,互不重叠):
+      #   0 = 全部研究域,**或**本次没有改动;
+      #   1 = 含执行域文件(该走完整流程);
+      #   2 = 环境不可用(fail-closed)——**只有这一种**该让关卡失败。
+      # 第 2 轮复核指出:若把「没有改动」也算 2,push 到 main 时(base==HEAD、
+      # 工作树干净)就会**永久变红**。已把「没有改动」分出来,返回 0。
+      #
+      # 【第 55 轮】这一步**不是**闸门步骤(它不产报告、不核对名单),
+      # 所以它不受「只有一条命令」的规范形约束——它自己的判据在脚本里。
+      - name: 后果域分档器冒烟(非 UTF-8 控制台 + 退出码 + 输出自证)
+        run: |
+          set -e
+          # PYTHONIOENCODING=cp1252 复现 Windows 默认控制台:崩了就红。
+          PYTHONIOENCODING=cp1252 python tools/check_domain.py scripts/optimize.py
+          # 按本次 PR 的改动分档。0 与 1 都是**正常**结果(1 = 含执行域文件,
+          # 该走完整流程——这里只要求命令能跑通,不做流程判定)。
+          # 2 = 环境不可用(fail-closed),那才是失败。
+          rc=0
+          out=$(python tools/check_domain.py --diff "origin/${{ github.base_ref || 'main' }}" 2>&1) || rc=$?
+          echo "$out"
+          if [ "$rc" = "2" ]; then
+            echo "分档器返回 2(环境不可用)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          # **必须看到「总判定:」这一行**,否则不能算「它给出了判断」。
+          # 只看退出码是不够的:Sourcery 复核抓到过一个 fail-open 口子——
+          # Python 遇到未捕获异常时退出码也是 **1**,而 1 在本工具的语义里
+          # 是「判为执行域」(正常结果)。于是「分档器自己崩了」与
+          # 「分档器说这是执行域」在 CI 眼里完全一样,崩了也照样放行。
+          # 两道防线:①CLI 现在把未预期异常归到 2(见 tools/check_domain.py::_cli);
+          # ②这里再要求输出里有结论行,崩了就没有。
+          if ! echo "$out" | grep -q "总判定:"; then
+            echo "分档器没有给出判定结论(崩溃?退出码=$rc)——按 fail-closed 处理,本关卡失败"; exit 1
+          fi
+          echo "分档器退出码=$rc(0/1 均正常;2 才是环境不可用)"
+          exit 0
+
+      # 变异验证(codex 第 2 轮的 M3):分档清单的每次改动都必须被测试抓住。
+      #
+      # 为什么要有这一步:ADR 里那张「N 种变异全部被抓住,条数实测」的表,
+      # 第 1 轮复核就发现**三行数字对不上**(测试从 82 条长到 90 条,
+      # 红的用例集自然变了),而且有一行**变异描述写反了**。
+      # 靠人记的数字会过期 —— 这条关卡把它变成机器保证:
+      # 脚本在**仓库副本**上逐个施加变异、数 pytest 的 FAILED 行数,
+      # 任何一种变异没被抓住就红。`--verify` 还会核对 ADR 表格里的数字。
+      #
+      # 注意它在**副本**里做(真工作树全程不动),所以跑起来慢一点是应该的。
+      - name: 分档清单的变异验证(每个清单改动都必须被抓住)
+        run: |
+          python tools/check_mutations.py --verify
+
+      # 纪律守卫自己的变异验证(第 48 轮,codex 第 2 轮的 L6)。
+      #
+      # 为什么要有这一步:第 46~47 轮在 ADR/CHANGELOG 里记的那套「M1~M10 变异」
+      # **仓库里没有实现**——那是手工拿反例去撞守卫,不可复算、别人也跑不了。
+      # 「写下了但没人跑」等于没有防线,所以这一步把它**脚本化**:
+      # `tools/check_guard_mutations.py` 在**仓库副本**上逐个施加变异
+      # (模块级一刀切跳过 / 别名跳过 / 无条件跳过 / 裸跳过 / 名单被摘 /
+      #  conftest 改收集 / 守卫视野变窄 / 名单采集漏条件块 /
+      #  CI 接线那一族:非规范形态的闸门调用 / 藏进 bash -c / 加 if: /
+      #  加 continue-on-error / 删掉整个闸门步骤 / …),
+      # 每一种都必须让**钉死的见证用例**变红;其中两条是**无害改动**
+      # (改注释、把 `python` 写成 `python3`),必须**保持绿**
+      # (证明这份脚本不是"永远红",空转的见证不算见证)。
+      #
+      # 第 49 轮起每条变异**只跑见证那一条**(此前每条都跑整份套件)。
+      # 这是**唯一**能证明纪律守卫没被"悄悄放松"的检查。
+      - name: 纪律守卫的变异验证(每条守卫松了都必须被抓)
+        run: |
+          python tools/check_guard_mutations.py --verify
+
+      # 接线自检(本 job 的最后一步)。
+      #
+      # 为什么它要在**这个** job 里再跑一遍(而不是只有下面那个 `wiring` job):
+      # 两处**独立**地跑同一个检查 ⇒ 删掉其中一处,另一处会发现。
+      # 这一处与 `wiring` job 的差别:这一处**在**跑真实测试的那个 job 里,
+      # 依赖已经装好;`wiring` job 是**独立**的(不依赖任何 pytest 套件),
+      # 因此「把整个 research job 删掉」它也照样跑得到。
+      - name: CI 接线自检(规范形 + 名单覆盖)
+        run: |
+          python tools/check_ci_wiring.py
+
+  # 接线自检的**独立** job(第 55 轮,codex 第 2 轮的 C1)。
+  #
+  # 【为什么必须独立成 job】
+  # codex 的 C1:此前**没有任何守卫**断言「名单里那几份套件真的被 CI 跑着」——
+  # 把「研究侧边界不变量」那一步删掉,CI 照样绿(104 passed、0 failures),
+  # 而且**那条守卫自己**(它在被删掉的那一步里)也跟着消失了 ⇒ 没人发现。
+  #
+  # 现在:这个 job **不跑任何 pytest 套件**,只跑 `tools/check_ci_wiring.py`。
+  # 它断言:①每个闸门步骤都是**规范形**(一条命令、不带 if:/continue-on-error:/shell:);
+  #        ②名单 `tests/guard_roster.json` 点名的**每一份**套件,
+  #          都真的被某个规范闸门步骤跑着(把那一步删掉 ⇒ 这里红);
+  #        ③两个 workflow 里**各自**都有跑这个自检的地方(自检自己也不能被悄悄删掉)。
+  #
+  # 它与 `constitution-guard.yml` 里的那处**互为兜底**:
+  # 删掉本文件里的两处自检 ⇒ constitution-guard.yml 那处会发现;
+  # 删掉 constitution-guard.yml 里那处 ⇒ 本文件里的两处会发现。
+  # (两处都被删 ⇒ 仓库内无人发现——这是**已知残余风险**,只能靠评审与分支保护兜。)
+  wiring:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # `tools/check_ci_wiring.py` 读 workflow 的 YAML ⇒ 需要 PyYAML。
+      # 版本与许可证与 requirements-research.txt 同一条(6.0.3,MIT,2026-11-13 核对)。
+      - name: 安装接线自检的依赖(PyYAML)
+        run: python -m pip install --quiet pyyaml==6.0.3
+
+      - name: CI 接线自检(规范形 + 名单覆盖 + 自检自身在场)
+        run: |
+          python tools/check_ci_wiring.py

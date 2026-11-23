@@ -48,7 +48,9 @@ def test_shipped_ledger_marks_15m_baseline_test_segment_as_used():
     import optimize_15m as o15
 
     with pytest.raises(sl.SegmentAlreadyUsed):
-        sl.check(o15.segment_key(), sl.bootstrap.ROOT / "config" / "test_segment_usage.json")
+        # 用**入库的那份**登记文件:全局 conftest 会把 `segment_ledger.LEDGER` 指向临时文件,
+        # 这里要查的是仓库里真实登记的那一条(ROOT 是模块常量,不会被 monkeypatch 改掉)。
+        sl.check(o15.segment_key(), sl.ROOT / "config" / "test_segment_usage.json")
 
 
 def test_optimize_15m_refuses_second_test_run_before_any_work(monkeypatch, capsys):
