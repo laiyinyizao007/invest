@@ -3306,16 +3306,24 @@ def is_approved_sha(sha256: str, approvals_file: Path) -> bool:
     return sha256 in _load_approvals(approvals_file)
 
 
-def record_approval(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None) -> str:
+def record_approval(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
+                    via: str = "unspecified") -> str:
     """记一次人工批准,返回被批准的哈希。
 
     `sha256`:调用方**已经核对过**的那份哈希。传了就直接拿它当键,不再重读文件——
     否则"人核对的内容"与"记下来的内容"之间会有时间差(TOCTOU:两次读之间文件被改,
     记下的其实是另一个版本的哈希)。不传才自己算(给不需要预读哈希的调用点用)。
 
+    `via`:批准通道的审计标记(第 59 号方案):"page"(批准页)/"cli"(本机终端)/
+    "inline-chat"(会话内哈希回贴)。只进账本条目,不参与任何判定——消费者仍按 sha 键查存在。
+    旧条目没有这个字段,读取方一律兼容(见 is_approved_sha)。
+
     写入用「独占锁 + 唯一临时名 + 原子替换」:两个批准进程同时提交时不会互相覆盖
     (先读后写的丢更新),也不会出现半截文件。
     """
+    via = (via or "").strip().lower() or "unspecified"
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", via):
+        raise SandboxError(f"批准通道标记格式不对(应为小写字母开头的短标记): {via!r}")
     approvals_file = Path(approvals_file)
     sha = str(sha256).strip().lower() if sha256 else file_sha256(path)
     if not re.fullmatch(r"[0-9a-f]{64}", sha):
@@ -3336,7 +3344,7 @@ def record_approval(path: Path, approvals_file: Path, now: datetime | None = Non
         new_row = None
         if sha not in data:
             prev = rows[-1]["hash"] if rows else chain.GENESIS
-            new_row = chain.seal({"sha": sha, "name": Path(path).name,
+            new_row = chain.seal({"sha": sha, "name": Path(path).name, "via": via,
                                   "at": (now or datetime.now()).isoformat(timespec="seconds")}, prev, len(rows) + 1)
             data[sha] = new_row
         tmp = approvals_file.with_name(

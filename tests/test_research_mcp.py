@@ -52,14 +52,22 @@ def test_exactly_three_tools_and_nothing_else():
     assert got == ["request_approval", "research_status", "start_research"]
 
 
-def test_module_never_writes_approval_records():
-    """MCP 只有「请求批准」的权限,批准记录的唯一写入者是批准进程。"""
+def test_module_writes_approval_records_only_via_the_single_writer():
+    """MCP 的落账**只**经唯一写入者 `rs.record_approval`(Issue #59 修订了
+    「MCP 完全无写路径」的旧不变量;写入者本身仍只有一个)。
+
+    不许绕开唯一写入者直接写账本文件(锁、核链、原子替换都在那一边)。
+    """
     source = Path(mcp_server.__file__).read_text(encoding="utf-8")
-    assert "record_approval" not in source
-    assert "approvals_file" in source                      # 只用来读
+    assert "rs.record_approval" in source
+    assert 'via="inline-chat"' in source                   # 审计:批准通道要可区分
+    for banned in ("approvals_file().write_text", "approvals_file().open(",
+                   "approvals_file().with_name("):
+        assert banned not in source
 
 
 def test_tool_descriptions_do_not_promise_approval():
+    """工具描述要如实:批准由人触发;inline 是人亲自粘贴哈希,page 仍是带外页面。"""
     import asyncio
 
     async def descs():
@@ -67,8 +75,10 @@ def test_tool_descriptions_do_not_promise_approval():
         return {t.name: (t.description or "") for t in listed}
 
     got = asyncio.run(descs())
-    assert "没有**写批准的权限" in got["request_approval"]
-    assert "人工决定" in got["request_approval"]
+    assert "亲自" in got["request_approval"]               # 粘贴哈希是人的动作
+    assert "唯一写入者" in got["request_approval"]          # 落账仍走唯一写入者
+    assert "页面地址与哈希不在返回值里" in got["request_approval"]   # page 模式不变量保留
+    assert "失效" in got["request_approval"]               # 哈希绑定要说清楚
 
 
 # ---------- 状态 ----------
@@ -355,7 +365,7 @@ def test_status_resumes_and_returns_evaluation_after_approval(clean_state, monke
 
 
 def test_request_approval_without_strategy_is_rejected(clean_state):
-    assert "候选文件名" in mcp_server._request_approval("")
+    assert "候选文件名" in mcp_server._request_approval_via_page("")
 
 
 # ---------- 批准:模型不能自己批准自己 ----------
@@ -399,7 +409,7 @@ def test_request_approval_never_returns_the_url_or_the_hash(clean_state, monkeyp
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert url not in out
     assert sha not in out
@@ -429,7 +439,7 @@ def test_request_approval_never_returns_the_approve_command(clean_state, monkeyp
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert "research_approval_server.py" not in out
     assert "research_api.py approve" not in out
@@ -449,7 +459,7 @@ def test_request_approval_passes_hide_url_to_the_approval_process(clean_state, m
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    mcp_server._request_approval("cand.py")
+    mcp_server._request_approval_via_page("cand.py")
 
     assert calls, "没有拉起批准进程"
     assert "--hide-url" in calls[0]
@@ -473,7 +483,7 @@ def test_request_approval_detaches_stdin_from_the_approval_process(clean_state, 
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    mcp_server._request_approval("cand.py")
+    mcp_server._request_approval_via_page("cand.py")
 
     assert seen, "没有拉起批准进程"
     assert seen[0].get("stdin") is mcp_server.subprocess.DEVNULL
@@ -499,7 +509,7 @@ def test_request_approval_says_unresponsive_when_the_child_hangs(clean_state, mo
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert "无响应" in out
     assert "候选可能不存在" not in out
@@ -511,7 +521,7 @@ def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, mon
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert "退出" in out and "3" in out
     assert "候选可能不存在" not in out
@@ -527,7 +537,7 @@ def test_request_approval_only_approves_the_current_candidate(clean_state, monke
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", boom)
 
-    out = mcp_server._request_approval("other.py")
+    out = mcp_server._request_approval_via_page("other.py")
 
     assert "cand_1.py" in out
     assert "other.py" in out
@@ -547,7 +557,7 @@ def test_request_approval_refuses_when_the_session_has_no_candidate(clean_state,
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", boom)
 
-    out = mcp_server._request_approval("old_candidate.py")
+    out = mcp_server._request_approval_via_page("old_candidate.py")
 
     assert "候选" in out
     assert "不能请求批准" in out
@@ -566,7 +576,7 @@ def test_request_approval_without_a_session_is_refused(clean_state, monkeypatch)
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", boom)
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert "没有进行中的研究" in out
     assert "先发起研究" in out
@@ -582,10 +592,111 @@ def test_request_approval_surfaces_the_fail_closed_reason(clean_state, monkeypat
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
-    out = mcp_server._request_approval("cand.py")
+    out = mcp_server._request_approval_via_page("cand.py")
 
     assert "拒绝" in out
     assert "脱敏模块不可用" in out
+
+
+# ---------- 会话内哈希回贴(Issue #59 方案 A) ----------
+
+def _inline_setup(clean_state):
+    """inline 测试共用:候选文件 + 会话 + 独立批准账本。返回 (候选路径, 哈希, 账本路径)。"""
+    pending = clean_state / "pending_strategies"
+    pending.mkdir(exist_ok=True)
+    cand = pending / "cand_1.py"
+    cand.write_text("class C: pass\n", encoding="utf-8")
+    sha = mcp_server.rs.file_sha256(cand)
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+                                       "candidate_sha": sha, "waiting_node": "input_wait",
+                                       "waiting_message_id": 12}})
+    approvals = clean_state / "approvals.json"
+    return cand, sha, approvals
+
+
+def test_inline_approval_stage1_returns_hash_and_location(clean_state):
+    cand, sha, _approvals = _inline_setup(clean_state)
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+    assert sha in out                                   # 哈希有意放行:人要粘贴的就是它
+    assert "cand_1.py" in out
+    assert "亲自" in out                                # 粘贴是人的动作
+    assert "confirm_sha256" in out                      # 告诉模型下一步怎么走
+    assert cand.exists()
+
+
+def test_inline_approval_stage2_records_via_inline_chat(clean_state, monkeypatch):
+    _cand, sha, approvals = _inline_setup(clean_state)
+    monkeypatch.setattr(mcp_server, "approvals_file", lambda: approvals)
+    out = mcp_server._request_approval_inline("cand_1.py", sha)
+    assert "批准" in out
+    rows = mcp_server.rs._load_approvals(approvals)
+    assert sha in rows
+    assert rows[sha]["via"] == "inline-chat"
+    # 幂等:已批准后再请求 → 短路提示
+    again = mcp_server._request_approval_inline("cand_1.py", None)
+    assert "已经批准过" in again
+
+
+def test_inline_approval_stage2_refuses_wrong_hash(clean_state, monkeypatch):
+    _cand, sha, approvals = _inline_setup(clean_state)
+    monkeypatch.setattr(mcp_server, "approvals_file", lambda: approvals)
+    out = mcp_server._request_approval_inline("cand_1.py", "f" * 64)
+    assert "不符" in out
+    assert "未批准" in out
+    assert not approvals.exists()                      # 账本一个字节都没写
+
+
+def test_inline_approval_stage2_refuses_bad_format(clean_state, monkeypatch):
+    _cand, _sha, approvals = _inline_setup(clean_state)
+    monkeypatch.setattr(mcp_server, "approvals_file", lambda: approvals)
+    out = mcp_server._request_approval_inline("cand_1.py", "abc123")
+    assert "格式不对" in out
+    assert not approvals.exists()
+
+
+def test_inline_approval_refuses_when_screening_fails(clean_state, monkeypatch):
+    """筛查不过 = 与 CLI approve 同一口径:连哈希都不发,更不会落账。"""
+    _cand, _sha, approvals = _inline_setup(clean_state)
+    monkeypatch.setattr(mcp_server.rs, "screen_source", lambda *a, **k: ["发现违禁调用"])
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+    assert "静态筛查未通过" in out
+    assert "不予批准" in out
+    assert not approvals.exists()
+
+
+def test_inline_approval_refuses_when_candidate_changed_after_research_start(clean_state):
+    """发起研究之后候选被改过 → 会话里记的哈希对不上,拒绝(与 approval_state 同口径)。"""
+    pending = clean_state / "pending_strategies"
+    pending.mkdir(exist_ok=True)
+    cand = pending / "cand_1.py"
+    cand.write_text("class C: pass\n", encoding="utf-8")
+    stale = "0" * 64
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+                                       "candidate_sha": stale, "waiting_node": "input_wait",
+                                       "waiting_message_id": 12}})
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+    assert "改动" in out
+    assert mcp_server.rs.file_sha256(cand) not in out
+
+
+def test_inline_approval_only_the_current_candidate(clean_state):
+    _inline_setup(clean_state)
+    out = mcp_server._request_approval_inline("other.py", None)
+    assert "不能批准" in out
+
+
+def test_inline_approval_without_a_session_is_refused(clean_state):
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+    assert "没有进行中的研究" in out
+
+
+def test_inline_redact_exemption_is_hash_only(clean_state):
+    """豁免只放行哈希这一个值:占位符换回后,其余脱敏规则(路径等)照旧生效。"""
+    sha = "a" * 64
+    out = mcp_server._redact_keeping_inline_hash(f"哈希 {sha} 在 C:/Users/somebody/secret.env", sha)
+    assert sha in out
+    assert mcp_server.INLINE_HASH_PLACEHOLDER not in out
+    assert "somebody" not in out                        # 绝对路径照洗
 
 
 # ---------- 批准绑定的是内容哈希 ----------
@@ -693,7 +804,8 @@ def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
                     await session.initialize()
                     t0 = time.monotonic()
                     res = await asyncio.wait_for(
-                        session.call_tool("request_approval", {"strategy": "cand.py"}), timeout=60)
+                        session.call_tool("request_approval",
+                                          {"strategy": "cand.py", "mode": "page"}), timeout=60)
                     return res.content[0].text, time.monotonic() - t0
 
     out, elapsed = asyncio.run(call())
