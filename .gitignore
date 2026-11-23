@@ -4,6 +4,8 @@
 .vntrader/
 # 演练状态目录(与实盘状态完全隔离,不入库)
 .vntrader_drill/
+# 断耦演练的状态目录(同上)
+.vntrader_decoupling/
 # 国信测试取证运行器的隔离状态目录
 .vntrader_brokertest/
 # 行情录制独立数据库与运行状态
@@ -22,8 +24,13 @@ reviewtmp/
 .coverage
 data/
 
-# 研究沙盒:候选策略(含 LLM 产出)只在本机 pending 目录,绝不入库;批准后由人移入 strategies/
+# 研究沙盒:候选策略(含 LLM 产出)只在本机 pending 目录,绝不入库;
+# 批准后由人收菜进 approved/(运行时唯一认的目录),approved/ 同样不入库。
 pending_strategies/
+
+# 批准目录:收菜后的策略(运行时唯一认的目录)。与 pending 同样不入库——
+# 未经审查的代码不进版本库;批准绑定的证据在 data/research-control/approvals.json(也不入库)。
+approved/
 
 # 本机私有状态:毕昇开放 API 密钥、research-mcp 会话状态。含密钥,绝不入库。
 .local/

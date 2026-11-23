@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from scripts import research_sandbox as rs
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 # ---------- 一个假的"仓库":允许目录 + 别的目录 + 可写目录 ----------

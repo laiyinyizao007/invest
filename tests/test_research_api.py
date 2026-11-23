@@ -423,6 +423,121 @@ def test_invalid_config_refuses_every_command(tree, monkeypatch, capsys):
 
 
 @requires_trading_stack
+def test_importing_the_vnpy_logger_inside_the_candidate_window_is_denied():
+    """第 40 轮(Medium 4)的**危害侧**实测(全新解释器,免得本进程已经导过):
+    `vnpy.trader.logger` 的导入期副作用是 loguru → colorama → `ctypes.windll.kernel32`,
+    在候选窗口里会被审计钩子按"能力"拒掉——报出来的是 `AttributeError: kernel32`,
+    看起来像颜色库坏了,离原因很远。此前它只是**碰巧**没发生(子进程入口先导了 backtest_lib)。"""
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent("""
+        import sys
+        sys.path[:0] = [r"{root}", r"{root}/scripts"]
+        import bootstrap
+        import research_sandbox as rs
+        with rs.candidate_window():
+            try:
+                import vnpy.trader.logger
+                print("IMPORTED")
+            except Exception as exc:
+                print("DENIED", type(exc).__name__)
+    """).format(root=root)
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         encoding="utf-8", timeout=180)
+
+    assert "DENIED" in out.stdout, out.stdout + out.stderr
+
+
+@requires_trading_stack
+def test_the_candidate_window_opens_with_the_trading_stack_already_imported():
+    """生产路径:候选窗口打开**那一刻**,交易栈必须已经导入完毕。
+
+    窗口内**第一次**导入 `vnpy.trader.logger` 会走 colorama → `ctypes.dlopen`,
+    被审计钩子按能力拒掉——报出来的是 `AttributeError: kernel32`,
+    看起来像颜色库坏了,离原因很远(危害侧那条用例就是复现它)。
+    所以在**窗口边界**上钉住这个不变量:不是"事后看导入完了",而是"开窗口时就已经在了"。"""
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent("""
+        import sys, pathlib, tempfile
+        sys.path[:0] = [r"{root}", r"{root}/scripts"]
+        import bootstrap
+        import research_api as api
+        import research_sandbox as rs
+
+        seen = {{}}
+        real_window = rs.candidate_window
+        def spy_window(*a, **k):
+            seen["logger_at_window"] = "vnpy.trader.logger" in sys.modules
+            return real_window(*a, **k)
+        rs.candidate_window = spy_window
+
+        api.check_candidate_class = lambda *a, **k: None      # 只关心导入期副作用,不管类校验
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "s.py"
+        f.write_text("from vnpy_ctastrategy import CtaTemplate\\nclass S(CtaTemplate):\\n    pass\\n",
+                     encoding="utf-8")
+        api.import_candidate(f, "S", api.rs.file_sha256(f))
+        print("WINDOW_STATE", seen.get("logger_at_window"))
+    """).format(root=root)
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         encoding="utf-8", timeout=180)
+
+    assert "WINDOW_STATE True" in out.stdout, out.stdout + out.stderr
+
+
+@requires_trading_stack
+def test_the_explicit_preload_holds_the_line_when_the_indirect_layer_is_gone():
+    """把**间接的那一层**关掉,只留**显式的那一层**。
+
+    实测:候选窗口打开之前,交易栈其实**早就**被载入了——但那是**间接**来的
+    (宪法的受保护模块预载 `const.snapshot_protected_state()` → `_preload_protected_modules()`
+    → `strategies.…` → vnpy → logger)。也就是说:不写显式预载,这条用例照样绿,
+    它测到的是"别的层兜着",不是自己这一层(实测过:删掉显式预载,用例不变红)。
+
+    所以这里把间接的那层换成空实现(`snapshot_protected_state` 不再预载),
+    让候选自己在窗口里 `import vnpy.trader.logger`:
+    **没有**显式预载 ⇒ 窗口内的第一次导入被拒(`AttributeError: kernel32`)⇒ 候选失败;
+    **有**显式预载 ⇒ 缓存命中 ⇒ 候选照常跑完。这条用例盯的就是显式预载本身。"""
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent("""
+        import sys, pathlib, tempfile
+        sys.path[:0] = [r"{root}", r"{root}/scripts"]
+        import bootstrap
+        import research_api as api
+        from risk import constitution as const
+
+        const.snapshot_protected_state = lambda: {{}}        # 关掉间接的那层
+
+        api.check_candidate_class = lambda *a, **k: None
+        d = pathlib.Path(tempfile.mkdtemp())
+        f = d / "s.py"
+        f.write_text("import vnpy.trader.logger\\n"
+                     "from vnpy_ctastrategy import CtaTemplate\\n"
+                     "class S(CtaTemplate):\\n    pass\\n", encoding="utf-8")
+        try:
+            api.import_candidate(f, "S", api.rs.file_sha256(f))
+            print("CANDIDATE_OK")
+        except Exception as exc:
+            print("CANDIDATE_FAIL", type(exc).__name__, str(exc)[:200])
+    """).format(root=root)
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         encoding="utf-8", timeout=180)
+
+    assert "CANDIDATE_OK" in out.stdout, out.stdout + out.stderr
+
+
+@requires_trading_stack
 def test_child_refuses_when_file_changed_after_approval(tree):
     # 候选必须放在 pending_strategies/ 内:子入口自己会查这条,否则拒绝原因会变成"路径不对"
     f = tree / "pending_strategies" / "s.py"
@@ -923,12 +1038,27 @@ def test_gate_child_rejects_a_candidate_that_fails_the_runtime_class_check(tree,
 
 
 def test_all_three_child_entrypoints_go_through_the_same_validation_function(tree, monkeypatch):
-    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。"""
-    import inspect
+    """三个子进程入口共用 import_candidate:复制粘贴的防线会漏,收敛成一个入口才不会漏。
+
+    第 43 轮(codex 的 L3):断言机制从 `inspect.getsource` 换成 **ast 按函数名定位**。
+    `getsource` 是**按行号**从磁盘上的当前文件里切块的:模块导入之后文件被改写
+    (行号位移),它会返回**另一段**源码——断言照样会"通过"或"失败",但看的
+    根本不是被测的那个函数。第 40 轮实测:在全量套件运行期间编辑
+    `scripts/research_api.py`,这条用例就会误报失败(全量跑挂、单跑绿)。
+    ast 按**名字**定位,与行号、与导入时机都无关。
+    """
+    import ast
+    import pathlib
+
+    parsed = ast.parse(pathlib.Path(api.__file__).read_text(encoding="utf-8"))
+    functions = {node.name: node for node in ast.walk(parsed)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     for name in ("run_child", "run_evaluate_child", "run_gate_child"):
-        source = inspect.getsource(getattr(api, name))
-        assert "import_candidate(" in source, f"{name} 没走统一入口"
-        assert "check_candidate_class(" not in source, f"{name} 仍在自己做校验,会漏"
+        assert name in functions, f"源文件里找不到 {name}"
+        calls = {ast.unparse(child.func) for child in ast.walk(functions[name])
+                 if isinstance(child, ast.Call)}
+        assert "import_candidate" in calls, f"{name} 没走统一入口(实际调用:{sorted(calls)})"
+        assert "check_candidate_class" not in calls, f"{name} 仍在自己做校验,会漏"
 
 
 # ---------- codex 第 4 轮:pyc 绕过、参数绕过、evaluate 回归 ----------

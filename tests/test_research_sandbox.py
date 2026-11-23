@@ -10,6 +10,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import research_sandbox as rs
+pytestmark = pytest.mark.usefixtures("numpy_on_allowlist", "without_audit_window")
 
 
 # ---------- 路径:只认 pending_strategies/ ----------
@@ -370,12 +371,60 @@ def test_recording_twice_keeps_one_entry(tmp_path):
     assert len(json.loads(approvals.read_text(encoding="utf-8"))) == 1
 
 
-def test_a_stale_lock_does_not_block_approvals_forever(tmp_path):
-    """进程崩了会留下锁文件:不认残留锁的话,一次崩溃就让**之后所有**批准永久失败。"""
+def test_approval_records_the_channel_in_via(tmp_path):
+    """via 字段:批准通道进账本(Issue #59),不参与任何判定,只供审计。"""
     f = tmp_path / "s.py"
     f.write_text("a = 1\n", encoding="utf-8")
     approvals = tmp_path / "approvals.json"
-    lock = tmp_path / "approvals.json.lock"
+
+    import json
+    sha = rs.record_approval(f, approvals, via="inline-chat")
+    row = json.loads(approvals.read_text(encoding="utf-8"))[sha]
+    assert row["via"] == "inline-chat"
+    assert rs.is_approved_sha(sha, approvals) is True          # 判定只看键,不看 via
+
+    # 通道标记格式受约束:进链式账本的载荷不许是任意文本
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(f, approvals, via="坏!标记")
+    with pytest.raises(rs.SandboxError):
+        rs.record_approval(f, approvals, via="x" * 40)
+
+
+def test_approval_ledger_rows_without_via_still_read(tmp_path):
+    """旧条目没有 via(Issue #59 之前的账本):读取方一律兼容,判定不受影响。"""
+    import json
+    from risk import ledger_chain as chain
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    sha = rs.file_sha256(f)
+    # 手工封一条**旧格式**(无 via)的链上条目——正是旧版 record_approval 产出的形状
+    row = chain.seal({"sha": sha, "name": f.name,
+                      "at": datetime(2026, 11, 12, 21, 0).isoformat(timespec="seconds")},
+                     chain.GENESIS, 1)
+    approvals.write_text(json.dumps({sha: row}, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 旧版 record_approval 同样会写锚点:锚点缺失会被判「账本被换进来」(fail-closed),不是这里的场景
+    chain.write_anchor(chain.anchor_path_for(approvals), row["seq"], row["hash"])
+
+    assert rs.is_approved_sha(sha, approvals) is True
+    assert rs.is_approved(f, approvals) is True
+    # 在旧账本上继续追加(via 落进新条目,旧条目原样保留)
+    f2 = tmp_path / "t.py"
+    f2.write_text("a = 2\n", encoding="utf-8")
+    sha2 = rs.record_approval(f2, approvals, via="cli")
+    rows = json.loads(approvals.read_text(encoding="utf-8"))
+    assert rows[sha].get("via") is None and rows[sha2]["via"] == "cli"
+
+
+def test_a_stale_lock_does_not_block_approvals_forever(tmp_path):
+    """进程崩了会留下锁文件:不认残留锁的话,一次崩溃就让**之后所有**批准永久失败。
+
+    第 40 轮:锁统一到 `risk/ledger_chain.file_lock`(`<账本名>.chainlock`),锁文件里写着持有者 PID,
+    "持有者已死"是一条独立的判据(不必等满 stale_seconds)。"""
+    f = tmp_path / "s.py"
+    f.write_text("a = 1\n", encoding="utf-8")
+    approvals = tmp_path / "approvals.json"
+    lock = tmp_path / "approvals.json.chainlock"
     lock.write_text("999999 0\n", encoding="ascii")          # 一个早就不存在的 PID
 
     sha = rs.record_approval(f, approvals)
@@ -389,13 +438,56 @@ def test_a_lock_held_by_a_live_process_is_not_stolen(tmp_path, monkeypatch):
     f = tmp_path / "s.py"
     f.write_text("a = 1\n", encoding="utf-8")
     approvals = tmp_path / "approvals.json"
-    lock = tmp_path / "approvals.json.lock"
+    lock = tmp_path / "approvals.json.chainlock"
     lock.write_text(f"{os.getpid()} {time.time()}\n", encoding="ascii")
 
     with pytest.raises(rs.SandboxError):
         rs.record_approval(f, approvals)
 
     assert lock.exists()          # 锁还在,没被抢
+
+
+def test_the_approvals_ledger_admin_entries_take_the_same_lock_as_record_approval(tmp_path, monkeypatch):
+    """第 40 轮(codex 的 High 3):批准记录此前有**两把互不相干**的锁,而账本维护入口一把都不拿——
+    "批准与重置并发"能静默丢掉一条已批准的记录,而链仍然自洽(重置按有效前缀重新定锚)。
+    现在所有写批准记录的路径共用同一把锁:锁被占着时,维护入口必须**失败**,不能照改不误。"""
+    from risk import ledger_admin as admin
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text("{}", encoding="utf-8")
+    lock = tmp_path / "approvals.json.chainlock"
+    lock.write_text(f"{os.getpid()} {time.time()}\n", encoding="ascii")   # 一把活着的锁
+
+    monkeypatch.setattr(rs, "APPROVALS_LOCK_TIMEOUT", 0.2)
+    monkeypatch.setattr(admin, "ADMIN_LOCK_TIMEOUT", 0.2)
+
+    with pytest.raises(admin.AdminError):
+        admin.reset_approvals(approvals)
+    with pytest.raises(admin.AdminError):
+        admin.migrate_approvals(approvals)
+
+    assert approvals.read_text(encoding="utf-8") == "{}"     # 没被改动
+    assert lock.exists()                                     # 锁还在,没被抢
+
+
+def test_the_reset_reads_the_ledger_while_holding_the_lock(tmp_path, monkeypatch):
+    """同一把锁的另一个可观测后果:维护入口在**读**之前就要拿到锁——
+    否则"先读后加锁"之间夹进来的批准会被静默丢掉(读与写都在锁内)。"""
+    from risk import ledger_admin as admin
+
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text("{}", encoding="utf-8")
+    states: list[bool] = []
+    real_load = admin._load_dict
+
+    def spy(path):
+        states.append((tmp_path / "approvals.json.chainlock").exists())
+        return real_load(path)
+
+    monkeypatch.setattr(admin, "_load_dict", spy)
+    admin.reset_approvals(approvals)
+
+    assert states == [True], "读账本时必须已经持有锁"
 
 
 def test_a_write_failure_is_reported_as_a_sandbox_error(tmp_path, monkeypatch):
