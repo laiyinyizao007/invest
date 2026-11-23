@@ -263,9 +263,9 @@ def check_approval(path: Path, paths: dict, confirm: bool, sha256: str | None = 
             # 免得"核对的内容"与"记下的内容"之间出现时间差(TOCTOU)。
             rs.record_approval(path, paths["approvals_file"], sha256=sha, via="cli")
         elif sha256 is not None:
-            if sha256 not in rs._load_approvals(paths["approvals_file"]):
+            if not rs.is_approved_sha_any(sha256, paths["approvals_file"], paths.get("auto_approvals_file")):
                 raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
-        elif not rs.is_approved(path, paths["approvals_file"]):
+        elif not rs.is_approved_sha_any(rs.file_sha256(path), paths["approvals_file"], paths.get("auto_approvals_file")):
             raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc))
@@ -373,7 +373,7 @@ def child_approved(sha256: str) -> None:
     不必为了查审批再读一遍文件(两处读之间文件若被改,查的就是另一个版本的内容)。"""
     _, paths = settings()
     try:
-        if not rs.is_approved_sha(sha256, paths["approvals_file"]):
+        if not rs.is_approved_sha_any(sha256, paths["approvals_file"], paths.get("auto_approvals_file")):
             raise JobError(EXIT_REFUSED, NEEDS_APPROVAL)
     except rs.SandboxError as exc:
         raise JobError(EXIT_REFUSED, str(exc)) from exc

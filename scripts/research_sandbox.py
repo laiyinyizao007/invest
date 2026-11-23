@@ -3306,8 +3306,26 @@ def is_approved_sha(sha256: str, approvals_file: Path) -> bool:
     return sha256 in _load_approvals(approvals_file)
 
 
-def record_approval(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
-                    via: str = "unspecified") -> str:
+AUTO_APPROVALS_FILE_NAME = "auto_approvals.json"
+AUTO_APPROVAL_VIA = "auto-research"
+
+
+def is_approved_sha_any(sha256: str, approvals_file: Path, auto_approvals_file: Path | None = None) -> bool:
+    """研究沙盒的「是否被批准」:人工账**或**自动账命中即可(Issue #67)。
+
+    **只给研究侧用**。运行侧(`trading/`、`risk/approved_guard.py`)继续只读人工账——
+    自动批准的候选没有人读过源码,不得借此进入装载链路。两本账各自核链、各自 fail-closed:
+    任何一本读不了都抛 SandboxError,不会因为另一本命中而放行。
+    """
+    if sha256 in _load_approvals(approvals_file):
+        return True
+    if auto_approvals_file is not None and Path(auto_approvals_file).exists():
+        return sha256 in _load_approvals(auto_approvals_file)
+    return False
+
+
+def _record_row(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
+                via: str = "unspecified") -> str:
     """记一次人工批准,返回被批准的哈希。
 
     `sha256`:调用方**已经核对过**的那份哈希。传了就直接拿它当键,不再重读文件——
@@ -3370,6 +3388,26 @@ def record_approval(path: Path, approvals_file: Path, now: datetime | None = Non
             except OSError:
                 pass          # 删不掉只是个残留文件,不该把这次批准变成失败
     return sha
+
+
+def record_approval(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
+                    via: str = "unspecified") -> str:
+    """记一次**人工**批准(唯一的人工账写入者)。通道标记 auto-research 专属自动账,这里拒收。"""
+    if (via or "").strip().lower() == AUTO_APPROVAL_VIA:
+        raise SandboxError(f"通道标记 {AUTO_APPROVAL_VIA!r} 只能走自动批准写入口,不能写人工账")
+    return _record_row(path, approvals_file, now=now, sha256=sha256, via=via)
+
+
+def record_auto_approval(path: Path, auto_approvals_file: Path, now: datetime | None = None,
+                         sha256: str | None = None) -> str:
+    """把候选记入**自动批准账**(不是人工账)。调用方必须已确认开关打开且静态筛查通过。
+
+    只做两件事:拒绝写错文件(目标必须叫 auto_approvals.json,不得是人工账),
+    其余落账逻辑(哈希与文件内容绑定、哈希链、锚点、独占锁)复用 `_record_row`。
+    """
+    if Path(auto_approvals_file).name != AUTO_APPROVALS_FILE_NAME:
+        raise SandboxError(f"自动批准只能写 {AUTO_APPROVALS_FILE_NAME},拒绝写入: {Path(auto_approvals_file).name!r}")
+    return _record_row(path, auto_approvals_file, now=now, sha256=sha256, via=AUTO_APPROVAL_VIA)
 
 
 def _atomic_replace(tmp: Path, target: Path, attempts: int = 5) -> None:

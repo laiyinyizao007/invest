@@ -44,7 +44,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research",
               "approvals_file": "data/research-control/approvals.json",
               "collected_file": "data/research-control/collected.json",
-              "approved_dir": "approved"},
+              "approved_dir": "approved",
+              "auto_approvals_file": "data/research-control/auto_approvals.json",
+              "attempts_file": "data/research/attempts.jsonl"},
+    # 研究沙盒自动批准(Issue #67)。**默认关**;由人在本机改这个文件打开,模型改不了它。
+    # 打开后,通过静态筛查的候选由服务端写入**独立账本** auto_approvals.json(via=auto-research)。
+    # 该账本**只被研究沙盒读**;运行侧/装载门/实盘准入仍只认人工账 approvals.json。
+    "auto_approve": {"enabled": False},
     "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": [], "allowed_modules": []},
 }
 
@@ -74,6 +80,10 @@ RESERVED_FILES = {".env", ".env.simnow.bak"}
 # 改成**结构约束**:目录固定、文件名固定,没有借名的余地。
 CONTROL_DIR = ("data", "research-control")
 APPROVALS_FILE_NAME = "approvals.json"
+# 自动批准的**独立**账本:与人工账同目录、固定文件名。运行侧不读它(见 tests/test_auto_approval_isolation.py)。
+AUTO_APPROVALS_FILE_NAME = "auto_approvals.json"
+# 每次研究尝试的追加记录(含被拒/失败的)。固定在 results 目录下。
+ATTEMPTS_FILE_NAME = "attempts.jsonl"
 # 「已收菜」记录:收菜脚本写、运行时装载读。证明这段字节**经过了收菜那道关口**
 # (人工 cp 拷进 approved/ 就绕不过它)。
 COLLECTED_FILE_NAME = "collected.json"
@@ -167,6 +177,14 @@ def _validate(cfg: dict) -> None:
     approved = _relative_inside(cfg["paths"]["approved_dir"], "paths.approved_dir")
     if approved.parts != (APPROVED_DIR_NAME,):
         raise ConfigError(f"paths.approved_dir 必须固定为 {APPROVED_DIR_NAME}")
+    auto = _relative_inside(cfg["paths"]["auto_approvals_file"], "paths.auto_approvals_file")
+    if auto.parts != CONTROL_DIR + (AUTO_APPROVALS_FILE_NAME,):
+        raise ConfigError(f"paths.auto_approvals_file 必须固定为 {'/'.join(CONTROL_DIR)}/{AUTO_APPROVALS_FILE_NAME}")
+    attempts = _relative_inside(cfg["paths"]["attempts_file"], "paths.attempts_file")
+    if attempts.parts != ("data", "research", ATTEMPTS_FILE_NAME):
+        raise ConfigError(f"paths.attempts_file 必须固定为 data/research/{ATTEMPTS_FILE_NAME}")
+    if not isinstance(cfg["auto_approve"]["enabled"], bool):
+        raise ConfigError("auto_approve.enabled 必须是布尔值")
     token = _relative_inside(cfg["gateway"]["token_file"], "gateway.token_file")
     if token.name.lower() in reserved_files or token.parts[0].lower() in reserved_dirs:
         raise ConfigError("gateway.token_file 不得借用凭据文件或源码目录")
@@ -204,6 +222,8 @@ def resolve_paths(cfg: dict, root: Path) -> dict[str, Path]:
         "approvals_file": cfg["paths"]["approvals_file"], "token_file": cfg["gateway"]["token_file"],
         "approved_dir": cfg["paths"]["approved_dir"],
         "collected_file": cfg["paths"]["collected_file"],
+        "auto_approvals_file": cfg["paths"]["auto_approvals_file"],
+        "attempts_file": cfg["paths"]["attempts_file"],
     }
     resolved = {}
     for key, rel in out.items():
