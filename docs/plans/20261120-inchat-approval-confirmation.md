@@ -100,3 +100,6 @@ graph LR
   改为「写路径恰好一个、必带 via、必先常数时间比较」（判定器复用）；`test_research_mcp.py` 的
   「模块永不写账本」「工具描述」两条同口径改写；页面模式测试（URL/哈希不进返回值）原样保留并显式指定 `mode="page"`。
 - 2026-11-20 回归结果：research-rest 闸门 606 项（3 跳过）、guards 闸门 870 项，本地全绿（G9：新增分支 100% 覆盖）。
+- 2026-11-22 G8 复核结果:zen codereview 第一轮——pro 档先返回陈旧缓存、后因免费配额耗尽失败,改用 gemini-2.5-flash 补做(较弱:偏泛泛认可,未发现别名绕过);codex 第二轮分两个文件各一轮(第一次 429 限流,收窄后重试成功),采纳 1 条 High:MCP 唯一写入点不变量可被别名绕过 ⇒ 收紧为 AST 级(提及恰好一处 / via 关键字字面量 / 同函数内先 compare_digest),反向探针实测变红,另提交 5b21f90。未采纳 1 条 Low(load_config 的 ConfigError:更早的调用已先抛出,补捕获是死代码)。遗留 Low:dashboard 读批准账本不核链(预先存在,仅影响展示)。
+- 2026-11-22 T3.4 完成(repo 外):Roaming cordis.patch.yml 的 preset-research 提示边界第 1 条改写为「模型只转述哈希与位置,用户亲自粘贴哈希后才可带 confirm_sha256 再调」;备份 cordis.patch.yml.bak-20261122-inchat;靠提示约束,技术上不可强制(ADR 已记)。
+- 2026-11-22 GitHub CI(research/wiring/constitution)全部通过。未做:G9 覆盖率工具量化(按路径逐条核对)、真实 DSH 端到端演练(需先合并并拉取 main)。
