@@ -950,57 +950,64 @@ def test_research_ledger_cli_status_migrate_reset(tmp_path, monkeypatch, capsys)
     assert log.exists() and "migrate" in log.read_text(encoding="utf-8")
 
 
-def _container_tag(posix_path: str) -> str:
-    import hashlib
-    return hashlib.sha256(posix_path.lower().encode("utf-8")).hexdigest()[:10]
+def test_anchor_name_is_the_same_whatever_the_absolute_root(tmp_path):
+    """Issue #73:宿主机和网关容器里账本的绝对路径不同(C:/.../data/research vs /app/data/research),
+    锚点文件名只能由"相对 data 目录的路径"决定,否则一方写的锚点另一方永远读不到。"""
+    a = tmp_path / "hostroot" / "data" / "research" / "trials.jsonl"
+    b = tmp_path / "other" / "deep" / "app" / "data" / "research" / "trials.jsonl"
+    assert chain.anchor_path_for(a).name == chain.anchor_path_for(b).name
+    assert chain.anchor_path_for(a).parent == a.parent.parent / "ledger_anchor"
+    ctl = tmp_path / "hostroot" / "data" / "research-control" / "approvals.json"
+    assert chain.anchor_path_for(ctl).name != chain.anchor_path_for(a).name     # 不同账本不同锚点
+    assert chain.anchor_path_for(ctl).name.startswith("approvals-")
 
 
-def test_research_ledger_cli_container_view_anchors_for_the_gateway_path(tmp_path, monkeypatch, capsys):
-    """Issue #73:网关容器里账本在 /app/data/research/,锚点文件名按那个路径取哈希。
+def test_a_legacy_named_anchor_is_no_longer_trusted(tmp_path):
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    trials.parent.mkdir(parents=True)
+    tl.record_trials(trials, "submission", 3, at=1.0)
+    rows = trials.read_text(encoding="utf-8").splitlines()
+    assert rows
+    new = chain.anchor_path_for(trials)
+    old = chain.legacy_anchor_path_for(trials)
+    assert old.name != new.name
+    new.rename(old)                                                    # 只剩旧名的锚点
+    with pytest.raises(tl.TrialLedgerError, match="没有锚点"):
+        tl.total_trials(trials)
 
-    宿主机人工入口加 --as-container-root /app 后,必须把锚点写到容器会去读的文件名上
-    (宿主机真实目录 data/ledger_anchor/,容器里挂在 /app/data/ledger_anchor/)。
-    不加该参数时行为不变;读侧(chain.verify)不动。"""
+
+def test_rename_anchors_moves_legacy_names_and_keeps_the_ledger_verifiable(tmp_path, monkeypatch, capsys):
     import research_ledger as cli
     trials = tmp_path / "data" / "research" / "trials.jsonl"
     approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
     monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
-    monkeypatch.setattr(cli, "_ROOT", tmp_path)
     trials.parent.mkdir(parents=True)
-    trials.write_text(json.dumps({"kind": "submission", "count": 3, "at": 1.0}) + "\n", encoding="utf-8")
-    assert cli.main(["migrate", "trials", "--as-container-root", "/app"]) == 0
-    anchors = tmp_path / "data" / "ledger_anchor"
-    want = anchors / f"trials-{_container_tag('/app/data/research/trials.jsonl')}.anchor"
-    assert want.exists()
-    seq, head, _total = chain.read_anchor(want)
-    row = json.loads(trials.read_text(encoding="utf-8").splitlines()[-1])
-    assert (seq, head) == (row["seq"], row["hash"])
-    # 没加参数的宿主机视角没有被顺手写出来:两边是各自独立的锚点
-    assert not chain.anchor_path_for(trials).exists()
-    # 容器视角下 status 读到的是健康的
-    capsys.readouterr()
-    assert cli.main(["status", "--as-container-root", "/app"]) == 0
-    assert '"trials": "ok"' in capsys.readouterr().out
+    tl.record_trials(trials, "submission", 3, at=1.0)
+    new, old = chain.anchor_path_for(trials), chain.legacy_anchor_path_for(trials)
+    content = new.read_text(encoding="ascii")
+    new.rename(old)
+    assert cli.main(["rename-anchors"]) == 0
+    assert new.read_text(encoding="ascii") == content and not old.exists()
+    assert tl.total_trials(trials) == 3
+    assert cli.main(["rename-anchors"]) == 0                           # 幂等:已迁移的跳过
+    log = new.parent / "ledger.admin.log"
+    assert "rename-anchors" in log.read_text(encoding="utf-8")
 
 
-def test_research_ledger_cli_container_view_still_fails_closed_without_anchor(tmp_path, monkeypatch, capsys):
+def test_rename_anchors_rolls_back_when_the_ledger_does_not_match_the_anchor(tmp_path, monkeypatch, capsys):
     import research_ledger as cli
     trials = tmp_path / "data" / "research" / "trials.jsonl"
     approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
     monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
-    monkeypatch.setattr(cli, "_ROOT", tmp_path)
     trials.parent.mkdir(parents=True)
-    trials.write_text(json.dumps({"kind": "submission", "count": 3, "at": 1.0}) + "\n", encoding="utf-8")
-    assert cli.main(["migrate", "trials"]) == 0                          # 只给宿主机视角定了锚
-    capsys.readouterr()
-    assert cli.main(["status", "--as-container-root", "/app"]) == 0
-    assert "没有锚点" in capsys.readouterr().out                           # 容器视角没锚点 ⇒ 仍然拒绝
-
-
-def test_research_ledger_cli_rejects_a_relative_container_root(tmp_path, monkeypatch):
-    import research_ledger as cli
-    monkeypatch.setattr(cli, "_paths", lambda: (tmp_path / "t.jsonl", tmp_path / "a.json"))
-    assert cli.main(["status", "--as-container-root", "app"]) == 1
+    tl.record_trials(trials, "submission", 3, at=1.0)
+    tl.record_trials(trials, "submission", 2, at=1.0)
+    new, old = chain.anchor_path_for(trials), chain.legacy_anchor_path_for(trials)
+    new.rename(old)
+    lines = trials.read_text(encoding="utf-8").splitlines()
+    trials.write_text(lines[0] + chr(10), encoding="utf-8")            # 账本被截短:旧锚点已不对应
+    assert cli.main(["rename-anchors"]) == 1
+    assert old.exists() and not new.exists()                           # 校验没过 ⇒ 回滚改名,不让坏锚点生效
 
 
 # ======================================================================

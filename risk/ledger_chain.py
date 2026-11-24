@@ -9,6 +9,8 @@
 诚实的边界(与 ladder 同,别写成"防篡改"之外的东西):
 - 哈希链**没有密钥**:能写账本与锚点两处的人,可以把两者一起改成一条自洽的链。
   本层只拦"只改了其中一处"(候选经 numpy/pandas 往账本写字节、却够不到锚点,或没想到要改锚点)。
+  **网关容器内锚点目录与账本同在可写区**(Issue #73:容器要写自己的试验锚点):候选在容器里"够不到锚点"
+  靠的是研究沙盒的审计钩子(写入白名单),与保护账本本身的是同一道,不是独立信任域。
   同时删掉账本与锚点 = 回到"从未有过账本",也发现不了。
 - 真正的外部锚点需要另一个信任域(Issue #29 独立进程 / 容器只读挂载);这里没有。
 - 锚点**只会落后于账本**(崩在写锚点之前),所以"账本比锚点多几条"在 `allow_ahead=True`
@@ -137,13 +139,28 @@ def seal(record: dict, prev_hash: str, seq: int) -> dict:
 
 
 def anchor_path_for(ledger_path) -> Path:
-    """锚点位置:账本所在目录的**上一级**下的 `ledger_anchor/`,文件名带账本绝对路径的短哈希。
+    """锚点位置:账本所在目录的**上一级**下的 `ledger_anchor/`,文件名带**账本相对该上一级的路径**的短哈希。
+
+    Issue #73:以前哈希的是账本**绝对路径**,而同一份账本在宿主机(`C:/.../data/research/`)与网关容器
+    (`/app/data/research/`)里绝对路径不同 ⇒ 两边算出不同的锚点文件名,一方写的锚点另一方永远读不到
+    (容器里批准账本、试验账本因此一律 fail-closed)。现在只取 `<账本所在目录名>/<账本文件名>`(转小写),
+    两边一致;不同账本仍各有各的锚点。不同的根目录各有各的 `ledger_anchor/`,测试之间互不串账。
+    **如实登记**:这个目录在网关容器里与账本同在可写区,候选受审计钩子约束的程度与对账本一样,不是独立信任域。
 
     **如实说明**(第 32 号 PR 复审实测):这个目录**不是**"候选碰不到"的位置——没有审计钩子时候选能往
     `data/ledger_anchor/` 写文件,也能写账本本身。锚点真正的保护有两层:
-    ① 文件名里的 `sha256(账本绝对路径)` 短哈希:候选算不出 sha256(pickle/hashlib 都不在白名单)、也列不出目录,
-       猜不到该写哪个文件;② 读侧要求账本头与锚点**同时**一致。两者都不是密码学意义的保护(见模块文件头"诚实的边界")。
-    多个 tmp 目录共享同一个上级时,路径哈希也让它们互不串账。两本账本共用同一个 `ledger_anchor/` 目录。"""
+    ① 文件名里的 `sha256(相对路径)` 短哈希:候选算不出 sha256(pickle/hashlib 都不在白名单)、也列不出目录,
+       猜不到该写哪个文件(相对路径比绝对路径好猜,但容器内能列目录的候选本来就不靠这一层);
+       ② 读侧要求账本头与锚点**同时**一致。两者都不是密码学意义的保护(见模块文件头"诚实的边界")。
+    各账本共用同一个 `ledger_anchor/` 目录。"""
+    ledger = Path(ledger_path).resolve()
+    relative = f"{ledger.parent.name}/{ledger.name}".lower()
+    tag = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:10]
+    return ledger.parent.parent / ANCHOR_DIRNAME / f"{ledger.stem}-{tag}.anchor"
+
+
+def legacy_anchor_path_for(ledger_path) -> Path:
+    """旧口径(绝对路径哈希)的锚点位置,**只给迁移工具用**:读侧不认它。"""
     ledger = Path(ledger_path)
     resolved = str(ledger.resolve()).replace("\\", "/").lower()
     tag = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:10]
@@ -231,7 +248,8 @@ def verify(rows: list[dict], anchor: Path, *, what: str, allow_ahead: bool, tool
     anchored = read_anchor(anchor)
     if anchored is None:
         if rows:
-            raise LedgerChainError(f"{what}有记录却没有锚点(fail-closed):锚点被删过,或账本是被换进来的;{hint}",
+            raise LedgerChainError(f"{what}有记录却没有锚点(fail-closed):锚点被删过,或账本是被换进来的;"
+                                   f"若刚从按绝对路径命名锚点的旧版本升级,先 `python scripts/research_ledger.py rename-anchors`;{hint}",
                                    reason="chain")
         return
     seq, head, total = anchored

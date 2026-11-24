@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 import time
@@ -54,28 +53,38 @@ def _health(which: str, path: Path) -> str | None:
     return None
 
 
-def _container_view(container_root: str):
-    """Issue #73:按"网关容器看到的路径"算锚点文件名,锚点仍写在宿主机的 data/ledger_anchor/。
-
-    锚点文件名里带账本**绝对路径**的哈希(risk/ledger_chain.py)。网关容器里账本在 /app/data/research/,
-    宿主机上在仓库根下,两边哈希不同;所以宿主机人工 migrate/reset 只给宿主机视角定锚,容器读不到。
-    这里只换"算哈希用的路径",**不碰读侧**(chain.verify 照旧)。不加此参数时行为与以前完全一致。
-    返回还原函数。"""
-    real = chain.anchor_path_for
-    root = _ROOT.resolve()
-
-    def anchor_path_for(ledger_path) -> Path:
-        ledger = Path(ledger_path).resolve()
-        try:
-            rel = ledger.relative_to(root).as_posix()
-        except ValueError:
-            return real(ledger_path)                    # 仓库外的路径:不映射,保持原样
-        virtual = (container_root.rstrip("/") + "/" + rel).lower()
-        tag = hashlib.sha256(virtual.encode("utf-8")).hexdigest()[:10]
-        return ledger.parent.parent / chain.ANCHOR_DIRNAME / f"{ledger.stem}-{tag}.anchor"
-
-    chain.anchor_path_for = anchor_path_for
-    return lambda: setattr(chain, "anchor_path_for", real)
+def _rename_anchors() -> dict:
+    """Issue #73:把旧口径(绝对路径哈希)命名的锚点改成新口径,内容不动;改完立刻用读侧核对,
+    核对不过就**回滚改名**。只搬锚点,不碰账本;幂等(新名已存在则跳过)。"""
+    trials, approvals = _paths()
+    import research_attempts as ra
+    ledgers = {
+        "trials": (trials, lambda p: tl.total_trials(p)),
+        "attempts": (trials.parent / "attempts.jsonl", lambda p: ra.read(p)),
+        "approvals": (approvals, lambda p: rs._load_approvals(p)),
+        "auto_approvals": (approvals.parent / "auto_approvals.json", lambda p: rs._load_approvals(p)),
+    }
+    out: dict = {}
+    failed = False
+    for name, (path, check) in ledgers.items():
+        new, old = chain.anchor_path_for(path), chain.legacy_anchor_path_for(path)
+        if new.exists():
+            out[name] = "已是新口径"
+        elif not old.exists():
+            out[name] = "无旧锚点(账本为空或从未建过)" if not path.exists() else "没有旧锚点,账本有记录:需人工 reset"
+            failed = failed or path.exists()
+        else:
+            old.rename(new)
+            try:
+                check(path)
+            except Exception as exc:                   # 核对不过:把锚点放回去,不让坏锚点生效
+                new.rename(old)
+                out[name] = f"核对失败,已回滚: {str(exc)[:160]}"
+                failed = True
+            else:
+                out[name] = "已改名并核对通过"
+    out["ok"] = not failed
+    return out
 
 
 def _audit(entry: dict) -> None:
@@ -87,16 +96,14 @@ def _audit(entry: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="试验账本/批准账本的人工入口(status / migrate / reset)")
-    view = argparse.ArgumentParser(add_help=False)
-    view.add_argument("--as-container-root", metavar="/app", default=None,
-                      help="按网关容器内的路径(仓库根映射到此目录)算锚点文件名;给容器里的账本定锚/查健康时用")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", parents=[view], help="两本账本是否健康(只读)")
-    mig = sub.add_parser("migrate", parents=[view], help="把无链的旧账本一次性升级成哈希链(原文件备份)")
+    sub.add_parser("status", help="两本账本是否健康(只读)")
+    sub.add_parser("rename-anchors", help="把旧口径(绝对路径哈希)的锚点改名为新口径(内容不动,改后核对,失败回滚)")
+    mig = sub.add_parser("migrate", help="把无链的旧账本一次性升级成哈希链(原文件备份)")
     mig.add_argument("ledger", choices=("trials", "approvals"))
     mig.add_argument("--confirm-all-approved", action="store_true",
                      help="迁移批准记录必须加:表示人已核对过现有记录里每一个 sha 都是自己批准的")
-    rst = sub.add_parser("reset", parents=[view], help="链断之后:保留有效前缀、重新定锚(原文件备份;不会找回丢失的内容)")
+    rst = sub.add_parser("reset", help="链断之后:保留有效前缀、重新定锚(原文件备份;不会找回丢失的内容)")
     rst.add_argument("ledger", choices=("trials", "approvals"))
     rst.add_argument("--reason", required=True, help="原因(必填,写进审计日志)")
     rst.add_argument("--force", action="store_true", help="账本状态正常时也重置")
@@ -105,25 +112,17 @@ def main(argv: list[str] | None = None) -> int:
                      help="(仅 trials)确认允许重置后累计试验次数变小(N 变小会让 DSR 的分母变小、去通胀失效;"
                           "默认拒绝,必须显式确认)")
     args = parser.parse_args(argv)
-    restore = None
-    if args.as_container_root is not None:
-        if not args.as_container_root.startswith("/"):
-            print("拒绝: --as-container-root 必须是容器内的绝对路径(例如 /app)", file=sys.stderr)
-            return 1
-        restore = _container_view(args.as_container_root)
-    try:
-        return _run(args)
-    finally:
-        if restore:
-            restore()
-
-
-def _run(args) -> int:
     trials, approvals = _paths()
     targets = {"trials": trials, "approvals": approvals}
     try:
         if args.command == "status":
             out = {name: (_health(name, path) or "ok") for name, path in targets.items()}
+        elif args.command == "rename-anchors":
+            out = _rename_anchors()
+            _audit({"action": "rename-anchors", "result": out})
+            if not out["ok"]:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+                return 1
         elif args.command == "migrate":
             if args.ledger == "approvals":
                 if not args.confirm_all_approved:
