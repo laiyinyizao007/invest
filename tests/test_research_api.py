@@ -641,6 +641,37 @@ def test_evaluate_job_spawns_the_evaluate_child_with_hash_and_configured_timeout
     assert (tree / "data" / "research" / f"{result['run_id']}.json").exists()
 
 
+@pytest.mark.parametrize("product", ["C15", "V15", "M15"])
+def test_evaluate_job_hands_the_child_the_product_and_records_it_as_the_key(tree, monkeypatch, product):
+    """父进程把 product 原样交给子进程,结果的 key 就是它(不是写死的 C15)。"""
+    make_strategy(tree)
+    seen = {}
+
+    def fake_spawn(cmd, timeout):
+        seen["cmd"] = cmd
+        return {"passed": False, "failures": ["x"], "params": {}, "selection": {"n_cells": 27}, "metrics": {}}
+
+    monkeypatch.setattr(api, "spawn_child", fake_spawn)
+    result = api.evaluate_job(strategy="s.py", cls="S", confirm=True, product=product)
+    assert seen["cmd"][seen["cmd"].index("--product") + 1] == product
+    assert result["key"] == product
+
+
+def test_evaluate_job_defaults_to_corn(tree, monkeypatch):
+    make_strategy(tree)
+    seen = {}
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: seen.update(cmd=cmd) or {"passed": False, "failures": [], "params": {}, "selection": {"n_cells": 27}, "metrics": {}})
+    result = api.evaluate_job(strategy="s.py", cls="S", confirm=True)
+    assert seen["cmd"][seen["cmd"].index("--product") + 1] == "C15" and result["key"] == "C15"
+
+
+def test_evaluate_job_refuses_a_bad_product_before_spawning(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("非法 product 不应启动子进程"))
+    with pytest.raises(api.JobError, match="product 只能是"):
+        api.evaluate_job(strategy="s.py", cls="S", confirm=True, product="XX")
+
+
 def test_evaluate_job_records_strategy_errors_as_results(tree, monkeypatch):
     make_strategy(tree)
     monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"error": {"type": "GridError", "message": "param_grid 必须恰好 3 个参数"}})
@@ -1169,6 +1200,69 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     assert "error" not in payload, payload
     assert payload["passed"] is True
     assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]
+
+
+def _stub_trading_stack(monkeypatch):
+    """替身交易栈:记录子进程取了哪份数据、用了哪个规格键。"""
+    import sys
+    import types as pytypes
+
+    class Win:
+        name = "W1"
+        train_start = 1
+        train_end = 2
+        valid_start = 3
+        valid_end = 4
+
+    calls = {"bars": None, "runner_key": None}
+    wf = pytypes.ModuleType("walk_forward_optimizer")
+    wf.DATA_FILE = "c.csv"
+    wf.SYMBOL = "CADJ15"
+    wf.KEY = "C15"
+    wf.PRODUCTS = {"C15": ("c.csv", "CADJ15"), "V15": ("v.csv", "VADJ15"), "M15": ("m.csv", "MADJ15")}
+    wf.build_windows = lambda: [Win()]
+    bl = pytypes.ModuleType("backtest_lib")
+    bl.DEFAULT_CAPITAL = 100000.0
+    bl.load_bars_csv = lambda path, symbol, exchange, *a, **k: calls.update(bars=(path, symbol)) or []
+    rg = pytypes.ModuleType("research_gate")
+    rg.engine_runner = lambda key: calls.update(runner_key=key) or (lambda *a, **k: None)
+    rg.run_evaluation = lambda **kw: {"passed": True, "sharpe": 1.0}
+    rnd = pytypes.ModuleType("strategies.random_entry_15m_strategy")
+    rnd.RandomEntry15mStrategy = object
+    for name, mod in (("walk_forward_optimizer", wf), ("backtest_lib", bl), ("research_gate", rg),
+                      ("strategies.random_entry_15m_strategy", rnd)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    return calls
+
+
+@requires_trading_stack
+@pytest.mark.parametrize("product,expected", [("C15", ("c.csv", "CADJ15")), ("V15", ("v.csv", "VADJ15")),
+                                              ("M15", ("m.csv", "MADJ15"))])
+def test_evaluate_child_uses_the_selected_products_data_and_spec_key(tree, monkeypatch, capsys, product, expected):
+    """子进程取的行情文件与规格键必须是所选品种的(变异:忽略 --product / 键写死 C15 都会红)。"""
+    body = "from vnpy_ctastrategy import CtaTemplate" + chr(10) + "class S(CtaTemplate):" + chr(10) + "    VALUE = 'GOOD'" + chr(10)
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
+    calls = _stub_trading_stack(monkeypatch)
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S", "--random-runs", "20",
+                                          "--sha256", api.rs.file_sha256(path), "--product", product])
+    assert api.run_evaluate_child(args) == api.EXIT_OK
+    assert calls["bars"] == expected and calls["runner_key"] == product
+
+
+@requires_trading_stack
+def test_evaluate_child_refuses_a_bad_product_with_the_whitelist_message(tree, monkeypatch, capsys):
+    """文件存在且已批准,这样拒绝只可能来自 product 白名单(不是别的校验先拦下)。"""
+    body = "from vnpy_ctastrategy import CtaTemplate" + chr(10) + "class S(CtaTemplate):" + chr(10) + "    VALUE = 'GOOD'" + chr(10)
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S", "--random-runs", "20",
+                                          "--sha256", api.rs.file_sha256(path), "--product", "XX"])
+    assert api.run_evaluate_child(args) == api.EXIT_REFUSED
+    assert "product 只能是" in capsys.readouterr().err
 
 
 def test_the_saved_backtest_stats_are_exactly_what_the_dashboard_validates():

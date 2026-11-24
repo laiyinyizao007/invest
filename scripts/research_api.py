@@ -120,9 +120,9 @@ def trials_path(paths: dict) -> Path:
 
 def check_product(product) -> None:
     """评估品种只能取 walk_forward_optimizer.PRODUCTS 白名单里的键(Issue #69);其余一律拒绝。"""
-    import walk_forward_optimizer as wf
-    if not isinstance(product, str) or product not in wf.PRODUCTS:
-        raise JobError(EXIT_REFUSED, f"product 只能是 {sorted(wf.PRODUCTS)}")
+    # 只认 research_sandbox.PRODUCTS(无交易栈依赖):父进程/网关里不得 import walk_forward_optimizer(它会拖进 vnpy)
+    if not isinstance(product, str) or product not in rs.PRODUCTS:
+        raise JobError(EXIT_REFUSED, f"product 只能是 {list(rs.PRODUCTS)}")
 
 
 def prior_trials(paths: dict) -> int:

@@ -454,8 +454,8 @@ class GatewayApp:
         product = data.get("product")
         if product is None or product == "":
             product = "C15"
-        if not isinstance(product, str):
-            return 400, {"error": "product 必须是字符串"}
+        if not isinstance(product, str) or product not in rs.PRODUCTS:
+            return 400, {"error": f"product 只能是 {list(rs.PRODUCTS)}"}
         view = _view(data)
         return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False,
                                          product=product), view)

@@ -53,7 +53,7 @@ SYMBOL = "CADJ15"
 
 # 研究评估可选的品种(Issue #69)。数据文件由这里的映射决定,**不读环境变量**(C15 沿用上面的 DATA_FILE 以保持行为不变);
 # 白名单之外的 product 一律拒绝。规格见 strategies/instruments.py。
-_DERIVED = Path(r"C:\Dev\data\invest\derived")   # 固定目录,不随 INVEST_C15_DATA 漂移
+_DERIVED = DATA_FILE.parent   # 与 C15 同目录(容器里 INVEST_C15_DATA 指向挂载点,其余品种随之);文件名固定在下表
 PRODUCTS = {
     "C15": (DATA_FILE, "CADJ15"),
     "V15": (_DERIVED / "V_15m_adj.csv", "VADJ15"),
