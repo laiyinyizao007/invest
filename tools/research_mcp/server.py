@@ -312,14 +312,38 @@ def redact_for_model(text: str) -> str:
     return rs.scrub_text(text, secrets=known_secret_values())
 
 
+def _as_dict(value) -> dict | None:
+    """毕昇的 close 载荷有时是对象、有时是 JSON 字符串。"""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
 def node_failures(events: list[dict]) -> list[str]:
     failures = []
     for event in events:
+        if not isinstance(event, dict):
+            continue
         if event.get("event") == "node_run":
             schema = event.get("output_schema") or {}
             reason = schema.get("reason") if isinstance(schema, dict) else None
             if reason:
                 failures.append(str(reason)[:300])
+        elif event.get("event") == "close":
+            # 毕昇任务异常时只发一条 close(output_schema.message 是 {status_code, status_message, data}),
+            # 没有 node_run 失败也没有输出——不接住就会被当成「空输出」的静默失败(Issue #71)。
+            schema = event.get("output_schema") or {}
+            message = _as_dict(schema.get("message") if isinstance(schema, dict) else None)
+            if message is not None:
+                code = message.get("status_code")
+                data = _as_dict(message.get("data")) or {}
+                detail = data.get("exception") or data.get("error") or ""
+                bad_code = isinstance(code, int) and not isinstance(code, bool) and code != 200
+                if bad_code or detail:      # 状态码是 200 但带了异常,同样是失败
+                    failures.append(f"毕昇任务异常({code}):{message.get('status_message') or '未给出原因'} {detail}"[:300])
     return failures
 
 

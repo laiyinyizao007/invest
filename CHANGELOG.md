@@ -6,6 +6,7 @@
 
 ## [Unreleased]
 ### Added（新增）
+- **修网关镜像缺包与研究助手吞掉毕昇失败**(Issue #71):`docker/research/Dockerfile` 漏拷 `dashboard/safe.py`、`notify/redact.py`,而 `research_sandbox.redact_paths` 惰性 import 它们⇒容器里任何走到脱敏的响应都会让网关线程崩溃、连接被掐断,毕昇只报 RemoteDisconnected(10541)。另 `tools/research_mcp/server.py` 的 `node_failures` 漏看毕昇 `close` 事件里的任务异常,失败被显示成「空输出」。现补拷两个文件(不拷 notify 的发送通道)、`close` 异常计入失败并写入尝试记录;新增守卫测试:研究侧脚本 import 的项目包必须都被 Dockerfile 复制。
 - 研究评估**按品种选数据与规格**(Issue #69,新 ADR [`docs/adr/20261124-per-product-evaluation.md`](docs/adr/20261124-per-product-evaluation.md)):此前评估的数据文件/品种键/规格全写死玉米 C15,预注册第 1 轮对 EB/EG/V/PP/M 的提交实际都在玉米上评估(第 3 次 EG 的评估口径作废,不得当 EG 的证据)。现 `evaluate` 增加白名单 `product`(C15/V15/EB15/EG15/PP15/M15),缺省 C15 与旧行为一致;数据文件由代码映射决定、不读环境变量;`strategies/instruments.py` 增 5 个品种规格(取自 20261116 核实表)。`backtest`/`gate` 仍是玉米(已知局限)。不改任何门槛数值与测试段纪律。
 - 研究沙盒**自动批准**(Issue #67,默认关):`auto_approve.enabled` 打开后,通过静态筛查的候选写入**独立的自动账** `auto_approvals.json`(`via=auto-research`),不写人工账;运行侧/装载门/实盘准入不读自动账。新增每次研究尝试的哈希链记录 `data/research/attempts.jsonl`(含被拒/失败,记不下就不批)。风险与取代预注册 §2 上限见 `docs/adr/20261123-research-auto-approval.md`。
 - **第一轮有界研究的预注册**(新 ADR [`docs/adr/20261123-research-round-1-preregistration.md`](docs/adr/20261123-research-round-1-preregistration.md),研究域,写于看任何本轮候选的回测结果之前):用户要求「研究直到产出合格可上线的策略」,但「跑到合格为止」是多重检验,改为有界:仅 EB/EG/V/PP/M 的 15 分钟;**试验次数最多再加 3 次**(3→6),重调参重提同一想法也计一次;每次提交前先写假设与失败判据;研究轮内不碰测试段,只有「通过验证筛选+击败两条基准+用户明确同意」的候选才看测试段一次;到上限或有候选走完测试段即停。**合法结果包括「证明不了有优势」。**不改任何风控常量与晋级门槛;「上线」(装载门、SimNow、穿透测试、期货公司)与实盘切换不在范围内,须用户另行授权。含两条需人工确认的声明(EG 候选批准后的回测是否已被看过)。
