@@ -320,6 +320,15 @@ def node_failures(events: list[dict]) -> list[str]:
             reason = schema.get("reason") if isinstance(schema, dict) else None
             if reason:
                 failures.append(str(reason)[:300])
+        elif event.get("event") == "close":
+            # 毕昇任务异常时只发一条 close(output_schema.message 是 {status_code, status_message, data}),
+            # 没有 node_run 失败也没有输出——不接住就会被当成「空输出」的静默失败(Issue #71)。
+            schema = event.get("output_schema") or {}
+            message = schema.get("message") if isinstance(schema, dict) else None
+            if isinstance(message, dict) and message.get("status_code") not in (None, 200):
+                data = message.get("data") if isinstance(message.get("data"), dict) else {}
+                detail = data.get("exception") or ""
+                failures.append(f"毕昇任务异常({message.get('status_code')}):{message.get('status_message')} {detail}"[:300])
     return failures
 
 

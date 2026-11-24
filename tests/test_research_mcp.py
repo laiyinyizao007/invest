@@ -298,6 +298,34 @@ def test_start_research_reports_backend_failure(clean_state, monkeypatch):
     assert "毕昇没起来" in mcp_server._start_research("想法")
 
 
+CLOSE_FAILURE = {"event": "close", "output_schema": {"message": {
+    "status_code": 10541, "status_message": "Workflow task execution failed",
+    "data": {"exception": "('Connection aborted.', RemoteDisconnected('Remote end closed connection'))"}}}}
+
+
+def test_node_failures_reports_a_close_event_error():
+    """毕昇任务异常只发一条 close:不接住就被当成「空输出」的静默失败(Issue #71)。"""
+    found = mcp_server.node_failures([CLOSE_FAILURE])
+    assert len(found) == 1 and "10541" in found[0] and "Workflow task execution failed" in found[0]
+    assert "RemoteDisconnected" in found[0]
+
+
+def test_node_failures_ignores_a_normal_close():
+    assert mcp_server.node_failures([{"event": "close", "output_schema": {"message": {"status_code": 200}}}]) == []
+    assert mcp_server.node_failures([{"event": "close"}, {"event": "close", "output_schema": {"message": "bye"}}]) == []
+
+
+def test_start_research_shows_the_close_failure_instead_of_an_empty_result(clean_state, monkeypatch):
+    def fake_invoke(**kwargs):
+        if "session_id" not in kwargs:
+            return {"session_id": "s2", "events": [{"event": "input", "node_id": "input_idea", "message_id": 80}]}
+        return {"session_id": "s2", "events": [CLOSE_FAILURE]}
+
+    monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
+    out = mcp_server._start_research("想法")
+    assert "工作流有节点失败" in out and "10541" in out
+
+
 def test_start_research_falls_back_to_a_new_session_when_resume_fails(clean_state, monkeypatch):
     """上一轮会话失效(毕昇会话过期)时退回全新会话,不能把用户卡在死会话里。"""
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法",

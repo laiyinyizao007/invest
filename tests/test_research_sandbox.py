@@ -1105,3 +1105,26 @@ def test_redact_paths_does_not_eat_a_prose_word_after_a_users_directory():
     cleaned = rs.redact_paths(text)
     assert "failed" in cleaned, cleaned
     assert "alice" not in cleaned, cleaned
+
+
+def test_container_image_copies_every_project_package_the_research_scripts_import():
+    """研究侧脚本(含函数内惰性 import)用到的项目内包,Dockerfile 必须复制,否则容器里一走到就 ModuleNotFoundError、
+    网关线程崩溃(Issue #71:dashboard.safe / notify.redact 漏拷,毕昇只看到连接被掐断)。"""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    docker = (root / "docker" / "research" / "Dockerfile").read_text(encoding="utf-8")
+    copied = {line.split()[1] for line in docker.splitlines() if line.startswith("COPY ")}
+    project_dirs = {p.name for p in root.iterdir() if p.is_dir() and (p / "__init__.py").exists()}
+    imported = set()
+    for path in (root / "scripts").glob("research_*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+            elif isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+    for pkg in sorted((imported & project_dirs) - {"scripts"}):
+        assert any(c == pkg or c.startswith(pkg + "/") for c in copied),             f"研究侧脚本 import 了项目包 {pkg},但 docker/research/Dockerfile 没有 COPY 它"
+    # 具体点名:脱敏链路要用的两个文件
+    assert "dashboard/safe.py" in docker and "notify/redact.py" in docker
