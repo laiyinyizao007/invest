@@ -46,3 +46,5 @@
 - **`gate` 与 `evaluate` 的 key 可能不同**:`gate_job` 仍写死 `C15`;`record_promotion` 从 evaluate 的 run_id 取 key,若把 V15 的 evaluate 与玉米的 gate 混用会张冠李戴——**晋级记录前必须核对两者品种一致**(本 PR 不改晋级链路)。
 - 装载侧 `write_load_approval` 不校验 key 是否在 `INSTRUMENTS` 里。
 - G8:第一轮(zen codereview)因 Gemini 免费档 429 被阻塞,未取得实质结论;第二轮 codex 的 10 条发现,Critical/High 均已修复并加了对应测试(见 PR),`guard_roster` 一条经核实只是「提示」不是失败(同 `test_auto_approval.py` 的既有做法)。
+- **`INVEST_C15_DATA` 现在决定全部 6 个品种的目录**(文件名固定、目录不校验内容):目录里同名异源 CSV 会被读到;缺文件时子进程回可读错误(「数据文件缺失:xxx」)而不是崩溃。codex 建议另设 `INVEST_DERIVED_DIR`,未采纳(多一个环境变量=多一个能改评估输入的点),留作后续。
+- 子进程级品种测试用替身交易栈,在无 vnpy 的研究 CI 里真跑;白名单与数据映射的一致性检查需交易栈,研究 CI 里跳过,由本地/交易侧运行。
