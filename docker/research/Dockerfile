@@ -19,11 +19,15 @@ COPY docker/research/requirements.txt docker/research/requirements-vnpy.txt ./
 COPY docker/research/wheelhouse /wheelhouse
 RUN pip install --no-index --find-links=/wheelhouse -r requirements.txt     && pip install --no-index --find-links=/wheelhouse --no-deps -r requirements-vnpy.txt     && rm -rf /wheelhouse
 
-# 只拷研究链路需要的代码;不拷 trading/notify/.env/data
+# 只拷研究链路需要的代码;不拷 trading/.env/data。
+# dashboard/notify 只拷脱敏要用的两个文件(research_sandbox.redact_paths 惰性 import dashboard.safe → notify.redact;
+# 不拷 notify/webhook.py 等发送通道)。缺了它们,任何走到脱敏的响应都会让网关线程崩溃(Issue #71)。
 COPY risk ./risk
 COPY strategies ./strategies
 COPY scripts ./scripts
 COPY config ./config
+COPY dashboard/__init__.py dashboard/safe.py ./dashboard/
+COPY notify/__init__.py notify/redact.py ./notify/
 COPY docker/research/entrypoint.sh /entrypoint.sh
 
 RUN useradd --create-home --uid 1000 research \

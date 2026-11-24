@@ -1105,3 +1105,56 @@ def test_redact_paths_does_not_eat_a_prose_word_after_a_users_directory():
     cleaned = rs.redact_paths(text)
     assert "failed" in cleaned, cleaned
     assert "alice" not in cleaned, cleaned
+
+
+def test_container_image_copies_every_project_module_the_research_scripts_import():
+    """研究侧脚本(含函数内惰性 import、importlib/__import__ 字符串、被它们 import 的 scripts/ 模块)用到的项目内模块,
+    Dockerfile 必须复制到位,否则容器里一走到就 ModuleNotFoundError、网关线程崩溃
+    (Issue #71:dashboard.safe / notify.redact 漏拷,毕昇只看到连接被掐断)。按**模块文件**核对,不按包名。"""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    docker = (root / "docker" / "research" / "Dockerfile").read_text(encoding="utf-8")
+    sources = set()
+    for line in docker.splitlines():
+        if line.startswith("COPY "):
+            tokens = [t for t in line.split()[1:] if not t.startswith("--")]
+            sources.update(t.rstrip("/") for t in tokens[:-1])
+    tops = {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")} - {"scripts"}
+
+    def imported(path):
+        found = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                found.add(node.module)
+                found.update(node.module + "." + a.name for a in node.names)
+            elif isinstance(node, ast.Import):
+                found.update(a.name for a in node.names)
+            elif isinstance(node, ast.Call):
+                fn = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if fn in ("import_module", "__import__") and node.args and isinstance(node.args[0], ast.Constant)                         and isinstance(node.args[0].value, str):
+                    found.add(node.args[0].value)
+        return found
+
+    seen, queue, missing = set(), sorted((root / "scripts").glob("research_*.py")), []
+    while queue:
+        path = queue.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        for mod in imported(path):
+            sibling = root / "scripts" / (mod.split(".")[0] + ".py")
+            if sibling.exists():
+                queue.append(sibling)
+            parts = mod.split(".")
+            if parts[0] not in tops:
+                continue
+            rel = Path(*parts)
+            if not ((root / rel).with_suffix(".py").exists() or (root / rel / "__init__.py").exists()):
+                continue                                   # 子名字不是模块(如 from x import 函数)
+            if not (parts[0] in sources or rel.with_suffix(".py").as_posix() in sources
+                    or (rel.as_posix() + "/__init__.py") in sources):
+                missing.append(f"{mod}(被 {path.name} 用到)")
+    assert not missing, "docker/research/Dockerfile 没有复制这些研究侧要用的模块:" + "; ".join(sorted(set(missing)))
+    assert "dashboard/safe.py" in docker and "notify/redact.py" in docker      # 本次回归的两个文件,点名钉住
