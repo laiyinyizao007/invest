@@ -53,36 +53,76 @@ def _health(which: str, path: Path) -> str | None:
     return None
 
 
-def _rename_anchors() -> dict:
-    """Issue #73:把旧口径(绝对路径哈希)命名的锚点改成新口径,内容不动;改完立刻用读侧核对,
-    核对不过就**回滚改名**。只搬锚点,不碰账本;幂等(新名已存在则跳过)。"""
+def _anchor_ledgers() -> dict:
     trials, approvals = _paths()
     import research_attempts as ra
-    ledgers = {
+    return {
         "trials": (trials, lambda p: tl.total_trials(p)),
         "attempts": (trials.parent / "attempts.jsonl", lambda p: ra.read(p)),
         "approvals": (approvals, lambda p: rs._load_approvals(p)),
         "auto_approvals": (approvals.parent / "auto_approvals.json", lambda p: rs._load_approvals(p)),
     }
-    out: dict = {}
+
+
+def _describe_anchor(path: Path, anchor: Path) -> str:
+    got = chain.read_anchor(anchor)
+    rows = 0
+    if path.exists():
+        rows = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    if got is None:
+        return f"锚点不可读;账本 {rows} 行"
+    seq, head, total = got
+    return f"账本 {rows} 行;锚点 seq={seq} head={head[:12]}… 累计={total}"
+
+
+def _rename_anchors(apply: bool) -> dict:
+    """Issue #73:把旧口径(绝对路径哈希)命名的锚点换成新口径名,内容不动。
+
+    **默认只预演(不改任何文件)**,把每本账本"账本多少行 / 锚点 seq、头哈希、累计次数"列给人核对;
+    加 `--apply` 才执行。原因(codex 复审,已实测):本命令只能证明"账本与这份锚点自洽",证明不了
+    "这份锚点是真的"——被一并改过的账本 + 植入的旧名锚点会通过校验。所以必须由人对照自己记得的数字确认。
+    执行时**复制**而不是改名:旧锚点原样保留到新锚点核对通过之后才改成 `.migrated`;任何失败(含 Ctrl-C)
+    都只删掉刚写的新锚点,回到执行前的状态。新名已存在的也要核对,不再无条件报"已迁移"。"""
+    out: dict = {"apply": apply}
     failed = False
-    for name, (path, check) in ledgers.items():
+    for name, (path, check) in _anchor_ledgers().items():
         new, old = chain.anchor_path_for(path), chain.legacy_anchor_path_for(path)
         if new.exists():
-            out[name] = "已是新口径"
-        elif not old.exists():
-            out[name] = "无旧锚点(账本为空或从未建过)" if not path.exists() else "没有旧锚点,账本有记录:需人工 reset"
-            failed = failed or path.exists()
-        else:
-            old.rename(new)
             try:
                 check(path)
-            except Exception as exc:                   # 核对不过:把锚点放回去,不让坏锚点生效
-                new.rename(old)
-                out[name] = f"核对失败,已回滚: {str(exc)[:160]}"
+                out[name] = "新口径锚点已存在,核对通过:" + _describe_anchor(path, new)
+            except Exception as exc:
+                out[name] = f"新口径锚点已存在但核对不过(请人工核对,必要时 reset): {str(exc)[:160]}"
                 failed = True
-            else:
-                out[name] = "已改名并核对通过"
+            continue
+        if not old.exists():
+            out[name] = "无旧锚点(账本为空或从未建过)" if not path.exists() else "没有旧锚点,账本有记录:需人工 reset"
+            failed = failed or path.exists()
+            continue
+        if not apply:
+            out[name] = "待迁移:" + _describe_anchor(path, old)
+            continue
+        try:
+            new.write_bytes(old.read_bytes())
+            check(path)
+        except BaseException as exc:                  # 含 KeyboardInterrupt:一律回到执行前
+            try:
+                new.unlink(missing_ok=True)
+            except OSError:
+                pass
+            out[name] = f"核对失败,已撤销新锚点: {str(exc)[:160]}"
+            failed = True
+            if not isinstance(exc, Exception):
+                out["ok"] = False
+                _audit({"action": "rename-anchors", "result": out})
+                raise
+            continue
+        try:
+            old.rename(old.with_name(old.name + ".migrated"))
+        except OSError as exc:
+            out[name] = f"已迁移并核对通过,但旧锚点没能改名({str(exc)[:80]});可手工删除旧文件"
+        else:
+            out[name] = "已迁移并核对通过:" + _describe_anchor(path, new)
     out["ok"] = not failed
     return out
 
@@ -98,7 +138,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="试验账本/批准账本的人工入口(status / migrate / reset)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="两本账本是否健康(只读)")
-    sub.add_parser("rename-anchors", help="把旧口径(绝对路径哈希)的锚点改名为新口径(内容不动,改后核对,失败回滚)")
+    ren = sub.add_parser("rename-anchors", help="把旧口径(绝对路径哈希)的锚点换成新口径名(默认只预演;加 --apply 才执行)")
+    ren.add_argument("--apply", action="store_true", help="执行迁移(先看预演输出,对照你记得的次数/行数)")
     mig = sub.add_parser("migrate", help="把无链的旧账本一次性升级成哈希链(原文件备份)")
     mig.add_argument("ledger", choices=("trials", "approvals"))
     mig.add_argument("--confirm-all-approved", action="store_true",
@@ -118,8 +159,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             out = {name: (_health(name, path) or "ok") for name, path in targets.items()}
         elif args.command == "rename-anchors":
-            out = _rename_anchors()
-            _audit({"action": "rename-anchors", "result": out})
+            out = _rename_anchors(args.apply)
+            if args.apply:
+                _audit({"action": "rename-anchors", "result": out})
             if not out["ok"]:
                 print(json.dumps(out, ensure_ascii=False, indent=2))
                 return 1

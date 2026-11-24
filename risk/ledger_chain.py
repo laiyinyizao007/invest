@@ -155,8 +155,8 @@ def anchor_path_for(ledger_path) -> Path:
     各账本共用同一个 `ledger_anchor/` 目录。"""
     ledger = Path(ledger_path).resolve()
     relative = f"{ledger.parent.name}/{ledger.name}".lower()
-    tag = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:10]
-    return ledger.parent.parent / ANCHOR_DIRNAME / f"{ledger.stem}-{tag}.anchor"
+    tag = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:16]     # 64 位:比旧的 40 位难碰撞
+    return ledger.parent.parent / ANCHOR_DIRNAME / f"{ledger.stem.lower()}-{tag}.anchor"
 
 
 def legacy_anchor_path_for(ledger_path) -> Path:

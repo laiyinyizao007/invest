@@ -976,38 +976,66 @@ def test_a_legacy_named_anchor_is_no_longer_trusted(tmp_path):
         tl.total_trials(trials)
 
 
-def test_rename_anchors_moves_legacy_names_and_keeps_the_ledger_verifiable(tmp_path, monkeypatch, capsys):
+def _legacy_setup(tmp_path, monkeypatch, counts=(3,)):
     import research_ledger as cli
     trials = tmp_path / "data" / "research" / "trials.jsonl"
     approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
     monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
     trials.parent.mkdir(parents=True)
-    tl.record_trials(trials, "submission", 3, at=1.0)
+    for count in counts:
+        tl.record_trials(trials, "submission", count, at=1.0)
     new, old = chain.anchor_path_for(trials), chain.legacy_anchor_path_for(trials)
-    content = new.read_text(encoding="ascii")
     new.rename(old)
+    return cli, trials, new, old
+
+
+def test_rename_anchors_dry_run_changes_nothing_and_shows_what_it_would_adopt(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
     assert cli.main(["rename-anchors"]) == 0
+    assert old.exists() and not new.exists()
+    assert not (new.parent / "ledger.admin.log").exists()
+    result = cli._rename_anchors(False)
+    assert "累计=3" in result["trials"] and "锚点 seq=1" in result["trials"]
+
+
+def test_rename_anchors_apply_publishes_only_after_the_read_side_accepts(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
+    content = old.read_text(encoding="ascii")
+    assert cli.main(["rename-anchors", "--apply"]) == 0
     assert new.read_text(encoding="ascii") == content and not old.exists()
+    assert old.with_name(old.name + ".migrated").exists()
     assert tl.total_trials(trials) == 3
-    assert cli.main(["rename-anchors"]) == 0                           # 幂等:已迁移的跳过
-    log = new.parent / "ledger.admin.log"
-    assert "rename-anchors" in log.read_text(encoding="utf-8")
+    assert cli.main(["rename-anchors", "--apply"]) == 0                # 幂等
+    assert "rename-anchors" in (new.parent / "ledger.admin.log").read_text(encoding="utf-8")
 
 
-def test_rename_anchors_rolls_back_when_the_ledger_does_not_match_the_anchor(tmp_path, monkeypatch, capsys):
-    import research_ledger as cli
-    trials = tmp_path / "data" / "research" / "trials.jsonl"
-    approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
-    monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
-    trials.parent.mkdir(parents=True)
-    tl.record_trials(trials, "submission", 3, at=1.0)
-    tl.record_trials(trials, "submission", 2, at=1.0)
-    new, old = chain.anchor_path_for(trials), chain.legacy_anchor_path_for(trials)
-    new.rename(old)
+def test_rename_anchors_apply_undoes_the_new_anchor_when_the_ledger_does_not_match(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch, counts=(3, 2))
     lines = trials.read_text(encoding="utf-8").splitlines()
     trials.write_text(lines[0] + chr(10), encoding="utf-8")            # 账本被截短:旧锚点已不对应
-    assert cli.main(["rename-anchors"]) == 1
-    assert old.exists() and not new.exists()                           # 校验没过 ⇒ 回滚改名,不让坏锚点生效
+    assert cli.main(["rename-anchors", "--apply"]) == 1
+    assert old.exists() and not new.exists()                           # 旧锚点原样还在,新锚点已撤销
+
+
+def test_rename_anchors_undoes_even_on_keyboard_interrupt(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
+
+    def boom(path):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(tl, "total_trials", boom)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["rename-anchors", "--apply"])
+    assert old.exists() and not new.exists()
+    assert "rename-anchors" in (new.parent / "ledger.admin.log").read_text(encoding="utf-8")   # 审计不丢
+
+
+def test_rename_anchors_does_not_report_a_mismatched_new_anchor_as_migrated(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch, counts=(3, 2))
+    old.rename(new)
+    lines = trials.read_text(encoding="utf-8").splitlines()
+    trials.write_text(lines[0] + chr(10), encoding="utf-8")
+    assert cli.main(["rename-anchors"]) == 1                           # 新名已在但对不上 ⇒ 不是"已迁移"
 
 
 # ======================================================================
