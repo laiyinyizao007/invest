@@ -31,6 +31,11 @@ services:
       - ./pending_strategies:/app/pending_strategies
       - ./data/research:/app/data/research
       - ./data/research-control:/app/data/research-control:ro
+      # 账本锚点(Issue #73):锚点放在账本目录的上一级 ledger_anchor/,容器的根文件系统只读,不挂载就写不了也读不到,
+      # 新镜像一读非空账本就 fail-closed。锚点文件名带"账本绝对路径"的哈希,所以宿主机人工 migrate/reset 要加
+      # --as-container-root /app 才会写出容器会去读的那个文件名。
+      # 如实说明:这个目录与账本一样在容器内可写,锚点防的是"账本被意外截断/换入",不是对容器内恶意候选的密码学保护。
+      - ./data/ledger_anchor:/app/data/ledger_anchor
     networks: [research_net]
     healthcheck:
       test: ["CMD", "python", "-c", "import os,socket,sys; s=socket.create_connection((socket.gethostbyname(socket.gethostname()), 8765), 3); sys.exit(0)"]

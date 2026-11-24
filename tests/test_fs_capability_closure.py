@@ -950,6 +950,59 @@ def test_research_ledger_cli_status_migrate_reset(tmp_path, monkeypatch, capsys)
     assert log.exists() and "migrate" in log.read_text(encoding="utf-8")
 
 
+def _container_tag(posix_path: str) -> str:
+    import hashlib
+    return hashlib.sha256(posix_path.lower().encode("utf-8")).hexdigest()[:10]
+
+
+def test_research_ledger_cli_container_view_anchors_for_the_gateway_path(tmp_path, monkeypatch, capsys):
+    """Issue #73:网关容器里账本在 /app/data/research/,锚点文件名按那个路径取哈希。
+
+    宿主机人工入口加 --as-container-root /app 后,必须把锚点写到容器会去读的文件名上
+    (宿主机真实目录 data/ledger_anchor/,容器里挂在 /app/data/ledger_anchor/)。
+    不加该参数时行为不变;读侧(chain.verify)不动。"""
+    import research_ledger as cli
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
+    monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
+    monkeypatch.setattr(cli, "_ROOT", tmp_path)
+    trials.parent.mkdir(parents=True)
+    trials.write_text(json.dumps({"kind": "submission", "count": 3, "at": 1.0}) + "\n", encoding="utf-8")
+    assert cli.main(["migrate", "trials", "--as-container-root", "/app"]) == 0
+    anchors = tmp_path / "data" / "ledger_anchor"
+    want = anchors / f"trials-{_container_tag('/app/data/research/trials.jsonl')}.anchor"
+    assert want.exists()
+    seq, head, _total = chain.read_anchor(want)
+    row = json.loads(trials.read_text(encoding="utf-8").splitlines()[-1])
+    assert (seq, head) == (row["seq"], row["hash"])
+    # 没加参数的宿主机视角没有被顺手写出来:两边是各自独立的锚点
+    assert not chain.anchor_path_for(trials).exists()
+    # 容器视角下 status 读到的是健康的
+    capsys.readouterr()
+    assert cli.main(["status", "--as-container-root", "/app"]) == 0
+    assert '"trials": "ok"' in capsys.readouterr().out
+
+
+def test_research_ledger_cli_container_view_still_fails_closed_without_anchor(tmp_path, monkeypatch, capsys):
+    import research_ledger as cli
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
+    monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
+    monkeypatch.setattr(cli, "_ROOT", tmp_path)
+    trials.parent.mkdir(parents=True)
+    trials.write_text(json.dumps({"kind": "submission", "count": 3, "at": 1.0}) + "\n", encoding="utf-8")
+    assert cli.main(["migrate", "trials"]) == 0                          # 只给宿主机视角定了锚
+    capsys.readouterr()
+    assert cli.main(["status", "--as-container-root", "/app"]) == 0
+    assert "没有锚点" in capsys.readouterr().out                           # 容器视角没锚点 ⇒ 仍然拒绝
+
+
+def test_research_ledger_cli_rejects_a_relative_container_root(tmp_path, monkeypatch):
+    import research_ledger as cli
+    monkeypatch.setattr(cli, "_paths", lambda: (tmp_path / "t.jsonl", tmp_path / "a.json"))
+    assert cli.main(["status", "--as-container-root", "app"]) == 1
+
+
 # ======================================================================
 # D. 行情在候选导入前取定
 # ======================================================================
@@ -967,6 +1020,8 @@ def child_env(monkeypatch, tmp_path):
     csv = tmp_path / "bars.csv"
     _write_bars_csv(csv, 10.5)
     monkeypatch.setattr(wf, "DATA_FILE", csv)
+    # #70 之后评估按产品从 wf.PRODUCTS 取数据文件;只补 DATA_FILE 会读到真实行情(夹具要同步换掉 C15 那一项)
+    monkeypatch.setitem(wf.PRODUCTS, "C15", (csv, wf.PRODUCTS["C15"][1]))
     monkeypatch.setattr(api, "child_file", lambda p: p)
     monkeypatch.setattr(api, "child_approved", lambda sha: None)
     monkeypatch.setattr(api, "child_params", lambda a: {})
