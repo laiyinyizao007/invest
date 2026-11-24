@@ -751,7 +751,7 @@ def test_evaluate_forwards_validated_fields_and_never_passes_confirm(tmp_path):
 
     status, _ = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "Candidate", "random_runs": "50", "confirm": True})
 
-    assert status == 200 and seen == {"strategy": "a.py", "cls": "Candidate", "random_runs": 50, "confirm": False}
+    assert status == 200 and seen == {"strategy": "a.py", "cls": "Candidate", "random_runs": 50, "confirm": False, "product": "C15"}
 
 
 def test_evaluate_rejects_bad_fields_without_entering_the_job(tmp_path):

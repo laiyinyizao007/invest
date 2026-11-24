@@ -118,6 +118,13 @@ def trials_path(paths: dict) -> Path:
     return Path(paths["results_dir"]) / "trials.jsonl"
 
 
+def check_product(product) -> None:
+    """评估品种只能取 walk_forward_optimizer.PRODUCTS 白名单里的键(Issue #69);其余一律拒绝。"""
+    # 只认 research_sandbox.PRODUCTS(无交易栈依赖):父进程/网关里不得 import walk_forward_optimizer(它会拖进 vnpy)
+    if not isinstance(product, str) or product not in rs.PRODUCTS:
+        raise JobError(EXIT_REFUSED, f"product 只能是 {list(rs.PRODUCTS)}")
+
+
 def prior_trials(paths: dict) -> int:
     """累计试验次数,供子进程计算 DSR。账本损坏则拒绝作业(fail-closed):少记试验等于放水。"""
     try:
@@ -807,10 +814,11 @@ def save_with_report(result: dict, paths: dict) -> None:
 
 
 def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
-                 confirm: bool = False) -> dict:
+                 confirm: bool = False, product: str = "C15") -> dict:
     """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
     再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。"""
     cfg, paths = settings()
+    check_product(product)
     timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
     random_runs = random_runs if random_runs is not None else cfg["gate"]["random_runs"]
     path = resolve_strategy(strategy, cfg)
@@ -829,12 +837,13 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
 
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior)]
+           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior),
+           "--product", product]
     body = spawn_child(cmd, timeout)
     if "error" not in body:
         top_up_grid_trials(paths, body)
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
-            "class": cls, "key": "C15", "protocol_notice": EVALUATE_NOTICE,
+            "class": cls, "key": product, "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
     if "error" in body:
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
@@ -888,7 +897,7 @@ def cmd_backtest(args) -> int:
 
 def cmd_evaluate(args) -> int:
     return run_cli_job(lambda: evaluate_job(strategy=args.strategy, cls=args.cls, random_runs=args.random_runs,
-                                            timeout=args.timeout, confirm=args.confirm_reviewed))
+                                            timeout=args.timeout, confirm=args.confirm_reviewed, product=args.product))
 
 
 def cmd_gate(args) -> int:
@@ -958,11 +967,20 @@ def run_evaluate_child(args) -> int:
         path = child_file(Path(args.file))    # 自己确认文件仍在 pending 目录内
         child_approved(args.sha256)            # 自己查审批记录:"人看过代码"这条前提不能靠父入口担保
         random_runs, prior_trials = child_int_args(args)   # 整数参数自己复查(负的 prior_trials 会放松 DSR 门槛)
+        check_product(args.product)            # 品种白名单子进程自己再查一次
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
+    try:
+        data_file, symbol = wf.PRODUCTS[args.product]      # 白名单与数据映射漂移时给出可读错误,不抛裸 KeyError
+    except KeyError:
+        print(f"品种 {args.product} 没有登记数据映射(walk_forward_optimizer.PRODUCTS)", file=sys.stderr)
+        return EXIT_REFUSED
+    if not Path(data_file).is_file():
+        print(f"品种 {args.product} 的数据文件缺失:{Path(data_file).name}", file=sys.stderr)
+        return EXIT_REFUSED
     # 行情、窗口、配置在候选**导入之前**取定(Issue #31 D,理由见 run_gate_child)。
-    bars = load_bars_csv(wf.DATA_FILE, wf.SYMBOL, Exchange.DCE)
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     windows = wf.build_windows()
     cfg = rc.load()                          # 选参网格上限来自配置:统一入口重构时漏掉了这一行
     try:
@@ -976,7 +994,7 @@ def run_evaluate_child(args) -> int:
     try:
         with rs.candidate_window():
             result = run_evaluation(
-                candidate_cls=candidate, bars=bars, runner=engine_runner(wf.KEY), random_cls=RandomEntry15mStrategy,
+                candidate_cls=candidate, bars=bars, runner=engine_runner(args.product), random_cls=RandomEntry15mStrategy,
                 random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
                 min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
                 validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
@@ -1073,6 +1091,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--class", dest="cls", required=True)
     ev.add_argument("--random-runs", type=int, default=None, help="随机入场对照次数;缺省取配置 gate.random_runs")
     ev.add_argument("--timeout", type=float, default=None, help="秒;缺省取配置 gate.timeout_seconds + grid.timeout_seconds")
+    ev.add_argument("--product", default="C15", help="评估品种(白名单见 walk_forward_optimizer.PRODUCTS);缺省 C15=玉米,与旧行为一致")
     ev.add_argument("--confirm-reviewed", action="store_true")
     ev.set_defaults(func=cmd_evaluate)
     rv = sub.add_parser("review", help="先看代码再批准:显示带行号的源码与静态筛查结果,"
@@ -1104,6 +1123,7 @@ def build_parser() -> argparse.ArgumentParser:
         echild.add_argument(f"--{name}", required=True)
     echild.add_argument("--random-runs", type=int, required=True)
     echild.add_argument("--prior-trials", type=int, default=None)
+    echild.add_argument("--product", default="C15")      # 子进程自己再按白名单核对,不假设父进程查过
     echild.set_defaults(func=run_evaluate_child)
     return parser
 
