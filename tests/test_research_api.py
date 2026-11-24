@@ -1175,7 +1175,8 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     wf.DATA_FILE = "x.csv"
     wf.SYMBOL = "c2701.DCE"
     wf.KEY = "CADJ"
-    wf.PRODUCTS = {"C15": ("x.csv", "c2701.DCE"), "V15": ("v.csv", "VADJ15.DCE")}
+    (tree / "x.csv").write_text("x", encoding="utf-8")     # 子进程会先核对数据文件存在
+    wf.PRODUCTS = {"C15": (tree / "x.csv", "c2701.DCE")}
     wf.build_windows = lambda: [Win()]
     bl = pytypes.ModuleType("backtest_lib")
     bl.DEFAULT_CAPITAL = 100000.0
@@ -1202,7 +1203,7 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     assert seen["max_cells"] == api.rc.load()["grid"]["max_cells"]
 
 
-def _stub_trading_stack(monkeypatch):
+def _stub_trading_stack(monkeypatch, data_dir):
     """替身交易栈:记录子进程取了哪份数据、用了哪个规格键。"""
     import sys
     import types as pytypes
@@ -1219,7 +1220,9 @@ def _stub_trading_stack(monkeypatch):
     wf.DATA_FILE = "c.csv"
     wf.SYMBOL = "CADJ15"
     wf.KEY = "C15"
-    wf.PRODUCTS = {"C15": ("c.csv", "CADJ15"), "V15": ("v.csv", "VADJ15"), "M15": ("m.csv", "MADJ15")}
+    wf.PRODUCTS = {k: (data_dir / f, sym) for k, (f, sym) in {"C15": ("c.csv", "CADJ15"), "V15": ("v.csv", "VADJ15"), "M15": ("m.csv", "MADJ15")}.items()}
+    for _f, _s in wf.PRODUCTS.values():
+        _f.write_text("x", encoding="utf-8")
     wf.build_windows = lambda: [Win()]
     bl = pytypes.ModuleType("backtest_lib")
     bl.DEFAULT_CAPITAL = 100000.0
@@ -1229,40 +1232,68 @@ def _stub_trading_stack(monkeypatch):
     rg.run_evaluation = lambda **kw: {"passed": True, "sharpe": 1.0}
     rnd = pytypes.ModuleType("strategies.random_entry_15m_strategy")
     rnd.RandomEntry15mStrategy = object
+    const = pytypes.ModuleType("vnpy.trader.constant")
+    const.Exchange = pytypes.SimpleNamespace(DCE="DCE")
     for name, mod in (("walk_forward_optimizer", wf), ("backtest_lib", bl), ("research_gate", rg),
-                      ("strategies.random_entry_15m_strategy", rnd)):
+                      ("strategies.random_entry_15m_strategy", rnd), ("vnpy", pytypes.ModuleType("vnpy")),
+                      ("vnpy.trader", pytypes.ModuleType("vnpy.trader")), ("vnpy.trader.constant", const)):
         monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(api, "import_candidate", lambda *a, **k: object)     # 候选导入不是这里要测的
     return calls
 
 
-@requires_trading_stack
-@pytest.mark.parametrize("product,expected", [("C15", ("c.csv", "CADJ15")), ("V15", ("v.csv", "VADJ15")),
-                                              ("M15", ("m.csv", "MADJ15"))])
+@pytest.mark.parametrize("product,expected", [("C15", "c.csv"), ("V15", "v.csv"), ("M15", "m.csv")])
 def test_evaluate_child_uses_the_selected_products_data_and_spec_key(tree, monkeypatch, capsys, product, expected):
     """子进程取的行情文件与规格键必须是所选品种的(变异:忽略 --product / 键写死 C15 都会红)。"""
     body = "from vnpy_ctastrategy import CtaTemplate" + chr(10) + "class S(CtaTemplate):" + chr(10) + "    VALUE = 'GOOD'" + chr(10)
     path = tree / "pending_strategies" / "s.py"
     path.write_text(body, encoding="utf-8")
     monkeypatch.setattr(api, "check_candidate_class", lambda *a, **k: None)
-    calls = _stub_trading_stack(monkeypatch)
+    calls = _stub_trading_stack(monkeypatch, tree)
     approve(path)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S", "--random-runs", "20",
                                           "--sha256", api.rs.file_sha256(path), "--product", product])
     assert api.run_evaluate_child(args) == api.EXIT_OK
-    assert calls["bars"] == expected and calls["runner_key"] == product
+    assert calls["bars"][0].name == expected and calls["bars"][1] == {"C15": "CADJ15", "V15": "VADJ15", "M15": "MADJ15"}[product]
+    assert calls["runner_key"] == product
 
 
-@requires_trading_stack
 def test_evaluate_child_refuses_a_bad_product_with_the_whitelist_message(tree, monkeypatch, capsys):
     """文件存在且已批准,这样拒绝只可能来自 product 白名单(不是别的校验先拦下)。"""
     body = "from vnpy_ctastrategy import CtaTemplate" + chr(10) + "class S(CtaTemplate):" + chr(10) + "    VALUE = 'GOOD'" + chr(10)
     path = tree / "pending_strategies" / "s.py"
     path.write_text(body, encoding="utf-8")
+    _stub_trading_stack(monkeypatch, tree)
     approve(path)
     args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S", "--random-runs", "20",
                                           "--sha256", api.rs.file_sha256(path), "--product", "XX"])
     assert api.run_evaluate_child(args) == api.EXIT_REFUSED
     assert "product 只能是" in capsys.readouterr().err
+
+
+def _run_child_with(tree, monkeypatch, product):
+    body = "class S: pass" + chr(10)
+    path = tree / "pending_strategies" / "s.py"
+    path.write_text(body, encoding="utf-8")
+    calls = _stub_trading_stack(monkeypatch, tree)
+    approve(path)
+    args = api.build_parser().parse_args(["_evaluate_child", "--file", str(path), "--cls", "S", "--random-runs", "20",
+                                          "--sha256", api.rs.file_sha256(path), "--product", product])
+    return calls, args
+
+
+def test_evaluate_child_reports_a_missing_data_file_readably(tree, monkeypatch, capsys):
+    calls, args = _run_child_with(tree, monkeypatch, "V15")
+    (tree / "v.csv").unlink()
+    assert api.run_evaluate_child(args) == api.EXIT_REFUSED
+    assert "数据文件缺失:v.csv" in capsys.readouterr().err and calls["bars"] is None
+
+
+def test_evaluate_child_reports_a_whitelisted_product_without_a_data_mapping(tree, monkeypatch, capsys):
+    """白名单与数据映射漂移时给可读错误,而不是裸 KeyError。"""
+    calls, args = _run_child_with(tree, monkeypatch, "EB15")      # 白名单里有,桩的映射里没有
+    assert api.run_evaluate_child(args) == api.EXIT_REFUSED
+    assert "没有登记数据映射" in capsys.readouterr().err and calls["bars"] is None
 
 
 def test_the_saved_backtest_stats_are_exactly_what_the_dashboard_validates():

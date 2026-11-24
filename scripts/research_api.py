@@ -971,7 +971,14 @@ def run_evaluate_child(args) -> int:
     except JobError as exc:
         print(exc.message, file=sys.stderr)
         return exc.code
-    data_file, symbol = wf.PRODUCTS[args.product]
+    try:
+        data_file, symbol = wf.PRODUCTS[args.product]      # 白名单与数据映射漂移时给出可读错误,不抛裸 KeyError
+    except KeyError:
+        print(f"品种 {args.product} 没有登记数据映射(walk_forward_optimizer.PRODUCTS)", file=sys.stderr)
+        return EXIT_REFUSED
+    if not Path(data_file).is_file():
+        print(f"品种 {args.product} 的数据文件缺失:{Path(data_file).name}", file=sys.stderr)
+        return EXIT_REFUSED
     # 行情、窗口、配置在候选**导入之前**取定(Issue #31 D,理由见 run_gate_child)。
     bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     windows = wf.build_windows()
