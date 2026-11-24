@@ -1144,6 +1144,7 @@ def test_evaluate_child_really_runs_the_evaluation(tree, monkeypatch, capsys):
     wf.DATA_FILE = "x.csv"
     wf.SYMBOL = "c2701.DCE"
     wf.KEY = "CADJ"
+    wf.PRODUCTS = {"C15": ("x.csv", "c2701.DCE"), "V15": ("v.csv", "VADJ15.DCE")}
     wf.build_windows = lambda: [Win()]
     bl = pytypes.ModuleType("backtest_lib")
     bl.DEFAULT_CAPITAL = 100000.0

@@ -32,4 +32,11 @@ INSTRUMENTS: dict[str, Instrument] = {
     "MAADJ": Instrument("MAADJ.CZCE", size=10, pricetick=1.0),
     # 购买的分钟线合成的 15 分钟复权主力连续(scripts/import_minute.py 输出,不在数据库里,回测时直接传入 K 线)
     "C15": Instrument("CADJ15.DCE", size=10, pricetick=1.0),
+    # 候选池 5 个品种的 15 分钟复权主力连续(规格与国信费率取自 docs/adr/20261116-candidate-product-pool.md 的核实表;
+    # 滑点口径同上:1 个最小变动价位 + 每手单边手续费折点)。只供研究评估按 product 选用。
+    "V15": Instrument("VADJ15.DCE", size=5, pricetick=1.0, fee_per_lot=1.01),     # PVC
+    "EB15": Instrument("EBADJ15.DCE", size=5, pricetick=1.0, fee_per_lot=1.01),   # 苯乙烯
+    "EG15": Instrument("EGADJ15.DCE", size=10, pricetick=1.0, fee_per_lot=3.01),  # 乙二醇
+    "PP15": Instrument("PPADJ15.DCE", size=5, pricetick=1.0, fee_per_lot=1.01),   # 聚丙烯
+    "M15": Instrument("MADJ15.DCE", size=10, pricetick=1.0, fee_per_lot=1.51),    # 豆粕
 }

@@ -450,8 +450,15 @@ class GatewayApp:
             return 400, {"error": "strategy/class 必须是字符串,class 必须是合法标识符"}
         random_runs = _lenient_int(data.get("random_runs"), "random_runs")
         # 参数网格由候选类的 param_grid 声明,不经请求体传入:请求体里不接受任何影响选参的字段
+        # product(Issue #69)只是白名单里的一个键,缺省 C15;非法值由 evaluate_job 拒绝
+        product = data.get("product")
+        if product is None or product == "":
+            product = "C15"
+        if not isinstance(product, str):
+            return 400, {"error": "product 必须是字符串"}
         view = _view(data)
-        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False), view)
+        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False,
+                                         product=product), view)
 
     def _results(self, _data, params):
         run_id = params["run_id"]
