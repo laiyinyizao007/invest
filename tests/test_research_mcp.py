@@ -310,6 +310,19 @@ def test_node_failures_reports_a_close_event_error():
     assert "RemoteDisconnected" in found[0]
 
 
+def test_node_failures_close_edge_shapes():
+    def close(message):
+        return {"event": "close", "output_schema": {"message": message}}
+
+    assert mcp_server.node_failures([close({"status_code": "200"})]) == []          # 字符串 200 不是失败
+    assert mcp_server.node_failures([close({"status_code": True})]) == []
+    assert mcp_server.node_failures([close({"status_code": 200, "data": {"exception": "boom"}})])   # 200 带异常也算
+    as_text = '{"status_code": 500, "status_message": "bad", "data": {"error": "why"}}'
+    found = mcp_server.node_failures([close(as_text)])                                 # JSON 字符串载荷
+    assert found and "500" in found[0] and "why" in found[0]
+    assert mcp_server.node_failures([None, "x", 3]) == []                              # 非 dict 事件不抛
+
+
 def test_node_failures_ignores_a_normal_close():
     assert mcp_server.node_failures([{"event": "close", "output_schema": {"message": {"status_code": 200}}}]) == []
     assert mcp_server.node_failures([{"event": "close"}, {"event": "close", "output_schema": {"message": "bye"}}]) == []
