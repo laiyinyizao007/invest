@@ -51,6 +51,18 @@ DATA_FILE = Path(os.environ.get("INVEST_C15_DATA") or r"C:\Dev\data\invest\deriv
 KEY = "C15"
 SYMBOL = "CADJ15"
 
+# 研究评估可选的品种(Issue #69)。数据文件由这里的映射决定,**不读环境变量**(C15 沿用上面的 DATA_FILE 以保持行为不变);
+# 白名单之外的 product 一律拒绝。规格见 strategies/instruments.py。
+_DERIVED = DATA_FILE.parent   # 与 C15 同目录(容器里 INVEST_C15_DATA 指向挂载点,其余品种随之);文件名固定在下表
+PRODUCTS = {
+    "C15": (DATA_FILE, "CADJ15"),
+    "V15": (_DERIVED / "V_15m_adj.csv", "VADJ15"),
+    "EB15": (_DERIVED / "EB_15m_adj.csv", "EBADJ15"),
+    "EG15": (_DERIVED / "EG_15m_adj.csv", "EGADJ15"),
+    "PP15": (_DERIVED / "PP_15m_adj.csv", "PPADJ15"),
+    "M15": (_DERIVED / "M_15m_adj.csv", "MADJ15"),
+}
+
 # 网格只扫均线快慢两维;atr_mult 固定 1.5(策略类默认),risk_budget 不传键、固定 300。
 FAST = [10, 14, 18, 22, 26, 30]
 SLOW = [40, 50, 60, 70, 80, 90]

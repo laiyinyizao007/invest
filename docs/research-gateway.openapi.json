@@ -287,6 +287,11 @@
                     "type": "integer",
                     "description": "随机对照次数;缺省取服务端配置"
                   },
+                  "product": {
+                    "type": "string",
+                    "enum": ["C15", "V15", "EB15", "EG15", "PP15", "M15"],
+                    "description": "评估品种(15 分钟复权主力连续):C15 玉米(缺省)、V15 PVC、EB15 苯乙烯、EG15 乙二醇、PP15 聚丙烯、M15 豆粕。必须与研究想法里的品种一致"
+                  },
                   "view": {
                     "type": "string",
                     "enum": [

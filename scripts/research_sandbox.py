@@ -50,6 +50,9 @@ PENDING_DIR = "pending_strategies"
 # 那是同进程残余,由 Issue #29(独立进程 + 只读挂载)闭合。见 ADR 第 39 轮。
 SEGMENTS = ("train", "valid")
 KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复权品种
+# 评估可选品种(Issue #69):15 分钟复权主力连续。**不含交易栈依赖**——父进程与网关只认这份名单,
+# 数据文件与规格由回测子进程按它去 walk_forward_optimizer.PRODUCTS / strategies.instruments 取(一致性有测试锁定)。
+PRODUCTS = ("C15", "V15", "EB15", "EG15", "PP15", "M15")
 # 残留锁(持有者已崩)的判定上限(秒)。
 # 第 43 轮:这个值**必须与账本维护入口用同一个**(两者锁的是同一个 `approvals.json.chainlock`;
 # 此前这里是 60 秒、那边是默认 30 秒,于是维护入口能按自己的口径把批准路径的**活锁**当陈旧锁抢走)。
