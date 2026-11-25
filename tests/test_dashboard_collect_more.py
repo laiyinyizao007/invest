@@ -118,7 +118,7 @@ def test_research_quota_pending_and_recent_runs(tmp_path):
         pending={"demo.py": src, "other.py": "x = 1\n"}, approvals={sha: {"name": "demo.py"}})
     r = col.collect_research(S(tmp_path), NOW)
     d = r.section["data"]
-    assert d["quota"]["used"] == 1 and d["quota"]["limit"] == 5 and d["quota"]["window_hours"] == 24
+    assert d["quota"]["used"] == 1 and d["quota"]["limit"] == 20 and d["quota"]["window_hours"] == 24
     assert d["quota"]["next_release_in_seconds"] == int(24 * 3600 - 3600)          # 只有窗口内的一条
     assert d["approvals_count"] == 1
     pend = {p["name"]: p for p in d["pending"]}

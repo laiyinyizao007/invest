@@ -734,7 +734,7 @@ MAX_PENDING_LISTED = 50              # 待审候选最多列出多少个
 
 def _research_cfg(settings: Settings) -> tuple[dict, str | None]:
     """沙盒配置里的额度与路径。配置文件缺失用默认值(沙盒按默认运行);损坏返回错误。"""
-    defaults = {"iteration": {"max_iterations": 5, "window_hours": 24},
+    defaults = {"iteration": {"max_iterations": 20, "window_hours": 24},
                 "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research", "approvals_file": "data/research-control/approvals.json"}}
     raw, err = m.read_json(settings.paths["research_config"])
     if err == "missing":
