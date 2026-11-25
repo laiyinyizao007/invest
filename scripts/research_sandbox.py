@@ -3626,9 +3626,65 @@ def _approvals_lock_message(approvals_file, exc: chain.LedgerChainError) -> str:
 _ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def save_result(result: dict, directory: Path, now: datetime | None = None) -> str:
+def new_run_id(now: datetime | None = None) -> str:
+    return (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+
+
+# 异步评估(Issue #84):运行中/失败/被中断的状态放在结果目录下的**子目录**里,不放进 `*.json` 的结果清单:
+# 反馈、看板、`list_results` 都只看顶层 `*.json`,于是它们对「还没跑完」的东西**完全不可见**,不会把未完成当成结果或损坏。
+# 只有跑完的最终结果才写成顶层 `<run_id>.json`(与同步评估产出的完全同形)。
+RUNNING_DIRNAME = "running"
+
+
+def _running_path(directory: Path, run_id: str) -> Path:
+    if not _ID.match(run_id or ""):
+        raise SandboxError(f"非法的 run_id: {run_id!r}")
+    return directory / RUNNING_DIRNAME / f"{run_id}.json"
+
+
+def write_running(directory: Path, run_id: str, state: dict) -> None:
+    """原子写入运行状态(running/error/interrupted)。run_id 以参数为准,不信 state 里带的。"""
+    path = _running_path(directory, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({**state, "run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def clear_running(directory: Path, run_id: str) -> None:
+    """最终结果已落盘后撤掉运行状态。删不掉也无妨(读侧顶层结果优先),所以不抛错。"""
+    try:
+        _running_path(directory, run_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def mark_interrupted(directory: Path) -> list[str]:
+    """网关启动时调用:上一个进程留下的 `running` 不可能还有工作线程在跑,改标 `interrupted`。
+    坏文件跳过(不让一个坏文件挡住启动)。返回被改标的 run_id。试验已在启动前预扣,账本只增不减。"""
+    marked: list[str] = []
+    folder = directory / RUNNING_DIRNAME
+    if not folder.is_dir():
+        return marked
+    for path in sorted(folder.glob("*.json")):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("status") != "running" or not _ID.match(path.stem):
+                continue
+            write_running(directory, path.stem, {**state, "status": "interrupted",
+                                                 "message": "网关重启时这次评估还没跑完,已中断;试验次数已预扣,不退还"})
+            marked.append(path.stem)
+        except (OSError, ValueError):
+            continue
+    return marked
+
+
+def save_result(result: dict, directory: Path, now: datetime | None = None, run_id: str | None = None) -> str:
     directory.mkdir(parents=True, exist_ok=True)
-    run_id = (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+    if run_id is None:
+        run_id = new_run_id(now)
+    elif not _ID.match(run_id):
+        raise SandboxError(f"非法的 run_id: {run_id!r}")
     path = directory / f"{run_id}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({**result, "run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3641,6 +3697,9 @@ def load_result(run_id: str, directory: Path) -> dict:
         raise SandboxError(f"非法的 run_id: {run_id!r}")
     path = directory / f"{run_id}.json"
     if not path.is_file():
+        running = _running_path(directory, run_id)          # 还没跑完/失败/被中断:读运行状态(顶层最终结果始终优先)
+        if running.is_file():
+            return json.loads(running.read_text(encoding="utf-8"))
         raise SandboxError(f"没有这条结果: {run_id}")
     return json.loads(path.read_text(encoding="utf-8"))
 

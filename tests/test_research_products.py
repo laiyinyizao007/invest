@@ -18,6 +18,7 @@ for _p in (ROOT, ROOT / "scripts"):
         sys.path.insert(0, str(_p))
 
 import research_api as api  # noqa: E402
+import research_config as rc  # noqa: E402
 import research_gateway as gw  # noqa: E402
 import research_sandbox as rs  # noqa: E402
 from strategies.instruments import INSTRUMENTS  # noqa: E402
@@ -78,17 +79,27 @@ class _Jobs:
     def __init__(self):
         self.seen = {}
 
-    def evaluate_job(self, **kw):
+    def evaluate_prepare(self, **kw):
         self.seen = kw
-        return {"kind": "evaluate", "passed": False, "status": "ok"}
+        return {"strategy_file": "s.py", "cls": kw["cls"], "product": kw["product"]}
+
+    def evaluate_run(self, ctx, run_id=None):
+        return {}
 
 
 def _gateway_evaluate(data):
-    app = gw.GatewayApp.__new__(gw.GatewayApp)
-    app.jobs = _Jobs()
-    app._run_job = lambda func, **kw: func(**kw)
-    app._shape = lambda result, view: (200, result)
-    return app, app._evaluate(data, {})
+    import tempfile
+    import threading
+    tmp = Path(tempfile.mkdtemp())
+    (tmp / "pending_strategies").mkdir()
+    paths = {"pending_dir": tmp / "pending_strategies", "results_dir": tmp / "data" / "research",
+             "approvals_file": tmp / "approvals.json", "token_file": tmp / "tok"}
+    app = gw.GatewayApp(rc.load(), paths, "t" * 40, jobs=_Jobs())
+    out = app._evaluate(data, {})
+    for t in list(threading.enumerate()):
+        if t.name.startswith("evaluate-"):
+            t.join(timeout=5)
+    return app, out
 
 
 def test_gateway_defaults_to_corn_and_forwards_product():

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -190,6 +191,7 @@ def _scrub(payload, secrets: tuple[str, ...] = ()):
 def _default_jobs() -> SimpleNamespace:
     import research_api as api
     return SimpleNamespace(data_report=api.data_report, backtest_job=api.backtest_job, gate_job=api.gate_job, evaluate_job=api.evaluate_job,
+                           evaluate_prepare=api.evaluate_prepare, evaluate_run=api.evaluate_run,
                            plateau_from_data=api.plateau_from_data)
 
 
@@ -401,6 +403,17 @@ class GatewayApp:
             return status, PlainText(f"{payload.get('report', '')}\n\n(run_id: {payload.get('run_id', '?')})")
         return status, payload
 
+    @staticmethod
+    def _job_error(exc) -> tuple[int, dict]:
+        import research_api as api
+        # 作业消息也可能带本机路径(批准记录位置之类),同样盖掉再出去。
+        message = rs.redact_paths(exc.message)
+        if exc.code == api.EXIT_TIMEOUT:
+            return 504, {"error": message}
+        if exc.code == api.EXIT_FAILED:
+            return 500, {"error": message}
+        return (403 if exc.message == api.NEEDS_APPROVAL else 400), {"error": message}
+
     def _run_job(self, func, **kwargs):
         import research_api as api
         if not self._busy.acquire(blocking=False):
@@ -408,15 +421,81 @@ class GatewayApp:
         try:
             return 200, func(**kwargs)
         except api.JobError as exc:
-            # 作业消息也可能带本机路径(批准记录位置之类),同样盖掉再出去。
-            message = rs.redact_paths(exc.message)
-            if exc.code == api.EXIT_TIMEOUT:
-                return 504, {"error": message}
-            if exc.code == api.EXIT_FAILED:
-                return 500, {"error": message}
-            return (403 if exc.message == api.NEEDS_APPROVAL else 400), {"error": message}
+            return self._job_error(exc)
         finally:
             self._busy.release()
+
+    # ---- 异步评估(Issue #84) ----
+    # 毕昇工具节点对网关的读超时硬编码 30 秒,而评估要数分钟。所以 evaluate 改成「启动即返回」:
+    # 前半段(入参、策略名、静态筛查、**批准检查**、试验预扣)在**请求线程里**同步做完,任何拒绝都以原状态码在启动前返回;
+    # 通过后才起后台线程跑慢的后半段。线程不做任何检查,也就**不可能绕过**检查。
+    # 返回码用 **200**(不是 202):毕昇的 API 工具把任何非 200 都当异常抛。
+    # 运行状态写在结果目录的 `running/` 子目录(见 research_sandbox.RUNNING_DIRNAME),最终结果与同步评估同形、写顶层。
+    def _start_evaluate(self, strategy: str, cls: str, random_runs, product: str, view):
+        import research_api as api
+        results_dir = self.paths["results_dir"]
+        if not self._busy.acquire(blocking=False):
+            return 409, {"error": "已有作业在运行,请稍后重试"}
+        started = False
+        run_id = None
+        try:
+            try:
+                ctx = self.jobs.evaluate_prepare(strategy=strategy, cls=cls, random_runs=random_runs, confirm=False,
+                                                 product=product)
+            except api.JobError as exc:
+                return self._job_error(exc)
+            run_id = rs.new_run_id()
+            try:
+                rs.write_running(results_dir, run_id, {
+                    "kind": "evaluate", "status": "running", "key": product, "strategy_file": ctx.get("strategy_file"),
+                    "started_at": datetime.fromtimestamp(self.wall()).isoformat(timespec="seconds")})
+            except OSError as exc:
+                print(f"网关内部错误: 运行状态无法登记: {exc}", file=sys.stderr)
+                return 500, {"error": "运行状态无法登记,评估未启动(试验次数已预扣,不退还)"}
+            try:
+                worker = threading.Thread(target=self._evaluate_worker, args=(ctx, run_id), name=f"evaluate-{run_id}",
+                                          daemon=True)
+                worker.start()
+            except RuntimeError as exc:
+                rs.clear_running(results_dir, run_id)
+                print(f"网关内部错误: 无法启动评估线程: {exc}", file=sys.stderr)
+                return 500, {"error": "无法启动评估线程(试验次数已预扣,不退还)"}
+            started = True                                              # 从这里起 _busy 由线程释放
+        finally:
+            if not started:
+                self._busy.release()
+        poll = f"稍后用 get_result(run_id={run_id}) 取结果;status=running 表示还在跑(通常几分钟),别重复提交。"
+        if view == "text":
+            return 200, PlainText(f"评估已启动(run_id: {run_id})。{poll}")
+        return 200, {"run_id": run_id, "status": "running", "message": poll}
+
+    def _evaluate_worker(self, ctx: dict, run_id: str) -> None:
+        import research_api as api
+        results_dir = self.paths["results_dir"]
+        try:
+            self.jobs.evaluate_run(ctx, run_id=run_id)                  # 最终结果落顶层 <run_id>.json
+            rs.clear_running(results_dir, run_id)
+        except api.JobError as exc:
+            self._finish_running(run_id, rs.redact_paths(exc.message), exc.code)
+        except Exception as exc:                                        # 兜底:任何异常都落成 error,绝不留下永久 running
+            print(f"网关内部错误(评估线程): {type(exc).__name__}: {exc}", file=sys.stderr)
+            self._finish_running(run_id, "内部错误", None)
+        finally:
+            self._busy.release()
+
+    def _finish_running(self, run_id: str, message: str, code) -> None:
+        try:
+            state = rs.load_result(run_id, self.paths["results_dir"])
+        except (rs.SandboxError, ValueError, OSError):
+            state = {"kind": "evaluate"}
+        try:
+            rs.write_running(self.paths["results_dir"], run_id, {**state, "status": "error", "error": message, "code": code})
+        except OSError as exc:
+            print(f"网关内部错误: 无法记录评估失败: {exc}", file=sys.stderr)
+
+    def recover_interrupted(self) -> list[str]:
+        """启动时调用:上个进程留下的 running 改标 interrupted(那些线程已随进程消失)。"""
+        return rs.mark_interrupted(self.paths["results_dir"])
 
     def _backtest(self, data, _params):
         strategy, cls, key, segment = (data.get(k) for k in ("strategy", "class", "key", "segment"))
@@ -456,9 +535,7 @@ class GatewayApp:
             product = "C15"
         if not isinstance(product, str) or product not in rs.PRODUCTS:
             return 400, {"error": f"product 只能是 {list(rs.PRODUCTS)}"}
-        view = _view(data)
-        return self._shape(self._run_job(self.jobs.evaluate_job, strategy=strategy, cls=cls, random_runs=random_runs, confirm=False,
-                                         product=product), view)
+        return self._start_evaluate(strategy, cls, random_runs, product, _view(data))
 
     def _results(self, _data, params):
         run_id = params["run_id"]
@@ -589,6 +666,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     app = GatewayApp(cfg, paths, token, secrets=rc.known_secret_values(
         cfg=cfg, root=rc.ROOT, label="research-gateway", token=token))
+    recovered = app.recover_interrupted()
+    if recovered:
+        print(f"上次未跑完的评估已改标 interrupted: {recovered}", file=sys.stderr)
     server = build_server(app, cfg["gateway"]["host"], cfg["gateway"]["port"])
     print(f"研究沙盒网关监听 {cfg['gateway']['host']}:{cfg['gateway']['port']}", file=sys.stderr)
     try:
