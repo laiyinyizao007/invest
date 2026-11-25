@@ -560,20 +560,38 @@ def require_clean(path: Path, cfg: dict) -> None:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
 
 
-_REPEATED_PY = re.compile(r"(?:\.py){2,}$")
+MAX_STRATEGY_NAME = 300
+
+
+def _collapse_repeated_py(name: str) -> str:
+    """把末尾连续重复的 ".py" 收成一个;**线性**(不用正则:131KB 的 ".py" 重复串上正则要 21 秒,拖住整个网关)。"""
+    end = len(name)
+    while end >= 6 and name.endswith(".py", 0, end) and name.endswith(".py", 0, end - 3):
+        end -= 3
+    return name[:end]
 
 
 def resolve_strategy(strategy: str, cfg: dict) -> Path:
     # Issue #75:毕昇流程自己会在命名节点的输出后补 ".py";命名模型偶尔违反"不带扩展名"而输出 "x.py",
-    # 拼出 "x.py.py" ⇒ 评估一次也没跑就 400。这里只把**末尾连续重复的 .py** 收成一个。
-    # 不放宽任何检查:规范化后仍走 resolve_pending 的目录/后缀/存在性三道关;批准绑定的是文件内容哈希,
-    # 不是名字,所以名字写法不影响"批的是哪份字节"。
-    if isinstance(strategy, str):
-        strategy = _REPEATED_PY.sub(".py", strategy)
+    # 拼出 "x.py.py" ⇒ 评估一次也没跑就 400。
+    # **先按原名解析**(磁盘上真有 x.py.py 就用它,绝不悄悄换成 x.py);只有原名不存在才回退到
+    # 收掉重复 .py 的名字。回退后仍走 resolve_pending 的目录/后缀/存在性三道关;批准绑定文件内容哈希。
+    # 失败时的错误信息仍写调用方给的原名。带 ":" 的名字不回退(Windows 备用数据流)。
+    pending_dir = cfg["paths"]["pending_dir"]
+    if isinstance(strategy, str) and len(strategy) > MAX_STRATEGY_NAME:
+        raise JobError(EXIT_REFUSED, "策略名过长")
     try:
-        return rs.resolve_pending(strategy, rc.ROOT, cfg["paths"]["pending_dir"])
+        return rs.resolve_pending(strategy, rc.ROOT, pending_dir)
     except rs.SandboxError as exc:
-        raise JobError(EXIT_REFUSED, str(exc))
+        original = exc
+    if isinstance(strategy, str) and ":" not in strategy:
+        collapsed = _collapse_repeated_py(strategy)
+        if collapsed != strategy:
+            try:
+                return rs.resolve_pending(collapsed, rc.ROOT, pending_dir)
+            except rs.SandboxError:
+                pass
+    raise JobError(EXIT_REFUSED, str(original))
 
 
 def data_report() -> list:

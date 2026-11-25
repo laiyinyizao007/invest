@@ -140,3 +140,47 @@ def test_an_absolute_path_outside_pending_is_still_refused_after_normalising(pen
     tree, cfg = pending_tree
     with pytest.raises(api.JobError):
         api.resolve_strategy(str(tree / "secret.py.py"), cfg)
+
+
+def test_a_literal_file_named_x_py_py_is_used_as_is_and_never_swapped_for_x_py(pending_tree):
+    """codex 复审(高):磁盘上两个文件都在时,'a.py.py' 必须解析到 a.py.py,不能悄悄换成 a.py。"""
+    tree, cfg = pending_tree
+    (tree / "pending_strategies" / "a.py").write_text("class C: pass\n", encoding="utf-8")
+    (tree / "pending_strategies" / "a.py.py").write_text("class C: pass\n", encoding="utf-8")
+    assert api.resolve_strategy("a.py.py", cfg).name == "a.py.py"
+    assert api.resolve_strategy("a.py", cfg).name == "a.py"
+
+
+def test_the_refusal_names_the_requested_strategy_not_the_collapsed_one(pending_tree):
+    _tree, cfg = pending_tree
+    with pytest.raises(api.JobError) as info:
+        api.resolve_strategy("nope.py.py", cfg)
+    assert "nope.py.py" in str(info.value)
+
+
+def test_collapsing_is_linear_and_a_huge_name_is_refused_fast(pending_tree):
+    """codex 复审(中):以前用正则,131KB 的 '.py' 重复串要 21 秒,GIL 内拖住整个网关。"""
+    import time
+    _tree, cfg = pending_tree
+    huge = ".py" * 43690 + "x"
+    start = time.perf_counter()
+    with pytest.raises(api.JobError):
+        api.resolve_strategy(huge, cfg)
+    assert time.perf_counter() - start < 1.0
+    start = time.perf_counter()
+    assert api._collapse_repeated_py(".py" * 43690) == ".py"
+    assert time.perf_counter() - start < 1.0
+
+
+@pytest.mark.parametrize("name,want", [("x", "x"), ("x.py", "x.py"), ("x.py.py", "x.py"), ("x.py.py.py", "x.py"),
+                                       (".py", ".py"), (".py.py", ".py"), ("a.pyx.py", "a.pyx.py"), ("x.PY.py", "x.PY.py")])
+def test_collapse_helper_only_touches_a_trailing_run_of_dot_py(name, want):
+    assert api._collapse_repeated_py(name) == want
+
+
+def test_a_name_with_a_colon_is_never_collapsed(pending_tree):
+    """codex 复审(低):带 ':' 的名字(Windows 备用数据流写法)不走回退。"""
+    tree, cfg = pending_tree
+    (tree / "pending_strategies" / "a.py").write_text("class C: pass\n", encoding="utf-8")
+    with pytest.raises(api.JobError):
+        api.resolve_strategy("a.py:s.py.py", cfg)
