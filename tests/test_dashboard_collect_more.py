@@ -118,18 +118,18 @@ def test_research_quota_pending_and_recent_runs(tmp_path):
         pending={"demo.py": src, "other.py": "x = 1\n"}, approvals={sha: {"name": "demo.py"}})
     r = col.collect_research(S(tmp_path), NOW)
     d = r.section["data"]
-    assert d["quota"]["used"] == 1 and d["quota"]["limit"] == 5 and d["quota"]["window_hours"] == 24
+    assert d["quota"]["used"] == 1 and d["quota"]["limit"] == 20 and d["quota"]["window_hours"] == 24
     assert d["quota"]["next_release_in_seconds"] == int(24 * 3600 - 3600)          # 只有窗口内的一条
     assert d["approvals_count"] == 1
     pend = {p["name"]: p for p in d["pending"]}
     assert pend["demo.py"]["approved"] is True and pend["other.py"]["approved"] is False and len(pend["demo.py"]["sha256"]) == 64
     run = d["recent_runs"][0]
     assert run["run_id"] == RID and run["kind"] == "evaluate" and run["passed"] is False and "未通过" in run["headline"]
-    assert r.section["state"] == "ok" and r.level == "ok" and "1/5" in r.headline
+    assert r.section["state"] == "ok" and r.level == "ok" and "1/20" in r.headline
 
 
 def test_research_full_quota_is_a_warning(tmp_path):
-    res(tmp_path, ledger=[{"at": NOW - 100 * i, "name": f"{i}.py", "sha256": "x"} for i in range(5)])
+    res(tmp_path, ledger=[{"at": NOW - 100 * i, "name": f"{i}.py", "sha256": "x"} for i in range(20)])
     r = col.collect_research(S(tmp_path), NOW)
     assert r.level == "warn" and "用尽" in r.headline
 
@@ -514,3 +514,13 @@ def test_the_run_detail_exposes_the_backtest_statistics(tmp_path):
     assert d is not None and d["stats"] is not None
     assert d["stats"]["round_trips"] == 78 and d["stats"]["sharpe"] == 1.2
     assert d["metrics"] is None
+
+
+@pytest.mark.parametrize("bad", [9999, 0, "20", True, 20.5, None])
+def test_research_panel_rejects_a_cap_the_gateway_would_refuse_to_boot_with(tmp_path, bad):
+    res(tmp_path, ledger=[])
+    cfg = tmp_path / "config" / "research_sandbox.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"iteration": {"max_iterations": bad, "window_hours": 24}}), encoding="utf-8")
+    r = col.collect_research(S(tmp_path), NOW)
+    assert r.section["state"] == "corrupt" and r.headline == "配置损坏"

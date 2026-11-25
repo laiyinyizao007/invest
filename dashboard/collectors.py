@@ -734,7 +734,7 @@ MAX_PENDING_LISTED = 50              # 待审候选最多列出多少个
 
 def _research_cfg(settings: Settings) -> tuple[dict, str | None]:
     """沙盒配置里的额度与路径。配置文件缺失用默认值(沙盒按默认运行);损坏返回错误。"""
-    defaults = {"iteration": {"max_iterations": 5, "window_hours": 24},
+    defaults = {"iteration": {"max_iterations": 20, "window_hours": 24},
                 "paths": {"pending_dir": "pending_strategies", "results_dir": "data/research", "approvals_file": "data/research-control/approvals.json"}}
     raw, err = m.read_json(settings.paths["research_config"])
     if err == "missing":
@@ -742,6 +742,9 @@ def _research_cfg(settings: Settings) -> tuple[dict, str | None]:
     if err or not isinstance(raw, dict):
         return defaults, "corrupt"
     it = raw.get("iteration") if isinstance(raw.get("iteration"), dict) else {}
+    cap = it.get("max_iterations", defaults["iteration"]["max_iterations"])
+    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 50:
+        return defaults, "corrupt"          # 与网关同口径(整数且 ∈ [1,50]):网关会拒绝启动的值,面板不能照显示成额度(Issue #80 codex 复核)
     pa = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
     return {"iteration": {**defaults["iteration"], **it}, "paths": {**defaults["paths"], **pa}}, None
 

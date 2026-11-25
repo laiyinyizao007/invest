@@ -1037,3 +1037,15 @@ def test_array_manager_misuse_is_rejected_before_any_quota_or_trial(tmp_path):
     assert not (tmp_path / "pending_strategies" / "bad.py").exists()
     assert not (tmp_path / "data" / "research" / "submissions.jsonl").exists()     # 提交额度没动
     assert _trial_total(tmp_path) == 0                                             # 试验账本没动
+
+
+def test_shipped_default_allows_twenty_submissions_then_refuses_the_twenty_first(tmp_path):
+    """Issue #80:出厂上限 20/24h;第 21 个被 429 拒绝(不是无限)。"""
+    app = make_app(tmp_path)        # 不覆盖 iteration:用配置文件里出厂的值
+
+    assert app.cfg["iteration"]["max_iterations"] == 20
+    for i in range(20):
+        assert submit(app, f"b{i}.py")[0] == 200
+    status, body = submit(app, "b20.py")
+
+    assert status == 429 and "最多提交 20" in body["error"]
