@@ -1272,3 +1272,21 @@ def test_am_findings_are_capped_and_deduplicated_by_name():
 def test_am_rule_rejects_private_names_but_not_dunders():
     src = _am_src("    def on_init(self):\n        self.am = ArrayManager()\n", "        x = self.am._buf\n")
     assert _am_findings(rs.screen_source(src))
+
+
+def test_am_rule_is_scoped_per_class_and_per_module_origin():
+    other_class = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\n"
+                   "class A(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n"
+                   "class B(CtaTemplate):\n    def on_init(self):\n        self.am = Mine()\n"
+                   "    def on_bar(self, bar):\n        x = self.am.label\n")
+    assert not _am_findings(rs.screen_source(other_class))             # A 的证据不牵连 B
+    unrelated_attr = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\nclass Config:\n    am = 5\n"
+                      "class S(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n"
+                      "    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert _am_findings(rs.screen_source(unrelated_attr))              # 别的类的类属性 am 不让它失效
+    foreign = ("from mymod import ArrayManager\nclass S:\n    def on_init(self):\n        self.am = ArrayManager()\n"
+               "    def on_bar(self, bar):\n        x = self.am.custom(3)\n")
+    assert not _am_findings(rs.screen_source(foreign))                 # 非 vnpy 来源的同名类不算
+    dotted = ("import vnpy_ctastrategy.template\nclass S:\n    def on_init(self):\n"
+              "        self.am = vnpy_ctastrategy.template.ArrayManager()\n    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert _am_findings(rs.screen_source(dotted))

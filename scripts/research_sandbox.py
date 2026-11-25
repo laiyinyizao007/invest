@@ -3166,12 +3166,14 @@ def _am_constructors(tree: ast.AST) -> set[str]:
         if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ArrayManager":
             return set()
         if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name == "ArrayManager":
-                    names.add(alias.asname or alias.name)
+            if (node.module or "").split(".")[0].startswith("vnpy"):          # 别的模块里的同名类不算
+                for alias in node.names:
+                    if alias.name == "ArrayManager":
+                        names.add(alias.asname or alias.name)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                names.add((alias.asname or alias.name.split(".")[0]) + ".ArrayManager")
+                if alias.name.split(".")[0].startswith("vnpy"):
+                    names.add((alias.asname or alias.name) + ".ArrayManager")
     return names
 
 
@@ -3187,11 +3189,37 @@ def _is_am_construct(value: ast.AST | None, ctors: set[str]) -> bool:
     if isinstance(func, ast.Name):
         return func.id in ctors
     if isinstance(func, ast.Attribute) and func.attr == "ArrayManager":
-        return isinstance(func.value, ast.Name) and f"{func.value.id}.ArrayManager" in ctors
+        parts: list[str] = []
+        base: ast.AST = func.value
+        while isinstance(base, ast.Attribute):
+            parts.append(base.attr)
+            base = base.value
+        if not isinstance(base, ast.Name):
+            return False
+        parts.append(base.id)
+        return ".".join(reversed(parts)) + ".ArrayManager" in ctors
     return False
 
 
 def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
+    """逐个类单独判定(codex 复核 Medium:证据与读取若跨类共用,A 类的 `self.am = ArrayManager()` 会让 B 类
+    自己的 `self.am` 被误拒;别的类里的类属性 `am` 也不该让规则整份失效)。"""
+    ctors = _am_constructors(tree)
+    if not ctors:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for finding_name, line in _screen_am_scope(node, ctors):
+                if finding_name not in seen and len(out) < MAX_AM_FINDINGS:
+                    seen.add(finding_name)
+                    out.append(f"第 {line} 行: self.am.{finding_name} 不存在(ArrayManager 没有这个成员,评估时会 AttributeError)。"
+                               "区间最高/最低价请用 self.am.donchian(n)(返回上轨、下轨);可用指标:sma/ema/rsi/atr/boll/donchian/std 等")
+    return out
+
+
+def _screen_am_scope(tree: ast.AST, ctors: set[str]) -> list[tuple[str, int]]:
     """`self.am.<名字>` 的名字必须是 ArrayManager 的真实成员。只收紧、不放松:多拒一类**确定会报错**的写法。
 
     **要有正面证据才生效**(codex 对 PR #78 的 Medium 1/2):文件里至少有一处 `self.am = ArrayManager(...)`
@@ -3199,9 +3227,6 @@ def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
     (元组解包、for/with 目标、增量赋值、类属性 `am = ...`、赋成别的对象)、或文件自己定义了 `ArrayManager`、
     或没有任何赋值(可能继承自基类)⇒ 整条规则让路。让路的代价只是这类候选回到"评估时才报错",
     不会漏掉任何别的筛查(本函数只追加 finding)。"""
-    ctors = _am_constructors(tree)
-    if not ctors:
-        return []
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):            # 类属性 `am = ...`:self.am 可能来自它
             for stmt in node.body:
@@ -3227,18 +3252,9 @@ def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
             return []
     if not saw_construct:
         return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and _is_self_am(node.value) \
-                and node.attr not in ARRAY_MANAGER_MEMBERS and not (node.attr.startswith("__") and node.attr.endswith("__")) \
-                and node.attr not in seen:
-            seen.add(node.attr)
-            out.append(f"第 {node.lineno} 行: self.am.{node.attr} 不存在(ArrayManager 没有这个成员,评估时会 AttributeError)。"
-                       "区间最高/最低价请用 self.am.donchian(n)(返回上轨、下轨);可用指标:sma/ema/rsi/atr/boll/donchian/std 等")
-            if len(out) >= MAX_AM_FINDINGS:
-                break
-    return out
+    return [(n.attr, n.lineno) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and _is_self_am(n.value)
+            and n.attr not in ARRAY_MANAGER_MEMBERS and not (n.attr.startswith("__") and n.attr.endswith("__"))]
 
 
 def _screen_key_usage(tree: ast.AST) -> list[str]:
