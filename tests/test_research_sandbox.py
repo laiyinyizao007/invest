@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 from datetime import datetime
 from types import ModuleType, SimpleNamespace
 
@@ -1158,3 +1159,18 @@ def test_container_image_copies_every_project_module_the_research_scripts_import
                 missing.append(f"{mod}(被 {path.name} 用到)")
     assert not missing, "docker/research/Dockerfile 没有复制这些研究侧要用的模块:" + "; ".join(sorted(set(missing)))
     assert "dashboard/safe.py" in docker and "notify/redact.py" in docker      # 本次回归的两个文件,点名钉住
+
+
+def test_gateway_compose_mounts_the_ledger_anchor_dir_where_the_ledgers_expect_it():
+    """Issue #73:锚点放在 <账本目录的上一级>/ledger_anchor/。网关容器根文件系统只读,
+    不挂载 /app/data/ledger_anchor 就写不了(试验账本)也读不到(批准账本)⇒ 新镜像读非空账本即 fail-closed。"""
+    import re
+    compose = (Path(__file__).resolve().parent.parent / "docker-compose.research.yml").read_text(encoding="utf-8")
+    mounts = re.findall(r"^\s*-\s*(\S+):(/app/\S+?)(?::ro)?\s*$", compose, flags=re.M)
+    targets = {dest for _src, dest in mounts}
+    assert "/app/data/research" in targets and "/app/data/research-control" in targets
+    assert "/app/data/ledger_anchor" in targets
+    anchor = [(src, dest) for src, dest in mounts if dest == "/app/data/ledger_anchor"][0]
+    assert anchor[0].endswith("data/ledger_anchor")
+    line = [ln for ln in compose.splitlines() if "/app/data/ledger_anchor" in ln and ln.lstrip().startswith("-")][0]
+    assert not line.rstrip().endswith(":ro")                 # 容器要写自己的试验账本锚点
