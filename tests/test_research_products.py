@@ -108,3 +108,35 @@ def test_openapi_enum_equals_the_whitelist():
     spec = json.loads((ROOT / "docs" / "research-gateway.openapi.json").read_text(encoding="utf-8"))
     schema = spec["paths"]["/research/evaluate"]["post"]["requestBody"]["content"]["application/json"]["schema"]
     assert set(schema["properties"]["product"]["enum"]) == set(rs.PRODUCTS)
+
+
+# ---------------------------------------------------------------------------
+# Issue #75:命名节点偶尔输出带 .py 的名字,流程又补一个 .py ⇒ "x.py.py"
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def pending_tree(tmp_path, monkeypatch):
+    (tmp_path / "pending_strategies").mkdir()
+    (tmp_path / "pending_strategies" / "x.py").write_text("class C: pass\n", encoding="utf-8")
+    (tmp_path / "secret.py").write_text("SECRET = 1\n", encoding="utf-8")
+    monkeypatch.setattr(api.rc, "ROOT", tmp_path)
+    return tmp_path, {"paths": {"pending_dir": "pending_strategies"}}
+
+
+@pytest.mark.parametrize("name", ["x.py", "x.py.py", "x.py.py.py", "pending_strategies/x.py.py"])
+def test_a_repeated_py_suffix_resolves_to_the_same_file(pending_tree, name):
+    tree, cfg = pending_tree
+    assert api.resolve_strategy(name, cfg) == (tree / "pending_strategies" / "x.py").resolve()
+
+
+@pytest.mark.parametrize("name", ["x", "../secret.py", "../secret.py.py", "nope.py.py", "x.txt", "x.pyc.py.py", ".py.py"])
+def test_normalising_the_suffix_does_not_loosen_any_other_check(pending_tree, name):
+    _tree, cfg = pending_tree
+    with pytest.raises(api.JobError):
+        api.resolve_strategy(name, cfg)
+
+
+def test_an_absolute_path_outside_pending_is_still_refused_after_normalising(pending_tree):
+    tree, cfg = pending_tree
+    with pytest.raises(api.JobError):
+        api.resolve_strategy(str(tree / "secret.py.py"), cfg)

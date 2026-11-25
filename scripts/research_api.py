@@ -560,7 +560,16 @@ def require_clean(path: Path, cfg: dict) -> None:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
 
 
+_REPEATED_PY = re.compile(r"(?:\.py){2,}$")
+
+
 def resolve_strategy(strategy: str, cfg: dict) -> Path:
+    # Issue #75:毕昇流程自己会在命名节点的输出后补 ".py";命名模型偶尔违反"不带扩展名"而输出 "x.py",
+    # 拼出 "x.py.py" ⇒ 评估一次也没跑就 400。这里只把**末尾连续重复的 .py** 收成一个。
+    # 不放宽任何检查:规范化后仍走 resolve_pending 的目录/后缀/存在性三道关;批准绑定的是文件内容哈希,
+    # 不是名字,所以名字写法不影响"批的是哪份字节"。
+    if isinstance(strategy, str):
+        strategy = _REPEATED_PY.sub(".py", strategy)
     try:
         return rs.resolve_pending(strategy, rc.ROOT, cfg["paths"]["pending_dir"])
     except rs.SandboxError as exc:
