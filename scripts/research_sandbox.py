@@ -3669,6 +3669,13 @@ def prune_running(directory: Path, now: float | None = None, max_age: float = PR
         return 0
     now = time.time() if now is None else now
     removed = 0
+    for path in folder.glob("*.tmp"):                       # 原子写被打断时遗留的临时文件:过期就清(它从来不是状态)
+        try:
+            if now - path.stat().st_mtime >= max_age:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
     for path in folder.glob("*.json"):
         try:
             if now - path.stat().st_mtime < max_age:
@@ -3686,8 +3693,12 @@ def acquire_results_lock(directory: Path):
     """网关进程对结果目录的**排他锁**(整个进程生命周期持有,返回要保持引用的句柄)。
     拿不到 ⇒ 抛 SandboxError:同一目录上有第二个网关实例,单作业锁与「遗留 running 必为已死」都会失效,宁可拒绝启动。
     只有拿到这把锁之后才允许调 mark_interrupted(此时不可能还有别的进程的线程在跑)。"""
-    directory.mkdir(parents=True, exist_ok=True)
-    handle = open(directory / ".gateway.lock", "a+b")             # noqa: SIM115 - 句柄要活到进程结束
+    import errno
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(directory / ".gateway.lock", "a+b")         # noqa: SIM115 - 句柄要活到进程结束
+    except OSError as exc:                                        # 目录不可写等:如实报,别说成「被占用」
+        raise SandboxError(f"无法在结果目录建立网关锁文件(拒绝启动): {type(exc).__name__}") from exc
     try:
         if os.name == "nt":
             import msvcrt
@@ -3698,7 +3709,9 @@ def acquire_results_lock(directory: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         handle.close()
-        raise SandboxError("结果目录已被另一个网关实例占用(拒绝启动:否则单作业锁与中断标记都不可信)") from exc
+        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK, getattr(errno, "EWOULDBLOCK", errno.EAGAIN)):
+            raise SandboxError("结果目录已被另一个网关实例占用(拒绝启动:否则单作业锁与中断标记都不可信)") from exc
+        raise SandboxError(f"网关锁文件无法加锁(拒绝启动): errno={exc.errno}") from exc
     return handle
 
 

@@ -195,6 +195,21 @@ def _default_jobs() -> SimpleNamespace:
                            plateau_from_data=api.plateau_from_data)
 
 
+class _ReleaseOnce:
+    """单作业锁的**幂等**释放:请求线程与工作线程都可能调它,只有第一次真的释放
+    (codex 复核:双重释放会让锁在评估还在跑时空出来;此前的「标志」方案在标记与启动之间有窗口)。"""
+
+    def __init__(self, lock):
+        self._lock, self._guard, self._done = lock, threading.Lock(), False
+
+    def release(self) -> None:
+        with self._guard:
+            if self._done:
+                return
+            self._done = True
+        self._lock.release()
+
+
 class GatewayApp:
     """纯逻辑的请求处理(不涉及 socket),便于单测。"""
 
@@ -436,6 +451,7 @@ class GatewayApp:
         results_dir = self.paths["results_dir"]
         if not self._busy.acquire(blocking=False):
             return 409, {"error": "已有作业在运行,请稍后重试"}
+        once = _ReleaseOnce(self._busy)
         started = False
         run_id = None
         try:
@@ -453,13 +469,12 @@ class GatewayApp:
             except OSError as exc:
                 print(f"网关内部错误: 运行状态无法登记: {exc}", file=sys.stderr)
                 return 500, {"error": "运行状态无法登记,评估未启动(试验次数已预扣,不退还)"}
-            worker = threading.Thread(target=self._evaluate_worker, args=(ctx, run_id), name=f"evaluate-{run_id}",
+            worker = threading.Thread(target=self._evaluate_worker, args=(ctx, run_id, once), name=f"evaluate-{run_id}",
                                       daemon=True)
-            started = True            # **先**标记再启动:线程一启动就可能自己释放锁,标记若在启动之后,中间出异常会双重释放(codex #1)
             try:
                 worker.start()
+                started = True                                          # 线程已起来:释放归它;两边共用幂等释放,最坏也只释放一次
             except BaseException as exc:
-                started = False       # 线程没起来 ⇒ 锁由 finally 释放
                 rs.clear_running(results_dir, run_id)
                 if not isinstance(exc, RuntimeError):
                     raise
@@ -467,13 +482,13 @@ class GatewayApp:
                 return 500, {"error": "无法启动评估线程(试验次数已预扣,不退还)"}
         finally:
             if not started:
-                self._busy.release()
+                once.release()
         poll = f"稍后用 get_result(run_id={run_id}) 取结果;status=running 表示还在跑(通常几分钟),别重复提交。"
         if view == "text":
             return 200, PlainText(f"评估已启动(run_id: {run_id})。{poll}")
         return 200, {"run_id": run_id, "status": "running", "message": poll}
 
-    def _evaluate_worker(self, ctx: dict, run_id: str) -> None:
+    def _evaluate_worker(self, ctx: dict, run_id: str, once: _ReleaseOnce) -> None:
         import research_api as api
         results_dir = self.paths["results_dir"]
         try:
@@ -485,7 +500,7 @@ class GatewayApp:
             print(f"网关内部错误(评估线程): {type(exc).__name__}: {exc}", file=sys.stderr)
             self._finish_running(run_id, "内部错误", None)
         finally:
-            self._busy.release()
+            once.release()
 
     def _finish_running(self, run_id: str, message: str, code) -> None:
         try:

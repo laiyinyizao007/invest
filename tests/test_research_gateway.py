@@ -1283,3 +1283,42 @@ def test_a_corrupt_running_file_is_a_clear_500_not_an_unhandled_error(tmp_path):
     status, body = call(app, "GET", "/research/results/20261125-100000-000009")
 
     assert status == 500 and "无法解析" in body["error"]
+
+
+def test_release_once_releases_the_lock_a_single_time_even_when_called_by_both_sides():
+    import threading
+    lock = threading.Lock()
+    lock.acquire()
+    once = gw._ReleaseOnce(lock)
+
+    once.release()
+    once.release()                       # 第二次是空操作,不抛 "release unlocked lock",也不会放掉别人拿到的锁
+    assert lock.acquire(blocking=False)  # 此刻别人合法拿到了锁
+    once.release()                       # 迟到的第三次调用不得把它放掉
+    assert not lock.acquire(blocking=False)
+
+
+def test_results_lock_reports_an_unwritable_directory_as_such_not_as_another_instance(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+
+    with pytest.raises(rs.SandboxError) as err:
+        rs.acquire_results_lock(blocker / "sub")      # 父路径是个文件:建目录/建锁文件必失败
+
+    assert "另一个网关实例" not in str(err.value) and "无法在结果目录建立网关锁文件" in str(err.value)
+
+
+def test_prune_also_clears_stale_tmp_files_but_keeps_fresh_ones(tmp_path):
+    import os
+    import time as _t
+    folder = tmp_path / "running"
+    folder.mkdir()
+    stale, fresh = folder / "a.tmp", folder / "b.tmp"
+    stale.write_text("x", encoding="utf-8")
+    fresh.write_text("x", encoding="utf-8")
+    old = _t.time() - 30 * 24 * 3600
+    os.utime(stale, (old, old))
+
+    rs.prune_running(tmp_path)
+
+    assert not stale.exists() and fresh.exists()
