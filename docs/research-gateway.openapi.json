@@ -239,7 +239,7 @@
     "/research/results/{run_id}": {
       "get": {
         "operationId": "get_result",
-        "summary": "读取一次回测或门槛评估的完整结果。",
+        "summary": "读取一次回测或门槛评估的完整结果。评估还没跑完时返回 status=running;失败为 status=error(含原因);网关重启打断为 status=interrupted(试验次数已预扣,不退还)。",
         "parameters": [
           {
             "name": "run_id",
@@ -263,7 +263,7 @@
     "/research/evaluate": {
       "post": {
         "operationId": "run_evaluate",
-        "summary": "选参 + 晋级门槛评估(推荐):候选类须声明 param_grid(恰好三个策略参数,各至少 3 个递增数值,且参数名须出现在类的 parameters 列表里)。服务端先在选参窗口(止于 2022-06-30)扫网格、邻域平滑选参并判定参数高原,再用选出的参数在其后的滚动验证窗口上做完整门槛评估,两段数据不重叠。风控参数(risk_budget 等)不得进入网格。仅运行已被人批准的代码。",
+        "summary": "选参 + 晋级门槛评估(推荐):候选类须声明 param_grid(恰好三个策略参数,各至少 3 个递增数值,且参数名须出现在类的 parameters 列表里)。服务端先在选参窗口(止于 2022-06-30)扫网格、邻域平滑选参并判定参数高原,再用选出的参数在其后的滚动验证窗口上做完整门槛评估,两段数据不重叠。风控参数(risk_budget 等)不得进入网格。仅运行已被人批准的代码。**异步**:本接口在批准检查、静态筛查、试验预扣都通过后**立即返回** {run_id, status:running},评估在后台跑(通常几分钟);用 get_result(run_id) 取结果,status 为 running 表示还在跑,别重复提交。",
         "requestBody": {
           "required": true,
           "content": {
@@ -307,7 +307,7 @@
         },
         "responses": {
           "200": {
-            "description": "passed、failures、params(选出的参数)、selection(选参摘要:有效格子数、是否在高原)、metrics、windows、diagnosis;候选自身出错时 status=strategy_error 及 error"
+            "description": "已启动:run_id、status=running(注意是 200 不是 202:毕昇工具层把非 200 都当异常)。最终结果见 get_result(run_id):passed、failures、params(选出的参数)、selection(选参摘要:有效格子数、是否在高原)、metrics、windows、diagnosis;候选自身出错时 status=strategy_error 及 error"
           },
           "403": {
             "description": "代码尚未被人批准"

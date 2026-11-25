@@ -1661,3 +1661,39 @@ def test_the_three_model_visible_channels_share_one_secret_list(tmp_path, monkey
     assert token in gateway_list
     # 同一份清单本体:函数是同一个,不是各写一份。
     assert gw.rc.known_secret_values is api.rc.known_secret_values
+
+
+# ---------- Issue #84:evaluate 拆成「同步前半段 prepare」+「慢的后半段 run」 ----------
+
+def test_evaluate_prepare_does_every_check_and_charge_before_anything_slow(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda *a, **k: pytest.fail("prepare 不得起子进程"))
+
+    with pytest.raises(api.JobError) as err:                               # 未批准:前半段就拒,不预扣
+        api.evaluate_prepare(strategy="s.py", cls="S")
+    assert err.value.message == api.NEEDS_APPROVAL
+    assert not (tree / "data" / "research" / "trials.jsonl").exists()
+
+    ctx = api.evaluate_prepare(strategy="s.py", cls="S", confirm=True)     # 批准后:检查通过并预扣最小网格
+    assert ctx["product"] == "C15" and ctx["strategy_file"] == "s.py"
+    assert api.total_trials(api.trials_path(ctx["paths"])) == api.MIN_GRID_CELLS
+
+
+def test_evaluate_run_keeps_the_preassigned_run_id(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"passed": False, "failures": ["x"], "params": {}, "selection": {}, "metrics": {}})
+    ctx = api.evaluate_prepare(strategy="s.py", cls="S", confirm=True)
+
+    result = api.evaluate_run(ctx, run_id="20261125-120000-000009")
+
+    assert result["run_id"] == "20261125-120000-000009"
+    assert (tree / "data" / "research" / "20261125-120000-000009.json").exists()
+
+
+def test_evaluate_run_rejects_an_unsafe_run_id(tree, monkeypatch):
+    make_strategy(tree)
+    monkeypatch.setattr(api, "spawn_child", lambda cmd, timeout: {"passed": False, "failures": [], "params": {}, "selection": {}, "metrics": {}})
+    ctx = api.evaluate_prepare(strategy="s.py", cls="S", confirm=True)
+
+    with pytest.raises(api.rs.SandboxError):
+        api.evaluate_run(ctx, run_id="../escape")

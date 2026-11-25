@@ -3626,9 +3626,121 @@ def _approvals_lock_message(approvals_file, exc: chain.LedgerChainError) -> str:
 _ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def save_result(result: dict, directory: Path, now: datetime | None = None) -> str:
+def new_run_id(now: datetime | None = None) -> str:
+    return (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+
+
+# 异步评估(Issue #84):运行中/失败/被中断的状态放在结果目录下的**子目录**里,不放进 `*.json` 的结果清单:
+# 反馈、看板、`list_results` 都只看顶层 `*.json`,于是它们对「还没跑完」的东西**完全不可见**,不会把未完成当成结果或损坏。
+# 只有跑完的最终结果才写成顶层 `<run_id>.json`(与同步评估产出的完全同形)。
+RUNNING_DIRNAME = "running"
+
+
+def _running_path(directory: Path, run_id: str) -> Path:
+    if not _ID.match(run_id or ""):
+        raise SandboxError(f"非法的 run_id: {run_id!r}")
+    return directory / RUNNING_DIRNAME / f"{run_id}.json"
+
+
+def write_running(directory: Path, run_id: str, state: dict) -> None:
+    """原子写入运行状态(running/error/interrupted)。run_id 以参数为准,不信 state 里带的。"""
+    path = _running_path(directory, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({**state, "run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def clear_running(directory: Path, run_id: str) -> None:
+    """最终结果已落盘后撤掉运行状态。删不掉也无妨(读侧顶层结果优先),所以不抛错。"""
+    try:
+        _running_path(directory, run_id).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+PRUNE_AFTER_SECONDS = 14 * 24 * 3600
+
+
+def prune_running(directory: Path, now: float | None = None, max_age: float = PRUNE_AFTER_SECONDS) -> int:
+    """清掉超过 max_age 的**终态**(error/interrupted)运行状态,免得 `running/` 无限增长;**绝不动 running**。"""
+    folder = directory / RUNNING_DIRNAME
+    if not folder.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    removed = 0
+    for path in folder.glob("*.tmp"):                       # 原子写被打断时遗留的临时文件:过期就清(它从来不是状态)
+        try:
+            if now - path.stat().st_mtime >= max_age:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    for path in folder.glob("*.json"):
+        try:
+            if now - path.stat().st_mtime < max_age:
+                continue
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(state, dict) and state.get("status") in ("error", "interrupted"):
+                path.unlink()
+                removed += 1
+        except (OSError, ValueError):
+            continue
+    return removed
+
+
+def acquire_results_lock(directory: Path):
+    """网关进程对结果目录的**排他锁**(整个进程生命周期持有,返回要保持引用的句柄)。
+    拿不到 ⇒ 抛 SandboxError:同一目录上有第二个网关实例,单作业锁与「遗留 running 必为已死」都会失效,宁可拒绝启动。
+    只有拿到这把锁之后才允许调 mark_interrupted(此时不可能还有别的进程的线程在跑)。"""
+    import errno
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle = open(directory / ".gateway.lock", "a+b")         # noqa: SIM115 - 句柄要活到进程结束
+    except OSError as exc:                                        # 目录不可写等:如实报,别说成「被占用」
+        raise SandboxError(f"无法在结果目录建立网关锁文件(拒绝启动): {type(exc).__name__}") from exc
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK, getattr(errno, "EWOULDBLOCK", errno.EAGAIN)):
+            raise SandboxError("结果目录已被另一个网关实例占用(拒绝启动:否则单作业锁与中断标记都不可信)") from exc
+        raise SandboxError(f"网关锁文件无法加锁(拒绝启动): errno={exc.errno}") from exc
+    return handle
+
+
+def mark_interrupted(directory: Path) -> list[str]:
+    """网关启动时调用(**须已持有 acquire_results_lock**):上一个进程留下的 `running` 不可能还有工作线程在跑,改标 `interrupted`。
+    坏文件跳过(不让一个坏文件挡住启动)。返回被改标的 run_id。试验已在启动前预扣,账本只增不减。"""
+    marked: list[str] = []
+    folder = directory / RUNNING_DIRNAME
+    if not folder.is_dir():
+        return marked
+    for path in sorted(folder.glob("*.json")):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict) or state.get("status") != "running" or not _ID.match(path.stem):
+                continue
+            write_running(directory, path.stem, {**state, "status": "interrupted",
+                                                 "message": "网关重启时这次评估还没跑完,已中断;试验次数已预扣,不退还"})
+            marked.append(path.stem)
+        except (OSError, ValueError):
+            continue
+    return marked
+
+
+def save_result(result: dict, directory: Path, now: datetime | None = None, run_id: str | None = None) -> str:
     directory.mkdir(parents=True, exist_ok=True)
-    run_id = (now or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+    if run_id is None:
+        run_id = new_run_id(now)
+    elif not _ID.match(run_id):
+        raise SandboxError(f"非法的 run_id: {run_id!r}")
     path = directory / f"{run_id}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps({**result, "run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3641,6 +3753,9 @@ def load_result(run_id: str, directory: Path) -> dict:
         raise SandboxError(f"非法的 run_id: {run_id!r}")
     path = directory / f"{run_id}.json"
     if not path.is_file():
+        running = _running_path(directory, run_id)          # 还没跑完/失败/被中断:读运行状态(顶层最终结果始终优先)
+        if running.is_file():
+            return json.loads(running.read_text(encoding="utf-8"))
         raise SandboxError(f"没有这条结果: {run_id}")
     return json.loads(path.read_text(encoding="utf-8"))
 

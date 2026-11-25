@@ -911,3 +911,52 @@ def test_server_still_serves_outside_the_dedicated_home_but_says_so(tmp_path):
 def test_deployment_treats_js_undefined_as_missing(value):
     """模板写的是 `process.env.DSH_HOME`(守卫不许字面量兜底):日常 Desktop 没设它时,DSH 传来的是字符串 "undefined"。"""
     assert "没有 DSH_HOME" in mcp_server.deployment_problem({"DSH_HOME": value})
+
+
+# ---------- 异步评估(Issue #84):工作流只回 run_id,结果由 research_status 按 run_id 取 ----------
+
+def _async_session(clean_state, monkeypatch, tmp_path, start_text="评估已启动(run_id: 20261125-100000-000001)。稍后用 get_result 取结果。"):
+    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+                                        "waiting_node": "input_wait", "waiting_message_id": 12,
+                                        "last_outputs": [], "failures": []}})
+    monkeypatch.setattr(mcp_server, "approval_state", lambda session: (True, ""))
+    monkeypatch.setattr(mcp_server, "invoke", lambda **kw: {"session_id": "s1", "events": [
+        {"event": "output_msg", "node_id": "output_result", "output_schema": {"message": start_text}}]})
+    monkeypatch.setattr(mcp_server.rc, "resolve_paths", lambda cfg, root: {"results_dir": tmp_path})
+
+
+def test_status_follows_the_async_evaluation_by_run_id(clean_state, monkeypatch, tmp_path):
+    _async_session(clean_state, monkeypatch, tmp_path)
+    rid = "20261125-100000-000001"
+
+    out = mcp_server._research_status()                       # 刚启动:结果文件还不存在
+    assert "结果还没有出现" in out
+    assert json.loads(mcp_server.STATE_FILE.read_text(encoding="utf-8"))["current"]["eval_run_id"] == rid
+
+    mcp_server.rs.write_running(tmp_path, rid, {"kind": "evaluate", "status": "running"})
+    assert "仍在运行" in mcp_server._research_status()
+
+    mcp_server.rs.save_result({"kind": "evaluate", "report": "结论: 未通过(4 项未过)"}, tmp_path, run_id=rid)
+    out = mcp_server._research_status()
+    assert "评估 " + rid + " 完成" in out and "结论: 未通过" in out
+
+
+@pytest.mark.parametrize("status, word", [("error", "失败"), ("interrupted", "打断")])
+def test_status_reports_failed_or_interrupted_async_evaluation(clean_state, monkeypatch, tmp_path, status, word):
+    _async_session(clean_state, monkeypatch, tmp_path)
+    rid = "20261125-100000-000001"
+    mcp_server.rs.write_running(tmp_path, rid, {"kind": "evaluate", "status": status, "error": "超过 600s,已终止", "message": "x"})
+
+    out = mcp_server._research_status()
+
+    assert word in out and rid in out
+
+
+def test_status_ignores_a_malformed_run_id_from_the_workflow_output(clean_state, monkeypatch, tmp_path):
+    _async_session(clean_state, monkeypatch, tmp_path, start_text="评估已启动(run_id: ../../etc/passwd)")
+    (tmp_path.parent / "passwd.json").write_text('{"status": "running"}', encoding="utf-8")
+
+    out = mcp_server._research_status()
+
+    assert "评估 " not in out
+    assert "eval_run_id" not in json.loads(mcp_server.STATE_FILE.read_text(encoding="utf-8"))["current"]
