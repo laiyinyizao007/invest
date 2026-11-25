@@ -19,17 +19,28 @@ FLOW_ID = "1194f8540b9944fea4353b07f0493cbf"
 def apply_prompt_blocks(data: dict) -> list[str]:
     """原地修改工作流 data,返回改了哪些。纯函数(不连毕昇),便于单测。"""
     changed: list[str] = []
-    targets = {"llm_name": pb.name_user_prompt(), "llm_code": pb.code_user_prompt()}
+    user = {"llm_name": pb.name_user_prompt(), "llm_code": pb.code_user_prompt()}
+    rule = {"llm_name": pb.NAME_RULE_TEXT, "llm_code": pb.RULE_TEXT}
+    seen: set[tuple[str, str]] = set()
     for n in data["nodes"]:
         d = n["data"]
+        if d["id"] not in user:
+            continue
         for grp in d["group_params"]:
             for p in grp["params"]:
-                if d["id"] in targets and p["key"] == "user_prompt" and p["value"] != targets[d["id"]]:
-                    p["value"] = targets[d["id"]]
-                    changed.append(f"{d['id']}.user_prompt")
-                if d["id"] == "llm_code" and p["key"] == "system_prompt" and pb.RULE_MARK not in p["value"]:
-                    p["value"] = p["value"].rstrip() + pb.RULE_TEXT
-                    changed.append("llm_code.system_prompt")
+                if p["key"] == "user_prompt":
+                    seen.add((d["id"], "user_prompt"))
+                    if p["value"] != user[d["id"]]:
+                        p["value"] = user[d["id"]]
+                        changed.append(f"{d['id']}.user_prompt")
+                elif p["key"] == "system_prompt":
+                    seen.add((d["id"], "system_prompt"))
+                    if pb.RULE_MARK not in p["value"]:
+                        p["value"] = p["value"].rstrip() + rule[d["id"]]
+                        changed.append(f"{d['id']}.system_prompt")
+    missing = {(n, k) for n in user for k in ("user_prompt", "system_prompt")} - seen
+    if missing:                                                   # 节点或参数改名/丢失时不能静默无操作
+        raise ValueError(f"工作流里找不到这些节点参数,拒绝在不完整的流上打补丁: {sorted(missing)}")
     return changed
 
 

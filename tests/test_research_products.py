@@ -218,7 +218,7 @@ def _flow(feedback_has_product=False):
 
     fb = [p("product")] if feedback_has_product else []
     return {"nodes": [
-        node("llm_name", [p("user_prompt", "旧提示词")]),
+        node("llm_name", [p("user_prompt", "旧提示词"), p("system_prompt", "你是命名助手。")]),
         node("llm_code", [p("user_prompt", "旧提示词"), p("system_prompt", "你是量化研究员,为玉米(DCE)期货 15 分钟线写策略。")]),
         node("tool_feedback", fb),
         node("tool_eval", [p("strategy"), p("class"), p("random_runs"), p("view")]),
@@ -258,8 +258,9 @@ def test_every_variable_reference_in_the_prompts_is_a_known_flow_output():
 def test_apply_prompt_blocks_is_minimal_and_idempotent():
     flow = _flow()
     first = ppb.apply_prompt_blocks(flow)
-    assert sorted(first) == ["llm_code.system_prompt", "llm_code.user_prompt", "llm_name.user_prompt"]
+    assert sorted(first) == ["llm_code.system_prompt", "llm_code.user_prompt", "llm_name.system_prompt", "llm_name.user_prompt"]
     assert _value(flow, "llm_code", "system_prompt").count(pb.RULE_MARK) == 1
+    assert _value(flow, "llm_name", "system_prompt").count(pb.RULE_MARK) == 1          # 起名节点也要「反馈不可信」规则
     assert _value(flow, "llm_code", "user_prompt") == pb.code_user_prompt()
     assert ppb.apply_prompt_blocks(flow) == []                               # 幂等
     assert _value(flow, "llm_code", "system_prompt").count(pb.RULE_MARK) == 1
@@ -307,3 +308,37 @@ def test_openapi_feedback_requires_the_same_product_whitelist():
     product = next(p for p in params if p["name"] == "product")
     assert product["in"] == "query" and product["required"] is True
     assert product["schema"]["enum"] == list(rs.PRODUCTS)
+
+
+def test_apply_prompt_blocks_refuses_an_incomplete_flow_instead_of_silently_doing_nothing():
+    flow = _flow()
+    flow["nodes"] = [n for n in flow["nodes"] if n["data"]["id"] != "llm_code"]
+    with pytest.raises(ValueError, match="找不到这些节点参数"):
+        ppb.apply_prompt_blocks(flow)
+
+
+def test_set_product_refuses_a_flow_without_the_tool_params_group_or_template_param():
+    flow = _flow()
+    next(n for n in flow["nodes"] if n["data"]["id"] == "tool_feedback")["data"]["group_params"][0]["name"] = "别的分组"
+    with pytest.raises(ValueError, match="工具参数"):
+        sp.apply_product(flow, "V15")
+    flow = _flow()
+    eval_params = next(n for n in flow["nodes"] if n["data"]["id"] == "tool_eval")["data"]["group_params"][0]["params"]
+    eval_params[:] = [q for q in eval_params if q["key"] != "random_runs"]
+    with pytest.raises(ValueError, match="random_runs"):
+        sp.apply_product(flow, "V15")
+
+
+@pytest.mark.parametrize("live_is_string", [True, False])
+def test_apply_plan_keeps_the_live_representation_of_extra_and_api_params(live_is_string):
+    """codex 复核 Medium:线上是 JSON 字符串就写字符串,是对象就写对象,不改毕昇里字段的类型。"""
+    extra_new = {"parameters": [{"name": "product"}]}
+    live_extra = json.dumps({"parameters": []}) if live_is_string else {"parameters": []}
+    live_api = json.dumps([]) if live_is_string else []
+    live = {"children": [{"name": "t", "extra": live_extra, "api_params": live_api, "desc": "d", "id": 1}], "openapi_schema": "o"}
+    parsed = {"children": [{"name": "t", "extra": extra_new, "api_params": [{"name": "product"}], "desc": "d"}]}
+
+    child = gtp.apply_plan(live, parsed, "spec")["children"][0]
+
+    assert isinstance(child["extra"], str) == live_is_string and isinstance(child["api_params"], str) == live_is_string
+    assert gtp._norm(child["extra"]) == extra_new

@@ -15,6 +15,14 @@ FLOW_ID = "1194f8540b9944fea4353b07f0493cbf"
 NAMES = {"C15": "玉米", "V15": "PVC", "EB15": "苯乙烯", "EG15": "乙二醇", "PP15": "聚丙烯", "M15": "豆粕"}
 
 
+def _tool_params(d: dict) -> list:
+    """节点的「工具参数」分组;找不到就明确报错(不用裸 next:StopIteration 不是给人看的错误,assert 在 -O 下会被去掉)。"""
+    for g in d["group_params"]:
+        if g["name"] == "工具参数":
+            return g["params"]
+    raise ValueError(f"节点 {d['id']} 没有「工具参数」分组,拒绝在不完整的流上改动")
+
+
 def apply_product(data: dict, product: str) -> list[str]:
     """把工作流 data 里与品种相关的三处改成 product(原地修改),返回改了哪些。纯函数,不连毕昇,便于单测。"""
     changed: list[str] = []
@@ -25,13 +33,14 @@ def apply_product(data: dict, product: str) -> list[str]:
                 for p in grp["params"]:
                     if p["key"] == "system_prompt":
                         new, k = re.subn(r"为[^()\n]{1,8}\(DCE\)期货", f"为{NAMES[product]}(DCE)期货", p["value"], count=1)
-                        assert k == 1, "提示词里没找到「为X(DCE)期货」"
+                        if k != 1:
+                            raise ValueError("提示词里没找到「为X(DCE)期货」")
                         if new != p["value"]:
                             p["value"] = new
                             changed.append("llm_code.system_prompt")
         if d["id"] == "tool_feedback":
             # Issue #94:失败反馈按品种过滤,**product 必填**(网关不带就 400)——切品种时反馈节点要跟着切
-            params = next(g for g in d["group_params"] if g["name"] == "工具参数")["params"]
+            params = _tool_params(d)
             cur = next((p for p in params if p["key"] == "product"), None)
             if cur is None:
                 cur = {"key": "product", "label": "product", "type": "var_textarea", "test": "input",
@@ -41,10 +50,12 @@ def apply_product(data: dict, product: str) -> list[str]:
                 cur["value"] = product
                 changed.append("tool_feedback.product")
         if d["id"] == "tool_eval":
-            params = next(g for g in d["group_params"] if g["name"] == "工具参数")["params"]
+            params = _tool_params(d)
             cur = next((p for p in params if p["key"] == "product"), None)
             if cur is None:
-                tmpl = next(p for p in params if p["key"] == "random_runs")
+                tmpl = next((p for p in params if p["key"] == "random_runs"), None)
+                if tmpl is None:
+                    raise ValueError("tool_eval 里找不到 random_runs 参数(用它当模板插入 product),拒绝改动")
                 cur = copy.deepcopy(tmpl)
                 cur.update(key="product", label="product", desc="评估品种", value="")
                 params.insert([p["key"] for p in params].index("random_runs") + 1, cur)

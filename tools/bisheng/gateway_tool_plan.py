@@ -22,6 +22,18 @@ def _norm(value):
     return json.loads(json.dumps(value, sort_keys=True, ensure_ascii=False))
 
 
+def _like(live, new):
+    """把 new 写成与线上 live **相同的表示**:线上是 JSON 字符串就写字符串,是对象就写对象(codex 复核 Medium)。"""
+    if isinstance(live, str) and not isinstance(new, str):
+        return json.dumps(new, ensure_ascii=False)
+    if not isinstance(live, str) and isinstance(new, str):
+        try:
+            return json.loads(new)
+        except ValueError:
+            return new
+    return new
+
+
 def plan(live_children: list[dict], parsed_children: list[dict]) -> list[dict]:
     """逐个子工具比较,返回 [{name, changed: [字段...]}];只在线上有/只在仓库有的子工具用 only_live / only_repo 标出。"""
     live = {c["name"]: c for c in live_children}
@@ -51,5 +63,5 @@ def apply_plan(tool: dict, parsed: dict, spec_text: str) -> dict:
             continue
         for field in FIELDS:
             if _norm(child.get(field)) != _norm(src.get(field)):
-                child[field] = src[field]
+                child[field] = _like(child.get(field), src[field])
     return body
