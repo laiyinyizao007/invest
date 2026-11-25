@@ -745,17 +745,37 @@ def test_feedback_includes_strategy_errors_with_type_and_message(tmp_path):
 
 # ---------- evaluate:选参 + 门槛评估 ----------
 
+def async_jobs(prepare=None, run=None, seen=None):
+    """异步评估的替身:prepare 对应同步前半段(检查/预扣),run 对应慢的后半段。"""
+    def default_prepare(**kw):
+        if seen is not None:
+            seen.update(kw)
+        return {"strategy_file": "a.py", "cls": kw["cls"], "product": kw["product"]}
+
+    return SimpleNamespace(evaluate_prepare=prepare or default_prepare,
+                           evaluate_run=run or (lambda ctx, run_id=None: {"run_id": run_id}))
+
+
+def wait_workers():
+    import threading
+    for t in list(threading.enumerate()):
+        if t.name.startswith("evaluate-"):
+            t.join(timeout=5)
+            assert not t.is_alive()
+
+
 def test_evaluate_forwards_validated_fields_and_never_passes_confirm(tmp_path):
     seen = {}
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: seen.update(kw) or {"passed": False}))
+    app = make_app(tmp_path, jobs=async_jobs(seen=seen))
 
     status, _ = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "Candidate", "random_runs": "50", "confirm": True})
+    wait_workers()
 
     assert status == 200 and seen == {"strategy": "a.py", "cls": "Candidate", "random_runs": 50, "confirm": False, "product": "C15"}
 
 
 def test_evaluate_rejects_bad_fields_without_entering_the_job(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: pytest.fail("校验未过不应进入作业")))
+    app = make_app(tmp_path, jobs=async_jobs(prepare=lambda **kw: pytest.fail("校验未过不应进入作业")))
 
     assert call(app, "POST", "/research/evaluate", {"class": "C"})[0] == 400
     assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "bad name; rm"})[0] == 400
@@ -763,12 +783,143 @@ def test_evaluate_rejects_bad_fields_without_entering_the_job(tmp_path):
 
 
 def test_evaluate_maps_unapproved_to_403(tmp_path):
-    def evaluate_job(**kw):
+    def prepare(**kw):
         raise api.JobError(api.EXIT_REFUSED, api.NEEDS_APPROVAL)
 
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=evaluate_job))
+    app = make_app(tmp_path, jobs=async_jobs(prepare=prepare))
 
     assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 403
+
+
+# ---------- 异步评估(Issue #84):启动即返回,结果按 run_id 取 ----------
+
+def test_evaluate_returns_immediately_with_running_then_the_final_result_appears_under_the_same_run_id(tmp_path):
+    import threading
+    gate, started = threading.Event(), threading.Event()
+
+    def run(ctx, run_id=None):
+        started.set()
+        assert gate.wait(5)
+        rs.save_result({"kind": "evaluate", "passed": False, "report": "结论: 未通过", "strategy_file": "a.py",
+                        "strategy_sha256": "a" * 64, "ran_at": "2026-11-25T10:00:00"}, app.paths["results_dir"], run_id=run_id)
+        return {}
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    status, body = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "product": "V15"})
+    run_id = body["run_id"]
+    assert status == 200 and body["status"] == "running"                 # 毕昇只认 200
+    assert started.wait(5)
+    state = call(app, "GET", f"/research/results/{run_id}")[1]
+    assert state["status"] == "running" and state["key"] == "V15"
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 409     # 单作业锁持有到线程结束
+
+    gate.set()
+    wait_workers()
+
+    final = call(app, "GET", f"/research/results/{run_id}")[1]
+    assert final["report"] == "结论: 未通过" and "status" not in final
+    assert not (app.paths["results_dir"] / "running" / f"{run_id}.json").exists()
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 200      # 锁已释放
+
+
+def test_a_refused_evaluation_leaves_no_running_state_and_does_not_hold_the_lock(tmp_path):
+    def prepare(**kw):
+        raise api.JobError(api.EXIT_REFUSED, api.NEEDS_APPROVAL)
+
+    app = make_app(tmp_path, jobs=async_jobs(prepare=prepare))
+
+    assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[0] == 403
+    assert not (app.paths["results_dir"] / "running").exists()
+    assert app._busy.acquire(blocking=False)                              # 没被占着
+    app._busy.release()
+
+
+def test_the_worker_never_runs_when_the_synchronous_checks_refuse(tmp_path):
+    ran = []
+
+    def prepare(**kw):
+        raise api.JobError(api.EXIT_REFUSED, "静态筛查未通过: x")
+
+    app = make_app(tmp_path, jobs=async_jobs(prepare=prepare, run=lambda ctx, run_id=None: ran.append(1)))
+
+    status, _ = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+    wait_workers()
+
+    assert status == 400 and ran == []
+
+
+@pytest.mark.parametrize("exc, expect", [
+    (api.JobError(api.EXIT_TIMEOUT, "超过 600s,已终止"), "超过 600s"),
+    (RuntimeError("boom C:\\Users\\x\\secret"), "内部错误"),
+])
+def test_a_failing_worker_is_recorded_as_error_never_left_running(tmp_path, exc, expect):
+    def run(ctx, run_id=None):
+        raise exc
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    run_id = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]["run_id"]
+    wait_workers()
+
+    state = call(app, "GET", f"/research/results/{run_id}")[1]
+    assert state["status"] == "error" and expect in state["error"] and "secret" not in json.dumps(state, ensure_ascii=False)
+    assert app._busy.acquire(blocking=False)
+    app._busy.release()
+
+
+def test_unregisterable_running_state_fails_the_start_and_releases_the_lock(tmp_path, monkeypatch):
+    def broken(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rs, "write_running", broken)
+    app = make_app(tmp_path, jobs=async_jobs(run=lambda ctx, run_id=None: pytest.fail("不应运行")))
+
+    status, body = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+
+    assert status == 500 and "不退还" in body["error"]
+    assert app._busy.acquire(blocking=False)
+    app._busy.release()
+
+
+def test_restart_marks_leftover_running_as_interrupted_and_keeps_it_out_of_listings_and_feedback(tmp_path):
+    app = make_app(tmp_path)
+    rid = "20261125-100000-000001"
+    rs.write_running(app.paths["results_dir"], rid, {"kind": "evaluate", "status": "running", "key": "V15"})
+    rs.write_running(app.paths["results_dir"], "20261125-100000-000002", {"kind": "evaluate", "status": "error", "error": "x"})
+    (app.paths["results_dir"] / "running" / "broken.json").write_text("{not json", encoding="utf-8")
+
+    assert app.recover_interrupted() == [rid]
+
+    state = call(app, "GET", f"/research/results/{rid}")[1]
+    assert state["status"] == "interrupted" and "不退还" in state["message"]
+    assert call(app, "GET", "/research/results/20261125-100000-000002")[1]["status"] == "error"        # 非 running 的不动
+    assert rs.list_results(app.paths["results_dir"]) == []                                              # 看板/清单看不见
+    assert call(app, "GET", "/research/feedback")[1]["traces"] == []                                    # 也不进反馈
+
+
+def test_a_finished_result_wins_over_a_stale_running_file(tmp_path):
+    app = make_app(tmp_path)
+    rid = "20261125-100000-000003"
+    rs.write_running(app.paths["results_dir"], rid, {"kind": "evaluate", "status": "running"})
+    seed_result(app, rid, kind="evaluate", passed=False, report="r")
+
+    assert call(app, "GET", f"/research/results/{rid}")[1]["report"] == "r"
+
+
+def test_running_state_paths_reject_unsafe_ids(tmp_path):
+    for bad in ("../x", "a/b", "", "a b"):
+        with pytest.raises(rs.SandboxError):
+            rs.write_running(tmp_path, bad, {})
+
+
+def test_view_text_start_response_is_plain_text_with_the_run_id(tmp_path):
+    app = make_app(tmp_path, jobs=async_jobs())
+
+    status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
+    wait_workers()
+
+    assert status == 200 and isinstance(payload, gw.PlainText) and "run_id: " in payload and "get_result" in payload
 
 
 def test_feedback_includes_failed_evaluations_but_not_passed_ones(tmp_path):
@@ -867,11 +1018,10 @@ FULL = {"run_id": "r1", "passed": False, "report": "结论: 未通过", "metrics
 
 
 def test_view_report_returns_only_the_compact_fields(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL), backtest_job=lambda **kw: dict(FULL),
+    app = make_app(tmp_path, jobs=SimpleNamespace(backtest_job=lambda **kw: dict(FULL),
                                                   gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x")))
 
-    for path, body in (("/research/evaluate", {"strategy": "a.py", "class": "C"}),
-                       ("/research/gate", {"strategy": "a.py", "class": "C"}),
+    for path, body in (("/research/gate", {"strategy": "a.py", "class": "C"}),
                        ("/research/backtest", {"strategy": "a.py", "class": "C", "key": "CADJ", "segment": "train"})):
         status, out = call(app, "POST", path, {**body, "view": "report"})
         assert status == 200 and out == {"run_id": "r1", "passed": False, "report": "结论: 未通过"}, path
@@ -880,23 +1030,23 @@ def test_view_report_returns_only_the_compact_fields(tmp_path):
 
 
 def test_unknown_view_is_rejected_before_running_anything(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: pytest.fail("不应运行")))
+    app = make_app(tmp_path, jobs=async_jobs(prepare=lambda **kw: pytest.fail("不应运行")))
 
     assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "raw"})[0] == 400
     assert call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": 5})[0] == 400
 
 
 def test_blank_view_means_full_result(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+    app = make_app(tmp_path, jobs=SimpleNamespace(gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x")))
 
-    assert "metrics" in call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": ""})[1]
+    assert "metrics" in call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "C", "view": ""})[1]
 
 
 def test_view_report_keeps_strategy_error_status(tmp_path):
     result = {"run_id": "r2", "passed": False, "status": "strategy_error", "report": "策略运行报错: X", "error": {"type": "X"}}
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(result)))
+    app = make_app(tmp_path, jobs=SimpleNamespace(gate_job=lambda **kw: dict(result), plateau_from_data=lambda d: (True, "x")))
 
-    out = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "report"})[1]
+    out = call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "C", "view": "report"})[1]
 
     assert out["status"] == "strategy_error" and out["report"].startswith("策略运行报错")
 
@@ -904,9 +1054,9 @@ def test_view_report_keeps_strategy_error_status(tmp_path):
 # ---------- view=text:纯文本报告(给毕昇结果节点直接展示,不显示成带 \n 转义的 JSON) ----------
 
 def test_view_text_returns_plain_text_with_the_run_id(tmp_path):
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=lambda **kw: dict(FULL)))
+    app = make_app(tmp_path, jobs=SimpleNamespace(gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x")))
 
-    status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
+    status, payload = call(app, "POST", "/research/gate", {"strategy": "a.py", "class": "C", "view": "text"})
 
     assert status == 200 and isinstance(payload, gw.PlainText)
     assert payload.startswith("结论: 未通过") and "run_id: r1" in payload
@@ -916,7 +1066,7 @@ def test_errors_stay_json_even_when_text_view_is_requested(tmp_path):
     def boom(**kw):
         raise api.JobError(api.EXIT_REFUSED, api.NEEDS_APPROVAL)
 
-    app = make_app(tmp_path, jobs=SimpleNamespace(evaluate_job=boom))
+    app = make_app(tmp_path, jobs=async_jobs(prepare=boom))
 
     status, payload = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C", "view": "text"})
 
@@ -927,11 +1077,11 @@ def test_server_sends_text_view_as_text_plain():
     import threading
     import urllib.request
     app = make_app_for_server()
-    app.jobs = SimpleNamespace(evaluate_job=lambda **kw: dict(FULL))
+    app.jobs = SimpleNamespace(gate_job=lambda **kw: dict(FULL), plateau_from_data=lambda d: (True, "x"))
     server = gw.build_server(app, "127.0.0.1", 0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/research/evaluate", method="POST",
+        req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/research/gate", method="POST",
                                      data=json.dumps({"strategy": "a.py", "class": "C", "view": "text"}).encode("utf-8"),
                                      headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
         resp = urllib.request.urlopen(req, timeout=5)
@@ -1049,3 +1199,126 @@ def test_shipped_default_allows_twenty_submissions_then_refuses_the_twenty_first
     status, body = submit(app, "b20.py")
 
     assert status == 429 and "最多提交 20" in body["error"]
+
+
+# ---------- Issue #84 codex 复核后补的用例 ----------
+
+def test_a_thread_that_cannot_start_releases_the_lock_exactly_once(tmp_path, monkeypatch):
+    import threading
+    app = make_app(tmp_path, jobs=async_jobs())
+
+    def cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", cannot_start)
+    status, body = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+
+    assert status == 500 and "不退还" in body["error"]
+    assert not (app.paths["results_dir"] / "running").exists() or not list((app.paths["results_dir"] / "running").glob("*.json"))
+    assert app._busy.acquire(blocking=False)          # 锁是空闲的(没被占着)
+    app._busy.release()                               # 且只释放过一次(再释放会抛 RuntimeError)
+    with pytest.raises(RuntimeError):
+        app._busy.release()
+
+
+def test_a_systemexit_in_the_worker_is_still_recorded_as_error(tmp_path):
+    def run(ctx, run_id=None):
+        raise SystemExit(3)
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    run_id = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]["run_id"]
+    wait_workers()
+
+    assert call(app, "GET", f"/research/results/{run_id}")[1]["status"] == "error"
+    assert app._busy.acquire(blocking=False)
+    app._busy.release()
+
+
+def test_stored_error_is_scrubbed_of_hashes(tmp_path):
+    sha = "ab" * 32
+
+    def run(ctx, run_id=None):
+        raise api.JobError(api.EXIT_FAILED, f"失败 {sha}")
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    run_id = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]["run_id"]
+    wait_workers()
+
+    stored = (app.paths["results_dir"] / "running" / f"{run_id}.json").read_text(encoding="utf-8")
+    assert sha not in stored
+
+
+def test_the_results_directory_lock_refuses_a_second_holder_and_frees_on_close(tmp_path):
+    first = rs.acquire_results_lock(tmp_path)
+    with pytest.raises(rs.SandboxError, match="另一个网关实例"):
+        rs.acquire_results_lock(tmp_path)
+    first.close()
+    rs.acquire_results_lock(tmp_path).close()
+
+
+def test_prune_removes_only_old_terminal_states_never_running(tmp_path):
+    import os
+    import time as _t
+    old = _t.time() - 30 * 24 * 3600
+    for rid, status in (("20261001-100000-000001", "error"), ("20261001-100000-000002", "interrupted"),
+                        ("20261001-100000-000003", "running"), ("20261125-100000-000004", "error")):
+        rs.write_running(tmp_path, rid, {"status": status})
+    for rid in ("20261001-100000-000001", "20261001-100000-000002", "20261001-100000-000003"):
+        os.utime(tmp_path / "running" / f"{rid}.json", (old, old))
+
+    assert rs.prune_running(tmp_path) == 2
+
+    left = sorted(p.stem for p in (tmp_path / "running").glob("*.json"))
+    assert left == ["20261001-100000-000003", "20261125-100000-000004"]
+
+
+def test_a_corrupt_running_file_is_a_clear_500_not_an_unhandled_error(tmp_path):
+    app = make_app(tmp_path)
+    folder = app.paths["results_dir"] / "running"
+    folder.mkdir(parents=True)
+    (folder / "20261125-100000-000009.json").write_text("{broken", encoding="utf-8")
+
+    status, body = call(app, "GET", "/research/results/20261125-100000-000009")
+
+    assert status == 500 and "无法解析" in body["error"]
+
+
+def test_release_once_releases_the_lock_a_single_time_even_when_called_by_both_sides():
+    import threading
+    lock = threading.Lock()
+    lock.acquire()
+    once = gw._ReleaseOnce(lock)
+
+    once.release()
+    once.release()                       # 第二次是空操作,不抛 "release unlocked lock",也不会放掉别人拿到的锁
+    assert lock.acquire(blocking=False)  # 此刻别人合法拿到了锁
+    once.release()                       # 迟到的第三次调用不得把它放掉
+    assert not lock.acquire(blocking=False)
+
+
+def test_results_lock_reports_an_unwritable_directory_as_such_not_as_another_instance(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+
+    with pytest.raises(rs.SandboxError) as err:
+        rs.acquire_results_lock(blocker / "sub")      # 父路径是个文件:建目录/建锁文件必失败
+
+    assert "另一个网关实例" not in str(err.value) and "无法在结果目录建立网关锁文件" in str(err.value)
+
+
+def test_prune_also_clears_stale_tmp_files_but_keeps_fresh_ones(tmp_path):
+    import os
+    import time as _t
+    folder = tmp_path / "running"
+    folder.mkdir()
+    stale, fresh = folder / "a.tmp", folder / "b.tmp"
+    stale.write_text("x", encoding="utf-8")
+    fresh.write_text("x", encoding="utf-8")
+    old = _t.time() - 30 * 24 * 3600
+    os.utime(stale, (old, old))
+
+    rs.prune_running(tmp_path)
+
+    assert not stale.exists() and fresh.exists()

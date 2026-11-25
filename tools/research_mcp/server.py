@@ -526,6 +526,28 @@ def _start_research(idea: str) -> str:
         return redact_for_model(f"发起研究失败:{exc}")
 
 
+EVAL_RUN_ID = re.compile(r"run_id[:=]\s*(\d{8}-\d{6}-\d{6})")
+
+
+def _eval_progress(session: dict) -> list[str]:
+    """异步评估(Issue #84):工作流只回「已启动,run_id=…」,真正的结果由这里按 run_id 到结果目录取。
+    只读结果文件,不碰任何账本;run_id 必须符合固定格式(来自网关输出,取到后再校验一次)。"""
+    run_id = session.get("eval_run_id")
+    if not isinstance(run_id, str) or not EVAL_RUN_ID.fullmatch(f"run_id: {run_id}"):
+        return []
+    try:
+        state = rs.load_result(run_id, rc.resolve_paths(rc.load(), rc.ROOT)["results_dir"])
+    except (rs.SandboxError, rc.ConfigError, OSError, ValueError):
+        return [f"评估 {run_id}:结果还没有出现(刚启动,或结果目录暂时读不到),稍后再查。"]
+    status = state.get("status")
+    if status == "running":
+        return [f"评估 {run_id}:仍在运行(通常几分钟),稍后再用 research_status 查看;不要重复提交。"]
+    if status in ("error", "interrupted"):
+        why = state.get("error") or state.get("message") or ""
+        return [redact_for_model(f"评估 {run_id}:{'失败' if status == 'error' else '被网关重启打断'}。{why}")[:600]]
+    return [redact_for_model(f"评估 {run_id} 完成:\n" + str(state.get("report") or "(结果里没有报告文本)"))[:3000]]
+
+
 def _research_status() -> str:
     session = current_session()
     if not session:
@@ -554,6 +576,10 @@ def _research_status() -> str:
         session["waiting_node"] = waiting2.get("node_id") if waiting2 else None
         session["waiting_message_id"] = waiting2.get("message_id") if waiting2 else None
         session["last_outputs"] = texts[-3:]
+        for text in texts:
+            hit = EVAL_RUN_ID.search(text)
+            if hit:
+                session["eval_run_id"] = hit.group(1)               # 异步评估的 run_id:之后每次查进度都去取结果
         session["failures"] = failures
         session["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         set_current(session)
@@ -568,6 +594,7 @@ def _research_status() -> str:
             lines.append(warn)
     elif waiting == "input_wait":
         lines.append("当前停在「等待批准」节点;批准前不会继续。用 request_approval 请求人工审阅。")
+    lines.extend(_eval_progress(session))
     return "\n".join(lines)
 
 

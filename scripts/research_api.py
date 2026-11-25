@@ -834,16 +834,18 @@ EVALUATE_NOTICE = ("evaluate 的样本外由服务端保证：参数只在选参
                    "门槛评估只用其后的滚动验证窗口（2022-07 ~ 2023-12），两段不重叠；测试段不可达。")
 
 
-def save_with_report(result: dict, paths: dict) -> None:
-    """落盘前补上确定性中文报告(纯函数生成,出错也只是一行说明),并写入 run_id。"""
+def save_with_report(result: dict, paths: dict, run_id: str | None = None) -> None:
+    """落盘前补上确定性中文报告(纯函数生成,出错也只是一行说明),并写入 run_id。
+    run_id 给定(异步评估启动时已分配)就用它,否则现分配。"""
     result["report"] = render_report(result)
-    result["run_id"] = rs.save_result(result, paths["results_dir"])
+    result["run_id"] = rs.save_result(result, paths["results_dir"], run_id=run_id)
 
 
-def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
-                 confirm: bool = False, product: str = "C15") -> dict:
-    """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
-    再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。"""
+def evaluate_prepare(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
+                     confirm: bool = False, product: str = "C15") -> dict:
+    """评估的**同步前半段**(Issue #84):入参校验、策略名解析、静态筛查、**批准检查**、试验预扣——
+    全部在这里做完,任何拒绝都在启动前抛 JobError。返回交给 `evaluate_run` 的上下文(仅进程内使用,不序列化)。
+    异步网关与同步 CLI 共用这一段,所以「异步」不可能绕过任何前置检查。"""
     cfg, paths = settings()
     check_product(product)
     timeout = timeout if timeout is not None else cfg["gate"]["timeout_seconds"] + cfg["grid"]["timeout_seconds"]
@@ -862,22 +864,36 @@ def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, tim
     check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
+    return {"path": path, "strategy_file": path.name, "cls": cls, "product": product, "timeout": timeout,
+            "random_runs": random_runs, "strategy_sha": strategy_sha, "prior": prior, "paths": paths}
 
+
+def evaluate_run(ctx: dict, run_id: str | None = None) -> dict:
+    """评估的**慢的后半段**:起子进程、补记网格试验、落盘。run_id 给定则沿用(异步),否则现分配(同步)。"""
+    path, cls, product, paths = ctx["path"], ctx["cls"], ctx["product"], ctx["paths"]
     cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
-           "--random-runs", str(random_runs), "--sha256", strategy_sha, "--prior-trials", str(prior),
+           "--random-runs", str(ctx["random_runs"]), "--sha256", ctx["strategy_sha"], "--prior-trials", str(ctx["prior"]),
            "--product", product]
-    body = spawn_child(cmd, timeout)
+    body = spawn_child(cmd, ctx["timeout"])
     if "error" not in body:
         top_up_grid_trials(paths, body)
-    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": strategy_sha,
+    base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": ctx["strategy_sha"],
             "class": cls, "key": product, "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
     if "error" in body:
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
     else:
         result = {**base, **body}
-    save_with_report(result, paths)
+    save_with_report(result, paths, run_id)
     return result
+
+
+def evaluate_job(*, strategy: str, cls: str, random_runs: int | None = None, timeout: float | None = None,
+                 confirm: bool = False, product: str = "C15") -> dict:
+    """候选在类上声明 `param_grid`（三个参数、各至少 3 个递增取值）：先在选参窗口扫网格并判定参数高原，
+    再用选出的参数在滚动验证窗口上做完整的晋级门槛评估。同步入口(CLI 用):前半段 + 后半段连着跑。"""
+    return evaluate_run(evaluate_prepare(strategy=strategy, cls=cls, random_runs=random_runs, timeout=timeout,
+                                         confirm=confirm, product=product))
 
 
 def run_cli_job(func) -> int:
