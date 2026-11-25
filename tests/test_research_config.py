@@ -15,7 +15,7 @@ def write(tmp_path, data):
 def test_shipped_config_file_loads_and_matches_defaults():
     cfg = rc.load()
 
-    assert cfg["iteration"]["max_iterations"] == 5
+    assert cfg["iteration"]["max_iterations"] == 20
     assert cfg["feedback"]["limit"] == 3
     assert cfg["gate"]["random_runs"] == 200
     assert cfg["gateway"]["host"] == "127.0.0.1"
@@ -41,6 +41,7 @@ def test_partial_file_overrides_only_what_it_names(tmp_path):
     {"feedback": {"limit": 11}},                   # 违反「硬记忆预算」精神
     {"iteration": {"max_iterations": 0}},
     {"iteration": {"max_iterations": 1000}},
+    {"iteration": {"max_iterations": 51}},
     {"backtest": {"timeout_seconds": 0}},
     {"candidates": {"max_source_bytes": 0}},
     {"candidates": {"name_pattern": "("}},         # 非法正则
@@ -220,7 +221,12 @@ def test_invalid_grid_values_are_rejected(tmp_path, data):
 
 
 def test_iteration_window_hours_default_and_bounds(tmp_path):
-    assert rc.load()["iteration"] == {"max_iterations": 5, "window_hours": 24}
+    assert rc.load()["iteration"] == {"max_iterations": 20, "window_hours": 24}
     for bad in (0, 721):
         with pytest.raises(rc.ConfigError):
             rc.load(write(tmp_path, {"iteration": {"window_hours": bad}}))
+
+
+def test_code_defaults_match_the_shipped_config_for_the_submission_cap():
+    """Issue #80:DEFAULTS 是配置文件缺失时的真实回退,不能与出厂配置悄悄分叉(codex 实测改 DEFAULTS 20→21 测试仍全绿)。"""
+    assert rc.DEFAULTS["iteration"] == rc.load()["iteration"] == {"max_iterations": 20, "window_hours": 24}

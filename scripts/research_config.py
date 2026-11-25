@@ -33,7 +33,7 @@ if str(CODE_ROOT) not in sys.path:
 CONFIG_PATH = CODE_ROOT / "config" / "research_sandbox.json"
 
 DEFAULTS: dict[str, dict[str, Any]] = {
-    "iteration": {"max_iterations": 5, "window_hours": 24},
+    "iteration": {"max_iterations": 20, "window_hours": 24},
     "feedback": {"limit": 3},
     "gate": {"random_runs": 200, "timeout_seconds": 3600},
     "backtest": {"timeout_seconds": 600},
