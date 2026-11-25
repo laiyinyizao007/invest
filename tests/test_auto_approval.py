@@ -28,6 +28,7 @@ def env(tmp_path, monkeypatch):
     cand.write_text("class C: pass\n", encoding="utf-8")
     sha = rs.file_sha256(cand)
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+                                       "provenance": "user",
                                        "candidate_sha": sha, "waiting_node": "input_wait",
                                        "waiting_message_id": 12}})
     human = tmp_path / "data" / "research-control" / "approvals.json"
@@ -369,30 +370,47 @@ def test_the_auto_writer_requires_provenance_so_forgetting_it_is_not_a_default_a
         rs.record_auto_approval(cand, tmp_path / "auto_approvals.json")      # 故意不传 provenance
 
 
-def test_a_web_session_is_never_auto_approved_even_with_the_switch_on(env, monkeypatch):
+@pytest.mark.parametrize("switch", [True, False])
+def test_a_web_session_gets_no_hash_and_no_inline_approval_whatever_the_switch(env, monkeypatch, switch):
+    """codex 实测的严重问题:联网想法若回退到会话内回贴批准,哈希会进模型通道,模型回传即可批准,
+    还写进运行侧信任的人工账。所以这类想法 inline 一律拒绝,只能走带外批准页。"""
     _cand, sha, human, auto, attempts = env
-    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: switch)
     _set_provenance("web")
 
     out = mcp_server._request_approval_inline("cand_1.py", None)
 
-    assert not auto.exists() and not human.exists()                       # 自动账没动,人工账也没动
-    assert sha in out and "亲自" in out                                    # 回到人工两阶段:给哈希让人粘贴
-    assert "不自动批准" in out and "'web'" in out
-    rows = ra.read(attempts)
-    assert [r["event"] for r in rows] == ["auto_refused"]
-    assert rows[0]["provenance"] == "web"
+    assert sha not in out                                                  # 哈希不进模型通道
+    assert "mode=" in out and "page" in out and "不能自动批准" in out
+    assert not auto.exists() and not human.exists()
+    events = [r["event"] for r in ra.read(attempts)] if attempts.exists() else []
+    assert events == (["auto_refused"] if switch else [])
+    if switch:
+        assert ra.read(attempts)[0]["provenance"] == "web"
 
 
-@pytest.mark.parametrize("weird", ["", "Web", "robot", 5, ["user"]])
-def test_a_tampered_or_unknown_provenance_in_the_session_is_not_auto_approvable(env, monkeypatch, weird):
-    _cand, _sha, _human, auto, _attempts = env
+@pytest.mark.parametrize("switch", [True, False])
+def test_a_web_session_cannot_be_approved_by_the_model_echoing_the_hash(env, monkeypatch, switch):
+    """模型自己算出/拿到哈希后回传(第二阶段)也不能让联网想法落任何账。"""
+    _cand, sha, human, auto, _attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: switch)
+    _set_provenance("web")
+
+    out = mcp_server._request_approval_inline("cand_1.py", sha)             # 带上正确的哈希
+
+    assert "不能" in out and not human.exists() and not auto.exists()
+    assert not mcp_server.approval_state(mcp_server.current_session())[0]
+
+
+@pytest.mark.parametrize("weird", ["", "Web", "robot", 5, ["user"], None])
+def test_a_tampered_unknown_or_missing_provenance_is_not_approvable_inline_or_auto(env, monkeypatch, weird):
+    _cand, sha, human, auto, _attempts = env
     monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
     _set_provenance(weird)
 
     out = mcp_server._request_approval_inline("cand_1.py", None)
 
-    assert not auto.exists() and "亲自" in out
+    assert sha not in out and not auto.exists() and not human.exists()
 
 
 def test_a_user_session_behaves_exactly_as_before(env, monkeypatch):
@@ -405,16 +423,6 @@ def test_a_user_session_behaves_exactly_as_before(env, monkeypatch):
     assert "已按本机配置自动批准" in out and rs._load_approvals(auto)[sha]["via"] == "auto-research"
     assert [r["event"] for r in ra.read(attempts)] == ["approval_requested", "auto_approved"]
     assert all(r["provenance"] == "user" for r in ra.read(attempts))
-
-
-def test_a_session_without_a_provenance_field_is_treated_as_user_for_backward_compat(env, monkeypatch):
-    _cand, sha, _human, auto, _attempts = env
-    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
-    _set_provenance(None)
-
-    mcp_server._request_approval_inline("cand_1.py", None)
-
-    assert sha in rs._load_approvals(auto)
 
 
 def test_the_model_facing_start_research_tool_has_no_provenance_parameter():
@@ -471,3 +479,35 @@ def test_a_fresh_user_session_after_a_user_session_stays_user(env, monkeypatch):
     mcp_server._start_research("用户自己的想法", provenance="user")
 
     assert mcp_server.current_session()["provenance"] == "user"
+
+
+def test_record_row_itself_refuses_the_auto_ledger_without_an_approvable_provenance(tmp_path):
+    """codex:来源检查必须在共用底层,不能只在包装层——直接调 _record_row 也写不进自动账。"""
+    cand = tmp_path / "c.py"
+    cand.write_text("x = 1\n", encoding="utf-8")
+    auto = tmp_path / "auto_approvals.json"
+    for bad in (None, "web", "WEB", "", 3):
+        with pytest.raises(rs.SandboxError, match="不得自动批准"):
+            rs._record_row(cand, auto, via="auto-research", provenance=bad)
+    with pytest.raises(rs.SandboxError, match="不得自动批准"):
+        rs._record_row(cand, auto, via="auto-research")                      # 不传 = 拒绝
+    assert not auto.exists()
+    rs._record_row(cand, auto, via="auto-research", provenance="user")        # user 才能写
+    assert auto.exists()
+
+
+def test_start_research_requires_the_provenance_keyword():
+    with pytest.raises(TypeError):
+        mcp_server._start_research("想法")
+
+
+def test_a_resumed_session_without_a_provenance_field_becomes_web(env, monkeypatch):
+    _fake_workflow(monkeypatch)
+    state = mcp_server.load_state()
+    state["current"]["waiting_node"] = "input_idea"
+    state["current"].pop("provenance", None)
+    mcp_server.save_state(state)
+
+    mcp_server._start_research("用户自己的想法", provenance="user")
+
+    assert mcp_server.current_session()["provenance"] == "web"

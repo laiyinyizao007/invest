@@ -444,9 +444,10 @@ def is_candidate_approved(name: str) -> bool:
 SESSION_PROVENANCES = ("user", "web")
 
 
-def _start_research(idea: str, provenance: str = "user") -> str:
-    """`provenance` 是想法的来源(Issue #88),**只有宿主机上的驱动器能传 `web`**:
-    MCP 暴露给模型的 `start_research(idea)` 不带这个参数,恒为 `user`,模型不能自己声明来源。"""
+def _start_research(idea: str, *, provenance: str) -> str:
+    """`provenance` 是想法的来源(Issue #88),**必填**(忘了传是 TypeError,不是默认放行),
+    **只有宿主机上的驱动器能传 `web`**:MCP 暴露给模型的 `start_research(idea)` 不带这个参数,
+    由工具入口固定传 `user`,模型不能自己声明来源。"""
     idea = (idea or "").strip()
     if provenance not in SESSION_PROVENANCES:
         return f"想法来源只能是 {list(SESSION_PROVENANCES)}。"
@@ -499,10 +500,10 @@ def _start_research(idea: str, provenance: str = "user") -> str:
             if guess and guess in pending_snapshot():
                 candidate = guess
         waiting2 = last_input_event(events2)
-        # 来源是**粘性**的:续跑的会话上下文里已含上一轮的想法,上一轮不是 user(含缺失/未知取值,fail-closed 当作 web)
+        # 来源是**粘性**的:续跑的会话上下文里已含上一轮的想法,上一轮不是 user(**含字段缺失/未知取值:fail-closed 当作 web**)
         # 就不能因为这一轮是 user 而洗白。
         effective = provenance
-        if resumed and (previous or {}).get("provenance", "user") != "user":
+        if resumed and (previous or {}).get("provenance") != "user":
             effective = "web"
         session = {
             "session_id": second.get("session_id") or session_id,
@@ -696,6 +697,20 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
     approved, _why = approval_state({"candidate": name, "candidate_sha": session.get("candidate_sha")})
     if approved:
         return "该候选已经批准过,不需要再批。"
+    # Issue #88:联网/未知来源的想法**不得自动批准,也不得在会话里回贴批准**——回贴批准要把哈希交给模型,
+    # 而模型回传同一串哈希就能通过(服务端分不出是人还是模型),等于模型自己批准、还落进运行侧信任的人工账
+    # (codex 实测)。这类想法只能走带外批准页(mode="page"),哈希与页面地址都不进模型通道。
+    # 来源字段**缺失也按不可批准**(fail-closed):会话只由 _start_research 写入,它总会带上这个字段。
+    provenance = session.get("provenance")
+    auto_ok = isinstance(provenance, str) and provenance in rs.AUTO_APPROVABLE_PROVENANCE
+    if not auto_ok:
+        if auto_approve_enabled():
+            _attempt("auto_refused", session=session.get("session_id"), candidate=name,
+                     note=f"想法来源 {provenance!r} 不可自动批准,也不可会话内回贴批准", provenance=str(provenance))
+        return redact_for_model(
+            f"本想法的来源是 {provenance!r}:按规则不能自动批准,也不能在会话里回贴哈希批准"
+            "(哈希会进入模型通道,模型自己就能批准自己)。请由人用 request_approval(mode=\"page\") 打开本机批准页,"
+            "在页面上读完源码、核对 sha256 后亲自确认。")
     path, sha, findings, err = _inline_approval_target(name, session)
     if err:
         return redact_for_model(err)
@@ -705,15 +720,7 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
                  note="; ".join(findings[:5]))
         return redact_for_model("静态筛查未通过,不予批准:" + "; ".join(findings)
                                 + "。修正候选后需要重新发起研究。")
-    provenance = session.get("provenance", "user")
-    auto_ok = isinstance(provenance, str) and provenance in rs.AUTO_APPROVABLE_PROVENANCE
-    refusal_note = ""
-    if auto_approve_enabled() and not auto_ok:
-        # Issue #88:联网/未知来源的想法**不得自动批准**,回到人工哈希批准。记一条尝试(记不下也照样不自动批)。
-        _attempt("auto_refused", session=session.get("session_id"), candidate=name, sha256=sha,
-                 note=f"想法来源 {provenance!r} 不可自动批准,改走人工批准", provenance=str(provenance))
-        refusal_note = (f"(本想法的来源是 {provenance!r}:按规则**不自动批准**,必须由人亲自核对哈希。)")
-    if auto_approve_enabled() and auto_ok:
+    if auto_approve_enabled():
         # 自动批准(Issue #67):静态筛查已过。**先落尝试记录,记不下就不批**(fail-closed),
         # 再写**独立的自动账**(不是人工账)。落账哈希仍是服务端自算值,与盘上文件绑定。
         warn = _attempt("approval_requested", session=session.get("session_id"), candidate=name, sha256=sha,
@@ -741,7 +748,6 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
         # 第一阶段:发哈希与位置,**不发源码**——源码由人在本机编辑器里直接读盘上文件
         # (聊天里经模型转述的内容不可作为审阅依据;盘上的文件才是将要被执行的字节)。
         lines = [
-            *([refusal_note] if refusal_note else []),
             f"候选 {name} 的批准信息(会话内确认,不打开浏览器):",
             f"- 文件:候选目录(pending_strategies)下的 {name},请人工在本机用编辑器打开、通读源码;",
             f"- 该文件当前内容的 sha256:{INLINE_HASH_PLACEHOLDER}",
@@ -913,7 +919,7 @@ async def start_research(idea: str) -> str:
     若上一轮评估后工作流已回到「研究想法」节点(等修正),本次想法会**接着那一轮**发,
     而不是另起一个会话——毕昇的失败反馈就在那轮上下文里。
     """
-    return await asyncio.to_thread(_start_research, idea)
+    return await asyncio.to_thread(_start_research, idea, provenance="user")      # 模型入口:来源恒为 user,不可自报
 
 
 @mcp.tool()
@@ -932,6 +938,8 @@ async def request_approval(strategy: str, confirm_sha256: str | None = None, mod
       2. 模型带 confirm_sha256=<人粘贴的哈希> 再次调用:服务端与自算哈希比对一致,
          且静态筛查通过时,经 record_approval(唯一写入者)落账(via=inline-chat)。
       只能批准当前会话本轮的候选;粘贴的哈希与文件不符、筛查不过、文件在发起研究后被改过,都拒绝。
+      **想法来源**(Issue #88):只有用户亲自给的想法(provenance=user)可以走 inline;联网/未知来源的想法
+      inline 与自动批准都会被拒绝,必须用 mode=page 由人在批准页确认。
       **自动批准例外**(本机配置 auto_approve.enabled,默认关):第一次调用即由服务端写入独立的自动账
       (via=auto-research)并在返回里明说;此时不返回哈希、无需人粘贴。每次尝试都会记入尝试记录。
     - page(带外页面,原样保留):拉起本机批准页(只监听 127.0.0.1),页面展示完整源码、

@@ -3460,7 +3460,7 @@ def is_approved_sha_any(sha256: str, approvals_file: Path, auto_approvals_file: 
 
 
 def _record_row(path: Path, approvals_file: Path, now: datetime | None = None, sha256: str | None = None,
-                via: str = "unspecified") -> str:
+                via: str = "unspecified", provenance: str | None = None) -> str:
     """记一次人工批准,返回被批准的哈希。
 
     `sha256`:调用方**已经核对过**的那份哈希。传了就直接拿它当键,不再重读文件——
@@ -3483,6 +3483,9 @@ def _record_row(path: Path, approvals_file: Path, now: datetime | None = None, s
     if (via == AUTO_APPROVAL_VIA) != (approvals_file.name == AUTO_APPROVALS_FILE_NAME):
         raise SandboxError(f"通道 {via!r} 与目标账本 {approvals_file.name!r} 不匹配:"
                            f"{AUTO_APPROVAL_VIA!r} 只写 {AUTO_APPROVALS_FILE_NAME},人工通道只写人工账")
+    # 想法来源(Issue #88)同样在**共用底层**强制:写自动账必须带可自动批准的来源,直接调 _record_row 也绕不过。
+    if via == AUTO_APPROVAL_VIA and (not isinstance(provenance, str) or provenance not in AUTO_APPROVABLE_PROVENANCE):
+        raise SandboxError(f"该来源的想法不得自动批准(provenance={provenance!r}):请走人工批准")
     sha = str(sha256).strip().lower() if sha256 else file_sha256(path)
     if not re.fullmatch(r"[0-9a-f]{64}", sha):
         raise SandboxError(f"批准的哈希格式不对(应为 64 位小写十六进制): {sha!r}")
@@ -3556,7 +3559,7 @@ def record_auto_approval(path: Path, auto_approvals_file: Path, now: datetime | 
         raise SandboxError(f"该来源的想法不得自动批准(provenance={provenance!r}):请走人工批准")
     if Path(auto_approvals_file).name != AUTO_APPROVALS_FILE_NAME:
         raise SandboxError(f"自动批准只能写 {AUTO_APPROVALS_FILE_NAME},拒绝写入: {Path(auto_approvals_file).name!r}")
-    return _record_row(path, auto_approvals_file, now=now, sha256=sha256, via=AUTO_APPROVAL_VIA)
+    return _record_row(path, auto_approvals_file, now=now, sha256=sha256, via=AUTO_APPROVAL_VIA, provenance=provenance)
 
 
 def _atomic_replace(tmp: Path, target: Path, attempts: int = 5) -> None:
