@@ -3131,7 +3131,58 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
     # 与本模块的职责不符。候选代码侧的效果不变:配置放行的模块自己泄漏能力时,
     # 静态层照样按属性链报违规(上面的任意深度属性链规则),运行期则整个拒绝导入。
     findings.extend(_screen_key_usage(tree))
+    findings.extend(_screen_array_manager_interface(tree))
     return findings
+
+
+# vnpy `ArrayManager` 的公开成员(类上的方法/属性 + 实例上的 count/size/inited/*_array)。
+# 常驻研究进程不许 import vnpy(tests/test_research_boundary.py),所以写成常量;
+# tests/test_research_sandbox.py 里有一条需要 vnpy 的测试把它与真实类逐项比对(本机跑,CI 无 vnpy 时跳过)。
+# 用途只有一个:候选写了 `self.am.highest(...)` 这类**不存在**的方法,会在评估时才 AttributeError,
+# 白白耗掉一次提交额度与试验账本(Issue #77)。静态筛查在额度检查之前,在这里拒掉就什么都不占。
+ARRAY_MANAGER_MEMBERS = frozenset({
+    "ad", "adosc", "adx", "adxr", "apo", "aroon", "aroonosc", "atr", "boll", "bop", "cci", "close", "cmo",
+    "donchian", "dx", "ema", "high", "kama", "keltner", "low", "macd", "mfi", "minus_di", "minus_dm", "mom",
+    "natr", "obv", "open", "open_interest", "plus_di", "plus_dm", "ppo", "roc", "rocp", "rocr", "rocr_100",
+    "rsi", "sar", "sma", "std", "stoch", "trange", "trix", "turnover", "ultosc", "update_bar", "volume",
+    "willr", "wma",
+    "count", "size", "inited", "open_array", "high_array", "low_array", "close_array", "volume_array",
+    "turnover_array", "open_interest_array",
+})
+
+
+def _is_self_am(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "am" \
+        and isinstance(node.value, ast.Name) and node.value.id == "self"
+
+
+def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
+    """`self.am.<名字>` 的名字必须是 ArrayManager 的真实成员。只收紧、不放松:多拒一类**确定会报错**的写法。
+
+    保守:候选若把 `self.am` 赋成别的东西(不是 `ArrayManager(...)` 调用),它可能有自己的类,规则整体让路;
+    对 `self.am.x = ...` 这类写入不判(写入不是调用不存在的方法)。"""
+    for node in ast.walk(tree):
+        targets: list[ast.AST] = []
+        value = None
+        if isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets, value = [node.target], node.value
+        if any(_is_self_am(t) for t in targets):
+            func = value.func if isinstance(value, ast.Call) else None
+            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            if name != "ArrayManager":
+                return []
+    out: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and _is_self_am(node.value) \
+                and node.attr not in ARRAY_MANAGER_MEMBERS and not node.attr.startswith("_") \
+                and (node.lineno, node.attr) not in seen:
+            seen.add((node.lineno, node.attr))
+            out.append(f"第 {node.lineno} 行: self.am.{node.attr} 不存在(ArrayManager 没有这个成员,评估时会 AttributeError)。"
+                       "区间最高/最低价请用 self.am.donchian(n)(返回上轨、下轨);可用指标:sma/ema/rsi/atr/boll/donchian/std 等")
+    return out
 
 
 def _screen_key_usage(tree: ast.AST) -> list[str]:

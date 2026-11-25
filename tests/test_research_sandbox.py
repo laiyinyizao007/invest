@@ -1174,3 +1174,46 @@ def test_gateway_compose_mounts_the_ledger_anchor_dir_where_the_ledgers_expect_i
     assert anchor[0].endswith("data/ledger_anchor")
     line = [ln for ln in compose.splitlines() if "/app/data/ledger_anchor" in ln and ln.lstrip().startswith("-")][0]
     assert not line.rstrip().endswith(":ro")                 # 容器要写自己的试验账本锚点
+
+
+# ---------- Issue #77:ArrayManager 接口误用 ----------
+
+AM_HEAD = "from vnpy_ctastrategy import CtaTemplate, ArrayManager\nclass S(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n    def on_bar(self, bar):\n"
+
+
+def _am_findings(findings):
+    return [f for f in findings if "ArrayManager 没有这个成员" in f]
+
+
+@pytest.mark.parametrize("call_src", ["self.am.highest(20)", "self.am.lowest(20)", "self.am.rolling(5)", "self.am.max(3)"])
+def test_screen_rejects_nonexistent_array_manager_members(call_src):
+    findings = rs.screen_source(AM_HEAD + f"        x = {call_src}\n")
+
+    assert _am_findings(findings) and all("donchian" in f for f in _am_findings(findings))
+
+
+@pytest.mark.parametrize("call_src", [
+    "self.am.sma(5)", "self.am.donchian(20, array=True)[0][-2]", "self.am.close_array[-1]", "self.am.inited",
+    "self.am.atr(14)", "self.am.boll(20, 2)", "self.am.count", "self.am.update_bar(bar)",
+])
+def test_screen_accepts_real_array_manager_members(call_src):
+    assert not _am_findings(rs.screen_source(AM_HEAD + f"        x = {call_src}\n"))
+
+
+def test_screen_array_manager_rule_does_not_misfire_on_other_objects_or_writes():
+    src = AM_HEAD + "        self.other.highest(3)\n        self.am.note = 1\n        y = self.am2.highest(3)\n"
+    assert not _am_findings(rs.screen_source(src))
+
+
+def test_screen_array_manager_rule_yields_when_candidate_assigns_its_own_am():
+    src = ("from vnpy_ctastrategy import CtaTemplate\nclass Mine:\n    def highest(self, n):\n        return 1\n"
+           "class S(CtaTemplate):\n    def on_init(self):\n        self.am = Mine()\n"
+           "    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert not _am_findings(rs.screen_source(src))
+
+
+def test_array_manager_member_list_matches_the_real_class():
+    ctas = pytest.importorskip("vnpy_ctastrategy")
+    am = ctas.ArrayManager()
+    real = {n for n in dir(am) if not n.startswith("_")}
+    assert rs.ARRAY_MANAGER_MEMBERS == real, (sorted(rs.ARRAY_MANAGER_MEMBERS - real), sorted(real - rs.ARRAY_MANAGER_MEMBERS))

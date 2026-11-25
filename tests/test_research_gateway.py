@@ -1016,3 +1016,24 @@ def test_corrupt_trial_ledger_fails_closed_and_stores_nothing(tmp_path):
     assert status == 500 and "试验账本" in body["error"]
     assert not (tmp_path / "pending_strategies" / "a.py").exists()
     assert not (tmp_path / "data" / "research" / "submissions.jsonl").exists()       # 迭代额度也没被占用
+
+
+# ---------- Issue #77:接口误用在提交阶段被拒,不占额度也不记试验 ----------
+
+AM_BAD = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\n"
+          "class S(CtaTemplate):\n"
+          "    def on_init(self):\n"
+          "        self.am = ArrayManager()\n"
+          "    def on_bar(self, bar):\n"
+          "        top = self.am.highest(20)\n")
+
+
+def test_array_manager_misuse_is_rejected_before_any_quota_or_trial(tmp_path):
+    app = make_app(tmp_path)
+
+    status, body = call(app, "POST", "/research/candidates", {"name": "bad.py", "source": AM_BAD})
+
+    assert status == 400 and "highest" in body["error"] and "donchian" in body["error"]
+    assert not (tmp_path / "pending_strategies" / "bad.py").exists()
+    assert not (tmp_path / "data" / "research" / "submissions.jsonl").exists()     # 提交额度没动
+    assert _trial_total(tmp_path) == 0                                             # 试验账本没动
