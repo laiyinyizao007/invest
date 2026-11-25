@@ -1174,3 +1174,119 @@ def test_gateway_compose_mounts_the_ledger_anchor_dir_where_the_ledgers_expect_i
     assert anchor[0].endswith("data/ledger_anchor")
     line = [ln for ln in compose.splitlines() if "/app/data/ledger_anchor" in ln and ln.lstrip().startswith("-")][0]
     assert not line.rstrip().endswith(":ro")                 # 容器要写自己的试验账本锚点
+
+
+# ---------- Issue #77:ArrayManager 接口误用 ----------
+
+AM_HEAD = "from vnpy_ctastrategy import CtaTemplate, ArrayManager\nclass S(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n    def on_bar(self, bar):\n"
+
+
+def _am_findings(findings):
+    return [f for f in findings if "ArrayManager 没有这个成员" in f]
+
+
+@pytest.mark.parametrize("call_src", ["self.am.highest(20)", "self.am.lowest(20)", "self.am.rolling(5)", "self.am.max(3)"])
+def test_screen_rejects_nonexistent_array_manager_members(call_src):
+    findings = rs.screen_source(AM_HEAD + f"        x = {call_src}\n")
+
+    assert _am_findings(findings) and all("donchian" in f for f in _am_findings(findings))
+
+
+@pytest.mark.parametrize("call_src", [
+    "self.am.sma(5)", "self.am.donchian(20, array=True)[0][-2]", "self.am.close_array[-1]", "self.am.inited",
+    "self.am.atr(14)", "self.am.boll(20, 2)", "self.am.count", "self.am.update_bar(bar)",
+])
+def test_screen_accepts_real_array_manager_members(call_src):
+    assert not _am_findings(rs.screen_source(AM_HEAD + f"        x = {call_src}\n"))
+
+
+def test_screen_array_manager_rule_does_not_misfire_on_other_objects_or_writes():
+    src = AM_HEAD + "        self.other.highest(3)\n        self.am.note = 1\n        y = self.am2.highest(3)\n"
+    assert not _am_findings(rs.screen_source(src))
+
+
+def test_screen_array_manager_rule_yields_when_candidate_assigns_its_own_am():
+    src = ("from vnpy_ctastrategy import CtaTemplate\nclass Mine:\n    def highest(self, n):\n        return 1\n"
+           "class S(CtaTemplate):\n    def on_init(self):\n        self.am = Mine()\n"
+           "    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert not _am_findings(rs.screen_source(src))
+
+
+def test_array_manager_member_list_matches_the_real_class():
+    ctas = pytest.importorskip("vnpy_ctastrategy")
+    am = ctas.ArrayManager()
+    real = {n for n in dir(am) if not n.startswith("_")}
+    assert rs.ARRAY_MANAGER_MEMBERS == real, (sorted(rs.ARRAY_MANAGER_MEMBERS - real), sorted(real - rs.ARRAY_MANAGER_MEMBERS))
+
+
+# ---------- Issue #77 codex 复核后补的用例:让路条件要精确、输出要有上限 ----------
+
+def _am_src(head_lines: str, body: str = "        x = self.am.highest(3)\n") -> str:
+    return ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\nclass S(CtaTemplate):\n"
+            f"{head_lines}    def on_bar(self, bar):\n{body}")
+
+
+@pytest.mark.parametrize("head", [
+    "    def on_init(self):\n        self.am = ArrayManager()\n    def on_stop(self):\n        self.am = None\n",   # None 清理不让路
+    "    def on_init(self):\n        self.am: ArrayManager = ArrayManager()\n",
+    "    def on_init(self):\n        self.am = ArrayManager() if self.x else None\n",
+    "    def on_init(self):\n        self.am: ArrayManager\n        self.am = ArrayManager()\n",
+])
+def test_am_rule_still_fires_when_other_writes_are_only_none_or_annotations(head):
+    assert _am_findings(rs.screen_source(_am_src(head)))
+
+
+def test_am_rule_follows_import_aliases():
+    src = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager as AM\nclass S(CtaTemplate):\n"
+           "    def on_init(self):\n        self.am = AM()\n    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert _am_findings(rs.screen_source(src))
+
+
+@pytest.mark.parametrize("head", [
+    "    def on_init(self):\n        self.am, b = Mine(), 1\n",                         # 元组解包
+    "    def on_init(self):\n        self.am = ArrayManager()\n        self.am += 1\n",   # 增量赋值
+    "    am = Mine()\n    def on_init(self):\n        self.am = ArrayManager()\n",       # 类属性
+    "    def on_init(self):\n        self.am = ArrayManager()\n    def other(self):\n        self.am = Mine()\n",
+    "    def on_init(self):\n        for self.am in []:\n            pass\n        self.am = ArrayManager()\n",
+    "    def on_init(self):\n        pass\n",                                           # 没有赋值:可能继承自基类
+])
+def test_am_rule_stands_down_without_positive_evidence(head):
+    assert not _am_findings(rs.screen_source(_am_src(head)))
+
+
+def test_am_rule_stands_down_when_file_defines_its_own_arraymanager():
+    src = ("from vnpy_ctastrategy import CtaTemplate\nclass ArrayManager:\n    def highest(self, n):\n        return 1\n"
+           "class S(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n"
+           "    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert not _am_findings(rs.screen_source(src))
+
+
+def test_am_findings_are_capped_and_deduplicated_by_name():
+    body = "".join(f"        x{i} = self.am.highest({i})\n" for i in range(500))
+    body += "".join(f"        y{i} = self.am.name{i}()\n" for i in range(50))
+    found = _am_findings(rs.screen_source(_am_src("    def on_init(self):\n        self.am = ArrayManager()\n", body)))
+    assert len(found) == rs.MAX_AM_FINDINGS
+    assert sum("highest" in f for f in found) == 1
+
+
+def test_am_rule_rejects_private_names_but_not_dunders():
+    src = _am_src("    def on_init(self):\n        self.am = ArrayManager()\n", "        x = self.am._buf\n")
+    assert _am_findings(rs.screen_source(src))
+
+
+def test_am_rule_is_scoped_per_class_and_per_module_origin():
+    other_class = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\n"
+                   "class A(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n"
+                   "class B(CtaTemplate):\n    def on_init(self):\n        self.am = Mine()\n"
+                   "    def on_bar(self, bar):\n        x = self.am.label\n")
+    assert not _am_findings(rs.screen_source(other_class))             # A 的证据不牵连 B
+    unrelated_attr = ("from vnpy_ctastrategy import CtaTemplate, ArrayManager\nclass Config:\n    am = 5\n"
+                      "class S(CtaTemplate):\n    def on_init(self):\n        self.am = ArrayManager()\n"
+                      "    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert _am_findings(rs.screen_source(unrelated_attr))              # 别的类的类属性 am 不让它失效
+    foreign = ("from mymod import ArrayManager\nclass S:\n    def on_init(self):\n        self.am = ArrayManager()\n"
+               "    def on_bar(self, bar):\n        x = self.am.custom(3)\n")
+    assert not _am_findings(rs.screen_source(foreign))                 # 非 vnpy 来源的同名类不算
+    dotted = ("import vnpy_ctastrategy.template\nclass S:\n    def on_init(self):\n"
+              "        self.am = vnpy_ctastrategy.template.ArrayManager()\n    def on_bar(self, bar):\n        x = self.am.highest(3)\n")
+    assert _am_findings(rs.screen_source(dotted))

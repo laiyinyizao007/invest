@@ -3131,7 +3131,130 @@ def screen_source(source: str, extra_modules: Sequence[str] = (), extra_calls: S
     # 与本模块的职责不符。候选代码侧的效果不变:配置放行的模块自己泄漏能力时,
     # 静态层照样按属性链报违规(上面的任意深度属性链规则),运行期则整个拒绝导入。
     findings.extend(_screen_key_usage(tree))
+    findings.extend(_screen_array_manager_interface(tree))
     return findings
+
+
+# vnpy `ArrayManager` 的公开成员(类上的方法/属性 + 实例上的 count/size/inited/*_array)。
+# 常驻研究进程不许 import vnpy(tests/test_research_boundary.py),所以写成常量;
+# tests/test_research_sandbox.py 里有一条需要 vnpy 的测试把它与真实类逐项比对(本机跑,CI 无 vnpy 时跳过)。
+# 用途只有一个:候选写了 `self.am.highest(...)` 这类**不存在**的方法,会在评估时才 AttributeError,
+# 白白耗掉一次提交额度与试验账本(Issue #77)。静态筛查在额度检查之前,在这里拒掉就什么都不占。
+ARRAY_MANAGER_MEMBERS = frozenset({
+    "ad", "adosc", "adx", "adxr", "apo", "aroon", "aroonosc", "atr", "boll", "bop", "cci", "close", "cmo",
+    "donchian", "dx", "ema", "high", "kama", "keltner", "low", "macd", "mfi", "minus_di", "minus_dm", "mom",
+    "natr", "obv", "open", "open_interest", "plus_di", "plus_dm", "ppo", "roc", "rocp", "rocr", "rocr_100",
+    "rsi", "sar", "sma", "std", "stoch", "trange", "trix", "turnover", "ultosc", "update_bar", "volume",
+    "willr", "wma",
+    "count", "size", "inited", "open_array", "high_array", "low_array", "close_array", "volume_array",
+    "turnover_array", "open_interest_array",
+})
+
+
+def _is_self_am(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "am" \
+        and isinstance(node.value, ast.Name) and node.value.id == "self"
+
+
+MAX_AM_FINDINGS = 5          # 一份源码里堆几千处也只报前几个不同的名字(codex 实测 64KB 能放大成 ~300KB 进模型通道)
+
+
+def _am_constructors(tree: ast.AST) -> set[str]:
+    """文件里指向 vnpy `ArrayManager` 的名字(含 `import ... as AM`)。文件自己定义了同名类/函数 ⇒ 空集(不能当证据)。"""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ArrayManager":
+            return set()
+        if isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0].startswith("vnpy"):          # 别的模块里的同名类不算
+                for alias in node.names:
+                    if alias.name == "ArrayManager":
+                        names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0].startswith("vnpy"):
+                    names.add((alias.asname or alias.name) + ".ArrayManager")
+    return names
+
+
+def _is_am_construct(value: ast.AST | None, ctors: set[str]) -> bool:
+    """`ArrayManager(...)` / `mod.ArrayManager(...)` / 别名调用;`None`(清理用)与三元里的这两种也算。"""
+    if isinstance(value, ast.Constant) and value.value is None:
+        return True
+    if isinstance(value, ast.IfExp):
+        return _is_am_construct(value.body, ctors) and _is_am_construct(value.orelse, ctors)
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id in ctors
+    if isinstance(func, ast.Attribute) and func.attr == "ArrayManager":
+        parts: list[str] = []
+        base: ast.AST = func.value
+        while isinstance(base, ast.Attribute):
+            parts.append(base.attr)
+            base = base.value
+        if not isinstance(base, ast.Name):
+            return False
+        parts.append(base.id)
+        return ".".join(reversed(parts)) + ".ArrayManager" in ctors
+    return False
+
+
+def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
+    """逐个类单独判定(codex 复核 Medium:证据与读取若跨类共用,A 类的 `self.am = ArrayManager()` 会让 B 类
+    自己的 `self.am` 被误拒;别的类里的类属性 `am` 也不该让规则整份失效)。"""
+    ctors = _am_constructors(tree)
+    if not ctors:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for finding_name, line in _screen_am_scope(node, ctors):
+                if finding_name not in seen and len(out) < MAX_AM_FINDINGS:
+                    seen.add(finding_name)
+                    out.append(f"第 {line} 行: self.am.{finding_name} 不存在(ArrayManager 没有这个成员,评估时会 AttributeError)。"
+                               "区间最高/最低价请用 self.am.donchian(n)(返回上轨、下轨);可用指标:sma/ema/rsi/atr/boll/donchian/std 等")
+    return out
+
+
+def _screen_am_scope(tree: ast.AST, ctors: set[str]) -> list[tuple[str, int]]:
+    """`self.am.<名字>` 的名字必须是 ArrayManager 的真实成员。只收紧、不放松:多拒一类**确定会报错**的写法。
+
+    **要有正面证据才生效**(codex 对 PR #78 的 Medium 1/2):文件里至少有一处 `self.am = ArrayManager(...)`
+    (vnpy 的那个类,允许别名),并且 `self.am` 的**所有**写入都是它(或 `None` 清理);出现任何别的写入形态
+    (元组解包、for/with 目标、增量赋值、类属性 `am = ...`、赋成别的对象)、或文件自己定义了 `ArrayManager`、
+    或没有任何赋值(可能继承自基类)⇒ 整条规则让路。让路的代价只是这类候选回到"评估时才报错",
+    不会漏掉任何别的筛查(本函数只追加 finding)。"""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):            # 类属性 `am = ...`:self.am 可能来自它
+            for stmt in node.body:
+                tgts = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) else []
+                if any(isinstance(t, ast.Name) and t.id == "am" for t in tgts):
+                    return []
+    ok_targets: set[int] = set()                      # 直接形如 `self.am = ArrayManager(...)`/`= None`/只有注解 的目标节点
+    saw_construct = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_am_construct(node.value, ctors):
+            for t in node.targets:
+                if _is_self_am(t):
+                    ok_targets.add(id(t))
+                    saw_construct = saw_construct or not (isinstance(node.value, ast.Constant) and node.value.value is None)
+        elif isinstance(node, ast.AnnAssign) and _is_self_am(node.target):
+            if node.value is None:
+                ok_targets.add(id(node.target))      # 只有注解、没有赋值:不改变对象
+            elif _is_am_construct(node.value, ctors):
+                ok_targets.add(id(node.target))
+                saw_construct = saw_construct or not (isinstance(node.value, ast.Constant) and node.value.value is None)
+    for node in ast.walk(tree):                       # 其余任何对 self.am 的写/删(解包、增量、for/with 目标、赋成别的)⇒ 让路
+        if _is_self_am(node) and isinstance(node.ctx, (ast.Store, ast.Del)) and id(node) not in ok_targets:
+            return []
+    if not saw_construct:
+        return []
+    return [(n.attr, n.lineno) for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and _is_self_am(n.value)
+            and n.attr not in ARRAY_MANAGER_MEMBERS and not (n.attr.startswith("__") and n.attr.endswith("__"))]
 
 
 def _screen_key_usage(tree: ast.AST) -> list[str]:
