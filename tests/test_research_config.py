@@ -225,3 +225,8 @@ def test_iteration_window_hours_default_and_bounds(tmp_path):
     for bad in (0, 721):
         with pytest.raises(rc.ConfigError):
             rc.load(write(tmp_path, {"iteration": {"window_hours": bad}}))
+
+
+def test_code_defaults_match_the_shipped_config_for_the_submission_cap():
+    """Issue #80:DEFAULTS 是配置文件缺失时的真实回退,不能与出厂配置悄悄分叉(codex 实测改 DEFAULTS 20→21 测试仍全绿)。"""
+    assert rc.DEFAULTS["iteration"] == rc.load()["iteration"] == {"max_iterations": 20, "window_hours": 24}

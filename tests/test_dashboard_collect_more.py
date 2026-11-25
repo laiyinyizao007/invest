@@ -514,3 +514,13 @@ def test_the_run_detail_exposes_the_backtest_statistics(tmp_path):
     assert d is not None and d["stats"] is not None
     assert d["stats"]["round_trips"] == 78 and d["stats"]["sharpe"] == 1.2
     assert d["metrics"] is None
+
+
+@pytest.mark.parametrize("bad", [9999, 0, "20", True, 20.5, None])
+def test_research_panel_rejects_a_cap_the_gateway_would_refuse_to_boot_with(tmp_path, bad):
+    res(tmp_path, ledger=[])
+    cfg = tmp_path / "config" / "research_sandbox.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"iteration": {"max_iterations": bad, "window_hours": 24}}), encoding="utf-8")
+    r = col.collect_research(S(tmp_path), NOW)
+    assert r.section["state"] == "corrupt" and r.headline == "配置损坏"

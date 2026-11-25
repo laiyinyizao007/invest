@@ -742,6 +742,9 @@ def _research_cfg(settings: Settings) -> tuple[dict, str | None]:
     if err or not isinstance(raw, dict):
         return defaults, "corrupt"
     it = raw.get("iteration") if isinstance(raw.get("iteration"), dict) else {}
+    cap = it.get("max_iterations", defaults["iteration"]["max_iterations"])
+    if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 50:
+        return defaults, "corrupt"          # 与网关同口径(整数且 ∈ [1,50]):网关会拒绝启动的值,面板不能照显示成额度(Issue #80 codex 复核)
     pa = raw.get("paths") if isinstance(raw.get("paths"), dict) else {}
     return {"iteration": {**defaults["iteration"], **it}, "paths": {**defaults["paths"], **pa}}, None
 
