@@ -1199,3 +1199,87 @@ def test_shipped_default_allows_twenty_submissions_then_refuses_the_twenty_first
     status, body = submit(app, "b20.py")
 
     assert status == 429 and "最多提交 20" in body["error"]
+
+
+# ---------- Issue #84 codex 复核后补的用例 ----------
+
+def test_a_thread_that_cannot_start_releases_the_lock_exactly_once(tmp_path, monkeypatch):
+    import threading
+    app = make_app(tmp_path, jobs=async_jobs())
+
+    def cannot_start(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", cannot_start)
+    status, body = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})
+
+    assert status == 500 and "不退还" in body["error"]
+    assert not (app.paths["results_dir"] / "running").exists() or not list((app.paths["results_dir"] / "running").glob("*.json"))
+    assert app._busy.acquire(blocking=False)          # 锁是空闲的(没被占着)
+    app._busy.release()                               # 且只释放过一次(再释放会抛 RuntimeError)
+    with pytest.raises(RuntimeError):
+        app._busy.release()
+
+
+def test_a_systemexit_in_the_worker_is_still_recorded_as_error(tmp_path):
+    def run(ctx, run_id=None):
+        raise SystemExit(3)
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    run_id = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]["run_id"]
+    wait_workers()
+
+    assert call(app, "GET", f"/research/results/{run_id}")[1]["status"] == "error"
+    assert app._busy.acquire(blocking=False)
+    app._busy.release()
+
+
+def test_stored_error_is_scrubbed_of_hashes(tmp_path):
+    sha = "ab" * 32
+
+    def run(ctx, run_id=None):
+        raise api.JobError(api.EXIT_FAILED, f"失败 {sha}")
+
+    app = make_app(tmp_path, jobs=async_jobs(run=run))
+
+    run_id = call(app, "POST", "/research/evaluate", {"strategy": "a.py", "class": "C"})[1]["run_id"]
+    wait_workers()
+
+    stored = (app.paths["results_dir"] / "running" / f"{run_id}.json").read_text(encoding="utf-8")
+    assert sha not in stored
+
+
+def test_the_results_directory_lock_refuses_a_second_holder_and_frees_on_close(tmp_path):
+    first = rs.acquire_results_lock(tmp_path)
+    with pytest.raises(rs.SandboxError, match="另一个网关实例"):
+        rs.acquire_results_lock(tmp_path)
+    first.close()
+    rs.acquire_results_lock(tmp_path).close()
+
+
+def test_prune_removes_only_old_terminal_states_never_running(tmp_path):
+    import os
+    import time as _t
+    old = _t.time() - 30 * 24 * 3600
+    for rid, status in (("20261001-100000-000001", "error"), ("20261001-100000-000002", "interrupted"),
+                        ("20261001-100000-000003", "running"), ("20261125-100000-000004", "error")):
+        rs.write_running(tmp_path, rid, {"status": status})
+    for rid in ("20261001-100000-000001", "20261001-100000-000002", "20261001-100000-000003"):
+        os.utime(tmp_path / "running" / f"{rid}.json", (old, old))
+
+    assert rs.prune_running(tmp_path) == 2
+
+    left = sorted(p.stem for p in (tmp_path / "running").glob("*.json"))
+    assert left == ["20261001-100000-000003", "20261125-100000-000004"]
+
+
+def test_a_corrupt_running_file_is_a_clear_500_not_an_unhandled_error(tmp_path):
+    app = make_app(tmp_path)
+    folder = app.paths["results_dir"] / "running"
+    folder.mkdir(parents=True)
+    (folder / "20261125-100000-000009.json").write_text("{broken", encoding="utf-8")
+
+    status, body = call(app, "GET", "/research/results/20261125-100000-000009")
+
+    assert status == 500 and "无法解析" in body["error"]

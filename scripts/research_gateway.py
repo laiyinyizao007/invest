@@ -445,6 +445,7 @@ class GatewayApp:
             except api.JobError as exc:
                 return self._job_error(exc)
             run_id = rs.new_run_id()
+            rs.prune_running(results_dir)                                # 顺手清掉过期的终态状态,免得 running/ 无限增长
             try:
                 rs.write_running(results_dir, run_id, {
                     "kind": "evaluate", "status": "running", "key": product, "strategy_file": ctx.get("strategy_file"),
@@ -452,15 +453,18 @@ class GatewayApp:
             except OSError as exc:
                 print(f"网关内部错误: 运行状态无法登记: {exc}", file=sys.stderr)
                 return 500, {"error": "运行状态无法登记,评估未启动(试验次数已预扣,不退还)"}
+            worker = threading.Thread(target=self._evaluate_worker, args=(ctx, run_id), name=f"evaluate-{run_id}",
+                                      daemon=True)
+            started = True            # **先**标记再启动:线程一启动就可能自己释放锁,标记若在启动之后,中间出异常会双重释放(codex #1)
             try:
-                worker = threading.Thread(target=self._evaluate_worker, args=(ctx, run_id), name=f"evaluate-{run_id}",
-                                          daemon=True)
                 worker.start()
-            except RuntimeError as exc:
+            except BaseException as exc:
+                started = False       # 线程没起来 ⇒ 锁由 finally 释放
                 rs.clear_running(results_dir, run_id)
+                if not isinstance(exc, RuntimeError):
+                    raise
                 print(f"网关内部错误: 无法启动评估线程: {exc}", file=sys.stderr)
                 return 500, {"error": "无法启动评估线程(试验次数已预扣,不退还)"}
-            started = True                                              # 从这里起 _busy 由线程释放
         finally:
             if not started:
                 self._busy.release()
@@ -476,8 +480,8 @@ class GatewayApp:
             self.jobs.evaluate_run(ctx, run_id=run_id)                  # 最终结果落顶层 <run_id>.json
             rs.clear_running(results_dir, run_id)
         except api.JobError as exc:
-            self._finish_running(run_id, rs.redact_paths(exc.message), exc.code)
-        except Exception as exc:                                        # 兜底:任何异常都落成 error,绝不留下永久 running
+            self._finish_running(run_id, rs.scrub_text(exc.message), exc.code)    # 落盘的副本也走统一清洗(哈希/凭据/路径)
+        except BaseException as exc:                                    # 兜底:连 SystemExit 也落成 error,绝不留下永久 running
             print(f"网关内部错误(评估线程): {type(exc).__name__}: {exc}", file=sys.stderr)
             self._finish_running(run_id, "内部错误", None)
         finally:
@@ -545,6 +549,8 @@ class GatewayApp:
             return 200, rs.load_result(run_id, self.paths["results_dir"])
         except rs.SandboxError:
             return 404, {"error": "没有这条结果"}
+        except ValueError:
+            return 500, {"error": "结果文件无法解析"}
 
     def _feedback(self, _data, _params):
         """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
@@ -666,6 +672,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     app = GatewayApp(cfg, paths, token, secrets=rc.known_secret_values(
         cfg=cfg, root=rc.ROOT, label="research-gateway", token=token))
+    try:
+        lock = rs.acquire_results_lock(paths["results_dir"])              # 进程内一直持有;拿不到就不启动
+    except rs.SandboxError as exc:
+        print(f"拒绝: {exc}", file=sys.stderr)
+        return 2
+    app._results_lock = lock
     recovered = app.recover_interrupted()
     if recovered:
         print(f"上次未跑完的评估已改标 interrupted: {recovered}", file=sys.stderr)

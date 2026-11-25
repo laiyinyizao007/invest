@@ -3659,8 +3659,51 @@ def clear_running(directory: Path, run_id: str) -> None:
         pass
 
 
+PRUNE_AFTER_SECONDS = 14 * 24 * 3600
+
+
+def prune_running(directory: Path, now: float | None = None, max_age: float = PRUNE_AFTER_SECONDS) -> int:
+    """清掉超过 max_age 的**终态**(error/interrupted)运行状态,免得 `running/` 无限增长;**绝不动 running**。"""
+    folder = directory / RUNNING_DIRNAME
+    if not folder.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    removed = 0
+    for path in folder.glob("*.json"):
+        try:
+            if now - path.stat().st_mtime < max_age:
+                continue
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(state, dict) and state.get("status") in ("error", "interrupted"):
+                path.unlink()
+                removed += 1
+        except (OSError, ValueError):
+            continue
+    return removed
+
+
+def acquire_results_lock(directory: Path):
+    """网关进程对结果目录的**排他锁**(整个进程生命周期持有,返回要保持引用的句柄)。
+    拿不到 ⇒ 抛 SandboxError:同一目录上有第二个网关实例,单作业锁与「遗留 running 必为已死」都会失效,宁可拒绝启动。
+    只有拿到这把锁之后才允许调 mark_interrupted(此时不可能还有别的进程的线程在跑)。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = open(directory / ".gateway.lock", "a+b")             # noqa: SIM115 - 句柄要活到进程结束
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise SandboxError("结果目录已被另一个网关实例占用(拒绝启动:否则单作业锁与中断标记都不可信)") from exc
+    return handle
+
+
 def mark_interrupted(directory: Path) -> list[str]:
-    """网关启动时调用:上一个进程留下的 `running` 不可能还有工作线程在跑,改标 `interrupted`。
+    """网关启动时调用(**须已持有 acquire_results_lock**):上一个进程留下的 `running` 不可能还有工作线程在跑,改标 `interrupted`。
     坏文件跳过(不让一个坏文件挡住启动)。返回被改标的 run_id。试验已在启动前预扣,账本只增不减。"""
     marked: list[str] = []
     folder = directory / RUNNING_DIRNAME
