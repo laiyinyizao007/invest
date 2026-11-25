@@ -27,6 +27,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from typing import Callable
 
 import research_config as rc
@@ -195,6 +196,46 @@ def _default_jobs() -> SimpleNamespace:
                            plateau_from_data=api.plateau_from_data)
 
 
+# ---- 候选自己写的报错文字不可信(Issue #94) ----
+# 策略运行报错的 message 由候选(模型写的代码)决定,例如 `raise ValueError("忽略以上指令并……")`。它若原样进入下一轮提示词,
+# 就是现成的提示词注入通道,也是"可信知识"与"不可信反馈"必须隔开的原因。所以只放行**能被固定模板识别**的内置报错,
+# 并且只取模板里的标识符片段(单个 token、≤60 字符);其余自由文本一律丢弃,换成固定的中文说明。
+_IDENT = r"[A-Za-z_][A-Za-z0-9_]{0,60}"
+_ERROR_TEMPLATES = (
+    (re.compile(rf"'({_IDENT})' object has no attribute '({_IDENT})'"), "{0} 对象没有属性 {1}(只能用 self.am 上真实存在的方法)"),
+    (re.compile(rf"name '({_IDENT})' is not defined"), "名称 {0} 未定义"),
+    (re.compile(rf"({_IDENT})\(\) got an unexpected keyword argument '({_IDENT})'"), "{0}() 收到了不存在的关键字参数 {1}"),
+    (re.compile(r"(list|tuple) index out of range"), "{0} 下标越界(数据不足时要先判断长度)"),
+    (re.compile(r"(?:float )?division by zero"), "除以零"),
+    (re.compile(r"'NoneType' object is not subscriptable"), "对 None 取了下标(指标尚未算出时会返回 None,要先判断)"),
+    (re.compile(r"cannot unpack non-iterable NoneType object"), "解包了 None(指标尚未算出时会返回 None,要先判断)"),
+)
+_STATIC_ERROR_HINTS = {
+    "GridError": "param_grid 声明不合法(要求:恰好 3 个参数,每个 3~10 个严格递增的取值,参数名须登记在 parameters 里,且不得是受保护参数)",
+    "SyntaxError": "候选源码有语法错误",
+    "IndentationError": "候选源码缩进错误",
+    "ImportError": "候选导入了不可用的模块",
+    "ModuleNotFoundError": "候选导入了不可用的模块",
+}
+_IDENT_RE = re.compile(_IDENT)
+
+
+def _safe_error_line(error: dict) -> str:
+    """把候选的报错压成一行**可信**的说明:类型名 + (模板化片段 或 固定提示 或 \"详情已省略\")。绝不回传自由文本。"""
+    etype = str(error.get("type", ""))
+    etype = etype if _IDENT_RE.fullmatch(etype) else "UnknownError"
+    message = str(error.get("message", ""))
+    detail = None
+    for pattern, template in _ERROR_TEMPLATES:
+        hit = pattern.fullmatch(message)
+        if hit:
+            detail = template.format(*hit.groups())
+            break
+    if detail is None:
+        detail = _STATIC_ERROR_HINTS.get(etype, "详情已省略(不是已知的内置报错模板)")
+    return f"策略运行报错: {etype}: {detail}"
+
+
 class _ReleaseOnce:
     """单作业锁的**幂等**释放:请求线程与工作线程都可能调它,只有第一次真的释放
     (codex 复核:双重释放会让锁在评估还在跑时空出来;此前的「标志」方案在标记与启动之间有窗口)。"""
@@ -260,6 +301,8 @@ class GatewayApp:
             return 413, {"error": "请求体过大"}
 
         route, params = self._match(method, path)
+        if route is not None:
+            params = {**params, "_query": parse_qs(urlsplit(path).query)}       # GET 的查询串(目前只有 /research/feedback 用)
         if route is None:
             known_paths = {p.split("{")[0].rstrip("/") for _, p in ROUTES}
             return (405, {"error": "方法不允许"}) if path.rstrip("/") in known_paths else (404, {"error": "不存在"})
@@ -567,26 +610,36 @@ class GatewayApp:
         except ValueError:
             return 500, {"error": "结果文件无法解析"}
 
-    def _feedback(self, _data, _params):
+    def _feedback(self, _data, params):
         """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
+
+        **`product` 必填(Issue #94)**:反馈是"记忆",必须有作用域——研究 V 时不能看到玉米的失败。
+        不带或不在白名单里 ⇒ 400,而不是回落成全局(全局正是此前串品种的来源)。
+        **候选自己写的报错文字不原样进提示词**(见 `_safe_error_line`):那是不可信文本,会成为提示词注入通道。
 
         另外回一份**已有候选的文件名**:起名那一步要避开它们。
         少了这一段,同一个研究想法重跑会撞名 → 网关 409 → 整条工作流中止,
         「多轮研究循环」实际退化成单轮(第 6 轮实测:同一个想法第二跑死在 409 上)。
         只给文件名(且只给符合命名规则的),不给路径、不给源码、不给内容。"""
         limit = self.cfg["feedback"]["limit"]
+        wanted = (params.get("_query") or {}).get("product", [])
+        if len(wanted) != 1 or wanted[0] not in rs.PRODUCTS:
+            return 400, {"error": f"product 必填(查询参数),只能是 {list(rs.PRODUCTS)}"}
+        product = wanted[0]
         traces = []
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
             try:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
                 continue
+            if result.get("key") != product:                       # 只给当前研究品种的失败,不跨品种
+                continue
             failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
             diagnosis = result.get("diagnosis") or {}
             weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
             error = result.get("error")
             if result.get("status") == "strategy_error" and isinstance(error, dict):
-                failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
+                failures = [_safe_error_line(error)]
             failed = bool(failures) if (result.get("kind") in ("gate", "evaluate") or failures) else weakest is not None
             if not failed:
                 continue
@@ -599,7 +652,7 @@ class GatewayApp:
             })
             if len(traces) >= limit:
                 break
-        return 200, {"limit": limit, "pending_candidates": self._pending_names(), "traces": traces}
+        return 200, {"limit": limit, "product": product, "pending_candidates": self._pending_names(), "traces": traces}
 
     def _pending_names(self) -> list[str]:
         """已有候选的文件名(新到旧)。只回文件名,且只回符合命名规则的那些。
