@@ -66,7 +66,7 @@ def test_auto_approval_goes_to_its_own_ledger_only(tmp_path):
     cand = tmp_path / "c.py"
     cand.write_text("x = 1\n", encoding="utf-8")
     human, auto = tmp_path / "approvals.json", tmp_path / "auto_approvals.json"
-    sha = rs.record_auto_approval(cand, auto)
+    sha = rs.record_auto_approval(cand, auto, provenance="user")
     assert rs._load_approvals(auto)[sha]["via"] == "auto-research"
     assert not human.exists()                                       # 人工账没被碰
     assert rs.is_approved_sha_any(sha, human, auto) is True
@@ -77,14 +77,14 @@ def test_auto_writer_refuses_the_human_ledger_name(tmp_path):
     cand = tmp_path / "c.py"
     cand.write_text("x = 1\n", encoding="utf-8")
     with pytest.raises(rs.SandboxError):
-        rs.record_auto_approval(cand, tmp_path / "approvals.json")
+        rs.record_auto_approval(cand, tmp_path / "approvals.json", provenance="user")
 
 
 def test_changing_the_file_invalidates_auto_approval(tmp_path):
     cand = tmp_path / "c.py"
     cand.write_text("x = 1\n", encoding="utf-8")
     auto = tmp_path / "auto_approvals.json"
-    rs.record_auto_approval(cand, auto)
+    rs.record_auto_approval(cand, auto, provenance="user")
     cand.write_text("x = 2\n", encoding="utf-8")
     assert rs.is_approved_sha_any(rs.file_sha256(cand), tmp_path / "approvals.json", auto) is False
 
@@ -93,7 +93,7 @@ def test_a_corrupt_auto_ledger_fails_closed_not_open(tmp_path):
     cand = tmp_path / "c.py"
     cand.write_text("x = 1\n", encoding="utf-8")
     auto = tmp_path / "auto_approvals.json"
-    sha = rs.record_auto_approval(cand, auto)
+    sha = rs.record_auto_approval(cand, auto, provenance="user")
     auto.write_text(auto.read_text(encoding="utf-8").replace(sha, "0" * 64), encoding="utf-8")
     with pytest.raises(rs.SandboxError):
         rs.is_approved_sha_any(sha, tmp_path / "approvals.json", auto)
@@ -308,7 +308,7 @@ def test_a_corrupt_auto_ledger_fails_closed_even_when_the_human_ledger_hits(tmp_
     sha = rs.record_approval(cand, human, via="cli")
     other = tmp_path / "d.py"
     other.write_text("y = 1\n", encoding="utf-8")
-    rs.record_auto_approval(other, auto)
+    rs.record_auto_approval(other, auto, provenance="user")
     auto.write_text("{ not json", encoding="utf-8")
     with pytest.raises(rs.SandboxError):
         rs.is_approved_sha_any(sha, human, auto)
@@ -339,3 +339,135 @@ def test_the_shared_writer_references_both_pairing_constants():
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_record_row")
     names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
     assert {"AUTO_APPROVAL_VIA", "AUTO_APPROVALS_FILE_NAME"} <= names
+
+
+# ---- Issue #88:联网/未知来源的想法不得自动批准(provenance 强制) ----
+
+def _set_provenance(value):
+    state = mcp_server.load_state()
+    if value is None:
+        state["current"].pop("provenance", None)
+    else:
+        state["current"]["provenance"] = value
+    mcp_server.save_state(state)
+
+
+@pytest.mark.parametrize("bad", ["web", "WEB", "User", "user ", "", "unknown", None, 1, ["user"]])
+def test_the_auto_writer_refuses_every_provenance_except_exactly_user(tmp_path, bad):
+    cand = tmp_path / "c.py"
+    cand.write_text("x = 1\n", encoding="utf-8")
+    auto = tmp_path / "data" / "research-control" / "auto_approvals.json"
+    with pytest.raises(rs.SandboxError, match="不得自动批准"):
+        rs.record_auto_approval(cand, auto, provenance=bad)
+    assert not auto.exists()
+
+
+def test_the_auto_writer_requires_provenance_so_forgetting_it_is_not_a_default_allow(tmp_path):
+    cand = tmp_path / "c.py"
+    cand.write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(TypeError):
+        rs.record_auto_approval(cand, tmp_path / "auto_approvals.json")      # 故意不传 provenance
+
+
+def test_a_web_session_is_never_auto_approved_even_with_the_switch_on(env, monkeypatch):
+    _cand, sha, human, auto, attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    _set_provenance("web")
+
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+
+    assert not auto.exists() and not human.exists()                       # 自动账没动,人工账也没动
+    assert sha in out and "亲自" in out                                    # 回到人工两阶段:给哈希让人粘贴
+    assert "不自动批准" in out and "'web'" in out
+    rows = ra.read(attempts)
+    assert [r["event"] for r in rows] == ["auto_refused"]
+    assert rows[0]["provenance"] == "web"
+
+
+@pytest.mark.parametrize("weird", ["", "Web", "robot", 5, ["user"]])
+def test_a_tampered_or_unknown_provenance_in_the_session_is_not_auto_approvable(env, monkeypatch, weird):
+    _cand, _sha, _human, auto, _attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    _set_provenance(weird)
+
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+
+    assert not auto.exists() and "亲自" in out
+
+
+def test_a_user_session_behaves_exactly_as_before(env, monkeypatch):
+    _cand, sha, _human, auto, attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    _set_provenance("user")
+
+    out = mcp_server._request_approval_inline("cand_1.py", None)
+
+    assert "已按本机配置自动批准" in out and rs._load_approvals(auto)[sha]["via"] == "auto-research"
+    assert [r["event"] for r in ra.read(attempts)] == ["approval_requested", "auto_approved"]
+    assert all(r["provenance"] == "user" for r in ra.read(attempts))
+
+
+def test_a_session_without_a_provenance_field_is_treated_as_user_for_backward_compat(env, monkeypatch):
+    _cand, sha, _human, auto, _attempts = env
+    monkeypatch.setattr(mcp_server, "auto_approve_enabled", lambda: True)
+    _set_provenance(None)
+
+    mcp_server._request_approval_inline("cand_1.py", None)
+
+    assert sha in rs._load_approvals(auto)
+
+
+def test_the_model_facing_start_research_tool_has_no_provenance_parameter():
+    import inspect
+    params = inspect.signature(mcp_server.start_research.fn if hasattr(mcp_server.start_research, "fn")
+                               else mcp_server.start_research).parameters
+    assert list(params) == ["idea"]                                        # 模型不能自己声明来源
+
+
+def test_start_research_rejects_an_unknown_provenance(env):
+    assert "来源只能是" in mcp_server._start_research("想法", provenance="trusted")
+
+
+def _fake_workflow(monkeypatch, waiting_node="input_idea"):
+    """让 _start_research 在没有毕昇的情况下走完:续跑上一轮会话,返回一个停在输入节点的事件。"""
+    monkeypatch.setattr(mcp_server, "idea_node", lambda: waiting_node)
+    monkeypatch.setattr(mcp_server, "invoke", lambda **kw: {
+        "session_id": "s1", "events": [{"event": "input", "node_id": "input_wait", "message_id": 99}]})
+    monkeypatch.setattr(mcp_server, "pending_snapshot", lambda: set())
+
+
+def test_provenance_is_recorded_on_the_session_and_in_the_start_attempt(env, monkeypatch):
+    _cand, _sha, _human, _auto, attempts = env
+    _fake_workflow(monkeypatch)
+    state = mcp_server.load_state()
+    state["current"]["waiting_node"] = "input_idea"           # 上一轮停在想法节点 ⇒ 续跑
+    mcp_server.save_state(state)
+
+    mcp_server._start_research("一个联网来源的想法", provenance="web")
+
+    assert mcp_server.current_session()["provenance"] == "web"
+    assert ra.read(attempts)[-1]["provenance"] == "web" and ra.read(attempts)[-1]["event"] == "start"
+
+
+@pytest.mark.parametrize("previous", ["web", "garbage", "", 7])
+def test_a_resumed_session_that_was_ever_not_user_stays_not_auto_approvable(env, monkeypatch, previous):
+    """粘性:上一轮的想法已在会话上下文里,下一轮是 user 也不能洗白(未知取值按 fail-closed 当作 web)。"""
+    _fake_workflow(monkeypatch)
+    state = mcp_server.load_state()
+    state["current"].update(waiting_node="input_idea", provenance=previous)
+    mcp_server.save_state(state)
+
+    mcp_server._start_research("用户自己的想法", provenance="user")
+
+    assert mcp_server.current_session()["provenance"] == "web"
+
+
+def test_a_fresh_user_session_after_a_user_session_stays_user(env, monkeypatch):
+    _fake_workflow(monkeypatch)
+    state = mcp_server.load_state()
+    state["current"].update(waiting_node="input_idea", provenance="user")
+    mcp_server.save_state(state)
+
+    mcp_server._start_research("用户自己的想法", provenance="user")
+
+    assert mcp_server.current_session()["provenance"] == "user"

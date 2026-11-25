@@ -441,8 +441,15 @@ def is_candidate_approved(name: str) -> bool:
 
 # ---------- 工具实现(同步核心) ----------
 
-def _start_research(idea: str) -> str:
+SESSION_PROVENANCES = ("user", "web")
+
+
+def _start_research(idea: str, provenance: str = "user") -> str:
+    """`provenance` 是想法的来源(Issue #88),**只有宿主机上的驱动器能传 `web`**:
+    MCP 暴露给模型的 `start_research(idea)` 不带这个参数,恒为 `user`,模型不能自己声明来源。"""
     idea = (idea or "").strip()
+    if provenance not in SESSION_PROVENANCES:
+        return f"想法来源只能是 {list(SESSION_PROVENANCES)}。"
     if not idea:
         return "请给出研究想法(一句话说明要验证什么假设)。"
     if len(idea) > MAX_IDEA_LEN:
@@ -492,9 +499,15 @@ def _start_research(idea: str) -> str:
             if guess and guess in pending_snapshot():
                 candidate = guess
         waiting2 = last_input_event(events2)
+        # 来源是**粘性**的:续跑的会话上下文里已含上一轮的想法,上一轮不是 user(含缺失/未知取值,fail-closed 当作 web)
+        # 就不能因为这一轮是 user 而洗白。
+        effective = provenance
+        if resumed and (previous or {}).get("provenance", "user") != "user":
+            effective = "web"
         session = {
             "session_id": second.get("session_id") or session_id,
             "workflow_id": workflow_id(),
+            "provenance": effective,
             "idea": idea,
             "candidate": candidate,
             "candidate_sha": candidate_sha(candidate) if candidate else None,
@@ -506,7 +519,7 @@ def _start_research(idea: str) -> str:
         }
         set_current(session)
         warn = _attempt("start", session=session["session_id"], idea=idea, candidate=candidate or "",
-                        sha256=session["candidate_sha"], note="; ".join(failures[:3]))
+                        sha256=session["candidate_sha"], note="; ".join(failures[:3]), provenance=effective)
         lines = [f"已发起研究。想法:{idea}", f"毕昇会话:{session['session_id']}"]
         if warn:
             lines.append(warn)
@@ -692,23 +705,31 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
                  note="; ".join(findings[:5]))
         return redact_for_model("静态筛查未通过,不予批准:" + "; ".join(findings)
                                 + "。修正候选后需要重新发起研究。")
-    if auto_approve_enabled():
+    provenance = session.get("provenance", "user")
+    auto_ok = isinstance(provenance, str) and provenance in rs.AUTO_APPROVABLE_PROVENANCE
+    refusal_note = ""
+    if auto_approve_enabled() and not auto_ok:
+        # Issue #88:联网/未知来源的想法**不得自动批准**,回到人工哈希批准。记一条尝试(记不下也照样不自动批)。
+        _attempt("auto_refused", session=session.get("session_id"), candidate=name, sha256=sha,
+                 note=f"想法来源 {provenance!r} 不可自动批准,改走人工批准", provenance=str(provenance))
+        refusal_note = (f"(本想法的来源是 {provenance!r}:按规则**不自动批准**,必须由人亲自核对哈希。)")
+    if auto_approve_enabled() and auto_ok:
         # 自动批准(Issue #67):静态筛查已过。**先落尝试记录,记不下就不批**(fail-closed),
         # 再写**独立的自动账**(不是人工账)。落账哈希仍是服务端自算值,与盘上文件绑定。
         warn = _attempt("approval_requested", session=session.get("session_id"), candidate=name, sha256=sha,
-                        via="auto-research", idea=session.get("idea"))
+                        via="auto-research", idea=session.get("idea"), provenance=provenance)
         if warn:
             return redact_for_model("自动批准未执行(尝试记录写不进去,拒绝在无记录的情况下批准):" + warn)
         try:
-            rs.record_auto_approval(path, auto_approvals_file(), sha256=sha)
+            rs.record_auto_approval(path, auto_approvals_file(), sha256=sha, provenance=provenance)
         except rs.SandboxError as exc:
             _attempt("failure", session=session.get("session_id"), candidate=name, sha256=sha,
-                     via="auto-research", note=f"自动批准写入失败:{exc}")
+                     via="auto-research", note=f"自动批准写入失败:{exc}", provenance=provenance)
             return redact_for_model(f"自动批准写入失败:{exc}")
         # 批准**已落账**之后才记「已批准」:日志不得比账本领先。记不下时账里有批准而日志缺一行,
         # 如实告诉调用方(前一行 approval_requested 已在)。
         confirm_warn = _attempt("auto_approved", session=session.get("session_id"), candidate=name,
-                                sha256=sha, via="auto-research")
+                                sha256=sha, via="auto-research", provenance=provenance)
         if confirm_warn:
             return redact_for_model(f"已自动批准候选 {name},但「已批准」那条尝试记录没写进去:" + confirm_warn)
         return redact_for_model("\n".join([
@@ -720,6 +741,7 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
         # 第一阶段:发哈希与位置,**不发源码**——源码由人在本机编辑器里直接读盘上文件
         # (聊天里经模型转述的内容不可作为审阅依据;盘上的文件才是将要被执行的字节)。
         lines = [
+            *([refusal_note] if refusal_note else []),
             f"候选 {name} 的批准信息(会话内确认,不打开浏览器):",
             f"- 文件:候选目录(pending_strategies)下的 {name},请人工在本机用编辑器打开、通读源码;",
             f"- 该文件当前内容的 sha256:{INLINE_HASH_PLACEHOLDER}",

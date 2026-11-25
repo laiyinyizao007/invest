@@ -3538,13 +3538,22 @@ def record_approval(path: Path, approvals_file: Path, now: datetime | None = Non
     return _record_row(path, approvals_file, now=now, sha256=sha256, via=via)
 
 
+# 想法的来源(Issue #88):只有**用户亲自给的**想法可以自动批准。联网来源(`web`)的文本经模型变成代码、
+# 再被自动批准直接在本机沙盒执行——静态筛查只是黑名单、不是隔离,所以联网来源**在写入口就拒绝**。
+# 白名单而不是黑名单:未知/缺省/大小写变体一律不可自动批准(fail-closed)。
+AUTO_APPROVABLE_PROVENANCE = frozenset({"user"})
+
+
 def record_auto_approval(path: Path, auto_approvals_file: Path, now: datetime | None = None,
-                         sha256: str | None = None) -> str:
+                         sha256: str | None = None, *, provenance: str) -> str:
     """把候选记入**自动批准账**(不是人工账)。调用方必须已确认开关打开且静态筛查通过。
 
-    只做两件事:拒绝写错文件(目标必须叫 auto_approvals.json,不得是人工账),
+    做三件事:**拒绝不可自动批准的来源**(`provenance` 必填,只有 `user` 通过;忘了传是 TypeError,不是默认放行),
+    拒绝写错文件(目标必须叫 auto_approvals.json,不得是人工账),
     其余落账逻辑(哈希与文件内容绑定、哈希链、锚点、独占锁)复用 `_record_row`。
     """
+    if not isinstance(provenance, str) or provenance not in AUTO_APPROVABLE_PROVENANCE:
+        raise SandboxError(f"该来源的想法不得自动批准(provenance={provenance!r}):请走人工批准")
     if Path(auto_approvals_file).name != AUTO_APPROVALS_FILE_NAME:
         raise SandboxError(f"自动批准只能写 {AUTO_APPROVALS_FILE_NAME},拒绝写入: {Path(auto_approvals_file).name!r}")
     return _record_row(path, auto_approvals_file, now=now, sha256=sha256, via=AUTO_APPROVAL_VIA)
