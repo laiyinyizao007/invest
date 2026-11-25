@@ -950,6 +950,94 @@ def test_research_ledger_cli_status_migrate_reset(tmp_path, monkeypatch, capsys)
     assert log.exists() and "migrate" in log.read_text(encoding="utf-8")
 
 
+def test_anchor_name_is_the_same_whatever_the_absolute_root(tmp_path):
+    """Issue #73:宿主机和网关容器里账本的绝对路径不同(C:/.../data/research vs /app/data/research),
+    锚点文件名只能由"相对 data 目录的路径"决定,否则一方写的锚点另一方永远读不到。"""
+    a = tmp_path / "hostroot" / "data" / "research" / "trials.jsonl"
+    b = tmp_path / "other" / "deep" / "app" / "data" / "research" / "trials.jsonl"
+    assert chain.anchor_path_for(a).name == chain.anchor_path_for(b).name
+    assert chain.anchor_path_for(a).parent == a.parent.parent / "ledger_anchor"
+    ctl = tmp_path / "hostroot" / "data" / "research-control" / "approvals.json"
+    assert chain.anchor_path_for(ctl).name != chain.anchor_path_for(a).name     # 不同账本不同锚点
+    assert chain.anchor_path_for(ctl).name.startswith("approvals-")
+
+
+def test_a_legacy_named_anchor_is_no_longer_trusted(tmp_path):
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    trials.parent.mkdir(parents=True)
+    tl.record_trials(trials, "submission", 3, at=1.0)
+    rows = trials.read_text(encoding="utf-8").splitlines()
+    assert rows
+    new = chain.anchor_path_for(trials)
+    old = chain.legacy_anchor_path_for(trials)
+    assert old.name != new.name
+    new.rename(old)                                                    # 只剩旧名的锚点
+    with pytest.raises(tl.TrialLedgerError, match="没有锚点"):
+        tl.total_trials(trials)
+
+
+def _legacy_setup(tmp_path, monkeypatch, counts=(3,)):
+    import research_ledger as cli
+    trials = tmp_path / "data" / "research" / "trials.jsonl"
+    approvals_file = tmp_path / "data" / "research-control" / "approvals.json"
+    monkeypatch.setattr(cli, "_paths", lambda: (trials, approvals_file))
+    trials.parent.mkdir(parents=True)
+    for count in counts:
+        tl.record_trials(trials, "submission", count, at=1.0)
+    new, old = chain.anchor_path_for(trials), chain.legacy_anchor_path_for(trials)
+    new.rename(old)
+    return cli, trials, new, old
+
+
+def test_rename_anchors_dry_run_changes_nothing_and_shows_what_it_would_adopt(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
+    assert cli.main(["rename-anchors"]) == 0
+    assert old.exists() and not new.exists()
+    assert not (new.parent / "ledger.admin.log").exists()
+    result = cli._rename_anchors(False)
+    assert "累计=3" in result["trials"] and "锚点 seq=1" in result["trials"]
+
+
+def test_rename_anchors_apply_publishes_only_after_the_read_side_accepts(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
+    content = old.read_text(encoding="ascii")
+    assert cli.main(["rename-anchors", "--apply"]) == 0
+    assert new.read_text(encoding="ascii") == content and not old.exists()
+    assert old.with_name(old.name + ".migrated").exists()
+    assert tl.total_trials(trials) == 3
+    assert cli.main(["rename-anchors", "--apply"]) == 0                # 幂等
+    assert "rename-anchors" in (new.parent / "ledger.admin.log").read_text(encoding="utf-8")
+
+
+def test_rename_anchors_apply_undoes_the_new_anchor_when_the_ledger_does_not_match(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch, counts=(3, 2))
+    lines = trials.read_text(encoding="utf-8").splitlines()
+    trials.write_text(lines[0] + chr(10), encoding="utf-8")            # 账本被截短:旧锚点已不对应
+    assert cli.main(["rename-anchors", "--apply"]) == 1
+    assert old.exists() and not new.exists()                           # 旧锚点原样还在,新锚点已撤销
+
+
+def test_rename_anchors_undoes_even_on_keyboard_interrupt(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch)
+
+    def boom(path):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(tl, "total_trials", boom)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["rename-anchors", "--apply"])
+    assert old.exists() and not new.exists()
+    assert "rename-anchors" in (new.parent / "ledger.admin.log").read_text(encoding="utf-8")   # 审计不丢
+
+
+def test_rename_anchors_does_not_report_a_mismatched_new_anchor_as_migrated(tmp_path, monkeypatch):
+    cli, trials, new, old = _legacy_setup(tmp_path, monkeypatch, counts=(3, 2))
+    old.rename(new)
+    lines = trials.read_text(encoding="utf-8").splitlines()
+    trials.write_text(lines[0] + chr(10), encoding="utf-8")
+    assert cli.main(["rename-anchors"]) == 1                           # 新名已在但对不上 ⇒ 不是"已迁移"
+
+
 # ======================================================================
 # D. 行情在候选导入前取定
 # ======================================================================
@@ -967,6 +1055,8 @@ def child_env(monkeypatch, tmp_path):
     csv = tmp_path / "bars.csv"
     _write_bars_csv(csv, 10.5)
     monkeypatch.setattr(wf, "DATA_FILE", csv)
+    # #70 之后评估按产品从 wf.PRODUCTS 取数据文件;只补 DATA_FILE 会读到真实行情(夹具要同步换掉 C15 那一项)
+    monkeypatch.setitem(wf.PRODUCTS, "C15", (csv, wf.PRODUCTS["C15"][1]))
     monkeypatch.setattr(api, "child_file", lambda p: p)
     monkeypatch.setattr(api, "child_approved", lambda sha: None)
     monkeypatch.setattr(api, "child_params", lambda a: {})
