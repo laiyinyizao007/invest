@@ -111,7 +111,7 @@ def test_start_research_reports_candidate_and_waiting_node(clean_state, monkeypa
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("均线突破")
+    out = mcp_server._start_research("均线突破", provenance="user")
 
     assert "cand_1.py" in out
     assert "input_wait" in out
@@ -148,7 +148,7 @@ def test_start_research_never_leaks_the_hash_or_the_approve_command(clean_state,
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("均线突破")
+    out = mcp_server._start_research("均线突破", provenance="user")
 
     assert sha not in out
     assert "research_api.py approve" not in out
@@ -210,7 +210,7 @@ def test_candidate_comes_from_the_filesystem_not_from_the_model_prose(clean_stat
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("想法")
+    out = mcp_server._start_research("想法", provenance="user")
 
     assert "候选已提交:real_1.py" in out
 
@@ -229,7 +229,7 @@ def test_candidate_named_in_prose_must_exist_in_the_pending_dir(clean_state, mon
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("想法")
+    out = mcp_server._start_research("想法", provenance="user")
 
     assert "候选已提交:" not in out
     state = json.loads(mcp_server.STATE_FILE.read_text(encoding="utf-8"))
@@ -237,12 +237,12 @@ def test_candidate_named_in_prose_must_exist_in_the_pending_dir(clean_state, mon
 
 
 def test_start_research_without_idea_is_rejected(clean_state):
-    assert "研究想法" in mcp_server._start_research("   ")
+    assert "研究想法" in mcp_server._start_research("   ", provenance="user")
 
 
 def test_start_research_continues_previous_session_after_feedback(clean_state, monkeypatch):
     """评估后工作流回到「研究想法」节点:下一次发起接着同一会话走,反馈才对得上。"""
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_idea",
                                        "waiting_message_id": 61}})
     calls = []
@@ -256,7 +256,7 @@ def test_start_research_continues_previous_session_after_feedback(clean_state, m
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("换个思路")
+    out = mcp_server._start_research("换个思路", provenance="user")
 
     assert "cand_2.py" in out
     assert len(calls) == 1                       # 没有另起会话
@@ -268,7 +268,7 @@ def test_start_research_continues_previous_session_after_feedback(clean_state, m
 
 def test_start_research_starts_new_session_when_previous_is_awaiting_approval(clean_state, monkeypatch):
     """上一轮还停在「等待批准」节点时,发起新研究要另起会话,不能把想法喂给批准节点。"""
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_wait",
                                        "waiting_message_id": 58}})
     calls = []
@@ -283,7 +283,7 @@ def test_start_research_starts_new_session_when_previous_is_awaiting_approval(cl
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    mcp_server._start_research("新想法")
+    mcp_server._start_research("新想法", provenance="user")
 
     assert calls[0].get("session_id") is None     # 先起新会话
     assert calls[1]["node"] == "input_idea"
@@ -295,7 +295,7 @@ def test_start_research_reports_backend_failure(clean_state, monkeypatch):
 
     monkeypatch.setattr(mcp_server, "invoke", boom)
 
-    assert "毕昇没起来" in mcp_server._start_research("想法")
+    assert "毕昇没起来" in mcp_server._start_research("想法", provenance="user")
 
 
 CLOSE_FAILURE = {"event": "close", "output_schema": {"message": {
@@ -335,13 +335,13 @@ def test_start_research_shows_the_close_failure_instead_of_an_empty_result(clean
         return {"session_id": "s2", "events": [CLOSE_FAILURE]}
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
-    out = mcp_server._start_research("想法")
+    out = mcp_server._start_research("想法", provenance="user")
     assert "工作流有节点失败" in out and "10541" in out
 
 
 def test_start_research_falls_back_to_a_new_session_when_resume_fails(clean_state, monkeypatch):
     """上一轮会话失效(毕昇会话过期)时退回全新会话,不能把用户卡在死会话里。"""
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_idea",
                                        "waiting_message_id": 61}})
     calls = []
@@ -358,7 +358,7 @@ def test_start_research_falls_back_to_a_new_session_when_resume_fails(clean_stat
 
     monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
 
-    out = mcp_server._start_research("新想法")
+    out = mcp_server._start_research("新想法", provenance="user")
 
     assert "发起研究失败" not in out
     assert calls[0]["session_id"] == "s1"          # 先试续跑
@@ -369,7 +369,7 @@ def test_start_research_falls_back_to_a_new_session_when_resume_fails(clean_stat
 
 
 def test_status_resumes_workflow_only_after_human_approval(clean_state, monkeypatch):
-    state = {"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    state = {"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                           "waiting_node": "input_wait", "waiting_message_id": 12,
                           "last_outputs": [], "failures": []}}
     mcp_server.save_state(state)
@@ -382,7 +382,7 @@ def test_status_resumes_workflow_only_after_human_approval(clean_state, monkeypa
 
 
 def test_status_resumes_and_returns_evaluation_after_approval(clean_state, monkeypatch):
-    state = {"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    state = {"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                           "waiting_node": "input_wait", "waiting_message_id": 12,
                           "last_outputs": [], "failures": []}}
     mcp_server.save_state(state)
@@ -447,7 +447,7 @@ def test_request_approval_never_returns_the_url_or_the_hash(clean_state, monkeyp
     ready = {"event": "ready", "strategy": "cand.py", "sha256": sha, "url": url,
              "screening_passed": True, "findings": []}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     out = mcp_server._request_approval_via_page("cand.py")
@@ -477,7 +477,7 @@ def test_request_approval_never_returns_the_approve_command(clean_state, monkeyp
     ready = {"event": "ready", "strategy": "cand.py", "sha256": "c" * 64,
              "screening_passed": True, "findings": []}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     out = mcp_server._request_approval_via_page("cand.py")
@@ -497,7 +497,7 @@ def test_request_approval_passes_hide_url_to_the_approval_process(clean_state, m
         return FakeApprovalProc(ready)
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", fake_popen)
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     mcp_server._request_approval_via_page("cand.py")
@@ -521,7 +521,7 @@ def test_request_approval_detaches_stdin_from_the_approval_process(clean_state, 
         return FakeApprovalProc(ready)
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", fake_popen)
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     mcp_server._request_approval_via_page("cand.py")
@@ -547,7 +547,7 @@ def test_request_approval_says_unresponsive_when_the_child_hangs(clean_state, mo
     """子进程活着却一直不吐 ready ⇒ 提示「无响应」,不再误导成「候选可能不存在」(Issue #57)。"""
     monkeypatch.setattr(mcp_server, "READY_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=True))
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     out = mcp_server._request_approval_via_page("cand.py")
@@ -559,7 +559,7 @@ def test_request_approval_says_unresponsive_when_the_child_hangs(clean_state, mo
 def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, monkeypatch):
     """子进程没吐 ready 就退出 ⇒ 提示「已退出」并带退出码(原因细节只进本机 stderr)。"""
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=False, rc=3))
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     out = mcp_server._request_approval_via_page("cand.py")
@@ -570,7 +570,7 @@ def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, mon
 
 def test_request_approval_only_approves_the_current_candidate(clean_state, monkeypatch):
     """不能拿批准流程去批别的文件:只能批本轮研究的候选。"""
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     def boom(*a, **k):
@@ -589,7 +589,7 @@ def test_request_approval_refuses_when_the_session_has_no_candidate(clean_state,
 
     否则模型可以借批准流程去批候选目录里的任意旧文件(它不是本轮研究的产物)。
     """
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": None,
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": None,
                                        "candidate_sha": None, "waiting_node": "input_wait",
                                        "waiting_message_id": 12}})
 
@@ -630,7 +630,7 @@ def test_request_approval_surfaces_the_fail_closed_reason(clean_state, monkeypat
     """
     ready = {"event": "error", "message": "脱敏模块不可用,拒绝提供批准页"}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
                                        "waiting_node": "input_wait", "waiting_message_id": 12}})
 
     out = mcp_server._request_approval_via_page("cand.py")
@@ -648,7 +648,7 @@ def _inline_setup(clean_state):
     cand = pending / "cand_1.py"
     cand.write_text("class C: pass\n", encoding="utf-8")
     sha = mcp_server.rs.file_sha256(cand)
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                        "candidate_sha": sha, "waiting_node": "input_wait",
                                        "waiting_message_id": 12}})
     approvals = clean_state / "approvals.json"
@@ -712,7 +712,7 @@ def test_inline_approval_refuses_when_candidate_changed_after_research_start(cle
     cand = pending / "cand_1.py"
     cand.write_text("class C: pass\n", encoding="utf-8")
     stale = "0" * 64
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                        "candidate_sha": stale, "waiting_node": "input_wait",
                                        "waiting_message_id": 12}})
     out = mcp_server._request_approval_inline("cand_1.py", None)
@@ -765,7 +765,7 @@ def test_approval_state_requires_the_same_content_hash(clean_state, monkeypatch)
 
 
 def test_long_idea_is_rejected(clean_state):
-    out = mcp_server._start_research("x" * (mcp_server.MAX_IDEA_LEN + 1))
+    out = mcp_server._start_research("x" * (mcp_server.MAX_IDEA_LEN + 1), provenance="user")
     assert "太长" in out
 
 
@@ -828,7 +828,7 @@ def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
     state = tmp_path / ".local" / "research-mcp"
     state.mkdir(parents=True)
     (state / "sessions.json").write_text(json.dumps({"current": {
-        "session_id": "s1", "idea": "x", "candidate": "cand.py",
+        "session_id": "s1", "provenance": "user", "idea": "x", "candidate": "cand.py",
         "waiting_node": "input_wait", "waiting_message_id": 1}}), encoding="utf-8")
     wrapper = tmp_path / "wrap_server.py"
     wrapper.write_text(_WRAPPER, encoding="utf-8")
@@ -916,7 +916,7 @@ def test_deployment_treats_js_undefined_as_missing(value):
 # ---------- 异步评估(Issue #84):工作流只回 run_id,结果由 research_status 按 run_id 取 ----------
 
 def _async_session(clean_state, monkeypatch, tmp_path, start_text="评估已启动(run_id: 20261125-100000-000001)。稍后用 get_result 取结果。"):
-    mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
+    mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                         "waiting_node": "input_wait", "waiting_message_id": 12,
                                         "last_outputs": [], "failures": []}})
     monkeypatch.setattr(mcp_server, "approval_state", lambda session: (True, ""))

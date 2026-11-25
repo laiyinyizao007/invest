@@ -23,7 +23,7 @@ if str(CODE_ROOT) not in sys.path:
 from risk import ledger_chain as chain  # noqa: E402
 
 EVENTS = ("start", "screening_rejected", "approval_requested", "manual_approved", "auto_approved",
-          "advanced", "failure", "note")
+          "advanced", "failure", "note", "auto_refused")
 MAX_TEXT = 600
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 TOOL_HINT = "尝试记录链断/被篡改:先人工核对,保留原文件备份后再重新开始记录。"
@@ -67,7 +67,7 @@ def read(path: Path) -> list[dict]:
 
 def record_attempt(path: Path, event: str, *, session: str | None = None, idea: str | None = None,
                    candidate: str | None = None, sha256: str | None = None, via: str | None = None,
-                   note: str | None = None) -> int:
+                   note: str | None = None, provenance: str | None = None) -> int:
     """追加一条并返回追加后的总行数。调用方传入的文本**必须已过模型可见通道的清洗**。"""
     if event not in EVENTS:
         raise AttemptsError(f"未知的尝试事件: {event!r}")
@@ -76,7 +76,7 @@ def record_attempt(path: Path, event: str, *, session: str | None = None, idea: 
     path = Path(path)
     body = {"event": event, "session": _clip(session), "idea": _clip(idea), "candidate": _clip(candidate),
             "sha": sha256 or "", "via": _clip(via), "note": _clip(note),
-            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            "provenance": _clip(provenance), "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
