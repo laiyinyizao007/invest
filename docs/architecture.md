@@ -38,10 +38,15 @@
 | TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
 | RSA 研究沙盒 API(CLI + HTTP 网关 + 容器) | IMPL | `scripts/research_api.py`、`research_gateway.py`、`docker-compose.research.yml`、`docker/research/`;端到端经毕昇容器 → 沙盒容器实测;**威胁模型:纵深防御而非完整隔离**(见 ADR) |
 | 候选独立进程执行 | PLAN(设计方案待评审) | ADR `20261115-candidate-process-isolation.md`,Issue [#29](https://github.com/laiyinyizao007/invest/issues/29):候选只产出信号序列,回测/评估/记账/落盘/指标全部由框架进程独立完成;试验次数改由框架自己数;**未改动任何已锁定阈值**;含 5 个需用户拍板的点 |
-| SBX 骨架目录 | PART | `pending_strategies/` 已落地(外层唯一可写位置);`approved/` 与骨架模板未做 |
+| SBX 骨架目录 | PART | `pending_strategies/` 已落地(候选源码的落点;网关容器另有 `data/research`、`data/ledger_anchor` 两个可写挂载,候选代码自身的写权限靠审计钩子白名单限制);`approved/` 与骨架模板未做 |
 | 外层 Bisheng AI 研究员 | PART | 本机部署(仅 127.0.0.1);工具与工作流 v3、无 LLM 联调工作流已建;**LLM 节点联调待额度**;`tools/bisheng/` |
 | 诊断书 / 候选评估 / 中文报告 | IMPL | `risk/diagnosis.py`、`risk/candidate_eval.py`、`risk/report.py`(纯函数) |
 | RTR MetaRouter | PLAN | 零代码 |
+| 评估异步化(启动即返回 + 按 run_id 取结果) | IMPL(端到端验证) | `scripts/research_gateway.py::_start_evaluate`、`scripts/research_api.py::evaluate_prepare/evaluate_run`、`scripts/research_sandbox.py::write_running/mark_interrupted/acquire_results_lock`;Issue #84,`docs/adr/20261125-pipeline-e2e-smoke.md` |
+| 想法来源强制(联网来源禁止自动批准) | IMPL | `scripts/research_sandbox.py::AUTO_APPROVABLE_PROVENANCE`、`_record_row`;`tools/research_mcp/server.py`;Issue #88。**目前没有出厂代码传 `web`**,防线保护的是之后接入的宿主机驱动器 |
+| 有界活动驱动器 | PLAN | Issue #90;方案见 `docs/plans/20261125-autonomous-research-plan.md` |
+| 候选多周期指标(框架扩展) | PLAN | Issue #91 |
+| 联网想法采集与净化 / 新数据封存段 | PLAN | 前者在驱动器之后,后者等用户补购 2026-06 之后分钟线;见 `docs/roadmap.md` §2.9 |
 
 ### 风控与守卫
 | 节点 | 状态 | 证据 / 缺口 |
@@ -179,3 +184,101 @@ flowchart TB
 | 非策略委托仅进程存活期间检测;算法单/价差子单 reference 前缀不同 | 同上 | 未解决 | 无头启用算法单时扩白名单(roadmap §2.6) |
 | 准入文件防误操作、不防恶意 | 同上 | 设计取舍 | — |
 | 5.2 批量撤单、2.1 全自动断网演练未做;证据图是渲染图非界面截图 | `adr/20261111-broker-test-compliance.md` | 待国信确认 | roadmap §2.6;国信书面确认(`docs/live-readiness.md` C3) |
+
+## 5. 研究系统(外层)现状架构(2026-11-25 核对)
+
+> 这一节只写**已经合并、已经验证过的**现状;计划与待办在 `docs/roadmap.md` §2.9 与 `docs/plans/20261125-autonomous-research-plan.md`。
+> 研究系统与交易路径**完全分离**:候选策略只产出研究结论,不接触真实委托、CTP 凭据与 `.env` 交易段(第一设计公理见 `docs/roadmap.md` §2.2)。
+
+### 5.1 部件与信任边界
+
+```mermaid
+flowchart LR
+  subgraph HOST[本机宿主机]
+    USER[人 / DSH 助手]
+    MCP[研究 MCP 服务器<br/>tools/research_mcp/server.py<br/>会话状态 .local/research-mcp/sessions.json]
+    BS[毕昇工作流 v3<br/>127.0.0.1:7860<br/>起名·写码两个 LLM 节点]
+    DER[(派生行情 CSV<br/>derived/*_15m_adj.csv<br/>只读挂载)]
+    CTRL[(批准账 / 自动批准账<br/>data/research-control<br/>网关只读)]
+  end
+  subgraph NET[research_net 内部网络 无外网]
+    GW[研究沙盒网关<br/>scripts/research_gateway.py :8765<br/>令牌鉴权 只读根文件系统]
+    CH[评估子进程<br/>候选在受限窗口内执行]
+  end
+  RES[(data/research<br/>试验账本 提交账本 结果 running/ 尝试记录)]
+  USER -->|start_research / research_status / request_approval| MCP
+  MCP -->|开放 API| BS
+  BS -->|submit_candidate / get_recent_failures / run_evaluate<br/>(毕昇后端额外接入 research_net 才能调网关)| GW
+  GW -->|批准检查通过后起子进程| CH
+  CH -->|读| DER
+  GW -->|读| CTRL
+  GW -->|写| RES
+  MCP -->|写批准账 自动账须过来源检查| CTRL
+  MCP -->|按 run_id 读结果| RES
+```
+
+- **网络边界**:网关容器在 `internal: true` 的网络里**没有外网**;候选代码被静态筛查(禁 socket/urllib/requests 等)和运行期审计钩子双重限制。毕昇后端与宿主机能联网,但**不是研究沙盒的一部分**。
+- **DSH 研究会话**没有联网/fetch/bash 工具(`research-profile-allowlist.json` 白名单),只有 research-mcp 的 3 个工具。
+- **批准链**:候选代码要先有批准记录(哈希绑定文件内容)才能被评估。人工批准写人工账;自动批准写**独立的自动账**(`via=auto-research`),运行侧(装载门、实盘准入)**不读自动账**。
+
+### 5.2 候选策略的"框架"分四层
+
+| 层 | 内容 | 谁能改 |
+|---|---|---|
+| 候选层 | 继承 `TrendAtr15mStrategy` 的类;只写 `entry_signal()`(返回 +1/-1/0)与**恰好 3 个**参数的 `param_grid`(每个参数 3~10 个严格递增的取值,且参数名须登记进类的 `parameters`);只看**单一品种**自己的 15 分钟价、量、持仓量 | 模型每次生成 |
+| 执行与风控层 | **出场方式与仓位由框架固定**:ATR 移动止损、当日连亏熔断;每笔固定 1 手,**止损距离 × 合约乘数 × 1 手超过单笔风险预算(300 元,受不可变宪法保护)就放弃该笔交易**(不是按预算定手数,也不会缩小止损去迁就预算)。候选只能在宪法允许的范围内调参数——例如可以启用可选的固定止盈 `take_profit_r`(默认 0 = 不启用),风险预算等受保护参数不可改 | 开发(不可降级,走审查) |
+| 评估层 | 选参窗口选参 → 滚动验证窗口上跑门槛:成本翻倍、200 次随机入场对照、参数高原、DSR(分母 = 试验账本累计) | 开发(不可降级) |
+| 治理层 | 沙盒筛查与审计钩子、批准账、哈希链账本与外置锚点、测试段台账、网关 | 开发(不可降级);**循环不得自改** |
+
+> 候选层的**表达能力有限**(出场固定、单品种、无多周期、无外部数据)是框架现状,不是想法本身的问题;扩展路线见 `docs/roadmap.md` §2.9。
+
+### 5.3 一轮研究的流程
+
+```mermaid
+sequenceDiagram
+  participant U as 人/DSH
+  participant M as MCP 服务器
+  participant B as 毕昇工作流
+  participant G as 网关
+  participant E as 评估子进程
+  U->>M: start_research(想法)  [来源恒为 user]
+  M->>B: 想法 → 反馈 → 起名 → 写码
+  B->>G: submit_candidate(静态筛查 → 额度检查 → 试验记账 → 落 pending)
+  U->>M: request_approval
+  M->>M: 自动批准(仅 user 来源,写自动账)或 人工批准(哈希)
+  U->>M: research_status(「继续」推进)
+  M->>B: input_wait 继续
+  B->>G: run_evaluate
+  G->>G: 同步前半段:校验、筛查、批准检查、试验预扣
+  G-->>B: 立即返回 {run_id, status: running}
+  G->>E: 后台线程起子进程(选参 + 门槛评估)
+  E-->>G: 结果 → 顶层 <run_id>.json(清掉 running/)
+  U->>M: research_status(按 run_id 轮询)
+  M-->>U: 仍在运行 / 完整报告
+```
+
+要点:毕昇工具对网关的读超时硬编码 30 秒,所以评估是**启动即返回 + 按 run_id 取结果**;检查全在请求线程里做完,后台线程只做慢的那半段,不可能绕过检查。
+
+### 5.4 状态归属(研究侧)
+
+| 路径 | 谁写 | 说明 |
+|---|---|---|
+| `data/research/trials.jsonl` | 网关(`risk/trial_ledger`) | 试验账本,哈希链 + 外置锚点;**只增不减**;DSR 的分母 |
+| `data/research/submissions.jsonl` | 网关 | 滚动 24 小时提交额度(现 20) |
+| `data/research/<run_id>.json` | 网关评估线程 | 最终结果;顶层 `*.json` 是看板/反馈/清单的唯一来源 |
+| `data/research/running/<run_id>.json` | 网关 | 运行中/失败/被中断状态;**不进结果清单** |
+| `data/research/attempts.jsonl` | MCP 服务器 | 每次尝试的哈希链记录(含来源 `provenance`、被拒的尝试) |
+| `data/research-control/approvals.json` | 批准通道(页面/回贴/CLI) | 人工批准账,运行侧信任 |
+| `data/research-control/auto_approvals.json` | MCP 服务器(仅 `user` 来源) | 自动批准账,**运行侧不读** |
+| `data/ledger_anchor/` | 账本写入者 | 各账本的外置锚点(键 = 相对路径哈希,宿主机与容器一致) |
+| `config/test_segment_usage.json` | 测试段台账 | 记录哪些测试段已被看过(只看一次) |
+| `pending_strategies/` | 网关 | 候选源码落点。注:网关容器另有 `data/research`、`data/ledger_anchor` 两个可写挂载;**候选代码自身**的写权限靠运行期审计钩子的白名单限制 |
+| `.local/research-mcp/sessions.json` | MCP 服务器 | 当前会话(单槽位) |
+
+### 5.5 已知局限(如实)
+
+- **静态筛查是黑名单,不是隔离**;候选与框架同进程执行(多轮 codex 实测有绕过)。独立进程隔离只有设计(#29,待评审),**没有实现**。
+- **自动批准意味着模型生成的代码不经人读就在本机沙盒执行**(用户已接受,见 `docs/adr/20261123-research-auto-approval.md`)。`provenance` 强制(Issue #88)保证联网来源想法进不了自动账,但目前出厂代码没有任何地方传 `web`;该防线成立的前提是自动批准只在没有联网工具的研究 profile 里开,`deployment_problem()` 目前只告警。
+- **容器内锚点目录与账本同在可写区**,候选"够不到锚点"靠沙盒写入白名单,不是独立信任域(见 `risk/ledger_chain.py` 头注释)。
+- 统计功效:现有分钟线按品种约 5.3~6.2 年(C15 约 5.9 年,V15 约 5.3 年,EG15 约 6.2 年),试验账本累计 765,DSR 分母已很大;单个短窗口几乎不可能通过。**合法结论多半是"证明不了有优势"**。
+- 数据:网关评估用的派生 15 分钟复权数据六个品种都止于 2026-06-15;免费源只有 C/EB/PP 自 2026-08-28 起的原始 15 分钟线(约 2.4 个月,与 06-15 之间有空档,未复权),V/EG/M 没有。
