@@ -704,9 +704,8 @@ def _request_approval_inline(strategy: str, confirm_sha256: str | None) -> str:
     provenance = session.get("provenance")
     auto_ok = isinstance(provenance, str) and provenance in rs.AUTO_APPROVABLE_PROVENANCE
     if not auto_ok:
-        if auto_approve_enabled():
-            _attempt("auto_refused", session=session.get("session_id"), candidate=name,
-                     note=f"想法来源 {provenance!r} 不可自动批准,也不可会话内回贴批准", provenance=str(provenance))
+        _attempt("auto_refused", session=session.get("session_id"), candidate=name,           # 开关开不开都记:被拒的尝试也要有记录
+                 note=f"想法来源 {provenance!r} 不可自动批准,也不可会话内回贴批准", provenance=str(provenance))
         return redact_for_model(
             f"本想法的来源是 {provenance!r}:按规则不能自动批准,也不能在会话里回贴哈希批准"
             "(哈希会进入模型通道,模型自己就能批准自己)。请由人用 request_approval(mode=\"page\") 打开本机批准页,"

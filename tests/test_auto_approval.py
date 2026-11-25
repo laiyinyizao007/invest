@@ -383,10 +383,8 @@ def test_a_web_session_gets_no_hash_and_no_inline_approval_whatever_the_switch(e
     assert sha not in out                                                  # 哈希不进模型通道
     assert "mode=" in out and "page" in out and "不能自动批准" in out
     assert not auto.exists() and not human.exists()
-    events = [r["event"] for r in ra.read(attempts)] if attempts.exists() else []
-    assert events == (["auto_refused"] if switch else [])
-    if switch:
-        assert ra.read(attempts)[0]["provenance"] == "web"
+    assert [r["event"] for r in ra.read(attempts)] == ["auto_refused"]      # 开关开不开都有记录
+    assert ra.read(attempts)[0]["provenance"] == "web"
 
 
 @pytest.mark.parametrize("switch", [True, False])
