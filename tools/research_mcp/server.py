@@ -559,6 +559,7 @@ def _eval_progress(session: dict) -> list[str]:
     if status in ("error", "interrupted"):
         why = state.get("error") or state.get("message") or ""
         return [redact_for_model(f"评估 {run_id}:{'失败' if status == 'error' else '被网关重启打断'}。{why}")[:600]]
+    state = rs.sanitize_result_for_model(state)                  # 候选自己写的报错文字不给模型看(Issue #94)
     return [redact_for_model(f"评估 {run_id} 完成:\n" + str(state.get("report") or "(结果里没有报告文本)"))[:3000]]
 
 
