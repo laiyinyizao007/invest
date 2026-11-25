@@ -207,7 +207,7 @@ flowchart LR
   RES[(data/research<br/>试验账本 提交账本 结果 running/ 尝试记录)]
   USER -->|start_research / research_status / request_approval| MCP
   MCP -->|开放 API| BS
-  BS -->|submit_candidate / get_feedback / run_evaluate| GW
+  BS -->|submit_candidate / get_recent_failures / run_evaluate<br/>(毕昇后端额外接入 research_net 才能调网关)| GW
   GW -->|批准检查通过后起子进程| CH
   CH -->|读| DER
   GW -->|读| CTRL
@@ -224,8 +224,8 @@ flowchart LR
 
 | 层 | 内容 | 谁能改 |
 |---|---|---|
-| 候选层 | 继承 `TrendAtr15mStrategy` 的类;只写 `entry_signal()`(返回 +1/-1/0)与最多 3 个参数的 `param_grid`;只看**单一品种**自己的 15 分钟价、量、持仓量 | 模型每次生成 |
-| 执行与风控层 | **出场与仓位固定**:ATR 移动止损、当日连亏熔断、按风险预算定手数 | 开发(不可降级,走审查) |
+| 候选层 | 继承 `TrendAtr15mStrategy` 的类;只写 `entry_signal()`(返回 +1/-1/0)与**恰好 3 个**参数的 `param_grid`(每个参数 3~10 个严格递增的取值,且参数名须登记进类的 `parameters`);只看**单一品种**自己的 15 分钟价、量、持仓量 | 模型每次生成 |
+| 执行与风控层 | **出场与仓位固定**:ATR 移动止损(可选固定止盈 `take_profit_r`,默认 0 = 不启用)、当日连亏熔断;手数固定,**止损距离 × 手数超过单笔风险预算(300 元)就放弃该笔交易**(不是按预算定手数,也不会缩小止损去迁就预算) | 开发(不可降级,走审查) |
 | 评估层 | 选参窗口选参 → 滚动验证窗口上跑门槛:成本翻倍、200 次随机入场对照、参数高原、DSR(分母 = 试验账本累计) | 开发(不可降级) |
 | 治理层 | 沙盒筛查与审计钩子、批准账、哈希链账本与外置锚点、测试段台账、网关 | 开发(不可降级);**循环不得自改** |
 
@@ -271,7 +271,7 @@ sequenceDiagram
 | `data/research-control/auto_approvals.json` | MCP 服务器(仅 `user` 来源) | 自动批准账,**运行侧不读** |
 | `data/ledger_anchor/` | 账本写入者 | 各账本的外置锚点(键 = 相对路径哈希,宿主机与容器一致) |
 | `config/test_segment_usage.json` | 测试段台账 | 记录哪些测试段已被看过(只看一次) |
-| `pending_strategies/` | 网关 | 候选源码(外层唯一可写位置) |
+| `pending_strategies/` | 网关 | 候选源码落点。注:网关容器另有 `data/research`、`data/ledger_anchor` 两个可写挂载;**候选代码自身**的写权限靠运行期审计钩子的白名单限制 |
 | `.local/research-mcp/sessions.json` | MCP 服务器 | 当前会话(单槽位) |
 
 ### 5.5 已知局限(如实)
@@ -279,5 +279,5 @@ sequenceDiagram
 - **静态筛查是黑名单,不是隔离**;候选与框架同进程执行(多轮 codex 实测有绕过)。独立进程隔离只有设计(#29,待评审),**没有实现**。
 - **自动批准意味着模型生成的代码不经人读就在本机沙盒执行**(用户已接受,见 `docs/adr/20261123-research-auto-approval.md`)。`provenance` 强制(Issue #88)保证联网来源想法进不了自动账,但目前出厂代码没有任何地方传 `web`;该防线成立的前提是自动批准只在没有联网工具的研究 profile 里开,`deployment_problem()` 目前只告警。
 - **容器内锚点目录与账本同在可写区**,候选"够不到锚点"靠沙盒写入白名单,不是独立信任域(见 `risk/ledger_chain.py` 头注释)。
-- 统计功效:现有分钟线约 5.9 年,试验账本累计 765,DSR 分母已很大;单个短窗口几乎不可能通过。**合法结论多半是"证明不了有优势"**。
+- 统计功效:现有分钟线按品种约 5.3~6.2 年(C15 约 5.9 年,V15 约 5.3 年,EG15 约 6.2 年),试验账本累计 765,DSR 分母已很大;单个短窗口几乎不可能通过。**合法结论多半是"证明不了有优势"**。
 - 数据:网关评估用的派生 15 分钟复权数据六个品种都止于 2026-06-15;免费源只有 C/EB/PP 自 2026-08-28 起的原始 15 分钟线(约 2.4 个月,与 06-15 之间有空档,未复权),V/EG/M 没有。
