@@ -3156,32 +3156,88 @@ def _is_self_am(node: ast.AST) -> bool:
         and isinstance(node.value, ast.Name) and node.value.id == "self"
 
 
+MAX_AM_FINDINGS = 5          # 一份源码里堆几千处也只报前几个不同的名字(codex 实测 64KB 能放大成 ~300KB 进模型通道)
+
+
+def _am_constructors(tree: ast.AST) -> set[str]:
+    """文件里指向 vnpy `ArrayManager` 的名字(含 `import ... as AM`)。文件自己定义了同名类/函数 ⇒ 空集(不能当证据)。"""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "ArrayManager":
+            return set()
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "ArrayManager":
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add((alias.asname or alias.name.split(".")[0]) + ".ArrayManager")
+    return names
+
+
+def _is_am_construct(value: ast.AST | None, ctors: set[str]) -> bool:
+    """`ArrayManager(...)` / `mod.ArrayManager(...)` / 别名调用;`None`(清理用)与三元里的这两种也算。"""
+    if isinstance(value, ast.Constant) and value.value is None:
+        return True
+    if isinstance(value, ast.IfExp):
+        return _is_am_construct(value.body, ctors) and _is_am_construct(value.orelse, ctors)
+    if not isinstance(value, ast.Call):
+        return False
+    func = value.func
+    if isinstance(func, ast.Name):
+        return func.id in ctors
+    if isinstance(func, ast.Attribute) and func.attr == "ArrayManager":
+        return isinstance(func.value, ast.Name) and f"{func.value.id}.ArrayManager" in ctors
+    return False
+
+
 def _screen_array_manager_interface(tree: ast.AST) -> list[str]:
     """`self.am.<名字>` 的名字必须是 ArrayManager 的真实成员。只收紧、不放松:多拒一类**确定会报错**的写法。
 
-    保守:候选若把 `self.am` 赋成别的东西(不是 `ArrayManager(...)` 调用),它可能有自己的类,规则整体让路;
-    对 `self.am.x = ...` 这类写入不判(写入不是调用不存在的方法)。"""
+    **要有正面证据才生效**(codex 对 PR #78 的 Medium 1/2):文件里至少有一处 `self.am = ArrayManager(...)`
+    (vnpy 的那个类,允许别名),并且 `self.am` 的**所有**写入都是它(或 `None` 清理);出现任何别的写入形态
+    (元组解包、for/with 目标、增量赋值、类属性 `am = ...`、赋成别的对象)、或文件自己定义了 `ArrayManager`、
+    或没有任何赋值(可能继承自基类)⇒ 整条规则让路。让路的代价只是这类候选回到"评估时才报错",
+    不会漏掉任何别的筛查(本函数只追加 finding)。"""
+    ctors = _am_constructors(tree)
+    if not ctors:
+        return []
     for node in ast.walk(tree):
-        targets: list[ast.AST] = []
-        value = None
-        if isinstance(node, ast.Assign):
-            targets, value = list(node.targets), node.value
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            targets, value = [node.target], node.value
-        if any(_is_self_am(t) for t in targets):
-            func = value.func if isinstance(value, ast.Call) else None
-            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
-            if name != "ArrayManager":
-                return []
+        if isinstance(node, ast.ClassDef):            # 类属性 `am = ...`:self.am 可能来自它
+            for stmt in node.body:
+                tgts = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target] if isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) else []
+                if any(isinstance(t, ast.Name) and t.id == "am" for t in tgts):
+                    return []
+    ok_targets: set[int] = set()                      # 直接形如 `self.am = ArrayManager(...)`/`= None`/只有注解 的目标节点
+    saw_construct = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_am_construct(node.value, ctors):
+            for t in node.targets:
+                if _is_self_am(t):
+                    ok_targets.add(id(t))
+                    saw_construct = saw_construct or not (isinstance(node.value, ast.Constant) and node.value.value is None)
+        elif isinstance(node, ast.AnnAssign) and _is_self_am(node.target):
+            if node.value is None:
+                ok_targets.add(id(node.target))      # 只有注解、没有赋值:不改变对象
+            elif _is_am_construct(node.value, ctors):
+                ok_targets.add(id(node.target))
+                saw_construct = saw_construct or not (isinstance(node.value, ast.Constant) and node.value.value is None)
+    for node in ast.walk(tree):                       # 其余任何对 self.am 的写/删(解包、增量、for/with 目标、赋成别的)⇒ 让路
+        if _is_self_am(node) and isinstance(node.ctx, (ast.Store, ast.Del)) and id(node) not in ok_targets:
+            return []
+    if not saw_construct:
+        return []
     out: list[str] = []
-    seen: set[tuple[int, str]] = set()
+    seen: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and _is_self_am(node.value) \
-                and node.attr not in ARRAY_MANAGER_MEMBERS and not node.attr.startswith("_") \
-                and (node.lineno, node.attr) not in seen:
-            seen.add((node.lineno, node.attr))
+                and node.attr not in ARRAY_MANAGER_MEMBERS and not (node.attr.startswith("__") and node.attr.endswith("__")) \
+                and node.attr not in seen:
+            seen.add(node.attr)
             out.append(f"第 {node.lineno} 行: self.am.{node.attr} 不存在(ArrayManager 没有这个成员,评估时会 AttributeError)。"
                        "区间最高/最低价请用 self.am.donchian(n)(返回上轨、下轨);可用指标:sma/ema/rsi/atr/boll/donchian/std 等")
+            if len(out) >= MAX_AM_FINDINGS:
+                break
     return out
 
 
