@@ -125,11 +125,11 @@ def test_research_quota_pending_and_recent_runs(tmp_path):
     assert pend["demo.py"]["approved"] is True and pend["other.py"]["approved"] is False and len(pend["demo.py"]["sha256"]) == 64
     run = d["recent_runs"][0]
     assert run["run_id"] == RID and run["kind"] == "evaluate" and run["passed"] is False and "未通过" in run["headline"]
-    assert r.section["state"] == "ok" and r.level == "ok" and "1/5" in r.headline
+    assert r.section["state"] == "ok" and r.level == "ok" and "1/20" in r.headline
 
 
 def test_research_full_quota_is_a_warning(tmp_path):
-    res(tmp_path, ledger=[{"at": NOW - 100 * i, "name": f"{i}.py", "sha256": "x"} for i in range(5)])
+    res(tmp_path, ledger=[{"at": NOW - 100 * i, "name": f"{i}.py", "sha256": "x"} for i in range(20)])
     r = col.collect_research(S(tmp_path), NOW)
     assert r.level == "warn" and "用尽" in r.headline
 
