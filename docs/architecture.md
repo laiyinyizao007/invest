@@ -37,7 +37,7 @@
 | PP 参数平原 / PBO/DSR | PART | 参数平原 IMPL(`risk/plateau.py` + `scripts/research_grid.py`);PBO/DSR PLAN |
 | TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
 | RSA 研究沙盒 API(CLI + HTTP 网关 + 容器) | IMPL | `scripts/research_api.py`、`research_gateway.py`、`docker-compose.research.yml`、`docker/research/`;端到端经毕昇容器 → 沙盒容器实测;**威胁模型:纵深防御而非完整隔离**(见 ADR) |
-| SBX 骨架目录 | PART | `pending_strategies/` 已落地(外层唯一可写位置);`approved/` 与骨架模板未做 |
+| SBX 骨架目录 | PART | `pending_strategies/` 已落地(候选源码的落点;网关容器另有 `data/research`、`data/ledger_anchor` 两个可写挂载,候选代码自身的写权限靠审计钩子白名单限制);`approved/` 与骨架模板未做 |
 | 外层 Bisheng AI 研究员 | PART | 本机部署(仅 127.0.0.1);工具与工作流 v3、无 LLM 联调工作流已建;**LLM 节点联调待额度**;`tools/bisheng/` |
 | 诊断书 / 候选评估 / 中文报告 | IMPL | `risk/diagnosis.py`、`risk/candidate_eval.py`、`risk/report.py`(纯函数) |
 | RTR MetaRouter | PLAN | 零代码 |
@@ -225,7 +225,7 @@ flowchart LR
 | 层 | 内容 | 谁能改 |
 |---|---|---|
 | 候选层 | 继承 `TrendAtr15mStrategy` 的类;只写 `entry_signal()`(返回 +1/-1/0)与**恰好 3 个**参数的 `param_grid`(每个参数 3~10 个严格递增的取值,且参数名须登记进类的 `parameters`);只看**单一品种**自己的 15 分钟价、量、持仓量 | 模型每次生成 |
-| 执行与风控层 | **出场与仓位固定**:ATR 移动止损(可选固定止盈 `take_profit_r`,默认 0 = 不启用)、当日连亏熔断;手数固定,**止损距离 × 手数超过单笔风险预算(300 元)就放弃该笔交易**(不是按预算定手数,也不会缩小止损去迁就预算) | 开发(不可降级,走审查) |
+| 执行与风控层 | **出场方式与仓位由框架固定**:ATR 移动止损、当日连亏熔断;每笔固定 1 手,**止损距离 × 合约乘数 × 1 手超过单笔风险预算(300 元,受不可变宪法保护)就放弃该笔交易**(不是按预算定手数,也不会缩小止损去迁就预算)。候选只能在宪法允许的范围内调参数——例如可以启用可选的固定止盈 `take_profit_r`(默认 0 = 不启用),风险预算等受保护参数不可改 | 开发(不可降级,走审查) |
 | 评估层 | 选参窗口选参 → 滚动验证窗口上跑门槛:成本翻倍、200 次随机入场对照、参数高原、DSR(分母 = 试验账本累计) | 开发(不可降级) |
 | 治理层 | 沙盒筛查与审计钩子、批准账、哈希链账本与外置锚点、测试段台账、网关 | 开发(不可降级);**循环不得自改** |
 
