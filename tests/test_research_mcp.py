@@ -303,6 +303,27 @@ def test_start_research_never_resumes_a_session_from_another_or_unknown_product(
     assert mcp_server.current_session()["product"] == now
 
 
+@pytest.mark.parametrize("previous_provenance,expected", [("web", "web"), ("garbage", "web"), (None, "web"), ("user", "user")])
+def test_switching_product_does_not_launder_a_non_user_provenance(clean_state, monkeypatch, previous_provenance, expected):
+    """codex 复核:换品种开新会话时,来源下限仍沿用上一轮(web/未知/缺失 ⇒ web),不能被洗成 user。"""
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "V15")
+    previous = {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py", "waiting_node": "input_idea",
+                "waiting_message_id": 61, "product": "C15"}
+    if previous_provenance is not None:
+        previous["provenance"] = previous_provenance
+    mcp_server.save_state({"current": previous})
+    _two_step_workflow(monkeypatch)
+
+    mcp_server._start_research("新想法", provenance="user")
+
+    assert mcp_server.current_session()["provenance"] == expected
+
+
+def test_current_product_file_lives_outside_the_gateway_results_dir(tmp_path):
+    import research_sandbox as rs
+    assert "research-control" in rs.current_product_file(tmp_path).parts
+
+
 def test_new_session_records_the_product_and_set_product_writes_it(clean_state, monkeypatch, tmp_path):
     calls = _two_step_workflow(monkeypatch)
     monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "EB15")

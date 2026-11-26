@@ -56,7 +56,7 @@ PRODUCTS = ("C15", "V15", "EB15", "EG15", "PP15", "M15")
 
 
 def current_product_file(root: Path) -> Path:
-    return Path(root) / "data" / "research" / "current_product.json"
+    return Path(root) / "data" / "research-control" / "current_product.json"   # 宿主机控制目录,不在网关的结果目录里
 
 
 def write_current_product(root: Path, product: str) -> None:
@@ -65,7 +65,7 @@ def write_current_product(root: Path, product: str) -> None:
         raise SandboxError(f"品种只能是 {list(PRODUCTS)}")
     path = current_product_file(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
+    tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"product": product}, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -74,7 +74,7 @@ def read_current_product(root: Path) -> str | None:
     """读不到/格式不对/不在白名单 ⇒ None(调用方据此**不续跑**旧会话,fail-closed)。"""
     try:
         value = json.loads(current_product_file(root).read_text(encoding="utf-8")).get("product")
-    except (OSError, ValueError, AttributeError):
+    except Exception:                                  # 任何读不了都按"不知道"处理(含超深 JSON 的 RecursionError)
         return None
     return value if isinstance(value, str) and value in PRODUCTS else None
 # 残留锁(持有者已崩)的判定上限(秒)。

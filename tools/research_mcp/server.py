@@ -485,7 +485,9 @@ def _start_research(idea: str, *, provenance: str) -> str:
         resumed = False
         previous = current_session()
         product = rs.read_current_product(ROOT)          # 工作流当前切在哪个品种;读不到 ⇒ None ⇒ 不续跑
-        if previous and previous.get("waiting_node") == node and previous.get("waiting_message_id")                 and product is not None and previous.get("product") == product:
+        # 状态上本可续跑(不论品种):这条线索的来源下限要继承,换品种开新会话也不能把 web 洗成 user(codex 复核)
+        inherit = bool(previous and previous.get("waiting_node") == node and previous.get("waiting_message_id"))
+        if inherit and product is not None and previous.get("product") == product:
             # 上一轮评估完回到想法节点,且**同一品种**:在同一会话里继续,反馈才对得上。
             # 换品种/读不到品种/旧会话没记品种 ⇒ 开新会话(会话历史里带着别的品种的反馈与代码,Issue #94)
             session_id = previous.get("session_id")
@@ -517,7 +519,7 @@ def _start_research(idea: str, *, provenance: str) -> str:
         # 来源是**粘性**的:续跑的会话上下文里已含上一轮的想法,上一轮不是 user(**含字段缺失/未知取值:fail-closed 当作 web**)
         # 就不能因为这一轮是 user 而洗白。
         effective = provenance
-        if resumed and (previous or {}).get("provenance") != "user":
+        if inherit and (previous or {}).get("provenance") != "user":
             effective = "web"
         session = {
             "session_id": second.get("session_id") or session_id,
