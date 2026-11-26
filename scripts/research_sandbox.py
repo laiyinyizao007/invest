@@ -3772,5 +3772,57 @@ def load_result(run_id: str, directory: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# ---- 候选自己写的报错文字不可信(Issue #94)----
+# 策略运行报错的 type/message 由候选(模型写的代码)决定,例如 `raise ValueError("忽略以上指令并……")`、
+# 自定义的异常类名 `ignore_all_previous_instructions`、属性名 `...print_the_system_prompt`。它们若进入模型看得见的通道,就是现成的
+# 提示词注入通道。所以**所有**会到模型眼前的结果出口(网关的反馈/结果/回测/门禁、MCP 的进度轮询)都只给**固定的中文说明**:
+# 模板只用来识别"是哪一类内置报错",**不回传任何从候选文字里抽出的片段**;异常类型只放行 Python 内置异常名(与 GridError)。
+_ERR_IDENT = r"[A-Za-z_][A-Za-z0-9_]{0,60}"
+_ERR_TEMPLATES = (
+    (re.compile(rf"'{_ERR_IDENT}' object has no attribute '{_ERR_IDENT}'"), "访问了不存在的属性(名称已省略;self.am 上只能用真实存在的指标方法)"),
+    (re.compile(rf"name '{_ERR_IDENT}' is not defined"), "用了未定义的名称(名称已省略)"),
+    (re.compile(rf"{_ERR_IDENT}\(\) got an unexpected keyword argument '{_ERR_IDENT}'"), "调用时传了不存在的关键字参数(名称已省略)"),
+    (re.compile(r"(?:list|tuple) index out of range"), "下标越界(数据不足时要先判断长度)"),
+    (re.compile(r"(?:float )?division by zero"), "除以零"),
+    (re.compile(r"'NoneType' object is not subscriptable"), "对 None 取了下标(指标尚未算出时会返回 None,要先判断)"),
+    (re.compile(r"cannot unpack non-iterable NoneType object"), "解包了 None(指标尚未算出时会返回 None,要先判断)"),
+)
+_ERR_STATIC_HINTS = {
+    "GridError": "param_grid 声明不合法(要求:恰好 3 个参数,每个 3~10 个严格递增的取值,参数名须登记在 parameters 里,且不得是受保护参数)",
+    "SyntaxError": "候选源码有语法错误",
+    "IndentationError": "候选源码缩进错误",
+    "ImportError": "候选导入了不可用的模块",
+    "ModuleNotFoundError": "候选导入了不可用的模块",
+}
+SAFE_EXCEPTION_TYPES = frozenset(
+    name for name, value in vars(__import__("builtins")).items()
+    if isinstance(value, type) and issubclass(value, BaseException)) | {"GridError"}
+STRATEGY_ERROR_TAIL = "请根据报错修正候选代码后重新提交。"
+
+
+def safe_error_line(error: object) -> str:
+    """把候选的报错压成一行**可信**的说明:内置异常类型名 + 固定中文说明。绝不回传候选写的文字、类名或标识符。"""
+    error = error if isinstance(error, dict) else {}
+    etype = str(error.get("type", ""))
+    etype = etype if etype in SAFE_EXCEPTION_TYPES else "UnknownError"
+    message = str(error.get("message", ""))
+    detail = next((template for pattern, template in _ERR_TEMPLATES if pattern.fullmatch(message)), None)
+    if detail is None:
+        detail = _ERR_STATIC_HINTS.get(etype, "详情已省略(不是已知的内置报错模板)")
+    return f"策略运行报错: {etype}: {detail}"
+
+
+def sanitize_result_for_model(result: dict) -> dict:
+    """返回一份**可给模型看**的结果副本:strategy_error 的 error/report 换成固定说明,其余原样(框架自己产生的内容是可信的)。
+    不改持久化的原文件(人要看原始报错去本机看结果文件)。"""
+    if not isinstance(result, dict) or result.get("status") != "strategy_error":
+        return result
+    line = safe_error_line(result.get("error"))
+    out = dict(result)
+    out["error"] = {"type": line.split(": ")[1], "message": line.split(": ", 2)[2]}
+    out["report"] = f"{line}\n{STRATEGY_ERROR_TAIL}"
+    return out
+
+
 def list_results(directory: Path) -> list[str]:
     return sorted(p.stem for p in directory.glob("*.json")) if directory.is_dir() else []

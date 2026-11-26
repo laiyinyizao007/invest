@@ -6,6 +6,7 @@ import json
 import sys
 
 import bs
+import prompt_blocks as pb
 
 KNOWLEDGE_ID = 5   # invest-研究资料（GET /knowledge 可查）
 STOP_CASE_ID = "stopcase"   # cond_stop 节点「输入为『结束』」分支的 case id(= 该分支出边的 sourceHandle)
@@ -112,12 +113,9 @@ def build(tool):
         # 起名那一步必须看得见**已用过的候选名**:看不见就会起重复的名字,
         # 撞名 → 网关 409 → 整条工作流中止 → 「多轮研究循环」退化成单轮(第 6 轮实测)。
         # tool_feedback 的输出里带了 pending_candidates(只有文件名),连同失败反馈一起给起名助手。
-        ("llm_name", "起名", 640, SYSTEM_NAME,
-         "研究想法:" + ref("input_idea", "user_input")
-         + "\n已有候选文件名(取自下方数据里的 pending_candidates,**不得重复使用**):" + ref("tool_feedback", "output")),
-        ("llm_code", "写策略", 960, SYSTEM_CODE, "研究想法:" + ref("input_idea", "user_input") + "\n策略名:" + ref("llm_name", "output")
-         + "\n最近失败反馈(结构化数据):" + ref("tool_feedback", "output")
-         + "\n知识库检索片段(节选，仅供参考):" + ref("kr_kb", "retrieved")),
+        # 提示词分三块并标注(Issue #94):[任务] / [可信知识] / [不可信反馈]——见 prompt_blocks.py
+        ("llm_name", "起名", 640, SYSTEM_NAME + pb.NAME_RULE_TEXT, pb.name_user_prompt()),
+        ("llm_code", "写策略", 960, SYSTEM_CODE + pb.RULE_TEXT, pb.code_user_prompt()),
     ):
         n = flow_node(node_id, "llm", x, 0, name)
         n["data"]["tab"]["value"] = "single"

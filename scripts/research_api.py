@@ -75,6 +75,8 @@ def emit(obj) -> None:
 
     人要看的哈希与源码走 **stderr**(approve/review 已经这么做了),stdout 只留 JSON。
     """
+    if isinstance(obj, dict):
+        obj = rs.sanitize_result_for_model(obj)               # 候选自己写的报错文字不出 CLI stdout(Issue #94)
     print(json.dumps(rs.scrub_model_visible(obj, secrets=_model_visible_secrets()),
                      ensure_ascii=False, indent=2))
 
