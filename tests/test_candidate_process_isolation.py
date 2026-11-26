@@ -81,6 +81,7 @@ def run_host(source: str, *, class_name: str = "Candidate", params: dict | None 
             "n_bars": len(bars), "source": source}), encoding="utf-8")
         env = _sandbox_env()
         env["CANDIDATE_RUNTIME_DIR"] = str(runtime)
+        env["CANDIDATE_WORKDIR"] = str(workdir)
         env.update(env_extra or {})
         payload = stdin_override if stdin_override is not None else proto.encode_frame(proto.pack_bars(bars))
         # 宿主**按源码文本**起(`-c`),不按路径起:按路径起时 `sys.orig_argv` 与调用栈帧的
@@ -441,3 +442,50 @@ def test_bar_fields_align_with_vnpy_bar_data():
     mine = {f.name for f in fields(Bar)} - {"extra", "interval"}
     theirs = set(vbars[0].__dict__)
     assert mine <= theirs, f"候选侧 Bar 的字段在 vnpy BarData 里找不到: {mine - theirs}"
+
+
+# ---------------------------------------------------------------- 最小运行期围栏:经生产启动器的端到端探针
+
+
+def test_fence_is_wired_into_the_real_host_candidates_cannot_spawn_connect_or_write_outside_their_cwd():
+    """围栏单独能工作还不够:要证明它在**真实宿主进程里、候选执行窗口内**确实上膛(经生产启动器观测)。
+    放行侧:候选在自己的临时 cwd 里照常写。不是安全边界(恶意候选能绕),见 host 里 `_FENCE` 的说明。"""
+    src = '''
+import importlib, json, os
+from candidate.signal_template import SignalTemplate
+
+class Candidate(SignalTemplate):
+    def run(self, bars):
+        sp, sock, sysm = importlib.import_module("subprocess"), importlib.import_module("socket"), importlib.import_module("sys")
+        out = {}
+
+        def attempt(label, fn):
+            try:
+                fn()
+                out[label] = "allowed"
+            except PermissionError:
+                out[label] = "denied"
+            except Exception as exc:
+                out[label] = "other:" + type(exc).__name__
+
+        outside = os.path.join(os.path.dirname(os.getcwd()), "fence_probe_outside.txt")
+        attempt("popen", lambda: sp.Popen([sysm.executable, "-c", "pass"]).wait())
+        attempt("connect", lambda: sock.socket().connect(("127.0.0.1", 9)))
+        attempt("write_outside", lambda: open(outside, "w").write("x"))
+        attempt("write_cwd", lambda: open(os.path.join(os.getcwd(), "ok.txt"), "w").write("x"))
+        raise RuntimeError(json.dumps(out))
+'''
+    status, detail = via_launcher(src)
+    leftover = Path(tempfile.gettempdir()) / "fence_probe_outside.txt"
+    leftover.unlink(missing_ok=True)                       # 围栏若失效这里会真写出文件,先清掉免得污染
+    assert status == "error", detail
+    seen = observed_text(detail)
+    assert seen == {"popen": "denied", "connect": "denied", "write_outside": "denied", "write_cwd": "allowed"}, seen
+
+
+def test_host_refuses_to_run_the_candidate_without_a_fence_root():
+    """没有围栏根目录就不跑候选(fail-closed):不能退化成「没有围栏地跑」。"""
+    head, signals, workdir, _, _ = run_host(PASS_SOURCE, env_extra={"CANDIDATE_WORKDIR": ""})
+    shutil.rmtree(workdir, ignore_errors=True)
+    assert head["status"] == "error" and signals is None
+    assert "CANDIDATE_WORKDIR" in head["error"]

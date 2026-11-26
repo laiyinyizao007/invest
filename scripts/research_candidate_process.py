@@ -76,12 +76,25 @@ def kill_tree(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
-def _reap(proc: subprocess.Popen) -> None:
-    """杀完之后等进程真的退出,但**有上限**:kill 失败(taskkill 被拦、killpg 抛错)时无限等会让评估永久挂死。"""
+def _reap(proc: subprocess.Popen, kill=None) -> None:
+    """杀完之后等进程真的退出,但**有上限**:kill 失败(taskkill 被拦、killpg 抛错)时无限等会让评估永久挂死。
+    第一次等不到就**再杀一次**、再等一次(codex 复核:原先超时只打警告、不再升级);两次都不退出才只打警告。"""
     try:
         proc.wait(timeout=10)
+        return
     except subprocess.TimeoutExpired:
-        print("警告:候选进程在被杀后 10 秒内仍未退出", file=sys.stderr)
+        pass
+    if kill is not None:
+        try:
+            kill(proc)
+        except Exception as exc:                             # noqa: BLE001 - 再杀失败也只能留痕
+            print(f"警告:再次终止候选进程失败: {type(exc).__name__}", file=sys.stderr)
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    print("警告:候选进程在被杀后仍未退出", file=sys.stderr)
 
 
 def _tail(path, size: int) -> bytes:
@@ -169,6 +182,7 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
         for name in CANDIDATE_ENV_DENY:
             env.pop(name, None)
         env["CANDIDATE_RUNTIME_DIR"] = str(runtime)
+        env["CANDIDATE_WORKDIR"] = str(workdir)           # 围栏的根目录:显式告知,宿主不靠 os.getcwd() 猜
         env["CANDIDATE_PARENT_PID"] = str(os.getpid())    # 宿主据此发现「父进程在 prctl 之前就死了」(见 host._die_with_parent)
         max_stdout = n_bars + STDOUT_HEADROOM
         with open(out_path, "wb") as out_fh, open(err_path, "wb") as err_fh:
@@ -186,13 +200,13 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
             while proc.poll() is None:
                 if time.monotonic() > deadline:
                     kill(proc)
-                    _reap(proc)
+                    _reap(proc, kill)
                     raise CandidateProcessError("timeout", f"候选进程超过 {timeout:g}s,已终止")
                 out_fh.flush()
                 err_fh.flush()
                 if os.path.getsize(out_path) > max_stdout or os.path.getsize(err_path) > MAX_STDERR_BYTES:
                     kill(proc)
-                    _reap(proc)
+                    _reap(proc, kill)
                     raise CandidateProcessError("output_limit", "候选进程输出超过上限,已终止")
                 time.sleep(POLL_SECONDS)
             writer.join(timeout=5)
@@ -209,7 +223,7 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
     finally:
         if proc is not None and proc.poll() is None:
             kill(proc)
-            _reap(proc)                               # 杀了要等到它真的退出,否则 cwd 还被占着,下面的清理会失败(有上限)
+            _reap(proc, kill)                         # 杀了要等到它真的退出,否则 cwd 还被占着,下面的清理会失败(有上限)
         for path in (runtime, workdir):
             _remove_tree(path)
         for path in (out_path, err_path):

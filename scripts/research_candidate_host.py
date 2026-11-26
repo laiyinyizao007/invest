@@ -82,6 +82,75 @@ def _die_with_parent() -> None:
         os._exit(1)
 
 
+# ---------------------------------------------------------------- 最小运行期围栏(只在候选执行窗口内上膛)
+#
+# 旧路径里候选执行窗口 `rs.candidate_window()` 会用审计钩子拒起子进程、联网、写目录之外的路径;新路径把候选搬进
+# 本进程后那层围栏随之消失(本进程只依赖标准库,`research_sandbox` 不在它的 sys.path 上)。这里装一个**自带的、最小的**:
+# 候选执行期间拒 起进程 / 联网 / 在临时工作目录(cwd)之外写或改文件。读不限制,本进程自己的 I/O 阶段(未上膛)不受影响。
+#
+# **不是安全边界**:恶意候选能用 ctypes 绕过,也能从 `sys.modules["__main__"]` 找到下面的状态字典把它关掉;
+# 真正的限制属于 S4(Job Object / 容器只读挂载 / 网络隔离)。这一层防的是失控或有 bug 的候选,
+# 并把「候选能起进程/联网/写盘」从"默认可以"变成"需要主动绕过"。
+_FENCE: dict = {"root": None, "installed": False}
+_FENCE_DENIED_EVENTS = frozenset({
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.startfile",
+    "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo",
+    "socket.gethostbyname", "socket.gethostbyaddr",
+})
+_FENCE_PATH_EVENTS = frozenset({
+    "os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.truncate", "os.chmod", "os.chown", "os.symlink", "os.link",
+    "shutil.copyfile", "shutil.copymode", "shutil.copystat", "shutil.copytree", "shutil.move", "shutil.rmtree",
+    "shutil.make_archive", "shutil.unpack_archive",
+})
+
+
+def _fence_inside(root: str, path) -> bool:
+    if isinstance(path, int):                              # 已经打开的 fd:不是路径,不在这里判
+        return True
+    try:
+        real = os.path.normcase(os.path.realpath(os.fsdecode(path)))
+    except (TypeError, ValueError):
+        return False
+    return real == root or real.startswith(root + os.sep)
+
+
+def _fence_is_write(mode, flags) -> bool:
+    if isinstance(mode, str) and any(ch in mode for ch in "wax+"):
+        return True
+    return isinstance(flags, int) and bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC))
+
+
+def _fence_hook(event: str, args) -> None:
+    root = _FENCE["root"]
+    if root is None:
+        return
+    if event in _FENCE_DENIED_EVENTS:
+        raise PermissionError(f"候选运行期围栏:禁止 {event}")
+    if event == "open":
+        path, mode, flags = (tuple(args) + (None, None, None))[:3]
+        if _fence_is_write(mode, flags) and not _fence_inside(root, path):
+            raise PermissionError("候选运行期围栏:禁止在临时工作目录之外写文件")
+    elif event in _FENCE_PATH_EVENTS:
+        for item in args:
+            if isinstance(item, (str, bytes, os.PathLike)) and not _fence_inside(root, item):
+                raise PermissionError(f"候选运行期围栏:禁止在临时工作目录之外 {event}")
+
+
+def _install_fence() -> None:
+    """装钩子(只装一次,装了就拆不掉;未上膛时它什么都不做)。"""
+    if not _FENCE["installed"]:
+        sys.addaudithook(_fence_hook)
+        _FENCE["installed"] = True
+
+
+def _arm_fence(root) -> None:
+    _FENCE["root"] = os.path.normcase(os.path.realpath(os.fspath(root)))
+
+
+def _disarm_fence() -> None:
+    _FENCE["root"] = None
+
+
 def _write_raw_frame(payload: bytes) -> None:
     """协议模块还没能用时的兜底写帧(与 `candidate.protocol.encode_frame` 同一算法)。"""
     sys.stdout.buffer.write(len(payload).to_bytes(4, "big") + payload)
@@ -124,6 +193,12 @@ def _exec_candidate(source: str, class_name: str, params: dict, bars: list):
     stdout = sys.stdout
     try:
         sys.stdout = sys.stderr                     # 候选的 print 走 stderr,协议通道保持干净
+        # 围栏的根目录由启动器显式告知(CANDIDATE_WORKDIR),宿主不靠 os.getcwd() 猜:研究栈有一条守卫禁止依赖进程 CWD,
+        # 而且显式比隐式更稳。**没有根目录就不跑候选**(fail-closed):不能退化成「没有围栏地跑」。
+        fence_root = os.environ.get("CANDIDATE_WORKDIR", "")
+        if not fence_root:
+            raise RuntimeError("缺少环境变量 CANDIDATE_WORKDIR:围栏没有根目录,拒绝运行候选")
+        _arm_fence(fence_root)                      # 围栏只在候选执行窗口内上膛(见 _FENCE 的说明:不是安全边界)
         code = compile(source, "<candidate-source>", "exec")
         exec(code, module.__dict__)                 # noqa: S102 - 这里就是"执行候选"的本意
         cls = getattr(module, class_name, None)
@@ -132,6 +207,7 @@ def _exec_candidate(source: str, class_name: str, params: dict, bars: list):
         instance = cls(params)
         signals = instance.run(bars)
     finally:
+        _disarm_fence()
         sys.stdout = stdout
 
     payload = pack_signals(signals)
@@ -140,6 +216,7 @@ def _exec_candidate(source: str, class_name: str, params: dict, bars: list):
 
 def main() -> int:
     _die_with_parent()
+    _install_fence()
     _scrub_host_paths()
     _reconfigure_stdio()
     random.seed(0)                                  # 确定性:候选用了未固定的随机数时仍可复现

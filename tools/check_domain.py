@@ -304,6 +304,8 @@ NEVER_DOWNGRADE = (
     "tests/test_candidate_spec.py",
     # 候选宿主随父进程消失(POSIX/容器路径):Linux 上真的杀进程验证,别处只看调用点。
     "tests/test_candidate_process_posix.py",
+    # 候选宿主里的最小运行期围栏(拒起进程/联网/写 cwd 之外):不依赖 talib,研究侧 CI 真跑。
+    "tests/test_candidate_fence.py",
 )
 
 # --------------------------------------------------------------------------

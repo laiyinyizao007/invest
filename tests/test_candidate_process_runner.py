@@ -446,3 +446,51 @@ def test_launcher_tells_the_host_its_parent_pid(monkeypatch):
     with pytest.raises(rcp.CandidateProcessError):
         rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
     assert seen["env"].get("CANDIDATE_PARENT_PID") == str(os.getpid())
+
+
+def test_reap_kills_again_once_if_the_process_does_not_exit_after_the_first_kill():
+    """_reap 超时后再杀一次、再等一次;两次都不退出才只打警告(codex 复核:原先超时只打警告、不再升级)。"""
+    import subprocess as sp
+
+    class Stubborn:
+        calls = 0
+
+        def wait(self, timeout=None):
+            Stubborn.calls += 1
+            if Stubborn.calls <= 1:
+                raise sp.TimeoutExpired("x", timeout)
+            return 0
+
+    killed = []
+    rcp._reap(Stubborn(), kill=lambda p: killed.append(p))
+    assert len(killed) == 1 and Stubborn.calls == 2
+
+
+def test_reap_gives_up_with_a_warning_only_after_the_second_wait_also_times_out(capsys):
+    import subprocess as sp
+
+    class Immortal:
+        def wait(self, timeout=None):
+            raise sp.TimeoutExpired("x", timeout)
+
+    killed = []
+    rcp._reap(Immortal(), kill=lambda p: killed.append(p))
+    assert len(killed) == 1
+    assert "仍未退出" in capsys.readouterr().err
+
+
+def test_every_product_in_the_whitelist_is_a_15_minute_product():
+    """候选侧 Bar.interval 与启动请求里的 interval 目前硬编码为 "15m"(research_signal_replay / research_candidate_process)。
+    将来白名单里出现非 15 分钟品种,这里先红,逼着先把 interval 接线再放行。"""
+    import research_sandbox as rs
+    assert all(str(key).endswith("15") for key in rs.PRODUCTS), list(rs.PRODUCTS)
+
+
+def test_launcher_tells_the_host_its_workdir_explicitly(monkeypatch):
+    """围栏的根目录由启动器显式告知(CANDIDATE_WORKDIR),宿主不靠 os.getcwd() 猜——
+    研究栈有一条守卫禁止依赖进程 CWD(tests/test_research_boundary.py),而且显式比隐式更稳。"""
+    seen = _capture_env(monkeypatch)
+    with pytest.raises(rcp.CandidateProcessError):
+        rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
+    workdir = seen["env"].get("CANDIDATE_WORKDIR", "")
+    assert workdir and Path(workdir).name.startswith("cand-cwd-")
