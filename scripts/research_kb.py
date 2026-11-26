@@ -42,7 +42,7 @@ def check_whitelist(whitelist=WHITELIST) -> None:
     if len(set(names)) != len(names):
         raise ValueError(f"白名单里有重名文件,库内无法区分: {names}")
     for r in whitelist:
-        if r.startswith("/") or ".." in r.split("/") or "\\" in r:
+        if r.startswith("/") or ".." in r.split("/") or "\\" in r or ":" in r:
             raise ValueError(f"白名单只能是仓库内的相对路径: {r}")
 
 
@@ -122,6 +122,7 @@ def staleness(root: Path, manifest_path: Path | None = None, whitelist=WHITELIST
     return problems
 
 
-def stale_message(problems: list[str]) -> str:
+def stale_message(problems: list[str], manifest_path: Path | None = None, code_root: Path | None = None) -> str:
+    where = f"\n(清单位置: {manifest_path};文档取自代码根: {code_root};两处须与同步命令所用的一致)" if manifest_path else ""
     return ("研究知识库与仓库文档不一致,已停止启动研究(模型会读到旧口径):\n- " + "\n- ".join(problems)
-            + "\n请在宿主机运行 `python tools/bisheng/sync_kb.py --apply` 重新同步后再试。")
+            + "\n请在宿主机运行 `python tools/bisheng/sync_kb.py --apply` 重新同步后再试。" + where)

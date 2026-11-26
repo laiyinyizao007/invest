@@ -176,3 +176,35 @@ def test_a_failed_apply_invalidates_the_manifest_instead_of_leaving_a_false_all_
     with pytest.raises(SystemExit):
         sync_kb.apply(repo, prune=False)
     assert deleted and not manifest.exists()                      # 旧版已删、上传失败 ⇒ 清单必须已被作废
+
+
+def test_failed_prune_does_not_write_a_manifest(repo, monkeypatch, tmp_path):
+    """codex 增量复核 High:--prune 删除失败不能静默报"已同步"。"""
+    manifest = tmp_path / "kb_manifest.json"
+    h_a, h_b = rk.sha256_of(repo / "docs/a.md"), rk.sha256_of(repo / "docs/adr/b.md")
+    live = [{"id": 1, "file_name": "a.md", "md5": h_a, "status": 2}, {"id": 2, "file_name": "b.md", "md5": h_b, "status": 2},
+            {"id": 9, "file_name": "旧口径.md", "md5": "x", "status": 2}]
+
+    class FakeBs:
+        login = staticmethod(lambda: "t")
+
+        @staticmethod
+        def _req(method, path, body=None, token=None, **kw):
+            return {"data": {"data": live}} if method == "GET" else {"status_code": 500}
+
+    monkeypatch.setitem(sys.modules, "bs", FakeBs)
+    orig = sync_kb.make_plan
+    monkeypatch.setattr(sync_kb, "make_plan", lambda root, lv: orig(root, lv, WL))
+    monkeypatch.setattr(sync_kb.rk, "WHITELIST", WL)
+    monkeypatch.setattr(sync_kb.rk, "default_manifest_path", lambda root: manifest)
+    assert sync_kb.apply(repo, prune=True) == 1 and not manifest.exists()
+
+
+def test_stale_message_names_the_manifest_location_and_code_root(tmp_path):
+    msg = rk.stale_message(["x"], tmp_path / "m.json", tmp_path)
+    assert "m.json" in msg and "代码根" in msg
+
+
+def test_drive_letter_paths_are_rejected_as_invalid_whitelist_entries():
+    with pytest.raises(ValueError):
+        rk.check_whitelist(("C:/x.md",))

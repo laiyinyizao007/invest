@@ -113,7 +113,13 @@ def apply(root: Path, prune: bool) -> int:
         for item in final["extra"]:
             r = bs._req("DELETE", f"/knowledge/file/{item['id']}", token=token)
             print("删除白名单外文件", item["name"], r.get("status_code"))
+            if r.get("status_code") != 200:
+                print("删除失败,未写清单(--prune 的目的就是清掉旧口径文档,没清掉不能报已同步)")
+                return 1
         final = make_plan(root, _list_files(bs, token))
+        if final["extra"]:
+            print("删除后库里仍有白名单外文件,未写清单:", [i["name"] for i in final["extra"]])
+            return 1
     ids = {f["file_name"]: f["id"] for f in live}
     manifest = rk.build_manifest(root, [{"path": r, "kb_file_id": ids.get(rk.kb_name(r))} for r in rk.WHITELIST], _commit(root),
                                  datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -128,7 +134,7 @@ def main(argv: list[str]) -> int:
     if "--check" in argv:
         print("清单位置:", rk.default_manifest_path(DATA_ROOT))
         problems = rk.staleness(ROOT, rk.default_manifest_path(DATA_ROOT))
-        print(rk.stale_message(problems) if problems else "知识库清单与仓库一致")
+        print(rk.stale_message(problems, rk.default_manifest_path(DATA_ROOT), ROOT) if problems else "知识库清单与仓库一致")
         return 1 if problems else 0
     if "--apply" in argv:
         return apply(ROOT, prune="--prune" in argv)

@@ -466,7 +466,7 @@ def _start_research(idea: str, *, provenance: str) -> str:
         return f"研究想法太长了({len(idea)} 字,上限 {MAX_IDEA_LEN}),请精简后重发。"
     problems = _kb_problems()                      # 知识库与仓库文档不一致 ⇒ 停止(Issue #94):模型会读到旧口径
     if problems:
-        return rkb.stale_message(problems)
+        return rkb.stale_message(problems, rkb.default_manifest_path(ROOT), CODE_ROOT)
     before = pending_snapshot()
 
     def begin() -> tuple[str | None, str, int | None]:
