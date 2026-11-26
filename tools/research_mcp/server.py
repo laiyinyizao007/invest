@@ -64,6 +64,7 @@ import research_config as rc           # noqa: E402
 import research_console as rconsole    # noqa: E402
 import research_sandbox as rs          # noqa: E402
 import research_attempts as ra         # noqa: E402
+import research_kb as rkb              # noqa: E402
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7860/api/v2"
 DEFAULT_WORKFLOW_ID = "1194f8540b9944fea4353b07f0493cbf"     # invest 研究工作流 v3(15分钟+门槛)
@@ -444,6 +445,14 @@ def is_candidate_approved(name: str) -> bool:
 SESSION_PROVENANCES = ("user", "web")
 
 
+def _kb_problems() -> list[str]:
+    """研究知识库(毕昇 5 号库)的清单与仓库文档逐个比对;读不了/对不上都算问题(fail-closed)。"""
+    try:
+        return rkb.staleness(CODE_ROOT, rkb.default_manifest_path(ROOT))   # 文档取代码根,清单在数据根
+    except Exception as exc:                       # 判不了等于不放行
+        return [f"知识库过期检测自身出错: {type(exc).__name__}"]
+
+
 def _start_research(idea: str, *, provenance: str) -> str:
     """`provenance` 是想法的来源(Issue #88),**必填**(忘了传是 TypeError,不是默认放行),
     **只有宿主机上的驱动器能传 `web`**:MCP 暴露给模型的 `start_research(idea)` 不带这个参数,
@@ -455,6 +464,9 @@ def _start_research(idea: str, *, provenance: str) -> str:
         return "请给出研究想法(一句话说明要验证什么假设)。"
     if len(idea) > MAX_IDEA_LEN:
         return f"研究想法太长了({len(idea)} 字,上限 {MAX_IDEA_LEN}),请精简后重发。"
+    problems = _kb_problems()                      # 知识库与仓库文档不一致 ⇒ 停止(Issue #94):模型会读到旧口径
+    if problems:
+        return rkb.stale_message(problems)
     before = pending_snapshot()
 
     def begin() -> tuple[str | None, str, int | None]:
