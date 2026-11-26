@@ -100,6 +100,7 @@ NEVER_DOWNGRADE = (
     "scripts/research_console.py",        # 同一批 CLI 入口的薄壳
     "scripts/research_gateway.py",        # 模型→内核的唯一网络通道(端点白名单)
     "scripts/research_config.py",         # 沙盒配置加载器(硬边界、只能追加的禁用清单)
+    "scripts/research_kb.py",             # 知识库白名单与过期检测(MCP 启动研究前的拦截判定;其值被喂进判定链路)
     # 收菜:把候选收进 approved/(运行时唯一认的目录)。它**调用静态筛查**,
     # 并且判定「这份字节能不能进入受信目录」——那是批准链上的一个判定点。
     "scripts/research_collect.py",
