@@ -94,3 +94,42 @@ def test_the_host_calls_it_before_reading_anything_from_stdin():
     first_read = next(i for i, n in enumerate(ast.walk(main)) if isinstance(n, ast.Name) and n.id == "_load_runtime")
     first_die = next(i for i, n in enumerate(ast.walk(main)) if isinstance(n, ast.Name) and n.id == "_die_with_parent")
     assert first_die < first_read
+
+
+CHILD_CODE = textwrap.dedent('''
+    import sys, time
+    host_src = open(sys.argv[1], encoding="utf-8").read()
+    ns = {"__name__": "host_under_test"}
+    exec(compile(host_src, "<host>", "exec"), ns)
+    ns["_die_with_parent"]()
+    print("alive", flush=True)
+    while True:
+        time.sleep(0.2)
+''')
+
+
+@requires_linux
+def test_host_exits_at_once_when_its_parent_was_already_dead_before_prctl():
+    """竞态:父进程在 prctl 之前就死了,内核不会再发死亡信号。启动器把自己的 pid 经 CANDIDATE_PARENT_PID 告诉宿主,
+    宿主 prctl 之后发现 getppid() 对不上就自己退出(G8 终轮复核指出的窗口:解释器启动与模块导入期间)。"""
+    env = dict(os.environ, CANDIDATE_PARENT_PID="999999")        # 与真实父进程(本测试进程)对不上
+    child = subprocess.Popen([sys.executable, "-c", CHILD_CODE, str(HOST)], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        child.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        pytest.fail("父 pid 对不上,宿主却没有退出")
+    assert child.returncode == 1
+
+
+@requires_linux
+def test_host_keeps_running_when_the_expected_parent_pid_matches():
+    """放行侧:告知的父 pid 与真实父进程一致时,宿主照常活着。"""
+    env = dict(os.environ, CANDIDATE_PARENT_PID=str(os.getpid()))
+    child = subprocess.Popen([sys.executable, "-c", CHILD_CODE, str(HOST)], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "alive"
+        time.sleep(0.5)
+        assert child.poll() is None
+    finally:
+        child.kill()

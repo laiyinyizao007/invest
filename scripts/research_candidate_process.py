@@ -41,6 +41,9 @@ MAX_HOST_SOURCE_CHARS = 30_000
 STDOUT_HEADROOM = 64 * 1024
 MAX_STDERR_BYTES = 1024 * 1024
 POLL_SECONDS = 0.05
+# 候选宿主**不需要**、候选更不该知道的环境变量:`sandbox_env` 的白名单为旧路径的评估子进程放行了它们。
+# INVEST_C15_DATA 是含测试段的行情 CSV 的绝对路径;候选只要有任一文件读原语就知道数据在哪(G8 终轮复核)。
+CANDIDATE_ENV_DENY = ("INVEST_C15_DATA", "RESEARCH_SANDBOX_CONFIG")
 
 
 class CandidateProcessError(Exception):
@@ -163,7 +166,10 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
             "class": class_name, "params": params, "interval": interval,
             "n_bars": n_bars, "source": source}, ensure_ascii=False), encoding="utf-8")
         env = rs.sandbox_env(os.environ)
+        for name in CANDIDATE_ENV_DENY:
+            env.pop(name, None)
         env["CANDIDATE_RUNTIME_DIR"] = str(runtime)
+        env["CANDIDATE_PARENT_PID"] = str(os.getpid())    # 宿主据此发现「父进程在 prctl 之前就死了」(见 host._die_with_parent)
         max_stdout = n_bars + STDOUT_HEADROOM
         with open(out_path, "wb") as out_fh, open(err_path, "wb") as err_fh:
             try:

@@ -229,7 +229,19 @@ def _check_module_structure(tree: ast.Module, class_node: ast.ClassDef) -> None:
     `Candidate = decorate(Candidate)`、`if` 里改写、`+=`)都会让「框架读到的」与「候选进程里生效的」不同——一律拒绝评估。
     `locals()` / `setattr` / `metaclass=` 这类由静态筛查拦,这里不重复。"""
     for stmt in tree.body:
-        if stmt is class_node or isinstance(stmt, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.Pass)) or _is_docstring(stmt):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            for alias in stmt.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                canonical = (isinstance(stmt, ast.ImportFrom) and stmt.level == 0 and stmt.module == CANDIDATE_BASE_MODULE
+                             and alias.name == CANDIDATE_BASE and alias.asname is None)
+                if alias.name == "*" or (bound in (CANDIDATE_BASE, class_node.name) and not canonical):
+                    raise SpecError(f"第 {stmt.lineno} 行:模块级只允许 import、函数定义、文档字符串与简单常量赋值"
+                                    "(import 不得绑定基类名或候选类名,不得 import *;读到的必须与运行时生效的一致)")
+            continue
+        if isinstance(stmt, ast.FunctionDef) and stmt.name in (CANDIDATE_BASE, class_node.name):
+            raise SpecError(f"第 {stmt.lineno} 行:模块级只允许 import、函数定义、文档字符串与简单常量赋值"
+                            "(函数不得占用基类名或候选类名)")
+        if stmt is class_node or isinstance(stmt, (ast.FunctionDef, ast.Pass)) or _is_docstring(stmt):
             continue
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = _simple_targets(stmt)

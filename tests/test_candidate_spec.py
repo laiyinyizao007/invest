@@ -206,3 +206,23 @@ def test_module_level_rebinding_of_the_template_name_is_refused(after):
     source = HEAD + after + "\nclass Candidate(SignalTemplate):\n" + GOOD_BODY
     with pytest.raises(spec_mod.SpecError):
         spec_mod.parse_spec(source)
+
+
+@pytest.mark.parametrize("before, why", [
+    ("from somewhere_else import SignalTemplate\n", "从别处导入同名"),
+    ("import other_module as SignalTemplate\n", "import … as 同名"),
+    ("from candidate.signal_template import SignalTemplate as SignalTemplate2\nfrom x import y as SignalTemplate\n", "别名重绑定"),
+    ("from candidate.signal_template import *\n", "星号导入"),
+    ("def SignalTemplate():\n    pass\n", "函数定义占用基类名"),
+])
+def test_module_level_imports_and_defs_cannot_rebind_the_template_name(before, why):
+    """只挡赋值不够:`from x import SignalTemplate` / `import … as SignalTemplate` / `def SignalTemplate` / `import *`
+    同样能让运行时的基类与 AST 里写的不是一回事(G8 终轮复核 L7 的遗漏)。"""
+    source = HEAD + before + "\nclass Candidate(SignalTemplate):\n" + GOOD_BODY
+    with pytest.raises(spec_mod.SpecError):
+        spec_mod.parse_spec(source)
+    assert why
+
+
+def test_the_canonical_template_import_is_still_accepted():
+    spec_mod.parse_spec(cls(GOOD_BODY))

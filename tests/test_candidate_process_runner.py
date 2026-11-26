@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import glob
 import importlib.util
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -409,3 +410,39 @@ def test_every_wait_in_the_launcher_is_bounded_so_a_failed_kill_cannot_hang_the_
     assert waits, "探针前提:模块里应当有 .wait(...) 调用,否则这条不变量空转"
     unbounded = [n.lineno for n in waits if not any(k.arg == "timeout" for k in n.keywords)]
     assert not unbounded, f"这些 .wait() 没有 timeout: 第 {unbounded} 行"
+
+
+# ---------------------------------------------------------------- G8 终轮复核(40/50)后的修复
+
+
+def _capture_env(monkeypatch):
+    """替换启动器看到的 Popen:记下传给候选进程的环境,然后让它「起不来」。不需要 talib,CI 能跑。"""
+    seen = {}
+
+    def fake_popen(*args, **kwargs):
+        seen["env"] = dict(kwargs.get("env") or {})
+        raise OSError("simulated launch failure")
+
+    monkeypatch.setattr(rcp.subprocess, "Popen", fake_popen)
+    return seen
+
+
+def test_candidate_env_has_no_data_or_config_paths(monkeypatch):
+    """`sandbox_env` 的白名单放行了 INVEST_C15_DATA(含测试段的行情 CSV 的绝对路径)与 RESEARCH_SANDBOX_CONFIG——
+    旧路径里评估子进程要用,候选宿主**不需要**。候选只要有任一文件读原语就知道测试段数据在哪,所以剔除。"""
+    monkeypatch.setenv("INVEST_C15_DATA", "C:\\data\\derived\\C_15m_adj.csv")
+    monkeypatch.setenv("RESEARCH_SANDBOX_CONFIG", "C:\\cfg\\research_sandbox.json")
+    seen = _capture_env(monkeypatch)
+    with pytest.raises(rcp.CandidateProcessError):
+        rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
+    assert seen["env"], "探针前提:应当抓到了传给候选进程的环境"
+    assert "INVEST_C15_DATA" not in seen["env"] and "RESEARCH_SANDBOX_CONFIG" not in seen["env"]
+    assert not any("C_15m_adj" in str(v) or "research_sandbox.json" in str(v) for v in seen["env"].values())
+
+
+def test_launcher_tells_the_host_its_parent_pid(monkeypatch):
+    """宿主在 prctl 之后核对 getppid():父进程若在 prctl 之前就死了,内核不会再发死亡信号,得靠这个 pid 自己发现。"""
+    seen = _capture_env(monkeypatch)
+    with pytest.raises(rcp.CandidateProcessError):
+        rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
+    assert seen["env"].get("CANDIDATE_PARENT_PID") == str(os.getpid())

@@ -74,6 +74,12 @@ def _die_with_parent() -> None:
         ctypes.CDLL(None, use_errno=True).prctl(1, 9, 0, 0, 0)        # PR_SET_PDEATHSIG = 1, SIGKILL = 9
     except Exception:                                    # noqa: BLE001 - 设不上也不能因此起不来
         pass
+    # 竞态:父进程若在 prctl **之前**就死了(解释器启动、模块导入期间),内核不会再发死亡信号,宿主就成了孤儿。
+    # 启动器经环境变量告知自己的 pid;prctl 之后发现真实的父进程不是它,就自己退出。
+    # 只在 Linux:Windows 上 venv 的 python.exe 是启动器,真实 python 的父进程是那个壳,pid 对不上是正常的。
+    expected = os.environ.get("CANDIDATE_PARENT_PID", "")
+    if expected.isdigit() and os.getppid() != int(expected):
+        os._exit(1)
 
 
 def _write_raw_frame(payload: bytes) -> None:
