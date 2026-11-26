@@ -494,3 +494,12 @@ def test_launcher_tells_the_host_its_workdir_explicitly(monkeypatch):
         rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
     workdir = seen["env"].get("CANDIDATE_WORKDIR", "")
     assert workdir and Path(workdir).name.startswith("cand-cwd-")
+
+
+def test_denied_env_names_are_stripped_case_insensitively():
+    """`rs.sandbox_env` 按 `k.upper()` 过滤白名单,我的剔除却大小写敏感:POSIX 上小写的 `invest_c15_data`
+    能通过白名单又不会被剔除。剔除也要按 upper() 比。"""
+    env = {"PATH": "/usr/bin", "INVEST_C15_DATA": "/d/C.csv", "invest_c15_data": "/d/c.csv",
+           "Research_Sandbox_Config": "/c.json", "KEEP_ME": "1"}
+    kept = rcp._strip_denied_env(env)
+    assert set(kept) == {"PATH", "KEEP_ME"}

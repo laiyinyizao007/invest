@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -55,6 +56,11 @@ HARNESS = textwrap.dedent('''
     attempt("write_inside", lambda: open(os.path.join(work, "ok.txt"), "w").write("x"))
     attempt("mkdir_inside", lambda: os.mkdir(os.path.join(work, "sub")))
     attempt("read_outside", lambda: open(sys.argv[1], "rb").read(1))
+    if hasattr(os, "O_DIRECTORY"):                      # POSIX:dir_fd 形式的写,审计到的 path 是相对名
+        escape_dir = os.path.dirname(outside)
+        dfd = os.open(escape_dir, os.O_RDONLY | os.O_DIRECTORY)
+        attempt("dir_fd_escape", lambda: os.close(os.open("escaped.txt", os.O_WRONLY | os.O_CREAT, dir_fd=dfd)))
+        out["dir_fd_file_escaped"] = os.path.exists(os.path.join(escape_dir, "escaped.txt"))
     ns["_disarm_fence"]()
     attempt("popen_after_disarm", lambda: subprocess.Popen([sys.executable, "-c", "pass"]).wait())
     out["outside_intact"] = os.path.exists(outside) and open(outside).read() == "keep"
@@ -117,3 +123,84 @@ def test_main_installs_the_fence_before_running_the_candidate():
     install = _calls(main, "_install_fence")
     run = _calls(main, "_exec_candidate")
     assert install and run and min(c.lineno for c in install) < min(c.lineno for c in run)
+
+
+# ---------------------------------------------------------------- G8 第三轮复核(39/50)后:逐事件、dir_fd、相对路径、realpath 异常
+
+
+def _host_ns() -> dict:
+    """把宿主源码 exec 进一个命名空间(不调 _install_fence,不往 pytest 进程里装审计钩子),直接测钩子函数本身。"""
+    ns: dict = {"__name__": "host_under_test"}
+    exec(compile(HOST.read_text(encoding="utf-8"), "<host>", "exec"), ns)
+    return ns
+
+
+@pytest.fixture
+def armed(tmp_path):
+    ns = _host_ns()
+    root = tmp_path / "work"
+    root.mkdir()
+    ns["_arm_fence"](root)
+    yield ns, root, tmp_path
+    ns["_disarm_fence"]()
+
+
+def test_every_event_in_the_deny_table_is_refused_while_armed_and_ignored_when_not(armed):
+    ns, _, _ = armed
+    events = sorted(ns["_FENCE_DENIED_EVENTS"])
+    assert events, "探针前提:拒绝表不应为空"
+    for event in events:
+        with pytest.raises(PermissionError):
+            ns["_fence_hook"](event, ())
+    ns["_disarm_fence"]()
+    for event in events:
+        ns["_fence_hook"](event, ())                       # 未上膛:什么都不做
+
+
+@pytest.mark.parametrize("event", ["os.kill", "os.killpg"])
+def test_signalling_other_processes_is_denied(armed, event):
+    """失控候选能 `os.kill` 框架父进程甚至同机别的进程——围栏自称要挡的「失控」恰恰包括这个。
+    (`os.kill` 是真实的审计事件,Windows 与 Linux 上都会触发;只是之前不在拒绝表里。)"""
+    ns, _, _ = armed
+    assert event in ns["_FENCE_DENIED_EVENTS"]
+    with pytest.raises(PermissionError):
+        ns["_fence_hook"](event, (12345, 9))
+
+
+def test_every_path_event_is_refused_outside_the_root_and_allowed_inside(armed):
+    ns, root, tmp = armed
+    for event in sorted(ns["_FENCE_PATH_EVENTS"]):
+        with pytest.raises(PermissionError):
+            ns["_fence_hook"](event, (str(tmp / "outside.txt"),))
+        ns["_fence_hook"](event, (str(root / "inside.txt"),))
+
+
+def test_an_oserror_from_realpath_is_treated_as_outside_not_raised_through_the_hook(armed, monkeypatch):
+    """cwd 被删之类让 realpath 抛 OSError:钩子自己不能崩成一个无关的 I/O 错误——按「不在围栏内」处理。"""
+    ns, root, _ = armed
+
+    def broken(_path):
+        raise OSError("cwd vanished")
+
+    monkeypatch.setattr(os.path, "realpath", broken)
+    with pytest.raises(PermissionError):
+        ns["_fence_hook"]("open", (str(root / "x.txt"), "w", 0))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="dir_fd 只有 POSIX 才有")
+def test_relative_write_paths_are_refused_on_posix_because_of_dir_fd(armed, monkeypatch):
+    """POSIX 上 `os.open("x", O_WRONLY|O_CREAT, dir_fd=fd)` 审计到的 path 是**相对名**,按 cwd 解析会被当成「在围栏内」,
+    实际却落在 fd 指向的目录(WSL 里实证:文件真的写到了 cwd 之外)。所以 POSIX 上写类事件一律拒绝相对路径。"""
+    ns, root, _ = armed
+    monkeypatch.chdir(root)       # 进入围栏根:相对名按 cwd 解析会「落在里面」——这正是 dir_fd 逃逸骗过围栏的方式
+    with pytest.raises(PermissionError):
+        ns["_fence_hook"]("open", ("escaped.txt", None, os.O_WRONLY | os.O_CREAT))
+    with pytest.raises(PermissionError):
+        ns["_fence_hook"]("os.remove", ("escaped.txt",))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="dir_fd 只有 POSIX 才有")
+def test_a_dir_fd_write_cannot_escape_the_work_directory(probe):
+    """真实逃逸探针(Linux):`os.open("escaped.txt", ..., dir_fd=fd)` 必须被拒,且文件真的没有写出去。"""
+    assert probe["dir_fd_escape"] == "denied", probe
+    assert probe["dir_fd_file_escaped"] is False, probe

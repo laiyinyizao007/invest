@@ -112,6 +112,13 @@ def _remove_tree(path) -> None:
         print(f"警告:候选进程的临时目录未能清理(可能仍被占用): {Path(path).name}", file=sys.stderr)
 
 
+def _strip_denied_env(env: dict) -> dict:
+    """剔除候选宿主不需要的环境变量,**按 upper() 比较**:`rs.sandbox_env` 的白名单过滤就是按 `k.upper()` 的,
+    剔除若大小写敏感,POSIX 上小写的 `invest_c15_data` 能通过白名单又不会被剔除。"""
+    deny = {name.upper() for name in CANDIDATE_ENV_DENY}
+    return {key: value for key, value in env.items() if key.upper() not in deny}
+
+
 def host_source() -> str:
     text = HOST_FILE.read_text(encoding="utf-8")
     if len(text) > MAX_HOST_SOURCE_CHARS:
@@ -178,9 +185,7 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
         (runtime / "request.json").write_text(json.dumps({
             "class": class_name, "params": params, "interval": interval,
             "n_bars": n_bars, "source": source}, ensure_ascii=False), encoding="utf-8")
-        env = rs.sandbox_env(os.environ)
-        for name in CANDIDATE_ENV_DENY:
-            env.pop(name, None)
+        env = _strip_denied_env(rs.sandbox_env(os.environ))
         env["CANDIDATE_RUNTIME_DIR"] = str(runtime)
         env["CANDIDATE_WORKDIR"] = str(workdir)           # 围栏的根目录:显式告知,宿主不靠 os.getcwd() 猜
         env["CANDIDATE_PARENT_PID"] = str(os.getpid())    # 宿主据此发现「父进程在 prctl 之前就死了」(见 host._die_with_parent)

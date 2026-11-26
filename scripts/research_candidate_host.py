@@ -94,6 +94,7 @@ def _die_with_parent() -> None:
 _FENCE: dict = {"root": None, "installed": False}
 _FENCE_DENIED_EVENTS = frozenset({
     "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.startfile",
+    "os.kill", "os.killpg",                                  # 失控候选能杀框架父进程、甚至同机别的进程
     "socket.connect", "socket.bind", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo",
     "socket.gethostbyname", "socket.gethostbyaddr",
 })
@@ -109,9 +110,24 @@ def _fence_inside(root: str, path) -> bool:
         return True
     try:
         real = os.path.normcase(os.path.realpath(os.fsdecode(path)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError):                 # OSError:比如 cwd 已被删,realpath 解析不了
         return False
     return real == root or real.startswith(root + os.sep)
+
+
+def _fence_write_allowed(root: str, path) -> bool:
+    """写类事件的路径是否在围栏内。POSIX 上**相对路径一律不算**:`os.open("x", O_WRONLY|O_CREAT, dir_fd=fd)`
+    审计到的 path 是相对名,按 cwd 解析会落在围栏里,实际却写到 fd 指向的目录(Linux 上实证)。
+    代价:候选在 POSIX 上不能用相对路径写自己的临时目录,须用绝对路径(候选本来就不该写文件)。"""
+    if isinstance(path, int):
+        return True
+    if os.name == "posix":
+        try:
+            if not os.path.isabs(os.fsdecode(path)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return _fence_inside(root, path)
 
 
 def _fence_is_write(mode, flags) -> bool:
@@ -128,11 +144,11 @@ def _fence_hook(event: str, args) -> None:
         raise PermissionError(f"候选运行期围栏:禁止 {event}")
     if event == "open":
         path, mode, flags = (tuple(args) + (None, None, None))[:3]
-        if _fence_is_write(mode, flags) and not _fence_inside(root, path):
+        if _fence_is_write(mode, flags) and not _fence_write_allowed(root, path):
             raise PermissionError("候选运行期围栏:禁止在临时工作目录之外写文件")
     elif event in _FENCE_PATH_EVENTS:
         for item in args:
-            if isinstance(item, (str, bytes, os.PathLike)) and not _fence_inside(root, item):
+            if isinstance(item, (str, bytes, os.PathLike)) and not _fence_write_allowed(root, item):
                 raise PermissionError(f"候选运行期围栏:禁止在临时工作目录之外 {event}")
 
 
