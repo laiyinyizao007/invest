@@ -163,7 +163,9 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
                                         stdout=out_fh, stderr=err_fh, cwd=workdir, env=env,
                                         **({} if sys.platform == "win32" else {"start_new_session": True}))
             except OSError as exc:
-                raise CandidateProcessError("launch", f"候选进程无法启动: {exc}") from exc
+                # OSError 的文字里常有本机路径:message 只给固定说明,细节只留本机 stderr
+                print(f"候选进程无法启动: {exc}", file=sys.stderr)
+                raise CandidateProcessError("launch", "候选进程无法启动(详情见本机日志)") from exc
             writer = threading.Thread(target=_feed_stdin, args=(proc, payload), daemon=True)
             writer.start()
             deadline = time.monotonic() + timeout

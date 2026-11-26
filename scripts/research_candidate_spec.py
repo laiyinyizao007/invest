@@ -27,8 +27,48 @@ CANDIDATE_BASE = "SignalTemplate"
 CANDIDATE_BASE_MODULE = "candidate.signal_template"
 
 
+# 给模型看的说明只能是**固定文字**:完整 message 里有候选可控的东西(类名、参数名、被赋值的名字……),
+# 那是不可信文本,回给模型就是提示词注入通道(仓库硬规矩:模型可见出口只回固定说明,不回传抽取出来的标识符)。
+# 做法:按 message 里**框架自己写的固定短语**选一条固定说明;候选可控的子串最多只影响「选哪一条」,进不了输出。
+_GENERIC_PUBLIC = ("候选声明不符合新格式要求:须是 SignalTemplate 子类,parameters 与 param_grid 写成字面量,"
+                   "类体与模块级只含简单赋值与方法(详情见本机日志)")
+_PUBLIC_BY_PHRASE = (
+    ("不是字面量", "parameters 与 param_grid 必须写成字面量"),
+    ("没有类定义", "候选源码里没有类定义"),
+    ("多于一个顶层类", "候选源码里只允许有一个顶层类"),
+    ("恰好继承一个基类", "候选类必须直接继承 SignalTemplate"),
+    ("基类必须是直接的名字", "候选类必须直接继承 SignalTemplate"),
+    ("必须继承候选版模板", "候选类必须直接继承 SignalTemplate"),
+    ("缺少 parameters", "候选类缺少 parameters 声明"),
+    ("parameters 必须是非空", "parameters 必须是非空的字面量列表"),
+    ("parameters 的每一项", "parameters 的每一项都必须是合法的参数名"),
+    ("parameters 里有重复项", "parameters 里有重复项"),
+    ("缺少 param_grid", "候选类缺少 param_grid 声明"),
+    ("param_grid 必须是非空", "param_grid 必须是非空的字面量 dict"),
+    ("param_grid 的键", "param_grid 的键必须是字符串"),
+    ("的取值必须是非空列表", "param_grid 的每个轴必须是非空列表"),
+    ("的取值必须全是数值", "param_grid 的取值必须全是数值"),
+    ("模块级只允许", "模块级只允许 import、函数定义、文档字符串与简单常量赋值(不得改写候选类)"),
+    ("特殊方法", "候选类不得定义特殊方法(双下划线方法)"),
+    ("只允许对简单名字赋值", "类体里只允许对简单名字赋值"),
+    ("海象运算符", "类体里不得使用海象运算符"),
+    ("被赋值了多次", "类体里有名字被赋值了多次"),
+    ("类体里只允许赋值", "类体里只允许赋值、方法定义与文档字符串"),
+    ("不是合法的 UTF-8", "候选源码不是合法的 UTF-8"),
+    ("语法错误", "候选源码有语法错误"),
+    ("必须 `from", "候选源码必须 from candidate.signal_template import SignalTemplate"),
+)
+
+
 class SpecError(ValueError):
-    """候选源码的声明读不出来(动态构造、缺声明、语法错误)⇒ fail-closed 拒绝评估。"""
+    """候选源码的声明读不出来(动态构造、缺声明、语法错误)⇒ fail-closed 拒绝评估。
+
+    `str(exc)` 是完整信息(含标识符与行号,**只给本机日志/人看**);`exc.public` 是固定说明(可以给模型看)。
+    少数调用点显式传 `public=`:那里的文字只含框架自己的名字,不含候选可控的字符串。"""
+
+    def __init__(self, message: str, public: str | None = None):
+        super().__init__(message)
+        self.public = public or next((text for phrase, text in _PUBLIC_BY_PHRASE if phrase in message), _GENERIC_PUBLIC)
 
 
 @dataclass(frozen=True)
@@ -271,7 +311,10 @@ def check_framework_defaults(spec: CandidateSpec, framework_parameters) -> None:
     会改变框架模板止损距离的写法,框架必须读得到值才能采用同样的有效参数。"""
     clash = sorted(set(spec.nonliteral) & set(framework_parameters))
     if clash:
-        raise SpecError(f"类体里的 {', '.join(clash)} 必须写成数值字面量(框架要采用同样的有效参数,读不出就不评估)")
+        # 这里的名字是 `spec.nonliteral ∩ framework_parameters`——框架自己的参数名,不是候选可控的字符串,可以进 public
+        names = ", ".join(clash)
+        raise SpecError(f"类体里的 {names} 必须写成数值字面量(框架要采用同样的有效参数,读不出就不评估)",
+                        public=f"类体里的 {names} 必须写成数值字面量(框架要采用同样的有效参数)")
 
 
 def proxy_class(spec: CandidateSpec) -> type:

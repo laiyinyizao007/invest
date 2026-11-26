@@ -143,3 +143,43 @@ def test_signals_to_map_refuses_misaligned_or_illegal_series():
     with pytest.raises(rsr.SignalSeriesError):
         rsr.signals_to_map(broken, [0, 0, 0, 0])              # 缺时间戳:信号会存在一个永远取不到的键下
     assert rsr.signals_to_map(bars, [0, 1, 0, -1]) == {bars[1].datetime: 1, bars[3].datetime: -1}
+
+
+# ---------------------------------------------------------------- 模型可见的错误文字:只回固定说明,不回传候选可控的标识符
+# (仓库硬规矩:候选写的文字/抽取出来的标识符都是不可信文本,是提示词注入通道)
+
+EVIL = "EVIL_IDENT_QZX"
+
+
+@pytest.mark.parametrize("source", [
+    cls(PARAMS + GRID + f"    {EVIL} = 1\n    {EVIL} = 2\n"),                                   # 重复赋值的名字
+    cls(PARAMS + GRID + f"\n    def __{EVIL}__(self):\n        pass\n"),                        # 特殊方法名
+    HEAD + f"class {EVIL}(SignalTemplate):\n" + PARAMS + GRID + f"\nclass {EVIL}2(SignalTemplate):\n    pass\n",  # 多个顶层类
+    "from candidate.signal_template import SignalTemplate\n\n\n" + f"class Candidate({EVIL}):\n" + PARAMS + GRID,   # 错的基类名
+    cls(PARAMS + f'    param_grid = {{"{EVIL}": 5}}\n'),                                       # param_grid 的键
+    cls(PARAMS + f'    param_grid = {{"{EVIL}": ["a", "b", "c"]}}\n'),                          # 取值不是数值
+    cls(PARAMS + GRID, f"\n{EVIL} = 1\nCandidate.{EVIL} = 2\n"),                              # 模块级改写
+    cls(PARAMS + GRID + f"    if True:\n        {EVIL} = 1\n"),                               # 块内赋值
+    "this is not python at all " + EVIL,                                                       # 语法错误
+])
+def test_public_error_text_never_contains_candidate_controlled_identifiers(source):
+    with pytest.raises(spec_mod.SpecError) as err:
+        spec_mod.parse_spec(source)
+    assert EVIL not in err.value.public, f"给模型看的说明里出现了候选可控的字符串: {err.value.public!r}"
+    assert err.value.public and len(err.value.public) < 200
+
+
+def test_every_spec_error_has_a_fixed_public_text_and_the_full_message_stays_local():
+    """完整信息(含标识符与行号)留给本机日志;给模型的 public 是固定说明,同一类错误的 public 完全一致。"""
+    a = pytest.raises(spec_mod.SpecError, spec_mod.parse_spec, cls(PARAMS + GRID + "    aaa = 1\n    aaa = 2\n"))
+    b = pytest.raises(spec_mod.SpecError, spec_mod.parse_spec, cls(PARAMS + GRID + "    bbb = 1\n    bbb = 2\n"))
+    assert a.value.public == b.value.public
+    assert "aaa" in str(a.value) and "bbb" in str(b.value)          # 完整信息保留(给人看)
+
+
+def test_the_non_literal_framework_default_message_may_name_framework_parameters_only():
+    """check_framework_defaults 的 public 可以点出框架自己的参数名(它们是框架的,不是候选可控的)。"""
+    spec = spec_mod.parse_spec(cls(PARAMS + GRID + "    atr_mult = 1.5 * 2\n    " + EVIL + " = 1 + 1\n"))
+    with pytest.raises(spec_mod.SpecError) as err:
+        spec_mod.check_framework_defaults(spec, ("fast_window", "slow_window", "atr_mult", "atr_window"))
+    assert "atr_mult" in err.value.public and EVIL not in err.value.public

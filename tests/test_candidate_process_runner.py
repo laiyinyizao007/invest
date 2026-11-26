@@ -385,3 +385,15 @@ class Candidate(SignalTemplate):
     with pytest.raises(rcp.CandidateProcessError) as err:
         _run(src)
     assert err.value.kind == "protocol"
+
+
+def test_launch_failure_message_is_fixed_and_does_not_echo_the_os_error(monkeypatch):
+    """起不来进程时,message 不得带 OSError 的文字(里面常有本机路径);细节只在本机 stderr。"""
+    def boom(*args, **kwargs):
+        raise OSError("C:\\Users\\secret\\python.exe: [WinError 5] 拒绝访问")
+
+    monkeypatch.setattr(rcp.subprocess, "Popen", boom)
+    with pytest.raises(rcp.CandidateProcessError) as err:
+        rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
+    assert err.value.kind == "launch"
+    assert "secret" not in err.value.message and "WinError" not in err.value.message

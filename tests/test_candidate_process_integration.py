@@ -350,3 +350,79 @@ def test_signal_child_refuses_a_non_literal_framework_default_as_a_structured_er
     assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_OK
     err = _printed_result(capsys)["error"]
     assert err["type"] == "SpecError" and "atr_mult" in err["message"]
+
+
+@requires_trading_stack
+@pytest.mark.parametrize("extra, why", [
+    ("\nimport os\n", "禁用模块"),
+    ("\nimport subprocess\n", "禁用模块"),
+    ("\nx = eval('1')\n", "禁用调用"),
+])
+def test_signal_child_rescreens_the_approved_bytes_like_the_old_child_does(child_env, capsys, extra, why):
+    """子入口是独立的信任边界:旧子入口在 import_candidate 里**再筛查一遍**(批准与筛查是两道独立的闸),
+    新子入口不得比它弱——人批准过的代码若过不了静态筛查,也不得被交给候选进程。"""
+    cand, _ = child_env
+    source = NEW_SOURCE + extra
+    cand.write_bytes(source.encode("utf-8"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_REFUSED, why
+    assert "静态筛查" in capsys.readouterr().err
+
+
+@requires_trading_stack
+def test_signal_child_screening_allows_the_candidate_import_root_only(child_env, monkeypatch, capsys):
+    """放行侧:正常的新格式候选能过子入口里的这道筛查(`candidate` 导入根被放行,别的照旧拦)。"""
+    cand, research_gate = child_env
+    cand.write_bytes(NEW_SOURCE.encode("utf-8"))
+    monkeypatch.setattr(research_gate, "run_evaluation", lambda **kw: {"passed": False, "failures": [], "trials": None})
+    assert api.run_evaluate_signal_child(_child_args(_sha(NEW_SOURCE))) == api.EXIT_OK
+    assert "error" not in _printed_result(capsys)
+
+
+@requires_trading_stack
+def test_signal_child_cls_mismatch_reports_a_fixed_text_not_the_caller_supplied_name(child_env, capsys):
+    """`--cls` 来自调用方(最终来自模型/工作流):回给模型的说明里不得回显它。"""
+    cand, _ = child_env
+    cand.write_bytes(NEW_SOURCE.encode("utf-8"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(NEW_SOURCE), "EVIL_CLS_QZX")) == api.EXIT_OK
+    err = _printed_result(capsys)["error"]
+    assert err["type"] == "SpecError" and "EVIL_CLS_QZX" not in err["message"]
+
+
+@requires_trading_stack
+def test_signal_child_spec_error_message_is_the_public_text(child_env, capsys):
+    cand, _ = child_env
+    source = _src_with_body("    EVIL_IDENT_QZX = 1\n    EVIL_IDENT_QZX = 2\n")
+    cand.write_bytes(source.encode("utf-8"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_OK
+    captured = capsys.readouterr()
+    result = json.loads(next(ln for ln in reversed(captured.out.splitlines()) if ln.startswith(api.CHILD_MARK))[len(api.CHILD_MARK):])
+    assert "EVIL_IDENT_QZX" not in result["error"]["message"]
+    assert "EVIL_IDENT_QZX" in captured.err                            # 完整信息留在本机 stderr(给人看)
+
+
+@requires_trading_stack
+def test_signal_child_reads_the_candidate_like_the_old_child_does_bom_and_unreadable(child_env, monkeypatch, capsys):
+    """带 BOM 的候选在旧路径(utf-8-sig)能跑,新路径不得因此误拒;读不了文件是「拒绝」不是「失败」。"""
+    cand, research_gate = child_env
+    raw = b"\xef\xbb\xbf" + NEW_SOURCE.encode("utf-8")
+    cand.write_bytes(raw)
+    monkeypatch.setattr(research_gate, "run_evaluation", lambda **kw: {"passed": False, "failures": [], "trials": None})
+    assert api.run_evaluate_signal_child(_child_args(hashlib.sha256(raw).hexdigest())) == api.EXIT_OK
+    assert "error" not in _printed_result(capsys)
+    cand.unlink()
+    assert api.run_evaluate_signal_child(_child_args(hashlib.sha256(raw).hexdigest())) == api.EXIT_REFUSED
+
+
+@requires_trading_stack
+def test_signal_child_scrubs_local_paths_out_of_framework_side_failure_messages(child_env, monkeypatch, capsys):
+    """框架侧失败的 message 也过统一的净化口径:即便将来某条消息里混进了本机路径,也出不去。"""
+    cand, research_gate = child_env
+    cand.write_bytes(NEW_SOURCE.encode("utf-8"))
+
+    def fake_run(**kwargs):
+        raise rcp.CandidateProcessError("protocol", "failed near C:\\Users\\secretname\\AppData\\x.py")
+
+    monkeypatch.setattr(research_gate, "run_evaluation", fake_run)
+    assert api.run_evaluate_signal_child(_child_args(_sha(NEW_SOURCE))) == api.EXIT_OK
+    err = _printed_result(capsys)["error"]
+    assert err["type"] == "CandidateProcessError" and "secretname" not in err["message"]

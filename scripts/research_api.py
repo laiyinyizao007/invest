@@ -1090,8 +1090,13 @@ def run_evaluate_signal_child(args) -> int:
     if not Path(data_file).is_file():
         print(f"品种 {args.product} 的数据文件缺失:{Path(data_file).name}", file=sys.stderr)
         return EXIT_REFUSED
-    # 候选源码只读一次,并核对它就是被批准的那一份字节(与旧路径 import_candidate 同一条哈希前提)
-    raw = path.read_bytes()
+    # 候选源码只读一次,并核对它就是被批准的那一份字节(与旧路径 import_candidate 同一条哈希前提)。
+    # 读法与旧路径**同一个函数**:`utf-8-sig`(带 BOM 的候选在旧路径能跑)、读不了是「拒绝」而不是「失败」。
+    try:
+        raw, source = read_candidate(path)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     if hashlib.sha256(raw).hexdigest() != args.sha256:
         print("候选文件内容与批准时的哈希不符,拒绝执行", file=sys.stderr)
         return EXIT_REFUSED
@@ -1099,16 +1104,26 @@ def run_evaluate_signal_child(args) -> int:
     bars = load_bars_csv(data_file, symbol, Exchange.DCE)
     windows = wf.build_windows()
     cfg = rc.load()
+    # 静态筛查在子进程里**再做一遍**:旧子入口在 import_candidate 里就是这么做的(批准与筛查是两道独立的闸;
+    # 自动批准账里的代码甚至没人读过)。新子入口不得比它弱。`candidate` 导入根只在这条路径上放行。
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"],
+                                list(cfg["screening"]["allowed_modules"]) + ["candidate"])
+    if findings:
+        print("静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
+        return EXIT_REFUSED
     try:
-        source = raw.decode("utf-8")
         spec = rspec.parse_spec(source)
         if spec.class_name != args.cls:
-            raise rspec.SpecError(f"--cls {args.cls} 与源码里唯一的候选类 {spec.class_name} 不符")
+            # `--cls` 来自调用方(最终来自模型/工作流):完整信息留本机,回给模型的是固定说明,不回显它
+            raise rspec.SpecError(f"--cls {args.cls} 与源码里唯一的候选类 {spec.class_name} 不符",
+                                  public="指定的类名与源码里唯一的候选类不符")
         rspec.check_framework_defaults(spec, TrendAtr15mStrategy.parameters)
-    except (rspec.SpecError, UnicodeDecodeError) as exc:
-        # 候选自己的声明有问题 = 研究中的正常结果(与旧路径的 GridError 对称),按结构化错误回传
-        print(CHILD_MARK + json.dumps({"error": {"type": "SpecError", "message": rs.scrub_text(str(exc))[:200]}},
-                                      ensure_ascii=False))
+    except rspec.SpecError as exc:
+        # 候选自己的声明有问题 = 研究中的正常结果(与旧路径的 GridError 对称),按结构化错误回传:
+        # 完整信息(含候选可控的标识符)只写本机 stderr,回给模型的只有固定说明 `exc.public`
+        print(f"候选声明被拒绝: {exc}", file=sys.stderr)
+        print(CHILD_MARK + json.dumps({"error": {"type": "SpecError", "message": exc.public}}, ensure_ascii=False))
         return EXIT_OK
     proxy = rspec.proxy_class(spec)
     runner = rsr.make_signal_runner(
@@ -1126,7 +1141,7 @@ def run_evaluate_signal_child(args) -> int:
         if exc.kind == "candidate_error":
             err = describe_error(RuntimeError(exc.detail))
         else:
-            err = {"type": "CandidateProcessError", "message": exc.message}
+            err = {"type": "CandidateProcessError", "message": rs.scrub_text(exc.message)[:200]}
         print(CHILD_MARK + json.dumps({"error": err}, ensure_ascii=False))
         return EXIT_OK
     except Exception as exc:                  # 含 GridError、受保护参数拒绝:候选自己的问题,作为结果回传
