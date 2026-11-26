@@ -101,6 +101,28 @@ def test_sync_plan_add_replace_keep_and_extra(repo):
     assert [i["name"] for i in sync_kb.make_plan(repo, [], WL)["add"]] == ["a.md", "b.md"]
 
 
+def test_case_variant_and_duplicate_copies_are_replaced_not_left_behind(repo):
+    h = rk.sha256_of(repo / "docs/a.md")
+    plan = sync_kb.make_plan(repo, [{"id": 1, "file_name": "A.MD", "md5": h}], WL)
+    assert plan["replace"][0]["old_ids"] == [1] and plan["extra"] == []
+
+
+def test_symlink_or_duplicate_manifest_entries_are_stale(repo, tmp_path_factory):
+    m = _synced(repo)
+    m["files"].append(dict(m["files"][0]))
+    rk.write_manifest(rk.default_manifest_path(repo), m)
+    assert any("重复" in p for p in rk.staleness(repo, whitelist=WL))
+    outside = tmp_path_factory.mktemp("out") / "a.md"
+    outside.write_text("x", encoding="utf-8")
+    (repo / "docs/a.md").unlink()
+    try:
+        (repo / "docs/a.md").symlink_to(outside)
+    except OSError:
+        pytest.skip("本机不允许建软链接")
+    _synced(repo)
+    assert any("仓库内" in p for p in rk.staleness(repo, whitelist=WL))
+
+
 def test_sync_plan_replaces_duplicate_live_copies(repo):
     h = rk.sha256_of(repo / "docs/a.md")
     live = [{"id": 1, "file_name": "a.md", "md5": h}, {"id": 5, "file_name": "a.md", "md5": h}]
@@ -119,5 +141,38 @@ def test_mcp_start_research_refuses_when_the_kb_is_stale(monkeypatch, tmp_path):
 
 def test_mcp_kb_check_failure_is_fail_closed(monkeypatch):
     import server as mcp_server
-    monkeypatch.setattr(mcp_server.rkb, "staleness", lambda root: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(mcp_server.rkb, "staleness", lambda root, manifest_path=None: (_ for _ in ()).throw(RuntimeError("boom")))
     assert mcp_server._kb_problems() and "出错" in mcp_server._kb_problems()[0]
+
+
+def test_a_failed_apply_invalidates_the_manifest_instead_of_leaving_a_false_all_clear(repo, monkeypatch, tmp_path):
+    """codex 复核 Critical:先删后传时上传失败,旧清单还在 ⇒ 库缺文档却被判一致。现在改动库之前先作废清单。"""
+    manifest = tmp_path / "kb_manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    deleted = []
+
+    class FakeBs:
+        @staticmethod
+        def login():
+            return "t"
+
+        @staticmethod
+        def _req(method, path, body=None, token=None, **kw):
+            if method == "GET":
+                return {"data": {"data": [{"id": 2, "file_name": "b.md", "md5": "old", "status": 2}]}}
+            deleted.append(path)
+            return {"status_code": 200}
+
+        @staticmethod
+        def multipart(path, files, token):
+            return {"status_code": 500, "status_message": "boom"}
+
+    monkeypatch.setitem(sys.modules, "bs", FakeBs)
+    orig = sync_kb.make_plan
+    monkeypatch.setattr(sync_kb, "make_plan", lambda root, live: orig(root, live, WL))
+    monkeypatch.setattr(sync_kb.rk, "WHITELIST", WL)
+    monkeypatch.setattr(sync_kb, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr(sync_kb.rk, "default_manifest_path", lambda root: manifest)
+    with pytest.raises(SystemExit):
+        sync_kb.apply(repo, prune=False)
+    assert deleted and not manifest.exists()                      # 旧版已删、上传失败 ⇒ 清单必须已被作废

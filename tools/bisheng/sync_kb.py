@@ -11,38 +11,41 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[2]                       # 代码根:文档从这里取
+DATA_ROOT = Path(os.environ.get("INVEST_ROOT") or ROOT).resolve()  # 数据根:清单写这里,与 MCP 读的是同一处
 sys.path.insert(0, str(ROOT / "scripts"))
 import research_kb as rk  # noqa: E402
 
 PAGE = 100
 POLL_SECONDS = 180
+TERMINAL_FAILED = (3, 6, 7)      # 毕昇 KnowledgeFileStatus:3 失败 / 6 超时 / 7 违规;2 成功;其余(1/4/5)仍在处理
 
 
 def make_plan(root: Path, live: list[dict], whitelist=rk.WHITELIST) -> dict:
     """纯函数:live = 库内文件列表[{id,file_name,md5}]。返回 {add, replace, keep, extra}。"""
     rk.check_whitelist(whitelist)
     by_name: dict[str, list[dict]] = {}
-    for f in live:
-        by_name.setdefault(f.get("file_name"), []).append(f)
+    for f in live:                                               # 大小写变体算同名:否则旧版滞留库里,检索会命中旧口径
+        by_name.setdefault(str(f.get("file_name")).lower(), []).append(f)
     plan = {"add": [], "replace": [], "keep": [], "extra": []}
     for rel in whitelist:
         name, want = rk.kb_name(rel), rk.sha256_of(root / rel)
-        found = by_name.get(name, [])
-        if len(found) == 1 and found[0].get("md5") == want:
+        found = by_name.get(name.lower(), [])
+        if len(found) == 1 and found[0].get("md5") == want and found[0].get("file_name") == name:
             plan["keep"].append({"path": rel, "name": name, "kb_file_id": found[0]["id"]})
         elif found:
             plan["replace"].append({"path": rel, "name": name, "old_ids": [f["id"] for f in found]})
         else:
             plan["add"].append({"path": rel, "name": name})
-    allowed = {rk.kb_name(r) for r in whitelist}
-    plan["extra"] = [{"id": f["id"], "name": f.get("file_name")} for f in live if f.get("file_name") not in allowed]
+    allowed = {rk.kb_name(r).lower() for r in whitelist}
+    plan["extra"] = [{"id": f["id"], "name": f.get("file_name")} for f in live if str(f.get("file_name")).lower() not in allowed]
     return plan
 
 
@@ -78,15 +81,14 @@ def apply(root: Path, prune: bool) -> int:
     token = bs.login()
     plan = make_plan(root, _list_files(bs, token))
     todo = plan["add"] + plan["replace"]
+    manifest_path = rk.default_manifest_path(DATA_ROOT)
+    if todo or (prune and plan["extra"]):                        # 先作废旧清单:之后任何一步失败,库都不再被当作"与仓库一致"
+        manifest_path.unlink(missing_ok=True)
     for item in plan["replace"]:                                 # 同名旧版先删(只删同名的),再传新版
         for old in item["old_ids"]:
             r = bs._req("DELETE", f"/knowledge/file/{old}", token=token)
             if r.get("status_code") != 200:
                 raise SystemExit(f"删除旧版 {item['name']}(id {old}) 失败: {r.get('status_code')} {r.get('status_message')}")
-    if prune:
-        for item in plan["extra"]:
-            r = bs._req("DELETE", f"/knowledge/file/{item['id']}", token=token)
-            print("删除白名单外文件", item["name"], r.get("status_code"))
     if todo:
         paths = [_upload(bs, token, root, item["path"]) for item in todo]
         r = bs._req("POST", "/knowledge/process", {"knowledge_id": rk.KNOWLEDGE_ID, "file_list": [{"file_path": p} for p in paths]}, token=token)
@@ -96,22 +98,27 @@ def apply(root: Path, prune: bool) -> int:
     while True:                                                  # 等入库完成,再逐个核对库里的哈希
         live = _list_files(bs, token)
         final = make_plan(root, live)
-        pending = [f for f in live if f.get("status") not in (2, 3)]
+        pending = [f for f in live if f.get("status") not in (2, *TERMINAL_FAILED)]
         if not final["add"] and not final["replace"] and not pending:
             break
         if time.time() > deadline:
             print("入库超时或哈希对不上,未写清单:", {k: [i["name"] for i in v] for k, v in final.items() if k in ("add", "replace")})
             return 1
         time.sleep(3)
-    bad = [f["file_name"] for f in live if f.get("status") == 3 and f["file_name"] in {rk.kb_name(r) for r in rk.WHITELIST}]
+    bad = [f["file_name"] for f in live if f.get("status") in TERMINAL_FAILED and f["file_name"] in {rk.kb_name(r) for r in rk.WHITELIST}]
     if bad:
-        print("这些文档入库失败(status=3),未写清单:", bad)
+        print("这些文档入库失败(status 3/6/7),未写清单:", bad)
         return 1
+    if prune:                                                    # 白名单外文件在**新版全部入库成功之后**才删,失败时不丢东西
+        for item in final["extra"]:
+            r = bs._req("DELETE", f"/knowledge/file/{item['id']}", token=token)
+            print("删除白名单外文件", item["name"], r.get("status_code"))
+        final = make_plan(root, _list_files(bs, token))
     ids = {f["file_name"]: f["id"] for f in live}
     manifest = rk.build_manifest(root, [{"path": r, "kb_file_id": ids.get(rk.kb_name(r))} for r in rk.WHITELIST], _commit(root),
                                  datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    rk.write_manifest(rk.default_manifest_path(root), manifest)
-    print("已同步并写清单:", rk.default_manifest_path(root))
+    rk.write_manifest(manifest_path, manifest)
+    print("已同步并写清单:", manifest_path)
     if final["extra"] and not prune:
         print("提示:库里有白名单外的文件(未删,删除需 --prune):", [i["name"] for i in final["extra"]])
     return 0
@@ -119,7 +126,8 @@ def apply(root: Path, prune: bool) -> int:
 
 def main(argv: list[str]) -> int:
     if "--check" in argv:
-        problems = rk.staleness(ROOT)
+        print("清单位置:", rk.default_manifest_path(DATA_ROOT))
+        problems = rk.staleness(ROOT, rk.default_manifest_path(DATA_ROOT))
         print(rk.stale_message(problems) if problems else "知识库清单与仓库一致")
         return 1 if problems else 0
     if "--apply" in argv:

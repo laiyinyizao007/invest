@@ -79,6 +79,10 @@ def write_manifest(path: Path, manifest: dict) -> None:
 def staleness(root: Path, manifest_path: Path | None = None, whitelist=WHITELIST) -> list[str]:
     """返回问题列表;空 = 知识库与仓库一致。任何读不了/对不上都算问题(fail-closed)。"""
     mp = manifest_path or default_manifest_path(root)
+    try:
+        check_whitelist(whitelist)
+    except ValueError as exc:
+        return [f"白名单本身不合法: {exc}"]
     if not mp.is_file():
         return [f"知识库清单不存在({mp.name}):还没同步过,请先运行 `python tools/bisheng/sync_kb.py --apply`"]
     try:
@@ -90,14 +94,21 @@ def staleness(root: Path, manifest_path: Path | None = None, whitelist=WHITELIST
         return ["知识库清单格式不对或指向别的库,请重新同步"]
     recorded = {}
     for f in manifest["files"]:
-        if isinstance(f, dict) and isinstance(f.get("path"), str) and isinstance(f.get("sha256"), str):
-            recorded[f["path"]] = f["sha256"]
+        if not (isinstance(f, dict) and isinstance(f.get("path"), str) and isinstance(f.get("sha256"), str)):
+            return ["知识库清单里有格式不对的条目,请重新同步"]
+        if f["path"] in recorded:
+            return [f"知识库清单里有重复条目: {f['path']},请重新同步"]
+        recorded[f["path"]] = f["sha256"]
     problems: list[str] = []
+    base = root.resolve()
     for rel in whitelist:
         if rel not in recorded:
             problems.append(f"白名单文档还没同步进知识库: {rel}")
             continue
-        p = root / rel
+        p = (root / rel).resolve()
+        if base not in p.parents:                      # 软链接指到仓库外 ⇒ 不认
+            problems.append(f"白名单文档不在仓库内(软链接?): {rel}")
+            continue
         try:
             current = sha256_of(p)
         except OSError:
