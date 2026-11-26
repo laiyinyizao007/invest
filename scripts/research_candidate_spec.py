@@ -174,6 +174,64 @@ def _parse_defaults(node: ast.ClassDef) -> tuple[dict[str, object], tuple[str, .
     return defaults, tuple(dict.fromkeys(nonliteral))
 
 
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+
+
+def _simple_targets(stmt: ast.stmt) -> list[ast.expr]:
+    return list(stmt.targets) if isinstance(stmt, ast.Assign) else [stmt.target]
+
+
+def _check_module_structure(tree: ast.Module, class_node: ast.ClassDef) -> None:
+    """模块级只允许 import、函数定义、文档字符串与**对简单名字**的赋值,且不得重绑定候选类。
+
+    框架只读 AST、从不 exec 候选,所以任何能在类定义**之后**改写类的写法(`Candidate.param_grid = ...`、
+    `Candidate = decorate(Candidate)`、`if` 里改写、`+=`)都会让「框架读到的」与「候选进程里生效的」不同——一律拒绝评估。
+    `locals()` / `setattr` / `metaclass=` 这类由静态筛查拦,这里不重复。"""
+    for stmt in tree.body:
+        if stmt is class_node or isinstance(stmt, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.Pass)) or _is_docstring(stmt):
+            continue
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = _simple_targets(stmt)
+            if all(isinstance(t, ast.Name) for t in targets) and class_node.name not in {t.id for t in targets}:
+                continue
+        raise SpecError(f"第 {stmt.lineno} 行:模块级只允许 import、函数定义、文档字符串与简单常量赋值"
+                        "(不得改写或重绑定候选类;框架只读源码结构,读到的必须与运行时生效的一致)")
+
+
+def _check_class_body(node: ast.ClassDef) -> None:
+    """类体只允许:文档字符串、`pass`、对**简单名字**的赋值(每个名字至多一次)、非特殊方法的定义。
+
+    被拒绝的写法都会让框架(读第一次/看不见块内赋值)与候选进程(运行时生效最后一次/块内赋值)读出不同的声明:
+    - 重复赋值:`parameters` 重复 ⇒ 运行时网格轴对候选无作用,相邻格子信号相同,参数高原被人为做平;
+    - 块里(`if`/`try`/`for`/`with`)赋值、`+=`、元组解包、`del`、嵌套类、海象运算符:框架看不见,静默用模板默认值;
+    - `__init__` / `__init_subclass__` / `__set_name__` 等特殊方法:`self.atr_mult = 5` 让候选实际用 5,框架止损按类体字面量算。"""
+    assigned: set[str] = set()
+    for stmt in node.body:
+        if _is_docstring(stmt) or isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.FunctionDef):
+            if stmt.name.startswith("__") and stmt.name.endswith("__"):
+                raise SpecError(f"第 {stmt.lineno} 行:候选类不得定义特殊方法 {stmt.name}"
+                                "(会让候选实际生效的参数与框架读到的不同)")
+            continue
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = _simple_targets(stmt)
+            if not all(isinstance(t, ast.Name) for t in targets):
+                raise SpecError(f"第 {stmt.lineno} 行:类体里只允许对简单名字赋值(不得解包、不得写属性/下标)")
+            if any(isinstance(sub, ast.NamedExpr) for sub in ast.walk(stmt)):
+                raise SpecError(f"第 {stmt.lineno} 行:类体里不得使用海象运算符")
+            if isinstance(stmt, ast.AnnAssign) and stmt.value is None:
+                continue
+            for target in targets:
+                if target.id in assigned:
+                    raise SpecError(f"第 {stmt.lineno} 行:类体里 {target.id} 被赋值了多次"
+                                    "(框架读第一次、运行时生效最后一次,二者会不一致)")
+                assigned.add(target.id)
+            continue
+        raise SpecError(f"第 {stmt.lineno} 行:类体里只允许赋值、方法定义与文档字符串(出现了 {type(stmt).__name__})")
+
+
 def parse_spec(source: str | bytes) -> CandidateSpec:
     """解析候选源码,返回静态声明。读不出来一律抛 SpecError(fail-closed)。"""
     if isinstance(source, bytes):
@@ -187,11 +245,13 @@ def parse_spec(source: str | bytes) -> CandidateSpec:
         raise SpecError(f"候选源码语法错误: 第 {exc.lineno} 行: {exc.msg}") from exc
 
     node = _find_class(tree)
+    _check_module_structure(tree, node)
     base_name = _base_name(node)
     if base_name != CANDIDATE_BASE:
         raise SpecError(f"候选类必须继承候选版模板 {CANDIDATE_BASE}(现在是 {base_name})")
     if not _imports_base(tree):
         raise SpecError(f"候选源码必须 `from {CANDIDATE_BASE_MODULE} import {CANDIDATE_BASE}`")
+    _check_class_body(node)
 
     defaults, nonliteral = _parse_defaults(node)
     return CandidateSpec(

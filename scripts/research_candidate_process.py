@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -64,7 +65,27 @@ def kill_tree(proc: subprocess.Popen) -> None:
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
     else:
-        proc.kill()
+        # POSIX:候选进程是自己会话的组长(启动时 start_new_session=True),整组一起杀——
+        # 只 proc.kill() 杀不到孙进程(G8 codex 审查指出,容器里就是这条路径)。
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
+
+def _tail(path, size: int) -> bytes:
+    """只读文件末尾 `size` 字节,**不把整个文件读进内存**(候选可能把 stderr 写得很大)。"""
+    with open(path, "rb") as fh:
+        end = fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, end - size))
+        return fh.read(size)
+
+
+def _remove_tree(path) -> None:
+    """清临时目录;清不掉(Windows 上仍被占用)就在**本机 stderr** 留痕,不静默堆积。只打目录名,不打路径。"""
+    shutil.rmtree(path, ignore_errors=True)
+    if Path(path).exists():
+        print(f"警告:候选进程的临时目录未能清理(可能仍被占用): {Path(path).name}", file=sys.stderr)
 
 
 def host_source() -> str:
@@ -139,7 +160,8 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
         with open(out_path, "wb") as out_fh, open(err_path, "wb") as err_fh:
             try:
                 proc = subprocess.Popen([sys.executable, "-E", "-P", "-B", "-c", code], stdin=subprocess.PIPE,
-                                        stdout=out_fh, stderr=err_fh, cwd=workdir, env=env)
+                                        stdout=out_fh, stderr=err_fh, cwd=workdir, env=env,
+                                        **({} if sys.platform == "win32" else {"start_new_session": True}))
             except OSError as exc:
                 raise CandidateProcessError("launch", f"候选进程无法启动: {exc}") from exc
             writer = threading.Thread(target=_feed_stdin, args=(proc, payload), daemon=True)
@@ -158,20 +180,25 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
                     raise CandidateProcessError("output_limit", "候选进程输出超过上限,已终止")
                 time.sleep(POLL_SECONDS)
             writer.join(timeout=5)
-        if os.path.getsize(out_path) > max_stdout:
+        # 退出后**两个**文件都要再核对一次:候选可以在两次轮询之间写爆 stderr 然后立刻退出(G8 codex 审查发现、本地复现)
+        if os.path.getsize(out_path) > max_stdout or os.path.getsize(err_path) > MAX_STDERR_BYTES:
             raise CandidateProcessError("output_limit", "候选进程输出超过上限")
         raw = out_path.read_bytes()
         if not raw:
             # 没有任何响应:详细 stderr 只留本机,不回传(可能含候选写的任意文字与本机路径)
-            tail = err_path.read_bytes()[-1500:].decode("utf-8", "replace")
+            tail = _tail(err_path, 1500).decode("utf-8", "replace")
             print("候选进程没有响应,stderr 尾部:\n" + tail, file=sys.stderr)
             raise CandidateProcessError("protocol", f"候选进程没有响应(退出码 {proc.returncode})")
         return _parse_response(raw, n_bars)
     finally:
         if proc is not None and proc.poll() is None:
             kill(proc)
+            try:
+                proc.wait(timeout=10)                 # 杀了要等到它真的退出,否则 cwd 还被占着,下面的清理会失败
+            except subprocess.TimeoutExpired:
+                print("警告:候选进程在被杀后 10 秒内仍未退出", file=sys.stderr)
         for path in (runtime, workdir):
-            shutil.rmtree(path, ignore_errors=True)
+            _remove_tree(path)
         for path in (out_path, err_path):
             try:
                 path.unlink()

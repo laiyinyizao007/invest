@@ -87,6 +87,10 @@ def decode_json(payload: bytes) -> dict:
         obj = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ProtocolError(f"控制帧不是合法 JSON: {exc}") from exc
+    except (RecursionError, MemoryError) as exc:
+        # 深层嵌套的 JSON 让 json.loads 抛 RecursionError(不是 JSONDecodeError):候选只要把第一帧写成几十 KB 的 `[[[[…`
+        # 就能让一个非契约异常逃出启动器(G8 codex 审查发现、本地复现)。一律按协议错误处理,整格判失败。
+        raise ProtocolError(f"控制帧嵌套过深或过大: {type(exc).__name__}") from exc
     if not isinstance(obj, dict):
         raise ProtocolError("控制帧必须是 JSON 对象")
     return obj

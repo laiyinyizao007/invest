@@ -288,3 +288,100 @@ def test_ported_example_candidate_parses_and_passes_screening_only_on_the_new_pa
     assert all(isinstance(v, int) for v in spec.param_grid["breakout_n"]), "整数取值必须保持整数"
     assert rs.screen_source(source, extra_allowed=["candidate"]) == []
     assert any("candidate" in finding for finding in rs.screen_source(source)), "关着开关时白名单不得放行 candidate"
+
+
+# ---------------------------------------------------------------- G8 codex 审查发现并经本地复现的问题
+
+
+@pytest.mark.parametrize("payload", [b"[" * 100_000, b'{"a":' * 50_000], ids=["nested-arrays", "nested-objects"])
+def test_deeply_nested_control_frame_is_a_protocol_error_not_a_raw_recursion_error(payload):
+    """候选把第一帧写成深层嵌套 JSON:`json.loads` 抛 RecursionError,不是 JSONDecodeError——
+    必须被包成 CandidateProcessError(整格判失败),不能让一个非契约异常逃出启动器。"""
+    with pytest.raises(rcp.CandidateProcessError) as err:
+        rcp._parse_response(proto.encode_frame(payload), 3)
+    assert err.value.kind == "protocol"
+
+
+def test_decode_json_wraps_recursion_errors_too():
+    with pytest.raises(proto.ProtocolError):
+        proto.decode_json(b"[" * 100_000)
+
+
+def test_stderr_flood_between_two_polls_is_still_refused_after_the_process_exits(monkeypatch):
+    """候选在两次轮询之间把 stderr 写爆(远超上限)然后正常退出:退出后那一次核对也必须拒绝。
+    把轮询间隔拉到 3 秒,让候选在第二次轮询之前就跑完退出——这样走的就是「退出后」的核对,不是轮询里的。"""
+    monkeypatch.setattr(rcp, "POLL_SECONDS", 3.0)
+    src = '''
+import sys
+from candidate.signal_template import SignalTemplate
+
+class Candidate(SignalTemplate):
+    def run(self, bars):
+        sys.stderr.write("y" * (3 * 1024 * 1024))
+        sys.stderr.flush()
+        return super().run(bars)
+'''
+    with pytest.raises(rcp.CandidateProcessError) as err:
+        _run(src)
+    assert err.value.kind == "output_limit"
+
+
+def test_tail_reads_only_the_tail_not_the_whole_file(tmp_path, monkeypatch):
+    big = tmp_path / "big.err"
+    big.write_bytes(b"a" * (3 * 1024 * 1024) + b"TAIL-MARKER")
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (_ for _ in ()).throw(AssertionError("整个文件被读进了内存")))
+    assert rcp._tail(big, 11) == b"TAIL-MARKER"
+    assert rcp._tail(tmp_path / "small.err" if (tmp_path / "small.err").write_bytes(b"xyz") else None, 1500) == b"xyz"
+
+
+def test_unexpected_exception_in_the_loop_still_kills_waits_and_cleans_up(monkeypatch):
+    """轮询里出了意外异常(这里模拟 getsize 失败):兜底分支必须把进程杀掉并等到它真的退出,临时目录清干净。"""
+    _require_talib()
+    before = _leftovers()
+    seen = []
+
+    def spy_kill(proc):
+        seen.append(proc)
+        rcp.kill_tree(proc)
+
+    monkeypatch.setattr(rcp.os.path, "getsize", lambda p: (_ for _ in ()).throw(OSError("simulated")))
+    src = '''
+from candidate.signal_template import SignalTemplate
+
+class Candidate(SignalTemplate):
+    def run(self, bars):
+        while True:
+            pass
+'''
+    with pytest.raises(OSError):
+        rcp.run_candidate_signals(src, "Candidate", {}, synth_bars(120), timeout=60.0, kill=spy_kill)
+    assert seen, "兜底分支没有杀进程"
+    assert seen[0].poll() is not None, "杀了之后没有等到进程真的退出"
+    assert _leftovers() == before
+
+
+def test_the_no_response_path_reads_only_the_stderr_tail_through_the_real_launcher(monkeypatch):
+    """调用点也要钉住:候选没有响应就退出、stderr 写得很大(但不超上限)时,框架只读尾部,不得对 .err 文件整体 read_bytes。
+    (只测 `_tail` 这个辅助函数本身,把调用点改回 `err_path.read_bytes()` 时测试仍是绿的——变异验证抓到的缺口。)"""
+    _require_talib()
+    real = Path.read_bytes
+
+    def guarded(self):
+        if str(self).endswith(".err"):
+            raise AssertionError("框架对 stderr 文件整体 read_bytes 了")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded)
+    src = '''
+import os, sys
+from candidate.signal_template import SignalTemplate
+
+class Candidate(SignalTemplate):
+    def run(self, bars):
+        sys.stderr.write("z" * (900 * 1024))
+        sys.stderr.flush()
+        os._exit(0)
+'''
+    with pytest.raises(rcp.CandidateProcessError) as err:
+        _run(src)
+    assert err.value.kind == "protocol"
