@@ -7,6 +7,37 @@
   `20261109-promotion-gate`(8 条门槛)、`20261112-candidate-evaluation`(样本外=滚动验证段)、
   `20261111-risk-floor-immutability`(风控底线不可优化)、`20261112-research-sandbox-groundwork`(纵深防御而非沙盒)
 
+## 2026-11-25 现状核对(本节为修订,正文其余部分的行号与"未合并"表述以本节为准)
+
+> 只更正**事实描述**,不改任何决定、阈值或防线口径;状态仍是"待评审"。核对基线:`docs/29-process-isolation-design` 分支当前工作树(已并入 main)。
+
+**已变化的事实**
+
+| 正文说法 | 现状(2026-11-25) |
+|---|---|
+| 账本"纯追加 JSONL,**没有哈希链**"、"同进程 `threading.Lock`,跨进程不加锁"(1.1、1.4、6.4、8.1) | 已有哈希链 + 外置锚点(`risk/ledger_chain.py`,每条带 `seq/prev/hash`)与**跨进程文件锁**(`chain.file_lock`);人工迁移/重置在 `risk/ledger_admin.py` + `scripts/research_ledger.py`。进程内 `threading.Lock` 仍在,但不再是唯一的串行手段 |
+| `candidate_window` 审计钩子"不在 main"(1.1) | 已在 main:`scripts/research_sandbox.py::candidate_window` |
+| PR #32(账本链/锚点/文件能力收口)与 PR #27(沙盒加固)"未合并"(第 8.2 节拍板点 5、第 12 节) | **均已合并**。拍板点 5 的依赖已满足,可关闭;S3 的账本改造直接基于现有链账本 |
+| 评估只有一个品种(玉米) | 评估按品种选数据与规格(`product` 参数,白名单 `research_sandbox.PRODUCTS`,见 `20261124-per-product-evaluation`)。S2 的切片生成、测试段断言、格子计数都必须带 `product`;评估键不再恒为 `C15` |
+| `evaluate_job` 是评估的单一入口(1.1、S1) | 评估已拆成 `evaluate_prepare`(同步前半段:校验、筛查、批准检查、试验预扣)与 `evaluate_run`(后台线程,慢的后半段),`evaluate_job` 只是包装;网关"启动即返回 + 按 `run_id` 取结果"(Issue #84)。**S1 退役三个子入口时必须保持这个两段形态**,否则异步评估会被破坏 |
+| 滚动 24 小时提交额度 | 现为 20(`config/research_sandbox.json::iteration.max_iterations`) |
+| 候选侧运行时包为 `scripts/candidate_runtime/`(5.3、7) | 工作树里实际落点是 `research/candidate/`,候选基类为 `SignalTemplate`,导入路径 `candidate.signal_template`(即拍板点 4 的"路线 A + 另起新名",**尚未获确认**) |
+
+**行号漂移(以符号名为准,下表仅供定位)**
+
+| 符号 | 文件 | 现行号 |
+|---|---|---|
+| `import_candidate` / `spawn_child` / `charge_trials` / `top_up_grid_trials` | `scripts/research_api.py` | 403 / 201 / 141 / 149 |
+| `CtaTemplate` 子类硬检查 | `scripts/research_api.py` | 552 |
+| `gate_job` / `evaluate_prepare` / `evaluate_run` / `evaluate_job` | `scripts/research_api.py` | 791 / 846 / 873 / 893 |
+| `run_gate_child` / `run_evaluate_child` / `run_child` | `scripts/research_api.py` | 960 / 1004 / 1053 |
+| `RepoImportGuard` / `safe_builtins` / `candidate_window` / `sandbox_env` / `screen_source` | `scripts/research_sandbox.py` | 1270 / 2039 / 2389 / 3328 / 2993 |
+| `PROTECTED_RUNTIME_PACKAGES` / `check_class` / `check_instance_state` / `check_protected_state` / `check_market_data_integrity` | `risk/constitution.py` | 1534 / 1769 / 1423 / 1731 / 1856 |
+
+**仍然成立(已逐条复核)**:`top_up_grid_trials` 仍按子进程自报格子数补记;预扣 `MIN_GRID_CELLS = 27`;`--prior-trials` 仍在(`research_api.py` 第 130/338/817/877 行);子进程结果通道仍是 `RESEARCH_RESULT_JSON:` 一行 JSON(交接单 + MAC 只在未合并的 `feat/21-stage3`);测试段起点仍是 `research_gate.TEST_SEGMENT_START` 与 `walk_forward_optimizer.TEST_SEGMENT_START` 两个相同的 `datetime(2024,1,1)`;`reconfigure_stdio()` 在 `scripts/research_console.py`;`grid.max_cells=343`、`min_round_trips=10`;PR #24 / Issue #21 仍 OPEN,故 `risk/ladder.py`、`map_elites.py`、`behavior.py` 仍不在 main。
+
+**代码已先于决议走了两步(须在实现前确认)**:`scripts/research_candidate_spec.py` 用 AST 静态读 `param_grid`、读不出即 `SpecError` fail-closed(对应拍板点 2);候选基类另起新名 `SignalTemplate`(对应拍板点 4 的 A1)。二者均**未获用户确认**,在确认前不得进入主线。
+
 ## 背景
 
 PR #24(Issue #21)的 G8 复审连续五轮没有收敛(Issue #29 正文记的分数:38 → 32 → 35 → 33 → 34,要求 ≥ 45),
@@ -68,11 +99,11 @@ PR #24(Issue #21)的 G8 复审连续五轮没有收敛(Issue #29 正文记的分
 | `evaluate_job` | `scripts/research_api.py:764-799` | 父进程:读账本 `prior` → `charge_trials("grid_cell", MIN_GRID_CELLS=27)` 预扣 → 起子进程 → 回传后按**子进程自报的** `trials.grid_cells` 补记差额(`top_up_grid_trials`,`scripts/research_api.py:140-147`) |
 | `safe_builtins` | `scripts/research_sandbox.py:1765-1823` | 候选执行时的最小内建集合:去掉 `UNSAFE_BUILTINS`,`__import__` 换成受限导入器(黑名单 → 路径裁决 → 导入白名单 → 配置准入审计) |
 | `RepoImportGuard` | `scripts/research_sandbox.py:1076+` | 按**路径**裁决候选的 import:仓库内非白名单目录拒绝;白名单目录还要满足"候选运行前就存在且此后没被改过";仓库外(站点包)同样要求运行前就存在 |
-| `candidate_window` | **不在 main**;在 `origin/feat/31-fs-capability:scripts/research_sandbox.py:2146` | 审计钩子窗口(`sys.addaudithook`):窗口内拒写模式 `open`、`os.remove/rename`、subprocess、socket、pickle.find_class 等;窗口外不判定。**只拦写与能力,不拦读** |
+| `candidate_window` | ~~不在 main~~ **(2026-11-25 更正:已合并进 main,`scripts/research_sandbox.py::candidate_window`)** | 审计钩子窗口(`sys.addaudithook`):窗口内拒写模式 `open`、`os.remove/rename`、subprocess、socket、pickle.find_class 等;窗口外不判定。**只拦写与能力,不拦读** |
 | `research_grid.validate_grid` | `scripts/research_grid.py:57-85` | 校验候选声明的 `param_grid`:恰好 3 个参数、每个 3~10 个取值、严格递增、不含受保护参数、格子数 ≤ `max_cells` |
 | `research_gate.run_gate` / `run_evaluation` | `scripts/research_gate.py:45-115` | 在**子进程内**跑候选回测(基准 + 成本翻倍 + 200 次随机对照)、聚合成 `CandidateMetrics`、调 `check_gate` |
 | `backtest_lib.run_engine_bars` | `scripts/backtest_lib.py:98-141` | 用 vn.py `BacktestingEngine` 真实回放;回放后核对风控底线、框架对象指纹、行情容器完整性 |
-| `risk/trial_ledger.py` | 全文 78 行 | 追加式 JSONL;`KINDS = ("submission","grid_cell","gate_run")`;只增不减;损坏/超限 fail-closed;**同进程内 `threading.Lock` 串行,跨进程不加锁**(模块文件头第 9~10 行明写) |
+| `risk/trial_ledger.py` | (写本文时 78 行;**2026-11-25 更正**:现已带哈希链 + 外置锚点 + 跨进程文件锁,见上方"现状核对") | 追加式 JSONL;`KINDS = ("submission","grid_cell","gate_run")`;只增不减;损坏/超限 fail-closed;~~同进程内 `threading.Lock` 串行,跨进程不加锁~~(该限制已被 `chain.file_lock` 取代) |
 | `risk/dsr.py` | `risk/dsr.py:47-69` | `deflated_sharpe(daily_returns, n_trials)`;V 取零假设理论值 `1/(T-1)`;非有限输入一律返回 0.0 |
 | `risk/constitution.py` | `PROTECTED_RUNTIME_PACKAGES`(第 1432 行)= `risk`、`strategies`、`vnpy_ctastrategy`、`vnpy.trader.constant/object/utility` | 运行时指纹只覆盖这几个包;**`scripts.*`(含 `research_grid`、`research_gate`、`backtest_lib`、`walk_forward_optimizer`)**不在其中 |
 
@@ -141,7 +172,7 @@ flowchart TD
   (`scripts/research_grid.py` 不在 `PROTECTED_RUNTIME_PACKAGES` 里),所以"实际扫了多少格"框架不知道。
 - DSR 的 N 就是这个数:`risk/candidate_eval.py:66-69` 的 `n_trials` → `risk/dsr.py:47`。
   N 偏小 ⇒ DSR 偏松 ⇒ **悄悄放松已锁定的 DSR ≥ 0.95**。这就是 Issue 里"改写 `validate_grid` → 试验次数少记"的机制。
-- 账本本身(main 上的 `risk/trial_ledger.py`)是**纯追加 JSONL,没有哈希链**。
+- 账本本身(~~main 上的 `risk/trial_ledger.py` 是纯追加 JSONL,没有哈希链~~ **2026-11-25 更正:PR #32 已合并,现有哈希链 + 外置锚点**;下面几句是写本文时的状态,留作溯源)。
   哈希链 + 外置锚点在 `origin/feat/31-fs-capability` 分支上(`risk/ledger_chain.py`、`risk/ledger_admin.py`、
   `scripts/research_ledger.py`),**尚未合并进 main**。该分支的 `risk/ledger_chain.py` 文件头已写明:
   "真正的外部锚点需要另一个信任域(Issue #29 独立进程 / 容器只读挂载);这里没有"。
@@ -649,11 +680,14 @@ flowchart LR
 
 ### 6.4 账本锚点与人工重置怎么配合
 
-现状(main):
+> **2026-11-25 更正**:下面"现状(main)"与"未合并分支"两段是写本文时的状态。PR #32 已合并,
+> 链、锚点、admin 入口、跨进程文件锁现在**都在 main**,本节"落地次序"一条的前提已满足。
+
+现状(写本文时的 main):
 - `risk/trial_ledger.py`:纯追加 JSONL,`KINDS = ("submission","grid_cell","gate_run")`,
   同进程 `threading.Lock` 串行,**跨进程不加锁**(文件头第 9~10 行明写这是已知限制)。
 
-未合并分支(`origin/feat/31-fs-capability`,Issue #31 / PR #32)上已有:
+当时未合并的分支(`origin/feat/31-fs-capability`,Issue #31 / PR #32;**现已合并**)上已有:
 - `risk/ledger_chain.py`:每条记录带 `seq`/`prev`/`hash`,`hash = sha256(prev + "|" + 规范化 JSON)`;
   锚点文件在**账本目录之外**的 `data/ledger_anchor/`,读侧逐条核链 + 核锚点头。
 - `risk/ledger_admin.py` + `scripts/research_ledger.py`:迁移(migrate)与人工重置(reset),
@@ -866,7 +900,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 伪造已被结构性堵死)。
 **建议 ③ + ②**,但两者都要新 ADR,且都不得在看到新候选结果后决定。
 
-**拍板点 2:"网格静态读不出"时怎么办。**
+**拍板点 2:"网格静态读不出"时怎么办。**(2026-11-25 注:工作树里 `scripts/research_candidate_spec.py` 已按 fail-closed 预写,**待确认**,确认前不入主线。)
 现状是"读不出 ⇒ 按 `max_cells` 保守记账"。新口径建议 **fail-closed 拒绝评估**。
 两者都改变现状行为(一个是更严的记账,一个是更严的拒绝),请确认取哪条。
 
@@ -875,7 +909,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 删掉能显著简化代码;保留则是一层无对象的空转(而且会让评审误以为还有防线)。
 本方案建议删,但这是"减少防线"的动作,按 G6 需明确确认。
 
-**拍板点 4:候选基类路线(第 5.2 节)。**
+**拍板点 4:候选基类路线(第 5.2 节)。**(2026-11-25 注:工作树里 `research/candidate/` 已按"路线 A + 另起新名 `SignalTemplate`"预写,**待确认**;它是候选格式的 breaking change,毕昇提示词与 `pending_strategies/*` 须同步。)
 建议采纳**路线 A(基类副本)**;路线 B(纯函数信号)更干净但与
 `risk/constitution.py` 的"必须继承模板家族"运行时校验直接冲突,且现有候选全部要重写。
 需确认路线 A 可接受(尤其"候选版模板不含风控计算"这一取舍)。
@@ -890,7 +924,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
   并把 breaking change 的成本如实计入人天。
 **A2. 候选版模板不含风控计算** —— 这条是路线 A 的核心,建议照第 5.3 节执行。
 
-**拍板点 5:本 Issue 的依赖项要补一条。**
+**拍板点 5:本 Issue 的依赖项要补一条。**(**2026-11-25:已满足,可关闭**——PR #27 与 PR #32 均已合并。)
 Issue 现在写"先合并 PR #27"。但本方案的实施**强烈依赖 PR #32(Issue #31)**
 ——账本的哈希链 + 锚点 + 人工重置入口都在那个分支上;没有它,本方案要写两遍账本改造。
 建议把依赖改为"先合 PR #27 与 PR #32"。
