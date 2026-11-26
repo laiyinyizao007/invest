@@ -557,8 +557,11 @@ def _eval_progress(session: dict) -> list[str]:
     if status == "running":
         return [f"评估 {run_id}:仍在运行(通常几分钟),稍后再用 research_status 查看;不要重复提交。"]
     if status in ("error", "interrupted"):
-        why = state.get("error") or state.get("message") or ""
-        return [redact_for_model(f"评估 {run_id}:{'失败' if status == 'error' else '被网关重启打断'}。{why}")[:600]]
+        # 失败原因文字来自子进程/作业,可能夹着不可信内容:给模型的只有**固定说明**,原文留在结果目录与网关日志里供人看(Issue #94)
+        why = ("评估失败(常见原因:超时、被策略拒绝、子进程崩溃;详情见网关日志与结果目录里的运行状态文件)。"
+               if status == "error" else "被网关重启打断:这次评估还没跑完(试验次数已预扣,不退还)。")
+        return [f"评估 {run_id}:{why}"]
+    state = rs.sanitize_result_for_model(state)                  # 候选自己写的报错文字不给模型看(Issue #94)
     return [redact_for_model(f"评估 {run_id} 完成:\n" + str(state.get("report") or "(结果里没有报告文本)"))[:3000]]
 
 

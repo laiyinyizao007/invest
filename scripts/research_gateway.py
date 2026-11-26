@@ -27,6 +27,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 from typing import Callable
 
 import research_config as rc
@@ -43,6 +44,7 @@ ROUTES = {
     ("GET", "/research/feedback"),
     ("GET", "/research/results/{run_id}"),
 }
+DIAGNOSIS_DIMENSIONS = frozenset({"sharpe", "drawdown", "trades", "losing_streak"})   # risk/diagnosis.py 的维度名;其余一律不回传
 CLASS_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,60}$")
 MIN_TOKEN_LENGTH = 32
 MAX_TRACE_FAILURES = 8
@@ -260,6 +262,8 @@ class GatewayApp:
             return 413, {"error": "请求体过大"}
 
         route, params = self._match(method, path)
+        if route is not None:
+            params = {**params, "_query": parse_qs(urlsplit(path).query)}       # GET 的查询串(目前只有 /research/feedback 用)
         if route is None:
             known_paths = {p.split("{")[0].rstrip("/") for _, p in ROUTES}
             return (405, {"error": "方法不允许"}) if path.rstrip("/") in known_paths else (404, {"error": "不存在"})
@@ -412,6 +416,7 @@ class GatewayApp:
         status, payload = outcome
         if status != 200 or not isinstance(payload, dict):
             return outcome                                   # 错误一律保持 JSON,调用方才能读到原因
+        payload = rs.sanitize_result_for_model(payload)     # 候选自己写的报错文字不给模型看(Issue #94)
         if view == "report":
             return status, _compact(payload)
         if view == "text":
@@ -561,32 +566,42 @@ class GatewayApp:
         if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
             return 400, {"error": "非法的 run_id"}
         try:
-            return 200, rs.load_result(run_id, self.paths["results_dir"])
+            return 200, rs.sanitize_result_for_model(rs.load_result(run_id, self.paths["results_dir"]))
         except rs.SandboxError:
             return 404, {"error": "没有这条结果"}
         except ValueError:
             return 500, {"error": "结果文件无法解析"}
 
-    def _feedback(self, _data, _params):
+    def _feedback(self, _data, params):
         """最近 N 条失败的结构化 Trace(N 来自配置)。只含固定字段,不回传源码、路径或调用方自由文本。
+
+        **`product` 必填(Issue #94)**:反馈是"记忆",必须有作用域——研究 V 时不能看到玉米的失败。
+        不带或不在白名单里 ⇒ 400,而不是回落成全局(全局正是此前串品种的来源)。
+        **候选自己写的报错文字不原样进提示词**(见 `research_sandbox.safe_error_line`):那是不可信文本,会成为提示词注入通道。
 
         另外回一份**已有候选的文件名**:起名那一步要避开它们。
         少了这一段,同一个研究想法重跑会撞名 → 网关 409 → 整条工作流中止,
         「多轮研究循环」实际退化成单轮(第 6 轮实测:同一个想法第二跑死在 409 上)。
         只给文件名(且只给符合命名规则的),不给路径、不给源码、不给内容。"""
         limit = self.cfg["feedback"]["limit"]
+        wanted = (params.get("_query") or {}).get("product", [])
+        if len(wanted) != 1 or wanted[0] not in rs.PRODUCTS:
+            return 400, {"error": f"product 必填(查询参数),只能是 {list(rs.PRODUCTS)}"}
+        product = wanted[0]
         traces = []
         for run_id in reversed(rs.list_results(self.paths["results_dir"])):
             try:
                 result = rs.load_result(run_id, self.paths["results_dir"])
             except rs.SandboxError:
                 continue
+            if result.get("key") != product:                       # 只给当前研究品种的失败,不跨品种
+                continue
             failures = [str(f)[:MAX_TRACE_TEXT] for f in (result.get("failures") or [])][:MAX_TRACE_FAILURES]
             diagnosis = result.get("diagnosis") or {}
             weakest = diagnosis.get("weakest") if isinstance(diagnosis, dict) else None
             error = result.get("error")
             if result.get("status") == "strategy_error" and isinstance(error, dict):
-                failures = [f"策略运行报错: {str(error.get('type', ''))[:60]}: {str(error.get('message', ''))[:MAX_TRACE_TEXT]}"]
+                failures = [rs.safe_error_line(error)]
             failed = bool(failures) if (result.get("kind") in ("gate", "evaluate") or failures) else weakest is not None
             if not failed:
                 continue
@@ -594,12 +609,12 @@ class GatewayApp:
             traces.append({
                 "run_id": run_id, "kind": result.get("kind"), "key": result.get("key"),
                 "class": cls if isinstance(cls, str) and CLASS_NAME.match(cls) else None,
-                "weakest": weakest if isinstance(weakest, str) else None, "failures": failures,
+                "weakest": weakest if weakest in DIAGNOSIS_DIMENSIONS else None, "failures": failures,
                 "summary": str(diagnosis.get("summary", ""))[:MAX_TRACE_TEXT] if isinstance(diagnosis, dict) else "",
             })
             if len(traces) >= limit:
                 break
-        return 200, {"limit": limit, "pending_candidates": self._pending_names(), "traces": traces}
+        return 200, {"limit": limit, "product": product, "pending_candidates": self._pending_names(), "traces": traces}
 
     def _pending_names(self) -> list[str]:
         """已有候选的文件名(新到旧)。只回文件名,且只回符合命名规则的那些。

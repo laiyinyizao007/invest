@@ -228,10 +228,25 @@
     "/research/feedback": {
       "get": {
         "operationId": "get_recent_failures",
-        "summary": "最近若干次失败的结构化 Trace(条数由服务端配置限定,默认 3)。只含固定字段。",
+        "summary": "最近若干次失败的结构化 Trace(条数由服务端配置限定,默认 3),**只含 product 指定品种的失败**。只含固定字段;候选自己写的报错文字不原样返回,只保留可被固定模板识别的内置报错片段。",
+        "parameters": [
+          {
+            "name": "product",
+            "in": "query",
+            "required": true,
+            "description": "评估品种(C15/V15/EB15/EG15/PP15/M15);必填,不带返回 400",
+            "schema": {
+              "type": "string",
+              "enum": ["C15", "V15", "EB15", "EG15", "PP15", "M15"]
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "traces 列表"
+            "description": "traces 列表(仅该品种)"
+          },
+          "400": {
+            "description": "product 缺失或不在白名单"
           }
         }
       }
