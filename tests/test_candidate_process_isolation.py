@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import research_candidate_process as rcp
 from research.candidate import protocol as proto
 from research.candidate.bars import Bar
 
@@ -99,6 +100,26 @@ def observed(head: dict) -> dict:
     return json.loads(text[text.index("{"):])
 
 
+def via_launcher(source: str, *, params: dict | None = None, bars: list[Bar] | None = None, timeout: float = 120.0):
+    """经**生产启动器** `research_candidate_process.run_candidate_signals` 起候选(不是测试自己拼启动参数)。
+
+    A1/A2/A3 这类「候选看得到什么」的探针必须走这条路:探针若走测试自带的 `run_host`,
+    生产启动器的参数被改坏(比如 cwd 指到仓库根)时探针不会红——那是在测试一份**抄来的**启动参数。
+    返回 ("ok", 信号序列) 或 ("error", 候选写的错误文字)。框架侧失败(超时/协议)原样抛出。"""
+    try:
+        signals = rcp.run_candidate_signals(source, "Candidate", params or {},
+                                            bars if bars is not None else synth_bars(80), timeout=timeout)
+        return "ok", signals
+    except rcp.CandidateProcessError as exc:
+        if exc.kind != "candidate_error":
+            raise
+        return "error", exc.detail
+
+
+def observed_text(detail: str) -> dict:
+    return json.loads(detail[detail.index("{"):])
+
+
 PASS_SOURCE = '''
 from candidate.signal_template import SignalTemplate
 
@@ -113,11 +134,9 @@ class Candidate(SignalTemplate):
 def test_good_candidate_returns_signal_sequence_of_same_length():
     """放行探针:正常候选能起来、回来的是等长且取值合法的信号序列。"""
     bars = synth_bars(200)
-    head, signals, workdir, _, stderr = run_host(PASS_SOURCE, bars=bars)
-    shutil.rmtree(workdir, ignore_errors=True)
-    assert head["status"] == "ok", (head, stderr)
-    assert head["n_bars"] == len(bars)
-    assert signals is not None and len(signals) == len(bars)
+    status, signals = via_launcher(PASS_SOURCE, bars=bars)
+    assert status == "ok", signals
+    assert len(signals) == len(bars)
     assert set(signals) <= {-1, 0, 1}
     assert any(s != 0 for s in signals), "200 根随机游走上默认双均线应当至少发出一次信号"
 
@@ -134,11 +153,8 @@ class Candidate(SignalTemplate):
         self.sharpe = 42
         return out
 '''
-    head, signals, workdir, _, _ = run_host(src)
-    shutil.rmtree(workdir, ignore_errors=True)
-    assert head["status"] == "ok"
-    assert set(head) == {"magic", "status", "n_bars", "error"}
-    assert "sharpe" not in json.dumps(head)
+    status, signals = via_launcher(src)
+    assert status == "ok"
     assert set(signals) <= {-1, 0, 1}
 
 
@@ -167,9 +183,9 @@ class Candidate(SignalTemplate):
             out["candidate.protocol"] = "MISSING"
         raise RuntimeError(json.dumps(out))
 '''
-    head, _, workdir, _, _ = run_host(src)
-    shutil.rmtree(workdir, ignore_errors=True)
-    seen = observed(head)
+    status, detail = via_launcher(src)
+    assert status == "error", detail
+    seen = observed_text(detail)
     assert seen["candidate.protocol"] == "ok"
     leaked = {k: v for k, v in seen.items() if k != "candidate.protocol" and v == "IMPORTED"}
     assert not leaked, f"候选进程里不该能 import 的框架模块被导入了: {leaked}"
@@ -178,17 +194,15 @@ class Candidate(SignalTemplate):
 # ---------------------------------------------------------------- A2:不知道仓库在哪
 
 
-def _probe(src_body: str, *, env_extra: dict | None = None):
-    """把一小段探针体包成候选并跑一次,返回观测 dict。"""
+def _probe(src_body: str):
+    """把一小段探针体包成候选并经生产启动器跑一次,返回 (观测 dict, None)。"""
     src = ("import json, os, sys\nfrom candidate.signal_template import SignalTemplate\n\n"
            "class Candidate(SignalTemplate):\n    def run(self, bars):\n        out = {}\n"
            + "".join("        " + line + "\n" for line in src_body.strip().splitlines())
            + "        raise RuntimeError(json.dumps(out))\n")
-    head, _, workdir, _, _ = run_host(src, env_extra=env_extra)
-    try:
-        return observed(head), workdir
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    status, detail = via_launcher(src)
+    assert status == "error", "探针候选应当用异常把观测结果带回来"
+    return observed_text(detail), None
 
 
 def test_a2_cwd_is_not_repo_root():
@@ -224,10 +238,15 @@ def test_a2_call_stack_filenames_do_not_leak_repo_path():
     assert leaked == [], leaked
 
 
-def test_a2_credentials_in_parent_env_do_not_reach_candidate():
-    seen, _ = _probe('out["keys"] = [k for k in os.environ if k.startswith(("CTP_", "WEBHOOK_", "LIVE_", "BISHENG"))]',
-                     env_extra=None)
-    assert seen["keys"] == []
+def test_a2_credentials_in_parent_env_do_not_reach_candidate(monkeypatch):
+    """父进程环境里**真的**放上凭据(探针前提),候选进程里一个都读不到。"""
+    for name, value in (("CTP_PASSWORD", "s3cret-ctp"), ("WEBHOOK_URL", "https://example.invalid/hook"),
+                        ("LIVE_VT_SYMBOL", "c2601"), ("BISHENG_OPENAPI_KEY", "sk-test")):
+        monkeypatch.setenv(name, value)
+    assert os.environ["CTP_PASSWORD"] == "s3cret-ctp"
+    seen, _ = _probe('out["keys"] = [k for k in os.environ if k.startswith(("CTP_", "WEBHOOK_", "LIVE_", "BISHENG"))]\n'
+                     'out["leaked_values"] = [v for v in os.environ.values() if "s3cret" in v or "sk-test" in v]')
+    assert seen["keys"] == [] and seen["leaked_values"] == []
 
 
 # ---------------------------------------------------------------- A3:候选的写不外溢
@@ -252,16 +271,18 @@ from candidate.signal_template import SignalTemplate
 
 class Candidate(SignalTemplate):
     def run(self, bars):
-        with open(os.path.join(os.getcwd(), "scratch.txt"), "w", encoding="utf-8") as fh:
+        target = os.path.join(os.getcwd(), "scratch.txt")
+        with open(target, "w", encoding="utf-8") as fh:
             fh.write("candidate was here")
-        raise RuntimeError(json.dumps({"wrote": True}))
+        with open(target, encoding="utf-8") as fh:
+            back = fh.read()
+        raise RuntimeError(json.dumps({"back": back, "cwd": os.getcwd()}))
 '''
-    head, _, workdir, _, _ = run_host(src)
-    try:
-        assert observed(head) == {"wrote": True}
-        assert (workdir / "scratch.txt").read_text(encoding="utf-8") == "candidate was here"
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    status, detail = via_launcher(src)
+    assert status == "error", detail
+    seen = observed_text(detail)
+    assert seen["back"] == "candidate was here"                       # 放行:候选能在自己的临时 cwd 里写
+    assert not Path(seen["cwd"]).exists(), "候选的临时 cwd 在评估结束后应当被清掉"
     assert _tree_digest("scripts", "risk", "strategies", "research") == before
 
 
