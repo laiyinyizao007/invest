@@ -23,6 +23,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "ROOT", tmp_path)
     monkeypatch.setenv("BISHENG_OPENAPI_KEY", "bs-sak-test")
     monkeypatch.setattr(mcp_server, "_kb_problems", lambda: [])        # 知识库过期检测另有专门用例(test_research_kb.py)
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "C15")   # 续跑要求同品种(Issue #94)
     pending = tmp_path / "pending_strategies"
     pending.mkdir()
     cand = pending / "cand_1.py"
@@ -31,7 +32,7 @@ def env(tmp_path, monkeypatch):
     mcp_server.save_state({"current": {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py",
                                        "provenance": "user",
                                        "candidate_sha": sha, "waiting_node": "input_wait",
-                                       "waiting_message_id": 12}})
+                                       "waiting_message_id": 12, "product": "C15"}})
     human = tmp_path / "data" / "research-control" / "approvals.json"
     auto = tmp_path / "data" / "research-control" / "auto_approvals.json"
     attempts = tmp_path / "data" / "research" / "attempts.jsonl"

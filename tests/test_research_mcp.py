@@ -19,6 +19,7 @@ def clean_state(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "ROOT", tmp_path)
     monkeypatch.setenv("BISHENG_OPENAPI_KEY", "bs-sak-test")
     monkeypatch.setattr(mcp_server, "_kb_problems", lambda: [])        # 知识库过期检测另有专门用例(test_research_kb.py)
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "C15")   # 续跑要求同品种(Issue #94)
     return tmp_path
 
 
@@ -245,7 +246,7 @@ def test_start_research_continues_previous_session_after_feedback(clean_state, m
     """评估后工作流回到「研究想法」节点:下一次发起接着同一会话走,反馈才对得上。"""
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_idea",
-                                       "waiting_message_id": 61}})
+                                       "waiting_message_id": 61, "product": "C15"}})
     calls = []
 
     def fake_invoke(**kwargs):
@@ -267,11 +268,89 @@ def test_start_research_continues_previous_session_after_feedback(clean_state, m
     assert calls[0]["text"] == "换个思路"
 
 
+def _two_step_workflow(monkeypatch):
+    calls = []
+
+    def fake_invoke(**kwargs):
+        calls.append(kwargs)
+        if "session_id" not in kwargs:
+            return {"session_id": "s2", "events": [{"event": "input", "node_id": "input_idea", "message_id": 80}]}
+        return {"session_id": kwargs.get("session_id"), "events": [{"event": "input", "node_id": "input_wait", "message_id": 81}]}
+
+    monkeypatch.setattr(mcp_server, "invoke", fake_invoke)
+    return calls
+
+
+@pytest.mark.parametrize("now,recorded", [
+    ("V15", "C15"),          # 换了品种:旧会话历史里是别的品种的反馈与代码
+    (None, "C15"),           # 读不到当前品种:判不了就不续跑
+    ("C15", None),           # 旧格式会话没记品种
+    ("C15", "V15"),
+])
+def test_start_research_never_resumes_a_session_from_another_or_unknown_product(clean_state, monkeypatch, now, recorded):
+    """Issue #94:续跑只在**同一品种**内;其余一律开新会话(fail-closed)。"""
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: now)
+    previous = {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
+                "waiting_node": "input_idea", "waiting_message_id": 61}
+    if recorded:
+        previous["product"] = recorded
+    mcp_server.save_state({"current": previous})
+    calls = _two_step_workflow(monkeypatch)
+
+    mcp_server._start_research("新想法", provenance="user")
+
+    assert calls[0].get("session_id") is None            # 先起了新会话,没有续 s1
+    assert mcp_server.current_session()["product"] == now
+
+
+@pytest.mark.parametrize("previous_provenance,expected", [("web", "web"), ("garbage", "web"), (None, "web"), ("user", "user")])
+def test_switching_product_does_not_launder_a_non_user_provenance(clean_state, monkeypatch, previous_provenance, expected):
+    """codex 复核:换品种开新会话时,来源下限仍沿用上一轮(web/未知/缺失 ⇒ web),不能被洗成 user。"""
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "V15")
+    previous = {"session_id": "s1", "idea": "想法", "candidate": "cand_1.py", "waiting_node": "input_idea",
+                "waiting_message_id": 61, "product": "C15"}
+    if previous_provenance is not None:
+        previous["provenance"] = previous_provenance
+    mcp_server.save_state({"current": previous})
+    _two_step_workflow(monkeypatch)
+
+    mcp_server._start_research("新想法", provenance="user")
+
+    assert mcp_server.current_session()["provenance"] == expected
+
+
+def test_current_product_file_lives_outside_the_gateway_results_dir(tmp_path):
+    import research_sandbox as rs
+    assert "research-control" in rs.current_product_file(tmp_path).parts
+
+
+def test_new_session_records_the_product_and_set_product_writes_it(clean_state, monkeypatch, tmp_path):
+    calls = _two_step_workflow(monkeypatch)
+    monkeypatch.setattr(mcp_server.rs, "read_current_product", lambda root: "EB15")
+    mcp_server._start_research("想法", provenance="user")
+    assert mcp_server.current_session()["product"] == "EB15" and calls
+
+
+def test_current_product_file_roundtrip_and_fail_closed(tmp_path):
+    import research_sandbox as rs
+    assert rs.read_current_product(tmp_path) is None                   # 没写过
+    rs.write_current_product(tmp_path, "V15")
+    assert rs.read_current_product(tmp_path) == "V15"
+    with pytest.raises(rs.SandboxError):
+        rs.write_current_product(tmp_path, "XX")
+    rs.current_product_file(tmp_path).write_text('{"product": "XX"}', encoding="utf-8")
+    assert rs.read_current_product(tmp_path) is None                   # 不在白名单
+    rs.current_product_file(tmp_path).write_text("[1,2]", encoding="utf-8")
+    assert rs.read_current_product(tmp_path) is None                   # 形状不对
+    rs.current_product_file(tmp_path).write_text("{坏", encoding="utf-8")
+    assert rs.read_current_product(tmp_path) is None                   # 损坏
+
+
 def test_start_research_starts_new_session_when_previous_is_awaiting_approval(clean_state, monkeypatch):
     """上一轮还停在「等待批准」节点时,发起新研究要另起会话,不能把想法喂给批准节点。"""
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_wait",
-                                       "waiting_message_id": 58}})
+                                       "waiting_message_id": 58, "product": "C15"}})
     calls = []
 
     def fake_invoke(**kwargs):
@@ -344,7 +423,7 @@ def test_start_research_falls_back_to_a_new_session_when_resume_fails(clean_stat
     """上一轮会话失效(毕昇会话过期)时退回全新会话,不能把用户卡在死会话里。"""
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法",
                                        "candidate": "cand_1.py", "waiting_node": "input_idea",
-                                       "waiting_message_id": 61}})
+                                       "waiting_message_id": 61, "product": "C15"}})
     calls = []
 
     def fake_invoke(**kwargs):
@@ -449,7 +528,7 @@ def test_request_approval_never_returns_the_url_or_the_hash(clean_state, monkeyp
              "screening_passed": True, "findings": []}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     out = mcp_server._request_approval_via_page("cand.py")
 
@@ -479,7 +558,7 @@ def test_request_approval_never_returns_the_approve_command(clean_state, monkeyp
              "screening_passed": True, "findings": []}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     out = mcp_server._request_approval_via_page("cand.py")
 
@@ -499,7 +578,7 @@ def test_request_approval_passes_hide_url_to_the_approval_process(clean_state, m
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", fake_popen)
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     mcp_server._request_approval_via_page("cand.py")
 
@@ -523,7 +602,7 @@ def test_request_approval_detaches_stdin_from_the_approval_process(clean_state, 
 
     monkeypatch.setattr(mcp_server.subprocess, "Popen", fake_popen)
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     mcp_server._request_approval_via_page("cand.py")
 
@@ -549,7 +628,7 @@ def test_request_approval_says_unresponsive_when_the_child_hangs(clean_state, mo
     monkeypatch.setattr(mcp_server, "READY_TIMEOUT_SECONDS", 0.5)
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=True))
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     out = mcp_server._request_approval_via_page("cand.py")
 
@@ -561,7 +640,7 @@ def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, mon
     """子进程没吐 ready 就退出 ⇒ 提示「已退出」并带退出码(原因细节只进本机 stderr)。"""
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: SilentApprovalProc(alive=False, rc=3))
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     out = mcp_server._request_approval_via_page("cand.py")
 
@@ -572,7 +651,7 @@ def test_request_approval_reports_exit_code_when_the_child_dies(clean_state, mon
 def test_request_approval_only_approves_the_current_candidate(clean_state, monkeypatch):
     """不能拿批准流程去批别的文件:只能批本轮研究的候选。"""
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     def boom(*a, **k):
         raise AssertionError("不该拉起批准进程")
@@ -592,7 +671,7 @@ def test_request_approval_refuses_when_the_session_has_no_candidate(clean_state,
     """
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": None,
                                        "candidate_sha": None, "waiting_node": "input_wait",
-                                       "waiting_message_id": 12}})
+                                       "waiting_message_id": 12, "product": "C15"}})
 
     def boom(*a, **k):
         raise AssertionError("不该拉起批准进程")
@@ -632,7 +711,7 @@ def test_request_approval_surfaces_the_fail_closed_reason(clean_state, monkeypat
     ready = {"event": "error", "message": "脱敏模块不可用,拒绝提供批准页"}
     monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *a, **k: FakeApprovalProc(ready))
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand.py",
-                                       "waiting_node": "input_wait", "waiting_message_id": 12}})
+                                       "waiting_node": "input_wait", "waiting_message_id": 12, "product": "C15"}})
 
     out = mcp_server._request_approval_via_page("cand.py")
 
@@ -651,7 +730,7 @@ def _inline_setup(clean_state):
     sha = mcp_server.rs.file_sha256(cand)
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                        "candidate_sha": sha, "waiting_node": "input_wait",
-                                       "waiting_message_id": 12}})
+                                       "waiting_message_id": 12, "product": "C15"}})
     approvals = clean_state / "approvals.json"
     return cand, sha, approvals
 
@@ -715,7 +794,7 @@ def test_inline_approval_refuses_when_candidate_changed_after_research_start(cle
     stale = "0" * 64
     mcp_server.save_state({"current": {"session_id": "s1", "provenance": "user", "idea": "想法", "candidate": "cand_1.py",
                                        "candidate_sha": stale, "waiting_node": "input_wait",
-                                       "waiting_message_id": 12}})
+                                       "waiting_message_id": 12, "product": "C15"}})
     out = mcp_server._request_approval_inline("cand_1.py", None)
     assert "改动" in out
     assert mcp_server.rs.file_sha256(cand) not in out
@@ -830,7 +909,7 @@ def test_approval_process_starts_under_a_real_stdio_mcp_session(tmp_path):
     state.mkdir(parents=True)
     (state / "sessions.json").write_text(json.dumps({"current": {
         "session_id": "s1", "provenance": "user", "idea": "x", "candidate": "cand.py",
-        "waiting_node": "input_wait", "waiting_message_id": 1}}), encoding="utf-8")
+        "waiting_node": "input_wait", "waiting_message_id": 1, "product": "C15"}}), encoding="utf-8")
     wrapper = tmp_path / "wrap_server.py"
     wrapper.write_text(_WRAPPER, encoding="utf-8")
     server_py = str(Path(mcp_server.__file__).resolve())
