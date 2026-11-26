@@ -73,6 +73,14 @@ def kill_tree(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
+def _reap(proc: subprocess.Popen) -> None:
+    """杀完之后等进程真的退出,但**有上限**:kill 失败(taskkill 被拦、killpg 抛错)时无限等会让评估永久挂死。"""
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("警告:候选进程在被杀后 10 秒内仍未退出", file=sys.stderr)
+
+
 def _tail(path, size: int) -> bytes:
     """只读文件末尾 `size` 字节,**不把整个文件读进内存**(候选可能把 stderr 写得很大)。"""
     with open(path, "rb") as fh:
@@ -172,13 +180,13 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
             while proc.poll() is None:
                 if time.monotonic() > deadline:
                     kill(proc)
-                    proc.wait()
+                    _reap(proc)
                     raise CandidateProcessError("timeout", f"候选进程超过 {timeout:g}s,已终止")
                 out_fh.flush()
                 err_fh.flush()
                 if os.path.getsize(out_path) > max_stdout or os.path.getsize(err_path) > MAX_STDERR_BYTES:
                     kill(proc)
-                    proc.wait()
+                    _reap(proc)
                     raise CandidateProcessError("output_limit", "候选进程输出超过上限,已终止")
                 time.sleep(POLL_SECONDS)
             writer.join(timeout=5)
@@ -195,10 +203,7 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
     finally:
         if proc is not None and proc.poll() is None:
             kill(proc)
-            try:
-                proc.wait(timeout=10)                 # 杀了要等到它真的退出,否则 cwd 还被占着,下面的清理会失败
-            except subprocess.TimeoutExpired:
-                print("警告:候选进程在被杀后 10 秒内仍未退出", file=sys.stderr)
+            _reap(proc)                               # 杀了要等到它真的退出,否则 cwd 还被占着,下面的清理会失败(有上限)
         for path in (runtime, workdir):
             _remove_tree(path)
         for path in (out_path, err_path):

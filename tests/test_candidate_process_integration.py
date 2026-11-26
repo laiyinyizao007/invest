@@ -426,3 +426,28 @@ def test_signal_child_scrubs_local_paths_out_of_framework_side_failure_messages(
     assert api.run_evaluate_signal_child(_child_args(_sha(NEW_SOURCE))) == api.EXIT_OK
     err = _printed_result(capsys)["error"]
     assert err["type"] == "CandidateProcessError" and "secretname" not in err["message"]
+
+
+@requires_trading_stack
+def test_signal_child_refuses_a_protected_default_before_launching_any_candidate_process(child_env, monkeypatch, capsys):
+    """类体里写 `risk_budget = 1e9`:旧路径是**硬拒绝**(退出码 2,根本不进评估)。新路径不得退化成「候选跑完才发现、
+    记成 strategy_error 软失败」——必须在起任何候选进程之前就按拒绝返回(G8 codex 复核 M4)。"""
+    cand, _ = child_env
+    source = _src_with_body("    risk_budget = 1000000000\n")
+    cand.write_bytes(source.encode("utf-8"))
+    monkeypatch.setattr(rcp, "run_candidate_signals", lambda *a, **k: pytest.fail("受保护参数违规不得起候选进程"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_REFUSED
+    assert "risk_budget" in capsys.readouterr().err
+
+
+@requires_trading_stack
+def test_protected_default_is_refused_early_even_if_static_screening_were_bypassed(child_env, monkeypatch, capsys):
+    """纵深防御:假装静态筛查被绕过(返回空),类体里的受保护参数默认值也必须在起任何候选进程之前被硬拒绝。
+    (上一条测试里是静态筛查先拦住的;这一条单独钉住「框架设置过检」这一层,不依赖筛查。)"""
+    cand, _ = child_env
+    source = _src_with_body("    risk_budget = 1000000000\n")
+    cand.write_bytes(source.encode("utf-8"))
+    monkeypatch.setattr(api.rs, "screen_source", lambda *a, **k: [])
+    monkeypatch.setattr(rcp, "run_candidate_signals", lambda *a, **k: pytest.fail("受保护参数违规不得起候选进程"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_REFUSED
+    assert "risk_budget" in capsys.readouterr().err

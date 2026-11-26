@@ -100,7 +100,8 @@ def test_module_level_statements_that_mutate_or_rebind_the_class_are_refused(aft
 
 def _bars(n, close_offset=0.0, start=datetime(2021, 1, 4, 9, 0)):
     return [SimpleNamespace(datetime=start + timedelta(minutes=15 * i), open_price=100.0 + i, high_price=101.0 + i,
-                            low_price=99.0 + i, close_price=100.0 + i + close_offset) for i in range(n)]
+                            low_price=99.0 + i, close_price=100.0 + i + close_offset,
+                            volume=1000.0 + i, turnover=0.0, open_interest=5000.0 + i) for i in range(n)]
 
 
 def _runner(monkeypatch):
@@ -183,3 +184,25 @@ def test_the_non_literal_framework_default_message_may_name_framework_parameters
     with pytest.raises(spec_mod.SpecError) as err:
         spec_mod.check_framework_defaults(spec, ("fast_window", "slow_window", "atr_mult", "atr_window"))
     assert "atr_mult" in err.value.public and EVIL not in err.value.public
+
+
+def test_cache_fingerprint_also_covers_volume_and_open_interest():
+    """候选侧 ArrayManager 暴露了 volume/turnover/open_interest,信号可以依赖成交量:指纹不能只看 OHLC。"""
+    import research_signal_replay as rsr
+    one, two = _bars(10), _bars(10)
+    two[4].volume += 1.0
+    assert rsr.fingerprint(one) != rsr.fingerprint(two)
+    three = _bars(10)
+    three[4].open_interest += 1.0
+    assert rsr.fingerprint(one) != rsr.fingerprint(three)
+    four = _bars(10)
+    four[4].turnover += 1.0
+    assert rsr.fingerprint(one) != rsr.fingerprint(four)
+
+
+@pytest.mark.parametrize("after", ["\nSignalTemplate = object\n", "\nSignalTemplate: type = object\n"])
+def test_module_level_rebinding_of_the_template_name_is_refused(after):
+    """类定义之前/之后重绑定基类名:AST 里写的是 SignalTemplate,运行时的基类却是别的东西。"""
+    source = HEAD + after + "\nclass Candidate(SignalTemplate):\n" + GOOD_BODY
+    with pytest.raises(spec_mod.SpecError):
+        spec_mod.parse_spec(source)

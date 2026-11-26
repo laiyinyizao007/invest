@@ -60,6 +60,22 @@ def _reconfigure_stdio() -> None:
             pass
 
 
+def _die_with_parent() -> None:
+    """Linux:父进程(框架子进程)一死,内核就杀掉本进程(`prctl(PR_SET_PDEATHSIG, SIGKILL)`)。
+
+    为什么需要:启动器让宿主自己当会话组长(`start_new_session=True`),好整组杀;代价是外层 `kill_tree`
+    在 POSIX 只 `proc.kill()` 框架子进程时,宿主不在它的进程组里,会成孤儿——候选若是死循环就永久占 CPU。
+    容器(Linux)正是这条路径;Windows 上 `taskkill /T` 杀整棵树,不需要。
+    **不是安全边界**:恶意候选自己也能 prctl 掉它(OS 级限制属 S4);这里防的是失控/有 bug 的候选。"""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(1, 9, 0, 0, 0)        # PR_SET_PDEATHSIG = 1, SIGKILL = 9
+    except Exception:                                    # noqa: BLE001 - 设不上也不能因此起不来
+        pass
+
+
 def _write_raw_frame(payload: bytes) -> None:
     """协议模块还没能用时的兜底写帧(与 `candidate.protocol.encode_frame` 同一算法)。"""
     sys.stdout.buffer.write(len(payload).to_bytes(4, "big") + payload)
@@ -117,6 +133,7 @@ def _exec_candidate(source: str, class_name: str, params: dict, bars: list):
 
 
 def main() -> int:
+    _die_with_parent()
     _scrub_host_paths()
     _reconfigure_stdio()
     random.seed(0)                                  # 确定性:候选用了未固定的随机数时仍可复现

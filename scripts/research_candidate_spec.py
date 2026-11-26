@@ -233,7 +233,9 @@ def _check_module_structure(tree: ast.Module, class_node: ast.ClassDef) -> None:
             continue
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = _simple_targets(stmt)
-            if all(isinstance(t, ast.Name) for t in targets) and class_node.name not in {t.id for t in targets}:
+            names = {t.id for t in targets if isinstance(t, ast.Name)}
+            # 候选类名与基类名都不得被重绑定:AST 里写的是 SignalTemplate,运行时的基类却可能是别的东西
+            if all(isinstance(t, ast.Name) for t in targets) and not names & {class_node.name, CANDIDATE_BASE}:
                 continue
         raise SpecError(f"第 {stmt.lineno} 行:模块级只允许 import、函数定义、文档字符串与简单常量赋值"
                         "(不得改写或重绑定候选类;框架只读源码结构,读到的必须与运行时生效的一致)")

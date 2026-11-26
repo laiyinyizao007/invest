@@ -41,11 +41,13 @@ def make_replay_class(base: type, signals_by_datetime: dict) -> type:
 
 
 def fingerprint(bars) -> str:
-    """K 线内容指纹(时间戳 + OHLC)。缓存键用它,而不是「首末时间戳 + 根数」:
+    """K 线内容指纹(时间戳 + OHLC + 成交量/成交额/持仓量:候选侧 ArrayManager 能看到的全部字段)。
+    缓存键用它,而不是「首末时间戳 + 根数」:
     首末与根数相同、中间不同的两组 K 线不得共用一份信号。"""
     digest = hashlib.sha1()
     for bar in bars:
-        digest.update(f"{bar.datetime}|{bar.open_price}|{bar.high_price}|{bar.low_price}|{bar.close_price};".encode())
+        digest.update((f"{bar.datetime}|{bar.open_price}|{bar.high_price}|{bar.low_price}|{bar.close_price}"
+                       f"|{bar.volume}|{bar.turnover}|{bar.open_interest};").encode())
     return digest.hexdigest()
 
 

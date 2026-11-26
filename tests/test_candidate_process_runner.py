@@ -397,3 +397,15 @@ def test_launch_failure_message_is_fixed_and_does_not_echo_the_os_error(monkeypa
         rcp.run_candidate_signals(PASS_SOURCE, "Candidate", {}, synth_bars(30))
     assert err.value.kind == "launch"
     assert "secret" not in err.value.message and "WinError" not in err.value.message
+
+
+def test_every_wait_in_the_launcher_is_bounded_so_a_failed_kill_cannot_hang_the_evaluation():
+    """启动器模块里**任何** `.wait(...)` 都必须带 timeout:kill 失败(taskkill 被拦、killpg 抛错)时,
+    不带 timeout 的 wait 会让评估永久挂死(G8 codex 复核 M3)。AST 不变量,不真的去挂。
+    扫整个模块而不是单个函数:等待逻辑集中在 `_reap` 里,分散回各处时同样要被抓住。"""
+    import ast
+    tree = ast.parse(Path(rcp.__file__).read_text(encoding="utf-8"))
+    waits = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "wait"]
+    assert waits, "探针前提:模块里应当有 .wait(...) 调用,否则这条不变量空转"
+    unbounded = [n.lineno for n in waits if not any(k.arg == "timeout" for k in n.keywords)]
+    assert not unbounded, f"这些 .wait() 没有 timeout: 第 {unbounded} 行"

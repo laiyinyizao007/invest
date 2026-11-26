@@ -1125,6 +1125,13 @@ def run_evaluate_signal_child(args) -> int:
         print(f"候选声明被拒绝: {exc}", file=sys.stderr)
         print(CHILD_MARK + json.dumps({"error": {"type": "SpecError", "message": exc.public}}, ensure_ascii=False))
         return EXIT_OK
+    # 类体默认值里的受保护参数(`risk_budget = 1e9`)在起**任何**候选进程之前就硬拒绝,与旧路径一致
+    # (旧路径是 check_class 在进评估之前拒绝、退出码 2)。静态筛查通常会先拦住;这一层不依赖它,是纵深防御。
+    try:
+        check_params_allowed(rspec.framework_setting(spec, None, TrendAtr15mStrategy.parameters))
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
     proxy = rspec.proxy_class(spec)
     runner = rsr.make_signal_runner(
         source=source, spec=spec, proxy=proxy, base=TrendAtr15mStrategy, engine=engine_runner(args.product),

@@ -302,6 +302,8 @@ NEVER_DOWNGRADE = (
     "tests/test_candidate_process_integration.py",
     # 候选声明的 AST 解析必须与运行时生效的一致(重复赋值/块内赋值/__init__/类体外改写一律拒绝):钉的是「框架读到的 = 生效的」。
     "tests/test_candidate_spec.py",
+    # 候选宿主随父进程消失(POSIX/容器路径):Linux 上真的杀进程验证,别处只看调用点。
+    "tests/test_candidate_process_posix.py",
 )
 
 # --------------------------------------------------------------------------
