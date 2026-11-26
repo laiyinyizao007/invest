@@ -18,6 +18,7 @@ def clean_state(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "KEY_FILE", tmp_path / "missing.key")
     monkeypatch.setattr(mcp_server, "ROOT", tmp_path)
     monkeypatch.setenv("BISHENG_OPENAPI_KEY", "bs-sak-test")
+    monkeypatch.setattr(mcp_server, "_kb_problems", lambda: [])        # 知识库过期检测另有专门用例(test_research_kb.py)
     return tmp_path
 
 
