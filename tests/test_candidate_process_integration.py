@@ -296,3 +296,57 @@ def test_signal_child_does_its_own_checks_before_doing_anything(child_env, monke
     monkeypatch.setattr(rcp, "run_candidate_signals", lambda *a, **k: pytest.fail("未批准不得起候选进程"))
     assert api.run_evaluate_signal_child(_child_args(_sha(NEW_SOURCE))) == api.EXIT_REFUSED
     assert api.NEEDS_APPROVAL in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- 类体默认值:读不懂就拒绝,不悄悄丢掉(G8 第一轮前自查发现)
+
+
+# 框架模板认识的参数名(取自 TrendAtr15mStrategy.parameters 里与指标窗口、止损距离有关的几项);
+# 纯函数测试用字面量名单,免得研究侧 CI(无交易栈)导入不了真模板
+FRAMEWORK_PARAMETER_NAMES = ("fast_window", "slow_window", "atr_mult", "atr_window")
+
+
+def _src_with_body(extra: str) -> str:
+    return NEW_SOURCE.replace("    breakout_n = 20\n", "    breakout_n = 20\n" + extra, 1)
+
+
+@pytest.mark.parametrize("extra, why", [
+    ("    atr_mult: float = 2.5\n", "带类型注解的字面量默认值"),
+    ("    atr_mult = -2.5\n", "负数字面量(一元运算,不是 Constant)"),
+])
+def test_class_body_defaults_written_in_other_literal_forms_are_still_seen(extra, why):
+    import research_candidate_spec as spec_mod
+    spec = spec_mod.parse_spec(_src_with_body(extra))
+    assert spec.defaults.get("atr_mult") in (2.5, -2.5), why
+    assert "atr_mult" not in spec.nonliteral
+
+
+@pytest.mark.parametrize("extra", [
+    "    atr_mult = 1.5 * 2\n",
+    "    atr_mult = ATR_BASE\n",
+    "    slow_window: int = 10 * 6\n",
+])
+def test_non_literal_default_for_a_framework_parameter_is_refused_not_dropped(extra):
+    """框架参数(止损距离、指标窗口)的类体默认值读不出字面量 ⇒ 拒绝评估。
+
+    悄悄丢掉会让框架侧用模板默认值,而旧路径里候选类属性直接生效:同一份源码两条路径的止损不同、且没有任何报错。"""
+    import research_candidate_spec as spec_mod
+    spec = spec_mod.parse_spec(_src_with_body(extra))
+    with pytest.raises(spec_mod.SpecError, match="字面量"):
+        spec_mod.check_framework_defaults(spec, FRAMEWORK_PARAMETER_NAMES)
+
+
+def test_non_literal_attribute_that_is_not_a_framework_parameter_is_fine():
+    import research_candidate_spec as spec_mod
+    spec = spec_mod.parse_spec(_src_with_body("    helper_table = [1, 2, 3]\n    breakout_limit = 10 * 2\n"))
+    spec_mod.check_framework_defaults(spec, FRAMEWORK_PARAMETER_NAMES)       # 不抛
+
+
+@requires_trading_stack
+def test_signal_child_refuses_a_non_literal_framework_default_as_a_structured_error(child_env, capsys):
+    cand, _ = child_env
+    source = _src_with_body("    atr_mult = 1.5 * 2\n")
+    cand.write_bytes(source.encode("utf-8"))
+    assert api.run_evaluate_signal_child(_child_args(_sha(source))) == api.EXIT_OK
+    err = _printed_result(capsys)["error"]
+    assert err["type"] == "SpecError" and "atr_mult" in err["message"]

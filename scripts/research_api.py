@@ -1104,6 +1104,7 @@ def run_evaluate_signal_child(args) -> int:
         spec = rspec.parse_spec(source)
         if spec.class_name != args.cls:
             raise rspec.SpecError(f"--cls {args.cls} 与源码里唯一的候选类 {spec.class_name} 不符")
+        rspec.check_framework_defaults(spec, TrendAtr15mStrategy.parameters)
     except (rspec.SpecError, UnicodeDecodeError) as exc:
         # 候选自己的声明有问题 = 研究中的正常结果(与旧路径的 GridError 对称),按结构化错误回传
         print(CHILD_MARK + json.dumps({"error": {"type": "SpecError", "message": rs.scrub_text(str(exc))[:200]}},

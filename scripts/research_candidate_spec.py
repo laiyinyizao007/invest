@@ -40,6 +40,9 @@ class CandidateSpec:
     parameters: tuple[str, ...] = ()
     param_grid: dict[str, tuple[int | float, ...]] = field(default_factory=dict)
     defaults: dict[str, object] = field(default_factory=dict)
+    # 类体里被赋值、但值读不成数值/字符串/布尔字面量的名字(表达式、别的名字、列表……)。
+    # 框架参数名落在这里面就拒绝评估:框架读不到它的值,会悄悄用模板默认值,与旧路径不等价。
+    nonliteral: tuple[str, ...] = ()
 
     def effective_params(self, params: dict | None = None) -> dict[str, object]:
         """这一格的**有效参数** = 类体默认值 ← 网格/调用方给的参数(后者覆盖前者)。"""
@@ -139,21 +142,36 @@ def _parse_grid(node: ast.ClassDef) -> dict[str, tuple[int | float, ...]]:
     return axes
 
 
-def _parse_defaults(node: ast.ClassDef) -> dict[str, object]:
-    """类体里写成字面量的类属性(不含 parameters / param_grid 本身)。"""
+def _parse_defaults(node: ast.ClassDef) -> tuple[dict[str, object], tuple[str, ...]]:
+    """类体里的标量类属性:(能读成字面量的 {名: 值}, 读不成字面量的名字)。
+
+    认 `x = 2.5`、`x: float = 2.5`、`x = -2.5`(一元运算)。表达式、别的名字、容器一律记入 `nonliteral`
+    而**不是悄悄丢掉**——丢掉会让框架侧用模板默认值,与旧路径(候选类属性直接生效)不等价,且没有任何报错。
+    `parameters` / `param_grid` 另有专门的解析,不在这里。
+    """
     defaults: dict[str, object] = {}
+    nonliteral: list[str] = []
     for stmt in node.body:
-        if not isinstance(stmt, ast.Assign):
+        if isinstance(stmt, ast.Assign):
+            targets = [t for t in stmt.targets if isinstance(t, ast.Name)]
+            value_node = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            targets, value_node = [stmt.target], stmt.value
+        else:
             continue
-        value_node = stmt.value
-        if not isinstance(value_node, ast.Constant):
-            continue                                   # 表达式不是字面量:不猜,交给运行期
-        if not isinstance(value_node.value, (int, float, str, bool)):
-            continue
-        for target in stmt.targets:
-            if isinstance(target, ast.Name) and target.id not in ("parameters", "param_grid"):
-                defaults[target.id] = value_node.value
-    return defaults
+        for target in targets:
+            if target.id in ("parameters", "param_grid"):
+                continue
+            try:
+                value = ast.literal_eval(value_node)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                nonliteral.append(target.id)
+                continue
+            if isinstance(value, (int, float, str, bool)):
+                defaults[target.id] = value
+            else:
+                nonliteral.append(target.id)
+    return defaults, tuple(dict.fromkeys(nonliteral))
 
 
 def parse_spec(source: str | bytes) -> CandidateSpec:
@@ -175,13 +193,25 @@ def parse_spec(source: str | bytes) -> CandidateSpec:
     if not _imports_base(tree):
         raise SpecError(f"候选源码必须 `from {CANDIDATE_BASE_MODULE} import {CANDIDATE_BASE}`")
 
+    defaults, nonliteral = _parse_defaults(node)
     return CandidateSpec(
         class_name=node.name,
         base_name=base_name,
         parameters=_parse_parameters(node),
         param_grid=_parse_grid(node),
-        defaults=_parse_defaults(node),
+        defaults=defaults,
+        nonliteral=nonliteral,
     )
+
+
+def check_framework_defaults(spec: CandidateSpec, framework_parameters) -> None:
+    """框架参数(止损距离、指标窗口……)的类体默认值必须是字面量,否则拒绝评估(fail-closed)。
+
+    候选自己的额外参数(如 `breakout_n`)框架不认识,写成表达式没关系;但 `atr_mult = 1.5 * 2` 这种
+    会改变框架模板止损距离的写法,框架必须读得到值才能采用同样的有效参数。"""
+    clash = sorted(set(spec.nonliteral) & set(framework_parameters))
+    if clash:
+        raise SpecError(f"类体里的 {', '.join(clash)} 必须写成数值字面量(框架要采用同样的有效参数,读不出就不评估)")
 
 
 def proxy_class(spec: CandidateSpec) -> type:

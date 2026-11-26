@@ -14,8 +14,10 @@ from datetime import datetime, timedelta
 
 import pytest
 
-pytest.importorskip("vnpy_ctastrategy", reason="需要交易栈:CI 的研究侧闸门不装交易环境")
-pytest.importorskip("talib", reason="候选进程里的指标用 ta-lib")
+# 用 find_spec 判断而不是 importorskip:后者**真的会导入**,而导入 vnpy_ctastrategy 会先把
+# vnpy.trader.database 加载进来,`import bootstrap` 随后就会因「必须先于 database 导入」而炸。
+if importlib.util.find_spec("vnpy_ctastrategy") is None or importlib.util.find_spec("talib") is None:
+    pytest.skip("需要交易栈(vnpy_ctastrategy)与 ta-lib:CI 的研究侧闸门不装", allow_module_level=True)
 import bootstrap  # noqa: E402,F401  必须先于 vnpy.trader.database 导入(时区与状态目录设置)
 import research_candidate_process as rcp
 import research_candidate_spec as spec_mod
