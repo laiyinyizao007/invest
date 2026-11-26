@@ -9,6 +9,10 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+import research_sandbox as rs  # noqa: E402
 
 
 FLOW_ID = "1194f8540b9944fea4353b07f0493cbf"
@@ -77,11 +81,15 @@ def main(product):
     data = copy.deepcopy(flow["data"])
     changed = apply_product(data, product)
     print("改动:", changed or "无(已是该品种)")
+    data_root = Path(os.environ.get("INVEST_ROOT") or Path(__file__).resolve().parents[2])
     if not changed:
+        rs.write_current_product(data_root, product)       # 已是该品种也同步记录:MCP 靠它判断会话能否续跑
         return
     vid = [v for v in bs._req("GET", f"/workflow/versions?flow_id={FLOW_ID}", token=t)["data"]["data"] if v.get("is_current")][0]["id"]
     r = bs._req("PUT", f"/workflow/versions/{vid}", {"name": "v1", "data": data, "flow_id": FLOW_ID}, token=t)
     print("PUT", r.get("status_code"), r.get("status_message"))
+    if r.get("status_code") == 200:                        # 只在线上流确实改成功后才记录
+        rs.write_current_product(data_root, product)
 
 
 if __name__ == "__main__":

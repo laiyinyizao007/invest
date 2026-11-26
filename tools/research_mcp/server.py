@@ -484,8 +484,10 @@ def _start_research(idea: str, *, provenance: str) -> str:
         node = idea_node()
         resumed = False
         previous = current_session()
-        if previous and previous.get("waiting_node") == node and previous.get("waiting_message_id"):
-            # 上一轮评估完回到想法节点:在同一会话里继续,反馈才对得上
+        product = rs.read_current_product(ROOT)          # 工作流当前切在哪个品种;读不到 ⇒ None ⇒ 不续跑
+        if previous and previous.get("waiting_node") == node and previous.get("waiting_message_id")                 and product is not None and previous.get("product") == product:
+            # 上一轮评估完回到想法节点,且**同一品种**:在同一会话里继续,反馈才对得上。
+            # 换品种/读不到品种/旧会话没记品种 ⇒ 开新会话(会话历史里带着别的品种的反馈与代码,Issue #94)
             session_id = previous.get("session_id")
             message_id = previous.get("waiting_message_id")
             resumed = True
@@ -521,6 +523,7 @@ def _start_research(idea: str, *, provenance: str) -> str:
             "session_id": second.get("session_id") or session_id,
             "workflow_id": workflow_id(),
             "provenance": effective,
+            "product": product,
             "idea": idea,
             "candidate": candidate,
             "candidate_sha": candidate_sha(candidate) if candidate else None,

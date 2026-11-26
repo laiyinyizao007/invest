@@ -53,6 +53,30 @@ KEYS = ("CADJ", "MAADJ")             # 目前只支持数据库里的日线复�
 # 评估可选品种(Issue #69):15 分钟复权主力连续。**不含交易栈依赖**——父进程与网关只认这份名单,
 # 数据文件与规格由回测子进程按它去 walk_forward_optimizer.PRODUCTS / strategies.instruments 取(一致性有测试锁定)。
 PRODUCTS = ("C15", "V15", "EB15", "EG15", "PP15", "M15")
+
+
+def current_product_file(root: Path) -> Path:
+    return Path(root) / "data" / "research" / "current_product.json"
+
+
+def write_current_product(root: Path, product: str) -> None:
+    """宿主机记下「线上工作流现在切在哪个品种」(只由 `tools/bisheng/set_product.py` 写)。MCP 用它判断会话能否续跑(Issue #94)。"""
+    if product not in PRODUCTS:
+        raise SandboxError(f"品种只能是 {list(PRODUCTS)}")
+    path = current_product_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"product": product}, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_current_product(root: Path) -> str | None:
+    """读不到/格式不对/不在白名单 ⇒ None(调用方据此**不续跑**旧会话,fail-closed)。"""
+    try:
+        value = json.loads(current_product_file(root).read_text(encoding="utf-8")).get("product")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and value in PRODUCTS else None
 # 残留锁(持有者已崩)的判定上限(秒)。
 # 第 43 轮:这个值**必须与账本维护入口用同一个**(两者锁的是同一个 `approvals.json.chainlock`;
 # 此前这里是 60 秒、那边是默认 30 秒,于是维护入口能按自己的口径把批准路径的**活锁**当陈旧锁抢走)。
