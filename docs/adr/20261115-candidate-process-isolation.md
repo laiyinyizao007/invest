@@ -36,7 +36,7 @@
 
 **仍然成立(已逐条复核)**:`top_up_grid_trials` 仍按子进程自报格子数补记;预扣 `MIN_GRID_CELLS = 27`;`--prior-trials` 仍在(`research_api.py` 第 130/338/817/877 行);子进程结果通道仍是 `RESEARCH_RESULT_JSON:` 一行 JSON(交接单 + MAC 只在未合并的 `feat/21-stage3`);测试段起点仍是 `research_gate.TEST_SEGMENT_START` 与 `walk_forward_optimizer.TEST_SEGMENT_START` 两个相同的 `datetime(2024,1,1)`;`reconfigure_stdio()` 在 `scripts/research_console.py`;`grid.max_cells=343`、`min_round_trips=10`;PR #24 / Issue #21 仍 OPEN,故 `risk/ladder.py`、`map_elites.py`、`behavior.py` 仍不在 main。
 
-**代码已先于决议走了两步(须在实现前确认)**:`scripts/research_candidate_spec.py` 用 AST 静态读 `param_grid`、读不出即 `SpecError` fail-closed(对应拍板点 2);候选基类另起新名 `SignalTemplate`(对应拍板点 4 的 A1)。二者均**未获用户确认**,在确认前不得进入主线。
+**代码已先于决议走了两步(须在实现前确认)**:`scripts/research_candidate_spec.py` 用 AST 静态读 `param_grid`、读不出即 `SpecError` fail-closed(对应拍板点 2);候选基类另起新名 `SignalTemplate`(对应拍板点 4 的 A1)。二者已于 2026-11-26 获用户确认(拍板点 1、3 仍未决:1 留到 S3,3 待 S1 切换完成后单独评审)。
 
 ## 背景
 
@@ -900,7 +900,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 伪造已被结构性堵死)。
 **建议 ③ + ②**,但两者都要新 ADR,且都不得在看到新候选结果后决定。
 
-**拍板点 2:"网格静态读不出"时怎么办。**(2026-11-25 注:工作树里 `scripts/research_candidate_spec.py` 已按 fail-closed 预写,**待确认**,确认前不入主线。)
+**拍板点 2:"网格静态读不出"时怎么办。**(2026-11-25 注:工作树里 `scripts/research_candidate_spec.py` 已按 fail-closed 预写。**2026-11-26 用户确认:读不出即拒绝评估(fail-closed),不按 `max_cells` 记满**;拒绝原因须可读,提示"请把 `param_grid` 写成字面量"。)
 现状是"读不出 ⇒ 按 `max_cells` 保守记账"。新口径建议 **fail-closed 拒绝评估**。
 两者都改变现状行为(一个是更严的记账,一个是更严的拒绝),请确认取哪条。
 
@@ -909,7 +909,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 删掉能显著简化代码;保留则是一层无对象的空转(而且会让评审误以为还有防线)。
 本方案建议删,但这是"减少防线"的动作,按 G6 需明确确认。
 
-**拍板点 4:候选基类路线(第 5.2 节)。**(2026-11-25 注:工作树里 `research/candidate/` 已按"路线 A + 另起新名 `SignalTemplate`"预写,**待确认**;它是候选格式的 breaking change,毕昇提示词与 `pending_strategies/*` 须同步。)
+**拍板点 4:候选基类路线(第 5.2 节)。**(2026-11-25 注:工作树里 `research/candidate/` 已按"路线 A + 另起新名 `SignalTemplate`"预写,**2026-11-26 用户确认:采纳路线 A + 另起新名 `SignalTemplate`**;它是候选格式的 breaking change,毕昇提示词与 `pending_strategies/*` 须与 S1 一起同步落地。)
 建议采纳**路线 A(基类副本)**;路线 B(纯函数信号)更干净但与
 `risk/constitution.py` 的"必须继承模板家族"运行时校验直接冲突,且现有候选全部要重写。
 需确认路线 A 可接受(尤其"候选版模板不含风控计算"这一取舍)。
