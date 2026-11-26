@@ -37,7 +37,7 @@
 | PP 参数平原 / PBO/DSR | PART | 参数平原 IMPL(`risk/plateau.py` + `scripts/research_grid.py`);PBO/DSR PLAN |
 | TPE(Optuna)/ MRO(`optimizer/` 包) | PLAN | 无 Optuna、无 `optimizer/` 目录 |
 | RSA 研究沙盒 API(CLI + HTTP 网关 + 容器) | IMPL | `scripts/research_api.py`、`research_gateway.py`、`docker-compose.research.yml`、`docker/research/`;端到端经毕昇容器 → 沙盒容器实测;**威胁模型:纵深防御而非完整隔离**(见 ADR) |
-| 候选独立进程执行 | PLAN(设计方案待评审) | ADR `20261115-candidate-process-isolation.md`,Issue [#29](https://github.com/laiyinyizao007/invest/issues/29):候选只产出信号序列,回测/评估/记账/落盘/指标全部由框架进程独立完成;试验次数改由框架自己数;**未改动任何已锁定阈值**;含 5 个需用户拍板的点 |
+| 候选独立进程执行 | PART(S1 已实现:配置开关 `isolation.candidate_process` **默认关**,默认路径仍是候选与框架同进程;S2~S4 未做) | ADR `20261115-candidate-process-isolation.md`,Issue [#29](https://github.com/laiyinyizao007/invest/issues/29):候选只产出信号序列,回测/评估/记账/落盘/指标全部由框架进程独立完成;试验次数改由框架自己数;**未改动任何已锁定阈值**;含 5 个需用户拍板的点(2、4 已于 2026-11-26 确认);S1 实现:`scripts/research_candidate_process.py`(起宿主、校验响应)、`scripts/research_signal_replay.py`(信号 → 框架模板回放)、`scripts/research_candidate_spec.py`(AST 读声明)、`scripts/research_candidate_host.py` 与 `research/candidate/`(候选侧)。实测:真实玉米数据上新旧路径逐项相同,新路径约慢 1.9 倍(进程启动开销) |
 | SBX 骨架目录 | PART | `pending_strategies/` 已落地(候选源码的落点;网关容器另有 `data/research`、`data/ledger_anchor` 两个可写挂载,候选代码自身的写权限靠审计钩子白名单限制);`approved/` 与骨架模板未做 |
 | 外层 Bisheng AI 研究员 | PART | 本机部署(仅 127.0.0.1);工具与工作流 v3、无 LLM 联调工作流已建;**LLM 节点联调待额度**;`tools/bisheng/` |
 | 诊断书 / 候选评估 / 中文报告 | IMPL | `risk/diagnosis.py`、`risk/candidate_eval.py`、`risk/report.py`(纯函数) |
@@ -279,7 +279,7 @@ sequenceDiagram
 
 ### 5.5 已知局限(如实)
 
-- **静态筛查是黑名单,不是隔离**;候选与框架同进程执行(多轮 codex 实测有绕过)。独立进程隔离只有设计(#29,待评审),**没有实现**。
+- **静态筛查是黑名单,不是隔离**;候选与框架同进程执行(多轮 codex 实测有绕过)。独立进程隔离(#29)**S1 已实现但开关默认关**:默认路径里候选与框架仍同进程执行;打开 `isolation.candidate_process` 后候选只在独立进程里算信号、框架自己回放与记账。S2~S4(输入冻结的 OS 级收窄、记账归属全面切换、Job Object/容器限制)**没有做**:S1 的候选进程仍能 import 用户 site-packages 里的库(含 vnpy),也没有 OS 级的文件/网络限制,只靠「不知道仓库路径 + 环境白名单 + 空 cwd」。
 - **自动批准意味着模型生成的代码不经人读就在本机沙盒执行**(用户已接受,见 `docs/adr/20261123-research-auto-approval.md`)。`provenance` 强制(Issue #88)保证联网来源想法进不了自动账,但目前出厂代码没有任何地方传 `web`;该防线成立的前提是自动批准只在没有联网工具的研究 profile 里开,`deployment_problem()` 目前只告警。
 - **容器内锚点目录与账本同在可写区**,候选"够不到锚点"靠沙盒写入白名单,不是独立信任域(见 `risk/ledger_chain.py` 头注释)。
 - 统计功效:现有分钟线按品种约 5.3~6.2 年(C15 约 5.9 年,V15 约 5.3 年,EG15 约 6.2 年),试验账本累计 765,DSR 分母已很大;单个短窗口几乎不可能通过。**合法结论多半是"证明不了有优势"**。

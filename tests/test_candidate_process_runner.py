@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import glob
+import importlib.util
 import tempfile
 import time
 from pathlib import Path
@@ -17,12 +18,19 @@ from research.candidate import protocol as proto
 from test_candidate_process_isolation import PASS_SOURCE, synth_bars
 
 
+def _require_talib() -> None:
+    """候选进程里的指标用 ta-lib;研究侧 CI 不装它 ⇒ 干净地跳过,而不是红。"""
+    if importlib.util.find_spec("talib") is None:
+        pytest.skip("需要 ta-lib(候选侧指标依赖);研究侧 CI 不装")
+
+
 def _leftovers() -> set[str]:
     base = Path(tempfile.gettempdir())
     return {p for p in glob.glob(str(base / "cand-rt-*")) + glob.glob(str(base / "cand-cwd-*"))}
 
 
 def _run(source: str, *, bars=None, timeout: float = 60.0, params: dict | None = None, class_name: str = "Candidate"):
+    _require_talib()
     return rcp.run_candidate_signals(source, class_name, params or {}, bars if bars is not None else synth_bars(120),
                                      timeout=timeout)
 

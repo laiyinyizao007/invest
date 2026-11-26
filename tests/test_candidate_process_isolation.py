@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -27,6 +28,12 @@ from research.candidate import protocol as proto
 from research.candidate.bars import Bar
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def _require_talib() -> None:
+    """候选进程里的指标用 ta-lib;研究侧 CI 不装它 ⇒ 干净地跳过,而不是红。"""
+    if importlib.util.find_spec("talib") is None:
+        pytest.skip("需要 ta-lib(候选侧指标依赖);研究侧 CI 不装")
+
 HOST = ROOT / "scripts" / "research_candidate_host.py"
 RUNTIME_SRC = ROOT / "research" / "candidate"
 
@@ -60,7 +67,10 @@ def _sandbox_env() -> dict[str, str]:
 def run_host(source: str, *, class_name: str = "Candidate", params: dict | None = None,
              bars: list[Bar] | None = None, env_extra: dict | None = None,
              stdin_override: bytes | None = None, timeout: float = 120.0):
-    """按设计文档 4.3 节的形态真起一个候选宿主进程,返回 (控制帧, 信号|None, cwd, 原始 stdout, stderr)。"""
+    """按设计文档 4.3 节的形态真起一个候选宿主进程,返回 (控制帧, 信号|None, cwd, 原始 stdout, stderr)。
+
+    **只用于宿主自身的 fail-closed 测试**(非法 stdin、候选 exit 等);「候选看得到什么」的探针一律走 `via_launcher`。"""
+    _require_talib()
     bars = bars if bars is not None else synth_bars(80)
     runtime = Path(tempfile.mkdtemp(prefix="cand-rt-"))
     workdir = Path(tempfile.mkdtemp(prefix="cand-cwd-"))
@@ -106,6 +116,7 @@ def via_launcher(source: str, *, params: dict | None = None, bars: list[Bar] | N
     A1/A2/A3 这类「候选看得到什么」的探针必须走这条路:探针若走测试自带的 `run_host`,
     生产启动器的参数被改坏(比如 cwd 指到仓库根)时探针不会红——那是在测试一份**抄来的**启动参数。
     返回 ("ok", 信号序列) 或 ("error", 候选写的错误文字)。框架侧失败(超时/协议)原样抛出。"""
+    _require_talib()
     try:
         signals = rcp.run_candidate_signals(source, "Candidate", params or {},
                                             bars if bars is not None else synth_bars(80), timeout=timeout)
@@ -406,6 +417,7 @@ def _vnpy_pair(n: int):
 
 
 def test_indicators_match_vnpy_array_manager_bar_by_bar():
+    pytest.importorskip("talib")
     from research.candidate.indicators import ArrayManager as Mine
     import numpy as np
     bars, vbars, vn_utility = _vnpy_pair(160)

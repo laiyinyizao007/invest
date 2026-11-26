@@ -14,7 +14,9 @@ from datetime import datetime, timedelta
 
 import pytest
 
-import bootstrap  # noqa: F401  必须先于 vnpy.trader.database 导入(时区与状态目录设置)
+pytest.importorskip("vnpy_ctastrategy", reason="需要交易栈:CI 的研究侧闸门不装交易环境")
+pytest.importorskip("talib", reason="候选进程里的指标用 ta-lib")
+import bootstrap  # noqa: E402,F401  必须先于 vnpy.trader.database 导入(时区与状态目录设置)
 import research_candidate_process as rcp
 import research_candidate_spec as spec_mod
 import research_signal_replay as replay
