@@ -904,7 +904,7 @@ S1 出问题就翻回旧路径,不影响现有 `evaluate`/`gate` 的可用性。
 现状是"读不出 ⇒ 按 `max_cells` 保守记账"。新口径建议 **fail-closed 拒绝评估**。
 两者都改变现状行为(一个是更严的记账,一个是更严的拒绝),请确认取哪条。
 
-**拍板点 3:运行时三层(实例状态 / 框架对象指纹 / 行情容器完整性)是否按第 7 节的清单删除。**
+**拍板点 3:运行时三层(实例状态 / 框架对象指纹 / 行情容器完整性)是否按第 7 节的清单删除。**(**2026-11-26 部分结论,用户确认**:候选宿主这一个执行入口对「第四层」做**有条件豁免**——见文末「宪法守卫的有条件豁免」。**旧路径里那三层一条都没删**,是否删除仍待 S1 切换完成后单独评审。)
 它们在同进程架构下是主防线,在新架构下**保护对象已不在候选进程**。
 删掉能显著简化代码;保留则是一层无对象的空转(而且会让评审误以为还有防线)。
 本方案建议删,但这是"减少防线"的动作,按 G6 需明确确认。
@@ -1224,3 +1224,31 @@ S2~S4 没有做。本 ADR 的整体状态仍是"待评审"(拍板点 1、3 未�
 | 围栏与旧路径的 `rs.candidate_window()` 两份实现并存(架构扣分) | 属实 | 记录:宿主不依赖 `research_sandbox`(它不在宿主的 sys.path 上),合并要等 S4 重构 |
 
 **变异验证累计 64 项**(其中 5 项在 WSL 里对 Linux 专属行为手工做),全部被各自断言抓住;期间有 2 次红灯追下去发现是**探针自己的 bug**(dir_fd 探针被插到了围栏下膛之后;`importorskip` 先于 `bootstrap` 导入),均已修并说明。
+
+## 宪法守卫的有条件豁免(2026-11-26,用户确认)
+
+**起因**:PR #98 的 `constitution` 检查红了——`tools/check_constitution_history.py::check_executor_completeness` 要求「谁执行候选代码,谁就必须在**同一进程里**对受保护对象(`risk` / `strategies` / `vnpy_*`)做快照与指纹比对」(第四层),而 `scripts/research_candidate_host.py` 在**刻意没有这些包**的进程里 `exec` 候选(A1 验收:候选里 `import risk` 必须失败)。要满足守卫就得把 `risk.constitution` import 进候选进程,正好违背 S1 的目的。**我本地漏跑了这个守卫**(只跑了 `research-guard` 的套件名单;守卫自己的 5 个测试文件我从没跑过,其中 3 条本来会直接报出来)。
+
+**改动**(这是对受宪法保护的守卫的**放宽**,所以做成有条件的,条件可被 AST 验证):
+- 只认登记在册的文件名 `_ISOLATED_EXECUTOR_FILES = ("scripts/research_candidate_host.py",)`;**不认「长得像宿主」的函数体**——别的新执行入口照旧不得裸奔。
+- 豁免条件(静态,AST 判):允许名单是宿主**实际用到的** 11 个模块——`__future__ candidate ctypes json numpy os pathlib random sys traceback types`。**不是整个标准库**:整个标准库含 `importlib` / `runpy` / `subprocess` / `socket` / `builtins`,放行它们等于放行把框架代码拉进来的路。相对导入一律算违规(`from .json import x` 指的是同目录的 `json.py`,不是标准库);动态导入原语(`__import__`、`__builtins__`、`import_module`、`exec_module`、`spec_from_file_location`、`run_path`)**引用即拒**,不只拒调用(`imp = __import__; imp('risk')` 不是 `__import__` 的调用形态);拒写 `sys.modules`(下标、`update`/`setdefault`/`pop`…、`del`);拒对**常量字符串**的 `exec`/`eval`(`exec("import risk")`)。宿主真正在做的事(读 `sys.modules`、改 `sys.path`、`ctypes` 调 `prctl`、`exec` 变量里的候选源码)有放行侧测试,不被误伤。
+- 条件不成立时豁免**立即失效**,守卫给出明确原因,并仍接受「宿主自己走第四层」这条出路。
+
+**第一版的验证**(后来被加固,见下):守卫自己的新测试 16 条(豁免成立、改名不能蹭豁免、10+ 种 import 形态使豁免失效、真实仓库通过);**6 个变异见证中 1 个初次幸存**——相对导入规则被删时测试不红,原因是 `from . import sibling` 的 `module` 是 `None`,会被「模块名不在名单里」顺带拦住;补上 `from .json import x` / `from ..candidate import y` 后抓住(这两种写法在没有该规则时会被误判为「只用标准库」,是真缺口)。
+
+**codex 对这条豁免的专项复核(攻击者视角)与处置**——结论:相对"无条件加进 `_EXECUTOR_SKIP_FILES`"**实质收紧**,但第一版的条件**可被绕过**,故加固:
+
+| 发现 | 严重 | 处置 |
+|---|---|---|
+| 条件只认调用的字面形态,且允许名单是整个标准库:`from importlib import import_module as im`、`imp = __import__`、`getattr(__builtins__, …)`、`exec("import risk")`、`runpy`、`subprocess`、`sys.modules` 注入全部绕过 | High | 修:允许名单收紧为 11 个;动态导入原语引用即拒;拒写 `sys.modules`;拒常量字符串 exec/eval |
+| 豁免表与条件检查器本身不受历史守卫看管:加一行文件名、或把检查函数改成恒真,**CLI 守卫照样 exit 0**(constitution job 只跑 CLI,不跑 pytest) | High | **部分修**:在 pytest 里钉死登记内容(`_ISOLATED_EXECUTOR_FILES`、允许名单、与 ADR 一致)与「完备性检查确实调用了条件检查器」(AST);该测试已进 `research-guard` 的 pytest 套件与不可降级清单。**没有**把它接进 CLI 守卫自身的历史登记表——所以「只有 CLI 的 constitution job」本身仍看不见豁免表的增长,是靠 research-guard 的 pytest 兜底 |
+| 豁免只钉文件名,不钉「它真的只在独立进程里跑」 | Medium | 修:钉死性质——没有任何非测试模块 import 宿主;启动器用 `-c <宿主源码>` 起子进程 |
+| `candidate` 就是仓库包 `research/candidate/`,它自己的 import 没人查(包里加一行 `import risk` 守卫仍全绿) | Medium | 修:测试钉死 `research/candidate/` 只 import 标准库子集 + numpy + talib 与包内相对导入 |
+| 允许集含 `subprocess` / `ctypes` 等能力模块 | Medium | `subprocess` 等已随收紧移除;`ctypes` 保留(宿主用它调 `prctl`) |
+| 名字制判定,标准库同名的仓库模块会被静默放行(今天无实例) | Low | 修:测试钉死仓库里没有与允许名单同名的文件/目录 |
+
+**如实说明静态判据的上限**:字符串**拼出来**的导入(运行期才构造)静态判据看不见。真正的保证是**运行期**的 A1 探针(候选进程里 `import risk` 必失败)与宿主 `sys.path` 的构造(仓库根不在其上)。静态判据防的是「有人给宿主加了框架 import」这类**无意或明目张胆**的改动,不是对抗性绕过。
+
+**变异验证(本豁免共 13 项不重复的变异,其中 2 项各被重跑一次)**:其中 2 项初次幸存,都是「这条规则被另一条规则顺带盖住」——① 相对导入规则:`from . import sibling` 的 `module` 是 `None`,被「名字不在名单里」顺带拦住;补 `from .json import x` / `from ..candidate import y`。② Attribute 形态的「引用即拒」:凡触及 `import_module`/`run_path` 的用例都先因 `import importlib`/`import runpy` 不在名单里被拦;补**不经 import 就拿加载器**的写法(`__loader__.exec_module(…)`、`__spec__.loader.exec_module(…)`——仓库第 21 轮踩过的那条)。测试现 41 条。
+
+**如实说明这换来了什么、丢了什么**:守卫对宿主的**自动检查**从「必须走第四层」变成「必须保持只用标准库 + numpy + candidate」。后者能抓住「有人给宿主加了框架 import」,但**抓不住宿主在隔离进程里能做什么**——那是围栏与 S4 的事。

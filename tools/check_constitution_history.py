@@ -1159,6 +1159,67 @@ _EXECUTOR_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv",
 # (见 check_constitution_module_is_clean)。
 _EXECUTOR_SKIP_FILES = ("risk/constitution.py",)
 
+# 「候选在**独立进程**里执行」的执行入口(Issue #29 S1;ADR `20261115-candidate-process-isolation.md` 拍板点 3 的一部分,
+# 2026-11-26 用户确认)。它们运行在**刻意没有任何受保护对象**的进程里(候选宿主不把仓库放上 sys.path,
+# A1 验收:候选里 `import risk` / `import strategies` / `import scripts.…` 必须失败),第四层(受保护对象的快照与指纹比对)
+# 在那里没有对象可比;强行调用它只会把框架模块带进候选进程,违背进程隔离的目的。
+#
+# 这是对本守卫的**放宽**,所以做成**有条件的**,而且条件能被 AST 验证:
+#   - 只认下面**登记在册的文件名**(不认「长得像宿主」的函数体——别的新执行入口照旧不得裸奔);
+#   - 条件 = 这个文件**不 import 任何仓库本地模块、不做动态导入**:只允许标准库、numpy 与候选侧运行时包 `candidate`。
+#     它一旦 import 了 `risk` / `strategies` / `scripts` / `vnpy` 之类,豁免**立刻失效**,守卫重新要求第四层。
+_ISOLATED_EXECUTOR_FILES = ("scripts/research_candidate_host.py",)
+# 允许名单是宿主**实际用到的**导入,不是「整个标准库」:放整个标准库等于放行 `importlib` / `runpy` / `subprocess` /
+# `socket` / `builtins`(codex 对本豁免的专项复核:这些都能把框架代码拉进来或绕开静态判据)。
+# 宿主要新增导入,就得改这里 + 测试里的钉死断言 + ADR 的登记——一次**有人看得见**的评审。
+_ISOLATED_EXECUTOR_ALLOWED_IMPORTS = frozenset({
+    "__future__", "candidate", "ctypes", "json", "numpy", "os", "pathlib", "random", "sys", "traceback", "types"})
+# 动态导入 / 动态加载的原语:**引用即拒**(不只拒调用——`imp = __import__` 之后 `imp("risk")` 不是 `__import__` 的调用形态)
+_ISOLATED_EXECUTOR_FORBIDDEN_NAMES = frozenset({
+    "__import__", "__builtins__", "import_module", "exec_module", "spec_from_file_location", "run_path"})
+_SYS_MODULES_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear", "__setitem__", "__delitem__"})
+
+
+def _is_sys_modules(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "modules"
+
+
+def _isolated_executor_violations(tree: ast.AST) -> list[str]:
+    """独立进程执行入口的豁免条件不成立的地方(空列表 = 条件成立)。"""
+    bad: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] not in _ISOLATED_EXECUTOR_ALLOWED_IMPORTS:
+                    bad.append(f"第 {node.lineno} 行 import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                bad.append(f"第 {node.lineno} 行相对导入")
+            elif (node.module or "").split(".")[0] not in _ISOLATED_EXECUTOR_ALLOWED_IMPORTS:
+                bad.append(f"第 {node.lineno} 行 from {node.module} import …")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            # exec / eval 的第一个实参是**常量字符串**:导入被藏进了字符串里(`exec("import risk")`)。
+            # 宿主 exec 的是变量里的候选源码,不是常量;所以这条不误伤它。
+            if isinstance(func, ast.Name) and func.id in ("exec", "eval") and node.args \
+                    and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                bad.append(f"第 {node.lineno} 行对常量字符串 {func.id}(…)")
+            # sys.modules 的写入(注入/替换/删除模块)
+            if isinstance(func, ast.Attribute) and func.attr in _SYS_MODULES_MUTATORS and _is_sys_modules(func.value):
+                bad.append(f"第 {node.lineno} 行改写 sys.modules.{func.attr}(…)")
+        # 动态导入原语:引用即拒(Name 与 Attribute 两种形态)
+        if isinstance(node, ast.Name) and node.id in _ISOLATED_EXECUTOR_FORBIDDEN_NAMES:
+            bad.append(f"第 {node.lineno} 行引用 {node.id}")
+        elif isinstance(node, ast.Attribute) and node.attr in _ISOLATED_EXECUTOR_FORBIDDEN_NAMES:
+            bad.append(f"第 {node.lineno} 行引用 .{node.attr}")
+        # sys.modules[...] 作为赋值/增强赋值/删除的目标
+        if isinstance(node, (ast.Assign, ast.AugAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Subscript) and _is_sys_modules(target.value):
+                    bad.append(f"第 {node.lineno} 行写入 sys.modules[…]")
+    return bad
+
 
 def _git_python_files(root: Path) -> list[Path] | None:
     """**git 视角**的 Python 文件清单;不是 git 仓库(或 git 不可用)时返回 None。
@@ -1385,6 +1446,15 @@ def check_executor_completeness(root: Path) -> list[str]:
         if not _is_candidate_executor(tree):
             continue
         if rel not in covered:
+            if rel in _ISOLATED_EXECUTOR_FILES:
+                violations = _isolated_executor_violations(tree)
+                if not violations:
+                    continue                       # 豁免成立:独立进程里没有受保护对象,见 _ISOLATED_EXECUTOR_FILES 的说明
+                problems.append(
+                    f"{rel} 声称在独立进程里执行候选(没有受保护对象,所以豁免第四层),"
+                    f"但豁免条件不成立:{';'.join(violations)}。"
+                    "它不得 import 任何仓库本地模块或做动态导入——要么去掉这些 import,要么让它自己走第四层")
+                continue
             problems.append(
                 f"{rel} 会执行候选代码,却没有走第四层(受保护对象的快照与指纹比对):"
                 "新执行入口不得裸奔")

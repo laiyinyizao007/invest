@@ -252,6 +252,8 @@ NEVER_DOWNGRADE = (
     "tests/test_constitution.py",
     "tests/test_constitution_round11.py",
     "tests/test_constitution_round12.py",
+    # 独立进程执行入口对第四层的**有条件**豁免(只认登记的文件名 + 不得 import 仓库本地模块/动态导入):钉的是「放宽没有变成留洞」。
+    "tests/test_constitution_isolated_executor.py",
     "tests/test_constitution_round25.py",
     "tests/test_merge_main_sandbox_union.py",
     "tests/test_candidate_escape_production_path.py",
