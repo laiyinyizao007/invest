@@ -121,6 +121,16 @@ NEVER_DOWNGRADE = (
     # 名字像"研究",但算出的东西直接喂进 check_gate
     "scripts/research_gate.py",
     "scripts/research_grid.py",
+    # --- 候选独立进程路径(Issue #29 S1)---
+    # 候选进程算出的信号经这几个模块进入评估:信号 → 回放策略 → 引擎 → 日收益 → 门槛输入。
+    # 改它们 = 改「候选的信号怎么变成门槛输入」,也就是改候选与框架之间那条唯一的边界。
+    # **图找得到**(research_api 的框架侧子入口 import 它们,数据流探针会把它们算成 provider):
+    "scripts/research_candidate_process.py",   # 起候选宿主进程、校验响应形状(框架不采信候选的任何自报)
+    "scripts/research_candidate_spec.py",      # 框架自己 AST 读 param_grid ⇒ 试验格子数的来源
+    "scripts/research_signal_replay.py",        # 信号 → 框架模板回放;受保护参数在这里过检
+    # **图找不到**(经子进程边界,没有 import 关系)⇒ 按「图找得到的归图,图找不到的归清单」兜住:
+    "scripts/research_candidate_host.py",      # 候选宿主:候选唯一运行的地方,抹路径/收窄能力都在这里
+    "research/",                                 # 候选侧运行时包(协议/指标/基类):候选进程里唯一能 import 的东西
     # 滚动优化器:它提供**晋级门槛评估用的窗口与数据文件**
     # (research_api.py:887-890 取 wf.DATA_FILE / wf.build_windows() 后交给 run_gate),
     # 改它 = 改 check_gate 的输入。它还自带一份 TEST_SEGMENT_START(与
@@ -242,6 +252,8 @@ NEVER_DOWNGRADE = (
     "tests/test_constitution.py",
     "tests/test_constitution_round11.py",
     "tests/test_constitution_round12.py",
+    # 独立进程执行入口对第四层的**有条件**豁免(只认登记的文件名 + 不得 import 仓库本地模块/动态导入):钉的是「放宽没有变成留洞」。
+    "tests/test_constitution_isolated_executor.py",
     "tests/test_constitution_round25.py",
     "tests/test_merge_main_sandbox_union.py",
     "tests/test_candidate_escape_production_path.py",
@@ -284,6 +296,18 @@ NEVER_DOWNGRADE = (
     # ——改断言 = 削弱检出能力。
     # 它同时在 `tests/guard_roster.json` 的逐条点名名单里(不许被整份/逐条跳过)。
     "tests/test_research_profile_check.py",
+    # Issue #29 S1:候选独立进程边界的动态探针与等价性——它们钉死的是「候选拿不到什么」
+    # (A1 导入、A2 路径与凭据、A3 写不外溢、A4 新旧等价、A5 丢弃自报指标)与开关只来自配置文件。
+    "tests/test_candidate_process_isolation.py",
+    "tests/test_candidate_process_runner.py",
+    "tests/test_candidate_process_equivalence.py",
+    "tests/test_candidate_process_integration.py",
+    # 候选声明的 AST 解析必须与运行时生效的一致(重复赋值/块内赋值/__init__/类体外改写一律拒绝):钉的是「框架读到的 = 生效的」。
+    "tests/test_candidate_spec.py",
+    # 候选宿主随父进程消失(POSIX/容器路径):Linux 上真的杀进程验证,别处只看调用点。
+    "tests/test_candidate_process_posix.py",
+    # 候选宿主里的最小运行期围栏(拒起进程/联网/写 cwd 之外):不依赖 talib,研究侧 CI 真跑。
+    "tests/test_candidate_fence.py",
 )
 
 # --------------------------------------------------------------------------

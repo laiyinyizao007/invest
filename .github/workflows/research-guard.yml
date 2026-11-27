@@ -87,6 +87,11 @@ jobs:
           python -m ruff check \
             scripts/backtest_lib.py \
             scripts/research_api.py \
+            scripts/research_candidate_host.py \
+            scripts/research_candidate_process.py \
+            scripts/research_candidate_spec.py \
+            scripts/research_signal_replay.py \
+            research \
             scripts/research_attempts.py \
             scripts/research_approval_server.py \
             scripts/research_config.py \
@@ -123,9 +128,17 @@ jobs:
             tests/test_dashboard_collect_more.py \
             tests/test_constitution_round11.py \
             tests/test_constitution_round12.py \
+            tests/test_constitution_isolated_executor.py \
             tests/test_fs_capability_closure.py \
             tests/test_merge_main_sandbox_union.py \
             tests/test_research_api.py \
+            tests/test_candidate_spec.py \
+            tests/test_candidate_process_posix.py \
+            tests/test_candidate_fence.py \
+            tests/test_candidate_process_isolation.py \
+            tests/test_candidate_process_runner.py \
+            tests/test_candidate_process_integration.py \
+            tests/test_candidate_process_equivalence.py \
             tests/test_research_approval_server.py \
             tests/test_research_boundary.py \
             tests/test_research_config.py \
@@ -235,7 +248,7 @@ jobs:
           # `tests/test_strategy_skeleton_contract.py`——它们 import `bootstrap`,
           # 会把 vnpy 交易栈拖进来 ⇒ 这个 job 装不了(也不该装:研究侧刻意不依赖交易栈);
           # 那两份属于交易侧,归实盘那条线。
-          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py --suite tests/test_auto_approval.py --suite tests/test_research_products.py --suite tests/test_research_kb.py
+          python tools/ci_gate.py --junitxml "$RUNNER_TEMP/research_rest.xml" --roster tests/guard_roster.json --suite tests/test_research_config.py --suite tests/test_research_sandbox.py --suite tests/test_research_gateway.py --suite tests/test_research_approval_server.py --suite tests/test_research_api.py --suite tests/test_research_mcp.py --suite tests/test_research_profile_check.py --suite tests/test_research_gate.py --suite tests/test_research_grid.py --suite tests/test_approval_ledger.py --suite tests/test_research_collect.py --suite tests/test_auto_approval.py --suite tests/test_research_products.py --suite tests/test_research_kb.py --suite tests/test_candidate_process_isolation.py --suite tests/test_candidate_process_runner.py --suite tests/test_candidate_process_integration.py --suite tests/test_candidate_spec.py --suite tests/test_candidate_process_posix.py --suite tests/test_candidate_fence.py --suite tests/test_constitution_isolated_executor.py
 
       # 后果域分档器**自己**的冒烟关卡(codex 第 1 轮的 M4、第 2 轮的 Critical-1)。
       #

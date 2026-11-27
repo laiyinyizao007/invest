@@ -25,6 +25,9 @@ RUN pip install --no-index --find-links=/wheelhouse -r requirements.txt     && p
 COPY risk ./risk
 COPY strategies ./strategies
 COPY scripts ./scripts
+# 候选侧运行时包(协议/指标/基类):候选独立进程路径(Issue #29 S1,`isolation.candidate_process`,默认关)要用;
+# 框架侧以 `research.candidate.protocol` 导入同一份文件,候选进程里则把它复制进自己的临时目录。关着开关时不被用到。
+COPY research ./research
 COPY config ./config
 COPY dashboard/__init__.py dashboard/safe.py ./dashboard/
 COPY notify/__init__.py notify/redact.py ./notify/

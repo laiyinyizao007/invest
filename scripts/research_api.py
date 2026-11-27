@@ -858,22 +858,28 @@ def evaluate_prepare(*, strategy: str, cls: str, random_runs: int | None = None,
         raise JobError(EXIT_REFUSED, f"random_runs 必须是 [{low}, {high}] 内的整数(配置边界)")
     raw, source = read_candidate(path)                  # 只读一次,见 backtest_job 的说明
     strategy_sha = hashlib.sha256(raw).hexdigest()
+    # 候选独立进程开关(Issue #29 S1,默认关):开着时新格式候选要 `from candidate.signal_template import ...`,
+    # 静态筛查只在**这条路径上**多放行 `candidate` 这个导入根;关着时白名单一个字都不变。
+    candidate_process = cfg["isolation"]["candidate_process"]
+    allowed_modules = list(cfg["screening"]["allowed_modules"]) + (["candidate"] if candidate_process else [])
     findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
-                                cfg["screening"]["extra_forbidden_calls"],
-                                cfg["screening"]["allowed_modules"])
+                                cfg["screening"]["extra_forbidden_calls"], allowed_modules)
     if findings:
         raise JobError(EXIT_REFUSED, "静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings))
     check_approval(path, paths, confirm, strategy_sha)
     prior = prior_trials(paths)                   # 先读后扣:子进程算 DSR 用 prior + 实际格子数,预扣的最小网格不能算两次
     charge_trials(paths, "grid_cell", MIN_GRID_CELLS)
     return {"path": path, "strategy_file": path.name, "cls": cls, "product": product, "timeout": timeout,
-            "random_runs": random_runs, "strategy_sha": strategy_sha, "prior": prior, "paths": paths}
+            "random_runs": random_runs, "strategy_sha": strategy_sha, "prior": prior, "paths": paths,
+            "candidate_process": candidate_process}
 
 
 def evaluate_run(ctx: dict, run_id: str | None = None) -> dict:
     """评估的**慢的后半段**:起子进程、补记网格试验、落盘。run_id 给定则沿用(异步),否则现分配(同步)。"""
     path, cls, product, paths = ctx["path"], ctx["cls"], ctx["product"], ctx["paths"]
-    cmd = [sys.executable, str(Path(__file__).resolve()), "_evaluate_child", "--file", str(path), "--cls", cls,
+    # 开关来自 prepare 读到的**配置文件**,不是调用方传的参数;开=框架侧子进程(不载入候选)+ 候选宿主进程
+    child_name = "_evaluate_signal_child" if ctx.get("candidate_process") else "_evaluate_child"
+    cmd = [sys.executable, str(Path(__file__).resolve()), child_name, "--file", str(path), "--cls", cls,
            "--random-runs", str(ctx["random_runs"]), "--sha256", ctx["strategy_sha"], "--prior-trials", str(ctx["prior"]),
            "--product", product]
     body = spawn_child(cmd, ctx["timeout"])
@@ -882,6 +888,8 @@ def evaluate_run(ctx: dict, run_id: str | None = None) -> dict:
     base = {"kind": "evaluate", "strategy_file": path.name, "strategy_sha256": ctx["strategy_sha"],
             "class": cls, "key": product, "protocol_notice": EVALUATE_NOTICE,
             "ran_at": datetime.now().isoformat(timespec="seconds")}
+    if ctx.get("candidate_process"):
+        base["isolation"] = "candidate-process"       # 留痕:这份结果是候选独立进程路径算出来的
     if "error" in body:
         result = {**base, "status": "strategy_error", "passed": False, "error": body["error"]}
     else:
@@ -1050,6 +1058,106 @@ def run_evaluate_child(args) -> int:
     return EXIT_OK
 
 
+def run_evaluate_signal_child(args) -> int:
+    """框架侧评估子进程(候选独立进程路径,Issue #29 S1)。**不载入候选**:候选源码只被当文本读、当文本交给宿主进程。
+
+    与 `run_evaluate_child` 同一套自查(路径、审批、整数参数、品种白名单),同一套评估(`run_evaluation`),
+    区别只在 runner:遇到候选(代理类)就起候选宿主进程取信号,再交给框架自己的引擎回放。
+    格子数、试验数全是本进程自己跑出来的数,候选无处自报。
+    """
+    import research_candidate_process as rcp
+    import research_candidate_spec as rspec
+    import research_signal_replay as rsr
+    import walk_forward_optimizer as wf
+    from backtest_lib import DEFAULT_CAPITAL, load_bars_csv
+    from research_gate import engine_runner, run_evaluation
+    from strategies.random_entry_15m_strategy import RandomEntry15mStrategy
+    from strategies.trend_atr_15m_strategy import TrendAtr15mStrategy
+    from vnpy.trader.constant import Exchange
+    try:
+        path = child_file(Path(args.file))
+        child_approved(args.sha256)
+        random_runs, prior_trials = child_int_args(args)
+        check_product(args.product)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    try:
+        data_file, symbol = wf.PRODUCTS[args.product]
+    except KeyError:
+        print(f"品种 {args.product} 没有登记数据映射(walk_forward_optimizer.PRODUCTS)", file=sys.stderr)
+        return EXIT_REFUSED
+    if not Path(data_file).is_file():
+        print(f"品种 {args.product} 的数据文件缺失:{Path(data_file).name}", file=sys.stderr)
+        return EXIT_REFUSED
+    # 候选源码只读一次,并核对它就是被批准的那一份字节(与旧路径 import_candidate 同一条哈希前提)。
+    # 读法与旧路径**同一个函数**:`utf-8-sig`(带 BOM 的候选在旧路径能跑)、读不了是「拒绝」而不是「失败」。
+    try:
+        raw, source = read_candidate(path)
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    if hashlib.sha256(raw).hexdigest() != args.sha256:
+        print("候选文件内容与批准时的哈希不符,拒绝执行", file=sys.stderr)
+        return EXIT_REFUSED
+    # 行情、窗口、配置在起任何候选进程之前取定(与旧路径同一条纪律)
+    bars = load_bars_csv(data_file, symbol, Exchange.DCE)
+    windows = wf.build_windows()
+    cfg = rc.load()
+    # 静态筛查在子进程里**再做一遍**:旧子入口在 import_candidate 里就是这么做的(批准与筛查是两道独立的闸;
+    # 自动批准账里的代码甚至没人读过)。新子入口不得比它弱。`candidate` 导入根只在这条路径上放行。
+    findings = rs.screen_source(source, cfg["screening"]["extra_forbidden_modules"],
+                                cfg["screening"]["extra_forbidden_calls"],
+                                list(cfg["screening"]["allowed_modules"]) + ["candidate"])
+    if findings:
+        print("静态筛查未通过:" + chr(10) + "  " + (chr(10) + "  ").join(findings), file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        spec = rspec.parse_spec(source)
+        if spec.class_name != args.cls:
+            # `--cls` 来自调用方(最终来自模型/工作流):完整信息留本机,回给模型的是固定说明,不回显它
+            raise rspec.SpecError(f"--cls {args.cls} 与源码里唯一的候选类 {spec.class_name} 不符",
+                                  public="指定的类名与源码里唯一的候选类不符")
+        rspec.check_framework_defaults(spec, TrendAtr15mStrategy.parameters)
+    except rspec.SpecError as exc:
+        # 候选自己的声明有问题 = 研究中的正常结果(与旧路径的 GridError 对称),按结构化错误回传:
+        # 完整信息(含候选可控的标识符)只写本机 stderr,回给模型的只有固定说明 `exc.public`
+        print(f"候选声明被拒绝: {exc}", file=sys.stderr)
+        print(CHILD_MARK + json.dumps({"error": {"type": "SpecError", "message": exc.public}}, ensure_ascii=False))
+        return EXIT_OK
+    # 类体默认值里的受保护参数(`risk_budget = 1e9`)在起**任何**候选进程之前就硬拒绝,与旧路径一致
+    # (旧路径是 check_class 在进评估之前拒绝、退出码 2)。静态筛查通常会先拦住;这一层不依赖它,是纵深防御。
+    try:
+        check_params_allowed(rspec.framework_setting(spec, None, TrendAtr15mStrategy.parameters))
+    except JobError as exc:
+        print(exc.message, file=sys.stderr)
+        return exc.code
+    proxy = rspec.proxy_class(spec)
+    runner = rsr.make_signal_runner(
+        source=source, spec=spec, proxy=proxy, base=TrendAtr15mStrategy, engine=engine_runner(args.product),
+        check_setting=check_params_allowed, framework_parameters=TrendAtr15mStrategy.parameters,
+        timeout=float(cfg["backtest"]["timeout_seconds"]))
+    try:
+        result = run_evaluation(
+            candidate_cls=proxy, bars=bars, runner=runner, random_cls=RandomEntry15mStrategy,
+            random_runs=random_runs, capital=DEFAULT_CAPITAL, max_cells=cfg["grid"]["max_cells"],
+            min_round_trips=cfg["grid"]["min_round_trips"], select_window=(windows[0].train_start, windows[0].train_end),
+            validation_windows=[(w.name, w.valid_start, w.valid_end) for w in windows], prior_trials=prior_trials)
+    except rcp.CandidateProcessError as exc:
+        # 候选写的文字(detail)不可信:走与旧路径同一条净化(describe_error);框架自己的失败只给固定说明
+        if exc.kind == "candidate_error":
+            err = describe_error(RuntimeError(exc.detail))
+        else:
+            err = {"type": "CandidateProcessError", "message": rs.scrub_text(exc.message)[:200]}
+        print(CHILD_MARK + json.dumps({"error": err}, ensure_ascii=False))
+        return EXIT_OK
+    except Exception as exc:                  # 含 GridError、受保护参数拒绝:候选自己的问题,作为结果回传
+        print(CHILD_MARK + json.dumps({"error": describe_error(exc)}))
+        return EXIT_OK
+    print(CHILD_MARK + json.dumps(result, ensure_ascii=False))
+    return EXIT_OK
+
+
 def run_child(args) -> int:
     """子进程:加载策略并回测。只在受限环境(sandbox_env)里由 cmd_backtest 拉起。"""
     # `vnpy_database_paths` 在**交易侧**模块里(常驻研究进程不许 import vnpy,见 tests/test_research_boundary.py)。
@@ -1170,6 +1278,13 @@ def build_parser() -> argparse.ArgumentParser:
     echild.add_argument("--prior-trials", type=int, default=None)
     echild.add_argument("--product", default="C15")      # 子进程自己再按白名单核对,不假设父进程查过
     echild.set_defaults(func=run_evaluate_child)
+    schild = sub.add_parser("_evaluate_signal_child")   # 内部使用:候选独立进程路径的框架侧评估(不载入候选)
+    for name in ("file", "cls", "sha256"):
+        schild.add_argument(f"--{name}", required=True)
+    schild.add_argument("--random-runs", type=int, required=True)
+    schild.add_argument("--prior-trials", type=int, default=None)
+    schild.add_argument("--product", default="C15")
+    schild.set_defaults(func=run_evaluate_signal_child)
     return parser
 
 

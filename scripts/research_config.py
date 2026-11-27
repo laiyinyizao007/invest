@@ -51,6 +51,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     # 打开后,通过静态筛查的候选由服务端写入**独立账本** auto_approvals.json(via=auto-research)。
     # 该账本**只被研究沙盒读**;运行侧/装载门/实盘准入仍只认人工账 approvals.json。
     "auto_approve": {"enabled": False},
+    # 候选独立进程执行(Issue #29 S1)。**默认关**=走旧的同进程路径;只有人在本机改这个文件才能打开,
+    # 请求体/网关/模型都改不了它。打开后:候选源码只在独立进程里跑、只回信号序列,须写成 `SignalTemplate` 子类。
+    "isolation": {"candidate_process": False},
     "screening": {"extra_forbidden_modules": [], "extra_forbidden_calls": [], "allowed_modules": []},
 }
 
@@ -185,6 +188,8 @@ def _validate(cfg: dict) -> None:
         raise ConfigError(f"paths.attempts_file 必须固定为 data/research/{ATTEMPTS_FILE_NAME}")
     if not isinstance(cfg["auto_approve"]["enabled"], bool):
         raise ConfigError("auto_approve.enabled 必须是布尔值")
+    if not isinstance(cfg["isolation"]["candidate_process"], bool):
+        raise ConfigError("isolation.candidate_process 必须是布尔值")
     token = _relative_inside(cfg["gateway"]["token_file"], "gateway.token_file")
     if token.name.lower() in reserved_files or token.parts[0].lower() in reserved_dirs:
         raise ConfigError("gateway.token_file 不得借用凭据文件或源码目录")
