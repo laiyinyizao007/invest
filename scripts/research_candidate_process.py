@@ -66,7 +66,10 @@ def kill_tree(proc: subprocess.Popen) -> None:
     """与 `research_api.kill_tree` 同一做法(venv 的 python.exe 是启动器,须杀整棵树)。
     不直接 import research_api:它是上层,会形成环。"""
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        except OSError:
+            proc.kill()                                      # taskkill 起不来:至少杀掉宿主本身
     else:
         # POSIX:候选进程是自己会话的组长(启动时 start_new_session=True),整组一起杀——
         # 只 proc.kill() 杀不到孙进程(G8 codex 审查指出,容器里就是这条路径)。
@@ -204,7 +207,10 @@ def run_candidate_signals(source: str, class_name: str, params: dict, bars, *, i
             deadline = time.monotonic() + timeout
             while proc.poll() is None:
                 if time.monotonic() > deadline:
-                    kill(proc)
+                    try:
+                        kill(proc)
+                    except Exception as exc:                 # noqa: BLE001 - 杀失败也要报 timeout,由 _reap 再杀一次
+                        print(f"警告:终止候选进程失败: {type(exc).__name__}", file=sys.stderr)
                     _reap(proc, kill)
                     raise CandidateProcessError("timeout", f"候选进程超过 {timeout:g}s,已终止")
                 out_fh.flush()

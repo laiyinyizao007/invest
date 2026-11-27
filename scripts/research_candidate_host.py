@@ -99,7 +99,7 @@ _FENCE_DENIED_EVENTS = frozenset({
     "socket.gethostbyname", "socket.gethostbyaddr",
 })
 _FENCE_PATH_EVENTS = frozenset({
-    "os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.truncate", "os.chmod", "os.chown", "os.symlink", "os.link",
+    "os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.truncate", "os.chmod", "os.chown", "os.symlink", "os.link", "os.utime",
     "shutil.copyfile", "shutil.copymode", "shutil.copystat", "shutil.copytree", "shutil.move", "shutil.rmtree",
     "shutil.make_archive", "shutil.unpack_archive",
 })

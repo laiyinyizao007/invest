@@ -503,3 +503,32 @@ def test_denied_env_names_are_stripped_case_insensitively():
            "Research_Sandbox_Config": "/c.json", "KEEP_ME": "1"}
     kept = rcp._strip_denied_env(env)
     assert set(kept) == {"PATH", "KEEP_ME"}
+
+
+def test_kill_tree_falls_back_to_proc_kill_when_taskkill_cannot_start(monkeypatch):
+    """Windows 上 taskkill 起不来(OSError)时,至少要杀掉宿主本身,而不是把异常抛给超时路径(G8 复核)。"""
+    monkeypatch.setattr(rcp.sys, "platform", "win32")
+
+    def boom(*a, **k):
+        raise FileNotFoundError("taskkill")
+
+    monkeypatch.setattr(rcp.subprocess, "run", boom)
+    killed = []
+
+    class P:
+        pid = 1
+
+        def kill(self):
+            killed.append(1)
+
+    rcp.kill_tree(P())
+    assert killed == [1]
+
+
+def test_fence_denies_utime_outside_workdir():
+    """os.utime 改围栏外文件的时间戳也要拦(G8 复核补的路径事件)。"""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "scripts" / "research_candidate_host.py").read_text(encoding="utf-8")
+    ns = {"__name__": "host_under_test"}
+    exec(compile(src, "<host>", "exec"), ns)
+    assert "os.utime" in ns["_FENCE_PATH_EVENTS"]
