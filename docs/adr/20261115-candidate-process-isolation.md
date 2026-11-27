@@ -1246,6 +1246,8 @@ S2~S4 没有做。本 ADR 的整体状态仍是"待评审"(拍板点 1、3 未�
 
 结论:**G8 两轮仍不够 45,不具备「已通过」表述**;本次新发现的真问题都是中低严重度,已修。
 
+**我(主模型)亲自做的补充自查(2026-11-27)**:逐行读了围栏钩子与路径事件表。`open` 事件的写判定、`os.rename`/`os.symlink` 的 fd 实参跳过、POSIX 相对路径一律拒,均与实测一致;补上仍缺的有审计事件的写类操作 `os.chflags`、`os.setxattr`、`os.removexattr`。**这是作者自查,不是独立复核,不计入 G8 的两轮,也不改变上面「未达 45」的结论。**
+
 ## 宪法守卫的有条件豁免(2026-11-26,用户确认)
 
 **起因**:PR #98 的 `constitution` 检查红了——`tools/check_constitution_history.py::check_executor_completeness` 要求「谁执行候选代码,谁就必须在**同一进程里**对受保护对象(`risk` / `strategies` / `vnpy_*`)做快照与指纹比对」(第四层),而 `scripts/research_candidate_host.py` 在**刻意没有这些包**的进程里 `exec` 候选(A1 验收:候选里 `import risk` 必须失败)。要满足守卫就得把 `risk.constitution` import 进候选进程,正好违背 S1 的目的。**我本地漏跑了这个守卫**(只跑了 `research-guard` 的套件名单;守卫自己的 5 个测试文件我从没跑过,其中 3 条本来会直接报出来)。

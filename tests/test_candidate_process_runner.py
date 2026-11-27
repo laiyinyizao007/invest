@@ -531,4 +531,4 @@ def test_fence_denies_utime_outside_workdir():
     src = (Path(__file__).resolve().parents[1] / "scripts" / "research_candidate_host.py").read_text(encoding="utf-8")
     ns = {"__name__": "host_under_test"}
     exec(compile(src, "<host>", "exec"), ns)
-    assert "os.utime" in ns["_FENCE_PATH_EVENTS"]
+    assert {"os.utime", "os.chflags", "os.setxattr", "os.removexattr"} <= ns["_FENCE_PATH_EVENTS"]
